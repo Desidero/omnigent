@@ -19,6 +19,9 @@ from omnigent.extensions import (
     ExtensionPermission,
     PageContribution,
     PrimaryNavigationContribution,
+    SlotId,
+    SlotItemContribution,
+    SlotItemKind,
 )
 
 
@@ -52,6 +55,15 @@ def get_manifest() -> ExtensionManifest:
                 order=500,
             ),
         ),
+        slot_items=(
+            SlotItemContribution(
+                id="acme.review.composer-action",
+                slot=SlotId.COMPOSER_ACTIONS,
+                kind=SlotItemKind.ACTION,
+                label="Review session",
+                page="acme.review.dashboard",
+            ),
+        ),
     )
 ```
 
@@ -64,6 +76,9 @@ def get_manifest() -> ExtensionManifest:
 - `requires_omnigent` is a PEP 440 release-line range.
 - Browser paths are fixed to `dist/extension.js` and optional
   `dist/extension.css` inside the entry point's verified import package.
+- Slot items use a supported slot/kind pairing, reference a page owned by the
+  same extension, and cannot reorder core UI. See
+  [Extension UI slots](extension_ui_slots.md).
 - Built-ins are reserved. All community extensions participating in a collision
   are disabled deterministically.
 - One invalid field rejects the whole extension; one rejected extension does not

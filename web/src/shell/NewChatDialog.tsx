@@ -377,6 +377,7 @@ import { BrandLogo } from "@/components/BrandLogo";
 import { PoweredByOmnigent } from "@/components/PoweredByOmnigent";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ExtensionSlotHost } from "@/extensions/ExtensionSlot";
 import type { CostControlMode } from "@/components/CostRoutingControl";
 import {
   composerSendShortcutKeys,
@@ -7303,17 +7304,19 @@ export function NewChatLandingScreen() {
                         triggerClassName="text-[13px] leading-5"
                       />
                     </div>
-                    <ComposerMicButton
-                      className="size-8 md:size-7"
-                      enableHotkey
-                      disabled={creating}
-                      onVoiceStart={() => {
-                        voiceSnapshotRef.current = message;
-                      }}
-                      onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
-                      onTranscript={dictation.appendFinal}
-                      onInterim={dictation.replaceInterim}
-                    />
+                    <ExtensionSlotHost slot="composer.actions" instance="new-chat-composer">
+                      <ComposerMicButton
+                        className="size-8 md:size-7"
+                        enableHotkey
+                        disabled={creating}
+                        onVoiceStart={() => {
+                          voiceSnapshotRef.current = message;
+                        }}
+                        onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                        onTranscript={dictation.appendFinal}
+                        onInterim={dictation.replaceInterim}
+                      />
+                    </ExtensionSlotHost>
                     <TooltipProvider>
                       <Tooltip
                         open={submitTooltipState !== "closed"}

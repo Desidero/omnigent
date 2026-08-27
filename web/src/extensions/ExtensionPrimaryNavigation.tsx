@@ -1,20 +1,7 @@
-import {
-  LayoutDashboardIcon,
-  PanelsTopLeftIcon,
-  PuzzleIcon,
-  SearchIcon,
-  type LucideIcon,
-} from "lucide-react";
 import type { MouseEvent } from "react";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useExtensions } from "./ExtensionProvider";
-
-const ICONS: Record<string, LucideIcon> = {
-  dashboard: LayoutDashboardIcon,
-  "panels-top-left": PanelsTopLeftIcon,
-  puzzle: PuzzleIcon,
-  search: SearchIcon,
-};
+import { extensionIcon } from "./icons";
 
 export function ExtensionPrimaryNavigation({
   activePageId,
@@ -43,7 +30,7 @@ export function ExtensionPrimaryNavigation({
         key={navigation.id}
         to={`/extensions/${extension.id}/${page.route}`}
         label={navigation.label}
-        icon={ICONS[navigation.icon ?? ""] ?? PuzzleIcon}
+        icon={extensionIcon(navigation.icon)}
         active={activePageId === page.id}
         onClick={onNavigate}
         componentId={`sidebar.extension.${navigation.id}`}

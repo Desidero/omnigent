@@ -28,6 +28,8 @@ trusted Python package -> validated manifest -> server catalog
 - `pages`: one-segment routes under `/extensions/{extension_id}/{route}`.
 - `primary_navigation`: links rendered in the extension-owned slot between
   Inbox and Usage. `order` sorts only within that slot.
+- `slot_items`: core-rendered, page-backed links in four semantic UI locations.
+  See [Extension UI slots](extension_ui_slots.md).
 
 Command metadata, activation events, and `when` expressions are validated and
 reserved but are not executed or evaluated in V1. Arbitrary React components,
@@ -52,5 +54,6 @@ load and asset errors through `doctor` or `/v1/extensions/diagnostics`.
 ![Hello Page reference extension](../demo/extensions-hello-page.png)
 
 See [Extension manifest](extension_manifest.md),
-[Browser extensions](browser_extensions.md), and the
+[Browser extensions](browser_extensions.md),
+[Extension UI slots](extension_ui_slots.md), and the
 [Hello Page example](../../examples/extensions/hello-page/README.md).

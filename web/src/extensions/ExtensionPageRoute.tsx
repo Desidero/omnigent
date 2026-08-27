@@ -1,5 +1,6 @@
+import { useMemo } from "react";
 import { Spinner } from "@/components/ui/spinner";
-import { useParams } from "@/lib/routing";
+import { useLocation, useParams } from "@/lib/routing";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { resolveExtensionPage } from "./catalog";
 import { useExtensions, useExtensionsLoading } from "./ExtensionProvider";
@@ -7,10 +8,18 @@ import { ExtensionPageHost } from "./ExtensionPageHost";
 
 export function ExtensionPageRoute() {
   const params = useParams<{ extensionId: string; "*": string }>();
+  const location = useLocation();
   const route = params["*"]?.split("/")[0];
   const extensions = useExtensions();
   const extensionsLoading = useExtensionsLoading();
   const resolved = resolveExtensionPage(extensions, params.extensionId, route);
+
+  const invocationContext = useMemo<Readonly<Record<string, string>>>(() => {
+    const context: Record<string, string> = {};
+    const conversationId = new URLSearchParams(location.search).get("conversationId");
+    if (conversationId) context.conversationId = conversationId;
+    return context;
+  }, [location.search]);
 
   if (extensionsLoading) {
     return (
@@ -24,5 +33,5 @@ export function ExtensionPageRoute() {
 
   if (!resolved) return <NotFoundPage />;
 
-  return <ExtensionPageHost resolved={resolved} />;
+  return <ExtensionPageHost resolved={resolved} invocationContext={invocationContext} />;
 }

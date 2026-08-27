@@ -24,6 +24,9 @@ from omnigent.extensions.api import (
     ExtensionPluginState,
     PageContribution,
     PrimaryNavigationContribution,
+    SlotId,
+    SlotItemContribution,
+    SlotItemKind,
 )
 from omnigent.version import VERSION
 
@@ -187,6 +190,45 @@ def _validate_navigation(
         )
 
 
+_SLOT_KINDS = {
+    SlotId.CHAT_HEADER_ACTIONS: SlotItemKind.ACTION,
+    SlotId.COMPOSER_ACTIONS: SlotItemKind.ACTION,
+    SlotId.SESSION_RIGHT_RAIL_TABS: SlotItemKind.TAB,
+    SlotId.SETTINGS_SECTIONS: SlotItemKind.SECTION,
+}
+
+
+def _validate_slot_item(
+    extension_id: str,
+    item: SlotItemContribution,
+    *,
+    page_ids: set[str],
+) -> None:
+    _validate_contribution_id(extension_id, item.id, "slot item")
+    if not isinstance(item.slot, SlotId):
+        raise ExtensionValidationError(f"slot item {item.id!r} uses an unsupported SlotId")
+    expected_kind = _SLOT_KINDS.get(item.slot)
+    if expected_kind is None:
+        raise ExtensionValidationError(f"slot item {item.id!r} uses an unsupported SlotId")
+    if not isinstance(item.kind, SlotItemKind) or expected_kind is not item.kind:
+        raise ExtensionValidationError(
+            f"slot item {item.id!r} kind must be {expected_kind.value!r} "
+            f"for slot {item.slot.value!r}"
+        )
+    _require_text(item.label, f"slot item {item.id!r} label")
+    _require_text(item.page, f"slot item {item.id!r} page")
+    if item.page not in page_ids:
+        raise ExtensionValidationError(
+            f"slot item {item.id!r} references unknown page {item.page!r}"
+        )
+    if item.icon is not None:
+        _require_symbol(item.icon, f"slot item {item.id!r} icon")
+    if item.when is not None:
+        _require_text(item.when, f"slot item {item.id!r} when")
+    if isinstance(item.order, bool) or not isinstance(item.order, int):
+        raise ExtensionValidationError(f"slot item {item.id!r} order must be an integer")
+
+
 def _validate_command(extension_id: str, command: CommandContribution) -> None:
     _validate_contribution_id(extension_id, command.id, "command")
     _require_text(command.title, f"command {command.id!r} title")
@@ -208,7 +250,13 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     """Validate one manifest independently of other installed extensions."""
     if not isinstance(manifest.entrypoints, ExtensionEntrypoints):
         raise ExtensionValidationError("entrypoints must be ExtensionEntrypoints")
-    for field_name in ("pages", "primary_navigation", "commands", "activation_events"):
+    for field_name in (
+        "pages",
+        "primary_navigation",
+        "slot_items",
+        "commands",
+        "activation_events",
+    ):
         if not isinstance(getattr(manifest, field_name), tuple):
             raise ExtensionValidationError(f"{field_name} must be a tuple")
     if not isinstance(manifest.permissions, frozenset):
@@ -216,6 +264,7 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     for field_name, values, expected_type in (
         ("pages", manifest.pages, PageContribution),
         ("primary_navigation", manifest.primary_navigation, PrimaryNavigationContribution),
+        ("slot_items", manifest.slot_items, SlotItemContribution),
         ("commands", manifest.commands, CommandContribution),
     ):
         invalid = [
@@ -315,6 +364,9 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     for navigation in manifest.primary_navigation:
         _validate_navigation(manifest.id, navigation, page_ids=page_ids)
     navigation_ids = {navigation.id for navigation in manifest.primary_navigation}
+    for item in manifest.slot_items:
+        _validate_slot_item(manifest.id, item, page_ids=page_ids)
+    slot_item_ids = {item.id for item in manifest.slot_items}
 
     _reject_duplicates((page.id for page in manifest.pages), "page ids")
     _reject_duplicates((page.route for page in manifest.pages), "page routes")
@@ -323,8 +375,9 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
         (navigation.id for navigation in manifest.primary_navigation),
         "primary navigation ids",
     )
+    _reject_duplicates((item.id for item in manifest.slot_items), "slot item ids")
     _reject_duplicates(
-        (*page_ids, *command_ids, *navigation_ids),
+        (*page_ids, *command_ids, *navigation_ids, *slot_item_ids),
         "contribution ids",
     )
 
@@ -376,6 +429,7 @@ def _manifest_claims(manifest: ExtensionManifest) -> tuple[str, ...]:
         *(page.id for page in manifest.pages),
         *(command.id for command in manifest.commands),
         *(item.id for item in manifest.primary_navigation),
+        *(item.id for item in manifest.slot_items),
     )
     return (
         f"extension:{manifest.id}",

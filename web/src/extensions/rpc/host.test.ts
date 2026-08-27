@@ -27,6 +27,7 @@ const extension: ExtensionCatalogItem = {
   permissions: [],
   pages: [page],
   primary_navigation: [],
+  slot_items: [],
   browser: {
     declared: true,
     has_styles: true,

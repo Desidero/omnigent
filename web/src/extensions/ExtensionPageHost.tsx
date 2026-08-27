@@ -3,7 +3,13 @@ import { useRefreshExtensions } from "./ExtensionProvider";
 import { ExtensionViewHost } from "./ExtensionViewHost";
 import { useExtensionHostServices } from "./services/useExtensionHostServices";
 
-export function ExtensionPageHost({ resolved }: { resolved: ResolvedExtensionPage }) {
+export function ExtensionPageHost({
+  resolved,
+  invocationContext,
+}: {
+  resolved: ResolvedExtensionPage;
+  invocationContext?: Readonly<Record<string, string>>;
+}) {
   const refresh = useRefreshExtensions();
   const { methods, events } = useExtensionHostServices(resolved.extension);
   return (
@@ -13,6 +19,7 @@ export function ExtensionPageHost({ resolved }: { resolved: ResolvedExtensionPag
       refresh={refresh}
       methods={methods}
       events={events}
+      invocationContext={invocationContext}
     />
   );
 }

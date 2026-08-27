@@ -16,6 +16,7 @@ const extensions = [
       { id: "acme.review.second", title: "Second", route: "second", view: "second" },
       { id: "acme.review.first", title: "First", route: "first", view: "first" },
     ],
+    slot_items: [],
     primary_navigation: [
       {
         id: "acme.review.second-nav",

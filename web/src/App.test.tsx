@@ -43,8 +43,17 @@ vi.mock("@/pages/SettingsPage", async () => {
   };
 });
 vi.mock("@/extensions/ExtensionPageHost", () => ({
-  ExtensionPageHost: ({ resolved }: { resolved: { page: { title: string } } }) => (
-    <h1>{resolved.page.title}</h1>
+  ExtensionPageHost: ({
+    resolved,
+    invocationContext,
+  }: {
+    resolved: { page: { title: string } };
+    invocationContext?: Record<string, string>;
+  }) => (
+    <>
+      <h1>{resolved.page.title}</h1>
+      <span data-testid="invocation-context">{invocationContext?.conversationId}</span>
+    </>
   ),
 }));
 vi.mock("@/extensions/ExtensionProvider", () => ({
@@ -68,6 +77,7 @@ vi.mock("@/extensions/ExtensionProvider", () => ({
         },
       ],
       primary_navigation: [],
+      slot_items: [],
       browser: {
         declared: true,
         has_styles: false,
@@ -302,6 +312,32 @@ describe("Extension page routes", () => {
     render(
       <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
         <MemoryRouter initialEntries={["/extensions/acme.review/dashboard"]}>
+          <App />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Review dashboard" })).toBeInTheDocument();
+  });
+
+  it("forwards session context from a slot navigation URL", async () => {
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter
+          initialEntries={["/extensions/acme.review/dashboard?conversationId=conv_123"]}
+        >
+          <App />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByTestId("invocation-context")).toHaveTextContent("conv_123");
+  });
+
+  it("renders an extension settings section inside the settings route family", async () => {
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter initialEntries={["/settings/extensions/acme.review/dashboard"]}>
           <App />
         </MemoryRouter>
       </CapabilitiesProvider>,

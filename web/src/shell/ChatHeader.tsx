@@ -50,6 +50,7 @@ import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
+import { ExtensionSlotHost } from "@/extensions/ExtensionSlot";
 
 const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
@@ -637,7 +638,15 @@ export function ChatHeader({
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
-        {!pending && conversationId && <ViewModeToggle />}
+        {!pending && (
+          <ExtensionSlotHost
+            slot="chat.header.actions"
+            context={{ conversationId }}
+            instance="chat-header"
+          >
+            {conversationId && <ViewModeToggle />}
+          </ExtensionSlotHost>
+        )}
         {!pending && !actionConversation && canFork && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

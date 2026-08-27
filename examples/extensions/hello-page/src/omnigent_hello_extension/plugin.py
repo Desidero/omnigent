@@ -7,6 +7,9 @@ from omnigent.extensions import (
     ExtensionPermission,
     PageContribution,
     PrimaryNavigationContribution,
+    SlotId,
+    SlotItemContribution,
+    SlotItemKind,
 )
 
 _EXTENSION_ID = "omnigent.hello-page"
@@ -39,6 +42,40 @@ def get_manifest() -> ExtensionManifest:
         primary_navigation=(
             PrimaryNavigationContribution(
                 id=f"{_EXTENSION_ID}.primary-nav",
+                label="Hello Extension",
+                page=_PAGE_ID,
+                icon="puzzle",
+            ),
+        ),
+        slot_items=(
+            SlotItemContribution(
+                id=f"{_EXTENSION_ID}.header-action",
+                slot=SlotId.CHAT_HEADER_ACTIONS,
+                kind=SlotItemKind.ACTION,
+                label="Open Hello Extension",
+                page=_PAGE_ID,
+                icon="puzzle",
+            ),
+            SlotItemContribution(
+                id=f"{_EXTENSION_ID}.composer-action",
+                slot=SlotId.COMPOSER_ACTIONS,
+                kind=SlotItemKind.ACTION,
+                label="Open Hello Extension",
+                page=_PAGE_ID,
+                icon="puzzle",
+            ),
+            SlotItemContribution(
+                id=f"{_EXTENSION_ID}.rail-tab",
+                slot=SlotId.SESSION_RIGHT_RAIL_TABS,
+                kind=SlotItemKind.TAB,
+                label="Open Hello Extension",
+                page=_PAGE_ID,
+                icon="puzzle",
+            ),
+            SlotItemContribution(
+                id=f"{_EXTENSION_ID}.settings-section",
+                slot=SlotId.SETTINGS_SECTIONS,
+                kind=SlotItemKind.SECTION,
                 label="Hello Extension",
                 page=_PAGE_ID,
                 icon="puzzle",

@@ -355,6 +355,7 @@ const TEST_EXTENSION: ExtensionCatalogItem = {
       view: "inbox",
     },
   ],
+  slot_items: [],
   primary_navigation: [
     {
       id: "acme.review.primary-nav",

@@ -23,6 +23,7 @@ const extension: ExtensionCatalogItem = {
     },
   ],
   primary_navigation: [],
+  slot_items: [],
   browser: {
     declared: true,
     has_styles: false,

@@ -9,6 +9,9 @@ from omnigent.extensions.api import (
     ExtensionPluginState,
     PageContribution,
     PrimaryNavigationContribution,
+    SlotId,
+    SlotItemContribution,
+    SlotItemKind,
 )
 from omnigent.extensions.conformance import check_extension_package
 from omnigent.extensions.registry import (
@@ -33,6 +36,9 @@ __all__ = [
     "ExtensionValidationError",
     "PageContribution",
     "PrimaryNavigationContribution",
+    "SlotId",
+    "SlotItemContribution",
+    "SlotItemKind",
     "check_extension_package",
     "extension_manifest",
     "extension_manifests",

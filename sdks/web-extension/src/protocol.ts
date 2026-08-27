@@ -13,6 +13,7 @@ export interface ExtensionInitMessage extends ExtensionIdentity {
   source: typeof EXTENSION_RPC_SOURCE;
   type: "init";
   capabilities: string[];
+  context: Record<string, string>;
 }
 
 export interface ExtensionReadyMessage extends ExtensionIdentity {

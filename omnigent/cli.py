@@ -5554,6 +5554,8 @@ def extensions_doctor(extension_id: str) -> None:
     click.echo(f"id: {manifest.id}")
     click.echo(f"distribution: {manifest.distribution} {manifest.version}")
     click.echo(f"extension API: {manifest.extension_api}")
+    for item in manifest.slot_items:
+        click.echo(f"UI slot: {item.slot.value} -> {item.page} ({item.label})")
     if manifest.entrypoints.browser is None:
         click.echo("browser bundle: not declared")
         return

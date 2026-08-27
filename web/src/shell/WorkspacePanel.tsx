@@ -97,6 +97,7 @@ import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+import { ExtensionSlot } from "@/extensions/ExtensionSlot";
 import { Button } from "../components/ui/button";
 
 const TerminalView = lazy(() =>
@@ -1744,6 +1745,13 @@ function WorkspacePanelImpl({
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
             {showOpenTabs && newTabMenu("end")}
+            {!pending && (
+              <ExtensionSlot
+                slot="session.rightRail.tabs"
+                context={{ conversationId }}
+                instance="right-rail"
+              />
+            )}
             {panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {

@@ -33,6 +33,7 @@ import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { ExtensionSlotHost } from "@/extensions/ExtensionSlot";
 
 export type SettingsSectionId =
   | "appearance"
@@ -258,6 +259,7 @@ export function SettingsSidebarBody({
     info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
   const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
   const { section } = useSettingsRoute();
+  const extensionSectionActive = useLocation().pathname.includes("/settings/extensions/");
   const groups = settingsNavGroups(
     hasAuthSession,
     isElectronShell(),
@@ -297,51 +299,53 @@ export function SettingsSidebarBody({
         </Button>
       </div>
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
-        {groups.map((group) => (
-          <div key={group.title} className="flex flex-col">
-            <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
-              {group.title}
-            </h2>
-            <div className="mt-1 flex flex-col gap-px">
-              {group.items.map((item) => {
-                const Icon = item.icon;
-                const selected = section === item.id;
-                return (
-                  <Button
-                    key={item.id}
-                    asChild
-                    variant="ghost"
-                    className={cn(
-                      SIDEBAR_ROW,
-                      "w-full justify-start border-0 font-normal",
-                      selected &&
-                        "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
-                      item.hideOnMobile && "max-md:hidden",
-                    )}
-                  >
-                    <Link
-                      to={`/settings/${item.id}`}
-                      onClick={onNavClick}
-                      data-testid={`settings-nav-${item.id}`}
-                      componentId={`settings.nav.${item.id}`}
-                      aria-current={selected ? "page" : undefined}
+        <ExtensionSlotHost slot="settings.sections" instance="settings" onNavigate={onNavClick}>
+          {groups.map((group) => (
+            <div key={group.title} className="flex flex-col">
+              <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
+                {group.title}
+              </h2>
+              <div className="mt-1 flex flex-col gap-px">
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const selected = !extensionSectionActive && section === item.id;
+                  return (
+                    <Button
+                      key={item.id}
+                      asChild
+                      variant="ghost"
+                      className={cn(
+                        SIDEBAR_ROW,
+                        "w-full justify-start border-0 font-normal",
+                        selected &&
+                          "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
+                        item.hideOnMobile && "max-md:hidden",
+                      )}
                     >
-                      <Icon
-                        className={cn(
-                          "ui-icon",
-                          selected
-                            ? "text-[var(--sidebar-active-foreground)]"
-                            : "text-muted-foreground",
-                        )}
-                      />
-                      {item.label}
-                    </Link>
-                  </Button>
-                );
-              })}
+                      <Link
+                        to={`/settings/${item.id}`}
+                        onClick={onNavClick}
+                        data-testid={`settings-nav-${item.id}`}
+                        componentId={`settings.nav.${item.id}`}
+                        aria-current={selected ? "page" : undefined}
+                      >
+                        <Icon
+                          className={cn(
+                            "ui-icon",
+                            selected
+                              ? "text-[var(--sidebar-active-foreground)]"
+                              : "text-muted-foreground",
+                          )}
+                        />
+                        {item.label}
+                      </Link>
+                    </Button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        ))}
+          ))}
+        </ExtensionSlotHost>
       </nav>
     </>
   );

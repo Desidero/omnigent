@@ -18,6 +18,9 @@ from omnigent.extensions import (
     ExtensionPluginState,
     PageContribution,
     PrimaryNavigationContribution,
+    SlotId,
+    SlotItemContribution,
+    SlotItemKind,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -146,6 +149,7 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
                 "permissions": ["navigation", "sessions.read", "storage.user"],
                 "pages": [],
                 "primary_navigation": [],
+                "slot_items": [],
                 "browser": {
                     "declared": True,
                     "has_styles": True,
@@ -194,6 +198,15 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
         entrypoints=ExtensionEntrypoints(),
         pages=(*_manifest().pages, alpha_page),
         primary_navigation=(*_manifest().primary_navigation, alpha_nav),
+        slot_items=(
+            SlotItemContribution(
+                id="acme.review.header-action",
+                slot=SlotId.CHAT_HEADER_ACTIONS,
+                kind=SlotItemKind.ACTION,
+                label="Review",
+                page="acme.review.dashboard",
+            ),
+        ),
     )
     app = _build_app(
         db_uri,
@@ -212,6 +225,18 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
     assert [item["id"] for item in data[0]["primary_navigation"]] == [
         "acme.review.alpha-nav",
         "acme.review.primary-nav",
+    ]
+    assert data[0]["slot_items"] == [
+        {
+            "id": "acme.review.header-action",
+            "slot": "chat.header.actions",
+            "kind": "action",
+            "label": "Review",
+            "page": "acme.review.dashboard",
+            "icon": None,
+            "order": 500,
+            "when": None,
+        }
     ]
 
 

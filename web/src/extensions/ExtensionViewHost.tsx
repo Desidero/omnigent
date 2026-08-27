@@ -24,6 +24,7 @@ const MAX_PENDING_HOST_REQUESTS = 32;
 type HostMethod = (params: unknown, signal: AbortSignal) => unknown | Promise<unknown>;
 const NO_HOST_METHODS: Readonly<Record<string, HostMethod>> = {};
 const NO_HOST_EVENTS: Readonly<Record<string, unknown>> = {};
+const NO_INVOCATION_CONTEXT: Readonly<Record<string, string>> = {};
 interface PendingRequest {
   controller: AbortController;
   timeout: ReturnType<typeof setTimeout>;
@@ -40,12 +41,14 @@ export function ExtensionViewHost({
   refresh,
   methods = NO_HOST_METHODS,
   events = NO_HOST_EVENTS,
+  invocationContext = NO_INVOCATION_CONTEXT,
 }: {
   extension: ExtensionCatalogItem;
   page: ExtensionPage;
   refresh: () => Promise<ExtensionCatalogItem[]>;
   methods?: Readonly<Record<string, HostMethod>>;
   events?: Readonly<Record<string, unknown>>;
+  invocationContext?: Readonly<Record<string, string>>;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
@@ -59,6 +62,7 @@ export function ExtensionViewHost({
   const [status, setStatus] = useState<"loading" | "activating" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
+  const invocationKey = JSON.stringify(invocationContext);
 
   const closeRuntime = useCallback(() => {
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
@@ -125,7 +129,7 @@ export function ExtensionViewHost({
       cancelled = true;
       closeRuntime();
     };
-  }, [closeRuntime, extension, page, refresh, retryKey]);
+  }, [closeRuntime, extension, page, refresh, retryKey, invocationKey]);
 
   useEffect(() => {
     const port = portRef.current;
@@ -268,11 +272,12 @@ export function ExtensionViewHost({
       source: EXTENSION_RPC_SOURCE,
       type: "init",
       capabilities: Object.keys(methodsRef.current).sort(),
+      context: { ...invocationContext },
     };
     // A srcdoc frame has opaque origin "null"; the per-mount nonce and the
     // transferred port are the spoofing boundary, so targetOrigin must be "*".
     iframeRef.current.contentWindow.postMessage(init, "*", [channel.port2]);
-  }, [closeRuntime, frameDocument]);
+  }, [closeRuntime, frameDocument, invocationContext]);
 
   if (status === "error") {
     return (

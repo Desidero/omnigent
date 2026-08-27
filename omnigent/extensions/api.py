@@ -13,6 +13,23 @@ from enum import StrEnum
 EXTENSION_API_VERSION = 1
 
 
+class SlotId(StrEnum):
+    """Stable semantic UI locations open to declarative contributions."""
+
+    CHAT_HEADER_ACTIONS = "chat.header.actions"
+    COMPOSER_ACTIONS = "composer.actions"
+    SESSION_RIGHT_RAIL_TABS = "session.rightRail.tabs"
+    SETTINGS_SECTIONS = "settings.sections"
+
+
+class SlotItemKind(StrEnum):
+    """Core-rendered presentation for one slot contribution."""
+
+    ACTION = "action"
+    TAB = "tab"
+    SECTION = "section"
+
+
 class ExtensionPermission(StrEnum):
     """Host capabilities an extension may request."""
 
@@ -54,6 +71,20 @@ class PrimaryNavigationContribution:
 
 
 @dataclass(frozen=True)
+class SlotItemContribution:
+    """A core-rendered link from a semantic UI slot to an extension page."""
+
+    id: str
+    slot: SlotId
+    kind: SlotItemKind
+    label: str
+    page: str
+    icon: str | None = None
+    order: int = 500
+    when: str | None = None
+
+
+@dataclass(frozen=True)
 class CommandContribution:
     """Reserved command metadata; V1 does not execute contributed commands."""
 
@@ -76,6 +107,7 @@ class ExtensionManifest:
     activation_events: tuple[str, ...] = ()
     pages: tuple[PageContribution, ...] = ()
     primary_navigation: tuple[PrimaryNavigationContribution, ...] = ()
+    slot_items: tuple[SlotItemContribution, ...] = ()
     commands: tuple[CommandContribution, ...] = ()
 
 

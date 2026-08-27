@@ -17,6 +17,9 @@ from omnigent.extensions import (
     ExtensionPermission,
     PageContribution,
     PrimaryNavigationContribution,
+    SlotId,
+    SlotItemContribution,
+    SlotItemKind,
 )
 
 
@@ -537,6 +540,71 @@ def test_rejects_navigation_reference_to_unknown_page(
     nav = replace(_manifest().primary_navigation[0], page="acme.review.missing")
     manifest = replace(_manifest(), primary_navigation=(nav,))
     _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
+
+    assert "references unknown page" in registry.plugin_state().load_errors["review"]
+
+
+def test_accepts_page_backed_semantic_slot_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = SlotItemContribution(
+        id="acme.review.header-action",
+        slot=SlotId.CHAT_HEADER_ACTIONS,
+        kind=SlotItemKind.ACTION,
+        label="Review",
+        page="acme.review.dashboard",
+        icon="search",
+    )
+    manifest = replace(_manifest(), slot_items=(item,))
+    _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
+
+    accepted = registry.extension_manifest(manifest.id)
+    assert accepted is not None
+    assert accepted.slot_items == (item,)
+
+
+def test_rejects_unknown_slot_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = SlotItemContribution(
+        id="acme.review.bad-slot",
+        slot="unknown.slot",  # type: ignore[arg-type]
+        kind=SlotItemKind.ACTION,
+        label="Bad",
+        page="acme.review.dashboard",
+    )
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint("review", replace(_manifest(), slot_items=(item,))),
+    )
+
+    assert "unsupported SlotId" in registry.plugin_state().load_errors["review"]
+
+
+def test_rejects_slot_kind_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = SlotItemContribution(
+        id="acme.review.bad-tab",
+        slot=SlotId.CHAT_HEADER_ACTIONS,
+        kind=SlotItemKind.TAB,
+        label="Bad",
+        page="acme.review.dashboard",
+    )
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint("review", replace(_manifest(), slot_items=(item,))),
+    )
+
+    assert "kind must be 'action'" in registry.plugin_state().load_errors["review"]
+
+
+def test_rejects_slot_item_unknown_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = SlotItemContribution(
+        id="acme.review.action",
+        slot=SlotId.COMPOSER_ACTIONS,
+        kind=SlotItemKind.ACTION,
+        label="Review",
+        page="acme.review.missing",
+    )
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint("review", replace(_manifest(), slot_items=(item,))),
+    )
 
     assert "references unknown page" in registry.plugin_state().load_errors["review"]
 

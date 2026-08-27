@@ -233,6 +233,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ExtensionSlotHost } from "@/extensions/ExtensionSlot";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
@@ -4337,30 +4338,36 @@ function ComposerImpl(
                   openNonce={pickerOpenNonce}
                 />
               </div>
-              <ComposerMicButton
-                className="size-8 md:size-7"
-                enableHotkey
-                disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
-                onVoiceStart={() => {
-                  voiceSnapshotRef.current = value;
-                }}
-                onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
-                }}
-                onTranscript={(text) => {
-                  dictation.appendFinal(text);
-                  dirtyRef.current = true;
-                  // Dictation is a user-driven edit — exit prompt-recall mode
-                  // so ArrowUp/ArrowDown don't clobber the dictated text.
-                  resetCursor();
-                  if (commandError !== null) setCommandError(null);
-                }}
-                onInterim={(text) => {
-                  dictation.replaceInterim(text);
-                  dirtyRef.current = true;
-                  resetCursor();
-                }}
-              />
+              <ExtensionSlotHost
+                slot="composer.actions"
+                context={{ conversationId }}
+                instance="chat-composer"
+              >
+                <ComposerMicButton
+                  className="size-8 md:size-7"
+                  enableHotkey
+                  disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
+                  onVoiceStart={() => {
+                    voiceSnapshotRef.current = value;
+                  }}
+                  onVoiceDiscard={() => {
+                    setValue(voiceSnapshotRef.current);
+                  }}
+                  onTranscript={(text) => {
+                    dictation.appendFinal(text);
+                    dirtyRef.current = true;
+                    // Dictation is a user-driven edit — exit prompt-recall mode
+                    // so ArrowUp/ArrowDown don't clobber the dictated text.
+                    resetCursor();
+                    if (commandError !== null) setCommandError(null);
+                  }}
+                  onInterim={(text) => {
+                    dictation.replaceInterim(text);
+                    dirtyRef.current = true;
+                    resetCursor();
+                  }}
+                />
+              </ExtensionSlotHost>
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>

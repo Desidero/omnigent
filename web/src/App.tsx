@@ -236,6 +236,10 @@ function AppRoutes({ basename }: AppProps) {
             path={`${prefix}/settings`}
             element={<AppRedirect to={`${prefix}/settings/general`} />}
           />
+          <Route
+            path={`${prefix}/settings/extensions/:extensionId/*`}
+            element={<ExtensionPageRoute />}
+          />
           <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories

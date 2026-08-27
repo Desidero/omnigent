@@ -84,5 +84,6 @@ async def test_reference_extension_package_reaches_catalog_and_asset_route() -> 
 
     assert catalog.status_code == 200
     assert catalog.json()["data"][0]["primary_navigation"][0]["label"] == "Hello Extension"
+    assert len(catalog.json()["data"][0]["slot_items"]) == 4
     assert asset.status_code == 200
     assert asset.content == bundle.assets[ASSET_SCRIPT].content

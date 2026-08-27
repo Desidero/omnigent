@@ -48,6 +48,20 @@ export interface ExtensionProjectSummary {
   icon: string | null;
 }
 
+export type ExtensionSlotId =
+  "chat.header.actions" | "composer.actions" | "session.rightRail.tabs" | "settings.sections";
+
+export interface ExtensionSlotItem {
+  id: string;
+  slot: ExtensionSlotId;
+  kind: "action" | "tab" | "section";
+  label: string;
+  page: string;
+  icon: string | null;
+  order: number;
+  when: string | null;
+}
+
 export interface ExtensionBrowserBundle {
   declared: boolean;
   has_styles: boolean;
@@ -67,6 +81,7 @@ export interface ExtensionCatalogItem {
   permissions: string[];
   pages: ExtensionPage[];
   primary_navigation: ExtensionPrimaryNavigation[];
+  slot_items: ExtensionSlotItem[];
   browser: ExtensionBrowserBundle;
 }
 

@@ -10,7 +10,12 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.extensions import ExtensionManifest, ExtensionPluginState
+from omnigent.extensions import (
+    ExtensionManifest,
+    ExtensionPluginState,
+    SlotId,
+    SlotItemKind,
+)
 from omnigent.extensions.assets import ASSET_SCRIPT, ASSET_STYLES, ResolvedBundle
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -30,6 +35,19 @@ class ExtensionPrimaryNavigationResponse(BaseModel):
     """One primary-sidebar navigation contribution."""
 
     id: str
+    label: str
+    page: str
+    icon: str | None
+    order: int
+    when: str | None
+
+
+class ExtensionSlotItemResponse(BaseModel):
+    """One core-rendered link contributed to a semantic UI slot."""
+
+    id: str
+    slot: SlotId
+    kind: SlotItemKind
     label: str
     page: str
     icon: str | None
@@ -60,6 +78,7 @@ class ExtensionResponse(BaseModel):
     permissions: list[str]
     pages: list[ExtensionPageResponse]
     primary_navigation: list[ExtensionPrimaryNavigationResponse]
+    slot_items: list[ExtensionSlotItemResponse]
     browser: ExtensionBrowserBundleResponse
 
 
@@ -124,6 +143,26 @@ def _serialize_manifest(
             for item in sorted(manifest.primary_navigation, key=lambda item: (item.order, item.id))
         ]
     )
+    slot_items = (
+        []
+        if unavailable
+        else [
+            ExtensionSlotItemResponse(
+                id=item.id,
+                slot=item.slot.value,
+                kind=item.kind.value,
+                label=item.label,
+                page=item.page,
+                icon=item.icon,
+                order=item.order,
+                when=item.when,
+            )
+            for item in sorted(
+                manifest.slot_items,
+                key=lambda item: (item.slot.value, item.order, item.id),
+            )
+        ]
+    )
     return ExtensionResponse(
         id=manifest.id,
         display_name=manifest.display_name,
@@ -134,6 +173,7 @@ def _serialize_manifest(
         permissions=sorted(permission.value for permission in manifest.permissions),
         pages=pages,
         primary_navigation=navigation,
+        slot_items=slot_items,
         browser=ExtensionBrowserBundleResponse(
             declared=manifest.entrypoints.browser is not None,
             has_styles=manifest.entrypoints.browser_css is not None,

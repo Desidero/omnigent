@@ -11,6 +11,8 @@ import type { ReactNode } from "react";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
+import type { ExtensionCatalogItem } from "@/extensions/types";
 
 const mocks = vi.hoisted(() => ({
   accountsEnabled: false,
@@ -53,14 +55,22 @@ import {
   useTrackSettingsReturn,
 } from "./settingsNav";
 
-function renderBody(opts: { onNavClick?: () => void } = {}) {
+function renderBody(
+  opts: {
+    onNavClick?: () => void;
+    initialEntry?: string;
+    extensions?: ExtensionCatalogItem[];
+  } = {},
+) {
   const onNavClick = opts.onNavClick ?? vi.fn();
   render(
-    <TooltipProvider>
-      <MemoryRouter initialEntries={["/settings/appearance"]}>
-        <SettingsSidebarBody onNavClick={onNavClick} />
-      </MemoryRouter>
-    </TooltipProvider>,
+    <ExtensionCatalogProvider extensions={opts.extensions ?? []}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[opts.initialEntry ?? "/settings/appearance"]}>
+          <SettingsSidebarBody onNavClick={onNavClick} />
+        </MemoryRouter>
+      </TooltipProvider>
+    </ExtensionCatalogProvider>,
   );
   return { onNavClick };
 }
@@ -174,6 +184,38 @@ describe("settingsNavGroups", () => {
   });
 });
 
+const SETTINGS_EXTENSION: ExtensionCatalogItem = {
+  object: "extension",
+  id: "acme.settings",
+  display_name: "Settings",
+  distribution: "acme-settings",
+  version: "1.0.0",
+  extension_api: 1,
+  status: "enabled",
+  permissions: [],
+  pages: [{ id: "acme.settings.page", title: "Acme", route: "acme", view: "acme" }],
+  primary_navigation: [],
+  slot_items: [
+    {
+      id: "acme.settings.section",
+      slot: "settings.sections",
+      kind: "section",
+      label: "Acme settings",
+      page: "acme.settings.page",
+      icon: null,
+      order: 500,
+      when: null,
+    },
+  ],
+  browser: {
+    declared: true,
+    has_styles: false,
+    digest: "digest",
+    script_url: "/script",
+    style_url: null,
+  },
+};
+
 describe("SettingsSidebarBody", () => {
   it.each([
     { connections: [], mcp: false, integrations: false },
@@ -215,6 +257,19 @@ describe("SettingsSidebarBody", () => {
       "ui-icon",
     );
     expect(screen.getByTestId("settings-nav-general")).toHaveAttribute("href", "/settings/general");
+  });
+
+  it("selects an extension section without also selecting a core section", () => {
+    const { onNavClick } = renderBody({
+      initialEntry: "/settings/extensions/acme.settings/acme",
+      extensions: [SETTINGS_EXTENSION],
+    });
+
+    const extension = screen.getByTestId("extension-slot-settings-acme.settings.section");
+    expect(extension).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("settings-nav-appearance")).not.toHaveAttribute("aria-current");
+    fireEvent.click(extension);
+    expect(onNavClick).toHaveBeenCalledOnce();
   });
 
   it("uses the shared row geometry with normal-weight labels", () => {
