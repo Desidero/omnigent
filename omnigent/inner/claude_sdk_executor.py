@@ -54,6 +54,7 @@ from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 from urllib.parse import urlsplit
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id
+from omnigent.claude_paths import claude_config_dir, claude_json_path
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
@@ -1918,11 +1919,12 @@ def _parse_optional_int(value: str | None) -> int | None:
 def _claude_internal_write_roots() -> list[pathlib.Path]:
     """Writable roots the Claude CLI needs for its own local session state."""
 
+    claude_dir = claude_config_dir()
     roots = [
-        pathlib.Path.home() / ".claude" / "backups",
-        pathlib.Path.home() / ".claude" / "plugins",
-        pathlib.Path.home() / ".claude" / "session-env",
-        pathlib.Path.home() / ".claude" / "sessions",
+        claude_dir / "backups",
+        claude_dir / "plugins",
+        claude_dir / "session-env",
+        claude_dir / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
         pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
@@ -1935,10 +1937,7 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
     """Exact files the Claude CLI updates outside its writable roots."""
 
     # .credentials.json holds the Claude CLI's OAuth token on Linux.
-    candidates = [
-        pathlib.Path.home() / ".claude.json",
-        pathlib.Path.home() / ".claude" / ".credentials.json",
-    ]
+    candidates = [claude_json_path(), claude_config_dir() / ".credentials.json"]
     return [path for path in candidates if path.exists()]
 
 
