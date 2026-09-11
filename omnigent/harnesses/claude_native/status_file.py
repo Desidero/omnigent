@@ -40,6 +40,8 @@ from pathlib import Path
 
 import psutil
 
+from omnigent.claude_paths import claude_config_dir
+
 _logger = logging.getLogger(__name__)
 
 # Runner-side status vocabulary the file maps onto. ``busy`` and
@@ -107,7 +109,7 @@ def sessions_dir(config_dir: Path | None = None) -> Path:
     """Return Claude Code's ``sessions`` directory.
 
     Mirrors Claude's own resolution: ``CLAUDE_CONFIG_DIR`` when set,
-    otherwise ``~/.claude`` — matching :mod:`omnigent.session_import.local`.
+    otherwise ``~/.claude``.
 
     :param config_dir: Explicit Claude config dir override (tests). When
         ``None`` the environment / home default is used.
@@ -115,9 +117,7 @@ def sessions_dir(config_dir: Path | None = None) -> Path:
     """
     if config_dir is not None:
         return config_dir / "sessions"
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    home = Path(configured).expanduser() if configured else Path.home() / ".claude"
-    return home / "sessions"
+    return claude_config_dir() / "sessions"
 
 
 def _read_json_file(path: Path) -> dict[str, object] | None:
