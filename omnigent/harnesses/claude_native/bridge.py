@@ -71,6 +71,7 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.claude_paths import claude_config_dir
 from omnigent.harnesses.claude_native import (
     PEER_MESSAGE_WAKE_KIND,
     PEER_MESSAGE_WAKE_TEXT,
@@ -284,7 +285,6 @@ _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 # The cost a cold resume seeded into the next Claude process; see ResumeCostBaseline.
 _RESUME_COST_BASELINE_FILE = "resume_cost_baseline.json"
-_USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
 # Read by the static relay entry in an enterprise managed-mcp.json; see
 # docs/CLAUDE_MANAGED_MCP.md.
@@ -10195,6 +10195,11 @@ def read_resume_cost_baseline(bridge_dir: Path) -> ResumeCostBaseline | None:
     )
 
 
+def _user_claude_settings_path() -> Path:
+    """Return the user's Claude Code ``settings.json`` for the active profile."""
+    return claude_config_dir() / "settings.json"
+
+
 def read_user_status_line_command() -> str | None:
     """
     Return the user's globally-configured statusLine shell command, if any.
@@ -10205,11 +10210,11 @@ def read_user_status_line_command() -> str | None:
     to whatever they had configured globally.
 
     :returns: The command string from
-        ``~/.claude/settings.json``'s ``statusLine.command``, or
+        the user's ``settings.json``'s ``statusLine.command``, or
         ``None`` when no global statusLine is configured / readable.
     """
     try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
+        raw = _user_claude_settings_path().read_text(encoding="utf-8")
     except OSError:
         return None
     try:
@@ -10231,14 +10236,14 @@ def read_user_effort_level() -> str | None:
     """
     Return the user's configured Claude Code effort level, if any.
 
-    Read client-side from ``effortLevel`` in ``~/.claude/settings.json`` —
-    the level the wrapped ``claude`` runs at when no ``--effort`` is passed.
+    Read client-side from ``effortLevel`` in the user's ``settings.json`` —
+    the level the wrapped ``claude`` actually runs at (we pass no ``--effort``).
 
     :returns: A recognized effort, e.g. ``"medium"``; ``None`` when unset,
         unreadable, or not a valid Claude effort (fail-soft, never blocks launch).
     """
     try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
+        raw = _user_claude_settings_path().read_text(encoding="utf-8")
     except OSError:
         return None
     try:

@@ -8711,3 +8711,42 @@ async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch
         finally:
             await executor.close()
     assert ("mcp_disabled_server_not_applied server=fixture" in caplog.text) == bool(active)
+
+
+def test_claude_internal_write_roots_follow_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sandbox opens the configured profile's state dirs, not ``~/.claude``."""
+    from omnigent.inner.claude_sdk_executor import _claude_internal_write_roots
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    profile = tmp_path / "work-profile"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+    roots = _claude_internal_write_roots()
+
+    assert profile / "sessions" in roots
+    assert home / ".claude" / "sessions" not in roots
+
+
+def test_claude_internal_write_files_follow_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the configured profile's config and credentials become writable."""
+    from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    profile = tmp_path / "work-profile"
+    profile.mkdir()
+    (profile / ".claude.json").write_text("{}\n", encoding="utf-8")
+    (profile / ".credentials.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+    assert _claude_internal_write_files() == [
+        profile / ".claude.json",
+        profile / ".credentials.json",
+    ]
