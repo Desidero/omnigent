@@ -23,6 +23,7 @@ import subprocess
 import sys
 import uuid
 
+from omnigent.claude_paths import claude_config_dir
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
@@ -1705,6 +1706,10 @@ def run_claude_native(
     # the in-process claude-sdk harness. ``use_claude_config`` forces the
     # CLI's own ~/.claude config (skips all of it).
     startup_profiler.mark("resolving claude config")
+    if not use_claude_config:
+        from omnigent.onboarding.subscription_accounts import apply_default_account_env
+
+        apply_default_account_env("claude-native")
     claude_config = None if use_claude_config else resolve_native_claude_config(spec=None)
     startup_profiler.mark(
         "claude config resolved",
@@ -3588,7 +3593,7 @@ def resolve_native_claude_config(
         load_config,
     )
     from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
-    from omnigent.spec.types import DatabricksAuth
+    from omnigent.spec.types import DatabricksAuth, ProviderAuth
 
     inference_config = load_runtime_inference_config(load_config())
     binding = binding_for_harness(inference_config, "claude-native")
@@ -3615,6 +3620,14 @@ def resolve_native_claude_config(
         entry = _resolve_provider_for_build(
             spec, harness_type="claude-sdk", actual_harness="claude-native"
         )
+        if entry is not None and isinstance(spec.executor.auth, ProviderAuth):
+            from omnigent.onboarding.subscription_accounts import (
+                require_subscription_dir_active,
+            )
+
+            # The pane inherits this process's CLAUDE_CONFIG_DIR, which the host
+            # sets from the session's account; a spec pinning another must fail.
+            require_subscription_dir_active(entry, claude_config_dir())
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
         ucode_config = _ucode_config_for_profile(
