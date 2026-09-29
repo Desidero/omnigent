@@ -37,6 +37,12 @@ and steers messages while the agent is busy.
   change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
+- `account`: when the host has more than one provider for the harness, an
+  **Account** section in the configuration menu picks the account a new
+  session runs on, and moves a running claude-native or claude-sdk session to
+  another one; see [Model providers](../docs/providers.md). States: hidden
+  with one choice, not signed in (disabled), separate login store (disabled
+  for a running session), switch now or after the current turn.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
@@ -145,6 +151,10 @@ and steers messages while the agent is busy.
   it is connected; click it to open the host menu.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
+- With two accounts for a harness under `providers:` on the host, open
+  configuration and choose under **Account**: before the first message it
+  picks the new session's account; in a running Claude session it switches
+  the account. Project settings → **Account** sets a project's default.
 - With focus in the prompt, press Shift+Tab to step the permission mode without
   opening the menu; the draft and focus stay put.
 - For a custom `claude-sdk` or `codex` agent session, open configuration and
@@ -355,6 +365,15 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
+- **`account`:** component coverage in
+  `web/src/components/composer/accountSection.test.tsx` and
+  `web/src/lib/sessionProvider.test.ts`; server coverage (plain `uv run
+  pytest`) in `tests/server/routes/test_host_providers.py`,
+  `tests/server/routes/test_session_provider_override.py` and
+  `tests/server/routes/test_session_provider_switch.py`. No browser test. By
+  hand, configure two Claude accounts on the host, start a claude-native
+  session on the second and check `/status` in its terminal, then switch it to
+  the first from the same menu and check again after the restart.
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
 - **`permission-mode-hotkey`:** in session with a real Claude CLI,
