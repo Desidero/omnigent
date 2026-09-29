@@ -709,6 +709,10 @@ minus `items` and snapshot-only fields.
 Supports cursor pagination and filters such as `search_query` and
 `include_archived`.
 
+`updated_after` (Unix epoch seconds) lists only sessions whose `updated_at` is
+later than that time; combine it with `sort_by=updated_at` to read the most
+recently active sessions first.
+
 Clients should always send `visibility` explicitly: `mine` lists owned
 active sessions, `shared` lists accessible active sessions owned by someone
 else, `archived` lists accessible archived sessions, and `all` lists all
