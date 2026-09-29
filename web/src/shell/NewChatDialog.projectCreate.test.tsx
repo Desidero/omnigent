@@ -114,6 +114,9 @@ vi.mock("@/components/ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof ToastModule>()),
   showToast: vi.fn(),
 }));
+vi.mock("@/hooks/useHostProviders", () => ({
+  useHostProviders: vi.fn(() => ({ data: [] })),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),

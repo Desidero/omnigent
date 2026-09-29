@@ -57,6 +57,12 @@ export interface ProjectConfig {
    * model's ladder. Unset = the harness's own configured effort.
    */
   effort?: string;
+  /**
+   * Default account for new sessions: the name of a `providers:` entry on the
+   * session's host (e.g. "claude-max2"). Where the host can't run the chosen
+   * harness on it, the composer falls back to the host default and says so.
+   */
+  provider?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

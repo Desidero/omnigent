@@ -311,6 +311,9 @@ import {
   useSandboxModelOptions,
   useSandboxUnsupportedAgents,
 } from "@/hooks/useSandboxModelOptions";
+import { useHostProviders } from "@/hooks/useHostProviders";
+import { buildAccountSection } from "@/components/composer/accountSection";
+import { resolveSessionProvider } from "@/lib/sessionProvider";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
@@ -2338,6 +2341,7 @@ function NewChatLandingContent({
           useWorktree: c.use_worktree,
           model: c.model,
           effort: c.effort,
+          provider: c.provider,
         }
       : {};
     return withProjectLaunchDefaults(stored, projectLaunch);
@@ -3643,10 +3647,6 @@ function NewChatLandingContent({
     const { [AUTO_HARNESS_ID]: _dropped, ...rest } = brainHarnessLabelsAll;
     return rest;
   }, [brainHarnessLabelsAll, brainRoutable]);
-  const isEntryConfigurable = (agent: AvailableAgent) =>
-    (sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
-    nativeAgentHasModelSettings(agent) ||
-    agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
   // Only an eligible harness can display active per-turn Smart Routing.
   const routingOn = smartRoutingEligible && costControlMode === "on";
   // Both fully-auto flavors own harness and model, but only top-level Smart
@@ -4102,6 +4102,38 @@ function NewChatLandingContent({
     setCostControlMode(null);
     rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
+  const skillsHarness = autoRoutingSelected
+    ? null
+    : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
+  // Accounts live on the host, so a sandbox or a routed harness offers none.
+  const accountsApply = !sandboxSelected && !smartRoutingHarnessSelected && !autoRoutingSelected;
+  const accountHarness = accountsApply ? skillsHarness : null;
+  const { data: listedHostProviders } = useHostProviders(selectedHostId, accountHarness);
+  const hostProviders = listedHostProviders ?? [];
+  // The user's pick is scoped to the project it was made in, so another
+  // project's default account takes over after an in-place switch.
+  const [providerPick, setProviderPick] = useState<{
+    project: string;
+    name: string | null;
+  } | null>(null);
+  const { override: effectiveProviderOverride, projectFallback: projectAccountFallback } =
+    resolveSessionProvider({
+      userPick: providerPick?.project === projectParam ? providerPick.name : undefined,
+      projectProvider: prefillConfig?.provider,
+      providers: accountHarness !== null ? listedHostProviders : undefined,
+      accountsApply,
+    });
+  const accountSection = buildAccountSection({
+    providers: hostProviders,
+    value: effectiveProviderOverride,
+    testIdPrefix: "new-chat-landing-agent",
+    onSelect: (name) => setProviderPick({ project: projectParam, name }),
+    disabled: creating,
+  });
+  const isEntryConfigurable = (agent: AvailableAgent) =>
+    (agent.id === effectiveAgentId && (sandboxHasModelCatalog || accountSection !== undefined)) ||
+    nativeAgentHasModelSettings(agent) ||
+    agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
   const modelSection: ComposerConfigSection | undefined =
     sandboxHasModelCatalog ||
     supportsModelPicker ||
@@ -4280,7 +4312,7 @@ function NewChatLandingContent({
           }
           models={modelSection}
           efforts={effortSection}
-          extra={fusionSections}
+          extra={[...(fusionSections ?? []), ...(accountSection ? [accountSection] : [])]}
         />
       </>
     ) : null;
@@ -5082,9 +5114,6 @@ function NewChatLandingContent({
     !sandboxRepoOverCap &&
     !sandboxRepoPending;
 
-  const skillsHarness = autoRoutingSelected
-    ? null
-    : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
   // Native prompts stay plain text; SDK skill invocations require the sandbox's catalog.
   const arcletSkills =
     sandboxSelected && effectiveSandboxProvider === "arclet" && isNativeTerminalAgent;
@@ -5576,6 +5605,8 @@ function NewChatLandingContent({
     { label: selectedAgentHasAdvancedSettings ? "Agent" : "Harness", value: agentLabel },
     ...harnessTriggerDetails,
     ...configSummary.filter((detail) => detail.label === "Connection"),
+    // Only a non-default account is worth calling out.
+    ...(effectiveProviderOverride ? [{ label: "Account", value: effectiveProviderOverride }] : []),
   ];
 
   // Pick top-level Smart Routing. The create call needs a concrete agent_id, so
@@ -6289,6 +6320,7 @@ function NewChatLandingContent({
           harness_override: smartRoutingHarnessSelected
             ? AUTO_HARNESS_ID
             : (pickedHarness ?? undefined),
+          provider_override: effectiveProviderOverride ?? undefined,
           smart_routing_message:
             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
         });
@@ -7809,6 +7841,16 @@ function NewChatLandingContent({
                 })
               }
             />
+          )}
+
+          {projectAccountFallback && (
+            <p
+              className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
+              data-testid="new-chat-landing-project-account-fallback"
+            >
+              <TriangleAlertIcon className="size-3.5 shrink-0" />
+              <span>{projectAccountFallback}</span>
+            </p>
           )}
 
           {/* Same slot, same styling as the readiness notice above: the host

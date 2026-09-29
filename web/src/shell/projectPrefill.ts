@@ -33,6 +33,9 @@ export interface ProjectPrefillConfig {
   /** Agent the project's last session started with. Unlike `agentId` it is a
    *  hint: it seeds only once the pickable list confirms it still exists. */
   launchAgentId?: string;
+  /** Default account (provider name). Not seeded by this machine — the
+   *  composer resolves it against the host's providers for the harness. */
+  provider?: string;
 }
 
 /**
