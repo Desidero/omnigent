@@ -905,6 +905,17 @@ have no key: any agent in a multi-agent session needs the reads, and async work
 handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
 session viewers to open a workspace-relative file without switching sessions.
 
+`sys_session_list` can narrow its session view with `updated_after` (an
+ISO-8601 time; sessions active since then), `order_by` (`created`, the
+default, or `updated`) and `ownership` (`any`, `mine` or `shared`); each row
+reports `created_at`, `updated_at` and `owner`. `sys_session_get_history`
+returns the most recent items by default. With `order: "asc"` it reads forward
+from the first item, and `after` set to a `next_cursor` from an earlier read
+resumes just after it, so an agent can walk a long transcript in pages or pick
+up where its last run stopped. Results carry `next_cursor` and `has_more`
+(plus `has_older` on a most-recent read); a cursor that no longer resolves
+returns `invalid_cursor`.
+
 ## Complete example
 
 ```yaml
