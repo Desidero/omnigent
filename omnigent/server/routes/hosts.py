@@ -1489,6 +1489,7 @@ def create_hosts_router(
                     if profile_binding is not None and profile_binding.runner_id is not None
                     else ()
                 ),
+                provider=target.conv.provider_override,
             )
         )
         try:

@@ -561,6 +561,7 @@ class ConversationStore(ABC):
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
         side_chat_parent_id: str | None = None,
+        provider_override: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -626,6 +627,7 @@ class ConversationStore(ABC):
         :param side_chat_parent_id: The session whose Workspace rail lists this
             conversation as a side chat, e.g. ``"conv_abc123"``; ``None`` for
             anything else.
+        :param provider_override: Optional host provider the session runs on.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is not ``None`` and a
