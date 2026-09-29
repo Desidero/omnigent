@@ -382,6 +382,7 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        provider_override=overrides["provider_override"],
         # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
         share_workspace_files=overrides["share_workspace_files"] == "on",
         sub_agent_name=meta.sub_agent_name if meta else None,
@@ -1200,6 +1201,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
         side_chat_parent_id: str | None = None,
+        provider_override: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1280,6 +1282,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "cost_control_mode_override": cost_control_mode_override,
                 "subagent_routing_override": subagent_routing_override,
                 "harness_override": harness_override,
+                "provider_override": provider_override,
             }
         )
         prepared_labels = _prepare_label_updates(labels) if labels else {}
@@ -7037,6 +7040,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         }
                         if continue_source
                         else {}
+                    ),
+                    "provider_override": (
+                        source_overrides["provider_override"] if copy_model_settings else None
                     ),
                 }
             )

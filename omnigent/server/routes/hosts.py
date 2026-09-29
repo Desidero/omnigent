@@ -1625,6 +1625,7 @@ def create_hosts_router(
                     else ()
                 ),
                 session_env_handoff_id=body.session_env_handoff_id,
+                provider=target.conv.provider_override,
             )
         )
         try:
