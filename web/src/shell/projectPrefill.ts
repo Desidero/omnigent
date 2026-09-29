@@ -66,6 +66,9 @@ export interface ProjectPrefillConfig {
   sandboxProvider?: string;
   /** Repository a project was created with; seeded into a sandbox pick. */
   repository?: ProjectRepository;
+  /** Default account (provider name). Not seeded by this machine — the
+   *  composer resolves it against the host's providers for the harness. */
+  provider?: string;
 }
 
 /**
