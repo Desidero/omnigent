@@ -650,6 +650,8 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
         "created_by_session_id": "conv_caller",
         "archived": True,
         "family": None,
+        "created_at": None,
+        "updated_at": None,
     }
     assert first["sessions"][1]["archived"] is False
     assert second["sessions"][0]["archived"] is True

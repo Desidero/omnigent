@@ -128,6 +128,8 @@ from omnigent.tools.builtins.spawn import (
     _clamp_history_content_chars,
     _clamp_history_offset_chars,
     _clamp_tail_items,
+    _history_page_fields,
+    _parse_history_window,
 )
 from omnigent.tools.builtins.sys_terminal import (
     SysTerminalCloseTool,
@@ -6068,6 +6070,17 @@ async def _execute_session_query_tool(
         agent_name = args.get("agent_name")
         include_archived = args.get("include_archived") is True
         visibility = args.get("visibility", _SESSION_LIST_DEFAULT_VISIBILITY)
+        if "ownership" in args:
+            if not _session_list_ownership_is_valid(args):
+                return json.dumps(
+                    {
+                        "error": (
+                            "sys_session_list: ownership must be 'any', 'mine' or 'shared', "
+                            "and must agree with visibility"
+                        )
+                    }
+                )
+            visibility = _SESSION_LIST_OWNERSHIP_VISIBILITY[str(args["ownership"])]
         if visibility not in _SESSION_LIST_VISIBILITIES:
             return json.dumps(
                 {
@@ -6077,11 +6090,22 @@ async def _execute_session_query_tool(
                     )
                 }
             )
+        recency = _parse_session_list_recency(args)
+        if isinstance(recency, str):
+            return recency
+        updated_after, order_by = recency
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            _session_list_filters(agent_name, include_archived, visibility, project),
+            _session_list_filters(
+                agent_name,
+                include_archived,
+                visibility,
+                project,
+                updated_after=updated_after,
+                order_by=order_by,
+            ),
         )
         if isinstance(window, str):
             return window
@@ -6093,6 +6117,8 @@ async def _execute_session_query_tool(
             include_archived=include_archived,
             visibility=visibility,
             project=project,
+            updated_after=updated_after,
+            order_by=order_by,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -7054,22 +7080,85 @@ def _project_agent_list(
     }
 
 
+# ``ownership`` predates ``visibility`` and stays accepted as an alias of it.
+# @deprecated: remove the alias in 0.24.0.
+_SESSION_LIST_OWNERSHIP_VISIBILITY = {"any": "all", "mine": "mine", "shared": "shared"}
+
+
+def _session_list_ownership_is_valid(args: _JsonObject) -> bool:
+    """
+    Whether ``sys_session_list``'s ``ownership`` names a visibility that agrees.
+
+    :param args: Parsed tool arguments, e.g. ``{"ownership": "any"}``.
+    :returns: ``True`` for a known ``ownership`` that matches any explicit
+        ``visibility`` (``"any"`` is ``"all"``).
+    """
+    ownership = args.get("ownership")
+    if not isinstance(ownership, str) or ownership not in _SESSION_LIST_OWNERSHIP_VISIBILITY:
+        return False
+    alias = _SESSION_LIST_OWNERSHIP_VISIBILITY[ownership]
+    return args.get("visibility", alias) == alias
+
+
+def _parse_session_list_recency(args: _JsonObject) -> tuple[int | None, str] | str:
+    """
+    Validate ``sys_session_list``'s ``updated_after`` and ``order_by``.
+
+    ``updated_after`` is accepted as ISO-8601 (a naive value is read as UTC)
+    and normalized to epoch seconds for ``GET /v1/sessions``.
+
+    :param args: Parsed tool arguments, e.g.
+        ``{"updated_after": "2026-09-01T00:00:00Z", "order_by": "updated"}``.
+    :returns: ``(updated_after, order_by)``, e.g. ``(1788220800, "updated")``,
+        or a JSON error string for the model.
+    """
+    raw_updated_after = args.get("updated_after")
+    updated_after: int | None = None
+    if raw_updated_after is not None:
+        if not isinstance(raw_updated_after, str) or not raw_updated_after:
+            return json.dumps(
+                {"error": "sys_session_list: 'updated_after' must be an ISO-8601 string"}
+            )
+        try:
+            parsed = datetime.fromisoformat(raw_updated_after)
+        except ValueError:
+            return json.dumps(
+                {
+                    "error": "sys_session_list: 'updated_after' is not a valid ISO-8601 "
+                    f"timestamp: {raw_updated_after!r}"
+                }
+            )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        updated_after = max(0, int(parsed.timestamp()))
+    order_by = args.get("order_by", "created")
+    if order_by not in ("created", "updated"):
+        return json.dumps({"error": "sys_session_list: 'order_by' must be 'created' or 'updated'"})
+    return updated_after, order_by
+
+
 def _session_list_filters(
     agent_name: object,
     include_archived: bool,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    *,
+    updated_after: int | None = None,
+    order_by: str = "created",
 ) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
 
-    ``include_archived`` and a non-default ``visibility`` are recorded only
-    when set, so cursors issued before those arguments existed still match a
-    call that omits them.
+    ``include_archived``, a non-default ``visibility``, ``updated_after`` and
+    ``order_by="updated"`` are recorded only when set, so cursors issued
+    before those arguments existed still match a call that omits them.
 
     :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
     :param include_archived: Whether archived sessions are listed.
     :param visibility: Which sessions the global view covers, e.g. ``"mine"``.
+    :param project: Optional project name filter.
+    :param updated_after: Epoch seconds the sessions must be updated after.
+    :param order_by: ``"created"`` or ``"updated"``, newest first.
     :returns: The filter mapping, e.g. ``{"agent_name": None}``.
     """
     filters: _JsonObject = {
@@ -7081,7 +7170,18 @@ def _session_list_filters(
         filters["visibility"] = visibility
     if project is not None:
         filters["project"] = project
+    if updated_after is not None:
+        filters["updated_after"] = updated_after
+    if order_by != "created":
+        filters["order_by"] = order_by
     return filters
+
+
+def _epoch_to_iso(value: object) -> str | None:
+    """Render Unix epoch seconds as an ISO-8601 UTC string, or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
 
 
 async def _session_list_via_rest(
@@ -7092,6 +7192,8 @@ async def _session_list_via_rest(
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    updated_after: int | None = None,
+    order_by: str = "created",
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -7116,6 +7218,8 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
         ownership filter for the global view.
+    :param updated_after: Only list sessions updated after these epoch seconds.
+    :param order_by: ``"created"`` or ``"updated"``, newest first.
     :param limit: Optional maximum rows returned from the global sessions view;
         :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -7133,6 +7237,8 @@ async def _session_list_via_rest(
             include_archived=include_archived,
             visibility=visibility,
             project=project,
+            updated_after=updated_after,
+            order_by=order_by,
             after=cursor_state["sessions"][1],
             limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
         )
@@ -7143,7 +7249,14 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived, visibility, project),
+        filters=_session_list_filters(
+            agent_name,
+            include_archived,
+            visibility,
+            project,
+            updated_after=updated_after,
+            order_by=order_by,
+        ),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
@@ -7394,6 +7507,8 @@ async def _collect_global_sessions(
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    updated_after: int | None = None,
+    order_by: str = "created",
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
@@ -7401,11 +7516,12 @@ async def _collect_global_sessions(
     Fetch the global session list via ``GET /v1/sessions``.
 
     Projects each listed session to ``{session_id, agent_name, title,
-    status, runner_id, runner_online, parent_session_id}``.
+    status, runner_id, runner_online, parent_session_id, created_at,
+    updated_at}`` (timestamps as ISO-8601 UTC).
     ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
     :func:`_fill_returned_runner_online` resolves it for the rows that
-    survive paging. An optional ``agent_name``
-    filters the list server-side. Permission-bounded by the server (the
+    survive paging. The ``agent_name``, ``updated_after`` and ``order_by``
+    filters are applied server-side. Permission-bounded by the server (the
     runner's request carries the owning user's identity). Best-effort:
     returns ``[]`` on a fetch failure.
 
@@ -7422,6 +7538,9 @@ async def _collect_global_sessions(
     :param visibility: The server's ownership filter. ``"mine"`` (the
         sidebar's default) keeps other users' sessions out of an agent's
         view; ``"shared"`` / ``"all"`` rows also carry ``owner``.
+    :param project: Optional project name filter.
+    :param updated_after: Only list sessions updated after these epoch seconds.
+    :param order_by: ``"created"`` or ``"updated"``, newest first.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
@@ -7446,6 +7565,7 @@ async def _collect_global_sessions(
     params: dict[str, str | int] = {
         "limit": limit,
         "order": "desc",
+        "sort_by": "updated_at" if order_by == "updated" else "created_at",
         "visibility": server_visibility,
     }
     if project is not None:
@@ -7454,6 +7574,8 @@ async def _collect_global_sessions(
         params["agent_name"] = agent_name
     if include_archived:
         params["include_archived"] = "true"
+    if updated_after is not None:
+        params["updated_after"] = updated_after
     if after is not None:
         params["after"] = after
     try:
@@ -7499,6 +7621,8 @@ async def _collect_global_sessions(
                     if visibility != _SESSION_LIST_DEFAULT_VISIBILITY
                     else {}
                 ),
+                "created_at": _epoch_to_iso(r.get("created_at")),
+                "updated_at": _epoch_to_iso(r.get("updated_at")),
             }
             for r in rows
         ],
@@ -7630,6 +7754,15 @@ async def _session_parent_id(
     return parent if isinstance(parent, str) and parent else None
 
 
+async def _session_exists(target_id: str, server_client: httpx.AsyncClient) -> bool:
+    """Return whether ``GET /v1/sessions/{id}`` resolves the session."""
+    try:
+        resp = await _get_session_metadata(server_client, target_id, timeout=30.0)
+    except Exception:  # noqa: BLE001
+        return False
+    return resp.status_code == 200
+
+
 async def _session_get_history_via_rest(
     args: _JsonObject,
     server_client: httpx.AsyncClient,
@@ -7646,8 +7779,8 @@ async def _session_get_history_via_rest(
     may read).
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items``, ``content_max_chars``, and
-        ``content_offset_chars``.
+        optional ``tail_items``, ``content_max_chars``,
+        ``content_offset_chars``, ``order``, and ``after``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
@@ -7671,44 +7804,68 @@ async def _session_get_history_via_rest(
     content_offset_chars = _clamp_history_offset_chars(args.get("content_offset_chars", 0))
     if isinstance(content_offset_chars, str):
         return content_offset_chars
+    window = _parse_history_window(args)
+    if isinstance(window, str):
+        return window
+    order, after = window
+    params: dict[str, str | int] = {"limit": tail_items, "order": order}
+    if after is not None:
+        params["after"] = after
     try:
         resp = await server_client.get(
             f"{_session_url(target_id)}/items",
-            params={"limit": tail_items, "order": "desc"},
+            params=params,
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_get_history failed: {exc}"})
+    if after is not None and resp.status_code in (400, 404):
+        # An unknown ``after`` id is a 400 stale cursor and a malformed one a
+        # 404; tell those apart from a missing session with one snapshot read.
+        if resp.status_code == 400 or await _session_exists(target_id, server_client):
+            return json.dumps({"error": "invalid_cursor", "conversation_id": target_id})
     if resp.status_code == 404:
         return json.dumps({"error": "session_not_found", "conversation_id": target_id})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_session_get_history returned {resp.status_code}"})
-    data: list[_JsonObject] = resp.json().get("data", [])
-    # ``order="desc"`` returns newest-first; reverse to chronological so
-    # the LLM reads top-to-bottom (matches the in-process peek).
+    body = resp.json()
+    data: list[_JsonObject] = body.get("data", [])
+    has_more = body.get("has_more") is True
+    # Tail reads come back newest-first; list chronologically (matches the
+    # in-process peek).
+    chronological = data if order == "asc" else list(reversed(data))
     items: list[_JsonObject] = [
         _project_api_item(it, max_chars=content_max_chars, offset_chars=content_offset_chars)
-        for it in reversed(data)
+        for it in chronological
     ]
     meta = await _fetch_peek_meta(target_id, server_client)
-    # Load the server's pending-index helpers only when a history tool needs them.
-    from omnigent.runtime import pending_elicitations
+    if order == "desc" or not has_more:
+        # Load the server's pending-index helpers only when a history tool needs them.
+        from omnigent.runtime import pending_elicitations
 
-    # A parked elicitation never lands in the conversation store (it
-    # lives only in the Omnigent server's pending-elicitations index, replayed
-    # on the snapshot), so append the snapshot's outstanding prompts
-    # after the stored tail — they are the sub-agent's most recent act.
-    items.extend(
-        pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
-    )
+        # A parked elicitation never lands in the conversation store (it
+        # lives only in the Omnigent server's pending-elicitations index, replayed
+        # on the snapshot), so append the outstanding prompts after the newest
+        # stored item — they are the sub-agent's most recent act.
+        items.extend(
+            pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
+        )
     return json.dumps(
         {
             "conversation_id": target_id,
             "agent": meta.agent,
             "title": meta.title,
             "items": items,
+            **_history_page_fields(
+                order=order,
+                after=after,
+                newest_item_id=_optional_string(chronological[-1].get("id"))
+                if chronological
+                else None,
+                has_more=has_more,
+            ),
         }
     )
 

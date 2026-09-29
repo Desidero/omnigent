@@ -16,6 +16,7 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
 )
+from omnigent.errors import StaleCursorError
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
@@ -517,8 +518,9 @@ class SysSessionListTool(Tool):
       (``visibility="mine"``, the UI sidebar's default), each with its
       status and runner connectivity. ``visibility="shared"`` lists
       sessions other users shared with the caller instead, and ``"all"``
-      lists both; those rows carry ``owner``. An optional
-      ``agent_name`` filter narrows this list. This powers
+      lists both; those rows carry ``owner``. Each row has its
+      timestamps. Optional ``agent_name`` / ``updated_after`` filters
+      narrow this list and ``order_by`` sorts it. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
       (``sys_session_send`` by ``session_id``).
@@ -552,7 +554,11 @@ class SysSessionListTool(Tool):
             "for children or sys_session_message for independent sessions. "
             "Pass agent_name to filter the global list to "
             "sessions running that agent, and include_archived to also list "
-            "archived sessions (marked archived). 'sessions' returns the newest 50 by "
+            "archived sessions (marked archived). Each global entry carries "
+            "created_at and updated_at (last activity, ISO-8601 UTC). Pass "
+            "updated_after for sessions active since a time (e.g. to review "
+            "what changed since your last check); order_by='updated' lists "
+            "the most recently active first. 'sessions' returns the newest 50 by "
             "default; when more remain, pass page.next_cursor as cursor to continue. "
             "sub_agents stays complete."
         )
@@ -605,6 +611,25 @@ class SysSessionListTool(Tool):
                                 "Optional: also list archived sessions in the "
                                 "global 'sessions' view; each row then carries "
                                 "'archived'. Defaults to false."
+                            ),
+                        },
+                        "updated_after": {
+                            "type": "string",
+                            "description": (
+                                "Optional ISO-8601 timestamp, e.g. "
+                                "'2026-09-01T00:00:00Z' (no offset means "
+                                "UTC). Only return sessions in 'sessions' "
+                                "whose last activity (updated_at) is later "
+                                "than this."
+                            ),
+                        },
+                        "order_by": {
+                            "type": "string",
+                            "enum": ["created", "updated"],
+                            "description": (
+                                "Sort 'sessions' newest first by creation "
+                                "time ('created', default) or by last "
+                                "activity ('updated')."
                             ),
                         },
                         "limit": {
@@ -1644,6 +1669,58 @@ def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) -> 
     return min(content_max_chars, _HISTORY_MAX_TOTAL_CHARS // tail_items)
 
 
+def _parse_history_window(args: dict[str, Any]) -> tuple[str, str | None] | str:
+    """
+    Validate the ``order`` / ``after`` history paging arguments.
+
+    ``order="desc"`` (the default) reads the most recent items. ``"asc"``
+    reads forward from the start, or from just after the ``after`` item
+    cursor; passing ``after`` alone implies ``"asc"``.
+
+    :param args: Parsed tool arguments, e.g. ``{"after": "msg_abc"}``.
+    :returns: ``(order, after)`` on success, or a JSON error string
+        suitable for returning to the model.
+    """
+    after = args.get("after")
+    if after is not None and (not isinstance(after, str) or not after):
+        return json.dumps({"error": "after must be a non-empty item id string"})
+    order = args.get("order", "asc" if after is not None else "desc")
+    if order not in ("asc", "desc"):
+        return json.dumps({"error": f"order must be 'asc' or 'desc', got {order!r}"})
+    if after is not None and order != "asc":
+        return json.dumps({"error": "after requires order='asc'"})
+    return order, after
+
+
+def _history_page_fields(
+    *,
+    order: str,
+    after: str | None,
+    newest_item_id: str | None,
+    has_more: bool,
+) -> dict[str, Any]:
+    """
+    Build the paging fields appended to a ``sys_session_get_history`` result.
+
+    ``next_cursor`` is the newest returned item (or the unchanged ``after``
+    when a forward read found nothing new), so it always resumes forward, and
+    ``has_more`` always says whether items follow it. A most-recent read ends
+    at the newest item, so it has none after it; ``has_older`` says instead
+    whether earlier history precedes the page.
+
+    :param order: ``"asc"`` or ``"desc"``.
+    :param after: The request's ``after`` cursor, if any.
+    :param newest_item_id: Id of the newest item returned, if any.
+    :param has_more: Whether the store reported more items past the page in
+        the read's own direction.
+    :returns: ``{"next_cursor": ..., "has_more": ...}``, plus ``has_older``
+        for a most-recent read.
+    """
+    if order == "asc":
+        return {"next_cursor": newest_item_id or after, "has_more": has_more}
+    return {"next_cursor": newest_item_id or after, "has_more": False, "has_older": has_more}
+
+
 class SysSessionGetHistoryTool(Tool):
     """
     Return the recent conversation items (history) of a session.
@@ -1683,14 +1760,22 @@ class SysSessionGetHistoryTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Read the most recent items from a session's conversation "
-            "without sending input. Global read — any session you can "
-            "access (not just sub-agents in your spawn tree), bounded "
-            "by the server's per-user permission model. Returns the "
-            "tail of conversation items (assistant/user messages, tool "
-            "calls, tool results) in chronological order. Returns "
-            "session_not_found if conversation_id is unknown, or "
-            "session_out_of_tree if the server denies read access."
+            "Read items from a session's conversation without sending "
+            "input. Global read — any session you can access (not just "
+            "sub-agents in your spawn tree), bounded by the server's "
+            "per-user permission model. By default returns the most "
+            "recent tail_items conversation items (assistant/user "
+            "messages, tool calls, tool results) in chronological order. "
+            "To read a whole session from the beginning, pass "
+            "order='asc'; then pass the returned next_cursor as 'after' "
+            "to fetch the following page until has_more is false. A "
+            "next_cursor saved from any earlier read also resumes from "
+            "where you left off. A most-recent read reports has_more "
+            "false (nothing follows the newest item) and has_older true "
+            "when earlier history exists. Returns session_not_found if "
+            "conversation_id is unknown, session_out_of_tree if the "
+            "server denies read access, or invalid_cursor if 'after' "
+            "does not name an item in the session."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1724,10 +1809,32 @@ class SysSessionGetHistoryTool(Tool):
                             "minimum": 1,
                             "maximum": _HISTORY_MAX_TAIL,
                             "description": (
-                                f"Number of recent items to return. "
+                                "Number of items to return: the most "
+                                "recent ones by default, or the next page "
+                                "when reading forward (order='asc'). "
                                 f"Defaults to {_HISTORY_DEFAULT_TAIL}; "
                                 f"clamped to {_HISTORY_MAX_TAIL} to keep "
                                 "prompt size bounded."
+                            ),
+                        },
+                        "order": {
+                            "type": "string",
+                            "enum": ["desc", "asc"],
+                            "description": (
+                                "'desc' (default): return the most recent "
+                                "items. 'asc': read forward from the first "
+                                "item, or from just after 'after'. Items "
+                                "are always listed oldest first."
+                            ),
+                        },
+                        "after": {
+                            "type": "string",
+                            "description": (
+                                "Item cursor to read forward from: the "
+                                "next_cursor of a previous "
+                                "sys_session_get_history result. Returns "
+                                "only items added after it. Implies "
+                                "order='asc'."
                             ),
                         },
                         "content_max_chars": {
@@ -1799,34 +1906,51 @@ class SysSessionGetHistoryTool(Tool):
         )
         if isinstance(content_offset_chars, str):
             return content_offset_chars
-        page = resolution.conv_store.list_items(
-            resolution.child.id,
-            limit=tail_items,
-            order="desc",
-        )
-        # ``list_items(order="desc")`` returns newest-first; reverse
-        # to chronological order so the LLM reads top-to-bottom.
+        window = _parse_history_window(resolution.args)
+        if isinstance(window, str):
+            return window
+        order, after = window
+        # Host startup must not load the database layer; only history reads need it.
+        from sqlalchemy.exc import StatementError
+
+        from omnigent.db.db_models import InvalidUuidError
+
+        try:
+            page = resolution.conv_store.list_items(
+                resolution.child.id,
+                limit=tail_items,
+                after=after,
+                order=order,
+            )
+        except (StaleCursorError, StatementError) as exc:
+            # A malformed item id fails at bind time rather than as a stale cursor.
+            if isinstance(exc, StatementError) and not isinstance(exc.orig, InvalidUuidError):
+                raise
+            return json.dumps({"error": "invalid_cursor", "conversation_id": resolution.child.id})
+        # Tail reads come back newest-first; list chronologically.
+        chronological = list(page.data) if order == "asc" else list(reversed(page.data))
         items: list[dict[str, Any]] = [
             _project_activity_item(
                 item,
                 max_chars=content_max_chars,
                 offset_chars=content_offset_chars,
             )
-            for item in reversed(page.data)
+            for item in chronological
         ]
-        # The server's pending index imports ORM models for workspace scoping.
-        from omnigent.runtime import pending_elicitations
+        reached_end = order == "desc" or not page.has_more
+        if reached_end:
+            # The server's pending index imports ORM models for workspace scoping.
+            from omnigent.runtime import pending_elicitations
 
-        # A parked elicitation never lands in the conversation store
-        # (it lives only in the pending-elicitations index), so without
-        # this a peek on a sub-agent blocked on AskUserQuestion would
-        # show no sign it needs input. Append the index's outstanding
-        # prompts after the stored tail — they are the most recent
-        # thing the sub-agent did.
-        items.extend(
-            pending_elicitations.project_for_peek(event)
-            for event in pending_elicitations.snapshot_for(resolution.child.id)
-        )
+            # A parked elicitation never lands in the conversation store
+            # (it lives only in the pending-elicitations index), so without
+            # this a peek on a sub-agent blocked on AskUserQuestion would
+            # show no sign it needs input. Append the outstanding prompts
+            # after the newest stored item — they are its most recent act.
+            items.extend(
+                pending_elicitations.project_for_peek(event)
+                for event in pending_elicitations.snapshot_for(resolution.child.id)
+            )
         labelled = _agent_title_from_conversation(resolution.child)
         return json.dumps(
             {
@@ -1834,6 +1958,12 @@ class SysSessionGetHistoryTool(Tool):
                 "agent": labelled.agent,
                 "title": labelled.title,
                 "items": items,
+                **_history_page_fields(
+                    order=order,
+                    after=after,
+                    newest_item_id=chronological[-1].id if chronological else None,
+                    has_more=page.has_more,
+                ),
             }
         )
 
