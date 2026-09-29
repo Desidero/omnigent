@@ -371,6 +371,36 @@ async def test_list_sessions_side_chat_reread_is_bounded(
     assert reads[2:] == [(2, cursor), (4, cursor)]
 
 
+@pytest.mark.usefixtures("distinct_store_clock")
+async def test_list_sessions_side_chat_reread_keeps_updated_after(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every read of a page widened past side chats applies ``updated_after``."""
+    stale = _seed_sessions_behind_side_chats(db_uri, visible_count=2, side_chat_count=0)
+    listed = (await client.get("/v1/sessions", params=_SIDEBAR_LIST_PARAMS)).json()["data"]
+    cutoff = max(row["updated_at"] for row in listed if row["id"] in stale)
+    recent = _seed_sessions_behind_side_chats(db_uri, visible_count=1, side_chat_count=3)
+    original = SqlAlchemyConversationStore.list_conversations
+    filters: list[int | None] = []
+
+    def spy(self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any) -> Any:
+        filters.append(kwargs.get("updated_after"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "list_conversations", spy)
+
+    resp = await client.get(
+        "/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "limit": 2, "updated_after": cutoff}
+    )
+    assert resp.status_code == 200, resp.text
+    # The first read holds only side chats, so the page is read again, wider.
+    assert filters == [cutoff, cutoff]
+    assert {row["id"] for row in resp.json()["data"]} == recent
+    assert resp.json()["has_more"] is False
+
+
 def test_side_chat_reread_keeps_earlier_read_when_wider_read_overfills() -> None:
     """A wider read that writes overfilled leaves the earlier read's rows and cursor together."""
     from omnigent.server.routes.sessions import routes_core
