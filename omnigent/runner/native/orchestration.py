@@ -9649,6 +9649,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        claude_launch_config_dir,
         claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
@@ -9657,6 +9658,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
     from omnigent.inner.bundle_skills import claude_agents_skill_overlay
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.onboarding.subscription_accounts import require_session_account_dir
 
     workspace = str(
         _claude_session_workspace(
@@ -10484,12 +10486,14 @@ async def _auto_create_claude_terminal(
         # the watcher reports the exit deterministically via `#{pane_dead}`.
         keep_alive_after_exit=True,
     )
-    # Seed trust and onboarding in the config selected by the terminal's launch environment.
+    # Seed trust and onboarding in the config selected by the terminal's launch
+    # environment, once that environment is known to log in to the session's account.
     try:
+        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+        launch_env = _claude_terminal_launch_env(env_spec)
+        require_session_account_dir("claude", claude_launch_config_dir(launch_cwd, launch_env))
         ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
-            added_dirs=trusted_added_dirs,
+            launch_cwd, env=launch_env, added_dirs=trusted_added_dirs
         )
     except BaseException as seed_error:
         release_offer()
