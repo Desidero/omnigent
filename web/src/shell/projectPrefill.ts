@@ -28,6 +28,9 @@ export interface ProjectPrefillConfig {
   /** Default reasoning effort for the configured agent; consumed by the same
    *  harness-seed effect as `model`. */
   effort?: string;
+  /** Default account (provider name). Not seeded by this machine — the
+   *  composer resolves it against the host's providers for the harness. */
+  provider?: string;
 }
 
 export interface ProjectPrefillState {

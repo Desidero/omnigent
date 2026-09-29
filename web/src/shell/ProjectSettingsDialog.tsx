@@ -1,6 +1,7 @@
 // Project settings dialog: edits the stored defaults (`config`) the new-session
-// composer prefills (host, workspace, agent, worktree and base branch, and a model
-// and effort for native harnesses). An unset field stores no key.
+// composer prefills (host, workspace, agent, worktree and base branch, a model
+// and effort for native harnesses, and the account — a host `providers:` entry —
+// new sessions run on). An unset field stores no key.
 
 import { ChevronDownIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -25,6 +26,7 @@ import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useHostProviders } from "@/hooks/useHostProviders";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -134,6 +136,8 @@ export function ProjectSettingsDialog({
   // Default reasoning effort, offered alongside the model for harnesses with an
   // effort ladder; NONE stores no default (unset key).
   const [effort, setEffort] = useState<string>(NONE);
+  // Default account (provider name); NONE runs on the host's default.
+  const [provider, setProvider] = useState<string>(NONE);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
@@ -186,6 +190,7 @@ export function ProjectSettingsDialog({
     setModel(c.model ?? NONE);
     // The server stores config untyped, so ignore a malformed effort.
     setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
+    setProvider(c.provider ?? NONE);
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
 
@@ -230,6 +235,9 @@ export function ProjectSettingsDialog({
     else if (!agentUnresolved) delete config.model;
     if (supportsEffortDefault && effortValue !== NONE) config.effort = effortValue;
     else if (!agentUnresolved) delete config.effort;
+    // A sandbox brings its own credentials, so a host account can't apply.
+    if (provider !== NONE && hostId !== SANDBOX_HOST_CHOICE) config.provider = provider;
+    else delete config.provider;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -336,6 +344,23 @@ export function ProjectSettingsDialog({
       (effortLadderKnown(next) && !effortInLadder(effortLadder(next), effortValue));
     if (dropEffort) setEffort(NONE);
   };
+  // Accounts are listed per host and harness; with no host default, list the
+  // first online host's, like the model catalog above.
+  const accountHarness = selectedNativeSpec?.harness ?? selectedAgent?.harness ?? null;
+  const accountHostId = hostId === SANDBOX_HOST_CHOICE ? null : modelCatalogHostId;
+  const accountHost = onlineHosts.find((h) => h.host_id === accountHostId) ?? null;
+  const { data: accountOptions = [] } = useHostProviders(accountHostId, accountHarness);
+  // Keep unlisted accounts (the stored one included, so it is an option before
+  // the draft seeds to it) as labeled items so saving can't drop them.
+  const unlistedProviders = [
+    ...new Set([stored?.provider, provider].filter((p): p is string => !!p && p !== NONE)),
+  ].filter((name) => !accountOptions.some((p) => p.name === name));
+  const accountHint =
+    hostId === SANDBOX_HOST_CHOICE
+      ? "Sandbox sessions use the sandbox's own credentials"
+      : accountHost === null || accountHarness === null
+        ? "Pick a host and an agent to list their accounts"
+        : `Account new sessions run on (as listed on ${accountHost.name}); falls back to the host default where unavailable`;
   // The host the agent picker's readiness badges check against (its config
   // hints show whether a harness is set up there). Null when no concrete host.
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
@@ -615,6 +640,40 @@ export function ProjectSettingsDialog({
               </Select>
             </Field>
           )}
+          <Field label="Account" hint={accountHint}>
+            <Select
+              value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
+              onValueChange={(v) => setProvider(v || NONE)}
+              onOpenChange={onDropdownOpenChange}
+              disabled={
+                isLoading ||
+                hostId === SANDBOX_HOST_CHOICE ||
+                (accountOptions.length === 0 && provider === NONE)
+              }
+            >
+              <SelectTrigger className="w-full" data-testid="project-settings-account">
+                <SelectValue placeholder="No default" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE}>No default</SelectItem>
+                {accountOptions.map((p) => (
+                  <SelectItem
+                    key={p.name}
+                    value={p.name}
+                    disabled={!p.ready}
+                    data-testid={`project-settings-account-${p.name}`}
+                  >
+                    {p.name}
+                    {p.default ? " (host default)" : ""}
+                    {p.ready ? "" : " · not signed in"}
+                  </SelectItem>
+                ))}
+                {unlistedProviders.map((name) => (
+                  <SelectItem key={name} value={name}>{`${name} (not listed here)`}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
 
           {loadFailed && (
             <p
