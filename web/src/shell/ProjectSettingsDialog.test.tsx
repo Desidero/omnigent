@@ -9,6 +9,7 @@ import {
   writeProjectLaunchDefaults,
 } from "@/lib/projectLaunchPreferences";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import userEvent from "@testing-library/user-event";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
@@ -23,6 +24,8 @@ vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
   useHostModelOptions: hostModelOptionsMock,
 }));
+const { hostProvidersMock } = vi.hoisted(() => ({ hostProvidersMock: vi.fn() }));
+vi.mock("@/hooks/useHostProviders", () => ({ useHostProviders: hostProvidersMock }));
 // Hoisted so the vi.mock factory below can reference it; per-test overrides
 // let cases control the agent catalog (the default is set in beforeEach).
 const { availableAgentsMock } = vi.hoisted(() => ({ availableAgentsMock: vi.fn() }));
@@ -87,6 +90,8 @@ beforeEach(() => {
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
   hostModelOptionsMock.mockReset();
   hostModelOptionsMock.mockReturnValue({ data: [] });
+  hostProvidersMock.mockReset();
+  hostProvidersMock.mockReturnValue({ data: [] });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
@@ -788,5 +793,99 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(updateMock).not.toHaveBeenCalled();
     expect(readProjectLaunchDefaults("p_1", {})).toEqual(launch);
+  });
+
+  describe("account", () => {
+    const MAX1 = { name: "max1", kind: "subscription", label: "a", default: true, ready: true };
+    const MAX2 = { name: "max2", kind: "subscription", label: "b", default: false, ready: true };
+    const OFF = { name: "max3", kind: "subscription", label: "c", default: false, ready: false };
+
+    async function waitForSaveEnabled() {
+      await waitFor(() =>
+        expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+          false,
+        ),
+      );
+    }
+
+    it("lists the host's accounts for the default agent and saves the pick", async () => {
+      hostProvidersMock.mockReturnValue({ data: [MAX1, MAX2, OFF] });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { host_id: "h1", agent_id: "ag_1" },
+      });
+      const user = userEvent.setup();
+      renderDialog();
+      await waitForSaveEnabled();
+      expect(hostProvidersMock).toHaveBeenLastCalledWith("h1", "claude-sdk");
+
+      await user.click(screen.getByTestId("project-settings-account"));
+      expect(await screen.findByRole("option", { name: /max3 · not signed in/ })).toHaveAttribute(
+        "data-disabled",
+      );
+      await user.click(screen.getByRole("option", { name: "max2" }));
+      await user.click(screen.getByTestId("project-settings-save"));
+
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          host_id: "h1",
+          agent_id: "ag_1",
+          provider: "max2",
+        }),
+      );
+    });
+
+    it("keeps a stored account the host doesn't list, labeled, so saving can't drop it", async () => {
+      hostProvidersMock.mockReturnValue({ data: [MAX1] });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { host_id: "h1", agent_id: "ag_1", provider: "alt-max" },
+      });
+      renderDialog();
+      await waitForSaveEnabled();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-account")).toHaveTextContent(
+          "alt-max (not listed here)",
+        ),
+      );
+
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          host_id: "h1",
+          agent_id: "ag_1",
+          provider: "alt-max",
+        }),
+      );
+    });
+
+    it("clears the account back to no default", async () => {
+      hostProvidersMock.mockReturnValue({ data: [MAX1, MAX2] });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { host_id: "h1", provider: "max2" },
+      });
+      const user = userEvent.setup();
+      renderDialog();
+      await waitForSaveEnabled();
+
+      await user.click(screen.getByTestId("project-settings-account"));
+      await user.click(await screen.findByRole("option", { name: "No default" }));
+      await user.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1" }));
+    });
+
+    it("asks for a host and an agent before it can list accounts", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+      await waitForSaveEnabled();
+
+      expect(hostProvidersMock).toHaveBeenLastCalledWith("h1", null);
+      expect(screen.getByText("Pick a host and an agent to list their accounts")).toBeVisible();
+      expect(screen.getByTestId("project-settings-account")).toBeDisabled();
+    });
   });
 });

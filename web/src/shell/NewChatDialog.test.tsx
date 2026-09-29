@@ -297,6 +297,9 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   getDesktopFeatures: vi.fn(async () => null),
   connectArcaHost: vi.fn(async () => ({ ok: false })),
 }));
+vi.mock("@/hooks/useHostProviders", () => ({
+  useHostProviders: vi.fn(() => ({ data: [] })),
+}));
 vi.mock("@/hooks/useHosts", async (importOriginal) => {
   const actual = await importOriginal<typeof UseHostsModule>();
   const fetchHostsMock = vi.fn(async (_includeSandbox?: boolean): Promise<Host[]> => []);
