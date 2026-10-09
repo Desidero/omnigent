@@ -18,7 +18,6 @@ import click
 import httpx
 import pytest
 
-from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 from omnigent.harnesses.codex_native import main as codex_native
@@ -230,7 +229,7 @@ async def test_create_claude_session_stamps_passed_effort_over_settings(
     """A pass-through ``--effort`` is the effort Claude runs at, so it is stamped."""
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     captured: dict[str, bytes] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
