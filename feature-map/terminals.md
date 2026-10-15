@@ -32,6 +32,9 @@ reattach when the session moves to another host.
 - `touch-keys`: on touch devices an extra-keys row (Esc, Tab, arrows, sticky
   Ctrl/Alt/Shift) under the terminal sends keys a soft keyboard can't. A
   setting shows it on touch devices (default), always, or never.
+- `touch-select`: on touch devices a long-press selects the word under the
+  finger (or offers Paste on a blank cell); drag to extend it, adjust it with
+  the handles, then Copy, Paste or Select screen from its menu.
 
 ## How to get to it (user POV)
 
@@ -70,6 +73,12 @@ don't get it. Tap Ctrl, Alt or Shift to apply it to the next key, hold it to
 lock it, and tap a locked one to release it. Settings → Appearance → Touch &
 mobile → **Extra keys row** chooses Auto (touch devices, the default), Always
 (desktop too) or Never; the choice is saved in this browser or app.
+
+To copy terminal output on a touch screen, rest a finger on a word for about
+half a second: it is selected with a handle at each end. Keep dragging to
+extend it, or drag a handle (past the top or bottom edge to scroll), then
+choose Copy, Paste or Select screen. Copy follows Settings → General →
+Terminal → **Copying from terminals**. Long-press a blank cell for Paste alone.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -131,6 +140,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_row_absent_on_fine_pointer`,
   `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_send_the_expected_bytes`,
   `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_keep_focus_and_scrollback`
+- **`touch-select`:** component coverage in
+  `web/src/components/blocks/terminalTouchSelection.test.ts` and
+  `web/src/components/blocks/TerminalView.test.tsx`; no browser test. By hand
+  on a phone or a touch-emulated phone viewport: long-press a word in a user
+  shell and expect it highlighted with two handles and the menu; choose Copy,
+  long-press a blank cell, choose Paste and expect the word at the prompt.
 - **`reconnect`:**
   `tests/e2e_ui/shells/test_terminal_bridge_reconnect.py::test_embedded_terminal_reconnects_after_transport_close`
 - **`host-switch-reattach`:**
@@ -174,6 +189,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - Key bindings added for scrollback can change how full-screen harness terminals
   behave. After a scrollback change, drive the harness terminal itself, not only
   a plain shell.
+- A long-press in the terminal selects instead of opening the iOS text
+  callout, and never reaches the program as a click. A quick swipe still
+  scrolls; the long-press only starts after the finger rests.
 - Terminal output is drawn on a canvas, so page text searches do not see it.
   Use the tests' approach (the harness's own transcript or program input)
   instead of reading the page.
