@@ -79,6 +79,7 @@ vi.mock("@/components/blocks/TerminalSession", async (importOriginal) => ({
     setFont() {}
     setClipboardEnabled() {}
     setInputTransform() {}
+    touchSelection = { setListener() {} };
     pasteCommand() {
       return () => {};
     }
