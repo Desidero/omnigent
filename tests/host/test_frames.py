@@ -414,9 +414,10 @@ def test_mcp_servers_result_validates_reported_account_state(
                 {
                     "name": "claude-max2",
                     "kind": "subscription",
-                    "label": "claude CLI login (~/.claude-max2)",
+                    "label": "claude account token",
                     "default": False,
                     "ready": True,
+                    "switch_group": "3f2a9c1d0b7e",
                 }
             ],
         ),
@@ -445,7 +446,8 @@ def test_providers_result_drops_unknown_fields() -> None:
         )
     )
     assert isinstance(frame, HostProvidersResultFrame)
-    assert frame.providers == [row]
+    # A host without switch_group reports no switching.
+    assert frame.providers == [{**row, "switch_group": None}]
 
 
 def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
