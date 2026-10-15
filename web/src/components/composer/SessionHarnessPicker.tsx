@@ -42,12 +42,23 @@ import {
 } from "@/lib/composerCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSessionField } from "@/components/composer/sessionPickerInputs";
+import { toast } from "sonner";
+import { useSession } from "@/hooks/useSession";
+import { type HostProvider, useHostProviders } from "@/hooks/useHostProviders";
+import {
+  buildAccountSection,
+  currentProvider,
+  inPlaceSwitchBlocked,
+} from "@/components/composer/accountSection";
 
 /** The conversation a picker targets: *sessionId*, else whichever is active now. */
 function useTargetConversationId(sessionId: string | undefined): string | null {
   const active = useChatStore((state) => state.conversationId);
   return sessionId ?? active;
 }
+
+const CLAUDE_ACCOUNT_HARNESSES = new Set(["claude-native", "claude-sdk"]);
+const EMPTY_HOST_PROVIDERS: HostProvider[] = [];
 
 /**
  * Whether the session surfaces any run-config the gear modal can edit. Shared
@@ -191,10 +202,63 @@ export function SessionHarnessPicker({
     modelLabel: modelSummary,
     costRoutingEligible,
   });
-  const configurable = hasSessionConfig({
-    showModels,
-    showEffort,
-  });
+  const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
+    if (disabled || busyRef.current || pendingModelChange !== null) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStartingSession(wakesSession);
+    try {
+      await change();
+    } catch {
+      // The store rolls back a refused change, so the pill shows what applied.
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+      setStartingSession(false);
+    }
+  };
+  const { session } = useSession(conversationId);
+  // Accounts live on the host; only Claude harnesses can swap them in place.
+  const accountHarness =
+    session?.hostId && sessionHarness && CLAUDE_ACCOUNT_HARNESSES.has(sessionHarness)
+      ? sessionHarness
+      : null;
+  const { data: hostProviders = EMPTY_HOST_PROVIDERS } = useHostProviders(
+    accountHarness ? (session?.hostId ?? null) : null,
+    accountHarness,
+  );
+  const providerOverride = session?.providerOverride ?? null;
+  const runningProvider = currentProvider(hostProviders, providerOverride);
+  const selectAccount = (name: string | null) =>
+    void apply(async () => {
+      const accountName =
+        name ?? hostProviders.find((p) => p.default)?.name ?? "the default account";
+      try {
+        const applied = await useChatStore.getState().setProvider(name, ...target);
+        toast.success(
+          applied === "now"
+            ? `Switched to ${accountName} — Claude is restarting`
+            : `Switches to ${accountName} after this turn`,
+        );
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : `Couldn't switch to ${accountName}.`);
+      }
+    });
+  const accountSection = accountHarness
+    ? buildAccountSection({
+        providers: hostProviders,
+        value: providerOverride,
+        testIdPrefix: "composer-agent",
+        onSelect: selectAccount,
+        disabled: busy || pendingModelChange !== null,
+        blockedReason: (provider) => inPlaceSwitchBlocked(provider, runningProvider),
+      })
+    : undefined;
+  const configurable =
+    hasSessionConfig({
+      showModels,
+      showEffort,
+    }) || accountSection !== undefined;
   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
@@ -221,21 +285,6 @@ export function SessionHarnessPicker({
     setMenuOpen(false);
     setConfigOpen(false);
   }, [conversationId, cancelCycle]);
-  const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
-    if (disabled || busyRef.current || pendingModelChange !== null) return;
-    busyRef.current = true;
-    setBusy(true);
-    setStartingSession(wakesSession);
-    try {
-      await change();
-    } catch {
-      // The store rolls back a refused change, so the pill shows what applied.
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-      setStartingSession(false);
-    }
-  };
   const changeModel = async (modelId: string | null, nextEffort?: string) => {
     const store = useChatStore.getState();
     const sourceSessionId = currentConversationId();
@@ -518,7 +567,7 @@ export function SessionHarnessPicker({
       <ComposerConfigSections
         models={modelSection}
         efforts={effortSection}
-        extra={fusionSections}
+        extra={[...(fusionSections ?? []), ...(accountSection ? [accountSection] : [])]}
       />
     </>
   );
