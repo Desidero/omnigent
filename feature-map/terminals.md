@@ -29,6 +29,9 @@ reattach when the session moves to another host.
   says so and routes the user to the terminal.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
+- `touch-keys`: on touch devices an extra-keys row (Esc, Tab, arrows, sticky
+  Ctrl/Alt/Shift) under the terminal sends keys a soft keyboard can't. A
+  setting shows it on touch devices (default), always, or never.
 
 ## How to get to it (user POV)
 
@@ -63,6 +66,13 @@ with their own terminal retain the switcher.
   is inert while the host is offline, the session is stranded, or a shell is
   still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
+
+**Touch devices:** the extra-keys row sits under the agent terminal and user
+shells on phones, tablets and the iOS and Android apps; read-only attaches
+don't get it. Tap Ctrl, Alt or Shift to apply it to the next key, hold it to
+lock it, and tap a locked one to release it. Settings → Appearance → Touch &
+mobile → **Extra keys row** chooses Auto (touch devices, the default), Always
+(desktop too) or Never; the choice is saved in this browser or app.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -126,6 +136,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`scrollback`, keyboard:** no e2e coverage. In a Codex terminal with more
   output than fits, press Page Up and expect older output; then check that the
   Codex terminal's other keys still behave as before.
+- **`touch-keys`:**
+  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_row_shows_on_touch_at_phone_and_tablet_widths`,
+  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_row_absent_on_fine_pointer`,
+  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_send_the_expected_bytes`,
+  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_keep_focus_and_scrollback`
 - **`reconnect`:**
   `tests/e2e_ui/shells/test_terminal_bridge_reconnect.py::test_embedded_terminal_reconnects_after_transport_close`
 - **`host-switch-reattach`:**
