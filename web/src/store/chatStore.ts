@@ -90,7 +90,9 @@ import {
   rewindSession,
   type RewindAttachment,
   SIGN_IN_EXPIRED_CODE,
+  type ProviderSwitchApplied,
   type SessionItemsPage,
+  switchSessionProvider,
   updateSession,
 } from "@/lib/sessionsApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
@@ -1504,6 +1506,13 @@ export interface ChatActions {
     model: string | null,
     opts?: { expectConfirmation?: boolean; sessionId?: string },
   ) => Promise<void>;
+  /**
+   * Move the active session (or *sessionId*) onto another of its host's
+   * providers (``null`` = the host default) and record it on the
+   * ``["session", id]`` snapshot. Resolves with when the switch applies;
+   * rejects with the server's error.
+   */
+  setProvider: (provider: string | null, sessionId?: string) => Promise<ProviderSwitchApplied>;
   /**
    * Set the active session's cost-control switch — optimistic local
    * flip, then PATCH; the server's canonical value (or a rollback on
@@ -4350,6 +4359,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // even if the user has since switched away.
       setterFor(conversationId)({ sessionModelOverride: canonical });
     }
+  },
+
+  setProvider: async (provider, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
+    if (!conversationId) throw new Error("No active session to switch.");
+    const result = await switchSessionProvider(conversationId, provider);
+    queryClient?.setQueryData<Session>(["session", conversationId], (session) =>
+      session ? { ...session, providerOverride: result.providerOverride } : session,
+    );
+    return result.applied;
   },
 
   setCostControlMode: async (mode, sessionId) => {

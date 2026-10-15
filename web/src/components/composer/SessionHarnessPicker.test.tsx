@@ -12,8 +12,17 @@ import {
   expectSetting,
   registeredPaletteCommands,
 } from "@/test/paletteCommands";
+import type * as UseSessionModule from "@/hooks/useSession";
 import type * as SectionSettingsModule from "./composerSectionSettings";
 import { SessionHarnessPicker } from "./SessionHarnessPicker";
+
+// The picker's Account section reads the session and its host's providers; these
+// tests render it without a query client and have no accounts to offer.
+vi.mock("@/hooks/useSession", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionModule>()),
+  useSession: () => ({ session: null, isLoading: false, error: null }),
+}));
+vi.mock("@/hooks/useHostProviders", () => ({ useHostProviders: () => ({ data: [] }) }));
 
 // Records each render of the ⌘K settings, so a picker without a source can prove it never mounts them.
 const settingsRenders = vi.hoisted(() => ({ count: 0 }));
