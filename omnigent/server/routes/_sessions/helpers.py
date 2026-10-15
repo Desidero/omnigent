@@ -5220,6 +5220,10 @@ def _publish_status(
     _set_blocked_on(session_id, blocked_on)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
+        # A provider switch waits for its runner's sessions to finish their turns.
+        from omnigent.server.routes.sessions.routes_provider import note_session_status
+
+        note_session_status(status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
         # A turn can open or merge a PR while nobody watches; refresh what the server
         # stores. Stops and archives publish idle without persisting it, and skip this.
