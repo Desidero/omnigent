@@ -5565,6 +5565,10 @@ def _publish_status(
         _session_background_agents_cache.pop(session_id, None)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
+        # A provider switch waits for its runner's sessions to finish their turns.
+        from omnigent.server.routes.sessions.routes_provider import note_session_status
+
+        note_session_status(status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
         # A turn can open or merge a PR while nobody watches, and the first turn's
         # reply can name a session better than its first message did. Stops and
