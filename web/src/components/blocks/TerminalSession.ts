@@ -22,6 +22,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
+import { TerminalTouchSelection } from "./terminalTouchSelection";
 import { SHIFT_ENTER_CSI_U } from "./terminalExtraKeysModel";
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
@@ -640,6 +641,8 @@ export class TerminalSession {
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
   private readonly codexPalette: CodexTerminalPalette | null;
+  /** Long-press text selection; the view renders its handles and menu. */
+  readonly touchSelection: TerminalTouchSelection;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
@@ -749,6 +752,7 @@ export class TerminalSession {
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
     this.webgl = loadWebglRenderer(this.term);
+    this.touchSelection = new TerminalTouchSelection(this.term, () => this.screenMetrics());
     try {
       this.fit.fit();
     } catch (err) {
@@ -889,11 +893,13 @@ export class TerminalSession {
         if (e.touches.length !== 1) {
           this.touchStart = null;
           this.touchScrolling = false;
+          this.touchSelection.cancelPress();
           return;
         }
         this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
         this.touchScrolling = false;
         this.touchPartialLines = 0;
+        this.touchSelection.touchStart(this.touchStart.x, this.touchStart.y);
       },
       { signal },
     );
@@ -902,6 +908,11 @@ export class TerminalSession {
       (e) => {
         if (this.touchStart === null || e.touches.length !== 1) return;
         const touch = e.touches[0];
+        // After a long-press the finger extends the selection instead.
+        if (this.touchSelection.touchMove(touch.clientX, touch.clientY)) {
+          if (e.cancelable) e.preventDefault();
+          return;
+        }
         if (!this.touchScrolling) {
           // Slop gate: taps and long-press jitter stay with the browser.
           // Past the slop, the dominant axis decides — a mostly-horizontal
@@ -909,6 +920,7 @@ export class TerminalSession {
           const dx = Math.abs(touch.clientX - this.touchStart.x);
           const dy = Math.abs(touch.clientY - this.touchStart.y);
           if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) return;
+          this.touchSelection.cancelPress();
           if (dx > dy) {
             this.touchStart = null;
             return;
@@ -945,8 +957,28 @@ export class TerminalSession {
       this.touchScrolling = false;
       this.touchPartialLines = 0;
     };
-    container.addEventListener("touchend", endTouch, { signal });
-    container.addEventListener("touchcancel", endTouch, { signal });
+    container.addEventListener(
+      "touchend",
+      (e) => {
+        // Cancelling a long-press's touchend keeps iOS from turning it into a
+        // click, which would reach the pane program as a mouse report.
+        if (this.touchSelection.touchEnd()) {
+          if (e.cancelable) e.preventDefault();
+        } else if (this.touchStart !== null && !this.touchScrolling) {
+          this.touchSelection.tap();
+        }
+        endTouch();
+      },
+      { passive: false, signal },
+    );
+    container.addEventListener(
+      "touchcancel",
+      () => {
+        this.touchSelection.touchEnd();
+        endTouch();
+      },
+      { signal },
+    );
 
     // ResizeObserver fires on any layout-affecting change (window
     // resize, font load, CSS class change). tmux deduplicates same-
@@ -1005,6 +1037,11 @@ export class TerminalSession {
     this.ws.send(INPUT_ENCODER.encode(data));
   }
 
+  /** Paste text the way a browser paste would (bracketed when the program asks). */
+  paste(text: string): void {
+    this.term.paste(text);
+  }
+
   /** Whether the program enabled application cursor keys (DECCKM). */
   applicationCursorKeys(): boolean {
     return this.term.modes.applicationCursorKeysMode;
@@ -1040,6 +1077,7 @@ export class TerminalSession {
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
+    this.touchSelection.dispose();
     try {
       this.ws.close();
     } catch {
