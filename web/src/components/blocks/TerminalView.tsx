@@ -37,6 +37,7 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import { canReadNativeClipboard, readNativeClipboardText } from "@/lib/nativeBridge";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import {
   isTerminalLaunching,
@@ -569,6 +570,12 @@ export function TerminalView({
     const session = sessionRef.current;
     if (!session || readOnly) return;
     session.touchSelection.clear();
+    if (canReadNativeClipboard()) {
+      void readNativeClipboardText().then((text) => {
+        if (text && sessionRef.current === session) session.paste(text);
+      });
+      return;
+    }
     if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
       toast.error("Pasting isn't available in this browser.");
       return;
