@@ -205,6 +205,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - A long-press in the terminal selects instead of opening the iOS text
   callout, and never reaches the program as a click. A quick swipe still
   scrolls; the long-press only starts after the finger rests.
+- In the iOS app, the menu's Paste reads the clipboard natively, so iOS follows
+  its Settings → Omnigent → Paste from Other Apps choice: Allow pastes without a
+  prompt. In a browser, Safari shows its own Paste bubble on every paste.
 - Terminal output is drawn on a canvas, so page text searches do not see it.
   Use the tests' approach (the harness's own transcript or program input)
   instead of reading the page.
