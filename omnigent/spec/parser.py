@@ -112,6 +112,7 @@ _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
         "broker_gateway",
         "context_files",
         "disable_native_tools",
+        "native_tools",
         "system_prompt_mode",
         "web_search",
     }
