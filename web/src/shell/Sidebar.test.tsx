@@ -34,6 +34,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
@@ -3070,6 +3071,94 @@ describe("Sidebar project sections", () => {
     expect(within(recentSection).queryByText("conv_filed")).toBeNull();
   });
 
+  it("Updated keeps recent sessions and hides folders with none", () => {
+    projectsMock.push("Customer X", "Quiet", "Empty");
+    const nowSeconds = Date.now() / 1000;
+    const row = (id: string, ageSeconds: number, partial: Partial<Conversation> = {}) =>
+      conv(id, "Codex", { status: "idle", updated_at: nowSeconds - ageSeconds, ...partial });
+    mockConversations([
+      row("conv_recent", 60 * 60),
+      row("conv_stale", 5 * 86400),
+      row("conv_recent_filed", 60 * 60, { labels: { omni_project: "Customer X" } }),
+      row("conv_stale_filed", 5 * 86400, { labels: { omni_project: "Quiet" } }),
+    ]);
+    renderSidebar();
+    expect(screen.getByRole("button", { name: /^Empty/ })).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    fireEvent.keyDown(screen.getByTestId("session-focus-recency-menu"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("session-focus-recency-day"));
+    closeProjectsMenu();
+
+    const sessions = screen.getByText("Sessions").closest("section")!;
+    expect(within(sessions).getByText("conv_recent")).toBeInTheDocument();
+    expect(within(sessions).queryByText("conv_stale")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Customer X/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Quiet/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Empty/ })).toBeNull();
+    expect(screen.getByTestId("session-filter")).toHaveAttribute("data-focus-active", "true");
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+      recency: "day",
+    });
+  });
+
+  it.each([
+    ["the folder the composer targets", "/?project=Quiet"],
+    ["an open project home's folder", "/projects/Quiet"],
+  ])("Updated keeps %s although nothing in it matches", (_case, route) => {
+    projectsMock.push("Quiet", "Empty");
+    localStorage.setItem("omnigent:sidebar-focus", JSON.stringify({ recency: "day" }));
+    mockConversations([
+      conv("conv_stale_filed", "Codex", {
+        status: "idle",
+        updated_at: Date.now() / 1000 - 5 * 86400,
+        labels: { omni_project: "Quiet" },
+      }),
+    ]);
+    renderSidebar(true, route, undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { ...FALLBACK_SERVER_INFO.features, project_kanban: true },
+    });
+
+    expect(screen.getByRole("button", { name: /^Quiet/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Empty/ })).toBeNull();
+    expect(screen.queryByText("conv_stale_filed")).toBeNull();
+  });
+
+  it("shows a removable chip for the Updated filter beside the filter button", async () => {
+    const nowSeconds = Date.now() / 1000;
+    mockConversations([
+      conv("conv_recent", "Codex", { status: "idle", updated_at: nowSeconds - 60 * 60 }),
+      conv("conv_stale", "Codex", { status: "idle", updated_at: nowSeconds - 5 * 86400 }),
+    ]);
+    renderSidebar();
+    const sessions = screen.getByText("Sessions").closest("section")!;
+    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    fireEvent.keyDown(screen.getByTestId("session-focus-recency-menu"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("session-focus-recency-three-days"));
+    closeProjectsMenu();
+    const recencyChip = screen.getByRole("button", { name: "Clear Updated filter: last 3 days" });
+    expect(recencyChip).toHaveTextContent("3d");
+    expect(within(sessions).queryByText("conv_stale")).toBeNull();
+
+    // Shift+Tab from the filter button reaches the chip; Enter clears the
+    // filter, persists that, and leaves focus on the filter button.
+    const user = userEvent.setup();
+    screen.getByTestId("session-filter").focus();
+    await user.tab({ shift: true });
+    expect(recencyChip).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("session-filter")).toHaveFocus();
+    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
+    expect(screen.getByTestId("session-filter")).not.toHaveAttribute("data-focus-active");
+    expect(within(sessions).getByText("conv_stale")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+      recency: "any",
+    });
+  });
+
   it("fills a folder from its own fetch, independent of the global list window", async () => {
     projectsMock.push("Customer X");
     // The global list holds only an unfiled chat — the project's sessions are
@@ -5036,6 +5125,63 @@ describe("Sidebar view options", () => {
       fireEvent.keyDown(reopened, { key: "Escape" });
       expect(screen.queryByRole("menu")).toBeNull();
       expect(within(openMenu()).getByTestId("session-grouping-menu")).toBeInTheDocument();
+    } finally {
+      matchMedia.mockRestore();
+    }
+  });
+
+  it("lists Updated under Display in the filter menu, with its current window", () => {
+    localStorage.setItem("omnigent:sidebar-focus", JSON.stringify({ recency: "week" }));
+    mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
+    renderGroupingSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    const menu = screen.getByRole("menu");
+
+    const entries = within(menu)
+      .getAllByRole("menuitem")
+      .map((item) => item.dataset.testid);
+    expect(entries).toEqual([
+      "session-grouping-menu",
+      "session-display-menu",
+      "session-focus-recency-menu",
+      "session-ordering-menu",
+      "session-show-menu",
+    ]);
+    expect(within(menu).getByTestId("session-focus-recency-menu")).toHaveTextContent(
+      "UpdatedLast 7 days",
+    );
+    // Only the rule above Show: Updated joins the menu's first block.
+    expect(within(menu).getAllByRole("separator")).toHaveLength(1);
+  });
+
+  it("opens the Updated submenu in place on a mobile viewport", () => {
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 1180.98px)",
+    }));
+    try {
+      mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
+      renderGroupingSidebar();
+      fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+        button: 0,
+        ctrlKey: false,
+        pointerType: "mouse",
+      });
+      const menu = screen.getByRole("menu");
+
+      fireEvent.click(within(menu).getByTestId("session-focus-recency-menu"));
+      expect(screen.getAllByRole("menu")).toEqual([menu]);
+      expect(within(menu).getByRole("menuitem", { name: "Back from Updated" })).toBeInTheDocument();
+      expect(within(menu).queryByTestId("session-display-menu")).toBeNull();
+      expect(within(menu).getAllByRole("separator")).toHaveLength(1);
+
+      fireEvent.click(within(menu).getByTestId("session-focus-recency-day"));
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+        recency: "day",
+      });
     } finally {
       matchMedia.mockRestore();
     }
