@@ -2,6 +2,7 @@ import { arrayMove } from "@dnd-kit/sortable";
 import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
+import { sidebarRecencyOption, type SidebarFocus } from "@/lib/sidebarFocusPreferences";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
 import { orderSessionFamilies, isIndividuallyPinnedSibling } from "@/lib/sessionFamilies";
@@ -366,6 +367,12 @@ export function dateBucket(timestamp: number, now: Date): DateBucket {
   if (at >= midnight(7)) return "in the last 7 days";
   if (at >= midnight(30)) return "in the last 30 days";
   return "earlier";
+}
+
+/** Whether a session passes the sidebar's "Updated" (recency) filter. */
+export function matchesSidebarFocus(c: Conversation, focus: SidebarFocus, now: Date): boolean {
+  const { windowMs } = sidebarRecencyOption(focus.recency);
+  return windowMs === null || c.updated_at * 1000 >= now.getTime() - windowMs;
 }
 
 /**

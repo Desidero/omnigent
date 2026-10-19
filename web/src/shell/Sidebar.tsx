@@ -126,6 +126,7 @@ import {
 } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSearchButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import {
@@ -258,6 +259,15 @@ import {
   type SidebarShowField,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
+import {
+  isSidebarFocusActive,
+  readSidebarFocus,
+  SIDEBAR_RECENCY_OPTIONS,
+  sidebarRecencyOption,
+  writeSidebarFocus,
+  type SidebarFocus,
+  type SidebarRecency,
+} from "@/lib/sidebarFocusPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
@@ -293,6 +303,7 @@ import {
   dateBucket,
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
+  matchesSidebarFocus,
   sessionBelongsToProject,
   sessionsListAcceptsDrop,
 } from "./sidebarNav";
@@ -1593,6 +1604,7 @@ function ProjectFolder({
   ordering,
   scrollRoot,
   pageSize,
+  matches,
 }: {
   /** The sidebar's scroll container, the root for unpaginated auto-loading. */
   scrollRoot: RefObject<HTMLElement | null>;
@@ -1650,6 +1662,8 @@ function ProjectFolder({
     conversations: Conversation[],
     visibleCount: number,
   ) => void;
+  /** The recency filter, or null when it is off. */
+  matches: ((c: Conversation) => boolean) | null;
 }) {
   const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
   const viewerId = useViewerId();
@@ -1680,7 +1694,8 @@ function ProjectFolder({
           (c) =>
             (c.archived === true) === archived &&
             sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
-            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))),
+            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))) &&
+            (matches?.(c) ?? true),
         ),
         activeOverride,
         frozenSortKeys,
@@ -1701,6 +1716,7 @@ function ProjectFolder({
     projectId,
     name,
     viewerId,
+    matches,
   ]);
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
@@ -1794,7 +1810,10 @@ function ProjectFolder({
   } else if (pageSize === undefined) {
     footer = (
       <InfiniteScrollSentinel
-        hasMore={query.hasNextPage}
+        // Filtered rows are recent, so older pages would only be fetched and
+        // hidden — and an all-hidden page keeps the sentinel in view, paging
+        // through the whole project.
+        hasMore={matches === null && query.hasNextPage}
         isFetching={query.isFetchingNextPage}
         fetchMore={query.fetchNextPage}
         scrollRoot={scrollRoot}
@@ -2101,6 +2120,21 @@ function ConversationList({
         : undefined;
     saveView(custom ? { ...patch, custom } : patch);
   });
+  const [focus, setFocus] = useState<SidebarFocus>(readSidebarFocus);
+  const updateFocus = useCallback(
+    (patch: Partial<SidebarFocus>) => {
+      // Narrowing can hide selected rows, so leave selection like a Display switch.
+      if (selectionMode) onExitSelectionMode();
+      setFocus((previous) => {
+        const next = { ...previous, ...patch };
+        writeSidebarFocus(next);
+        return next;
+      });
+    },
+    [selectionMode, onExitSelectionMode],
+  );
+  const focusActive = isSidebarFocusActive(focus);
+  const filterTriggerRef = useRef<HTMLButtonElement>(null);
   const grouped = view.grouping !== "default";
   const harnessLabels = useHarnessLabels(view.grouping === "harness");
   const harnessLabel = useCallback(
@@ -2267,6 +2301,15 @@ function ConversationList({
   // sessions render in their own group at the bottom (below "Shared with
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
+  // Rows passing the "Updated" filter; null when it is off. The open session
+  // always passes, so it doesn't drop out of the list while it is open.
+  const focusMatches = useMemo(() => {
+    if (!focusActive) return null;
+    const now = new Date();
+    return (c: Conversation) => c.id === displayedActiveId || matchesSidebarFocus(c, focus, now);
+    // A list update renews `now`, so rows age out of the window.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusActive, focus, displayedActiveId, allConversations]);
   const loadedSections = useMemo(() => {
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
@@ -2286,6 +2329,8 @@ function ConversationList({
           : activeTab === "mine"
             ? listed.filter((c) => isOwnedByViewer(c, viewerId))
             : listed;
+    // Pins stay put under every filter, so the "Updated" filter applies after them.
+    const focused = focusMatches ? tabScoped.filter(focusMatches) : tabScoped;
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -2325,20 +2370,33 @@ function ConversationList({
         name,
         icon,
         conversations: orderSessionFamilies(
-          sortConversations(inProject, activeOverride, frozenKeys, sortBy, customOrder),
+          sortConversations(
+            focusMatches ? inProject.filter(focusMatches) : inProject,
+            activeOverride,
+            frozenKeys,
+            sortBy,
+            customOrder,
+          ),
         ),
       };
     });
-    // NOTE: empty projects are intentionally NOT filtered out. A project comes
-    // from the server project list (useProjects), so it can have zero *loaded*
-    // conversations — either genuinely empty or because its chats live on an
-    // unloaded page. We render it as a folder with a "No sessions" placeholder
-    // rather than hiding it (matches the target sidebar layout).
+    // NOTE: without the "Updated" filter, empty projects are NOT
+    // filtered out. A project comes from the server project list (useProjects),
+    // so it can have zero *loaded* conversations — either genuinely empty or
+    // because its chats live on an unloaded page. We render it as a folder with
+    // a "No sessions" placeholder rather than hiding it. With a filter on, a
+    // folder with no matching loaded rows is hidden (unless the composer targets
+    // it): matches are recent, so they sit in the loaded window.
+    const visibleProjectGroups = focusMatches
+      ? projectGroups.filter(
+          (group) => group.conversations.length > 0 || group.name === newSessionProjectName,
+        )
+      : projectGroups;
 
     // The remainder — not pinned, not filed — splits into Shared (other owners')
     // and Sessions (the viewer's own).
     const allOrdered = sortConversations(
-      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
+      focused.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
       frozenKeys,
       sortBy,
@@ -2368,7 +2426,7 @@ function ConversationList({
         pinned,
         shared,
         sessions: orderSessionFamilies(ordered),
-        projectGroups,
+        projectGroups: visibleProjectGroups,
         groupTitles: null,
       };
     // Buckets use render-time "now", so a day rollover shows on the next list update.
@@ -2415,7 +2473,7 @@ function ConversationList({
     const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
       (g) => orderSessionFamilies(g.conversations),
     );
-    return { pinned, shared, sessions, projectGroups, groupTitles };
+    return { pinned, shared, sessions, projectGroups: visibleProjectGroups, groupTitles };
     // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -2423,6 +2481,8 @@ function ConversationList({
     activeRootSessionId,
     pinnedConversations,
     pinnedSet,
+    focusMatches,
+    newSessionProjectName,
     activeOverride,
     frozenKeys,
     frozenStatus,
@@ -2980,7 +3040,11 @@ function ConversationList({
     ...(sections.shared.length > 0 || sharedListOnly ? ["Shared"] : []),
     ...(sharedListOnly ? [] : (sessionGroups?.map((g) => g.title) ?? ["Chats"])),
   ];
-  const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
+  const emptyMessage = searchQuery
+    ? "No matching conversations"
+    : focusActive
+      ? "No matching sessions"
+      : "No sessions";
 
   // List header controls and row props, shared by the Shared, single "Sessions"
   // and grouped sections; the controls sit on the first of the viewer's lists.
@@ -3064,13 +3128,24 @@ function ConversationList({
     </div>
   ) : undefined;
   const sessionsFilterMenu = (
-    <SessionFilterMenu
-      value={activeTab}
-      onChange={onActiveTabChange}
-      multiUser={multiUser}
-      view={groupingUi ? view : null}
-      onViewChange={updateView}
-    />
+    <>
+      <SessionFocusChips
+        focus={focus}
+        onFocusChange={updateFocus}
+        // The cleared chip unmounts; keep keyboard focus on the filter controls.
+        onKeyboardClear={() => filterTriggerRef.current?.focus()}
+      />
+      <SessionFilterMenu
+        value={activeTab}
+        onChange={onActiveTabChange}
+        multiUser={multiUser}
+        view={groupingUi ? view : null}
+        onViewChange={updateView}
+        focus={focus}
+        onFocusChange={updateFocus}
+        triggerRef={filterTriggerRef}
+      />
+    </>
   );
 
   // Archived sessions are surfaced on the Settings page, not here, so they
@@ -3309,7 +3384,9 @@ function ConversationList({
                                 !projectOrder.data ||
                                 saveOrder.isPending ||
                                 selectionMode ||
-                                editingIds.size > 0,
+                                editingIds.size > 0 ||
+                                // Moves index the full project list, not the filtered folders.
+                                focusActive,
                               first: index === 0,
                               last: index === projects.length - 1,
                               move: (destination) => moveProject(group.name, destination),
@@ -3347,12 +3424,15 @@ function ConversationList({
                             onProjectAssigned={expandProject}
                             onConversationsLoaded={handleFolderConversationsLoaded}
                             reorderable={reorderable}
+                            matches={focusMatches}
                           />
                         ))}
                       </SortableContext>
                       {sections.projectGroups.length === 0 &&
                         !effectiveCollapsedSections.includes("Projects") && (
-                          <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
+                          <p className="px-2 py-1 text-ui text-muted-foreground">
+                            {focusActive ? "No matching projects" : "No projects"}
+                          </p>
                         )}
                     </SectionGroup>
                   )}
@@ -3422,7 +3502,13 @@ function ConversationList({
                         <ConversationSection
                           title="Sessions"
                           conversations={sections.sessions}
-                          emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
+                          emptyMessage={
+                            sessionStatus
+                              ? undefined
+                              : focusActive
+                                ? emptyMessage
+                                : SIDEBAR_FILTER_EMPTY[activeTab]
+                          }
                           footer={sessionStatus}
                           collapsed={effectiveCollapsedSections.includes("Chats")}
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
@@ -3810,6 +3896,92 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
   repo: "Repo",
   branch: "Branch",
 };
+// The "Updated" filter, offered in both forms of the filter menu.
+function SessionFocusMenuItems({
+  focus,
+  onFocusChange,
+}: {
+  focus: SidebarFocus;
+  onFocusChange: (patch: Partial<SidebarFocus>) => void;
+}) {
+  return (
+    <>
+      <DropdownMenuSeparator />
+      <FilterMenuSub
+        label="Updated"
+        value={sidebarRecencyOption(focus.recency).label}
+        testId="session-focus-recency-menu"
+      >
+        <DropdownMenuRadioGroup
+          value={focus.recency}
+          onValueChange={(next) => onFocusChange({ recency: next as SidebarRecency })}
+        >
+          {SIDEBAR_RECENCY_OPTIONS.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.id}
+              value={option.id}
+              data-testid={`session-focus-recency-${option.id}`}
+            >
+              {option.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </FilterMenuSub>
+    </>
+  );
+}
+
+// A removable chip for an active "Updated" filter, beside the filter button, so
+// a short list reads as filtered at a glance.
+function SessionFocusChips({
+  focus,
+  onFocusChange,
+  onKeyboardClear,
+}: {
+  focus: SidebarFocus;
+  onFocusChange: (patch: Partial<SidebarFocus>) => void;
+  /** Called after a keyboard-activated chip clears its filter, to place focus. */
+  onKeyboardClear: () => void;
+}) {
+  const recency = sidebarRecencyOption(focus.recency);
+  const chips = [
+    ...(recency.shortLabel
+      ? [
+          {
+            key: "recency",
+            text: recency.shortLabel,
+            label: `Clear Updated filter: ${recency.label.toLowerCase()}`,
+            clear: { recency: "any" } as const,
+          },
+        ]
+      : []),
+  ];
+  if (chips.length === 0) return null;
+  return (
+    <div className="mr-0.5 flex min-w-0 items-center gap-0.5">
+      {chips.map((chip) => (
+        <Badge key={chip.key} asChild variant="outline">
+          <button
+            type="button"
+            aria-label={chip.label}
+            title={chip.label}
+            data-testid={`session-focus-chip-${chip.key}`}
+            className="min-w-0 cursor-pointer gap-0.5 rounded-[var(--radius-sm)] border-primary/30 bg-primary/10 px-1.5 font-normal text-primary outline-none hover:bg-primary/20"
+            onClick={(event) => {
+              event.stopPropagation();
+              onFocusChange(chip.clear);
+              // Keyboard activation has no click count; a pointer click needs no focus move.
+              if (event.detail === 0) onKeyboardClear();
+            }}
+          >
+            <span className="min-w-0 truncate">{chip.text}</span>
+            <XIcon aria-hidden="true" />
+          </button>
+        </Badge>
+      ))}
+    </div>
+  );
+}
 
 // A filter-menu submenu whose trigger shows the current pick at its right edge.
 function FilterMenuSub({
@@ -3844,6 +4016,9 @@ function SessionFilterMenu({
   multiUser,
   view,
   onViewChange,
+  focus,
+  onFocusChange,
+  triggerRef,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
@@ -3851,10 +4026,14 @@ function SessionFilterMenu({
   /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
   view: SidebarViewPreferences | null;
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
+  focus: SidebarFocus;
+  onFocusChange: (patch: Partial<SidebarFocus>) => void;
+  triggerRef: RefObject<HTMLButtonElement | null>;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
   const [menuOpen, setMenuOpen] = useState(false);
   const tooltip = useMenuGuardedTooltip(menuOpen);
+  const focusItems = <SessionFocusMenuItems focus={focus} onFocusChange={onFocusChange} />;
   const filters = multiUser
     ? SIDEBAR_FILTERS
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
@@ -3880,12 +4059,18 @@ function SessionFilterMenu({
           <span className="inline-flex shrink-0" {...tooltip.triggerProps}>
             <DropdownMenuTrigger asChild>
               <Button
+                ref={triggerRef}
                 type="button"
                 variant="ghost"
                 size="icon-xs"
                 aria-label={triggerLabel}
                 data-testid="session-filter"
-                className="text-muted-foreground mobile-touch-target"
+                data-focus-active={isSidebarFocusActive(focus) || undefined}
+                // Highlighted while rows are hidden, so a short list isn't mistaken for missing sessions.
+                className={cn(
+                  isSidebarFocusActive(focus) ? "text-primary" : "text-muted-foreground",
+                  "mobile-touch-target",
+                )}
                 onClick={(event) => event.stopPropagation()}
               >
                 <ListFilterIcon className="size-3.5" />
@@ -3902,6 +4087,7 @@ function SessionFilterMenu({
         <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
           <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
           {displayOptions}
+          {focusItems}
         </DropdownMenuContent>
       ) : (
         <DropdownMenuContent align="end" className="min-w-56">
@@ -3933,6 +4119,7 @@ function SessionFilterMenu({
           >
             {displayOptions}
           </FilterMenuSub>
+          {focusItems}
           <FilterMenuSub
             label="Ordering"
             value={ORDERING_LABELS[view.ordering]}

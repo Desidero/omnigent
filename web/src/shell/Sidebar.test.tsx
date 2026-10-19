@@ -23,6 +23,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
@@ -2555,6 +2556,71 @@ describe("Sidebar project sections", () => {
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
     expect(within(recentSection).queryByText("conv_filed")).toBeNull();
+  });
+
+  it("Updated keeps recent sessions and hides folders with none", () => {
+    projectsMock.push("Customer X", "Quiet", "Empty");
+    const nowSeconds = Date.now() / 1000;
+    const row = (id: string, ageSeconds: number, partial: Partial<Conversation> = {}) =>
+      conv(id, "Codex", { status: "idle", updated_at: nowSeconds - ageSeconds, ...partial });
+    mockConversations([
+      row("conv_recent", 60 * 60),
+      row("conv_stale", 5 * 86400),
+      row("conv_recent_filed", 60 * 60, { labels: { omni_project: "Customer X" } }),
+      row("conv_stale_filed", 5 * 86400, { labels: { omni_project: "Quiet" } }),
+    ]);
+    renderSidebar();
+    expect(screen.getByRole("button", { name: /^Empty/ })).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    fireEvent.keyDown(screen.getByTestId("session-focus-recency-menu"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("session-focus-recency-day"));
+    closeProjectsMenu();
+
+    const sessions = screen.getByText("Sessions").closest("section")!;
+    expect(within(sessions).getByText("conv_recent")).toBeInTheDocument();
+    expect(within(sessions).queryByText("conv_stale")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Customer X/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Quiet/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Empty/ })).toBeNull();
+    expect(screen.getByTestId("session-filter")).toHaveAttribute("data-focus-active", "true");
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+      recency: "day",
+    });
+  });
+
+  it("shows a removable chip for the Updated filter beside the filter button", async () => {
+    const nowSeconds = Date.now() / 1000;
+    mockConversations([
+      conv("conv_recent", "Codex", { status: "idle", updated_at: nowSeconds - 60 * 60 }),
+      conv("conv_stale", "Codex", { status: "idle", updated_at: nowSeconds - 5 * 86400 }),
+    ]);
+    renderSidebar();
+    const sessions = screen.getByText("Sessions").closest("section")!;
+    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    fireEvent.keyDown(screen.getByTestId("session-focus-recency-menu"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("session-focus-recency-three-days"));
+    closeProjectsMenu();
+    const recencyChip = screen.getByRole("button", { name: "Clear Updated filter: last 3 days" });
+    expect(recencyChip).toHaveTextContent("3d");
+    expect(within(sessions).queryByText("conv_stale")).toBeNull();
+
+    // Shift+Tab from the filter button reaches the chip; Enter clears the
+    // filter, persists that, and leaves focus on the filter button.
+    const user = userEvent.setup();
+    screen.getByTestId("session-filter").focus();
+    await user.tab({ shift: true });
+    expect(recencyChip).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("session-filter")).toHaveFocus();
+    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
+    expect(screen.getByTestId("session-filter")).not.toHaveAttribute("data-focus-active");
+    expect(within(sessions).getByText("conv_stale")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+      recency: "any",
+    });
   });
 
   it("fills a folder from its own fetch, independent of the global list window", async () => {

@@ -13,6 +13,7 @@ import {
   groupConversations,
   getConversationAgentType,
   customSortOrder,
+  matchesSidebarFocus,
   migratePinnedConversationIds,
   moveCustomOrder,
   orderByPinnedTimestamp,
@@ -749,6 +750,33 @@ describe("dateBucket", () => {
     expect(dateBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("in the last 30 days");
     expect(dateBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("in the last 30 days");
     expect(dateBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("earlier");
+  });
+});
+
+describe("matchesSidebarFocus", () => {
+  const now = new Date(2026, 8, 30, 10, 0);
+  const updated = (date: Date) => conversation("a", "A", date, { updatedAt: date });
+
+  it("keeps everything with no filter", () => {
+    const old = updated(new Date(2025, 0, 1));
+    expect(matchesSidebarFocus(old, { recency: "any" }, now)).toBe(true);
+  });
+
+  it.each([
+    ["day", new Date(2026, 8, 29, 10, 0), new Date(2026, 8, 29, 9, 59)],
+    ["three-days", new Date(2026, 8, 27, 10, 0), new Date(2026, 8, 27, 9, 59)],
+    ["week", new Date(2026, 8, 23, 10, 0), new Date(2026, 8, 23, 9, 59)],
+    ["month", new Date(2026, 7, 31, 10, 0), new Date(2026, 7, 31, 9, 59)],
+  ] as const)("recency %s keeps sessions inside its rolling window", (recency, inside, outside) => {
+    const focus = { recency };
+    expect(matchesSidebarFocus(updated(inside), focus, now)).toBe(true);
+    expect(matchesSidebarFocus(updated(outside), focus, now)).toBe(false);
+  });
+
+  it("keeps the day before's sessions just after midnight", () => {
+    const justAfterMidnight = new Date(2026, 8, 30, 0, 15);
+    const lateEvening = updated(new Date(2026, 8, 29, 22, 0));
+    expect(matchesSidebarFocus(lateEvening, { recency: "day" }, justAfterMidnight)).toBe(true);
   });
 });
 
