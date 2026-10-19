@@ -201,6 +201,7 @@ import {
 } from "./interactionTelemetry";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
+  coordinatorMessageMarkerContent,
   isClaudeAgentMessageContent,
   isSystemUserContent,
   taskNotificationMarkerContent,
@@ -8070,7 +8071,7 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   // other meta message (injected skill text) stays hidden.
   const marker = taskNotificationMarkerContent(content);
   if (marker !== null) return marker;
-  if (event.isMeta === true) return null;
+  if (event.isMeta === true) return coordinatorMessageMarkerContent(content);
   return content;
 }
 
