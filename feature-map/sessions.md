@@ -274,6 +274,15 @@ the header menu), and each place is a separate entry point.
   reveals the shared destinations, including Usage when enabled.
 - `canvas-create`: the plus button on Main or a project opens the new-session
   composer; sending returns to that board with the new session selected.
+- `updated-filter`: **Updated** in the sidebar's filter menu (Any time, Last 24
+  hours, Last 3 days, Last 7 days or Last 30 days, as rolling windows) narrows
+  the list to recently updated sessions. It is saved per device and works with
+  any Display choice, with the grouping flag on or off. While it is on, project
+  folders with no match are hidden (the folder the composer targets and an open
+  project home's folder stay), the funnel is highlighted, pins and the open
+  session stay listed, and a chip beside the funnel clears it. With the grouping
+  flag on, Updated sits under Display and phone layouts open it in place under a
+  back row like the other submenus.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, in the toolbar above the session list, with Grouping
@@ -614,6 +623,11 @@ PR while offline; linking needs the host. Reconnect and verify live checks and
 merge controls return. Unlink the last PR and verify it stays absent after refresh.
 A session not yet imported to the server says so. Older servers retain their
 host-dependent unlink behavior.
+
+**Updated filter:** open the same funnel, with or without
+`sidebar_grouping_ui`, and pick a window under **Updated**. The active window
+shows as a chip beside the funnel (**24h**, **3d**, **7d** or **30d**); click
+the chip to clear it.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -1532,6 +1546,12 @@ plain `uv run pytest`, which starts a private server for the test.
   under the folder while pages remain; after three automatic loads (the default
   budget), further pages need a click on it. Turn the switch back on for the
   saved count plus Show more.
+- **`updated-filter`:** component coverage in `web/src/shell/Sidebar.test.tsx`,
+  `web/src/shell/sidebarNav.test.ts` and
+  `web/src/lib/sidebarFocusPreferences.test.ts`; no browser test. By hand: pick
+  **Updated → Last 24 hours** with an older session present and expect it
+  hidden, folders with no recent session hidden, and a **24h** chip. Reload
+  and expect it kept; click the chip and expect the full list back.
 
 For the desktop Close shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
@@ -1644,3 +1664,7 @@ its discoverability.
 - Grouping and ordering apply to the loaded pages only: an older session joins
   its group once it is paged in. Grouped views hide Projects, so dragging a
   session onto the list never removes it from its project there.
+- With **Updated** on, the filter matches loaded rows only, and a project
+  folder that lists every loaded session stops paging in older ones; matches
+  are recent, so they are normally loaded. Changing the filter leaves selection
+  mode.
