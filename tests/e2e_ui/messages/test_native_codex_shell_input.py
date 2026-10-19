@@ -81,3 +81,44 @@ def test_web_shell_input_runs_in_codex_shell_not_as_prompt(
     expect(page.get_by_text(marker, exact=True)).to_be_visible(timeout=10_000)
     # The shell command never reached the model as a prompt.
     assert page.locator(_ASSISTANT, has_text=leaked).count() == int(warmup)
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(300)
+def test_run_button_runs_each_suggested_command_in_codex_shell(
+    page: Page,
+    native_codex_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    base_url, session_id = native_codex_mock_session
+    first = f"run-first-{uuid.uuid4().hex[:8]}"
+    second = f"run-second-{uuid.uuid4().hex[:8]}"
+    reply = f"Please run:\n\n```\n!echo {first}\n!echo {second}\n```"
+    reset_mock_llm(mock_llm_server_url)
+    for model in ("default", _CODEX_MOCK_MODEL):
+        set_fallback_mock_llm(mock_llm_server_url, model, reply)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _ensure_chat_view(page)
+    _send(page, "What should I run?")
+    expect(page.locator(_ASSISTANT, has_text="Please run:").first).to_be_visible(timeout=90_000)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+
+    page.locator(_ASSISTANT).get_by_role("button", name="Run 2 commands").click()
+    page.get_by_role("dialog").get_by_role("button", name="Run", exact=True).click()
+
+    for marker in (first, second):
+        expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(1, timeout=60_000)
+    with httpx.Client(base_url=base_url, timeout=15) as client:
+        poll_until(
+            lambda: _shell_inputs(client, session_id) == [f"echo {first}", f"echo {second}"],
+            timeout_s=60,
+            interval_s=1,
+        )
+        snapshot = client.get(f"/v1/sessions/{session_id}")
+        snapshot.raise_for_status()
+        assert snapshot.json()["pending_inputs"] == []
+    # The shell commands never reached the model as prompts.
+    assert page.locator(_ASSISTANT, has_text="Please run:").count() == 1

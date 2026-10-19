@@ -891,6 +891,7 @@ function renderItem(
           className={cn("min-w-0", followsText && "mt-2")}
         >
           <FilePathAwareMessageResponse
+            allowRunCommands={!isTextStreaming}
             className="chat-markdown text-message"
             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
             isStreaming={isTextStreaming}
