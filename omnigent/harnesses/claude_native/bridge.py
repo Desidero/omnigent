@@ -11190,6 +11190,11 @@ def _is_agent_notification_text(text: str) -> bool:
     return wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
 
 
+def _is_coordinator_origin(origin: object) -> bool:
+    """Whether Claude marked a sub-agent's input as a message from its parent agent."""
+    return isinstance(origin, dict) and origin.get("kind") == "coordinator"
+
+
 def _subagent_handback_id(origin: object) -> str | None:
     """Read Claude's explicit returned-result provenance, excluding teammate chatter."""
     if (
@@ -11386,10 +11391,12 @@ def _user_transcript_items_from_entry(
         if isinstance(content, list)
         else []
     )
-    # Keep hidden completion provenance so the parent can link the returned child.
+    # Keep hidden completion provenance so the parent can link the returned child,
+    # and a parent's follow-up so the child's chat shows what it is answering.
     if (
         entry.get("isMeta") is True
         and return_id is None
+        and not _is_coordinator_origin(entry.get("origin"))
         and not any(_is_task_completion_text(text) for text in notification_texts)
     ):
         return current_response_id, []
