@@ -68,6 +68,10 @@ implements them separately, so a fix for one harness does not reach the others.
   the command (a script's first line and "+N lines") and expands to a
   terminal panel with the command, its output and exit status, in the
   Settings terminal theme.
+- `run-suggested-commands`: in claude-native and codex-native chats, **Run**
+  on a shell command an agent suggests queues it as a `!command` shell input
+  after a confirmation; see [Run suggested commands](../docs/run-suggested-commands.md).
+  A `!command` typed in a codex-native web composer runs in Codex's shell too.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
@@ -214,6 +218,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 **Codex side chat:** type `/side <question>` in the parent composer, send a
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
+
+**Run suggested commands:** in a claude-native or codex-native session, ask
+the agent for a shell command in a `bash` block, click the block's Run button
+(titled **Run command**, beside Copy), check the list in the confirmation and
+choose **Run**.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -773,6 +782,11 @@ Cross-harness journeys:
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`run-suggested-commands`:**
+  `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_run_button_queues_each_suggested_command`,
+  `tests/e2e_ui/messages/test_native_codex_shell_input.py::test_run_button_runs_each_suggested_command_in_codex_shell`
+  (real Claude Code or Codex and tmux, like the shell-command journeys above).
+  `web/src/lib/runnableCommands.test.ts` covers which blocks get Run.
 - **`codex-plugin-skills`:** use the
   [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
   real CLI catalog regression and recorded browser journey across both

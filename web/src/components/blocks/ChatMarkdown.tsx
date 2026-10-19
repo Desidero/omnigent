@@ -11,13 +11,17 @@
 // without importing the block dispatcher that renders them.
 
 import type React from "react";
-import { useMemo } from "react";
+import { useContext, useMemo } from "react";
 import { CopyIcon, GitPullRequestIcon } from "lucide-react";
 import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { MessageResponse } from "@/components/ai-elements/message";
+import {
+  MessageResponse,
+  RunCommandsButton,
+  RunCommandsContext,
+} from "@/components/ai-elements/message";
 import {
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
@@ -37,6 +41,7 @@ import { withBasePath } from "@/lib/basePath";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import { extractInlineRunnableCommand } from "@/lib/runnableCommands";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
@@ -179,6 +184,8 @@ function WorkspacePathInlineCode({
   // non-openable one just stays styled inline code — only an explicit
   // markdown link (WorkspaceFileLink) earns dead-path feedback.
   const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
+  const requestRun = useContext(RunCommandsContext);
+  const inlineCommand = requestRun ? extractInlineRunnableCommand(text) : null;
 
   if (openWorkspaceFile) {
     const shortLabel = shortFileCitationLabel(text);
@@ -216,7 +223,7 @@ function WorkspacePathInlineCode({
   }
   // Match Streamdown's default inline-code styling so non-path inline code
   // looks unchanged.
-  return (
+  const code = (
     <code
       className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
       data-streamdown="inline-code"
@@ -225,6 +232,19 @@ function WorkspacePathInlineCode({
       {codeChildren}
     </code>
   );
+  if (requestRun && inlineCommand !== null) {
+    return (
+      <>
+        {code}
+        <RunCommandsButton
+          className="ml-1 size-5 align-middle"
+          commands={[inlineCommand]}
+          onRun={requestRun}
+        />
+      </>
+    );
+  }
+  return code;
 }
 
 // Streamdown's own anchor styling and marker attribute. Overriding the `a`
