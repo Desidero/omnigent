@@ -12,6 +12,7 @@ import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
 import * as readStateHooks from "@/hooks/useUnseenConversations";
@@ -2249,6 +2250,98 @@ describe("Sidebar project sections", () => {
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
     expect(within(recentSection).queryByText("conv_filed")).toBeNull();
+  });
+
+  it("Needs me keeps approvals and unread replies and hides folders with neither", () => {
+    projectsMock.push("Customer X", "Quiet", "Empty");
+    seedReadState([
+      { id: "conv_unread", viewer_last_seen: 199 },
+      { id: "conv_unread_filed", viewer_last_seen: 199 },
+      { id: "conv_read", viewer_last_seen: 200 },
+      { id: "conv_read_filed", viewer_last_seen: 200 },
+      { id: "conv_waiting", viewer_last_seen: 200 },
+    ]);
+    const row = (id: string, partial: Partial<Conversation> = {}) =>
+      conv(id, "Codex", { status: "idle", updated_at: 200, ...partial });
+    mockConversations([
+      row("conv_unread"),
+      row("conv_read"),
+      row("conv_waiting", { pending_elicitations_count: 1 }),
+      row("conv_unread_filed", { labels: { omni_project: "Customer X" } }),
+      row("conv_read_filed", { labels: { omni_project: "Quiet" } }),
+    ]);
+    renderSidebar();
+    expect(screen.getByRole("button", { name: /^Empty/ })).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    fireEvent.click(screen.getByTestId("session-focus-needs-me"));
+    closeProjectsMenu();
+
+    const sessions = screen.getByText("Sessions").closest("section")!;
+    expect(within(sessions).getByText("conv_unread")).toBeInTheDocument();
+    expect(within(sessions).getByText("conv_waiting")).toBeInTheDocument();
+    expect(within(sessions).queryByText("conv_read")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Customer X/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Quiet/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Empty/ })).toBeNull();
+    expect(screen.getByTestId("session-filter")).toHaveAttribute("data-focus-active", "true");
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+      needsMe: true,
+      recency: "any",
+    });
+  });
+
+  it("shows a removable chip per active filter beside the filter button", async () => {
+    const nowSeconds = Date.now() / 1000;
+    mockConversations([
+      conv("conv_recent", "Codex", { status: "idle", updated_at: nowSeconds - 60 * 60 }),
+      conv("conv_stale", "Codex", { status: "idle", updated_at: nowSeconds - 5 * 86400 }),
+    ]);
+    renderSidebar();
+    const sessions = screen.getByText("Sessions").closest("section")!;
+    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
+    expect(screen.queryByTestId("session-focus-chip-needs-me")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    fireEvent.keyDown(screen.getByTestId("session-focus-recency-menu"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("session-focus-recency-three-days"));
+    closeProjectsMenu();
+    const recencyChip = screen.getByRole("button", { name: "Clear Updated filter: last 3 days" });
+    expect(recencyChip).toHaveTextContent("3d");
+    expect(within(sessions).queryByText("conv_stale")).toBeNull();
+    expect(screen.queryByTestId("session-focus-chip-needs-me")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+    fireEvent.click(screen.getByTestId("session-focus-needs-me"));
+    closeProjectsMenu();
+    expect(screen.getByRole("button", { name: "Clear Needs me filter" })).toHaveTextContent(
+      "Needs me",
+    );
+
+    // Each chip clears only its own filter, and the change persists.
+    fireEvent.click(screen.getByRole("button", { name: "Clear Updated filter: last 3 days" }));
+    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
+    expect(screen.getByTestId("session-focus-chip-needs-me")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+      needsMe: true,
+      recency: "any",
+    });
+
+    // Shift+Tab from the filter button reaches the remaining chip; Enter clears
+    // it and leaves focus on the filter button.
+    const user = userEvent.setup();
+    screen.getByTestId("session-filter").focus();
+    await user.tab({ shift: true });
+    expect(screen.getByTestId("session-focus-chip-needs-me")).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("session-filter")).toHaveFocus();
+    expect(screen.queryByTestId("session-focus-chip-needs-me")).toBeNull();
+    expect(screen.getByTestId("session-filter")).not.toHaveAttribute("data-focus-active");
+    expect(within(sessions).getByText("conv_stale")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
+      needsMe: false,
+      recency: "any",
+    });
   });
 
   it("fills a folder from its own fetch, independent of the global list window", async () => {

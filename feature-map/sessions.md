@@ -136,6 +136,13 @@ the header menu), and each place is a separate entry point.
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
+- `attention-filters`: **Needs me** (a pending approval or an unread agent
+  reply, the same read state as the unread dot) and **Updated** (Any time, Last
+  24 hours, Last 3 days, Last 7 days or Last 30 days, as rolling windows)
+  narrow the list. They are saved per device and work with any Display choice,
+  with the grouping flag on or off. While one is on, project folders with no
+  match are hidden, the funnel is highlighted, pins and the open session stay
+  listed, and a chip per filter beside the funnel clears just that filter.
 
 ## How to get to it (user POV)
 
@@ -240,6 +247,11 @@ session. Hovering a row opens
 its tooltip; the repo and PR rows load from the session's GitHub info only once
 the tooltip opens. With the flag off, the funnel sits on the Sessions header and
 offers Display only.
+
+**Needs me and Updated filters:** open the same funnel, with or without
+`sidebar_grouping_ui`, and tick **Needs me** or pick a window under
+**Updated**. Each active filter shows as a chip beside the funnel (**Needs
+me**, **24h**, **3d**, **7d** or **30d**); click a chip to clear that filter.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -780,6 +792,14 @@ plain `uv run pytest`, which starts a private server for the test.
   (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
+- **`attention-filters`:** component coverage in `web/src/shell/Sidebar.test.tsx`,
+  `web/src/shell/sidebarNav.test.ts` and
+  `web/src/lib/sidebarFocusPreferences.test.ts`; no browser test. By hand: with
+  one session showing the unread dot or waiting on an approval and another
+  read, tick **Needs me** and expect only the first (plus pins and the open
+  session) and a **Needs me** chip. Pick **Updated → Last 24 hours** with an
+  older session present and expect it hidden and a **24h** chip. Reload and
+  expect both kept; click each chip and expect the full list back.
 
 ## Gotchas
 
@@ -846,3 +866,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - Grouping and ordering apply to the loaded pages only: an older session joins
   its group once it is paged in. Grouped views hide Projects, so dragging a
   session onto the list never removes it from its project there.
+- With **Needs me** or **Updated** on, the sidebar stops paging in older
+  sessions, so both filters match loaded rows only; matches are recent or
+  unread, so they are normally loaded. Changing either filter leaves selection
+  mode.
