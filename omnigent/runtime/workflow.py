@@ -1474,6 +1474,10 @@ def _build_claude_sdk_spawn_env(
             if isinstance(raw_key, str):
                 source_env_names |= frozenset(_api_key_source_env_names(raw_key))
     env["HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES"] = json.dumps(sorted(source_env_names))
+    # Claude Code built-ins the spec opted into, e.g. WebSearch / WebFetch.
+    native_tools = spec.executor.config.get("native_tools")
+    if native_tools:
+        env["HARNESS_CLAUDE_SDK_NATIVE_TOOLS"] = json.dumps(native_tools)
     return env
 
 
