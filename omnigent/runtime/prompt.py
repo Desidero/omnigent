@@ -58,6 +58,32 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
     "attached) or for non-interactive bulk fetching."
 )
 
+# The chat renders a later mention of a bracketed label as a chip that previews
+# where the item was raised, and a struck-through label as a closed item
+# (web/src/lib/itemLabels.ts matches the label shape).
+ITEM_LABEL_INSTRUCTION = (
+    "Item labels: when you raise something that needs the user's decision or "
+    "attention later (a question, risk, finding, or follow-up), tag it once at "
+    "the start of that item with a short bracketed label: [Q1], [Q2] for "
+    "questions, [R1] for risks, [F1] for findings, [T1] for follow-up tasks. "
+    "Follow the label with a short bold title of a few words, then the full "
+    "detail: [Q2] **Docker socket access?** Full detail... The chat UI lists "
+    "items by that title and shows the whole item when the label is mentioned "
+    "later. Afterwards, refer to the item "
+    'by its label ("still need your call on [Q2]") instead of restating it. '
+    "Labels are session-wide: keep counting up across messages and never reuse "
+    "a label for a different item. When the user writes a label, it means that "
+    "item. Don't wrap labels in backticks or code, and use labels only for items "
+    "like these.\n\n"
+    "Closing items: when an item is resolved, decided, rejected, done, or no "
+    "longer relevant, close it by writing its label struck through, as in "
+    '~~[Q2]~~, inside the sentence that says how it ended ("~~[Q2]~~ copied the '
+    'rows as-is, per your answer"). Close each item once, as soon as it is '
+    "settled. After that, write its label struck through whenever you mention it "
+    "again; a plain mention reopens it. The chat UI pins a list of open items, so "
+    "closing settled ones keeps that list accurate."
+)
+
 
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
@@ -72,11 +98,12 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     The embedded-browser priority guidance follows the ``browser_*``
     registration gate (``ToolManager._register_browser_tools``): every
     agent unless the spec sets ``tool_groups.browser: false``, in which
-    case the prompt must not steer the model toward tools it lacks.
+    case the prompt must not steer the model toward tools it lacks. The
+    item-label guidance applies to every agent, since every transcript
+    renders label chips.
 
     :param spec: The parsed AgentSpec.
-    :returns: The applicable spec-level framework instructions; empty for
-        an agent with no sub-agents and the browser group disabled.
+    :returns: The applicable spec-level framework instructions, never empty.
     """
     instructions: list[str] = []
     dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
@@ -84,7 +111,20 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
     if spec.tool_groups.browser:
         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+    instructions.append(ITEM_LABEL_INSTRUCTION)
     return instructions
+
+
+def native_startup_instructions(author_instructions: str | None) -> str | None:
+    """Author instructions plus the framework text a native launch channel carries.
+
+    Native harnesses take instructions once, at launch, so only framework
+    instructions that hold for every turn of every session belong here.
+
+    :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
+    :returns: The combined text, or ``None`` when there is nothing to send.
+    """
+    return append_framework_instructions(author_instructions, [ITEM_LABEL_INSTRUCTION])
 
 
 def append_framework_instructions(

@@ -1,6 +1,7 @@
 """Tests for canonical system-instruction composition."""
 
 import json
+import re
 from types import SimpleNamespace
 from typing import cast
 
@@ -13,18 +14,21 @@ from omnigent.runner.subagent_work import (
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    ITEM_LABEL_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
     history_to_input_items,
+    native_startup_instructions,
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
 from tests._image_fixtures import _TINY_PNG_BASE64
 
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
+_EVERY_AGENT_GUIDANCE = f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
 
 
 def _spec(
@@ -260,8 +264,7 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
     )
 
     assert result == (
-        "Agent prompt\n\nRequest prompt\n\n"
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+        f"Agent prompt\n\nRequest prompt\n\n{_EVERY_AGENT_GUIDANCE}\n\nFramework prompt"
     )
 
 
@@ -269,7 +272,7 @@ def test_empty_framework_instructions_do_not_change_default() -> None:
     spec = _spec(None)
 
     assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
-        f"You are a helpful assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        f"You are a helpful assistant.\n\n{_EVERY_AGENT_GUIDANCE}"
     )
 
 
@@ -283,7 +286,7 @@ def test_build_instructions_nullable_unauthored_never_fabricates_fallback() -> N
     guidance applies to every agent)."""
     spec = _spec(None)
     result = build_instructions_nullable(spec, None, [])
-    assert result == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert result == _EVERY_AGENT_GUIDANCE
     assert "You are a helpful assistant." not in result
 
 
@@ -292,13 +295,11 @@ def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None
     raw_author_instructions' non-empty/non-whitespace gate, so authored_present
     and composed agree on what counts as "authored"."""
     spec = _spec("   \n  ")
-    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert build_instructions_nullable(spec, None, []) == _EVERY_AGENT_GUIDANCE
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == (
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
-    )
+    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
 
 
 def test_build_instructions_nullable_whitespace_only_per_request_treated_as_absent() -> None:
@@ -306,15 +307,11 @@ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_abse
     the same non-empty/non-whitespace gate applies to both instruction
     sources, not just spec.instructions."""
     spec = _spec(None)
-    assert (
-        build_instructions_nullable(spec, "   \n  ", []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-    )
+    assert build_instructions_nullable(spec, "   \n  ", []) == _EVERY_AGENT_GUIDANCE
     result = build_instructions_nullable(
         spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == (
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
-    )
+    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
 
 
 def test_build_instructions_nullable_authored_present() -> None:
@@ -324,8 +321,7 @@ def test_build_instructions_nullable_authored_present() -> None:
         spec, "Request prompt", [], framework_instructions=("Framework prompt",)
     )
     assert result == (
-        "Agent prompt\n\nRequest prompt\n\n"
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+        f"Agent prompt\n\nRequest prompt\n\n{_EVERY_AGENT_GUIDANCE}\n\nFramework prompt"
     )
 
 
@@ -343,9 +339,7 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == (
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
-    )
+    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
     assert "You are a helpful assistant." not in (result or "")
 
     # The comparison this helper replaces would have misclassified the
@@ -378,28 +372,27 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
     result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
     assert result == (
         f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nTurn note"
+        f"{_EVERY_AGENT_GUIDANCE}\n\nTurn note"
     )
 
     unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
     assert build_instructions_nullable(unauthored, None, []) == (
-        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{_EVERY_AGENT_GUIDANCE}"
     )
 
 
-def test_embedded_browser_guidance_included_for_every_agent() -> None:
+def test_every_agent_guidance_included_for_every_agent() -> None:
     """
-    Every agent's composed prompt steers the model to the embedded browser.
+    Every agent's composed prompt carries the embedded-browser and item-label guidance.
 
     The ``browser_*`` tools are auto-registered for every agent without a
     spec gate (``ToolManager._register_browser_tools``); a tool description
     alone loses to a model's native web tooling, so the system prompt must
-    carry the preference for any spec — authored or not.
+    carry the preference for any spec — authored or not. Every transcript
+    renders item-label chips, so the labelling guidance applies equally.
     """
     authored = _spec("Agent prompt")
-    assert build_instructions(authored, None, []) == (
-        f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
-    )
+    assert build_instructions(authored, None, []) == (f"Agent prompt\n\n{_EVERY_AGENT_GUIDANCE}")
 
 
 def test_embedded_browser_guidance_names_registered_tools() -> None:
@@ -445,12 +438,16 @@ def test_raw_author_instructions_verbatim_and_none() -> None:
 def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
     """
     With the ``browser_*`` tools unregistered, the prompt must not steer
-    the model toward them: author text composes alone, and an unauthored
-    spec yields ``None`` rather than guidance for tools it lacks.
+    the model toward them: only the every-agent label guidance follows the
+    author text, and an unauthored spec yields that guidance alone.
     """
     spec = _spec("You are a helpful assistant.", browser=False)
-    assert build_instructions_nullable(spec, None, []) == "You are a helpful assistant."
-    assert build_instructions_nullable(_spec(None, browser=False), None, []) is None
+    assert build_instructions_nullable(spec, None, []) == (
+        f"You are a helpful assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
+    )
+    assert build_instructions_nullable(_spec(None, browser=False), None, []) == (
+        ITEM_LABEL_INSTRUCTION
+    )
 
 
 def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
@@ -458,5 +455,26 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
     wake notice still rides its own dispatch gate."""
     spec = _spec(None, spawn=True, browser=False)
     result = build_instructions_nullable(spec, None, [])
-    assert result == SUBAGENT_WAKE_NOTICE_INSTRUCTION
+    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+
+
+def test_native_startup_instructions_append_item_labels_after_author_text() -> None:
+    """Native launch channels carry the author text first, then the label guidance."""
+    assert native_startup_instructions("  Agent prompt  ") == (
+        f"  Agent prompt  \n\n{ITEM_LABEL_INSTRUCTION}"
+    )
+    assert native_startup_instructions(None) == ITEM_LABEL_INSTRUCTION
+
+
+def test_item_label_examples_match_the_chat_label_shape() -> None:
+    """Every example label must match the shape web/src/lib/itemLabels.ts renders as a chip."""
+    examples = re.findall(r"\[[^\]]*\]", ITEM_LABEL_INSTRUCTION)
+    assert examples
+    for example in examples:
+        assert re.fullmatch(r"\[[A-Z]{1,3}\d{1,3}\]", example)
+
+
+def test_item_label_instruction_shows_a_bold_title_after_the_label() -> None:
+    """The example puts a bold title right after the label, which the chat UI lists items by."""
+    assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
