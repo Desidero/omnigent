@@ -1,6 +1,7 @@
 """Tests for canonical system-instruction composition."""
 
 import json
+import re
 from types import SimpleNamespace
 from typing import cast
 
@@ -13,6 +14,7 @@ from omnigent.runner.subagent_work import (
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    ITEM_LABEL_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
     WORKSPACE_IMAGE_INSTRUCTION,
@@ -26,9 +28,9 @@ from omnigent.runtime.prompt import (
 from omnigent.spec import AgentSpec
 from tests._image_fixtures import _TINY_PNG_BASE64
 
-_DEFAULT_FRAMEWORK_INSTRUCTIONS = (
-    f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
-)
+# Guidance every agent gets, native launches included.
+_STABLE_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+_DEFAULT_FRAMEWORK_INSTRUCTIONS = f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_STABLE_GUIDANCE}"
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
 
 
@@ -382,14 +384,15 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
     )
 
 
-def test_embedded_browser_guidance_included_for_every_agent() -> None:
+def test_every_agent_guidance_included_for_every_agent() -> None:
     """
-    Every agent's composed prompt steers the model to the embedded browser.
+    Every agent's composed prompt carries the embedded-browser and item-label guidance.
 
     The ``browser_*`` tools are auto-registered for every agent without a
     spec gate (``ToolManager._register_browser_tools``); a tool description
     alone loses to a model's native web tooling, so the system prompt must
-    carry the preference for any spec — authored or not.
+    carry the preference for any spec — authored or not. Every transcript
+    renders item-label chips, so the labelling guidance applies equally.
     """
     authored = _spec("Agent prompt")
     assert build_instructions(authored, None, []) == (
@@ -444,12 +447,9 @@ def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
     """
     spec = _spec("You are a helpful assistant.", browser=False)
     assert build_instructions_nullable(spec, None, []) == (
-        f"You are a helpful assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        f"You are a helpful assistant.\n\n{_STABLE_GUIDANCE}"
     )
-    assert (
-        build_instructions_nullable(_spec(None, browser=False), None, [])
-        == WORKSPACE_IMAGE_INSTRUCTION
-    )
+    assert build_instructions_nullable(_spec(None, browser=False), None, []) == _STABLE_GUIDANCE
 
 
 def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
@@ -457,15 +457,28 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
     wake notice still rides its own dispatch gate."""
     spec = _spec(None, spawn=True, browser=False)
     result = build_instructions_nullable(spec, None, [])
-    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{_STABLE_GUIDANCE}"
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
 
 
-def test_native_startup_instructions_keep_only_stable_image_guidance() -> None:
-    """Native startup preserves author text without unrelated tool/turn guidance."""
+def test_native_startup_instructions_keep_only_stable_guidance() -> None:
+    """Native startup preserves author text, then image and item-label guidance only."""
     spec = _spec("  Follow the user's directions.  ", spawn=True)
     result = build_native_startup_instructions(spec)
-    assert result == f"{spec.instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    assert result == f"{spec.instructions}\n\n{_STABLE_GUIDANCE}"
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
     assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in result
-    assert build_native_startup_instructions(None) == WORKSPACE_IMAGE_INSTRUCTION
+    assert build_native_startup_instructions(None) == _STABLE_GUIDANCE
+
+
+def test_item_label_examples_match_the_chat_label_shape() -> None:
+    """Every example label must match the shape web/src/lib/itemLabels.ts renders as a chip."""
+    examples = re.findall(r"\[[^\]]*\]", ITEM_LABEL_INSTRUCTION)
+    assert examples
+    for example in examples:
+        assert re.fullmatch(r"\[[A-Z]{1,3}\d{1,3}\]", example)
+
+
+def test_item_label_instruction_shows_a_bold_title_after_the_label() -> None:
+    """The example puts a bold title right after the label, which the chat UI lists items by."""
+    assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
