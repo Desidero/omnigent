@@ -46,7 +46,7 @@ from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.runtime import workflow
-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec import load_omnigent_yaml
 from omnigent.telemetry.request_headers import client_user_agent
 from omnigent.terminals.ws_common import (
@@ -1993,6 +1993,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
     assert (
         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
     )
+    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
 
 
 def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
@@ -2080,6 +2081,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
     assert (
         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
     )
+    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
 
 
 def test_local_resume_does_not_print_redundant_resume_hint(
@@ -7120,15 +7122,15 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
     result = claude_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Claude Code is running in the session terminal" in result
-    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
+    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
 
 
 def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert (
-        claude_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
+    assert claude_native._wrapper_spec_startup_instructions(bad_spec) == (
+        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
     )
 
 

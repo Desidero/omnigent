@@ -81,7 +81,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
@@ -171,6 +171,17 @@ class _ResumeSnapshotServerClient(NullServerClient):
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+# What a native launch with no author text appends to the system prompt.
+_STARTUP_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+
+
+def _appended_system_prompt(args: list[str]) -> str | None:
+    """Return the ``--append-system-prompt`` value, or None when it is absent."""
+    if "--append-system-prompt" not in args:
+        return None
+    return args[args.index("--append-system-prompt") + 1]
 
 
 def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
@@ -419,9 +430,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         path.parent == Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
     )
     expected = (
-        f"{instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        f"{instructions}\n\n{_STARTUP_GUIDANCE}"
         if instruction_spec in {"raw", "resolved", "resolved-replace"}
-        else WORKSPACE_IMAGE_INSTRUCTION
+        else _STARTUP_GUIDANCE
     )
     if memory_guidance is not None:
         expected = f"{expected}\n\n{memory_guidance}"
@@ -1560,9 +1571,9 @@ async def test_devin_image_guidance_leaves_the_rule_for_authored_sessions(
             bridge.bridge_dir_for_session_id(session_id)
         )
         expected = (
-            f"{authored}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+            f"{authored}\n\n{_STARTUP_GUIDANCE}"
             if session_id == "fallback-session"
-            else WORKSPACE_IMAGE_INSTRUCTION
+            else _STARTUP_GUIDANCE
         )
         assert preamble == expected
         if authored is None:
@@ -2425,7 +2436,7 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
 ) -> None:
     """
     Host-spawned launch emits ``--append-system-prompt`` with the agent's
-    author instructions and stable image guidance.
+    author instructions, then the stable image and item-label guidance.
 
     The managed-host wiring in ``runner/native/orchestration.py``
     (``augment_claude_args(..., append_system_prompt=
@@ -2492,11 +2503,9 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
         agent_spec=agent_spec,
     )
 
-    args = captured["spec"].args
-    assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
-    idx = args.index("--append-system-prompt")
-    assert args[idx + 1] == (
-        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    assert _appended_system_prompt(captured["spec"].args) == (
+        "Be a concise, careful coding assistant.\n\n"
+        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
     )
 
 
@@ -3811,11 +3820,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         # A fork's rebuild starts its own count.
         assert synth_costs == [None] * int(fork_carry_history)
 
-    # Startup gets image guidance; session-title metadata stays out of it.
-    assert (
-        launched_args[launched_args.index("--append-system-prompt") + 1]
-        == WORKSPACE_IMAGE_INSTRUCTION
-    )
+    # Startup gets the stable guidance; session-title metadata stays out of it.
+    assert _appended_system_prompt(launched_args) == _STARTUP_GUIDANCE
 
     permission_mode_index = launched_args.index("--permission-mode")
     assert launched_args[permission_mode_index + 1] == "auto"
@@ -6806,7 +6812,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     # early no longer cascades into "no server running" (#540).
     assert spec.keep_alive_after_exit is True
     args = spec.args
-    assert args[args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
+    assert _appended_system_prompt(args) == _STARTUP_GUIDANCE
     settings = _load_claude_invocation_settings(args)
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
@@ -7040,7 +7046,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
     )
     # A pinned session's spawns stay on the claude family, so it gets neither
     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
-    assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
+    assert _appended_system_prompt(spec.args) == _STARTUP_GUIDANCE
 
 
 async def test_a_subagent_only_claude_native_launch_gates_spawns_and_keeps_its_model(
@@ -7107,7 +7113,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     # The custom-slot pin tracks the launched 1M-capable Opus and carries [1m].
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
     # And the auto-harness extras, which only make sense alongside the router.
-    assert "--append-system-prompt" in spec.args
+    assert (_appended_system_prompt(spec.args) or "").startswith(f"{_STARTUP_GUIDANCE}\n\n")
     allowed = spec.args[spec.args.index("--allowedTools") + 1]
     assert "mcp__omnigent__sys_session_create" in allowed
 
