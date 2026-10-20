@@ -11,8 +11,11 @@ from omnigent.runner.app import (
     _native_startup_instructions_from_spec,
 )
 from omnigent.runner.native.orchestration import _opencode_session_instructions_from_spec
-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+# The stable guidance every native startup carries after the author text.
+_STARTUP_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
 
 
 def _spec(instructions: str | None) -> AgentSpec:
@@ -28,9 +31,9 @@ def _spec(instructions: str | None) -> AgentSpec:
 @pytest.mark.parametrize(
     ("instructions", "expected"),
     [
-        ("Be a concise assistant.", f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"),
-        (None, WORKSPACE_IMAGE_INSTRUCTION),
-        ("   \n  ", WORKSPACE_IMAGE_INSTRUCTION),
+        ("Be a concise assistant.", f"Be a concise assistant.\n\n{_STARTUP_GUIDANCE}"),
+        (None, _STARTUP_GUIDANCE),
+        ("   \n  ", _STARTUP_GUIDANCE),
     ],
     ids=["present", "absent", "whitespace-only"],
 )
@@ -41,7 +44,7 @@ def test_native_startup_instructions_from_spec(instructions: str | None, expecte
 
 def test_native_startup_instructions_from_spec_none_spec() -> None:
     """A missing spec still receives stable image guidance."""
-    assert _native_startup_instructions_from_spec(None) == WORKSPACE_IMAGE_INSTRUCTION
+    assert _native_startup_instructions_from_spec(None) == _STARTUP_GUIDANCE
 
 
 @pytest.mark.parametrize("has_spec", [False, True])
@@ -56,7 +59,7 @@ def test_native_startup_instructions_from_spec_resolved_wrapper() -> None:
     """A ResolvedSpec wrapper unwraps to the same instructions text."""
     wrapped = ResolvedSpec(spec=_spec("Be a concise assistant."), workdir=Path("/tmp"))
     assert _native_startup_instructions_from_spec(wrapped) == (
-        f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        f"Be a concise assistant.\n\n{_STARTUP_GUIDANCE}"
     )
 
 
@@ -64,7 +67,7 @@ def test_native_startup_instructions_from_spec_never_returns_stripped_form() -> 
     """The original resolved text is preserved verbatim, not the stripped form."""
     padded = "  Keep leading/trailing whitespace exactly.  "
     assert _native_startup_instructions_from_spec(_spec(padded)) == (
-        f"{padded}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        f"{padded}\n\n{_STARTUP_GUIDANCE}"
     )
 
 
@@ -98,8 +101,7 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
     )
 
     assert text == (
-        f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
-        "\n\nROUTING NOTE\n\nMEMORY GUIDANCE"
+        f"Be a concise assistant.\n\n{_STARTUP_GUIDANCE}\n\nROUTING NOTE\n\nMEMORY GUIDANCE"
     )
     # The workspace reaches the guidance, which names the session's project from it.
     assert memory_guidance == [(client, "sess", spec, "/work/omnigent")]
