@@ -35,9 +35,11 @@ import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
+import { ItemLabelIndexContext } from "@/lib/itemLabels";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
+import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
 import {
   RunnerStartingIndicator,
   McpStartupIndicator,
@@ -48,6 +50,7 @@ import {
   type ConversationScroller,
   BubbleView,
   ConversationScrollRefBridge,
+  buildBubbleItemLabelIndex,
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
@@ -412,162 +415,180 @@ function TranscriptImpl({
     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
-  const hasPinnedBanner = display.hasTasks || showArcaBanner;
+  const itemLabelIndex = useMemo(
+    () => buildBubbleItemLabelIndex(display.bubbles),
+    [display.bubbles],
+  );
+  const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
+  const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
   return (
     <TaskMarkersProvider value={taskMarkers}>
-      {/* Task preview pinned above the thread. Sibling of the viewport (not an
+      <ItemLabelIndexContext.Provider value={itemLabelIndex}>
+        {/* Task preview pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
-      {conversationId && (
-        <ChatTasksPreview
-          conversationId={conversationId}
-          tasks={tasks}
-          className="mt-14 md:mt-12"
-        />
-      )}
-      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
-      {/* Wrapper div gives us a ref to scope the SelectionPopup to the
-      conversation area without requiring Conversation to forward refs. */}
-      <div
-        ref={setConversationEl}
-        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
-      >
-        <Conversation
-          className={cn(
-            !isMobileViewport &&
-              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
-            "flex-1",
-          )}
-        >
-          <ConversationContent
-            scrollClassName="transcript-hide-native-scrollbar"
-            className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
-              hasPinnedBanner ? "pt-4" : "pt-20",
-              showArcaBanner && "chat-content-under-arca-banner",
-              CHAT_COLUMN_WIDTH,
-            )}
-          >
-            {/* Scroll helpers — must live inside StickToBottom to access context. */}
-            <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <KeepBottomOnResize />
-            <HistoryAutoLoader
-              scrollElement={scroller?.el ?? null}
-              rowCount={display.streamBubbles.length}
-            />
-            {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
-              sandboxLaunching || sandboxFailed ? (
-                <RunnerStartingIndicator variant="hero" />
-              ) : (
-                <ConversationEmptyState>
-                  <div className="space-y-1.5">
-                    <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                      What should we work on?
-                    </h3>
-                    <p className="text-muted-foreground text-ui">
-                      {agentsError
-                        ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                        : "Send a message to get started."}
-                    </p>
-                  </div>
-                </ConversationEmptyState>
-              )
-            ) : (
-              <>
-                {/* Older pages prepend here while their request is in flight. */}
-                {display.loadingMoreHistory && <HistoryLoadingIndicator />}
-                <VirtualBubbleList
-                  bubbles={display.streamBubbles}
-                  scrollEl={scroller?.el ?? null}
-                  lastAssistantIndex={lastAssistantIndex}
-                  showsWorking={display.showsWorking}
-                  sessionIdle={sessionStatus === "idle"}
-                  conversationId={display.conversationId}
-                  hasTasks={display.hasTasks}
-                  disableVirtualization={disableVirtualization}
-                  messageId={messageId}
-                  onGeometryChange={onGeometryChange}
-                />
-                {/* Pending elicitation cards, floated to the bottom of the chat
-                so an outstanding question stays in view. Newest renders last,
-                nearest the composer. Above the Working… indicator. */}
-                {display.pendingElicitations.map((item) => (
-                  <Message
-                    key={item.elicitationId}
-                    from="assistant"
-                    className="max-w-full"
-                    data-testid="bottom-elicitation"
-                    data-message-id={item.elicitationId}
-                  >
-                    <MessageContent className="w-full">
-                      <ElicitationCard
-                        item={item}
-                        keyboardActive={item.elicitationId === display.keyboardActiveElicitationId}
-                      />
-                    </MessageContent>
-                  </Message>
-                ))}
-                {/* Working… shimmer, lit for the whole busy turn. */}
-                <WorkingIndicatorRow
-                  key={display.conversationId ?? "landing"}
-                  show={showWorkingIndicator}
-                />
-                {/* Managed-sandbox launch status; only when Working is absent. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-                {/* MCP-server startup band (codex-native); clears once the
-                round settles (failures stay in host logs, not the chat). */}
-                <McpStartupIndicator />
-              </>
-            )}
-            {/* Frames the initially loaded turn at the top of the viewport. */}
-            <LatestTurnSpacer
-              key={display.conversationId ?? "landing"}
-              scrollElement={scroller?.el ?? null}
-              conversationId={display.conversationId}
-              blockCount={display.blockCount}
-              committedUserIds={display.committedUserIds}
-              hasCommittedAnchor={display.hasCommittedAnchor}
-              topGapPx={display.hasTasks ? 16 : undefined}
-              measureRef={spacerMeasureRef}
-              remeasureNonce={spacerMeasureNonce}
-            />
-          </ConversationContent>
-          {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
-          <ConversationScrollRefBridge onScroller={setScroller} />
-          <ConversationScrollButton
-            className={
-              isMobileViewport
-                ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
-                : undefined
-            }
-          />
-        </Conversation>
-        {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
-        chat-scroll-fade mask. */}
-        <TranscriptScrollbar scroller={scroller} topInset={display.hasTasks ? 12 : undefined} />
-        {/* Hover the top edge to reveal a pill that loads all older history. */}
-        <JumpToTopButton
-          containerEl={containerEl}
-          scroller={scroller}
-          hasMoreHistory={display.hasMoreHistory}
-        />
-        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
-        <FloatingBannerStack>
-          <StreamBudgetBanner />
-          <DbcertBanner conversationId={conversationId} hostId={hostId} />
-          <SandboxActionBanner />
-        </FloatingBannerStack>
-        {/* Left-edge minimap: one tick per turn. Desktop-only. */}
-        {!isMobileViewport && (
-          <TurnRail
-            turns={turns}
-            hasMoreHistory={display.hasMoreHistory}
-            loadingMoreHistory={display.loadingMoreHistory}
-            ensureItemVisible={ensureItemVisible}
-            activeTurnId={activeTurnId}
+        {conversationId && (
+          <ChatTasksPreview
+            conversationId={conversationId}
+            tasks={tasks}
+            className="mt-14 md:mt-12"
           />
         )}
-      </div>
+        {/* The first pinned row clears the header; chat-tasks-preview adds the
+      native shells' safe-area shift (index.css). */}
+        <OpenItemsPanel
+          className={display.hasTasks ? undefined : "chat-tasks-preview mt-14 md:mt-12"}
+        />
+        {showArcaBanner && (
+          <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks || hasOpenItems} />
+        )}
+        {/* Wrapper div gives us a ref to scope the SelectionPopup to the
+      conversation area without requiring Conversation to forward refs. */}
+        <div
+          ref={setConversationEl}
+          className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        >
+          <Conversation
+            className={cn(
+              !isMobileViewport &&
+                (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
+              "flex-1",
+            )}
+          >
+            <ConversationContent
+              scrollClassName="transcript-hide-native-scrollbar"
+              className={cn(
+                "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
+                hasPinnedBanner ? "pt-4" : "pt-20",
+                showArcaBanner && "chat-content-under-arca-banner",
+                CHAT_COLUMN_WIDTH,
+              )}
+            >
+              {/* Scroll helpers — must live inside StickToBottom to access context. */}
+              <ScrollToBottomOnSend nonce={sendScrollNonce} />
+              <KeepBottomOnResize />
+              <HistoryAutoLoader
+                scrollElement={scroller?.el ?? null}
+                rowCount={display.streamBubbles.length}
+              />
+              {display.bubbles.length === 0 &&
+              !showWorkingIndicator &&
+              !display.mcpStartupActive ? (
+                sandboxLaunching || sandboxFailed ? (
+                  <RunnerStartingIndicator variant="hero" />
+                ) : (
+                  <ConversationEmptyState>
+                    <div className="space-y-1.5">
+                      <h3 className="text-2xl font-medium tracking-[-0.02em]">
+                        What should we work on?
+                      </h3>
+                      <p className="text-muted-foreground text-ui">
+                        {agentsError
+                          ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
+                          : "Send a message to get started."}
+                      </p>
+                    </div>
+                  </ConversationEmptyState>
+                )
+              ) : (
+                <>
+                  {/* Older pages prepend here while their request is in flight. */}
+                  {display.loadingMoreHistory && <HistoryLoadingIndicator />}
+                  <VirtualBubbleList
+                    bubbles={display.streamBubbles}
+                    scrollEl={scroller?.el ?? null}
+                    lastAssistantIndex={lastAssistantIndex}
+                    showsWorking={display.showsWorking}
+                    sessionIdle={sessionStatus === "idle"}
+                    conversationId={display.conversationId}
+                    hasTasks={display.hasTasks}
+                    disableVirtualization={disableVirtualization}
+                    messageId={messageId}
+                    onGeometryChange={onGeometryChange}
+                  />
+                  {/* Pending elicitation cards, floated to the bottom of the chat
+                so an outstanding question stays in view. Newest renders last,
+                nearest the composer. Above the Working… indicator. */}
+                  {display.pendingElicitations.map((item) => (
+                    <Message
+                      key={item.elicitationId}
+                      from="assistant"
+                      className="max-w-full"
+                      data-testid="bottom-elicitation"
+                      data-message-id={item.elicitationId}
+                    >
+                      <MessageContent className="w-full">
+                        <ElicitationCard
+                          item={item}
+                          keyboardActive={
+                            item.elicitationId === display.keyboardActiveElicitationId
+                          }
+                        />
+                      </MessageContent>
+                    </Message>
+                  ))}
+                  {/* Working… shimmer, lit for the whole busy turn. */}
+                  <WorkingIndicatorRow
+                    key={display.conversationId ?? "landing"}
+                    show={showWorkingIndicator}
+                  />
+                  {/* Managed-sandbox launch status; only when Working is absent. */}
+                  {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                  {/* MCP-server startup band (codex-native); clears once the
+                round settles (failures stay in host logs, not the chat). */}
+                  <McpStartupIndicator />
+                </>
+              )}
+              {/* Frames the initially loaded turn at the top of the viewport. */}
+              <LatestTurnSpacer
+                key={display.conversationId ?? "landing"}
+                scrollElement={scroller?.el ?? null}
+                conversationId={display.conversationId}
+                blockCount={display.blockCount}
+                committedUserIds={display.committedUserIds}
+                hasCommittedAnchor={display.hasCommittedAnchor}
+                topGapPx={display.hasTasks ? 16 : undefined}
+                measureRef={spacerMeasureRef}
+                remeasureNonce={spacerMeasureNonce}
+              />
+            </ConversationContent>
+            {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
+            <ConversationScrollRefBridge onScroller={setScroller} />
+            <ConversationScrollButton
+              className={
+                isMobileViewport
+                  ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
+                  : undefined
+              }
+            />
+          </Conversation>
+          {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
+        chat-scroll-fade mask. */}
+          <TranscriptScrollbar scroller={scroller} topInset={display.hasTasks ? 12 : undefined} />
+          {/* Hover the top edge to reveal a pill that loads all older history. */}
+          <JumpToTopButton
+            containerEl={containerEl}
+            scroller={scroller}
+            hasMoreHistory={display.hasMoreHistory}
+          />
+          {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+          <FloatingBannerStack>
+            <StreamBudgetBanner />
+            <DbcertBanner conversationId={conversationId} hostId={hostId} />
+            <SandboxActionBanner />
+          </FloatingBannerStack>
+          {/* Left-edge minimap: one tick per turn. Desktop-only. */}
+          {!isMobileViewport && (
+            <TurnRail
+              turns={turns}
+              hasMoreHistory={display.hasMoreHistory}
+              loadingMoreHistory={display.loadingMoreHistory}
+              ensureItemVisible={ensureItemVisible}
+              activeTurnId={activeTurnId}
+            />
+          )}
+        </div>
+      </ItemLabelIndexContext.Provider>
     </TaskMarkersProvider>
   );
 }
