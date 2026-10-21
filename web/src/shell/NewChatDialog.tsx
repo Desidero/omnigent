@@ -64,6 +64,12 @@ import {
   type SandboxProfileSelection,
 } from "@/components/SandboxProfilePicker";
 import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
+import {
+  NewSessionLabelChips,
+  NewSessionLabelsDialog,
+} from "@/components/composer/NewSessionLabels";
+import { useNewSessionLabels } from "@/hooks/useSessionLabels";
+import { projectDefaultLabels } from "@/lib/sessionLabels";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -2133,6 +2139,9 @@ interface LandingDraft {
   // neither turns an untouched seed into an "explicit" value nor the reverse.
   agentFromConfig: boolean;
   workspaceFromConfig: boolean;
+  // The new session's label edits: a value sets a label, `null` leaves a
+  // project default off.
+  labelEdits: Record<string, string | null>;
 }
 
 const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed";
@@ -2472,6 +2481,11 @@ function NewChatLandingContent({
           // the other visit's workspace — drop the marker with it so the
           // seed/retract machinery starts clean for this visit.
           autoSeededBranch: "",
+          // Added labels come along; a removed default belonged to the other
+          // project.
+          labelEdits: Object.fromEntries(
+            Object.entries(landingDraft.labelEdits).filter(([, value]) => value !== null),
+          ),
         };
 
   const [message, setMessage] = useState<string>(() => {
@@ -2763,6 +2777,17 @@ function NewChatLandingContent({
   // Pre-filled from the `?project=` param so the sidebar's per-project
   // "new session" pencil lands here with the project already selected.
   const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
+  // Labels the session starts with, pre-filled with the project's defaults.
+  const projectLabelDefaults = useMemo(
+    () => projectDefaultLabels(storedProjectConfig),
+    [storedProjectConfig],
+  );
+  const sessionLabels = useNewSessionLabels(
+    projectLabelDefaults,
+    selectedProject,
+    restoredDraft?.labelEdits,
+  );
+  const [labelsDialogOpen, setLabelsDialogOpen] = useState(false);
   // The landing screen stays mounted while the `?project=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
   // re-run — sync the selection to the param whenever it changes.
@@ -2925,6 +2950,7 @@ function NewChatLandingContent({
     costControlMode,
     agentFromConfig: agentFromConfigRef.current,
     workspaceFromConfig: workspaceFromConfigRef.current,
+    labelEdits: sessionLabels.edits,
   };
   useEffect(() => {
     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
@@ -6123,7 +6149,9 @@ function NewChatLandingContent({
         } else if (startInExistingWorktree) {
           bundledGitOptions = { branchName: activeWorktree!.branch!, existingWorktree: true };
         }
-        const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
+        const metadata: Parameters<typeof createBundledSession>[1] = {
+          labels: { ...sessionLabels.requestLabels, ...createLabels },
+        };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
         if (sandboxSelected) {
           // Multipart creates allocate their host server-side; they cannot reserve a host ID.
@@ -6284,7 +6312,10 @@ function NewChatLandingContent({
           // placeholder, so the placeholder's wrapper labels, launch args and
           // model would all describe a CLI the router may not pick. The
           // server stamps the routed wrapper's labels once it has rebound.
+          // A removed project default rides along as null so the server
+          // leaves it off this session.
           labels: {
+            ...sessionLabels.requestLabels,
             ...(smartRoutingHarnessSelected ? {} : createLabels),
             [CLIENT_CREATE_TOKEN_LABEL]: createToken,
           },
@@ -7252,6 +7283,11 @@ function NewChatLandingContent({
                 delivered as an "[Attached: <path>]" marker prepended to the
                 first message at create time. */}
                     <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
+                    <NewSessionLabelChips
+                      labels={sessionLabels.labels}
+                      onEdit={() => setLabelsDialogOpen(true)}
+                      onRemove={sessionLabels.removeLabel}
+                    />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}
@@ -7297,6 +7333,8 @@ function NewChatLandingContent({
                                 : undefined
                             : undefined
                         }
+                        onLabels={() => setLabelsDialogOpen(true)}
+                        labelCount={Object.keys(sessionLabels.labels).length}
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
                           const params = new URLSearchParams(searchParams);
@@ -8103,6 +8141,15 @@ function NewChatLandingContent({
               }
             : undefined
         }
+      />
+      <NewSessionLabelsDialog
+        open={labelsDialogOpen}
+        onOpenChange={setLabelsDialogOpen}
+        labels={sessionLabels.labels}
+        projectDefaults={projectLabelDefaults}
+        projectName={selectedProject}
+        onSet={sessionLabels.setLabel}
+        onRemove={sessionLabels.removeLabel}
       />
     </div>
   );
