@@ -1,5 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -26,7 +27,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { BotIcon, FileTextIcon, Loader2Icon, XIcon } from "lucide-react";
+import { BotIcon, CheckIcon, FileTextIcon, Loader2Icon, XIcon } from "lucide-react";
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
@@ -75,6 +76,12 @@ import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import {
+  ItemCommentModeHeader,
+  ItemCommentTray,
+  itemCommentSendLabel,
+} from "@/components/composer/ItemCommentTray";
+import { useItemCommentMode, type ComposerContent } from "@/hooks/useItemCommentMode";
+import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
 } from "@/hooks/useNativeServerSwitcher";
@@ -104,6 +111,7 @@ import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   takeFailedSendDraft,
+  committedItemProvesDelivery,
   consumePendingInitialPrompt,
   holdsInitialDraft,
   isStaleTempConvId,
@@ -140,6 +148,7 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
+  expandMentionTokens,
   findMentionTokens,
   mergeTaggedDrafts,
   presentMentions,
@@ -374,6 +383,20 @@ const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 /** The draft's text as sent: a command is trimmed, anything else keeps its leading space. */
 function authoredOutgoingText(fullText: string, trimmed: string): string {
   return isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+}
+
+/**
+ * Whether a composer send goes out on its own, leaving the comment drafts:
+ * a slash command or skill (built-in or plaintext, /btw and /side included)
+ * or a `!` shell input, which must lead the message to work.
+ */
+export function sendsWithoutCommentDrafts(text: string, commands: Iterable<string>): boolean {
+  const trimmed = text.trim();
+  return (
+    trimmed.startsWith("!") ||
+    isSlashCommandText(trimmed) ||
+    matchSlashCommandInvocation(trimmed, commands) !== null
+  );
 }
 
 /**
@@ -2792,6 +2815,9 @@ function ComposerImpl(
   valueRef.current = fullText;
   const replyDraftRef = useRef(storedReplyDraft);
   replyDraftRef.current = storedReplyDraft;
+  // What the user had typed before commenting on an item; it, not the
+  // comment, is this session's draft while comment mode is on.
+  const commentSetAsideRef = useRef<ComposerContent | null>(null);
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
   // the input, which would delete the draft. Only save when the user
@@ -2891,14 +2917,27 @@ function ComposerImpl(
     // The store binds a clicked session a moment later; keep focus in a rename started meanwhile.
     if (!isMobileRef.current && !isInlineRenameFocused()) textareaRef.current?.focus();
 
+    // Read when the session is left: the composer may be mid-comment then.
+    const setAsideRef = commentSetAsideRef;
     return () => {
       if (!conversationId || !dirtyRef.current) return;
-      setSessionDraft(conversationId, {
-        text: valueRef.current,
-        files: draftFilesRef.current,
-        replyDraft: replyDraftRef.current,
-        mentions: taggedMentionsRef.current,
-      });
+      const setAside = setAsideRef.current;
+      setSessionDraft(
+        conversationId,
+        setAside
+          ? {
+              text: setAside.text,
+              files: setAside.files,
+              replyDraft: setAside.replyDraft,
+              mentions: { files: setAside.mentions, sessions: setAside.sessions },
+            }
+          : {
+              text: valueRef.current,
+              files: draftFilesRef.current,
+              replyDraft: replyDraftRef.current,
+              mentions: taggedMentionsRef.current,
+            },
+      );
     };
   }, [conversationId, replaceText]);
 
@@ -2936,13 +2975,24 @@ function ComposerImpl(
   // rather than only learning about a draft when this composer unmounts.
   useEffect(() => {
     if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
-    setSessionDraft(conversationId, {
-      text: fullText,
-      files: draftFilesRef.current,
-      replyDraft: storedReplyDraft,
-      // Tagging always edits the text too, so fullText re-runs this effect.
-      mentions: taggedMentionsRef.current,
-    });
+    const setAside = commentSetAsideRef.current;
+    setSessionDraft(
+      conversationId,
+      setAside
+        ? {
+            text: setAside.text,
+            files: setAside.files,
+            replyDraft: setAside.replyDraft,
+            mentions: { files: setAside.mentions, sessions: setAside.sessions },
+          }
+        : {
+            text: fullText,
+            files: draftFilesRef.current,
+            replyDraft: storedReplyDraft,
+            // Tagging always edits the text too, so fullText re-runs this effect.
+            mentions: taggedMentionsRef.current,
+          },
+    );
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
   const terminalPending = useChatStore((s) => s.terminalPending);
@@ -3174,6 +3224,7 @@ function ComposerImpl(
     attachMention,
     openMentionDir,
     mentionedSessions,
+    setMentionedSessions,
     attachSession,
     attachPastedFiles,
     mentionedAttachments,
@@ -3263,12 +3314,6 @@ function ComposerImpl(
     attachedFiles.length > 0 ||
     hasMentions ||
     localReviewComments.length > 0;
-  const showInterruptButton =
-    isWorking &&
-    (!hasDraft ||
-      hasPendingElicitation ||
-      isTempConvId(conversationId) ||
-      hasPendingInitialMessage);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // tagged items and inline tokens, deduping against what's already tagged,
@@ -3306,6 +3351,89 @@ function ComposerImpl(
     return () => useChatStore.getState().clearPendingComposerAttachments();
   }, [pendingComposerAttachments, editText]);
 
+  // Comment mode: commenting on a labelled item borrows this composer, so
+  // attachments, paste, @-mentions and dictation all work in the comment.
+  // Declared before the history hooks it calls back into; `write` only runs
+  // from events and effects, after this render has defined them.
+  const commentMode = useItemCommentMode({
+    sessionId: composerSessionId,
+    // Only while the text field takes input (it shares the composer's gates).
+    enabled:
+      !isReadOnly &&
+      !composerLockedByBtw &&
+      !((disabled || unreachable) && sendDisabledReason === null),
+    setAsideRef: commentSetAsideRef,
+    read: () => ({
+      text: valueRef.current,
+      ...(replyDraftRef.current ? { replyDraft: replyDraftRef.current } : {}),
+      // Like a saved draft, a pasted chip leaves with its file among the tray's.
+      files: draftFilesRef.current,
+      mentions: taggedMentionsRef.current.files,
+      sessions: taggedMentionsRef.current.sessions,
+    }),
+    write: (content) => {
+      replaceText(content.text, content.replyDraft);
+      textareaRef.current = tailTextareaRef.current;
+      restoreFiles(content.files);
+      setMentionedItems(content.mentions);
+      setMentionedSessions(content.sessions);
+      dirtyRef.current = true;
+      resetCursor();
+      recallingRef.current = false;
+      setCommandError(null);
+    },
+    focus: () => {
+      if (!isMobileRef.current) tailTextareaRef.current?.focus();
+    },
+    expandMentions: (text, mentions, sessions) => {
+      const present = presentMentions(
+        composerInlineMentions({ files: mentions, sessions }, sessionHarness),
+        [text],
+      );
+      return {
+        text: expandMentionTokens(text, present),
+        tagsSessions: present.some((m) => m.marker.startsWith("[Session: ")),
+      };
+    },
+    send: (text, sendFiles, options) =>
+      options ? onSend(text, sendFiles, undefined, options) : onSend(text, sendFiles),
+  });
+  const commentTarget = commentMode.target;
+  const takeFailedCommentSend = commentMode.takeFailedSend;
+  // A new comment being written goes out with the drafts if they're sent first.
+  const composingCommentLabel =
+    commentTarget && !commentTarget.draftId && hasDraft ? commentTarget.label : null;
+  const generalContent = commentTarget ? commentSetAsideRef.current : null;
+  const hasGeneralMessage = commentTarget
+    ? (generalContent?.text.trim() ?? "") !== "" || (generalContent?.files.length ?? 0) > 0
+    : hasDraft;
+  const showCommentTray =
+    commentMode.unsentDrafts.length > 0 || commentMode.sendingElsewhere.length > 0;
+  const commentSendDisabledReason =
+    sendDisabledReason ??
+    (isReadOnly
+      ? "You have read-only access to this session"
+      : hasPendingElicitation
+        ? "Respond to the pending request above first"
+        : disabled
+          ? "Waiting for agents…"
+          : null);
+  // Outside comment mode an ordinary send takes the unsent drafts along,
+  // unless what's typed is a command or shell input that has to go alone.
+  const sendCarriesCommentDrafts =
+    !commentTarget &&
+    commentMode.unsentDrafts.length > 0 &&
+    !sendsWithoutCommentDrafts(fullText, slashCommandNames);
+  const sendLabel = sendCarriesCommentDrafts
+    ? itemCommentSendLabel(commentMode.unsentDrafts.length, hasDraft)
+    : "Send";
+  const showInterruptButton =
+    isWorking &&
+    ((!hasDraft && !sendCarriesCommentDrafts) ||
+      hasPendingElicitation ||
+      isTempConvId(conversationId) ||
+      hasPendingInitialMessage);
+
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
   // case — `submit` clears it optimistically — so only fill it when the user
@@ -3322,9 +3450,17 @@ function ComposerImpl(
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
+    // A comment message comes back as drafts, not as text to resend.
+    const commentRestored =
+      !committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft) &&
+      takeFailedCommentSend(failedSendDraft.text);
     // Re-check live delivery and preserve any newer input before consuming the failure.
     const hasNewerInput = valueRef.current.trim() !== "" || filesRef.current.length > 0;
-    const failed = takeFailedSendDraft(failedSendDraft.conversationId, hasNewerInput, true);
+    const failed = takeFailedSendDraft(
+      failedSendDraft.conversationId,
+      commentRestored || hasNewerInput,
+      !commentRestored,
+    );
     if (!failed) return;
     // The failed text carries expanded markers; bring its session tags back as tokens.
     const recalled = recallComposerDraft(failed.text, failed.replyDraft);
@@ -3345,7 +3481,14 @@ function ComposerImpl(
     dirtyRef.current = true;
     if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, replaceText, draft]);
+  }, [
+    failedSendDraft,
+    conversationId,
+    settledConversationId,
+    replaceText,
+    draft,
+    takeFailedCommentSend,
+  ]);
 
   // Retract a restored failed-send draft once its send proves delivered (its
   // committed item arrived over the stream or a reconnect snapshot). Edits win:
@@ -3971,22 +4114,60 @@ function ComposerImpl(
     textareaRef.current = tailTextareaRef.current;
   };
 
+  /**
+   * Sends the unsent comment drafts as one message. Outside comment mode the
+   * typed message and any file review comments go along as its General
+   * section, unless `withMessage` is false, which leaves them in the composer.
+   */
+  const sendCommentDrafts = (withMessage = true, queue = false): Promise<void> => {
+    setCommandError(null);
+    const hasAuthoredText =
+      !!draft.text.trim() || draft.quotes.some((quote) => quote.before.trim());
+    const reviewContext =
+      withMessage && !commentTarget && localReviewComments.length > 0
+        ? formatLocalReviewComments(localReviewComments, { includeInstruction: !hasAuthoredText })
+        : "";
+    const reviewSessionId = conversationId;
+    return commentMode
+      .submitComments({ withMessage, appendGeneral: reviewContext, ...(queue ? { queue } : {}) })
+      .then((sent) => {
+        if (sent && reviewContext && reviewSessionId) clearLocalReviewContexts(reviewSessionId);
+      });
+  };
+
+  /**
+   * Sends what the composer holds. Outside comment mode the unsent comment
+   * drafts go along as one comment message unless `withCommentDrafts` is
+   * false; that send resolves the returned promise once it's queued.
+   */
   const submit = ({
     resetNativeInputSession = false,
     queue = false,
-  }: { resetNativeInputSession?: boolean } & ComposerSendOptions = {}) => {
+    withCommentDrafts = true,
+  }: {
+    resetNativeInputSession?: boolean;
+    withCommentDrafts?: boolean;
+  } & ComposerSendOptions = {}): Promise<void> | void => {
     // The /btw overlay locks the composer — never send while it's open.
     if (composerLockedByBtw) return;
+    // In comment mode, Enter and ✓ save the comment to the drafts tray.
+    if (commentTarget) {
+      commentMode.saveComment();
+      return;
+    }
     const trimmed = fullText.trim();
-    // Allow send if there's text, attached files, OR "@"-tagged paths.
+    const withDrafts = withCommentDrafts && sendCarriesCommentDrafts;
+    // Allow send if there's text, attached files, "@"-tagged paths, or comment drafts.
     if (
       (!trimmed &&
         attachedFiles.length === 0 &&
         !hasMentions &&
-        localReviewComments.length === 0) ||
+        localReviewComments.length === 0 &&
+        !withDrafts) ||
       disabled ||
       sendDisabledReason !== null ||
-      hasPendingElicitation
+      hasPendingElicitation ||
+      (withDrafts && (commentSendDisabledReason !== null || inputDisabled))
     )
       return;
     if (highlight.refusal !== null) {
@@ -4014,6 +4195,11 @@ function ComposerImpl(
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
+
+    if (withDrafts) {
+      setMention(null);
+      return sendCommentDrafts(true, queue);
+    }
 
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
@@ -4229,7 +4415,7 @@ function ComposerImpl(
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (showInterruptButton) {
+    if (!commentTarget && showInterruptButton) {
       onStop();
       return;
     }
@@ -4283,16 +4469,27 @@ function ComposerImpl(
     // Mod+Enter inverts Always steer mid-turn: with it on, the draft waits in the
     // queue; otherwise the draft joins the queue tail (or sends when idle) and the
     // whole queue is steered into the running turn.
-    if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
+    if (
+      conversationId !== null &&
+      !commentTarget &&
+      !hasPendingElicitation &&
+      shouldSteerAllFromKeyboard
+    ) {
       e.preventDefault();
-      // An empty composer has nothing to queue, so it still steers the backlog.
-      if (hasDraft && isWorking && readAlwaysSteer()) {
-        if (!mentionListingPending) submit({ queue: true });
+      // An empty composer with no comment drafts to send has nothing to queue,
+      // so it still steers the backlog.
+      if ((hasDraft || sendCarriesCommentDrafts) && isWorking && readAlwaysSteer()) {
+        if (!mentionListingPending) void submit({ queue: true });
         return;
       }
-      if (!mentionListingPending) submit();
+      const sent = mentionListingPending ? undefined : submit();
       // While unreachable the queue waits for the host, so nothing is steered.
-      if (!unreachable) steerAllQueuedMessages(conversationId);
+      const steer = () => {
+        if (!unreachable) steerAllQueuedMessages(conversationId);
+      };
+      // A comment message joins the queue once its draft files load.
+      if (sent) void sent.then(steer);
+      else steer();
       return;
     }
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
@@ -4322,6 +4519,12 @@ function ComposerImpl(
       submit();
       return;
     }
+    // Esc leaves comment mode, keeping what was typed as a draft.
+    if (e.key === "Escape" && commentTarget) {
+      e.preventDefault();
+      commentMode.leaveCommentMode();
+      return;
+    }
     // Esc closes slash-command output before it can reach the turn.
     if (e.key === "Escape" && commandError !== null) {
       e.preventDefault();
@@ -4345,6 +4548,7 @@ function ComposerImpl(
     // Recall starts from empty text; boundary checks preserve caret movement
     // through wrapped recalled entries. Modified arrows belong to global hotkeys.
     if (
+      !commentTarget &&
       (draft.quotes.length === 0 || recallingRef.current) &&
       (e.key === "ArrowUp" || e.key === "ArrowDown") &&
       !e.metaKey &&
@@ -4356,6 +4560,11 @@ function ComposerImpl(
         // Empty-composer recall takes the last queued row before browsing history.
         if (composerEmptyForRecall) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
+          if (target !== undefined && commentMode.restoreQueuedMessage(target.text)) {
+            e.preventDefault();
+            dequeueMessage(target.queueId);
+            return;
+          }
           if (target !== undefined) {
             e.preventDefault();
             resetCursor();
@@ -4441,6 +4650,27 @@ function ComposerImpl(
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
         {/* Design tool requests still on their way to this session. */}
         <DesignOutboxStrip conversationId={conversationId} widthClassName="mx-3 w-auto" />
+        {/* Comment drafts, docked above the queue like another shelf. */}
+        <ItemCommentTray
+          drafts={commentMode.unsentDrafts}
+          editingDraftId={commentTarget?.draftId ?? null}
+          composingLabel={composingCommentLabel}
+          withMessage={hasGeneralMessage}
+          sendDisabledReason={commentSendDisabledReason}
+          onSend={() => void sendCommentDrafts()}
+          {...(!commentTarget && hasDraft
+            ? {
+                onSendCommentsOnly: () => void sendCommentDrafts(false),
+                onSendMessageOnly: () => void submit({ withCommentDrafts: false }),
+              }
+            : {})}
+          onEdit={commentMode.editDraft}
+          onDelete={commentMode.deleteDraft}
+          onDiscardAll={commentMode.discardAll}
+          sendingElsewhere={commentMode.sendingElsewhere}
+          onRestoreSubmission={commentMode.restoreElsewhere}
+          widthClassName="mx-3 w-auto"
+        />
         {/* Queued messages — peeks above the workspace bar like the
             sub-agent tray. Lists follow-ups held while the agent is busy;
             drains FIFO on idle. Scope to this conversation so a queue held
@@ -4448,7 +4678,12 @@ function ComposerImpl(
         <QueuedMessagesStrip
           messages={composerQueuedMessages}
           arrowUpRecallQueueId={arrowUpRecallQueueId}
-          onDelete={dequeueMessage}
+          onDelete={(queueId) => {
+            const target = queuedMessages.find((m) => m.queueId === queueId);
+            dequeueMessage(queueId);
+            // A cancelled comment message gives its comments back as drafts.
+            if (target) commentMode.restoreQueuedMessage(target.text);
+          }}
           onEdit={(queueId) => {
             // Pull the queued message back into the composer for editing:
             // replace the composer's text + attachments with the queued
@@ -4456,6 +4691,11 @@ function ComposerImpl(
             // Re-sending re-queues it (busy) or sends it (idle).
             const target = queuedMessages.find((m) => m.queueId === queueId);
             if (!target) return;
+            // A comment message goes back to the drafts tray instead.
+            if (commentMode.restoreQueuedMessage(target.text)) {
+              dequeueMessage(queueId);
+              return;
+            }
             dequeueMessage(queueId);
             loadIntoComposer(target.text, target.files ?? [], { replyDraft: target.replyDraft });
           }}
@@ -4472,7 +4712,7 @@ function ComposerImpl(
           <ComposerWorkspaceBar
             data-testid="composer-workspace-controls"
             className={cn(
-              hasQueuedComposerMessages &&
+              (hasQueuedComposerMessages || showCommentTray) &&
                 "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
             )}
           >
@@ -4562,19 +4802,21 @@ function ComposerImpl(
           "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
           placeholder: composerLockedByBtw
             ? "Side chat open — press Esc to close"
-            : readOnlyReason !== null
-              ? readOnlyReason
-              : isReadOnly
-                ? "You have read-only access to this session"
-                : unreachable && !sendReconnectsArca && sendDisabledReason === null
-                  ? offlinePlaceholder
-                  : hasPendingElicitation
-                    ? "Respond to the pending request above to continue"
-                    : disabled && sendDisabledReason === null
-                      ? "Waiting for agents…"
-                      : isStreaming
-                        ? "Send a follow-up (queued) — Esc to stop"
-                        : readyPlaceholder,
+            : commentTarget
+              ? `Comment on ${commentTarget.label}…`
+              : readOnlyReason !== null
+                ? readOnlyReason
+                : isReadOnly
+                  ? "You have read-only access to this session"
+                  : unreachable && !sendReconnectsArca && sendDisabledReason === null
+                    ? offlinePlaceholder
+                    : hasPendingElicitation
+                      ? "Respond to the pending request above to continue"
+                      : disabled && sendDisabledReason === null
+                        ? "Waiting for agents…"
+                        : isStreaming
+                          ? "Send a follow-up (queued) — Esc to stop"
+                          : readyPlaceholder,
           rows: 1,
           heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
           disabled: inputDisabled,
@@ -4634,6 +4876,17 @@ function ComposerImpl(
                         setCommandError(err instanceof Error ? err.message : "Rewind failed");
                       });
                   }}
+                />
+              )}
+              {commentTarget && (
+                <ItemCommentModeHeader
+                  key={`${commentTarget.label}:${commentTarget.draftId ?? "new"}`}
+                  label={commentTarget.label}
+                  title={commentTarget.title}
+                  item={commentMode.item}
+                  excerpt={commentMode.excerpt}
+                  editing={commentTarget.draftId !== null}
+                  onLeave={commentMode.leaveCommentMode}
                 />
               )}
               {/* Slash-command suggestions — floats above the composer box */}
@@ -4875,41 +5128,60 @@ function ComposerImpl(
                   resetCursor();
                 }}
               />
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <ComposerSendButton
-                      interrupt={showInterruptButton}
-                      disabled={
-                        showInterruptButton
-                          ? isReadOnly
-                          : !hasDraft ||
-                            disabled ||
-                            isReadOnly ||
-                            sendDisabledReason !== null ||
-                            hasPendingElicitation
-                      }
-                      title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
-                      label={showInterruptButton ? "Interrupt" : "Send"}
-                    />
-                  </TooltipTrigger>
-                  {showInterruptButton ? (
-                    // The message box takes Esc to interrupt, so not while it's disabled
-                    // or while dictation listens (Esc then cancels the take).
-                    <KeyboardShortcutTooltipContent
-                      label="Interrupt"
-                      keys={inputDisabled || dictating ? [] : [ESC_KEY]}
-                    />
-                  ) : (
-                    !preventsKeyboardSubmit && (
-                      <KeyboardShortcutTooltipContent
-                        label="Send"
-                        keys={composerSendShortcutKeys(submitWithModEnter)}
+              {commentTarget ? (
+                <Button
+                  type="submit"
+                  size="sm"
+                  aria-label="Save comment"
+                  className="h-8 shrink-0 gap-1 rounded-lg px-2.5 hover:opacity-80 md:h-7"
+                  title={
+                    preventsKeyboardSubmit
+                      ? "Save to your comment drafts"
+                      : "Save to your comment drafts (Enter)"
+                  }
+                >
+                  <CheckIcon className="size-4" aria-hidden="true" />
+                  {/* Phones share the row with the composer's other controls. */}
+                  <span className="max-sm:hidden">Save comment</span>
+                  <span className="sm:hidden">Save</span>
+                </Button>
+              ) : (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <ComposerSendButton
+                        interrupt={showInterruptButton}
+                        disabled={
+                          showInterruptButton
+                            ? isReadOnly
+                            : (!hasDraft && !(sendCarriesCommentDrafts && !inputDisabled)) ||
+                              disabled ||
+                              isReadOnly ||
+                              sendDisabledReason !== null ||
+                              hasPendingElicitation
+                        }
+                        title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
+                        label={showInterruptButton ? "Interrupt" : sendLabel}
                       />
-                    )
-                  )}
-                </Tooltip>
-              </TooltipProvider>
+                    </TooltipTrigger>
+                    {showInterruptButton ? (
+                      // The message box takes Esc to interrupt, so not while it's disabled
+                      // or while dictation listens (Esc then cancels the take).
+                      <KeyboardShortcutTooltipContent
+                        label="Interrupt"
+                        keys={inputDisabled || dictating ? [] : [ESC_KEY]}
+                      />
+                    ) : (
+                      !preventsKeyboardSubmit && (
+                        <KeyboardShortcutTooltipContent
+                          label={sendLabel}
+                          keys={composerSendShortcutKeys(submitWithModEnter)}
+                        />
+                      )
+                    )}
+                  </Tooltip>
+                </TooltipProvider>
+              )}
             </>
           ),
           testId: "composer-action-row",

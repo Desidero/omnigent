@@ -66,6 +66,15 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
+import {
+  getItemCommentState,
+  publishItemLabelIndex,
+  requestItemComment,
+  resetItemCommentDraftsForTests,
+  saveItemCommentDraft,
+} from "@/lib/itemCommentDrafts";
+import { scanItemLabelSource } from "@/lib/itemComments";
+import { buildItemLabelIndex } from "@/lib/itemLabels";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
@@ -619,6 +628,356 @@ describe("Composer session drafts", () => {
     // ...and switching back re-arms the saved attachment as a chip.
     act(() => useChatStore.setState({ conversationId: "conv_draft" }));
     await waitFor(() => expect(screen.getByText("notes.txt")).toBeTruthy());
+  });
+});
+
+describe("Composer item comments", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_comments", queuedMessages: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    resetItemCommentDraftsForTests();
+    localStorage.clear();
+  });
+
+  function startComment(label: string, title: string) {
+    act(() => requestItemComment("conv_comments", { label, title }));
+  }
+
+  it("sets the typed message aside while commenting and saves the comment on Enter", async () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "Half-typed message" } });
+
+    startComment("Q2", "Report cutoff timezone");
+    const header = await screen.findByTestId("item-comment-mode");
+    expect(header.textContent).toContain("Q2");
+    expect(header.textContent).toContain("Report cutoff timezone");
+    expect(textarea()).toHaveValue("");
+    expect(textarea()).toHaveAttribute("placeholder", "Comment on Q2…");
+    // The set-aside message, not the comment, stays the session's draft.
+    fireEvent.change(textarea(), { target: { value: "Use the account's zone." } });
+    await waitFor(() => expect(getSessionDraft("conv_comments")?.text).toBe("Half-typed message"));
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(screen.queryByTestId("item-comment-mode")).toBeNull();
+    expect(textarea()).toHaveValue("Half-typed message");
+    // Saving leaves the tray collapsed, with the send button in its bar.
+    const tray = screen.getByTestId("item-comment-tray");
+    expect(tray.textContent).toContain("1 comment · Q2");
+    expect(screen.queryByTestId("item-comment-draft-row")).toBeNull();
+    expect(within(tray).getByTestId("submit-item-comments")).toHaveAccessibleName(
+      "Send 1 comment + message",
+    );
+    fireEvent.click(within(tray).getByRole("button", { name: "Show comment drafts" }));
+    expect(screen.getByTestId("item-comment-draft-row").textContent).toContain(
+      "Use the account's zone.",
+    );
+  });
+
+  it("shows the item's definition while commenting and a labelled Save button", async () => {
+    publishItemLabelIndex(
+      "conv_comments",
+      buildItemLabelIndex([
+        scanItemLabelSource({
+          messageId: "a1",
+          role: "assistant",
+          text: "1. **[Q2] Report cutoff timezone.** UTC or the account's zone?",
+        }),
+      ]),
+    );
+    render(<Composer {...composerProps()} />);
+    startComment("Q2", "Report cutoff timezone");
+    await screen.findByTestId("item-comment-mode");
+
+    expect(screen.getByRole("region", { name: "Q2 text" }).textContent).toContain(
+      "UTC or the account's zone?",
+    );
+    const actions = screen.getByTestId("composer-action-row");
+    expect(within(actions).getByRole("button", { name: "Save comment" })).toHaveAttribute(
+      "type",
+      "submit",
+    );
+    expect(within(actions).queryByRole("button", { name: /^Send/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse Q2 text" }));
+    expect(screen.queryByRole("region", { name: "Q2 text" })).toBeNull();
+  });
+
+  it("keeps the action row's send button for messages and names the typed message on the tray's", async () => {
+    render(<Composer {...composerProps()} />);
+    startComment("R1", "Backfill locking");
+    await screen.findByTestId("item-comment-mode");
+    fireEvent.change(textarea(), { target: { value: "Batch it." } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    const send = screen.getByTestId("submit-item-comments");
+    expect(send).toHaveAccessibleName("Send 1 comment");
+    expect(
+      within(screen.getByTestId("composer-action-row")).queryByTestId("submit-item-comments"),
+    ).toBeNull();
+    fireEvent.change(textarea(), { target: { value: "Thanks." } });
+    expect(send).toHaveAccessibleName("Send 1 comment + message");
+    expect(send).toHaveAccessibleDescription("The message you typed goes along as a General note.");
+  });
+
+  it("leaves comment mode on Escape and keeps what was typed as a draft", async () => {
+    const onStop = vi.fn();
+    render(<Composer {...composerProps({ isWorking: true, status: "streaming", onStop })} />);
+    startComment("R1", "Backfill locking");
+    await screen.findByTestId("item-comment-mode");
+    fireEvent.change(textarea(), { target: { value: "Run it at night." } });
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+
+    expect(screen.queryByTestId("item-comment-mode")).toBeNull();
+    expect(getItemCommentState("conv_comments").drafts.map((draft) => draft.text)).toEqual([
+      "Run it at night.",
+    ]);
+    expect(onStop).not.toHaveBeenCalled();
+  });
+
+  it("submits the drafts and the typed message as one message through onSend", async () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    startComment("R1", "Backfill locking");
+    await screen.findByTestId("item-comment-mode");
+    fireEvent.change(textarea(), { target: { value: "Batch it." } });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["lock"], "image.png", { type: "image/png" })] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save comment" }));
+    fireEvent.change(textarea(), { target: { value: "Thanks." } });
+
+    fireEvent.click(screen.getByTestId("submit-item-comments"));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const [text, files] = onSend.mock.calls[0];
+    expect(text).toBe(
+      [
+        "Comments on 1 item:",
+        "#### [R1] Backfill locking",
+        "Batch it.",
+        "Attachments: r1-1.png",
+        "#### General",
+        "Thanks.",
+      ].join("\n\n"),
+    );
+    expect((files as File[]).map((file) => file.name)).toEqual(["r1-1.png"]);
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByTestId("item-comment-tray")).toBeNull();
+  });
+
+  describe("the composer's own send", () => {
+    function saveDraft(id: string, label: string, text: string) {
+      act(() =>
+        saveItemCommentDraft("conv_comments", {
+          id,
+          label,
+          title: `${label} title`,
+          text,
+          files: [],
+          createdAt: Number(id.slice(1)),
+        }),
+      );
+    }
+    const unsentDrafts = () =>
+      getItemCommentState("conv_comments").drafts.filter((d) => !d.submissionId);
+    const composerSend = () =>
+      within(screen.getByTestId("composer-action-row")).getByRole("button", { name: /^Send/ });
+    const openSendOptions = () =>
+      fireEvent.pointerDown(screen.getByRole("button", { name: "More send options" }), {
+        button: 0,
+      });
+
+    it("sends the drafts and the typed message as one comment message on Enter", async () => {
+      const onSend = vi.fn();
+      render(<Composer {...composerProps({ onSend })} />);
+      saveDraft("d1", "Q2", "Use the account's zone.");
+      saveDraft("d2", "R1", "Batch it.");
+      fireEvent.change(textarea(), { target: { value: "Thanks." } });
+      expect(composerSend()).toHaveAccessibleName("Send 2 comments + message");
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+      expect(onSend.mock.calls[0][0]).toBe(
+        [
+          "Comments on 2 items:",
+          "#### [Q2] Q2 title",
+          "Use the account's zone.",
+          "#### [R1] R1 title",
+          "Batch it.",
+          "#### General",
+          "Thanks.",
+        ].join("\n\n"),
+      );
+      expect(textarea()).toHaveValue("");
+      expect(unsentDrafts()).toEqual([]);
+    });
+
+    it("sends the drafts from an empty composer, even while the agent works", async () => {
+      const onSend = vi.fn();
+      const onStop = vi.fn();
+      render(
+        <Composer {...composerProps({ onSend, onStop, isWorking: true, status: "streaming" })} />,
+      );
+      saveDraft("d1", "R1", "Batch it.");
+      const send = composerSend();
+      expect(send).toHaveAccessibleName("Send 1 comment");
+      expect(send).toBeEnabled();
+
+      fireEvent.click(send);
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+      expect(onSend.mock.calls[0][0]).toBe(
+        ["Comments on 1 item:", "#### [R1] R1 title", "Batch it."].join("\n\n"),
+      );
+      expect(onStop).not.toHaveBeenCalled();
+    });
+
+    it("queues the comment message behind the turn on Mod+Enter with Always steer on", async () => {
+      const previousAlwaysSteer = readAlwaysSteer();
+      onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+      writeAlwaysSteer(true);
+      const onSend = vi.fn();
+      render(<Composer {...composerProps({ onSend, isWorking: true, status: "streaming" })} />);
+      saveDraft("d1", "R1", "Batch it.");
+      fireEvent.change(textarea(), { target: { value: "Thanks." } });
+
+      fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+      expect(onSend.mock.calls[0]).toEqual([
+        ["Comments on 1 item:", "#### [R1] R1 title", "Batch it.", "#### General", "Thanks."].join(
+          "\n\n",
+        ),
+        undefined,
+        undefined,
+        { queue: true },
+      ]);
+    });
+
+    it("folds attached file review comments into the General section", async () => {
+      const onSend = vi.fn();
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Composer {...composerProps({ onSend })} />
+        </QueryClientProvider>,
+      );
+      saveDraft("d1", "R1", "Batch it.");
+      const review = {
+        id: "rc1",
+        conversation_id: "conv_comments",
+        path: "src/example.ts",
+        start_index: 0,
+        end_index: 0,
+        body: "Preserve the public API.",
+        status: "draft" as const,
+        created_at: 1,
+        updated_at: 1,
+        anchor_content: null,
+        created_by: null,
+        anchor_metadata: {
+          pr_url: "https://github.com/acme/repo/pull/1",
+          side: "RIGHT" as const,
+          line: 12,
+          start_line: null,
+          head_sha: "a".repeat(40),
+          base_sha: "b".repeat(40),
+        },
+      };
+      act(() => requestLocalReviewContext(review));
+      fireEvent.change(textarea(), { target: { value: "Thanks." } });
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+      expect(onSend.mock.calls[0][0]).toBe(
+        [
+          "Comments on 1 item:",
+          "#### [R1] R1 title",
+          "Batch it.",
+          "#### General",
+          "Thanks.",
+          formatLocalReviewComments([review], { includeInstruction: false }),
+        ].join("\n\n"),
+      );
+      await waitFor(() =>
+        expect(getSessionDraft("conv_comments")?.reviewComments ?? []).toEqual([]),
+      );
+    });
+
+    it.each(["/compact-notes now", "!git status"])(
+      "sends %s on its own and keeps the drafts",
+      (command) => {
+        const onSend = vi.fn();
+        render(<Composer {...composerProps({ onSend })} />);
+        saveDraft("d1", "R1", "Batch it.");
+        fireEvent.change(textarea(), { target: { value: command } });
+        expect(composerSend()).toHaveAccessibleName("Send");
+
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+
+        expect(onSend).toHaveBeenCalledTimes(1);
+        expect(onSend.mock.calls[0][0]).toBe(command);
+        expect(unsentDrafts().map((d) => d.id)).toEqual(["d1"]);
+        expect(screen.getByTestId("item-comment-tray")).toBeInTheDocument();
+      },
+    );
+
+    it("sends only the message from the tray's menu and keeps the drafts", async () => {
+      const onSend = vi.fn();
+      render(<Composer {...composerProps({ onSend })} />);
+      saveDraft("d1", "R1", "Batch it.");
+      fireEvent.change(textarea(), { target: { value: "Thanks." } });
+
+      openSendOptions();
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Send message only" }));
+
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(onSend.mock.calls[0][0]).toBe("Thanks.");
+      expect(textarea()).toHaveValue("");
+      expect(unsentDrafts().map((d) => d.id)).toEqual(["d1"]);
+    });
+
+    it("sends only the comments from the tray's menu and keeps the typed message", async () => {
+      const onSend = vi.fn();
+      render(<Composer {...composerProps({ onSend })} />);
+      saveDraft("d1", "R1", "Batch it.");
+      expect(screen.queryByRole("button", { name: "More send options" })).toBeNull();
+      fireEvent.change(textarea(), { target: { value: "Thanks." } });
+
+      openSendOptions();
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Send comments only" }));
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+      expect(onSend.mock.calls[0][0]).toBe(
+        ["Comments on 1 item:", "#### [R1] R1 title", "Batch it."].join("\n\n"),
+      );
+      expect(textarea()).toHaveValue("Thanks.");
+      expect(unsentDrafts()).toEqual([]);
+    });
+
+    it("still saves the comment on Enter in comment mode, sending nothing", async () => {
+      const onSend = vi.fn();
+      render(<Composer {...composerProps({ onSend })} />);
+      saveDraft("d1", "R1", "Batch it.");
+      startComment("Q2", "Report cutoff timezone");
+      await screen.findByTestId("item-comment-mode");
+      expect(screen.queryByRole("button", { name: "More send options" })).toBeNull();
+      fireEvent.change(textarea(), { target: { value: "Use the account's zone." } });
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(screen.queryByTestId("item-comment-mode")).toBeNull();
+      expect(unsentDrafts().map((d) => d.label)).toEqual(["R1", "Q2"]);
+      await act(async () => {});
+      expect(onSend).not.toHaveBeenCalled();
+    });
   });
 });
 
