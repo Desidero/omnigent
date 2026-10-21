@@ -1,6 +1,7 @@
-// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions.
-// Sessions are searched server-side (one loaded page can't find older ones), so
-// cmdk filtering is off and the static actions are filtered here.
+// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions,
+// and New chat in project (one row per project, opening the composer with its stored
+// defaults; hidden until the user types). Sessions are searched server-side (one loaded
+// page can't find older ones), so cmdk filtering is off and the static rows are filtered here.
 
 import type React from "react";
 import { defaultFilter } from "cmdk";
@@ -20,6 +21,7 @@ import { useNavigate } from "@/lib/routing";
 import {
   type ConversationsPage,
   useConversations,
+  useProjects,
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -45,6 +47,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
+import { ProjectRowIcon } from "./ProjectPicker";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
 export interface CommandPaletteProps {
@@ -244,6 +247,18 @@ export function CommandPalette({
     );
   }, [actions, query, sessionsOnly]);
 
+  const { data: projects = [] } = useProjects();
+  // Every typed word must appear in the row label or the group heading, so
+  // "new omni", "omni" and "project" all reach "New chat in omnigent".
+  const filteredProjects = useMemo(() => {
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (sessionsOnly || words.length === 0) return [];
+    return projects.filter((project) => {
+      const label = `new chat in project ${project.name}`.toLowerCase();
+      return words.every((word) => label.includes(word));
+    });
+  }, [projects, query, sessionsOnly]);
+
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", false, { enabled: open });
   const serverInfo = useServerInfo();
@@ -375,6 +390,11 @@ export function CommandPalette({
   };
 
   const queryClient = useQueryClient();
+  const newChatInProject = (name: string): void => {
+    close();
+    navigate(`/?project=${encodeURIComponent(name)}`);
+  };
+
   const goToSession = (id: string): void => {
     // Search results are dropped when the palette closes; the sidebar lists
     // the opened session from this copy, which keeps its owner.
@@ -587,6 +607,20 @@ export function CommandPalette({
                     </CommandItem>
                   );
                 })}
+              </CommandGroup>
+            )}
+            {filteredProjects.length > 0 && (
+              <CommandGroup heading="New chat in project">
+                {filteredProjects.map((project) => (
+                  <CommandItem
+                    key={project.name}
+                    value={`project:${project.name}`}
+                    onSelect={() => newChatInProject(project.name)}
+                  >
+                    <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
+                    <span className="flex-1 truncate text-left">New chat in {project.name}</span>
+                  </CommandItem>
+                ))}
               </CommandGroup>
             )}
           </CommandList>
