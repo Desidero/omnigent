@@ -17,6 +17,7 @@ import {
   overlayArchivedIntoCaches,
   settleUpdatedAtIntoCaches,
   overlayTitleIntoCaches,
+  overlayLabelsIntoCaches,
   recentlyCreatedSessions,
   removeIdsFromPages,
   settleOpenSessionRow,
@@ -628,6 +629,33 @@ describe("settleUpdatedAtIntoCaches", () => {
     expect(updatedAt(["conversations", "", true])).toBe(20);
     expect(updatedAt(["conversations", "", false])).toBe(30);
     expect(updatedAt(["project-sessions", "proj", "updated_at", true])).toBe(20);
+  });
+});
+
+describe("overlayLabelsIntoCaches", () => {
+  it("replaces the row's labels in the lists, the folder, and the session snapshot", () => {
+    const qc = new QueryClient();
+    const before = { team: "ml", "omnigent.wrapper": "claude" };
+    const after = { env: "prod", "omnigent.wrapper": "claude" };
+    qc.setQueryData(["conversations", "", false], data([conv("a", { labels: before })]));
+    qc.setQueryData(
+      ["project-sessions", "proj", "updated_at", false],
+      data([conv("a", { labels: before })]),
+    );
+    qc.setQueryData(["session", "a"], { id: "a", labels: before } as unknown as Session);
+
+    overlayLabelsIntoCaches(qc, "a", after);
+
+    const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!;
+    expect(list.pages[0].data[0].labels).toEqual(after);
+    const folder = qc.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "proj",
+      "updated_at",
+      false,
+    ])!;
+    expect(folder.pages[0].data[0].labels).toEqual(after);
+    expect(qc.getQueryData<Session>(["session", "a"])!.labels).toEqual(after);
   });
 });
 
