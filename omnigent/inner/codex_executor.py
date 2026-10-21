@@ -45,6 +45,7 @@ from omnigent.databricks_ai_gateway import (
     CODEX_AGENT,
     CODING_AGENT_HEADER,
     REQUEST_TAGS_HEADER,
+    REQUEST_TAGS_VALUE_ENV,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
 )
@@ -1345,7 +1346,8 @@ def materialize_codex_provider_config(
     Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
     untouched: Codex rejects unsupported fields there by discarding the whole config.
     Custom providers on a Databricks Unity Gateway also get the gateway's
-    usage-attribution ``http_headers``.
+    usage-attribution ``http_headers`` and an ``env_http_headers`` entry that
+    sends the session's request tags.
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
@@ -1524,6 +1526,14 @@ def materialize_codex_provider_config(
                     if name.lower() not in replaced_header_names
                 },
                 **attribution_headers,
+            }
+            # Codex sends the session's request tags only while its env carries them;
+            # that value already holds any CI tags, and Codex applies env headers
+            # after the static ones.
+            env_headers = provider_config.get("env_http_headers")
+            provider_config["env_http_headers"] = {
+                **(env_headers if isinstance(env_headers, Mapping) else {}),
+                REQUEST_TAGS_HEADER: REQUEST_TAGS_VALUE_ENV,
             }
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
@@ -1860,14 +1870,16 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
 
 
 #: Omnigent's own per-session signals for a codex launch: the subagent-router
-#: rendezvous, its session id, and the extended-catalog request. The runner sets
-#: them in the harness process env, and the executor reads them back out of
-#: ``_clean_codex_env``'s filtered copy — so they must be allowed through it or
-#: both features silently never engage on the wrapped ``codex`` harness.
+#: rendezvous, its session id, the extended-catalog request, and the Unity
+#: Gateway request tags. The runner sets them in the harness process env, and
+#: the executor reads them back out of ``_clean_codex_env``'s filtered copy — so
+#: they must be allowed through it or these features silently never engage on
+#: the wrapped ``codex`` harness.
 _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     CODEX_EXTENDED_CATALOG_ENV_VAR,
+    REQUEST_TAGS_VALUE_ENV,
 )
 
 
