@@ -56,3 +56,69 @@ you or the agent write them.
   at the bottom lists it with **Restore**. An item the agent later closes shows
   as closed as usual. Dismissals are stored on the session, as the
   `omnigent.items_dismissed` label, so they follow you to other devices.
+
+## Comment on items
+
+To answer several items at once, comment on each and send the comments
+together, like reviewing a document:
+
+1. Click an item's chip (in a message, in the Open items bar, or the label in
+   its own defining message) and choose **Comment** in its popover.
+2. The composer switches to comment mode for that item: a card names it, and
+   whatever you had typed is set aside until you save. Attachments, paste,
+   @-mentions of files and sessions, and dictation work as usual; a draft keeps
+   its tags.
+3. Press Enter or the check button to save the comment to **Comment drafts**,
+   a tray above the composer. Drafts can be edited or deleted (with Undo), and
+   the tray can be collapsed to one line. In comment mode, Enter always saves;
+   it never sends.
+4. Send as usual: outside comment mode, Enter or the composer's send button
+   (which then reads **Send N comments + message**) sends every draft, with
+   anything you typed as the General section, as one message. With nothing
+   typed it sends just the drafts. The tray's own **Send N comments** button
+   does the same, also from comment mode. It queues like any message while the
+   agent is busy, and a failed or cancelled send puts the drafts back.
+
+A slash command or skill (including `/btw` and `/side`) or a `!` shell input
+always goes on its own and leaves the drafts in the tray. To send only one
+part, open the **⋯** menu beside the tray's send button (shown once you have
+typed something): **Send comments only** leaves what you typed in the
+composer, and **Send message only** sends what you typed and keeps the drafts.
+File review comments attached to the composer go in the General section, after
+the typed message.
+
+The message is plain markdown that the agent is instructed to answer item by
+item:
+
+```markdown
+Comments on 2 items:
+
+#### [Q2] <item title>
+
+**1.** <comment>
+
+**2.** <comment>
+
+Attachments: q2-1.png
+
+#### [R1] <item title>
+
+<comment>
+
+#### General
+
+<typed message>
+```
+
+Items follow the order they were defined, comments are numbered only when an
+item has several, and attached files are renamed to be unique in the message
+(a pasted `image.png` on Q2 becomes `q2-1.png`). Tagged files and sessions are
+sent as markers in place, as in any message, and a message that tags a session
+ends with the one session tool hint. Chips with unsent drafts show
+a dot and chips with sent comments a count; the popover lists each sent
+comment with its files and the first sentence about the item in the agent's
+next reply. A comment on a closed item leaves it closed.
+
+Sent comments are read back from the transcript, so they show on every device.
+Drafts stay in this browser only (attachments included) and survive a reload;
+a failed or cancelled send puts them back as drafts.
