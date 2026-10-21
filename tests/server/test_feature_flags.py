@@ -53,6 +53,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "grid_sessions_display_ui": True,
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
+        "pr_watch": False,
         "sidebar_windowed_rows": False,
         "chat_composer_codemirror": False,
         "workflows": False,
