@@ -284,6 +284,7 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    register_pr_info_reader: Callable[..., None] | None = None,
 ) -> None:
     """Register the resources routes on router."""
     pull_request_store = server_prs.open_store(conversation_store)
@@ -4106,6 +4107,15 @@ def register_resources_routes(
         info = await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
         # Applied here, not in _github_info: background refreshes have no caller.
         return info_for_viewer(info, await _pull_request_viewer(conv, request))
+
+    async def read_pr_info(
+        session_id: str, conv: Conversation, pr_url: str, *, allow_cached: bool = False
+    ) -> dict[str, Any]:
+        """Read a linked PR like the panel does, unredacted, for the PR watcher."""
+        return await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
+
+    if register_pr_info_reader is not None:
+        register_pr_info_reader(read_pr_info)
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",

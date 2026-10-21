@@ -66,6 +66,7 @@ export type FeatureKey =
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
+  | "pr_watch"
   | "sidebar_windowed_rows"
   | "chat_composer_codemirror"
   | "session_orchestration"

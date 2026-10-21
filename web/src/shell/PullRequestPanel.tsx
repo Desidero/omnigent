@@ -126,6 +126,7 @@ import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
 import { IconButton } from "./PullRequestFileSection";
+import { PullRequestWatchSwitch } from "./PullRequestWatch";
 
 export { LARGE_DIFF_THRESHOLD } from "./PullRequestFileSection";
 
@@ -1907,6 +1908,15 @@ export function PullRequestPanelDetails({
                 editable={canEdit && !!data.capabilities.details_editing}
               />
               <PullRequestStatus state={pr.state} isDraft={pr.is_draft === true} />
+              {pr.state === "OPEN" && (
+                <div className="ml-auto">
+                  <PullRequestWatchSwitch
+                    conversationId={conversationId}
+                    prUrl={data.selected_pr_url ?? pr.url}
+                    canEdit={canEdit && data.owner_only_changes !== true}
+                  />
+                </div>
+              )}
             </div>
           </div>
           {/* Tab bar (Summary | Comments | Changes); the diff controls live inside
