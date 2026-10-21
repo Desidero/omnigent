@@ -48,6 +48,7 @@ class Feature(StrEnum):
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     SESSION_TIMERS = "session_timers"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    PR_WATCH = "pr_watch"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
     CHAT_COMPOSER_CODEMIRROR = "chat_composer_codemirror"
     WORKFLOWS = "workflows"
@@ -386,6 +387,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Share one session-updates WebSocket between a browser's tabs",
         owner="web",
         review_by_release="0.28.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PR_WATCH,
+        description="Keep a session on its pull requests until CI and review are clear",
+        owner="server",
+        review_by_release="0.27.0",
     ),
 )
 
