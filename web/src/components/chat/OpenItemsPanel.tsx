@@ -1,6 +1,7 @@
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronDownIcon, MessageSquareDotIcon, XIcon } from "lucide-react";
 import {
+  ItemLabelChipMarks,
   ItemLabelPopover,
   itemLabelChipClass,
   itemLabelChipName,
@@ -17,6 +18,7 @@ import {
   mentionedInLatestReply,
   type ItemLabelEntry,
 } from "@/lib/itemLabels";
+import { revealItemCommentTray, useItemCommentDraftCounts } from "@/lib/itemCommentDrafts";
 import { cn } from "@/lib/utils";
 
 // Header chips shown before the row has been measured (or without layout).
@@ -116,11 +118,13 @@ function useDismissedItems(sessionId: string | null) {
 
 function ItemRow({
   item,
+  draftCount,
   recent,
   onDismiss,
   onRestore,
 }: {
   item: ItemLabelEntry;
+  draftCount: number;
   recent: boolean;
   onDismiss?: () => void;
   onRestore?: () => void;
@@ -132,10 +136,19 @@ function ItemRow({
       <ItemLabelPopover item={item}>
         <button
           type="button"
-          aria-label={itemLabelChipName(item.label, closed, recent)}
+          aria-label={itemLabelChipName(
+            item.label,
+            closed,
+            item.comments.length,
+            draftCount,
+            recent,
+          )}
           className="flex min-w-0 flex-1 items-baseline gap-2 px-3 py-1.5 text-left text-ui hover:bg-muted"
         >
-          <span className={cn(itemLabelChipClass(closed, recent), "shrink-0")}>{item.label}</span>
+          <span className={cn(itemLabelChipClass(closed, recent), "shrink-0")}>
+            {item.label}
+            <ItemLabelChipMarks commentCount={item.comments.length} draftCount={draftCount} />
+          </span>
           <span className={cn("truncate", closed && "text-muted-foreground line-through")}>
             {title}
           </span>
@@ -168,16 +181,18 @@ function ItemRow({
 
 /**
  * Collapsible "Open items" tracker pinned above the chat thread, beside the
- * Plan tracker. The header lists open item labels as chips; expanding lists
- * every item with its title, closed ones last. Items the latest reply mentions
- * come first, tinted, one it just closed among them struck through. An open
- * item can be dismissed from the tracker (per session, on every device) and
- * restored from the "dismissed" list at the bottom. Self-hides until the
- * transcript uses item labels.
+ * Plan tracker. The header lists open item labels as chips, plus a jump to the
+ * comment drafts when there are any; expanding lists every item with its
+ * title, closed ones last. Items the latest reply mentions come first, tinted,
+ * one it just closed among them struck through. An open item can be dismissed
+ * from the tracker (per session, on every device) and restored from the
+ * "dismissed" list at the bottom. Self-hides until the transcript uses item
+ * labels.
  */
 export function OpenItemsPanel({ className }: { className?: string }) {
   const index = useContext(ItemLabelIndexContext);
   const sessionId = useContext(ItemLabelSessionContext);
+  const draftCounts = useItemCommentDraftCounts(sessionId);
   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
   const [showDismissed, setShowDismissed] = useState(false);
   const allItems = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
@@ -192,12 +207,16 @@ export function OpenItemsPanel({ className }: { className?: string }) {
   const closed = items.filter((item) => item.closedBy !== null && !isRecent(item));
   const chips = [...recent, ...otherOpen];
   const chipKey = chips
-    .map((item) => `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}`)
+    .map(
+      (item) =>
+        `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}:${item.comments.length}:${draftCounts.get(item.label) ?? 0}`,
+    )
     .join(" ");
   const fit = useFittedChipCount(chipKey);
   const detailsRef = useCollapseOnOutsidePress();
   if (allItems.length === 0) return null;
   const headerChips = chips.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
+  const draftTotal = [...draftCounts.values()].reduce((total, count) => total + count, 0);
 
   return (
     <div className={cn("shrink-0 px-3 md:px-4", className)}>
@@ -219,18 +238,29 @@ export function OpenItemsPanel({ className }: { className?: string }) {
             }}
           >
             {headerChips.map((item) => {
+              const draftCount = draftCounts.get(item.label) ?? 0;
               const recentChip = isRecent(item);
               return (
                 <ItemLabelPopover key={item.label} item={item} openOnHover>
                   <button
                     type="button"
-                    aria-label={itemLabelChipName(item.label, item.closedBy !== null, recentChip)}
+                    aria-label={itemLabelChipName(
+                      item.label,
+                      item.closedBy !== null,
+                      item.comments.length,
+                      draftCount,
+                      recentChip,
+                    )}
                     className={cn(
                       itemLabelChipClass(item.closedBy !== null, recentChip),
                       "shrink-0",
                     )}
                   >
                     {item.label}
+                    <ItemLabelChipMarks
+                      commentCount={item.comments.length}
+                      draftCount={draftCount}
+                    />
                   </button>
                 </ItemLabelPopover>
               );
@@ -252,10 +282,27 @@ export function OpenItemsPanel({ className }: { className?: string }) {
                 className={itemLabelChipClass(item.closedBy !== null, isRecent(item))}
               >
                 {item.label}
+                <ItemLabelChipMarks
+                  commentCount={item.comments.length}
+                  draftCount={draftCounts.get(item.label) ?? 0}
+                />
               </span>
             ))}
             <span className="text-xs">+{chips.length}</span>
           </span>
+          {draftTotal > 0 && (
+            <button
+              type="button"
+              className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border px-2 text-xs font-normal text-muted-foreground hover:bg-muted hover:text-foreground"
+              onClick={(event) => {
+                event.preventDefault();
+                revealItemCommentTray();
+              }}
+            >
+              <span aria-hidden="true" className="size-1.5 rounded-full bg-warning" />
+              {draftTotal} draft{draftTotal === 1 ? "" : "s"}
+            </button>
+          )}
           <ChevronDownIcon className="size-4 shrink-0 transition-transform group-open:rotate-180" />
         </summary>
         {/* Capped like the Plan tracker so a long list can't swallow the chat. */}
@@ -267,6 +314,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
             <ItemRow
               key={item.label}
               item={item}
+              draftCount={draftCounts.get(item.label) ?? 0}
               recent
               onDismiss={item.closedBy === null ? () => dismiss(item.label) : undefined}
             />
@@ -280,6 +328,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
             <ItemRow
               key={item.label}
               item={item}
+              draftCount={draftCounts.get(item.label) ?? 0}
               recent={false}
               onDismiss={() => dismiss(item.label)}
             />
@@ -290,7 +339,12 @@ export function OpenItemsPanel({ className }: { className?: string }) {
             </div>
           )}
           {closed.map((item) => (
-            <ItemRow key={item.label} item={item} recent={false} />
+            <ItemRow
+              key={item.label}
+              item={item}
+              draftCount={draftCounts.get(item.label) ?? 0}
+              recent={false}
+            />
           ))}
           {dismissedItems.length > 0 && (
             <button
@@ -307,6 +361,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
               <ItemRow
                 key={item.label}
                 item={item}
+                draftCount={draftCounts.get(item.label) ?? 0}
                 recent={false}
                 onRestore={() => restore(item.label)}
               />
