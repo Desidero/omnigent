@@ -84,6 +84,7 @@ import {
   switchSessionProvider,
   updateSession,
 } from "@/lib/sessionsApi";
+import { DEFAULT_CHAT_FEATURES } from "@/lib/chatFeatures";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
@@ -338,6 +339,8 @@ export interface OptimisticSessionModel {
   costControlModeOverride?: "on" | "off" | null;
   /** The `subagent_routing_override` the create POSTs, when set. */
   subagentRoutingOverride?: "on" | "off" | null;
+  /** The `chat_features` the create POSTs, when known. */
+  chatFeatures?: string[];
   /** Bound agent identity for the composer, when resolved. */
   boundAgentId?: string | null;
   boundAgentName?: string | null;
@@ -406,6 +409,7 @@ export function beginLocalConversation(
           ...(model.subagentRoutingOverride !== undefined
             ? { subagentRoutingOverride: model.subagentRoutingOverride }
             : {}),
+          ...(model.chatFeatures !== undefined ? { chatFeatures: model.chatFeatures } : {}),
         };
 
   const entry = conversationRegistry.acquire(tempConvId);
@@ -835,6 +839,11 @@ export interface ConversationState {
    * on bind and written through `setSubagentRouting`.
    */
   subagentRoutingOverride: "on" | "off" | null;
+  /**
+   * Enabled chat-feature keys for the active session, e.g. ``["run_commands"]``.
+   * Hydrated from the snapshot on bind and written through `setChatFeatures`.
+   */
+  chatFeatures: string[];
   /**
    * Per-session Codex collaboration-mode flag. Hydrated from
    * ``omnigent.codex_native.collaboration_mode`` on bind and updated by the
@@ -1356,6 +1365,12 @@ export interface ChatActions {
    * unrouted sub-agents. No-ops when there is no active conversation.
    */
   setSubagentRouting: (mode: "on" | "off") => Promise<void>;
+  /**
+   * Set the active session's enabled chat features — optimistic local write,
+   * then PATCH; the server's canonical set (or a rollback on failure) settles
+   * the state. No-ops when there is no active conversation.
+   */
+  setChatFeatures: (features: string[]) => Promise<void>;
   /**
    * Re-read the active session's routing switches (cost control + sub-agent
    * routing) from the server and apply them.
@@ -2150,6 +2165,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionHostId: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
+  chatFeatures: [...DEFAULT_CHAT_FEATURES],
   codexPlanMode: false,
   claudePermissionMode: "",
   codexApprovalMode: "",
@@ -3721,6 +3737,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  setChatFeatures: async (features) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().chatFeatures;
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    patchSet({ chatFeatures: features });
+    try {
+      const session = await updateSession(conversationId, { chatFeatures: features });
+      patchSet({ chatFeatures: session.chatFeatures ?? features });
+    } catch (err) {
+      patchSet({ chatFeatures: previous });
+      throw err;
+    }
+  },
+
   refreshSessionOverrides: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
@@ -4701,6 +4733,7 @@ function sessionBindingPatch(
   | "subAgentName"
   | "costControlModeOverride"
   | "subagentRoutingOverride"
+  | "chatFeatures"
   | "codexPlanMode"
   | "claudePermissionMode"
   | "codexApprovalMode"
@@ -4734,6 +4767,7 @@ function sessionBindingPatch(
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
+    chatFeatures: session.chatFeatures ?? [...DEFAULT_CHAT_FEATURES],
     codexPlanMode: codexPlanModeFromSession(session),
     claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
