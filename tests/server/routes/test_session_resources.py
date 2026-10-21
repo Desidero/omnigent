@@ -3391,6 +3391,32 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
 
 
 @pytest.mark.asyncio
+async def test_the_pr_watch_reader_reads_like_the_panel(
+    runner_globals_reset: None, db_uri: str
+) -> None:
+    """The PR watcher's reader is vouched for, stored, and answered with the server's list."""
+    del runner_globals_reset
+    readers: list[Any] = []
+    app = _pr_app(db_uri, register_pr_info_reader=readers.append)
+    runner = _FakeRunnerClient(payload=_pr_info())
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
+        await client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
+        set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+        await client.delete(f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    [read] = readers
+    conv = app.state.test_conversation_store.get_conversation(_PR_SESSION)
+
+    info = await read(_PR_SESSION, conv, _SECOND_PR)
+
+    assert runner.get_params[-1] == {"pr_url": _SECOND_PR, "server_tracked": True}
+    # The host still reports the unlinked PR; the answer is the server's list.
+    assert [pr["url"] for pr in info["prs"]] == [_SECOND_PR]
+
+
+@pytest.mark.asyncio
 async def test_linking_checks_the_session_limit_before_asking_the_host(
     pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
