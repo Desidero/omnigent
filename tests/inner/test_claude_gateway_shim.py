@@ -290,6 +290,25 @@ async def test_shim_forwards_non_opus_and_non_messages_traffic_verbatim(upstream
 
 
 @pytest.mark.asyncio
+async def test_shim_forwards_the_gateway_request_tags_header(upstream) -> None:  # type: ignore[no-untyped-def]  # fixture type owned by pytest
+    """The session tags Claude Code sends reach the gateway through the shim."""
+    shim = ClaudeGatewayShim(upstream_base_url=f"http://127.0.0.1:{upstream.port}")
+    await shim.start()
+    try:
+        tags = '{"omnigent_session_id":"conv_1","omnigent_label_team":"ml"}'
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{shim.base_url}/v1/messages",
+                content=_body("databricks-claude-opus-4-8", {"type": "adaptive"}),
+                headers={"Databricks-Ai-Gateway-Request-Tags": tags},
+            )
+
+        assert upstream.requests[0].headers["databricks-ai-gateway-request-tags"] == tags
+    finally:
+        await shim.aclose()
+
+
+@pytest.mark.asyncio
 async def test_shim_returns_502_when_upstream_unreachable() -> None:
     """Upstream connection failures surface as a 502 with an Anthropic-
     shaped error body instead of hanging or crashing the shim."""

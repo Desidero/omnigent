@@ -135,6 +135,20 @@ def test_ambiguous_routing_and_framing_headers_are_rejected(
         )
 
 
+def test_gateway_request_tags_header_is_dropped_by_the_rebuild() -> None:
+    """The signer forwards only the headers it rebuilds, so a client-sent
+    request-tags header does not reach the gateway from a signer worker."""
+    request = _reconstruct(
+        headers=[
+            ("Authorization", f"Bearer {_PLACEHOLDER}"),
+            ("Content-Type", "application/json"),
+            ("Databricks-Ai-Gateway-Request-Tags", '{"omnigent_session_id":"conv_1"}'),
+        ]
+    )
+
+    assert request.header("Databricks-Ai-Gateway-Request-Tags") is None
+
+
 def test_placeholder_literal_in_other_header_or_target_is_rejected() -> None:
     with pytest.raises(SigningRejected):
         _reconstruct(

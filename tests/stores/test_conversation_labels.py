@@ -17,7 +17,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
 )
-from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
+from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY, is_internal_label_key
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -489,3 +489,23 @@ def test_fork_does_not_inherit_archived_at_label(
     forked = conversation_store.get_conversation(fork.id)
     assert forked is not None
     assert ARCHIVED_AT_LABEL_KEY not in forked.labels
+
+
+# ── Internal vs user label keys ────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("key", "internal"),
+    [
+        ("omni_project", True),
+        ("omnigent.pinned.bob@example.com", True),
+        ("omnigent.archived_at", True),
+        ("cost_control.plan", True),
+        ("team", False),
+        ("omnigent", False),
+        ("omni_projects", False),
+    ],
+)
+def test_is_internal_label_key(key: str, internal: bool) -> None:
+    """Omnigent-owned keys are hidden from, and rejected for, user editing."""
+    assert is_internal_label_key(key) is internal

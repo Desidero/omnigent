@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from copy import deepcopy
@@ -39,6 +39,7 @@ from omnigent.databricks_ai_gateway import (
     PI_AGENT,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
+    with_gateway_request_tags,
 )
 from omnigent.harnesses.pi_native.auth_command import (
     AUTH_DIR_ENV,
@@ -1867,10 +1868,26 @@ def resolve_pi_native_provider(
         return None
 
 
+def with_pi_gateway_request_tags(
+    headers: Mapping[str, str] | None, tags_value: str
+) -> dict[str, str]:
+    """Set the Unity Gateway request-tags header on a Pi provider's headers.
+
+    Pi expands ``$NAME`` in header values, so a label's ``$`` is escaped as ``$$``.
+
+    :param headers: The provider's configured headers, or ``None``; not modified.
+    :param tags_value: Encoded tags, e.g. from ``gateway_request_tags_value``.
+    :returns: A copy of *headers* carrying the request tags.
+    """
+    return with_gateway_request_tags(headers, tags_value.replace("$", "$$"))
+
+
 def write_pi_models_config(
     agent_dir: Path,
     provider: PiProviderConfig,
     rendered: _PiModelsConfig | None = None,
+    *,
+    request_tags: str | None = None,
 ) -> Path:
     """Write *provider* as ``models.json`` into a managed Pi config dir.
 
@@ -1878,6 +1895,8 @@ def write_pi_models_config(
     :param provider: The resolved provider config to render.
     :param rendered: An already-rendered config to write, so a caller that also
         inspects it renders (and logs) only once. Defaults to rendering here.
+    :param request_tags: The session's encoded Unity Gateway request tags, sent
+        by gateway providers; ``None`` sends none.
     :returns: Path to the written ``models.json``.
     """
     if rendered is None:
@@ -1886,6 +1905,8 @@ def write_pi_models_config(
     os.chmod(agent_dir, 0o700)
     rendered = deepcopy(rendered)
     for provider_id, config in rendered["providers"].items():
+        if request_tags is not None and is_databricks_ai_gateway_url(config["baseUrl"]):
+            config["headers"] = with_pi_gateway_request_tags(config.get("headers"), request_tags)
         api_key = config.get("apiKey")
         # Windows Pi can use a configured PowerShell; preserve its own resolver.
         if os.name == "posix" and isinstance(api_key, str) and api_key.startswith("!"):
@@ -1939,6 +1960,7 @@ def pi_native_provider_launch(
     reasoning_effort: str | None = None,
     *,
     selection: str | None = None,
+    request_tags: str | None = None,
 ) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1950,6 +1972,8 @@ def pi_native_provider_launch(
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
+    :param request_tags: The session's encoded Unity Gateway request tags for
+        the written config; ``None`` sends none.
     :returns: The launch env, CLI args and any effort warning.
     :raises ValueError: If no generated provider serves the selected model.
     """
@@ -1982,7 +2006,7 @@ def pi_native_provider_launch(
         selected_model = candidate_model
     else:
         model_provider_id = _default_model_provider_id(provider, rendered)
-    write_pi_models_config(agent_dir, provider, rendered)
+    write_pi_models_config(agent_dir, provider, rendered, request_tags=request_tags)
     # Session effort or Pi's default selects thinking; don't inherit a global
     # thinking preference that may belong to a different provider.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir

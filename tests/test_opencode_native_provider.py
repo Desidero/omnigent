@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 import sys
 import types
@@ -160,6 +161,76 @@ def test_write_provider_config_attributes_unity_gateway_models(tmp_path: Path) -
     assert config["provider"]["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
         "User-Agent": "ucode/0.1.0 opencode/1.2.0"
     }
+
+
+def test_write_provider_config_tags_unity_gateway_models(tmp_path: Path) -> None:
+    """Each model of a Unity Gateway provider also sends the session's request tags."""
+    config = {
+        "provider": {
+            "databricks": {
+                "options": {"baseURL": "https://dbc-1.cloud.databricks.com/ai-gateway/mlflow/v1"},
+                "models": {"system.ai.glm-5": {}},
+            },
+            "serving": {
+                "options": {"baseURL": "https://dbc-1.cloud.databricks.com/serving-endpoints"},
+                "models": {"databricks-x": {"name": "databricks-x"}},
+            },
+        }
+    }
+    tags = '{"omnigent_session_id":"conv_1","omnigent_label_team":"ml"}'
+
+    path = write_opencode_provider_config(tmp_path, config, request_tags=tags)
+
+    providers = json.loads(path.read_text())["provider"]
+    assert providers["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "opencode",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+        "Databricks-Ai-Gateway-Request-Tags": tags,
+    }
+    assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
+    untagged = write_opencode_provider_config(tmp_path / "untagged", config)
+    assert (
+        "Databricks-Ai-Gateway-Request-Tags"
+        not in (
+            json.loads(untagged.read_text())["provider"]["databricks"]["models"][
+                "system.ai.glm-5"
+            ]["headers"]
+        )
+    )
+
+
+def test_write_provider_config_keeps_request_tags_literal(tmp_path: Path) -> None:
+    """A label spelled like an OpenCode config variable stays literal text: the
+    file never contains ``{env:`` or ``{file:`` for OpenCode to substitute, and
+    the header still decodes to the same tags."""
+    config = {
+        "provider": {
+            "databricks": {
+                "options": {"baseURL": "https://dbc-1.cloud.databricks.com/ai-gateway/mlflow/v1"},
+                "models": {"system.ai.glm-5": {}},
+            }
+        }
+    }
+    tags = json.dumps(
+        {
+            "omnigent_session_id": "conv_1",
+            "omnigent_label_team": "{env:DATABRICKS_TOKEN}",
+            "omnigent_label_{file:/etc/passwd}": "x",
+        },
+        separators=(",", ":"),
+    )
+
+    path = write_opencode_provider_config(tmp_path, config, request_tags=tags)
+
+    text = path.read_text()
+    assert "{env:" not in text and "{file:" not in text
+    # What OpenCode's loader does to the text before parsing it.
+    substituted = re.sub(r"\{env:([^}]+)\}", "", text)
+    substituted = re.sub(r"\{file:[^}]+\}", "", substituted)
+    header = json.loads(substituted)["provider"]["databricks"]["models"]["system.ai.glm-5"][
+        "headers"
+    ]["Databricks-Ai-Gateway-Request-Tags"]
+    assert json.loads(header) == json.loads(tags)
 
 
 @pytest.mark.parametrize(

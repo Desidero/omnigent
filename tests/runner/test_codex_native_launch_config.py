@@ -285,6 +285,7 @@ async def test_happy_path_parses_full_config(
             "omnigent.fork.source_external_session_id": "thread_src",
             "omnigent.fork.carry_history": "1",
             "omnigent.codex_native.bypass_sandbox": "1",
+            "team": "ml",
         },
     }
     client = _Client(_Resp(200, snapshot))
@@ -304,6 +305,7 @@ async def test_happy_path_parses_full_config(
     assert cfg.fork_source_external_id == "thread_src"
     assert cfg.fork_carry_history is True, "carry_history label '1' should parse to True."
     assert cfg.bypass_sandbox is True, "bypass_sandbox label '1' should parse to True."
+    assert cfg.labels["team"] == "ml", "Labels feed the Unity Gateway request tags."
     assert cfg.auto_harness is True
     assert cfg.routing_enabled is True
     assert cfg.turn_routing is True
@@ -544,6 +546,24 @@ async def test_client_side_launch_config_failure_stays_unattributed() -> None:
     with pytest.raises(RuntimeError) as info:
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert not isinstance(info.value, OmnigentError)
+
+
+@pytest.mark.asyncio
+async def test_opencode_launch_config_reads_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenCode's launch config carries the labels that feed the request tags."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    client = _Client(_Resp(200, {"workspace": "/tmp/repo", "labels": {"team": "ml", "count": 3}}))
+
+    cfg = await _orchestration._opencode_native_launch_config(
+        session_id="conv_1", server_client=client
+    )
+
+    assert cfg.labels == {"team": "ml", "count": "3"}
+    bare = _Client(_Resp(200, {"workspace": "/tmp/repo"}))
+    bare_cfg = await _orchestration._opencode_native_launch_config(
+        session_id="conv_1", server_client=bare
+    )
+    assert bare_cfg.labels == {}
 
 
 @pytest.mark.asyncio

@@ -6,14 +6,19 @@ whether a resolved harness launch is gateway-backed. Keeping one predicate here
 means a look-alike host is rejected identically everywhere.
 
 The usage-attribution headers every harness sends to the gateway live here too,
-so each harness names the coding agent and client surfaces the same way.
+so each harness names the coding agent and client surfaces the same way, as do
+the request tags that carry a session's id and labels into gateway logs.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from typing import Final, TypeVar
 from urllib.parse import urlparse
+
+from omnigent.stores.conversation_store import is_internal_label_key
 
 # Trusted parent domains for a Databricks-owned host. The Unity Gateway lives
 # under a per-workspace subdomain of one of these (the canonical form is
@@ -158,4 +163,134 @@ def with_gateway_attribution_lines(
     lines = [custom_headers] if custom_headers else []
     attribution = gateway_attribution_headers(coding_agent, via_ug=via_ug)
     lines.extend(f"{name}: {value}" for name, value in attribution.items())
+    return "\n".join(lines)
+
+
+# Per-request tags the Unity Gateway logs in the ``request_tags`` column of its
+# usage tracking and inference tables: a JSON object of string keys to string
+# values. Omnigent sends the session id plus the session's user labels.
+REQUEST_TAGS_HEADER: Final[str] = "Databricks-Ai-Gateway-Request-Tags"
+SESSION_ID_REQUEST_TAG: Final[str] = "omnigent_session_id"
+# User labels are namespaced so a session editor cannot write a tag an
+# organisation's gateway policies match on, such as ``team``.
+LABEL_REQUEST_TAG_PREFIX: Final[str] = "omnigent_label_"
+# Set to ``0`` / ``false`` / ``no`` / ``off`` to stop sending session tags.
+REQUEST_TAGS_SWITCH_ENV: Final[str] = "OMNIGENT_GATEWAY_REQUEST_TAGS"
+# Carries a session's encoded tags from the runner into its harness process.
+REQUEST_TAGS_VALUE_ENV: Final[str] = "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE"
+# A quarter of Node's default 16 KiB ``--max-http-header-size``, which bounds
+# the whole header block Claude Code sends, auth and beta headers included.
+_REQUEST_TAGS_MAX_BYTES: Final[int] = 4 * 1024
+
+
+def gateway_request_tags_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether session request tags are sent to the Unity Gateway (on by default).
+
+    :param environ: Environment to read; ``None`` reads ``os.environ``.
+    :returns: ``False`` only when :data:`REQUEST_TAGS_SWITCH_ENV` is falsy.
+    """
+    from omnigent.process_logging import env_truthy
+
+    source = os.environ if environ is None else environ
+    return env_truthy(source.get(REQUEST_TAGS_SWITCH_ENV) or "1")
+
+
+def gateway_request_tags(session_id: str, labels: Mapping[str, str] | None) -> dict[str, str]:
+    """Build the Unity Gateway request tags for a session.
+
+    The session id always comes first. User labels follow in key order as
+    ``omnigent_label_<key>``, stopping at the first one that would push the
+    encoded header past the size cap, so the same labels always yield the
+    same tags.
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :param labels: The session's labels, e.g. ``{"team": "ml"}``; internal
+        ``omnigent.*``, ``cost_control.*`` and project labels are skipped.
+    :returns: e.g. ``{"omnigent_session_id": "conv_abc123", "omnigent_label_team": "ml"}``.
+    """
+    tags = {SESSION_ID_REQUEST_TAG: session_id}
+    size = len(_encode_request_tags(tags))
+    for key, value in sorted((labels or {}).items()):
+        if is_internal_label_key(key):
+            continue
+        tag = f"{LABEL_REQUEST_TAG_PREFIX}{key}"
+        # Each entry adds ``,"key":"value"`` to the compact encoding.
+        entry_size = len(_encode_request_tags({tag: value})) - 1
+        if size + entry_size > _REQUEST_TAGS_MAX_BYTES:
+            break
+        tags[tag] = value
+        size += entry_size
+    return tags
+
+
+def _encode_request_tags(tags: Mapping[str, str]) -> str:
+    """Encode tags as compact ASCII JSON, safe for an HTTP header value."""
+    return json.dumps(tags, separators=(",", ":"))
+
+
+def gateway_request_tags_value(session_id: str, labels: Mapping[str, str] | None) -> str | None:
+    """Return the encoded request-tags header value, or ``None`` when opted out."""
+    if not gateway_request_tags_enabled():
+        return None
+    return _encode_request_tags(gateway_request_tags(session_id, labels))
+
+
+def gateway_request_tags_env(session_id: str, labels: Mapping[str, str] | None) -> dict[str, str]:
+    """Return the harness-process env that carries a session's request tags.
+
+    :returns: ``{REQUEST_TAGS_VALUE_ENV: "<json>"}``, or ``{}`` when opted out.
+    """
+    value = gateway_request_tags_value(session_id, labels)
+    return {REQUEST_TAGS_VALUE_ENV: value} if value is not None else {}
+
+
+def gateway_request_tags_headers(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return the request-tags header the runner handed this harness process.
+
+    :param environ: Environment to read; ``None`` reads ``os.environ``.
+    :returns: ``{REQUEST_TAGS_HEADER: "<json>"}``, or ``{}`` when none was handed over.
+    """
+    source = os.environ if environ is None else environ
+    value = source.get(REQUEST_TAGS_VALUE_ENV)
+    if not value or not gateway_request_tags_enabled(source):
+        return {}
+    return {REQUEST_TAGS_HEADER: value}
+
+
+def with_gateway_request_tags(
+    headers: Mapping[str, str] | None, tags_value: str
+) -> dict[str, str]:
+    """Set the request-tags header on a provider's header map.
+
+    An existing copy under any capitalisation is replaced, so stamping a
+    config twice leaves one header.
+
+    :param headers: The provider's configured headers, or ``None``; not modified.
+    :param tags_value: Encoded tags, e.g. from :func:`gateway_request_tags_value`.
+    :returns: A copy of *headers* carrying the request tags.
+    """
+    kept = {
+        name: value
+        for name, value in (headers or {}).items()
+        if name.lower() != REQUEST_TAGS_HEADER.lower()
+    }
+    return {**kept, REQUEST_TAGS_HEADER: tags_value}
+
+
+def with_gateway_request_tags_line(custom_headers: str | None, tags_value: str) -> str:
+    """Set the request-tags header in Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
+
+    An existing request-tags line is replaced, so a launch inside an already
+    tagged process still sends one header.
+
+    :param custom_headers: The existing newline-separated ``Name: value`` block, or ``None``.
+    :param tags_value: Encoded tags, e.g. from :func:`gateway_request_tags_value`.
+    :returns: The block with the request-tags line last.
+    """
+    lines = [
+        line
+        for line in (custom_headers or "").splitlines()
+        if line.split(":", 1)[0].strip().lower() != REQUEST_TAGS_HEADER.lower()
+    ]
+    lines.append(f"{REQUEST_TAGS_HEADER}: {tags_value}")
     return "\n".join(lines)

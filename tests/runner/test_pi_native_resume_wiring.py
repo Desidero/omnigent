@@ -71,12 +71,14 @@ async def test_launch_config_reads_fork_labels(monkeypatch: pytest.MonkeyPatch) 
             "labels": {
                 FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY: "src-pi-id",
                 FORK_CARRY_HISTORY_LABEL_KEY: "1",
+                "team": "ml",
             },
         }
     )
     config = await _pi_native_launch_config(session_id="conv_1", server_client=client)
     assert config.fork_source_external_id == "src-pi-id"
     assert config.fork_carry_history is True
+    assert config.labels["team"] == "ml", "Labels feed the Unity Gateway request tags."
 
 
 @pytest.mark.asyncio
@@ -87,6 +89,7 @@ async def test_launch_config_defaults_no_fork(monkeypatch: pytest.MonkeyPatch) -
     assert config.fork_source_external_id is None
     assert config.fork_carry_history is False
     assert config.native_usage_baseline is None
+    assert config.labels == {}
 
 
 # --------------------------------------------------------------------------

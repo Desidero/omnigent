@@ -33,6 +33,7 @@ from omnigent.databricks_ai_gateway import (
     OPENCODE_AGENT,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
+    with_gateway_request_tags,
 )
 from omnigent.models import model_catalog
 
@@ -165,7 +166,25 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
     }
 
 
-def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, object]:
+def _literal_request_tags(tags_value: str) -> str:
+    """Keep a session's request tags literal through OpenCode's config variables.
+
+    OpenCode substitutes ``{env:NAME}`` and ``{file:PATH}`` anywhere in the
+    config text before parsing it, so a label spelled that way would leak an
+    environment variable or a file into gateway logs. Escaping every ``{``
+    inside the JSON strings as ``\\u007b`` leaves the JSON equivalent and
+    gives the substitution nothing to match.
+
+    :param tags_value: Encoded tags, e.g. from ``gateway_request_tags_value``;
+        a flat JSON object whose only structural brace opens it.
+    :returns: The same JSON with string braces escaped.
+    """
+    return tags_value[:1] + tags_value[1:].replace("{", "\\u007b")
+
+
+def _with_gateway_attribution(
+    config: Mapping[str, object], request_tags: str | None = None
+) -> Mapping[str, object]:
     """
     Add usage-attribution headers to each model of a Unity Gateway provider.
 
@@ -173,6 +192,8 @@ def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, obje
     last, after its built-in ``User-Agent``.
 
     :param config: An ``opencode.json`` dict; it is not modified.
+    :param request_tags: The session's encoded Unity Gateway request tags,
+        sent as one more header; ``None`` sends none.
     :returns: *config*, with gateway providers' model entries copied and stamped.
     """
     providers = config.get("provider")
@@ -195,33 +216,46 @@ def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, obje
             stamped_models[model_id] = model
             if isinstance(model, Mapping):
                 headers = model.get("headers")
-                stamped_models[model_id] = {
-                    **model,
-                    "headers": with_gateway_attribution(
-                        headers if isinstance(headers, Mapping) else None,
-                        OPENCODE_AGENT,
-                        base_url,
-                    ),
-                }
+                stamped_headers = with_gateway_attribution(
+                    headers if isinstance(headers, Mapping) else None,
+                    OPENCODE_AGENT,
+                    base_url,
+                )
+                if request_tags is not None:
+                    stamped_headers = with_gateway_request_tags(
+                        stamped_headers, _literal_request_tags(request_tags)
+                    )
+                stamped_models[model_id] = {**model, "headers": stamped_headers}
         stamped[provider_id] = {**provider, "models": stamped_models}
     return {**config, "provider": stamped}
 
 
-def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
+def write_opencode_provider_config(
+    xdg_config_home: Path,
+    config: Mapping[str, object],
+    *,
+    request_tags: str | None = None,
+) -> Path:
     """
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
 
-    Unity Gateway providers get usage-attribution headers on the way out.
+    Unity Gateway providers get usage-attribution headers on the way out, and
+    the session's request tags when given.
 
     :param xdg_config_home: The per-session ``XDG_CONFIG_HOME`` the server uses.
     :param config: The provider config dict (see
         :func:`build_opencode_provider_config`).
+    :param request_tags: The session's encoded Unity Gateway request tags;
+        ``None`` sends none.
     :returns: The path written.
     """
     cfg_dir = xdg_config_home / "opencode"
     cfg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = cfg_dir / "opencode.json"
-    payload = json.dumps(_with_gateway_attribution(config), indent=2, sort_keys=True) + "\n"
+    payload = (
+        json.dumps(_with_gateway_attribution(config, request_tags), indent=2, sort_keys=True)
+        + "\n"
+    )
     fd, tmp_name = tempfile.mkstemp(prefix="opencode.json.", dir=str(cfg_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

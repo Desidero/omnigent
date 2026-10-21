@@ -1007,6 +1007,47 @@ def test_to_models_config_attributes_unity_gateway_providers() -> None:
     assert ug_provider["headers"] == {"User-Agent": "ucode/0.1.0 pi/0.80.0"}
 
 
+def test_write_models_config_tags_unity_gateway_providers(tmp_path: Path) -> None:
+    """Gateway providers send the session's request tags; Pi's ``$`` expansion
+    is escaped, and the configured headers and other providers stay as they were."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://dbc-1.cloud.databricks.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="system.ai.claude-sonnet-5",
+        api_key="!get-token",
+        auth_header=True,
+        additional_providers={
+            "other": {
+                "baseUrl": "https://openrouter.ai/api/v1",
+                "apiKey": "sk-test",
+                "api": "openai-completions",
+                "models": [{"id": "qwen/qwen3"}],
+            }
+        },
+    )
+    tags = '{"omnigent_session_id":"conv_1","omnigent_label_budget":"$HOME"}'
+
+    path = creds.write_pi_models_config(tmp_path / "pi-agent", provider, request_tags=tags)
+
+    providers = json.loads(path.read_text(encoding="utf-8"))["providers"]
+    assert providers["omnigent"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+        "Databricks-Ai-Gateway-Request-Tags": (
+            '{"omnigent_session_id":"conv_1","omnigent_label_budget":"$$HOME"}'
+        ),
+    }
+    assert "headers" not in providers["other"]
+    untagged = creds.write_pi_models_config(tmp_path / "pi-agent-untagged", provider)
+    assert (
+        "Databricks-Ai-Gateway-Request-Tags"
+        not in (
+            json.loads(untagged.read_text(encoding="utf-8"))["providers"]["omnigent"]["headers"]
+        )
+    )
+
+
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
     """models.json is written 0600 in a 0700 dir (it may hold a literal key)."""
     provider = creds.PiProviderConfig(
