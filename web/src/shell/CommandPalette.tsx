@@ -2,6 +2,9 @@
 // and New chat in project (one row per project, opening the composer with its stored
 // defaults; hidden until the user types). Sessions are searched server-side (one loaded
 // page can't find older ones), so cmdk filtering is off and the static rows are filtered here.
+//
+// With `projectStep` the palette instead asks which project a new session
+// belongs to: "No project" first, then every project, filtered as you type.
 
 import type React from "react";
 import { defaultFilter } from "cmdk";
@@ -9,6 +12,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClockIcon,
+  CircleSlashIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -52,6 +56,8 @@ import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav
 
 export interface CommandPaletteProps {
   sessionsOnly?: boolean;
+  /** Ask which project a new session belongs to instead of listing commands. */
+  projectStep?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Flip the left (Conversations) sidebar — owned by AppShell. */
@@ -60,6 +66,9 @@ export interface CommandPaletteProps {
   onToggleRightSidebar: () => void;
   /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
   rightSidebarShortcutEnabled?: boolean;
+  /** Start a new session, which may reopen the palette on the project step.
+      Defaults to opening the plain composer. */
+  onNewSession?: () => void;
 }
 
 interface ActionCommand {
@@ -155,13 +164,25 @@ function paletteSessions(
   return out;
 }
 
+/** Whether every whitespace-separated word of `query` occurs in `text`. */
+function matchesEveryWord(text: string, query: string): boolean {
+  const lower = text.toLowerCase();
+  return query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .every((word) => lower.includes(word));
+}
+
 export function CommandPalette({
   sessionsOnly = false,
+  projectStep = false,
   open,
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
   rightSidebarShortcutEnabled = true,
+  onNewSession,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -192,7 +213,7 @@ export function CommandPalette({
         label: "New chat",
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
+        run: onNewSession ?? (() => navigate("/")),
         shortcut: newSessionShortcutKeys(),
       },
       {
@@ -234,37 +255,52 @@ export function CommandPalette({
         shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
+    [
+      navigate,
+      onNewSession,
+      onToggleLeftSidebar,
+      onToggleRightSidebar,
+      rightSidebarShortcutEnabled,
+    ],
   );
 
   const filteredActions = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (sessionsOnly) return [];
+    if (sessionsOnly || projectStep) return [];
     if (q === "") return actions;
     return actions.filter(
       (a) =>
         a.label.toLowerCase().includes(q) || a.keywords.some((k) => k.toLowerCase().includes(q)),
     );
-  }, [actions, query, sessionsOnly]);
+  }, [actions, query, sessionsOnly, projectStep]);
 
-  const { data: projects = [] } = useProjects();
+  const { data: projects = [], isSuccess: projectsLoaded, isError: projectsFailed } = useProjects();
   // Every typed word must appear in the row label or the group heading, so
-  // "new omni", "omni" and "project" all reach "New chat in omnigent".
+  // "new omni", "omni" and "project" all reach "New chat in omnigent". The
+  // project step lists every project until the user types, and matches names only.
   const filteredProjects = useMemo(() => {
-    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    if (sessionsOnly || words.length === 0) return [];
-    return projects.filter((project) => {
-      const label = `new chat in project ${project.name}`.toLowerCase();
-      return words.every((word) => label.includes(word));
-    });
-  }, [projects, query, sessionsOnly]);
+    if (projectStep) return projects.filter((project) => matchesEveryWord(project.name, query));
+    if (sessionsOnly || query.trim() === "") return [];
+    return projects.filter((project) =>
+      matchesEveryWord(`new chat in project ${project.name}`, query),
+    );
+  }, [projects, query, sessionsOnly, projectStep]);
+  const showNoProject = projectStep && matchesEveryWord("no project", query);
+  // The project step may open before the list resolves. Nothing to choose
+  // from means the plain composer, as if the prompt had never been offered.
+  const noProjectToOffer = projectsFailed || (projectsLoaded && projects.length === 0);
+  useEffect(() => {
+    if (!open || !projectStep || !noProjectToOffer) return;
+    onOpenChange(false);
+    navigate("/");
+  }, [open, projectStep, noProjectToOffer, onOpenChange, navigate]);
 
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
-    useConversations("", false, { enabled: open });
+    useConversations("", false, { enabled: open && !projectStep });
   const serverInfo = useServerInfo();
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
-  const searching = !sessionsOnly && debouncedQuery !== "";
+  const searching = !sessionsOnly && !projectStep && debouncedQuery !== "";
   // Wait briefly for server info so a supporting server never gets the mixed
   // request; if it stalls, fall back to that request rather than never searching.
   const serverInfoLoading = serverInfo === "loading";
@@ -314,6 +350,8 @@ export function CommandPalette({
   ]);
 
   const sessions = useMemo(() => {
+    // A disabled query still returns cached pages; the project step lists none.
+    if (projectStep) return [];
     if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
     // Rows archived after they loaded are still cached here, so drop them.
     const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
@@ -326,7 +364,7 @@ export function CommandPalette({
     }
     // The full first page would push Actions below the fold.
     return out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, titleSearch.data, query, searching, sessionsOnly]);
+  }, [data, titleSearch.data, query, searching, sessionsOnly, projectStep]);
   // Excludes title matches again in case a rename moved a session between the
   // two groups' requests: cmdk needs each item value to be unique.
   const contentSessions = useMemo(
@@ -341,9 +379,12 @@ export function CommandPalette({
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
-  const loadError = searching
-    ? searchGroups.some((group) => group.isError)
-    : isError || isFetchNextPageError;
+  // The project step never reads sessions, so a stale fetch error stays hidden.
+  const loadError = projectStep
+    ? false
+    : searching
+      ? searchGroups.some((group) => group.isError)
+      : isError || isFetchNextPageError;
   const loadMoreError = searching
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;
@@ -379,10 +420,16 @@ export function CommandPalette({
     if (!userMovedSelection.current) setSelectedValue(firstItemValue);
   }, [firstItemValue, open, debouncedQuery]);
 
-  const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
-  const placeholder = sessionsOnly
-    ? "Search sessions by name…"
-    : "Search sessions or run a command";
+  const paletteLabel = projectStep
+    ? "New session"
+    : sessionsOnly
+      ? "Switch session"
+      : "Command palette";
+  const placeholder = projectStep
+    ? "Start a new session in…"
+    : sessionsOnly
+      ? "Search sessions by name…"
+      : "Search sessions or run a command";
 
   const runAction = (action: ActionCommand): void => {
     close();
@@ -392,7 +439,7 @@ export function CommandPalette({
   const queryClient = useQueryClient();
   const newChatInProject = (name: string): void => {
     close();
-    navigate(`/?project=${encodeURIComponent(name)}`);
+    navigate(name ? `/?project=${encodeURIComponent(name)}` : "/");
   };
 
   const goToSession = (id: string): void => {
@@ -609,8 +656,14 @@ export function CommandPalette({
                 })}
               </CommandGroup>
             )}
-            {filteredProjects.length > 0 && (
-              <CommandGroup heading="New chat in project">
+            {(filteredProjects.length > 0 || showNoProject) && (
+              <CommandGroup heading={projectStep ? "Project" : "New chat in project"}>
+                {showNoProject && (
+                  <CommandItem value="no-project" onSelect={() => newChatInProject("")}>
+                    <CircleSlashIcon />
+                    <span className="flex-1 truncate text-left">No project</span>
+                  </CommandItem>
+                )}
                 {filteredProjects.map((project) => (
                   <CommandItem
                     key={project.name}
@@ -618,7 +671,9 @@ export function CommandPalette({
                     onSelect={() => newChatInProject(project.name)}
                   >
                     <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
-                    <span className="flex-1 truncate text-left">New chat in {project.name}</span>
+                    <span className="flex-1 truncate text-left">
+                      {projectStep ? project.name : `New chat in ${project.name}`}
+                    </span>
                   </CommandItem>
                 ))}
               </CommandGroup>

@@ -27,6 +27,7 @@ import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
+import { NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY } from "@/lib/newChatProjectPromptPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
@@ -373,6 +374,7 @@ describe("SettingsPage", () => {
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
     localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
+    localStorage.removeItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY);
   });
 
   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
@@ -466,6 +468,22 @@ describe("SettingsPage", () => {
     fireEvent.click(toggle);
     expect(toggle).not.toBeChecked();
     expect(toastError).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the new-session project prompt enabled by default", async () => {
+    renderPage("/settings/general");
+
+    expect(await screen.findByTestId("new-chat-project-prompt-toggle")).toBeChecked();
+  });
+
+  it("persists turning the new-session project prompt off", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("new-chat-project-prompt-toggle");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("off");
   });
 
   it("asks before terminal copying by default and explains the scope", () => {
