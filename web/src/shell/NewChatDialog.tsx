@@ -36,6 +36,7 @@ import {
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { NewChatFeatureSection } from "@/components/composer/chatFeatureSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import {
   compactModelTriggerLabel,
@@ -2708,6 +2709,10 @@ export function NewChatLandingScreen() {
     _setCostControlMode(mode);
     if (mode === "on") _setPickedModel("");
   }, []);
+  // Chat features the user picked for the new session. Null sends none, so
+  // the server applies the user's saved default.
+  const [pickedChatFeatures, setPickedChatFeatures] = useState<string[] | null>(null);
+  const createChatFeatures = pickedChatFeatures ?? undefined;
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
@@ -4154,6 +4159,11 @@ export function NewChatLandingScreen() {
               : []),
             ...(accountSection ? [accountSection] : []),
           ]}
+        />
+        <NewChatFeatureSection
+          picked={pickedChatFeatures}
+          onChange={setPickedChatFeatures}
+          testIdPrefix="new-chat-landing-agent"
         />
       </>
     ) : null;
@@ -5796,6 +5806,7 @@ export function NewChatLandingScreen() {
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
         if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
+        if (createChatFeatures !== undefined) metadata.chat_features = createChatFeatures;
         if (createProjectId !== null) {
           // Atomic filing: the server sets first-class `project_id` at create.
           metadata.project_id = createProjectId;
@@ -5846,6 +5857,7 @@ export function NewChatLandingScreen() {
               ? null
               : (selectedNativeHarness ?? pickedHarness ?? null),
             costControlModeOverride: costControlOverride ?? null,
+            ...(createChatFeatures !== undefined ? { chatFeatures: createChatFeatures } : {}),
             boundAgentId: effectiveAgentId,
             // Name (not just id) so the in-session temp composer can evaluate
             // routing eligibility (isCostRoutingSession needs a bound agent).
@@ -5951,6 +5963,7 @@ export function NewChatLandingScreen() {
           model_override: normalizedModelOverride ?? undefined,
           reasoning_effort: normalizedReasoningEffort ?? undefined,
           cost_control_mode_override: costControlOverride,
+          chat_features: createChatFeatures,
           // Top-level Smart Routing sends the same "auto" sentinel the bundle
           // path does; the server tells them apart by the bound agent being a
           // native wrapper, and routes at create time (the terminal launches

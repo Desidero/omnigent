@@ -32,6 +32,7 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { seedChatFeaturePreferences } from "@/test/chatFeatureFixtures";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
@@ -204,6 +205,7 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
     dictation_available: false,
   };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  seedChatFeaturePreferences(client);
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
@@ -239,6 +241,7 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
     dictation_available: false,
   };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  seedChatFeaturePreferences(client);
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
@@ -274,6 +277,7 @@ function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: (
     dictation_available: false,
   };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  seedChatFeaturePreferences(client);
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
