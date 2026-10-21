@@ -10,7 +10,8 @@ from sqlalchemy import LargeBinary, event, func, select, type_coerce
 from omnigent.db.compression import decode
 from omnigent.db.db_models import SqlPreference, workspace_scope
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.preference_sync import PreferenceMutation, PreferenceSnapshot
+from omnigent.preference_sync import PreferenceMutation, PreferenceSnapshot, SharedPreferenceKey
+from omnigent.stores.preference_store import read_preference_entry
 from omnigent.stores.preference_store.sqlalchemy_store import (
     SqlAlchemyPreferenceStore,
     _fingerprint,
@@ -58,6 +59,7 @@ def test_receipt_fingerprint_is_stable():
         ({"kind": "model", "name": "opencode_model"}, "model-b"),
         ({"kind": "harness", "name": "default"}, "pi-native"),
         ({"kind": "harness_args", "name": "claude"}, []),
+        ({"kind": "chat_features", "name": "default"}, ["run_commands"]),
         (
             {
                 "kind": "plugin",
@@ -530,3 +532,31 @@ def test_configuration_snapshot_is_atomic_bounded_and_isolated(store, db_uri):
     with store._session("count_configuration_rows") as session:
         assert session.scalar(select(func.count()).select_from(SqlPreference)) == 1
     assert store.read(user_id="alice").revision == 0
+
+
+def test_read_preference_entry_follows_pages_and_restarts_after_an_edit(store):
+    chat_features = {"kind": "chat_features", "name": "default"}
+    store.apply(mutation(store, key=chat_features, value=["b", "a"]), user_id="alice")
+    store.apply(mutation(store), user_id="alice")
+    # Conflicts page first, so the entry is only on a later page.
+    assert store.apply(mutation(store, value="model-c"), user_id="alice").status == "conflict"
+    pending_edits = [
+        lambda: store.apply(mutation(store, value="model-b", version=1), user_id="alice")
+    ]
+
+    class OneEntryPages:
+        """Single-entry pages, with an edit landing before the first continuation."""
+
+        def read(self, *, user_id, limit=100, cursor=None):
+            if cursor is not None and pending_edits:
+                pending_edits.pop()()
+            return store.read(user_id=user_id, limit=1, cursor=cursor)
+
+    entry = read_preference_entry(
+        OneEntryPages(), SharedPreferenceKey(**chat_features), user_id="alice"
+    )
+    assert entry is not None
+    assert (entry.value, entry.version) == (["a", "b"], 1)
+    assert not pending_edits
+    missing = SharedPreferenceKey(kind="harness_args", name="codex-native")
+    assert read_preference_entry(store, missing, user_id="alice") is None

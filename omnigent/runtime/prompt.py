@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from omnigent.entities import (
@@ -15,6 +15,7 @@ from omnigent.entities import (
     NativeToolData,
 )
 from omnigent.inner.native_attachments import expand_framework_notices
+from omnigent.runtime.chat_features import ChatFeature, chat_feature_instructions
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import (
     image_omitted_placeholder,
@@ -125,16 +126,23 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     return instructions
 
 
-def native_startup_instructions(author_instructions: str | None) -> str | None:
+def native_startup_instructions(
+    author_instructions: str | None,
+    chat_features: Iterable[ChatFeature],
+) -> str | None:
     """Author instructions plus the framework text a native launch channel carries.
 
     Native harnesses take instructions once, at launch, so only framework
-    instructions that hold for every turn of every session belong here.
+    instructions that hold for every turn of the session belong here.
 
     :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
+    :param chat_features: The session's enabled chat features.
     :returns: The combined text, or ``None`` when there is nothing to send.
     """
-    return append_framework_instructions(author_instructions, [ITEM_LABEL_INSTRUCTION])
+    return append_framework_instructions(
+        author_instructions,
+        [ITEM_LABEL_INSTRUCTION, *chat_feature_instructions(chat_features)],
+    )
 
 
 def append_framework_instructions(
@@ -196,6 +204,7 @@ def build_instructions(
     tool_schemas: list[dict[str, Any]],
     *,
     framework_instructions: Sequence[str] = (),
+    chat_features: Iterable[ChatFeature] = (),
 ) -> str:
     """
     Build the system instructions string from the agent's
@@ -215,6 +224,8 @@ def build_instructions(
         for this turn, appended after user-authored agent/request instructions
         and after the spec-level framework instructions (the sub-agent
         wake-notice announcement for agents that can dispatch sub-agents).
+    :param chat_features: The session's enabled chat features; their
+        instructions follow the spec-level framework instructions.
     :returns: The assembled instructions string.
     """
     parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
@@ -222,7 +233,11 @@ def build_instructions(
     return (
         append_framework_instructions(
             base_instructions,
-            [*_framework_instructions_for(spec), *framework_instructions],
+            [
+                *_framework_instructions_for(spec),
+                *chat_feature_instructions(chat_features),
+                *framework_instructions,
+            ],
         )
         or base_instructions
     )
@@ -234,6 +249,7 @@ def build_instructions_nullable(
     tool_schemas: list[dict[str, Any]],
     *,
     framework_instructions: Sequence[str] = (),
+    chat_features: Iterable[ChatFeature] = (),
 ) -> str | None:
     """Like :func:`build_instructions`, but returns ``None`` instead of seeding
     the fabricated ``"You are a helpful assistant."`` fallback when there is
@@ -256,7 +272,11 @@ def build_instructions_nullable(
     base_instructions = "\n\n".join(parts) if parts else None
     return append_framework_instructions(
         base_instructions,
-        [*_framework_instructions_for(spec), *framework_instructions],
+        [
+            *_framework_instructions_for(spec),
+            *chat_feature_instructions(chat_features),
+            *framework_instructions,
+        ],
     )
 
 

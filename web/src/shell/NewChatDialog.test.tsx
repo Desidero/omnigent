@@ -164,6 +164,13 @@ import {
   peekNewSessionHandoff,
 } from "@/lib/newSessionHandoff";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  NO_CHAT_FEATURE_PREFERENCES,
+  RUN_COMMANDS_DEFINITION,
+  savedChatFeatureDefault,
+  seedChatFeaturePreferences,
+} from "@/test/chatFeatureFixtures";
+import { UNSUPPORTED_CHAT_FEATURE_DEFAULT } from "@/lib/chatFeaturesApi";
 
 describe("ComposerAddMenu", () => {
   it("groups real actions and opens the existing attachment picker only after selection", () => {
@@ -1430,6 +1437,9 @@ function useHostNavigate(): ReturnType<typeof useNavigate> {
   );
 }
 
+// Seeded so the landing never fetches it; the default hides the section.
+let landingChatFeaturePreferences = NO_CHAT_FEATURE_PREFERENCES;
+
 function renderLanding(
   infoOverrides: Partial<ServerInfo> | "loading" = {},
   route = "/",
@@ -1440,6 +1450,7 @@ function renderLanding(
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  seedChatFeaturePreferences(client, landingChatFeaturePreferences);
   // "loading" renders the probe still pending; `rerenderWith` resolves it later.
   const tree = (overrides: Partial<ServerInfo> | "loading") => (
     <QueryClientProvider client={client}>
@@ -11696,6 +11707,75 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(body.cost_control_mode_override).toBe("on");
     expect(body.model_override).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("NewChatLandingScreen chat features", () => {
+  const defaultPreferences = landingChatFeaturePreferences;
+  beforeEach(() => {
+    setupLandingMocks();
+    landingChatFeaturePreferences = {
+      catalog: [RUN_COMMANDS_DEFINITION],
+      saved: savedChatFeatureDefault(["run_commands"]),
+    };
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_features" }),
+    } as unknown as Response);
+  });
+  afterEach(() => {
+    landingChatFeaturePreferences = defaultPreferences;
+    cleanup();
+    localStorage.clear();
+  });
+
+  async function renderReadyLanding(): Promise<void> {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  }
+
+  function runCommandsChoice(): HTMLElement {
+    return within(screen.getByTestId("new-chat-landing-agent-chat-features")).getByRole(
+      "menuitemcheckbox",
+      { name: "Run suggested commands" },
+    );
+  }
+
+  it("shows the saved default and leaves it to the server when untouched", async () => {
+    await renderReadyLanding();
+    openAgentModels("a1");
+    expect(runCommandsChoice()).toHaveAttribute("aria-checked", "true");
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a1");
+    expect(body).not.toHaveProperty("chat_features");
+  });
+
+  it.each([
+    ["a saved empty set", savedChatFeatureDefault([]), "false"],
+    ["unknown saved keys only", savedChatFeatureDefault(["from_newer_build"]), "false"],
+    ["no saved default", savedChatFeatureDefault(null), "true"],
+    ["a server without shared preferences", UNSUPPORTED_CHAT_FEATURE_DEFAULT, "true"],
+  ])("pre-checks the menu from %s", async (_label, saved, checked) => {
+    landingChatFeaturePreferences = { catalog: [RUN_COMMANDS_DEFINITION], saved };
+    await renderReadyLanding();
+    openAgentModels("a1");
+    expect(runCommandsChoice()).toHaveAttribute("aria-checked", checked);
+  });
+
+  it("sends the set the user picked in the menu", async () => {
+    await renderReadyLanding();
+    openAgentModels("a1");
+    fireEvent.click(runCommandsChoice());
+    expect(runCommandsChoice()).toHaveAttribute("aria-checked", "false");
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a1");
+    expect(body.chat_features).toEqual([]);
   });
 });
 

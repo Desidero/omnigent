@@ -2992,9 +2992,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag, placed before a
+    :param append_system_prompt: Optional author instructions plus static
+        framework guidance (never per-turn framework text) to append through
+        Claude Code's native ``--append-system-prompt`` flag, placed before a
         caller-supplied inline prompt instead of replacing it.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.

@@ -101,7 +101,10 @@ from omnigent.runner.identity import (
 )
 from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
 from omnigent.runner.routing import RunnerRouter
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.session_init_protocol import (
+    build_runner_session_init_payload,
+    chat_feature_keys,
+)
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
@@ -111,6 +114,7 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.chat_features import encode_chat_features, parse_chat_features
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
@@ -3842,6 +3846,7 @@ async def _persist_external_acp_subagent_start(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=title_raw,
+            chat_features_override=parent_conv.chat_features_override,
         )
     except NameAlreadyExistsError:
         # The unique index fired but the label lookup missed — a concurrent POST
@@ -4091,6 +4096,7 @@ async def _persist_external_subagent_start(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=agent_type,
+            chat_features_override=parent_conv.chat_features_override,
         )
     except NameAlreadyExistsError:
         # The (parent, title) unique index fired: the row already exists
@@ -4213,6 +4219,7 @@ async def _create_and_publish_antigravity_child(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=agent_type or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+            chat_features_override=parent_conv.chat_features_override,
         )
     except NameAlreadyExistsError:
         # The (parent, title) unique index fired: a concurrent start, or a
@@ -4502,6 +4509,7 @@ async def _create_and_publish_codex_child(
             reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
             # Lists the /side fork in its parent's Workspace rail on every device.
             side_chat_parent_id=parent_conv.id if side_chat else None,
+            chat_features_override=parent_conv.chat_features_override,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -4630,6 +4638,7 @@ async def _create_and_publish_devin_child(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+            chat_features_override=parent_conv.chat_features_override,
         )
     except NameAlreadyExistsError:
         existing = await asyncio.to_thread(
@@ -8333,6 +8342,7 @@ async def _dispatch_skill_slash_command_to_runner(
     # time and never forwarded verbatim.
     if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
+    runner_body["chat_features"] = chat_feature_keys(conv.chat_features_override)
 
     try:
         await runner_client.post(
@@ -11165,6 +11175,13 @@ def _require_cost_control_label_authority(
     )
 
 
+def _metadata_chat_features_override(metadata: SessionCreateMetadata) -> str | None:
+    """Encode the multipart create's resolved chat features; ``None`` when unresolved."""
+    if metadata.chat_features is None:
+        return None
+    return encode_chat_features(parse_chat_features(metadata.chat_features))
+
+
 def _persist_stored_session_bundle(
     conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
@@ -11226,6 +11243,7 @@ def _persist_stored_session_bundle(
             project_id=metadata.project_id,
             host_id=metadata.host_id,
             created_by=created_by,
+            chat_features_override=_metadata_chat_features_override(metadata),
             **inference_kwargs,
         )
     except ConversationNotFoundError as exc:
@@ -11308,6 +11326,7 @@ def _persist_session_for_uploaded_agent(
             labels=create_labels(metadata),
             reasoning_effort=metadata.reasoning_effort,
             model_override=inference_model,
+            chat_features_override=_metadata_chat_features_override(metadata),
         )
     except IntegrityError as exc:
         raise OmnigentError(

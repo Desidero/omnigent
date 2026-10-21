@@ -220,6 +220,10 @@ vi.mock("@/pages/PoliciesPage", () => ({
 vi.mock("@/pages/AdminGeneralPage", () => ({
   AdminGeneralPage: () => <div>admin-general-page-stub</div>,
 }));
+// Server-backed and covered by its own test; this page renders no QueryClient.
+vi.mock("@/pages/settings/ChatFeaturesSettingsGroup", () => ({
+  ChatFeaturesSettingsGroup: () => null,
+}));
 vi.mock("@/components/McpRegistry", () => ({
   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
 }));

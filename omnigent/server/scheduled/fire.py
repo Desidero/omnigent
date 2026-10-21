@@ -83,6 +83,7 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
+from omnigent.runtime.chat_features import encode_chat_features
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -99,6 +100,7 @@ from omnigent.server.routes._session_create_validation import (
 )
 from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import _announce_session_added
+from omnigent.server.routes.preferences import resolve_session_chat_features
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
     FireIdentityRevoked,
@@ -1692,6 +1694,12 @@ async def _create_session_resources(
         labels[SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
         workspace = worktree.workspace or worktree.worktree_path
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
+    chat_features = await asyncio.to_thread(
+        resolve_session_chat_features,
+        None,
+        user_id=task.user_id,
+        preference_store=getattr(deps.app_state, "preference_store", None),
+    )
     conv: Conversation | None = None
     try:
         conv = await asyncio.to_thread(
@@ -1704,6 +1712,7 @@ async def _create_session_resources(
             terminal_launch_args=launch_args,
             labels=labels,
             project_id=await _fire_project_id(deps, task),
+            chat_features_override=encode_chat_features(chat_features),
         )
         reasoning_effort = task.reasoning_effort
         if reasoning_effort is None:
