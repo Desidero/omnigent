@@ -46,3 +46,54 @@ channel; labels still render when you or the agent write them.
   it. The newest mention decides, so a later plain mention reopens it.
 - **Open items:** a bar above the thread lists the open labels as chips.
   Expand it for every item with its title, closed ones under **Closed (N)**.
+
+## Comment on items
+
+To answer several items at once, comment on each and send the comments
+together, like reviewing a document:
+
+1. Click an item's chip (in a message, in the Open items bar, or the label in
+   its own defining message) and choose **Comment** in its popover.
+2. The composer switches to comment mode for that item: a card names it, and
+   whatever you had typed is set aside until you save. Attachments, paste,
+   @-mentions and dictation work as usual.
+3. Press Enter or the check button to save the comment to **Comment drafts**,
+   a tray above the composer. Drafts can be edited or deleted (with Undo), and
+   the tray can be collapsed to one line.
+4. Choose **Send N comments** (or **Send N comments + message** when you have
+   also typed a message) to send every draft as one message. It queues like any
+   message while the agent is busy.
+
+The message is plain markdown that the agent is instructed to answer item by
+item:
+
+```markdown
+Comments on 2 items:
+
+#### [Q2] <item title>
+
+**1.** <comment>
+
+**2.** <comment>
+
+Attachments: q2-1.png
+
+#### [R1] <item title>
+
+<comment>
+
+#### General
+
+<typed message>
+```
+
+Items follow the order they were defined, comments are numbered only when an
+item has several, and attached files are renamed to be unique in the message
+(a pasted `image.png` on Q2 becomes `q2-1.png`). Chips with unsent drafts show
+a dot and chips with sent comments a count; the popover lists each sent
+comment with its files and the first sentence about the item in the agent's
+next reply. A comment on a closed item leaves it closed.
+
+Sent comments are read back from the transcript, so they show on every device.
+Drafts stay in this browser only (attachments included) and survive a reload;
+a failed or cancelled send puts them back as drafts.
