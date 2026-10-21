@@ -691,6 +691,13 @@ already uploaded or registered an agent. The response is the full
     `PATCH /v1/sessions/{id}` (last-write-wins). See
     `designs/NATIVE_RUNNER_SERVER_LAUNCH.md`.
 
+  apply_project_labels (boolean, default true)
+    A create with `project_id` merges the project's default labels (the
+    project config's `labels`) under `labels`, and the request's labels
+    win. `false` takes `labels` as the final set, so a default removed
+    for this one session is not added back. Labels apply only at
+    creation, not when a session moves into a project later.
+
 400 Bad Request - invalid terminal_launch_args (count / length bounds)
 404 Not Found - no agent with that id
 409 Conflict - a managed create's host_id names an existing host, or
@@ -886,7 +893,9 @@ Request body:
     Session title update. `null` leaves the title unchanged.
 
   labels (object, optional)
-    Labels to merge into the existing session labels.
+    Labels to merge into the existing session labels. A `null` value
+    deletes that label; reserved and `cost_control.*` keys are rejected
+    for a delete exactly as for a set.
 
   reasoning_effort (string or null, optional)
     Per-session reasoning-effort hint. Accepted metadata values are
