@@ -204,6 +204,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status,
     _publish_session_superseded,
     _publish_terminal_pending,
+    _reject_malformed_label_keys,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _remove_session_worktree_best_effort,
@@ -2084,6 +2085,9 @@ def register_core_routes(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
         )
+        _reject_malformed_label_keys(parsed_metadata.labels)
+        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+        _reject_server_reserved_label_seed(parsed_metadata.labels, at_creation=True)
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
             server_sandbox_providers,
@@ -2109,8 +2113,6 @@ def register_core_routes(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
         )
-        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        _reject_server_reserved_label_seed(parsed_metadata.labels, at_creation=True)
         from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
 
         apply_browser_agent_tools_creation_labels(parsed_metadata.labels, request.headers)
@@ -3863,6 +3865,7 @@ def register_core_routes(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
+            _reject_malformed_label_keys(body.labels)
             _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
@@ -3987,7 +3990,7 @@ def register_core_routes(
                 require_owned_session, session_id, user_id, conversation_store, permission_store
             )
             family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
-        labels_to_set = dict(body.labels or {})
+        labels_to_set: dict[str, str | None] = dict(body.labels or {})
         if PROJECT_LABEL_KEY in labels_to_set and (
             not set_project or labels_to_set[PROJECT_LABEL_KEY]
         ):
@@ -4024,13 +4027,15 @@ def register_core_routes(
                 active = [member for member in members if not member.archived]
                 retained = active or members
                 if retained and retained[0].id == session_id:
-                    family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
+                    # A null pin deletes it, like the empty-string unpin.
+                    family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY) or ""
                     if not family_pin_value:
                         labels_to_set[pinned_label_key(user_id)] = ""
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
-        # through to the delete-clear loop below under the per-user key.
+        # through to the delete-clear loop below under the per-user key, as does
+        # a null.
         if PINNED_LABEL_KEY in labels_to_set:
             labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
         if MUTED_LABEL_KEY in labels_to_set:
@@ -4877,30 +4882,37 @@ def register_core_routes(
             # Cancel local teardown immediately; the deferred flag check handles
             # Undo arriving on another replica.
             _cancel_pending_archive_stop(normalize_uuid(session_id) or session_id)
-        # Some labels are cleared by DELETE, not by upserting an empty value:
-        # the project membership (empty = "remove from project") and the pinned
-        # flag (empty = "unpin"). Split any empty-valued clear keys out before
-        # the bulk upsert so other labels are unaffected. Labels are upsert-only,
-        # so without this an empty string would linger as a stored value.
-        # The pinned key was rewritten to the caller's per-user key above, so
-        # clear that one (not the canonical bare key) on an empty value.
+        # A null value deletes its label. The project membership and the
+        # caller's per-user pin and mute keys also treat an empty string as
+        # delete ("remove from project" / "unpin" / "unmute"), so it never
+        # lingers as a value. Reserved keys were rejected above whether set or deleted.
         for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id), muted_label_key(user_id)):
             if labels_to_set.get(_clear_key) == "":
-                labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
-                await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
-        if labels_to_set:
-            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+                labels_to_set[_clear_key] = None
+        labels_to_upsert = {k: v for k, v in labels_to_set.items() if v is not None}
+        labels_to_delete = [k for k, v in labels_to_set.items() if v is None]
+        # One store transaction, so a failed upsert does not leave the deletes
+        # behind and a concurrent reader never sees a half-applied edit.
+        if labels_to_delete:
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                labels_to_upsert,
+                delete_keys=labels_to_delete,
+            )
+        elif labels_to_upsert:
+            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_upsert)
         # Only when the switch was forwarded: a silent PATCH writes no label,
         # and an unconfirmed mode must not reach the picker.
-        if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:
+        if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_upsert:
             _publish_permission_mode(
                 session_id,
-                labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
+                labels_to_upsert[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
             )
-        if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
+        if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_upsert:
             _publish_codex_approval_mode(
                 session_id,
-                labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
+                labels_to_upsert[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
             )
         # Archiving means "get this out of my way", which contradicts a pin
         # ("keep it at the top"), so drop the archiver's own pin — otherwise the
