@@ -819,6 +819,7 @@ class _CodexNativeLaunchConfig:
         reads. A session the forwarder rotated onto carries the original
         session's id here. ``None`` when unlabelled: the bridge is then keyed
         by the session id.
+    :param labels: The session's labels, for the Unity Gateway request tags.
     """
 
     workspace: Path
@@ -840,6 +841,7 @@ class _CodexNativeLaunchConfig:
     #: The session is a child whose replies its parent receives, so one-time user
     #: offers are left to top-level sessions.
     has_parent: bool = False
+    labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1667,6 +1669,11 @@ async def _codex_native_launch_config(
         reasoning_effort=reasoning_effort,
         bridge_id=bridge_id,
         has_parent=bool(snapshot.get("parent_session_id")),
+        labels=(
+            {str(key): str(value) for key, value in labels.items()}
+            if isinstance(labels, dict)
+            else {}
+        ),
     )
 
 
@@ -6134,6 +6141,7 @@ async def _auto_create_codex_terminal(
         terminal_launch_args=launch_config.terminal_launch_args or (),
         reasoning_effort=launch_config.reasoning_effort,
         model_catalog_rows=_fresh_codex_catalog,
+        session_labels=launch_config.labels,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
@@ -9389,6 +9397,8 @@ class _ClaudeSessionLaunchMetadata:
     fork_carry_history: bool = False
     #: The session's own recorded cost, which a cold resume restores into Claude.
     resume_cost_usd: float | None = None
+    #: The session's labels, for the Unity Gateway request tags.
+    labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
     #: Both routing fields come from ``routing_class_from_snapshot``, so an
     #: auto-harness session always reads as routing-enabled too. Deriving them
     #: separately was the bug: a sub-agent child of a routed parent carries the
@@ -9445,6 +9455,7 @@ def _claude_launch_metadata_from_envelope(
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
         resume_cost_usd=snapshot.own_cost_usd,
         has_parent=bool(snapshot.parent_session_id),
+        labels=dict(snapshot.labels),
     )
 
 
@@ -9515,6 +9526,7 @@ async def _load_legacy_claude_launch_metadata(
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
         resume_cost_usd=_claude_resume_cost_from_snapshot(snapshot),
         has_parent=bool(snapshot.get("parent_session_id")),
+        labels={str(key): str(value) for key, value in labels.items()},
     )
     from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
 
@@ -9826,6 +9838,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.main import (
         _serves_canonical_anthropic_ids,
         build_native_claude_terminal_env,
+        claude_config_with_gateway_request_tags,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
         resolve_claude_native_model_selection,
@@ -10513,7 +10526,9 @@ async def _auto_create_claude_terminal(
         # MCP schemas are loaded on demand.
         {
             **build_native_claude_terminal_env(
-                claude_config,
+                claude_config_with_gateway_request_tags(
+                    claude_config, session_id=session_id, labels=launch_metadata.labels
+                ),
                 client_surface=resource_registry.client_surface(session_id),
             ),
             **claude_terminal_relay_env(bridge_dir),

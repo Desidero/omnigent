@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec, RetryPolicy
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.databricks_ai_gateway import REQUEST_TAGS_VALUE_ENV, gateway_request_tags_env
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
@@ -4241,6 +4242,7 @@ def build_codex_native_server(
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
     active_harnesses: Collection[str] | None = None,
+    session_labels: Mapping[str, str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -4299,6 +4301,9 @@ def build_codex_native_server(
     :param terminal_launch_args: Original CLI options used to select the Codex
         config-file profile (distinct from the Databricks routing profile)
         and the ``--add-dir`` roots the app-server owns.
+    :param session_labels: The session's labels, sent with *session_id* as
+        Unity Gateway request tags. Read once at start, so label edits reach
+        the header on the next launch.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -4314,6 +4319,10 @@ def build_codex_native_server(
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
     env = _clean_codex_env()
+    # Never inherit another session's tags; a Unity Gateway provider sends these.
+    env.pop(REQUEST_TAGS_VALUE_ENV, None)
+    if session_id is not None:
+        env.update(gateway_request_tags_env(session_id, session_labels))
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
