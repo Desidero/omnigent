@@ -819,6 +819,8 @@ def create_sessions_router(
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
+    register_pr_info_reader: Callable[..., None] | None = None,
+    register_server_message: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -883,6 +885,8 @@ def create_sessions_router(
         validate ownership when ``PATCH /v1/sessions/{id}`` files a
         session into a project. ``None`` disables the move-into-project
         action (a non-empty ``project_id`` is then rejected as unsupported).
+    :param register_pr_info_reader: Receives the panel's PR reader, for the PR watcher.
+    :param register_server_message: Receives the server-originated message sender.
     :param background_title_coordinator: Optional app-owned coordinator for
         semantic title generation after first-turn forwarding. ``None`` disables
         background titles in focused router tests.
@@ -899,6 +903,7 @@ def create_sessions_router(
     from omnigent.server.routes.sessions.routes_hooks import register_hooks_routes
     from omnigent.server.routes.sessions.routes_items import register_items_routes
     from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
+    from omnigent.server.routes.sessions.routes_pr_watch import register_pr_watch_routes
     from omnigent.server.routes.sessions.routes_provider import register_provider_routes
     from omnigent.server.routes.sessions.routes_resources import register_resources_routes
     from omnigent.server.routes.sessions.routes_ui import register_ui_routes
@@ -961,6 +966,7 @@ def create_sessions_router(
         permission_store=permission_store,
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
+        register_pr_info_reader=register_pr_info_reader,
     )
 
     register_ui_routes(
@@ -971,6 +977,13 @@ def create_sessions_router(
     )
 
     register_browser_routes(
+        router,
+        conversation_store=conversation_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+    )
+
+    register_pr_watch_routes(
         router,
         conversation_store=conversation_store,
         auth_provider=auth_provider,
@@ -1003,6 +1016,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        register_server_message=register_server_message,
     )
 
     register_permissions_routes(
