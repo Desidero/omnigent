@@ -607,6 +607,79 @@ async def test_an_outage_at_create_leaves_the_first_prompt_free_to_route(
     assert conv.model_override == CLAUDE_MODEL
 
 
+@pytest.mark.parametrize(
+    "create_body",
+    [{}, {"harness_override": "auto"}],
+    ids=["fixed-harness", "auto-harness"],
+)
+async def test_a_create_on_a_chosen_account_routes_on_its_first_prompt_instead(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    create_body: dict[str, str],
+) -> None:
+    """Before launch nothing describes the account: not the host's catalog, not its gateway report.
+
+    The pane's own vocabulary does, so the built-in judge routes the first
+    prompt off it and the workspace router is never asked.
+    """
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routing_backend import RoutingBackends
+
+    wrappers = await _native_wrappers(client, db_uri)
+    external = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="workspace pick"))
+    judge = FakeRoutingClient(RoutingResult(model="claude-opus-4-8", rationale="judge pick"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=judge),
+    )
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        # Choosing a provider needs a connected host, which is not under test.
+        patch.object(
+            orchestration, "_validated_provider_override", lambda value, *_a, **_k: value
+        ),
+    ):
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": wrappers["claude-native"],
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+                "provider_override": "claude-max2",
+                **create_body,
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        assert (external.offered, judge.offered) == ([], [])
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None
+        assert conv.provider_override == "claude-max2"
+        # The pane the client named, on the account's own default model.
+        assert conv.agent_id == wrappers["claude-native"]
+        assert conv.model_override is None
+        assert ROUTING_DECISION_LABEL_KEY not in conv.labels
+
+        orchestration._model_options_cache[session_id] = [
+            {"id": "opus", "model": "claude-opus-4-8"}
+        ]
+        try:
+            route = await client.post(
+                f"/v1/sessions/{session_id}/hooks/route-turn",
+                json={"harness": "claude-native", "prompt": ROUTING_MESSAGE},
+            )
+        finally:
+            orchestration._model_options_cache.pop(session_id, None)
+
+    assert route.status_code == 200, route.text
+    assert route.json()["action"] == "route"
+    assert external.offered == []
+    assert judge.offered == [{"claude-native": ["claude-opus-4-8"]}]
+    routed = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert routed is not None
+    assert routed.model_override == "claude-opus-4-8"
+
+
 async def test_bundle_agent_auto_path_is_unchanged(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -1206,6 +1279,17 @@ def test_ungatewayed_native_harnesses_without_a_host(
     from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
 
     assert _ungatewayed_native_harnesses(None, AUTO_NATIVE_ROUTING_HARNESSES) == []
+
+
+def test_a_chosen_provider_is_never_counted_as_gateway_backed(
+    gateway_host_registry: HostRegistry,
+) -> None:
+    """The host's report describes its default provider, not the session's."""
+    from omnigent.server.routes._sessions.orchestration import _gateway_backed
+
+    host = _host_reporting({"claude-native": True})
+    assert _gateway_backed(host, ("claude-native",)) is True
+    assert _gateway_backed(host, ("claude-native",), provider_override="claude-max2") is False
 
 
 def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
