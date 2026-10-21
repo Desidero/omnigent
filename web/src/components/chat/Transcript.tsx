@@ -37,6 +37,7 @@ import {
   ItemLabelSessionContext,
   type ItemLabelIndex,
 } from "@/lib/itemLabels";
+import { publishItemLabelIndex } from "@/lib/itemCommentDrafts";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
@@ -378,6 +379,11 @@ function TranscriptImpl({
     () => buildBubbleItemLabelIndex(display.bubbles),
     [display.bubbles],
   );
+  // The composer renders apart from the transcript; it orders and titles
+  // comment drafts from the index published here.
+  useEffect(() => {
+    if (display.conversationId) publishItemLabelIndex(display.conversationId, itemLabelIndex);
+  }, [display.conversationId, itemLabelIndex]);
   const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
   const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
   return (
@@ -539,7 +545,7 @@ function TranscriptImpl({
   );
 }
 
-/** Gives the transcript's item labels their index, and the session they belong to. */
+/** Gives the transcript's item labels their index, and the session their drafts belong to. */
 function ItemLabelScope({
   index,
   sessionId,
