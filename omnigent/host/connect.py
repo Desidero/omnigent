@@ -824,6 +824,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
         "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S",
+        # Unity Gateway request-tags opt-out (a boolean); the runner reads it.
+        "OMNIGENT_GATEWAY_REQUEST_TAGS",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the

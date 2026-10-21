@@ -1319,12 +1319,15 @@ def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
     assert sorted(path.name for path in workspace.iterdir()) == []
 
 
-def _claude_auto_create_session_init(session_id: str, workspace: Path):
+def _claude_auto_create_session_init(
+    session_id: str, workspace: Path, labels: dict[str, str] | None = None
+):
     """
     Build the session-init envelope ``_auto_create_claude_terminal`` consumes.
 
     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
+    :param labels: Session labels, e.g. ``{"team": "ml"}``; ``None`` sets none.
     :returns: A :class:`RunnerSessionInitEnvelope` rooted at *workspace*.
     """
     from omnigent.runner.session_init_protocol import (
@@ -1338,7 +1341,9 @@ def _claude_auto_create_session_init(session_id: str, workspace: Path):
         server_version="test",
         session_id=session_id,
         agent_id="agent",
-        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(workspace)),
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0, updated_at=0, workspace=str(workspace), labels=labels or {}
+        ),
     )
 
 
@@ -1349,6 +1354,8 @@ async def _auto_create_claude_terminal_for_test(
     workspace: Path,
     registry: object,
     publish_event: object | None = None,
+    labels: dict[str, str] | None = None,
+    launch_config: ClaudeNativeUcodeConfig | None = None,
 ) -> None:
     """
     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
@@ -1358,6 +1365,8 @@ async def _auto_create_claude_terminal_for_test(
     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
     :param registry: Session resource registry double.
     :param publish_event: Event publisher double; a plain ``Mock`` by default.
+    :param labels: Session labels carried by the init envelope.
+    :param launch_config: Provider config the launch resolves; ``None`` uses Claude's login.
     :returns: None. Raises whatever the auto-create path raises.
     """
     from unittest.mock import AsyncMock, Mock
@@ -1376,9 +1385,9 @@ async def _auto_create_claude_terminal_for_test(
         registry,
         publish_event if publish_event is not None else Mock(),
         server_client=AsyncMock(spec=httpx.AsyncClient),
-        session_init=_claude_auto_create_session_init(session_id, workspace),
+        session_init=_claude_auto_create_session_init(session_id, workspace, labels),
         auth_token_factory=lambda: None,
-        resolve_launch_config=AsyncMock(return_value=None),
+        resolve_launch_config=AsyncMock(return_value=launch_config),
     )
 
 
@@ -1621,6 +1630,65 @@ async def test_auto_create_claude_terminal_hands_claude_the_account_token(
         assert failure.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
         assert "sk-ant-oat01" not in failure.value.message
         assert seeded == []
+
+
+@pytest.mark.parametrize(
+    ("base_url", "tagged"),
+    [
+        ("https://dbc-1.cloud.databricks.com/ai-gateway/anthropic", True),
+        ("https://gateway.example/anthropic", False),
+    ],
+    ids=["unity-gateway", "other-gateway"],
+)
+async def test_auto_create_claude_terminal_tags_unity_gateway_requests_with_session_labels(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+    tagged: bool,
+) -> None:
+    """The pane's custom headers carry the session id and user labels, only for a Unity Gateway."""
+    from unittest.mock import Mock
+
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    monkeypatch.delenv("OMNIGENT_GATEWAY_REQUEST_TAGS", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+        lambda *_args, **_kwargs: None,
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = RuntimeError("stop at launch")
+    launch_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_CUSTOM_HEADERS": "X-Existing: 1"},
+        api_key_helper="printf %s token",
+    )
+
+    with pytest.raises(RuntimeError, match="stop at launch"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="conv_tags",
+            workspace=bridge_dir,
+            registry=registry,
+            labels={"team": "ml", "omnigent.ui": "terminal"},
+            launch_config=launch_config,
+        )
+
+    lines = (
+        registry.launch_required_terminal.await_args.kwargs["spec"]
+        .env["ANTHROPIC_CUSTOM_HEADERS"]
+        .splitlines()
+    )
+    assert "X-Existing: 1" in lines
+    # Attribution headers may join the block; exactly one request-tags line, on the gateway only.
+    tag_lines = [line for line in lines if line.startswith("Databricks-Ai-Gateway-Request-Tags:")]
+    expected = (
+        ['Databricks-Ai-Gateway-Request-Tags: {"omnigent_session_id":"conv_tags","team":"ml"}']
+        if tagged
+        else []
+    )
+    assert tag_lines == expected
 
 
 @pytest.mark.parametrize(
