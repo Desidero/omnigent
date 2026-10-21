@@ -1000,6 +1000,18 @@ class _RunnerEventContext:
     runner_id: str
 
 
+@dataclass(frozen=True)
+class _ServerEventContext:
+    """A message the server sends on a user's behalf, e.g. a PR watch wake-up."""
+
+    app: Any
+    headers: Headers
+    user_id: str | None
+
+
+# ``send(app, session_id, user_id, text)``: see ``send_server_message`` below.
+ServerMessageDispatch = Callable[[Any, str, str | None, str], Awaitable[None]]
+
 _RUNNER_EVENT_TYPES = frozenset(
     {
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
@@ -1095,6 +1107,7 @@ def register_events_routes(
         [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
     ]
     | None = None,
+    register_server_message: Callable[[ServerMessageDispatch], None] | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router.
 
@@ -1106,7 +1119,8 @@ def register_events_routes(
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
     def _has_bound_runner_authority(
-        request: Request | _RunnerEventContext | StartupInputContext, conv: Any
+        request: Request | _RunnerEventContext | StartupInputContext | _ServerEventContext,
+        conv: Any,
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return conv.runner_id == request.runner_id
@@ -1117,7 +1131,7 @@ def register_events_routes(
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
     def _reporting_runner_id(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | _ServerEventContext,
     ) -> str | None:
         """Return the runner that sent *request*, or ``None`` for a non-runner caller."""
         if isinstance(request, _RunnerEventContext):
@@ -1126,7 +1140,8 @@ def register_events_routes(
         return token_bound_runner_id(token) if token else None
 
     def _has_runner_created_by_authority(
-        request: Request | _RunnerEventContext | StartupInputContext, conv: Any
+        request: Request | _RunnerEventContext | StartupInputContext | _ServerEventContext,
+        conv: Any,
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return _has_bound_runner_authority(request, conv)
@@ -1136,7 +1151,7 @@ def register_events_routes(
         return _has_bound_runner_authority(request, conv)
 
     async def _authorized_conversation(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | _ServerEventContext,
         session_id: str,
         *,
         external_transcript: bool = False,
@@ -1144,7 +1159,7 @@ def register_events_routes(
         """Authorize event writes, reserving transcripts for owners and bound runners."""
         user_id = (
             request.user_id
-            if isinstance(request, (_RunnerEventContext, StartupInputContext))
+            if isinstance(request, (_RunnerEventContext, StartupInputContext, _ServerEventContext))
             else _get_user_id(request, auth_provider)
         )
         conv = None
@@ -1393,7 +1408,7 @@ def register_events_routes(
             )
 
     async def _post_event_impl(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | _ServerEventContext,
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
@@ -1857,7 +1872,10 @@ def register_events_routes(
 
         startup = getattr(request.app.state, "startup_inputs", None)
         may_wait_for_startup = (
-            not isinstance(request, (StartupInputContext, _RunnerEventContext))
+            # A server-sent wake-up is for an idle session: it never waits behind a startup.
+            not isinstance(
+                request, (StartupInputContext, _RunnerEventContext, _ServerEventContext)
+            )
             and startup is not None
             and (
                 (body.type == "message" and body.data.get("role") == "user")
@@ -4208,6 +4226,27 @@ def register_events_routes(
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
+
+    async def send_server_message(
+        app: Any, session_id: str, user_id: str | None, text: str
+    ) -> None:
+        """Send *text* as *user_id* through the normal message path, waking the runner."""
+        body = SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        )
+        with contextlib.ExitStack() as in_flight:
+            result = await _post_event_impl(
+                _ServerEventContext(app, Headers(), user_id), session_id, body, in_flight
+            )
+        if result.get("denied"):
+            raise OmnigentError(
+                str(result.get("reason") or "Message denied by policy"),
+                code=ErrorCode.FORBIDDEN,
+            )
+
+    if register_server_message is not None:
+        register_server_message(send_server_message)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

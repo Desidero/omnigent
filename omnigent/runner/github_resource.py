@@ -104,10 +104,11 @@ _gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=N
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
-# reviews, labels, and the merge fields feed the Summary and Comments tabs.
+# reviews, labels, and the merge fields feed the Summary and Comments tabs;
+# mergeable lets the PR watcher notice conflicts.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
-    ",reviews,reviewRequests,latestReviews,labels,mergeStateStatus,autoMergeRequest"
+    ",reviews,reviewRequests,latestReviews,labels,mergeStateStatus,autoMergeRequest,mergeable"
 )
 _PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
 _PR_COMMENTS_FIELD = "reviews"
@@ -497,6 +498,16 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
+def _mergeable(data: dict[str, Any]) -> bool | None:
+    """Whether the PR merges cleanly; ``None`` while GitHub is still computing it."""
+    value = data.get("mergeable")
+    if value == "MERGEABLE":
+        return True
+    if value == "CONFLICTING":
+        return False
+    return None
+
+
 # Cap the comments list so a very chatty PR can't bloat the payload; keep the
 # latest comments after merging issue comments and review bodies.
 _MAX_COMMENTS = 100
@@ -524,7 +535,13 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
             )
         ):
             continue
-        reviewers[("user", login.lower())] = {"login": login, "kind": "user", "state": state}
+        reviewers[("user", login.lower())] = {
+            "login": login,
+            "kind": "user",
+            "state": state,
+            **_optional_text(review, submittedAt="submitted_at"),
+            **_optional_text(review, authorAssociation="author_association"),
+        }
 
     requests = data.get("reviewRequests")
     for request in requests if isinstance(requests, list) else []:
@@ -539,6 +556,15 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
         # A re-request is pending even if the reviewer previously approved.
         reviewers[(kind, login.lower())] = {"login": login, "kind": kind, "state": "PENDING"}
     return list(reviewers.values())
+
+
+def _optional_text(raw: dict[str, Any], **renames: str) -> dict[str, str]:
+    """Copy non-empty string fields under new names, omitting absent ones."""
+    return {
+        target: value
+        for source, target in renames.items()
+        if isinstance(value := raw.get(source), str) and value
+    }
 
 
 def _shape_comments(
@@ -556,6 +582,7 @@ def _shape_comments(
                 "body": str(comment.get("body") or ""),
                 "created_at": comment.get("createdAt") or None,
                 "url": comment.get("url") or None,
+                **_optional_text(comment, authorAssociation="author_association"),
             }
         )
     for review in reviews if isinstance(reviews, list) else []:
@@ -1120,6 +1147,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             "body": body if isinstance(body, str) and body.strip() else None,
             **_comments_payload(data),
             **_merge_fields(data),
+            "mergeable": _mergeable(data),
         }
         if _PR_REVIEW_FIELDS.issubset(data):
             payload["pr"]["reviewers"] = _shape_reviewers(data)
@@ -1268,6 +1296,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "body": data.get("body") or None,
         **_comments_payload(data),
         **_merge_fields(data),
+        "mergeable": _mergeable(data),
     }
     if _PR_REVIEW_FIELDS.issubset(data):
         info["pr"]["reviewers"] = _shape_reviewers(data)
