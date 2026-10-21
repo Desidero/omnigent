@@ -975,6 +975,8 @@ class SysSessionCreateTool(Tool):
     An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session. With ``agent_id``, an optional
     ``workflow_id`` starts the session as a run of a saved workflow.
+    An optional ``provider`` runs a child on another account of this
+    host (see ``docs/providers.md``).
 
     Returns a handle ``{conversation_id, agent_id, title, status}``, plus
     ``project_id`` and ``project_name`` for an independent session. The session runs
@@ -1215,6 +1217,24 @@ class SysSessionCreateTool(Tool):
                                 "steps as its plan, and the workflow's page lists the run. "
                                 "Still give it a message asking it to run the workflow "
                                 "with the workflow skill."
+                            ),
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Optional account for the child: the name "
+                                "of a providers: entry on this host, e.g. "
+                                "'claude-alt' (a Claude subscription) or "
+                                "'chatgpt' (a Codex subscription). Omit to "
+                                "use your own provider when it serves the "
+                                "child's CLI, else the host default. "
+                                "sys_list_models lists the names under "
+                                "'host_providers'; the provider must serve "
+                                "the child agent's CLI. Only valid with "
+                                "'agent_id'. A child on an account other "
+                                "than yours runs in its own runner and "
+                                "does not wake you when it finishes; check "
+                                "it with sys_session_get_info."
                             ),
                         },
                     },
