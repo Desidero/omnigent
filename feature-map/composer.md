@@ -92,6 +92,10 @@ and steers messages while the agent is busy.
   `project`, `new omni` and `omni` all find it. Choosing a row opens the
   new-session composer with that project's defaults. The rows are hidden while
   the query is empty and absent from the sessions-only switcher.
+- `new-session-project-prompt`: when projects exist, the hotkey, the sidebar's
+  New session links, and the palette's New chat first ask for a project (or No
+  project), then open the composer with its defaults. Settings › General ›
+  Sessions turns it off. Modified clicks on the links still open a new tab.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -196,6 +200,12 @@ and steers messages while the agent is busy.
 - Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
   **New chat in <project>** to open the new-session composer with that
   project's host, workspace and agent prefilled.
+- With at least one project, press the hotkey or click New session (also from
+  the mobile drawer): a "Start a new session in…" picker opens. Type part of a
+  project name and press Enter to land on `/?project=<name>` with its defaults;
+  choose No project for a plain composer. Turn off **Ask for a project when
+  starting a session** in Settings and the same actions open the composer
+  directly.
 - Hover the model/effort pill to see the tooltip.
 - Hover the host chip to see the selected host or sandbox and its connection.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
