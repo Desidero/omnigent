@@ -881,6 +881,8 @@ def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
     [
         ([{"id": "a1", "type": "subagent", "status": "running"}], True),
         ([{"id": "a1", "type": "local_agent"}], True),
+        # An agent-team teammate keeps the lead waiting like a sub-agent.
+        ([{"id": "t1", "type": "teammate", "status": "running"}], True),
         ([{"id": "a1", "type": "agent", "status": "completed"}], False),
         ([{"id": "b1", "type": "local_bash", "status": "running"}], False),
         (None, False),
@@ -12614,6 +12616,28 @@ def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
             "command": "pytest -f",
         }
     ]
+
+
+def test_hook_record_stop_keeps_running_teammates_out_of_the_shell_tally() -> None:
+    """Agent-team teammates are background agents, not background shells."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "teammate-task",
+                        "type": "teammate",
+                        "status": "running",
+                        "description": "Investigate the failing check",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert record.background_task_count == 0
+    assert record.background_tasks is None
 
 
 def test_hook_record_stop_all_background_tasks_terminal_counts_zero() -> None:

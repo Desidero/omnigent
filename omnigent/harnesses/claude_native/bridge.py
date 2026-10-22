@@ -4514,7 +4514,10 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
 _BACKGROUND_TASK_FORWARD_LIMIT = 100
 _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
 _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
-_BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset({"agent", "local_agent", "subagent"})
+# ``teammate`` is an in-process agent-team teammate; it keeps the lead busy too.
+_BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset(
+    {"agent", "local_agent", "subagent", "teammate"}
+)
 _TURN_END_SCAN_BYTES = 256 * 1024
 
 
