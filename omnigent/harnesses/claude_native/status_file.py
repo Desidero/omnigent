@@ -404,7 +404,16 @@ class SessionStatusPoller:
     callback fires only on ``running`` ⇄ ``idle`` transitions.
 
     File reads and dedup baselines live on the watcher thread. Other threads
-    may request a resync; a lock protects only that pending request.
+    may request a resync or report turn boundaries; a lock protects only that
+    pending request and the boundary timestamps.
+
+    Claude keeps the file ``busy`` while a background agent outlives the turn,
+    and rewrites ``statusUpdatedAt`` only when the status changes. A ``busy``
+    stamped no later than the last ``Stop`` that left such an agent running,
+    with no turn started since then, is that holdover, so it reads as
+    :data:`IDLE` like the ``shell`` literal. A
+    turn Claude starts during the holdover leaves the file untouched, so each
+    tick of the holdover rechecks the last prompt time.
 
     Lifecycle:
 
@@ -442,6 +451,8 @@ class SessionStatusPoller:
         ``shell`` and ``False`` when it says ``idle``, or when the file stops
         being read. ``busy`` and ``waiting`` leave it unchanged: a turn or
         dialog hides whether a shell is still alive. Fires only on change.
+    :param prompt_submitted_at_getter: Returns when Claude last submitted a
+        prompt of its own session, in epoch milliseconds, or ``None``.
     """
 
     def __init__(
@@ -454,6 +465,7 @@ class SessionStatusPoller:
         omnigent_session_id: str | None = None,
         on_replay: Callable[[str, str | None], None] | None = None,
         on_background: Callable[[bool], None] | None = None,
+        prompt_submitted_at_getter: Callable[[], int | None] | None = None,
     ) -> None:
         self._on_status = on_status
         self._on_replay = on_replay or on_status
@@ -464,6 +476,7 @@ class SessionStatusPoller:
         self._pane_pid_getter = pane_pid_getter
         # Claude's own session uuid, resolved lazily from the bridge.
         self._session_id_getter = session_id_getter
+        self._prompt_submitted_at_getter = prompt_submitted_at_getter
         # The Omnigent conversation id this poller watches — for debug-log
         # attribution only (distinct from Claude's session uuid above).
         self._omnigent_session_id = omnigent_session_id
@@ -477,6 +490,9 @@ class SessionStatusPoller:
         self._observation_version = 0
         self._resync_lock = threading.Lock()
         self._resync_requested = False
+        self._turn_started_at_ms: int | None = None
+        self._turn_ended_at_ms: int | None = None
+        self._holding_busy = False
 
     @property
     def observation_version(self) -> int:
@@ -595,6 +611,62 @@ class SessionStatusPoller:
         with self._resync_lock:
             self._resync_requested = True
 
+    def note_turn_started(self, started_at_ms: int) -> None:
+        """Record that the runner delivered a turn, then re-assert the file.
+
+        :param started_at_ms: Delivery time in epoch milliseconds.
+        """
+        with self._resync_lock:
+            self._turn_started_at_ms = max(started_at_ms, self._turn_started_at_ms or 0)
+        self.resync()
+
+    def note_turn_ended(self, ended_at_ms: int) -> None:
+        """Record a ``Stop`` that left a background agent running, then re-assert.
+
+        :param ended_at_ms: When the hook was recorded, in epoch milliseconds.
+        """
+        with self._resync_lock:
+            self._turn_ended_at_ms = max(ended_at_ms, self._turn_ended_at_ms or 0)
+        self.resync()
+
+    def _runner_status(self, status: SessionStatus) -> str:
+        """Map a read to the runner vocabulary, treating a delegate holdover as idle."""
+        with self._resync_lock:
+            started_at_ms = self._turn_started_at_ms
+            ended_at_ms = self._turn_ended_at_ms
+        if (
+            status.raw_status != "busy"
+            or ended_at_ms is None
+            or status.status_updated_at is None
+            or status.status_updated_at > ended_at_ms
+            or (started_at_ms is not None and started_at_ms > ended_at_ms)
+        ):
+            return status.runner_status
+        prompt_at_ms = self._prompt_submitted_at()
+        if prompt_at_ms is not None and prompt_at_ms > ended_at_ms:
+            return status.runner_status
+        return IDLE
+
+    def _prompt_submitted_at(self) -> int | None:
+        """Read Claude's last prompt time, treating a failed read as unknown."""
+        if self._prompt_submitted_at_getter is None:
+            return None
+        try:
+            return self._prompt_submitted_at_getter()
+        except Exception:
+            _logger.debug(
+                "claude prompt time read failed",
+                exc_info=True,
+                extra={"session_id": self._omnigent_session_id},
+            )
+            return None
+
+    @property
+    def reports_busy(self) -> bool:
+        """Whether the file last read ``busy``, even when that publishes idle."""
+        status = self._last_status
+        return self.active and status is not None and status.raw_status == "busy"
+
     @property
     def blocked_on(self) -> str | None:
         """Why Claude is parked, when it is parked on a dialog.
@@ -622,38 +694,51 @@ class SessionStatusPoller:
             self._publish_background(False)
             return
         if self._last_mtime is not None and mtime == self._last_mtime:
-            return
-        self._last_mtime = mtime
-        status = read_session_status(self._path)
-        if self._exhausted:
-            return
-        if status is None:
-            # An unrecognized literal — the file is an undocumented internal
-            # detail whose vocabulary can grow. We are now blind to this
-            # transition, so drop the dedup baseline: the next readable
-            # status must publish rather than be swallowed as a duplicate.
-            if publish_status and self._last_status is not None:
+            if not publish_status or not self._holding_busy or self._last_status is None:
+                return
+            # A turn Claude starts during the holdover leaves the file untouched.
+            status = self._last_status
+            held = True
+        else:
+            held = False
+            self._last_mtime = mtime
+            read = read_session_status(self._path)
+            if self._exhausted:
+                return
+            if read is None:
+                # An unrecognized literal — the file is an undocumented internal
+                # detail whose vocabulary can grow. We are now blind to this
+                # transition, so drop the dedup baseline: the next readable
+                # status must publish rather than be swallowed as a duplicate.
+                if publish_status and self._last_status is not None:
+                    self._observation_version += 1
+                self._last_status = None
+                self._last_edge = None
+                self._holding_busy = False
+                return
+            status = read
+            # A read for the background signal alone does not observe the session's status.
+            if publish_status and status != self._last_status:
                 self._observation_version += 1
-            self._last_status = None
-            self._last_edge = None
-            return
-        # A read for the background signal alone does not observe the session's status.
-        if publish_status and status != self._last_status:
-            self._observation_version += 1
-        self._last_status = status
-        if status.raw_status == "shell":
-            self._publish_background(True)
-        elif status.raw_status == "idle":
-            self._publish_background(False)
+            self._last_status = status
+            if status.raw_status == "shell":
+                self._publish_background(True)
+            elif status.raw_status == "idle":
+                self._publish_background(False)
         if not publish_status:
             return
-        edge = (status.runner_status, status.blocked_on)
+        runner_status = self._runner_status(status)
+        self._holding_busy = status.raw_status == "busy" and runner_status == IDLE
+        edge = (runner_status, status.blocked_on)
+        if held and edge != self._last_edge:
+            # The holdover ended without a file write; a replay queued before it is stale.
+            self._observation_version += 1
         if edge == self._last_edge:
             if reassert:
-                self._on_replay(status.runner_status, status.blocked_on)
+                self._on_replay(runner_status, status.blocked_on)
             return
         self._last_edge = edge
-        self._on_status(status.runner_status, status.blocked_on)
+        self._on_status(runner_status, status.blocked_on)
 
     def _publish_background(self, running: bool) -> None:
         """Deliver a background-shell change to ``on_background``.
