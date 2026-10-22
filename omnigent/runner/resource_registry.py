@@ -710,10 +710,10 @@ class SessionResourceRegistry:
             )
 
     def claude_status_file_reports_busy(self, session_id: str) -> bool:
-        """Whether Claude's status file says busy, including a background agent.
+        """Whether Claude still reports work, including a background agent.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-        :returns: ``True`` when the session's status-file poller last read ``busy``.
+        :returns: ``True`` when Claude's OSC report or status file says it is working.
         """
         with self._lock:
             poller = self._status_pollers.get(session_id)
@@ -1818,6 +1818,7 @@ class SessionResourceRegistry:
                 terminal_launch_id=instance.lifecycle_trace.launch_id,
                 turn_is_active=lambda: self.session_turn_is_active(session_id),
                 turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
+                prompt_submitted_at_getter=_prompt_submitted_at_ms,
             )
         return fallback
 
