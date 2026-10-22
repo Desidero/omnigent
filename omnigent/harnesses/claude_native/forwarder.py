@@ -48,6 +48,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
+    record_peer_delivery,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -5378,6 +5379,9 @@ async def _forward_available_items(
         dedupe.pending_settled_response_id,
         dedupe.pending_settled_at,
     )
+    if result.latest_peer_delivery_at is not None:
+        # A teammate message starts a turn without a prompt hook.
+        await asyncio.to_thread(record_peer_delivery, bridge_dir, result.latest_peer_delivery_at)
     items = result.items
     if not items:
         if result.line_cursor == state.line_cursor and result.byte_offset == (
