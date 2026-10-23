@@ -131,6 +131,7 @@ def exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
     in_mem = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(telemetry._make_active_skill_processor())
+    provider.add_span_processor(telemetry._make_session_attributes_processor())
     provider.add_span_processor(SimpleSpanProcessor(in_mem))
     otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
     otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
@@ -154,7 +155,11 @@ def _tool(name: str, args: dict[str, object], call_id: str) -> list[ExecutorEven
     ]
 
 
-async def _run(events: list[ExecutorEvent], **request_fields: object) -> None:
+async def _run(
+    events: list[ExecutorEvent],
+    telemetry_attributes: dict[str, str] | None = None,
+    **request_fields: object,
+) -> None:
     """Run one adapter turn over *events*; *request_fields* extend the request."""
     executor = MockExecutor()
     executor.enqueue_events(events)
@@ -165,7 +170,12 @@ async def _run(events: list[ExecutorEvent], **request_fields: object) -> None:
         cancelled=asyncio.Event(),
     )
     try:
-        request = CreateResponseRequest(model="test-agent", input="hi", **request_fields)
+        request = CreateResponseRequest(
+            model="test-agent",
+            input="hi",
+            telemetry_attributes=telemetry_attributes,
+            **request_fields,
+        )
         await adapter.run_turn(request, ctx)
     finally:
         await adapter.on_shutdown()
@@ -303,6 +313,22 @@ async def test_malformed_skill_call_exports_no_argument_content(
         for value in (span.attributes or {}).values():
             assert "private task details" not in str(value)
     assert telemetry._active_skill_var.get() is None
+
+
+@pytest.mark.asyncio
+async def test_session_attributes_stamp_every_turn_span(
+    exporter: InMemorySpanExporter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The request's session attributes land on the agent span and its tool spans."""
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    attributes = {"omnigent.session.title": "Fix login", "omnigent.session.labels.team": "web"}
+
+    await _run([*_tool("Bash", {"command": "ls"}, "c1"), TurnComplete(response="")], attributes)
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    for name in ("agent:test-agent", "tool:Bash"):
+        assert {key: (spans[name].attributes or {}).get(key) for key in attributes} == attributes
+    assert telemetry._session_attributes_var.get() is None
 
 
 _UNSET = None
