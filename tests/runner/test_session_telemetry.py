@@ -86,7 +86,7 @@ def test_git_lookups_read_the_repo_and_tolerate_failures(
 
     # The SSH user and any https credentials are dropped from the remote.
     assert session_telemetry.git_remote_url(workspace) == "github.com:acme/app.git"
-    git("remote", "set-url", "origin", "https://alice:ghp_secret@github.com/acme/app.git")
+    git("remote", "set-url", "origin", "https://alice:s3cr3t-pw@github.com/acme/app.git")
     assert session_telemetry.git_remote_url(workspace) == "https://github.com/acme/app.git"
     assert session_telemetry.git_branch(workspace) == "main"
     git("checkout", "-q", "--detach")
