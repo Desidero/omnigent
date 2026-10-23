@@ -539,27 +539,37 @@ bare or MCP-prefixed `load_skill` tool call, plus claude-sdk's native `Skill`:
 ## 14. Model and effort attributes
 
 The per-turn agent span (`gen_ai.operation.name = invoke_agent`) records both
-what a turn asked for and what it ran with, so a turn left on the default
-model or effort still reports what ran whenever the harness says.
+what a turn asked for and what it ran with, so a session left on the default
+model or effort still reports a concrete value.
 
 | Attribute | Value |
 |---|---|
-| `gen_ai.request.model` | What the turn asked for: the model override. Unset when the turn asked for none; `gen_ai.agent.name` names the agent. `llm.model_name` keeps its OpenInference value (the override, else the agent name). |
+| `gen_ai.request.model` | What the turn asked for: the model override, else the agent's configured model. Unset when neither exists; `gen_ai.agent.name` names the agent. `llm.model_name` keeps its OpenInference value (the override, else the agent name). |
 | `gen_ai.response.model` | The model that ran, whenever it is known. |
-| `omnigent.model.source` | Where `gen_ai.response.model` came from: `observed` (the harness or provider reported it) or `requested` (only the turn's override is known). |
+| `omnigent.model.source` | Where `gen_ai.response.model` came from: `observed` (the harness or provider reported it), `resolved_default` (the agent's configured model; nothing reported yet), or `requested` (only the turn's override is known). |
 | `omnigent.reasoning_effort.requested` | The effort the turn asked for, as given, e.g. `high`. Omitted when none was asked for. |
 | `omnigent.reasoning_effort` | The effort that applied, as a level from the shared effort ladder (`low` … `max`). Omitted when unknown; never guessed. |
 | `omnigent.reasoning_effort.source` | Same values as `omnigent.model.source`. |
 
-A value observed at turn end replaces the one stamped at turn start.
+A value observed at turn end replaces the one stamped at turn start. With
+`OMNIGENT_TELEMETRY_ENABLED` on, the runner also stamps every span of the turn
+with `omnigent.agent.model` (the configured model), `omnigent.session.model`,
+`omnigent.session.model.source` and `omnigent.session.reasoning_effort`, read
+from the session snapshot it already fetches for the session attributes of
+§15, so there are no extra calls. The session model is the harness's last
+report (`observed`), else the session's override (`requested`), else the
+agent's configured model (`resolved_default`). `omnigent.agent.model` is the
+configured default on every span; `gen_ai.request.model` is what this turn
+asked for. The source is inferred: a snapshot `llm_model` that differs from the
+configured model counts as a harness report.
 
 Where the values come from:
 
 | Harness / path | `gen_ai.response.model` | `omnigent.reasoning_effort` |
 |---|---|---|
-| SDK harnesses that report a model in turn usage (claude-sdk, codex, pi, openai-agents, copilot, cursor, kimi, ACP, antigravity) | `observed` at turn end; before that, or if the turn fails, the override (`requested`), else unset | `requested` when asked for; codex reports the thread's own default as `observed`; otherwise unset |
-| SDK harnesses without turn usage (databricks, goose, hermes, qwen) | The override (`requested`), else unset | `requested`, else unset |
-| Native terminal harnesses (claude-native, codex-native, cursor-native, kimi-native, kiro-native, opencode-native, antigravity-native) | The override (`requested`), else unset | `requested` (codex-native's effort is mirrored back from Codex); unset when left at the terminal's own default |
+| SDK harnesses that report a model in turn usage (claude-sdk, codex, pi, openai-agents, copilot, cursor, kimi, ACP, antigravity) | `observed` at turn end; before that, or if the turn fails, the session model | `requested` when asked for; codex reports the thread's own default as `observed`; otherwise unset |
+| SDK harnesses without turn usage (databricks, goose, hermes, qwen) | Session model (`observed` from an earlier report, else `resolved_default`) | `requested`, else unset |
+| Native terminal harnesses (claude-native, codex-native, cursor-native, kimi-native, kiro-native, opencode-native, antigravity-native) | Session model: the terminal's own report (Claude Code's status line, Codex's thread settings), `observed`; `resolved_default` until it first reports | `requested` (codex-native's effort is mirrored back from Codex); unset when left at the terminal's own default |
 | Turns typed directly in a native terminal | No agent span | No agent span |
 
 An effort left at the harness's own default is unset for Claude Code, the

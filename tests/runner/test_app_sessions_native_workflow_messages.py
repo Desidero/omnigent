@@ -1004,7 +1004,9 @@ async def test_session_span_attributes_reach_the_harness_only_with_telemetry(
         workspace: str | None,
         local: dict,
         project_names: dict,
+        configured_model: str | None,
     ) -> dict:
+        assert configured_model is None  # no agent spec is cached for this session
         resolved.append(session_id)
         return {**local, "omnigent.session.title": "Fix login"}
 
