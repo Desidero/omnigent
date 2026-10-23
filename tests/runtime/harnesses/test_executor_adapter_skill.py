@@ -331,14 +331,19 @@ async def test_session_attributes_stamp_every_turn_span(
     assert telemetry._session_attributes_var.get() is None
 
 
+_SESSION_DEFAULT = {
+    "omnigent.session.model": "gpt-5.5",
+    "omnigent.session.model.source": "resolved_default",
+}
 _UNSET = None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("request_fields", "terminal", "expected"),
+    ("session", "request_fields", "terminal", "expected"),
     [
         pytest.param(
+            _SESSION_DEFAULT,
             {},
             TurnComplete(response="", usage={"model": "gpt-5.5-2026-09", "input_tokens": 3}),
             {
@@ -352,6 +357,18 @@ _UNSET = None
             id="default-model-observed",
         ),
         pytest.param(
+            {**_SESSION_DEFAULT, "omnigent.agent.model": "gpt-5.5"},
+            {},
+            TurnComplete(response=""),
+            {
+                "gen_ai.request.model": "gpt-5.5",
+                "gen_ai.response.model": "gpt-5.5",
+                "omnigent.model.source": "resolved_default",
+            },
+            id="default-model-unreported",
+        ),
+        pytest.param(
+            None,
             {},
             TurnComplete(response=""),
             {
@@ -362,6 +379,7 @@ _UNSET = None
             id="model-unknowable",
         ),
         pytest.param(
+            _SESSION_DEFAULT,
             {"model_override": "openai/gpt-5.4-mini", "reasoning": {"effort": "High"}},
             TurnComplete(response=""),
             {
@@ -375,6 +393,7 @@ _UNSET = None
             id="requested",
         ),
         pytest.param(
+            _SESSION_DEFAULT,
             {"model_override": "openai/gpt-5.4-mini", "reasoning": {"effort": "High"}},
             TurnComplete(
                 response="", usage={"model": "gpt-5.5-2026-09"}, reasoning_effort="medium"
@@ -390,6 +409,7 @@ _UNSET = None
             id="observed-replaces-requested",
         ),
         pytest.param(
+            None,
             {"reasoning": {"effort": "default"}},
             TurnComplete(response="", reasoning_effort="medium"),
             {
@@ -400,6 +420,7 @@ _UNSET = None
             id="default-effort-observed",
         ),
         pytest.param(
+            None,
             {"reasoning": {"effort": "default"}},
             TurnComplete(response=""),
             {
@@ -413,6 +434,7 @@ _UNSET = None
 async def test_agent_span_records_the_model_and_effort_the_turn_ran_with(
     exporter: InMemorySpanExporter,
     monkeypatch: pytest.MonkeyPatch,
+    session: dict[str, str] | None,
     request_fields: dict[str, object],
     terminal: TurnComplete,
     expected: dict[str, str | None],
@@ -423,7 +445,7 @@ async def test_agent_span_records_the_model_and_effort_the_turn_ran_with(
     """
     monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
 
-    await _run([terminal], **request_fields)
+    await _run([terminal], session, **request_fields)
 
     (agent,) = [s for s in exporter.get_finished_spans() if s.name == "agent:test-agent"]
     attributes = dict(agent.attributes or {})
