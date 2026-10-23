@@ -11,6 +11,15 @@ from typing import Any
 import httpx
 
 from omnigent.diagnostics import redact_url
+from omnigent.inner.tracing import (
+    AGENT_MODEL,
+    SESSION_MODEL,
+    SESSION_MODEL_SOURCE,
+    SESSION_REASONING_EFFORT,
+    SOURCE_OBSERVED,
+    SOURCE_REQUESTED,
+    SOURCE_RESOLVED_DEFAULT,
+)
 from omnigent.runner.github_resource import _git
 from omnigent.runner.native import _SESSION_METADATA_PARAMS
 from omnigent.runtime.telemetry import should_capture_content
@@ -25,11 +34,42 @@ _RESOLVE_TIMEOUT_S = 5.0
 LABEL_ATTRIBUTE_PREFIX = "omnigent.session.labels."
 
 
+def session_model(
+    session: Mapping[str, Any], configured_model: str | None
+) -> tuple[str, str] | None:
+    """
+    Resolve the model a session is running and where that value came from.
+
+    The snapshot's ``llm_model`` is the harness's reported model, else the
+    agent's configured one, so a value other than *configured_model* is a
+    harness report. Without a report, a session model override is what the
+    harness was asked to run, else the configured model is the default.
+
+    :param session: Session response body, e.g. ``{"llm_model": "gpt-5.5",
+        "model_override": None}``.
+    :param configured_model: The session agent's configured model, or ``None``.
+    :returns: ``(model, source)``, e.g. ``("claude-opus-4-8[1m]", "observed")``,
+        or ``None`` when no model is known.
+    """
+    llm_model = session.get("llm_model")
+    override = session.get("model_override")
+    if isinstance(llm_model, str) and llm_model and llm_model != configured_model:
+        return llm_model, SOURCE_OBSERVED
+    if isinstance(override, str) and override:
+        return override, SOURCE_REQUESTED
+    if isinstance(llm_model, str) and llm_model:
+        return llm_model, SOURCE_RESOLVED_DEFAULT
+    if configured_model:
+        return configured_model, SOURCE_RESOLVED_DEFAULT
+    return None
+
+
 def session_metadata_attributes(
     session: Mapping[str, Any],
     *,
     project_name: str | None = None,
     git_branch: str | None = None,
+    configured_model: str | None = None,
 ) -> dict[str, str]:
     """
     Project a ``GET /v1/sessions/{id}`` body onto ``omnigent.*`` span attributes.
@@ -42,15 +82,23 @@ def session_metadata_attributes(
         "labels": {"team": "web"}, "project_id": "proj_1"}``.
     :param project_name: Name of the session's project, if resolved.
     :param git_branch: Branch to report when the session records none.
+    :param configured_model: The session agent's configured model, reported
+        as such and used to tell a harness-reported model from the default
+        (:func:`session_model`).
     :returns: Attribute names mapped to values, e.g.
         ``{"omnigent.session.title": "Fix login"}``.
     """
+    model = session_model(session, configured_model)
     candidates: dict[str, object] = {
         "omnigent.session.title": session.get("title") if should_capture_content() else None,
         "omnigent.project.id": session.get("project_id"),
         "omnigent.project.name": project_name,
         "omnigent.git.branch": session.get("git_branch") or git_branch,
         "omnigent.agent.name": session.get("agent_name"),
+        AGENT_MODEL: configured_model,
+        SESSION_MODEL: model[0] if model else None,
+        SESSION_MODEL_SOURCE: model[1] if model else None,
+        SESSION_REASONING_EFFORT: session.get("reasoning_effort"),
     }
     labels = session.get("labels")
     if isinstance(labels, Mapping):
@@ -144,13 +192,15 @@ async def resolve_session_attributes(
     workspace: str | None,
     local: Mapping[str, str],
     project_names: MutableMapping[str, str] | None = None,
+    configured_model: str | None = None,
 ) -> dict[str, str]:
     """
     Resolve the current span attributes for *session_id*; never raises.
 
-    Server-owned metadata is read on every call so renames, label edits and
-    project moves made mid-session reach later turns. When the reads do not
-    finish within the budget, the turn goes on with *local* alone.
+    Server-owned metadata is read on every call so renames, label edits,
+    project moves and model or effort changes made mid-session reach later
+    turns. When the reads do not finish within the budget, the turn goes on
+    with *local* alone.
 
     :param server_client: Runner-to-server client.
     :param session_id: Session id, e.g. ``"conv_abc123"``.
@@ -158,12 +208,17 @@ async def resolve_session_attributes(
     :param local: The session's cached :func:`local_session_attributes`.
     :param project_names: Project names by project id, filled on first use so
         a project is looked up once per runner process.
+    :param configured_model: The session agent's configured model, or ``None``.
     :returns: Attribute names mapped to values.
     """
     try:
         metadata = await asyncio.wait_for(
             _server_session_attributes(
-                server_client, session_id, workspace=workspace, project_names=project_names
+                server_client,
+                session_id,
+                workspace=workspace,
+                project_names=project_names,
+                configured_model=configured_model,
             ),
             timeout=_RESOLVE_TIMEOUT_S,
         )
@@ -181,6 +236,7 @@ async def _server_session_attributes(
     *,
     workspace: str | None,
     project_names: MutableMapping[str, str] | None,
+    configured_model: str | None,
 ) -> dict[str, str]:
     """Read the session from the server and project it onto span attributes."""
     session = await _get_json(
@@ -197,4 +253,9 @@ async def _server_session_attributes(
     branch = None
     if not session.get("git_branch") and workspace:
         branch = await asyncio.to_thread(git_branch, workspace)
-    return session_metadata_attributes(session, project_name=project_name, git_branch=branch)
+    return session_metadata_attributes(
+        session,
+        project_name=project_name,
+        git_branch=branch,
+        configured_model=configured_model,
+    )
