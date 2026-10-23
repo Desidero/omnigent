@@ -46,6 +46,10 @@ channel; labels still render when you or the agent write them.
   it. The newest mention decides, so a later plain mention reopens it.
 - **Open items:** a bar above the thread lists the open labels as chips.
   Expand it for every item with its title, closed ones under **Closed (N)**.
+- **Latest reply:** the Open items bar puts the items the agent's newest reply
+  mentions first, tinted, and includes an item that reply just closed, struck
+  through. Expanded, they sit under **In the latest reply**, ahead of the other
+  open items.
 
 ## Comment on items
 
