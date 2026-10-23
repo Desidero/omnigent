@@ -306,6 +306,7 @@ class ExecutorAdapter(HarnessApp):
         from omnigent.runtime.telemetry import (
             current_session_id,
             reset_active_skill,
+            session_attributes_scope,
             session_scope,
             set_active_skill,
         )
@@ -343,6 +344,7 @@ class ExecutorAdapter(HarnessApp):
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
             with (
                 session_scope(turn_session_id),
+                session_attributes_scope(request.telemetry_attributes),
                 phase_scope(ErrorPhase.TURN),
                 trace_cm,
                 input_delivery_scope(input_identity, response_id=ctx.response_id),
