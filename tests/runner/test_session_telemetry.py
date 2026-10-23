@@ -107,7 +107,11 @@ async def test_resolve_session_attributes_reads_server_metadata_each_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(session_telemetry, "git_branch", lambda _: "feature/login")
-    session: dict[str, object] = {"title": "Untitled", "agent_name": "coder"}
+    session: dict[str, object] = {
+        "title": "Untitled",
+        "agent_name": "coder",
+        "llm_model": "gpt-5.5",
+    }
     bodies = {"/v1/sessions/conv_1": session, "/v1/projects/proj_1": {"name": "Web"}}
     local = {"omnigent.host.name": "dev"}
     requested: list[str] = []
@@ -118,23 +122,37 @@ async def test_resolve_session_attributes_reads_server_metadata_each_call(
         assert request.extensions["timeout"]["read"] == session_telemetry._SERVER_TIMEOUT_S
         return httpx.Response(200, json=bodies[request.url.path])
 
+    async def resolve() -> dict[str, str]:
+        return await session_telemetry.resolve_session_attributes(
+            client,
+            "conv_1",
+            workspace="/repo",
+            local=local,
+            project_names=project_names,
+            configured_model="gpt-5.5",
+        )
+
     async with _client(serve) as client:
-        first = await session_telemetry.resolve_session_attributes(
-            client, "conv_1", workspace="/repo", local=local, project_names=project_names
+        first = await resolve()
+        # The harness reports the model it resolved, and the user picks an effort.
+        session.update(
+            title="Fix login",
+            labels={"team": "web"},
+            project_id="proj_1",
+            llm_model="gpt-5.5-2026-09",
+            reasoning_effort="high",
         )
-        session.update(title="Fix login", labels={"team": "web"}, project_id="proj_1")
-        second = await session_telemetry.resolve_session_attributes(
-            client, "conv_1", workspace="/repo", local=local, project_names=project_names
-        )
-        third = await session_telemetry.resolve_session_attributes(
-            client, "conv_1", workspace="/repo", local=local, project_names=project_names
-        )
+        second = await resolve()
+        third = await resolve()
 
     assert first == {
         "omnigent.host.name": "dev",
         "omnigent.session.title": "Untitled",
         "omnigent.git.branch": "feature/login",
         "omnigent.agent.name": "coder",
+        "omnigent.agent.model": "gpt-5.5",
+        "omnigent.session.model": "gpt-5.5",
+        "omnigent.session.model.source": "resolved_default",
     }
     assert second == {
         **first,
@@ -142,12 +160,43 @@ async def test_resolve_session_attributes_reads_server_metadata_each_call(
         "omnigent.session.labels.team": "web",
         "omnigent.project.id": "proj_1",
         "omnigent.project.name": "Web",
+        "omnigent.session.model": "gpt-5.5-2026-09",
+        "omnigent.session.model.source": "observed",
+        "omnigent.session.reasoning_effort": "high",
     }
     # The session is re-read every call; the project name is cached by id.
     assert third == second
     assert requested.count("/v1/sessions/conv_1") == 3
     assert requested.count("/v1/projects/proj_1") == 1
     assert project_names == {"proj_1": "Web"}
+
+
+@pytest.mark.parametrize(
+    ("session", "configured_model", "expected"),
+    [
+        pytest.param({"llm_model": "opus[1m]"}, None, ("opus[1m]", "observed"), id="reported"),
+        pytest.param(
+            {"llm_model": "gpt-5.5", "model_override": "gpt-5.4-mini"},
+            "gpt-5.5",
+            ("gpt-5.4-mini", "requested"),
+            id="override-unreported",
+        ),
+        pytest.param(
+            {"llm_model": "gpt-5.4-mini", "model_override": "gpt-5.4-mini"},
+            "gpt-5.5",
+            ("gpt-5.4-mini", "observed"),
+            id="override-reported",
+        ),
+        pytest.param({}, "gpt-5.5", ("gpt-5.5", "resolved_default"), id="configured-only"),
+        pytest.param({}, None, None, id="unknown"),
+    ],
+)
+def test_session_model_tells_reports_from_requests_and_defaults(
+    session: dict[str, object],
+    configured_model: str | None,
+    expected: tuple[str, str] | None,
+) -> None:
+    assert session_telemetry.session_model(session, configured_model) == expected
 
 
 @pytest.mark.asyncio

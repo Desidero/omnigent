@@ -44,7 +44,7 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
-from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.inner.tracing import AGENT_MODEL, TracingContext, is_tracing_enabled
 from omnigent.native.input_diagnostics import (
     INPUT_FIELDS,
     input_attributes,
@@ -353,17 +353,20 @@ class ExecutorAdapter(HarnessApp):
                     _logger, "native_input_execution_started", session_id=turn_session_id
                 )
                 if tctx is not None:
+                    session_attributes = request.telemetry_attributes or {}
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
                         user_message=user_message,
                         model=request.model_override or request.model,
                         # ``request.model`` is the agent name, never a requested model.
-                        request_model=request.model_override,
+                        request_model=request.model_override
+                        or session_attributes.get(AGENT_MODEL),
                     )
                     tctx.set_requested_turn_settings(
                         agent_span,
                         requested_model=request.model_override,
                         requested_effort=extra.get("reasoning_effort"),
+                        session_attributes=request.telemetry_attributes,
                     )
 
                 response_text: str | None = None
