@@ -42,6 +42,8 @@ export interface ItemLabelEntry {
   source: ItemLabelSource;
   /** The message whose struck mention closed the item; null while open. */
   closedBy: ItemLabelSource | null;
+  /** The newest message that mentions the label. */
+  lastMention: ItemLabelSource;
   /** How many messages mention the label. */
   messageCount: number;
 }
@@ -54,6 +56,8 @@ export interface ItemLabelIndex {
   enabled: boolean;
   /** Items in order of definition. */
   items: ReadonlyMap<string, ItemLabelEntry>;
+  /** The newest agent message with any text; null before the agent has replied. */
+  latestReply: ItemLabelSource | null;
 }
 
 /** The transcript's label index; null on surfaces without a transcript. */
@@ -66,21 +70,33 @@ export const ItemLabelMessageContext = createContext<string | null>(null);
 export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIndex {
   const items = new Map<string, ItemLabelEntry>();
   let enabled = false;
+  let latestReply: ItemLabelSource | null = null;
   for (const { source, labels, struck } of scans) {
     if (labels.length > 1) enabled = true;
     for (const label of labels) {
       const closedBy = struck.includes(label) ? source : null;
       const entry = items.get(label);
       if (!entry) {
-        items.set(label, { label, source, closedBy, messageCount: 1 });
+        items.set(label, { label, source, closedBy, lastMention: source, messageCount: 1 });
         continue;
       }
       entry.closedBy = closedBy;
+      entry.lastMention = source;
       entry.messageCount += 1;
       enabled = true;
     }
+    // A tool-only turn has no text and isn't the reply the user is reading.
+    if (source.role === "assistant" && source.text.trim() !== "") latestReply = source;
   }
-  return { enabled, items };
+  return { enabled, items, latestReply };
+}
+
+/**
+ * Whether the latest agent reply mentions `item`, including by closing it, so
+ * the user sees at a glance which items the reply is about.
+ */
+export function mentionedInLatestReply(index: ItemLabelIndex, item: ItemLabelEntry): boolean {
+  return index.latestReply !== null && item.lastMention === index.latestReply;
 }
 
 interface ScannedLine {

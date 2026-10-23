@@ -539,14 +539,25 @@ function citesSamePlace(
 const ITEM_LABEL_BADGE_CLASS =
   "inline-flex items-baseline rounded border border-border bg-muted px-1 font-mono text-[0.85em] leading-snug";
 const ITEM_LABEL_CLOSED_CLASS = "line-through opacity-60";
+// Same amber as the message highlight, for items the latest reply mentions.
+const ITEM_LABEL_RECENT_CLASS = "border-warning/60 bg-warning/15";
 
-/** Classes for an item label chip: a clickable badge, struck through once closed. */
-export function itemLabelChipClass(closed: boolean): string {
+/**
+ * Classes for an item label chip: a clickable badge, struck through once
+ * closed, tinted when `recent` (the latest reply mentions it).
+ */
+export function itemLabelChipClass(closed: boolean, recent = false): string {
   return cn(
     ITEM_LABEL_BADGE_CLASS,
     "cursor-pointer text-link transition-colors hover:bg-accent",
+    recent && ITEM_LABEL_RECENT_CLASS,
     closed && ITEM_LABEL_CLOSED_CLASS,
   );
+}
+
+/** A chip's accessible name, e.g. "Show item Q2 (closed), mentioned in the latest reply". */
+export function itemLabelChipName(label: string, closed: boolean, recent = false): string {
+  return `Show item ${label}${closed ? " (closed)" : ""}${recent ? ", mentioned in the latest reply" : ""}`;
 }
 
 function describeSource(source: ItemLabelSource): string {
