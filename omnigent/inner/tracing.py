@@ -86,17 +86,25 @@ _ERROR_MESSAGE = "error.message"
 _SKILL_NAME = "omnigent.skill.name"
 
 # What an agent turn actually ran with. gen_ai.response.model is the model; each
-# source says where a value came from: the harness reported it (observed) or
-# only the request is known (requested).
+# source says where a value came from: the harness reported it (observed), a
+# configured or launch default (resolved_default), or only the request (requested).
 TURN_MODEL_SOURCE = "omnigent.model.source"
 TURN_REASONING_EFFORT_REQUESTED = "omnigent.reasoning_effort.requested"
 TURN_REASONING_EFFORT = "omnigent.reasoning_effort"
 TURN_REASONING_EFFORT_SOURCE = "omnigent.reasoning_effort.source"
 SOURCE_OBSERVED = "observed"
 SOURCE_REQUESTED = "requested"
+SOURCE_RESOLVED_DEFAULT = "resolved_default"
 
 # start_agent_span's default: the requested model is the recorded model.
 _SAME_AS_MODEL = object()
+
+# Session-level model and effort the runner stamps on every span of a turn;
+# AGENT_MODEL is the agent's configured model, absent when it names none.
+AGENT_MODEL = "omnigent.agent.model"
+SESSION_MODEL = "omnigent.session.model"
+SESSION_MODEL_SOURCE = "omnigent.session.model.source"
+SESSION_REASONING_EFFORT = "omnigent.session.reasoning_effort"
 
 # ---------------------------------------------------------------------------
 # Global enable/disable
@@ -345,7 +353,8 @@ class TracingContext:
 
         :param span: The turn's AGENT span.
         :param model: Model id, e.g. ``"claude-opus-4-8[1m]"``; ignored when empty.
-        :param source: One of :data:`SOURCE_OBSERVED`, :data:`SOURCE_REQUESTED`.
+        :param source: One of :data:`SOURCE_OBSERVED`, :data:`SOURCE_RESOLVED_DEFAULT`,
+            :data:`SOURCE_REQUESTED`.
         """
         if span is None or not model:
             return
@@ -378,19 +387,29 @@ class TracingContext:
         *,
         requested_model: str | None,
         requested_effort: str | None,
+        session_attributes: Mapping[str, str] | None,
     ) -> None:
         """
-        Stamp the model and effort a turn asked for as it starts.
+        Stamp the model and effort a turn is expected to run with as it starts.
 
-        An observed value at turn end replaces either.
+        A per-turn model request wins; otherwise the session's model as the
+        runner resolved it (the harness's last report, else the configured
+        default). An observed value at turn end replaces either.
 
         :param span: The turn's AGENT span.
         :param requested_model: The turn's model override, or ``None``.
         :param requested_effort: The effort the turn asked for, as given, or ``None``.
+        :param session_attributes: The runner's session span attributes, e.g.
+            ``{"omnigent.session.model": "gpt-5.5",
+            "omnigent.session.model.source": "resolved_default"}``.
         """
+        session = session_attributes or {}
         if requested_model:
             # Spelled like gen_ai.request.model, without a provider prefix.
             self.set_turn_model(span, parse_provider_name(requested_model)[1], SOURCE_REQUESTED)
+        elif session_model := session.get(SESSION_MODEL):
+            source = session.get(SESSION_MODEL_SOURCE) or SOURCE_RESOLVED_DEFAULT
+            self.set_turn_model(span, session_model, source)
         if span is not None and requested_effort:
             span.set_attribute(TURN_REASONING_EFFORT_REQUESTED, requested_effort)
         self.set_turn_reasoning_effort(span, requested_effort, SOURCE_REQUESTED)
