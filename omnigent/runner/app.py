@@ -2165,12 +2165,14 @@ def create_runner_app(
         if local is None:
             local = await asyncio.to_thread(local_session_attributes, workspace)
             _session_telemetry_local_attributes[session_id] = local
+        spec = _unwrap_resolved_spec(_session_spec_cache.get(session_id))
         return await resolve_session_attributes(
             server_client,
             session_id,
             workspace=workspace,
             local=local,
             project_names=_session_telemetry_project_names,
+            configured_model=getattr(getattr(spec, "executor", None), "model", None),
         )
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
