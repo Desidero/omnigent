@@ -4,9 +4,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
+import { useChatStore } from "@/store/chatStore";
 import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
 
-afterEach(cleanup);
+const realLoadToolOutput = useChatStore.getState().loadToolOutput;
+
+afterEach(() => {
+  cleanup();
+  useChatStore.setState({ loadToolOutput: realLoadToolOutput });
+});
 
 // Render helper: ToolCard reads a Tooltip (trigger title) so it needs the
 // TooltipProvider; createElement keeps this in a .ts file without JSX.
@@ -121,6 +127,66 @@ describe("ToolCard rendering", () => {
     fireEvent.click(trigger);
     expect(screen.getAllByText("Parameters").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+  });
+
+  it("fetches the full output once when a lean-page preview row is expanded", async () => {
+    // WHY: history pages carry only the head of a long result; the row must
+    // ask the store for the rest when (and only when) the reader opens it.
+    const loadToolOutput = vi.fn(() => Promise.resolve());
+    useChatStore.setState({ loadToolOutput });
+    const { container } = renderCard({
+      name: "Read",
+      arguments: { file_path: "/big.txt" },
+      output: "head",
+      state: "output-available",
+      resultItemId: "fco_1",
+      truncatedOutputLength: 12345,
+    });
+    expect(loadToolOutput).not.toHaveBeenCalled();
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(loadToolOutput).toHaveBeenCalledWith("fco_1", undefined);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Showing the first 4 of 12,345 characters; loading the full output",
+    );
+    // The preview itself is on screen while the rest loads.
+    expect(screen.getByText("head")).toBeInTheDocument();
+    await waitFor(() => expect(loadToolOutput).toHaveBeenCalledTimes(1));
+  });
+
+  it("offers a retry when the full output fails to load", async () => {
+    const loadToolOutput = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue(undefined);
+    useChatStore.setState({ loadToolOutput });
+    const { container } = renderCard({
+      name: "Read",
+      arguments: {},
+      output: "head",
+      state: "output-available",
+      resultItemId: "fco_1",
+      truncatedOutputLength: 500,
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(screen.getByRole("status")).toHaveTextContent("The full output failed to load.");
+    fireEvent.click(retry);
+    expect(loadToolOutput).toHaveBeenCalledTimes(2);
+  });
+
+  it("renders a complete result without any loading notice", () => {
+    const loadToolOutput = vi.fn(() => Promise.resolve());
+    useChatStore.setState({ loadToolOutput });
+    const { container } = renderCard({
+      name: "Read",
+      arguments: {},
+      output: "the whole output",
+      state: "output-available",
+      resultItemId: "fco_1",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(loadToolOutput).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {
