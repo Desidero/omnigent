@@ -286,15 +286,29 @@ interface SessionItemsResponseWire {
 }
 
 /**
- * Initial (and per-scroll-up-page) item count for conversation history
- * hydration. Bounds how many items the chat surface fetches, parses,
- * and renders when a conversation is opened. The synchronous first-paint
- * render scales ~linearly with this count (parse/walk are negligible;
- * mounting the markdown/Streamdown tree per bubble is the cost), so a
- * smaller window keeps thread-switch render cheap. `loadMoreHistory`
- * pages older items on scroll-up.
+ * Default item count for a `fetchSessionItemsPage` call: the newest-items
+ * page a reconnect backfills from. Bounds how many items a reconnect fetches,
+ * parses and renders before paging back to the pre-gap window.
  */
 export const SESSION_HISTORY_PAGE_SIZE = 20;
+
+/**
+ * Items per scroll-up history page (`loadMoreHistory`). Only the rows in view
+ * mount, so a page costs one request plus a store prepend whatever its size;
+ * a small page meant a round trip and a prepend hitch every screen or two of
+ * reading, which read as a stutter on the way up. A page is a few dozen KB.
+ */
+export const SCROLL_UP_HISTORY_PAGE_SIZE = 100;
+/**
+ * Scroll-up page on a mobile-width viewport: a phone reads a page in more
+ * screens, on a slower CPU and link, so a smaller page lands sooner.
+ */
+export const MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE = 60;
+
+/** Scroll-up page size for the viewport in use. */
+export function scrollUpHistoryPageSize(mobileViewport: boolean): number {
+  return mobileViewport ? MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE : SCROLL_UP_HISTORY_PAGE_SIZE;
+}
 
 /**
  * Convert the snake-case `usage_by_model` wire map into the camelCase
