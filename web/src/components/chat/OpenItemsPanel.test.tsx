@@ -2,8 +2,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  updateSession: vi.fn(),
+}));
+
+import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { updateSession } from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 import {
+  DISMISSED_ITEMS_LABEL_KEY,
   ItemLabelIndexContext,
+  ItemLabelSessionContext,
   buildItemLabelIndex,
   itemLabelsIn,
   struckItemLabelsIn,
@@ -27,12 +38,16 @@ function indexOf(...texts: string[]): ItemLabelIndex {
   );
 }
 
-function renderPanel(index: ItemLabelIndex) {
+function renderPanel(index: ItemLabelIndex, session?: Pick<Session, "id" | "labels">) {
+  const queryClient = new QueryClient();
+  if (session) queryClient.setQueryData(["session", session.id], session);
   return render(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={queryClient}>
       <MemoryRouter>
         <ItemLabelIndexContext.Provider value={index}>
-          <OpenItemsPanel />
+          <ItemLabelSessionContext.Provider value={session?.id ?? null}>
+            <OpenItemsPanel />
+          </ItemLabelSessionContext.Provider>
         </ItemLabelIndexContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -159,5 +174,87 @@ describe("fitItemChipCount", () => {
     expect(fitItemChipCount([30, 30, 30], 87, 4, 20)).toBe(1);
     expect(fitItemChipCount([60, 30], 50, 4, 20)).toBe(0);
     expect(fitItemChipCount([], 50, 4, 20)).toBe(0);
+  });
+});
+
+describe("OpenItemsPanel dismissed items", () => {
+  // The mutation observer notifies on a timer, so flush a macrotask.
+  const flush = () =>
+    act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+  const twoOpen = () =>
+    indexOf(
+      "- **[Q1] Backfill window.** Batch it?\n- **[Q2] Soft-deleted rows.** Copy or drop?",
+      "Looking.",
+    );
+
+  it("writes a dismissal to the session's labels and hides the item until restored", async () => {
+    const labels = new Map<string, string>();
+    let confirm: () => void = () => {};
+    vi.mocked(updateSession).mockImplementation(async (id, updates) => {
+      for (const [key, value] of Object.entries(updates.labels ?? {})) {
+        if (value === null) labels.delete(key);
+        else labels.set(key, value);
+      }
+      await new Promise<void>((resolve) => {
+        confirm = resolve;
+      });
+      return { id, labels: Object.fromEntries(labels) } as Session;
+    });
+    renderPanel(twoOpen(), { id: "conv_1", labels: {} });
+    const panel = screen.getByTestId("open-items");
+    expect(panel.textContent).toContain("Open items(2)");
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss item Q2" }));
+    await flush();
+    expect(updateSession).toHaveBeenCalledWith("conv_1", {
+      labels: { [DISMISSED_ITEMS_LABEL_KEY]: "Q2" },
+    });
+    // Hidden while the write is still in flight.
+    expect(screen.queryByRole("button", { name: "Show item Q2" })).toBeNull();
+    expect(panel.textContent).toContain("Open items(1)");
+    confirm();
+    await flush();
+    expect(screen.queryByRole("button", { name: "Show item Q2" })).toBeNull();
+    expect(panel.textContent).toContain("Open items(1)");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show dismissed (1)" }));
+    expect(screen.getByRole("button", { name: "Show item Q2" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Restore item Q2" }));
+    await flush();
+    expect(updateSession).toHaveBeenLastCalledWith("conv_1", {
+      labels: { [DISMISSED_ITEMS_LABEL_KEY]: null },
+    });
+    confirm();
+    await flush();
+    expect(labels.has(DISMISSED_ITEMS_LABEL_KEY)).toBe(false);
+    expect(panel.textContent).toContain("Open items(2)");
+    expect(screen.queryByRole("button", { name: /dismissed/ })).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Show item Q2" })).toHaveLength(2);
+  });
+
+  it("starts from the dismissals stored on the session", () => {
+    renderPanel(twoOpen(), { id: "conv_1", labels: { [DISMISSED_ITEMS_LABEL_KEY]: "Q1" } });
+    expect(screen.getByTestId("open-items").textContent).toContain("Open items(1)");
+    expect(screen.queryByRole("button", { name: "Show item Q1" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Show dismissed (1)" })).toBeTruthy();
+  });
+
+  it("shows a dismissed item again once the agent closes it", () => {
+    renderPanel(indexOf("- **[Q1] Backfill window.**\n- **[Q2] Rows.**", "~~[Q1]~~ batched."), {
+      id: "conv_1",
+      labels: { [DISMISSED_ITEMS_LABEL_KEY]: "Q1" },
+    });
+    expect(
+      screen.getAllByRole("button", {
+        name: "Show item Q1 (closed), mentioned in the latest reply",
+      }),
+    ).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: /dismissed/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dismiss item Q1" })).toBeNull();
   });
 });

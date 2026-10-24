@@ -5,6 +5,7 @@
 // struck-through mention (`~~[Q3]~~`) closes the item; the newest mention wins.
 
 import { createContext } from "react";
+import { LABEL_VALUE_MAX_LENGTH } from "@/lib/sessionLabels";
 
 /** Fragment href a label link carries from the remark pass to the link renderer. */
 export const ITEM_LABEL_HREF_PREFIX = "#omnigent-item-";
@@ -66,6 +67,9 @@ export const ItemLabelIndexContext = createContext<ItemLabelIndex | null>(null);
 /** Id of the message whose markdown is being rendered. */
 export const ItemLabelMessageContext = createContext<string | null>(null);
 
+/** The session whose transcript is rendering labels. */
+export const ItemLabelSessionContext = createContext<string | null>(null);
+
 /** Builds the index from messages in transcript order; the first definition wins. */
 export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIndex {
   const items = new Map<string, ItemLabelEntry>();
@@ -97,6 +101,41 @@ export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIn
  */
 export function mentionedInLatestReply(index: ItemLabelIndex, item: ItemLabelEntry): boolean {
   return index.latestReply !== null && item.lastMention === index.latestReply;
+}
+
+/**
+ * Session label listing the open items the user dismissed from the tracker,
+ * so a dismissal follows them to every device. Omnigent-namespaced, so the
+ * label editor leaves it alone.
+ */
+export const DISMISSED_ITEMS_LABEL_KEY = "omnigent.items_dismissed";
+
+const BARE_ITEM_LABEL_RE = /^[A-Z]{1,3}\d{1,3}$/;
+
+/** The labels in a dismissed-items label value: a comma list, junk dropped. */
+export function decodeDismissedItems(value: string | null | undefined): ReadonlySet<string> {
+  if (!value) return new Set();
+  return new Set(
+    value
+      .split(",")
+      .map((label) => label.trim())
+      .filter((label) => BARE_ITEM_LABEL_RE.test(label)),
+  );
+}
+
+/**
+ * Encodes dismissed labels for the session label, oldest first. When the list
+ * outgrows the label column the oldest dismissals are forgotten; `null` when
+ * nothing is dismissed, which deletes the label.
+ */
+export function encodeDismissedItems(labels: Iterable<string>): string | null {
+  const unique = [...new Set(labels)];
+  let encoded = unique.join(",");
+  while (encoded.length > LABEL_VALUE_MAX_LENGTH && unique.length > 0) {
+    unique.shift();
+    encoded = unique.join(",");
+  }
+  return encoded === "" ? null : encoded;
 }
 
 interface ScannedLine {
