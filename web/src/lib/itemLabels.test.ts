@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   ITEM_LABEL_HREF_PREFIX,
   buildItemLabelIndex,
+  decodeDismissedItems,
+  encodeDismissedItems,
   extractItemBlock,
   extractLabelSentence,
   itemLabelTitle,
@@ -401,5 +403,30 @@ describe("remarkItemLabels", () => {
       { type: "inlineCode", value: "[Q3]" },
       { type: "link", url: "https://x", children: [{ type: "text", value: "[Q4]" }] },
     ]);
+  });
+});
+
+describe("dismissed items label", () => {
+  it("round-trips labels through a comma list and deletes the label when empty", () => {
+    expect(encodeDismissedItems(["Q2", "R10", "Q2"])).toBe("Q2,R10");
+    expect([...decodeDismissedItems("Q2,R10")]).toEqual(["Q2", "R10"]);
+    expect(encodeDismissedItems([])).toBeNull();
+    expect(decodeDismissedItems(null).size).toBe(0);
+    expect(decodeDismissedItems(undefined).size).toBe(0);
+  });
+
+  it("drops junk from a stored value", () => {
+    expect([...decodeDismissedItems(" Q1 ,,[Q2],q3,Q4;,R12")]).toEqual(["Q1", "R12"]);
+  });
+
+  it("forgets the oldest dismissals when the label column would overflow", () => {
+    const labels = Array.from({ length: 80 }, (_, i) => `Q${i + 1}`);
+    const encoded = encodeDismissedItems(labels);
+    expect(encoded).not.toBeNull();
+    expect(encoded!.length).toBeLessThanOrEqual(256);
+    const kept = [...decodeDismissedItems(encoded)];
+    expect(kept.at(-1)).toBe("Q80");
+    expect(kept.at(0)).not.toBe("Q1");
+    expect(kept).toEqual(labels.slice(labels.length - kept.length));
   });
 });
