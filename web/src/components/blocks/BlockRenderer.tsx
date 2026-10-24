@@ -916,6 +916,8 @@ function renderItem(
           state={item.state}
           startedAt={item.startedAt}
           duration={item.duration}
+          resultItemId={item.resultItemId}
+          truncatedOutputLength={item.truncatedOutputLength}
         />
       );
     case "native_tool":
