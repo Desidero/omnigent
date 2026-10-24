@@ -1,16 +1,17 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 // Tests for shift-click range selection in the sidebar's multi-session mode.
 // Covers the pure range computation helper and the integrated click behavior.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
-import { computeShiftSelectRange, Sidebar } from "./Sidebar";
+import { computeShiftSelectRange } from "./Sidebar";
 
 describe("computeShiftSelectRange", () => {
   const ids = ["a", "b", "c", "d", "e"];
@@ -55,60 +56,42 @@ const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock } =
   bulkArchiveMock: { mutate: vi.fn() },
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({
-    mutate: bulkArchiveMock.mutate,
-    isPending: false,
-    isError: false,
-  }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
-  useProjectSessions: (project: string, enabled: boolean) => {
-    const override = projectSessionsMock.current[project];
-    const rows = !enabled
-      ? []
-      : (override ??
-        conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
-        ));
-    return {
-      data: enabled
-        ? {
-            pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
-            pageParams: [undefined],
-          }
-        : undefined,
-      isLoading: false,
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useBulkArchiveConversations: () => ({
+      mutate: bulkArchiveMock.mutate,
+      isPending: false,
       isError: false,
-      error: null,
-      fetchNextPage: vi.fn(),
-      hasNextPage: false,
-      isFetchingNextPage: false,
-    };
-  },
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    }),
+    useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
+    useProjectSessions: (project: string, enabled: boolean) => {
+      const override = projectSessionsMock.current[project];
+      const rows = !enabled
+        ? []
+        : (override ??
+          conversationsRef.current.filter(
+            (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
+          ));
+      return {
+        data: enabled
+          ? {
+              pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+              pageParams: [undefined],
+            }
+          : undefined,
+        isLoading: false,
+        isError: false,
+        error: null,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
+        isFetchingNextPage: false,
+      };
+    },
+    fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
+  };
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
@@ -140,41 +123,7 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
 
 function mockConversations(convs: Conversation[]) {
   conversationsRef.current = convs;
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: convs,
-              first_id: convs[0]?.id ?? null,
-              last_id: convs.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
-    </QueryClientProvider>,
-  );
+  useConvMock.mockImplementation(() => conversationPage(convs));
 }
 
 beforeEach(() => {
@@ -328,25 +277,30 @@ describe("Sidebar shift-click selection", () => {
   });
 
   it("labels Delete with the owned count when the selection is mixed-ownership", async () => {
-    // A project folder can hold sessions owned by other users (the folder query
-    // isn't ownership-filtered). Delete acts only on owned rows, so its label
-    // must reflect the owned count — not the raw "N selected" — when they differ.
-    projectsMock.push("Alpha");
-    const mine = conv("mine", { owner: "viewer", labels: { omni_project: "Alpha" } });
-    const theirs = conv("theirs", { owner: "someone_else", labels: { omni_project: "Alpha" } });
+    // The flat "All sessions" list mixes the viewer's own sessions with ones
+    // shared to them by other owners. Delete acts only on owned rows, so its
+    // label must reflect the owned count — not the raw "N selected" — when they
+    // differ. (Project folders are owner-only, so mixed ownership only arises in
+    // the flat list, not a folder.)
+    const mine = conv("mine", { owner: "viewer" });
+    const theirs = conv("theirs", { owner: "someone_else" });
     mockConversations([mine, theirs]);
-    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
     renderSidebar();
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+    // Mixed ownership only shows on "All sessions"; the default "My sessions"
+    // filter hides the shared row, so switch to All before selecting.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
       button: 0,
       ctrlKey: false,
+      pointerType: "mouse",
     });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(screen.getByTestId("session-filter-all"));
+
+    fireEvent.click(screen.getByRole("button", { name: /select/i }));
 
     // Select both rows — "2 selected", but only the owned one is deletable.
     fireEvent.click(await screen.findByRole("link", { name: "mine" }));
-    fireEvent.click(screen.getByRole("link", { name: "theirs" }));
+    fireEvent.click(screen.getByRole("link", { name: /^theirs/ }));
     await waitFor(() => {
       expect(screen.getByText("2 selected")).toBeInTheDocument();
     });

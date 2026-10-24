@@ -70,7 +70,7 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
-          <span className="truncate text-xs font-medium leading-tight">{label}</span>
+          <span className="truncate text-sm font-medium leading-tight">{label}</span>
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>
@@ -214,7 +214,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node<AgentNodeData>) => {
       const params = new URLSearchParams(location.search);
-      for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
+      for (const key of ["file", "diff", "comment", "view", "message"]) params.delete(key);
       const search = params.toString();
       navigate({
         pathname: `/c/${node.data.sessionId}`,

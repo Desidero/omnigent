@@ -21,7 +21,11 @@ MODEL_ID_RE = re.compile(
       | (?:openai/)?(?:gpt-\d[a-z0-9._:/-]*|gpt-oss-[a-z0-9][a-z0-9._:/-]*)
       | o[134](?:-[a-z0-9][a-z0-9._:/-]*)?
       | claude-(?:opus|sonnet|haiku|fable|\d)[a-z0-9._:/-]*
-      | gemini-\d[a-z0-9][a-z0-9._:/-]*
+      | gemini-(?:
+            \d[a-z0-9][a-z0-9._:/-]*
+          | \d+(?:\.\d+)+(?:-[a-z0-9][a-z0-9._:/-]*)?
+          | \d+(?:-\d+)*-[a-z][a-z0-9._:/-]*
+        )
       | kimi-k\d[a-z0-9._:/-]*
       | qwen\d[a-z0-9][a-z0-9._:/-]*
       | llama-\d[a-z0-9][a-z0-9._:/-]*
@@ -47,7 +51,7 @@ SKIP_PARTS = {
     "node_modules",
     "tests",
 }
-OWNED_FALLBACK_PATH = Path("omnigent/model_fallbacks.py")
+OWNED_FALLBACK_PATH = Path("omnigent/models/model_fallbacks.py")
 FALLBACK_METADATA_FIELDS = frozenset({"owner", "provenance", "discovery_gap"})
 
 

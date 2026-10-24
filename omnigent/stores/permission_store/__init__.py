@@ -1,8 +1,8 @@
 """Permission store — manages session-level access grants.
 
-Each grant carries a numeric access level plus an independent, owner-controlled
-approval capability. The ``"__public__"`` sentinel user ID represents public
-read access and can never approve privileged actions.
+Each grant is a ``(user_id, conversation_id, level)`` triple where
+level is an integer: 1=read, 2=edit, 3=manage. The ``"__public__"``
+sentinel user ID represents public link access, capped by the live server policy.
 """
 
 from abc import ABC, abstractmethod
@@ -32,8 +32,6 @@ class PermissionStore(ABC):
         user_id: str,
         conversation_id: str,
         level: int,
-        *,
-        can_approve: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant.
 
@@ -48,8 +46,6 @@ class PermissionStore(ABC):
             e.g. ``"conv_abc123"``.
         :param level: Numeric permission level (1=read, 2=edit,
             3=manage).
-        :param can_approve: Whether the session owner delegated approval
-            authority to the grantee.
         :returns: The resulting :class:`SessionPermission`.
         """
         ...
@@ -157,6 +153,20 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def get_user(self, user_id: str) -> Account | None:
+        """Read the target account and generation before an operation on another user."""
+        ...
+
+    @abstractmethod
+    def user_exists(self, user_id: str) -> bool:
+        """Check whether a user row exists, without creating it.
+
+        :param user_id: The user identifier, e.g. ``"alice"``.
+        :returns: ``True`` if a row exists for the user.
+        """
+        ...
+
+    @abstractmethod
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """Return every real user row, for the admin user list.
 
@@ -211,7 +221,7 @@ class PermissionStore(ABC):
         """Check whether *user_id* has a grant at *required_level* or above.
 
         Checks the user's direct grant and the ``__public__`` sentinel
-        grant.  Does NOT handle admin bypass or sub-agent parent
+        grant, subject to the live public ceiling. Does NOT handle admin bypass or sub-agent parent
         delegation — callers are responsible for those.
 
         :param user_id: The authenticated user, or ``None`` if unauthenticated.
