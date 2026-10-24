@@ -272,3 +272,89 @@ it("keeps a renamed top bubble's row across a history prepend", () => {
     "user:user-1",
   );
 });
+
+it("holds the row under the reader while rows above it change height", () => {
+  // Rows the mocked virtualizer reports, list-relative; mutable so a
+  // re-measure or a re-key can be played back through the virtualizer's
+  // onChange, the way a ResizeObserver batch or a mount measurement reaches it.
+  interface Row {
+    key: string;
+    start: number;
+    size: number;
+  }
+  let rows: Row[] = [
+    { key: "user:user-0", start: 0, size: 200 },
+    { key: "user:user-1", start: 216, size: 200 },
+    { key: "user:user-2", start: 432, size: 200 },
+  ];
+  const passThrough = vi.mocked(useVirtualizer).getMockImplementation()!;
+  vi.mocked(useVirtualizer).mockImplementation(
+    (options) =>
+      ({
+        ...passThrough(options),
+        getVirtualItems: () =>
+          rows.map((row, index) => ({
+            index,
+            key: row.key,
+            start: options.scrollMargin! + row.start,
+            size: row.size,
+            end: options.scrollMargin! + row.start + row.size,
+            lane: 0,
+          })),
+        getTotalSize: () => rows.at(-1)!.start + rows.at(-1)!.size,
+      }) as never,
+  );
+  try {
+    const bubbles = ["user-0", "user-1", "user-2"].map((itemId) => ({ ...bubble, itemId }));
+    const view = render(list(false, document.createElement("div"), vi.fn(), false, bubbles));
+    // The hold writes through StickToBottom, so hand it StickToBottom's own scroller.
+    const scroller = view.container.querySelector<HTMLElement>('[role="log"] > div')!;
+    Object.defineProperties(scroller, {
+      scrollTop: { configurable: true, writable: true, value: 216 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollHeight: { configurable: true, value: 1_000 },
+    });
+    scroller.getBoundingClientRect = () => ({ top: 0 }) as DOMRect;
+    // The list sits at the scroller's top, scrolled by 216: its offset is 0.
+    const wrapper = view.container.querySelector<HTMLElement>('[data-index="0"]')!.parentElement!;
+    wrapper.getBoundingClientRect = () => ({ top: -216 }) as DOMRect;
+    view.rerender(list(false, scroller, vi.fn(), false, bubbles));
+    expect(scroller.scrollTop).toBe(216);
+    const virtualizer = vi.mocked(useVirtualizer).mock.results.at(-1)!.value as {
+      shouldAdjustScrollPositionOnItemSizeChange?: () => boolean;
+    };
+    // The hold is the only in-list compensation; the library's own is off.
+    expect(virtualizer.shouldAdjustScrollPositionOnItemSizeChange?.()).toBe(false);
+    const notify = () =>
+      vi.mocked(useVirtualizer).mock.lastCall![0].onChange!(undefined as never, false);
+
+    // The row above the reader grows by 100: the reader's row keeps its place.
+    rows = [
+      { key: "user:user-0", start: 0, size: 300 },
+      { key: "user:user-1", start: 316, size: 200 },
+      { key: "user:user-2", start: 532, size: 200 },
+    ];
+    notify();
+    expect(scroller.scrollTop).toBe(316);
+
+    // It shrinks back: so does the offset.
+    rows = [
+      { key: "user:user-0", start: 0, size: 200 },
+      { key: "user:user-1", start: 216, size: 200 },
+      { key: "user:user-2", start: 432, size: 200 },
+    ];
+    notify();
+    expect(scroller.scrollTop).toBe(216);
+
+    // The reader's row remounts under a new key with the same content: nothing moved.
+    rows = [
+      { key: "user:user-0", start: 0, size: 200 },
+      { key: "assistant:renamed", start: 216, size: 200 },
+      { key: "user:user-2", start: 432, size: 200 },
+    ];
+    notify();
+    expect(scroller.scrollTop).toBe(216);
+  } finally {
+    vi.mocked(useVirtualizer).mockImplementation(passThrough);
+  }
+});
