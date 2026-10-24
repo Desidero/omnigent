@@ -32,7 +32,11 @@ import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
-import { ItemLabelIndexContext } from "@/lib/itemLabels";
+import {
+  ItemLabelIndexContext,
+  ItemLabelSessionContext,
+  type ItemLabelIndex,
+} from "@/lib/itemLabels";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
@@ -420,7 +424,7 @@ function TranscriptImpl({
   const hasPinnedBanner = display.hasTasks || hasOpenItems;
   return (
     <TaskMarkersProvider value={taskMarkers}>
-      <ItemLabelIndexContext.Provider value={itemLabelIndex}>
+      <ItemLabelScope index={itemLabelIndex} sessionId={display.conversationId ?? null}>
         {/* Task preview pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
@@ -586,8 +590,27 @@ function TranscriptImpl({
             />
           )}
         </div>
-      </ItemLabelIndexContext.Provider>
+      </ItemLabelScope>
     </TaskMarkersProvider>
+  );
+}
+
+/** Gives the transcript's item labels their index, and the session they belong to. */
+function ItemLabelScope({
+  index,
+  sessionId,
+  children,
+}: {
+  index: ItemLabelIndex;
+  sessionId: string | null;
+  children: React.ReactNode;
+}) {
+  return (
+    <ItemLabelIndexContext.Provider value={index}>
+      <ItemLabelSessionContext.Provider value={sessionId}>
+        {children}
+      </ItemLabelSessionContext.Provider>
+    </ItemLabelIndexContext.Provider>
   );
 }
 
