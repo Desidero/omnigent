@@ -19,7 +19,11 @@ function subscribe(callback: () => void): () => void {
   return () => mql.removeEventListener("change", callback);
 }
 
-function getSnapshot(): boolean {
+/**
+ * One-off read of {@link useIsMobileViewport}'s answer, for code outside React
+ * (store actions) that sizes work to the viewport. `false` without a window.
+ */
+export function isMobileViewport(): boolean {
   if (typeof window === "undefined" || !window.matchMedia) return false;
   return window.matchMedia(MOBILE_QUERY).matches;
 }
@@ -31,5 +35,5 @@ function getSnapshot(): boolean {
  * (returns `false` on the server, matching `initialSidebarOpen`).
  */
 export function useIsMobileViewport(): boolean {
-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
+  return useSyncExternalStore(subscribe, isMobileViewport, () => false);
 }
