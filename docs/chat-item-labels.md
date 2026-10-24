@@ -50,6 +50,11 @@ channel; labels still render when you or the agent write them.
   mentions first, tinted, and includes an item that reply just closed, struck
   through. Expanded, they sit under **In the latest reply**, ahead of the other
   open items.
+- **Dismiss:** each open item in the expanded bar has a dismiss button. A
+  dismissed item leaves the bar's chips and open count; **Show dismissed (N)**
+  at the bottom lists it with **Restore**. An item the agent later closes shows
+  as closed as usual. Dismissals are stored on the session, as the
+  `omnigent.items_dismissed` label, so they follow you to other devices.
 
 ## Comment on items
 
