@@ -26,6 +26,9 @@ import {
   openSessionStream,
   postEvent,
   continueFailedTurn,
+  MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE,
+  SCROLL_UP_HISTORY_PAGE_SIZE,
+  scrollUpHistoryPageSize,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -1493,6 +1496,13 @@ describe("fetchSessionItemsPage", () => {
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       `/v1/sessions/conv%20with%20space/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
     );
+  });
+
+  it("sizes scroll-up pages larger than the reconnect page, and smaller on a phone", () => {
+    expect(scrollUpHistoryPageSize(false)).toBe(SCROLL_UP_HISTORY_PAGE_SIZE);
+    expect(scrollUpHistoryPageSize(true)).toBe(MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE);
+    expect(MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE).toBeLessThan(SCROLL_UP_HISTORY_PAGE_SIZE);
+    expect(SCROLL_UP_HISTORY_PAGE_SIZE).toBeGreaterThan(SESSION_HISTORY_PAGE_SIZE);
   });
 
   it("pages backwards via an `after` cursor in descending order when olderThan is set", async () => {

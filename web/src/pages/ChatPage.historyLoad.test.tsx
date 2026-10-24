@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
+import { SEEK_ITEMS_PER_GESTURE } from "@/components/chat/chatBubbleParts";
+import { SCROLL_UP_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { TRANSCRIPT_SCROLLBAR_DRAG_EVENT } from "@/pages/TranscriptScrollbar";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -25,6 +27,7 @@ vi.mock("use-stick-to-bottom", () => ({
 }));
 
 const originalLoadMoreHistory = useChatStore.getState().loadMoreHistory;
+const originalPrefetchMoreHistory = useChatStore.getState().prefetchMoreHistory;
 
 function userBlock(id: string, text = id): UserMessageBlock {
   return {
@@ -266,12 +269,17 @@ describe("HistoryAutoLoader", () => {
       loadingMoreHistory: false,
       oldestItemId: "item_2",
       historyGeneration: 0,
+      // A seeking gesture also prefetches; keep that off the network here.
+      prefetchMoreHistory: vi.fn(),
     });
   });
 
   afterEach(() => {
     cleanup();
-    useChatStore.setState({ loadMoreHistory: originalLoadMoreHistory });
+    useChatStore.setState({
+      loadMoreHistory: originalLoadMoreHistory,
+      prefetchMoreHistory: originalPrefetchMoreHistory,
+    });
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
@@ -888,14 +896,88 @@ describe("HistoryAutoLoader", () => {
       stalled = loadMoreHistory.mock.calls.length === before;
     }
     expect(stalled).toBe(true);
-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
-    expect(loadMoreHistory.mock.calls.length).toBeGreaterThan(10);
+    // The gesture's first page is free; the item budget bounds the chained ones.
+    const chainedPages = Math.ceil(SEEK_ITEMS_PER_GESTURE / SCROLL_UP_HISTORY_PAGE_SIZE);
+    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 1);
 
     // The next flick, after a quiet gap, is a new gesture and continues from there.
     now += 1000;
     fireEvent.wheel(scrollRoot, { deltaY: -120 });
     nowSpy.mockRestore();
-    expect(loadMoreHistory.mock.calls.length).toBe(32);
+    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 2);
+  });
+
+  it("prefetches the page a finger-armed request is waiting to land", () => {
+    // The landing waits for the pane to settle (see the hold tests); the page
+    // itself need not — by the time the pane is still it is in memory.
+    let now = 1000;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    const prefetchMoreHistory = vi.fn();
+    useChatStore.setState({
+      hasMoreHistory: true,
+      oldestItemId: "item_50",
+      loadMoreHistory,
+      prefetchMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    // The open alone asks for nothing.
+    expect(prefetchMoreHistory).not.toHaveBeenCalled();
+
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.scroll(scrollRoot);
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+    // Still moving: the landing is held, but the page is already on the wire.
+    expect(prefetchMoreHistory).toHaveBeenCalled();
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    now += 200;
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // The page lands with the pane still near the top: the one after it is
+    // fetched ahead of the gesture's next page.
+    prefetchMoreHistory.mockClear();
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_40" });
+    });
+    expect(prefetchMoreHistory).toHaveBeenCalled();
+    nowSpy.mockRestore();
+  });
+
+  it("prefetches only for a gesture that asked for older history", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    const prefetchMoreHistory = vi.fn();
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory, prefetchMoreHistory });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 300, scrollHeight: 4000, clientHeight: 800 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    // The pane moving near the top on its own is not a request.
+    fireEvent.scroll(scrollRoot);
+    expect(prefetchMoreHistory).not.toHaveBeenCalled();
+
+    // A wheel-up inside the threshold asks: the page is fetched and landed.
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    expect(prefetchMoreHistory).toHaveBeenCalledTimes(1);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // Wheeling back down withdraws: later movement near the top prefetches nothing.
+    prefetchMoreHistory.mockClear();
+    fireEvent.wheel(scrollRoot, { deltaY: 120 });
+    metrics.scrollTop = 200;
+    fireEvent.scroll(scrollRoot);
+    expect(prefetchMoreHistory).not.toHaveBeenCalled();
   });
 
   it("ignores a wheel-down, which is not a request for older history", () => {
@@ -1144,8 +1226,8 @@ describe("HistoryAutoLoader", () => {
       stalled = loadMoreHistory.mock.calls.length === before;
     }
     expect(stalled).toBe(true);
-    expect(loadMoreHistory.mock.calls.length).toBeGreaterThan(10);
-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
+    const chainedPages = Math.ceil(SEEK_ITEMS_PER_GESTURE / SCROLL_UP_HISTORY_PAGE_SIZE);
+    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 1);
   });
 
   it("resumes seeking on the reader's next gesture", () => {
