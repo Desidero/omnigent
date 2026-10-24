@@ -4,6 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChunkLoadErrorBoundary } from "./ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "./RenderErrorBoundary";
 
+const { copyText } = vi.hoisted(() => ({ copyText: vi.fn(async () => {}) }));
+vi.mock("@/lib/clipboard", () => ({ copyText }));
+
 const renderError = new Error("Component render failed");
 const chunkError = new TypeError("Failed to fetch dynamically imported module: /assets/old.js");
 const reload = vi.fn();
@@ -16,7 +19,8 @@ beforeEach(() => {
   window.addEventListener("error", suppressExpectedError);
   sessionStorage.clear();
   reload.mockReset();
-  vi.stubGlobal("location", { reload });
+  copyText.mockClear();
+  vi.stubGlobal("location", { reload, pathname: "/c/abc" });
   vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
@@ -100,6 +104,30 @@ describe("RenderErrorBoundary", () => {
     expect(screen.queryByText("Panel recovered")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(screen.getByText("Panel recovered")).toBeInTheDocument();
+  });
+
+  it("shows the error, component stack and path, with copy and reload", () => {
+    function BrokenChild(): never {
+      throw renderError;
+    }
+    render(
+      <RenderErrorBoundary name="this page">
+        <BrokenChild />
+      </RenderErrorBoundary>,
+    );
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Component render failed");
+    expect(alert).toHaveTextContent("BrokenChild");
+    expect(alert).toHaveTextContent("Path: /c/abc");
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy details" }));
+    expect(copyText).toHaveBeenCalledWith(
+      expect.stringMatching(/Component render failed[\s\S]*BrokenChild[\s\S]*\/c\/abc/),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    expect(reload).toHaveBeenCalledOnce();
   });
 
   it("retries a failed child when the session changes", () => {
