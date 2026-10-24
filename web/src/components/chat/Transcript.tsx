@@ -6,7 +6,6 @@ import {
   Conversation,
   ConversationContent,
   ConversationEmptyState,
-  ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
@@ -71,6 +70,7 @@ import {
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
 } from "@/components/chat/chatBubbleParts";
+import { JumpToLatestButton } from "@/components/chat/JumpToLatestButton";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
@@ -78,7 +78,8 @@ export interface TranscriptProps {
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
-  /** Wrapper element the JumpToTopButton attaches its hover listeners to. */
+  /** Wrapper element the JumpToTopButton attaches its hover listeners to and
+   *  the JumpToLatestButton mounts into. */
   containerEl: HTMLElement | null;
   /** StickToBottom scroll container + lock controls, lifted by the bridge. */
   scroller: ConversationScroller | null;
@@ -326,6 +327,13 @@ function TranscriptImpl({
   }, [nav]);
 
   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  // A reply is landing below the reader: the live bubble streams, or the turn
+  // is busy before its first visible item.
+  const replyStreaming =
+    showWorkingIndicator ||
+    display.streamBubbles.some(
+      (bubble) => bubble.kind === "assistant" && bubble.lifecycle === "streaming",
+    );
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const itemLabelIndex = useMemo(
@@ -452,7 +460,13 @@ function TranscriptImpl({
               remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
-          <ConversationScrollButton />
+          {/* Bottom-edge pill for a reader scrolled away from the live end;
+          reads the StickToBottom context here, mounts into the wrapper. */}
+          <JumpToLatestButton
+            containerEl={containerEl}
+            bubbles={display.streamBubbles}
+            streaming={replyStreaming}
+          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
