@@ -33,7 +33,13 @@ import type {
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
-import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import {
+  getSessionSlim,
+  INITIAL_WINDOW_ITEMS,
+  MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE,
+  SCROLL_UP_HISTORY_PAGE_SIZE,
+  SESSION_HISTORY_PAGE_SIZE,
+} from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { clearUnsentSends, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
@@ -1947,7 +1953,7 @@ describe("chatStore — switchTo", () => {
 
   it("hydrates only the initial window and flags that older history remains", async () => {
     // Longer than the initial window so the loaded window is a strict subset.
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE + 5;
     const fullItems = Array.from({ length: total }, (_, idx) =>
       userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
     );
@@ -1982,7 +1988,7 @@ describe("chatStore — switchTo", () => {
   it.each([false, true])(
     "loadMoreHistory prepends the correct page (scoped pane: %s)",
     async (scoped) => {
-      const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
+      const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE + 5;
       const fullItems = Array.from({ length: total }, (_, idx) =>
         userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
       );
@@ -2001,14 +2007,14 @@ describe("chatStore — switchTo", () => {
       // Window + one older page. A wrong older-page cursor — e.g. the pre-fix
       // bug that fetched the convo head — would yield the wrong count or
       // duplicate blocks.
-      expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE);
+      expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE);
       // The older page sits before the original, oldest item first. Its first
       // block is index `total - WINDOW - PAGE` (= 5): proves the prepend order
       // and the descending+after cursor math are correct.
       expect(state.blocks[0]).toMatchObject({
         type: "user_message",
         ctx: {
-          itemId: `msg_resp_${(total - INITIAL_WINDOW_ITEMS - SESSION_HISTORY_PAGE_SIZE)
+          itemId: `msg_resp_${(total - INITIAL_WINDOW_ITEMS - SCROLL_UP_HISTORY_PAGE_SIZE)
             .toString()
             .padStart(4, "0")}_user`,
         },
@@ -2024,7 +2030,7 @@ describe("chatStore — switchTo", () => {
     // relative to a window that no longer existed. The conversation now keeps its
     // window across navigation, so the page is still valid when it lands and must
     // be applied rather than discarded.
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
     const itemsA = Array.from({ length: total }, (_, idx) =>
       userMessage(`a_${idx.toString().padStart(4, "0")}`, `a ${idx}`),
     );
@@ -2056,7 +2062,7 @@ describe("chatStore — switchTo", () => {
     const state = useChatStore.getState();
     // Prepended onto the window it was fetched against, which is still current.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...itemsA.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
     expect(state.oldestItemId).toBe(itemsA[0]!.id);
@@ -2065,7 +2071,7 @@ describe("chatStore — switchTo", () => {
   });
 
   it("loadMoreHistory dedupes a page overlapping blocks kept across a rebind", async () => {
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE * 2;
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE * 2;
     const items = Array.from({ length: total }, (_, idx) =>
       userMessage(`r_${idx.toString().padStart(4, "0")}`, `r ${idx}`),
     );
@@ -2074,7 +2080,7 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_re");
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks).toHaveLength(
-      INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE,
+      INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE,
     );
 
     // The stream died (idle disconnect): the send-triggered rebind
@@ -2088,7 +2094,7 @@ describe("chatStore — switchTo", () => {
     // kept across the rebind — without itemId dedupe each would render twice.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      items.slice(SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      items.slice(SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     // The cursor advanced through the overlap, so the oldest page loads next.
@@ -2099,7 +2105,7 @@ describe("chatStore — switchTo", () => {
   });
 
   it("clears loadingMoreHistory when a rebind hydration voids the in-flight page", async () => {
-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
     const items = Array.from({ length: total }, (_, idx) =>
       userMessage(`lh_${idx.toString().padStart(4, "0")}`, `lh ${idx}`),
     );
@@ -2138,9 +2144,148 @@ describe("chatStore — switchTo", () => {
     // Scroll-up still works: the older page actually fetches and prepends.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...items.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
+  });
+
+  it("lands a prefetched page from memory and never fetches the same cursor twice", async () => {
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE + 5;
+    const items = Array.from({ length: total }, (_, idx) =>
+      userMessage(`pf_${idx.toString().padStart(4, "0")}`, `pf ${idx}`),
+    );
+    seedSession("conv_pf", items);
+    await useChatStore.getState().switchTo("conv_pf");
+    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    const olderPageRequests = () =>
+      fetchMock.mock.calls.filter(([u]) =>
+        /\/v1\/sessions\/conv_pf\/items\?.*after=/.test(String(u)),
+      );
+
+    // The loader asks on every re-evaluation; one page per cursor goes on the wire.
+    useChatStore.getState().prefetchMoreHistory();
+    useChatStore.getState().prefetchMoreHistory();
+    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(1));
+    // A prefetch is not a prepend: nothing lands and no loading row shows.
+    expect(useChatStore.getState().blocks).toHaveLength(INITIAL_WINDOW_ITEMS);
+    expect(useChatStore.getState().loadingMoreHistory).toBe(false);
+
+    await useChatStore.getState().loadMoreHistory();
+    expect(olderPageRequests()).toHaveLength(1);
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+      ...items.slice(5, 5 + SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...windowIds,
+    ]);
+    expect(useChatStore.getState().hasMoreHistory).toBe(true);
+
+    // The cursor moved on, so the next prefetch is a new page.
+    useChatStore.getState().prefetchMoreHistory();
+    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(2));
+  });
+
+  it("refetches an older page whose prefetch failed when the reader asks for it", async () => {
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
+    const items = Array.from({ length: total }, (_, idx) =>
+      userMessage(`pff_${idx.toString().padStart(4, "0")}`, `pff ${idx}`),
+    );
+    seedSession("conv_pff", items);
+    await useChatStore.getState().switchTo("conv_pff");
+    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+
+    let failed = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_pff\/items\?.*after=/.test(url) && !failed) {
+        failed = true;
+        return Promise.reject(new TypeError("network down"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.getState().prefetchMoreHistory();
+    await vi.waitFor(() => expect(failed).toBe(true));
+    // The rejection settles within the task it arrives in; let that task end.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    // A failed prefetch is silent: scroll-up stays armed rather than disabled.
+    expect(useChatStore.getState().hasMoreHistory).toBe(true);
+
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+      ...items.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...windowIds,
+    ]);
+    expect(useChatStore.getState().hasMoreHistory).toBe(false);
+  });
+
+  it("does not prefetch while a page is in flight or once history is exhausted", async () => {
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
+    const items = Array.from({ length: total }, (_, idx) =>
+      userMessage(`pfx_${idx.toString().padStart(4, "0")}`, `pfx ${idx}`),
+    );
+    seedSession("conv_pfx", items);
+    await useChatStore.getState().switchTo("conv_pfx");
+    const olderPageRequests = () =>
+      fetchMock.mock.calls.filter(([u]) =>
+        /\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(String(u)),
+      );
+
+    let releasePage: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(url) && releasePage === null) {
+        return new Promise<Response>((resolve) => {
+          releasePage = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const page = useChatStore.getState().loadMoreHistory();
+    await vi.waitFor(() => expect(releasePage).not.toBeNull());
+    // The page in flight is the one a prefetch would fetch.
+    useChatStore.getState().prefetchMoreHistory();
+    await Promise.resolve();
+    expect(olderPageRequests()).toHaveLength(1);
+
+    releasePage!();
+    await page;
+    expect(useChatStore.getState().hasMoreHistory).toBe(false);
+    useChatStore.getState().prefetchMoreHistory();
+    await Promise.resolve();
+    expect(olderPageRequests()).toHaveLength(1);
+  });
+
+  it("sizes a scroll-up page to the viewport", async () => {
+    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE * 2;
+    const items = Array.from({ length: total }, (_, idx) =>
+      userMessage(`pfm_${idx.toString().padStart(4, "0")}`, `pfm ${idx}`),
+    );
+    seedSession("conv_pfm", items);
+    await useChatStore.getState().switchTo("conv_pfm");
+    const lastOlderPageUrl = () =>
+      String(
+        fetchMock.mock.calls
+          .filter(([u]) => /\/v1\/sessions\/conv_pfm\/items\?.*after=/.test(String(u)))
+          .at(-1)![0],
+      );
+
+    await useChatStore.getState().loadMoreHistory();
+    expect(lastOlderPageUrl()).toContain(`limit=${SCROLL_UP_HISTORY_PAGE_SIZE}&`);
+
+    // A mobile-width viewport pages in smaller steps.
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(max-width: 767.98px)",
+      addEventListener() {},
+      removeEventListener() {},
+    }));
+    try {
+      await useChatStore.getState().loadMoreHistory();
+      expect(lastOlderPageUrl()).toContain(`limit=${MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE}&`);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("keeps each conversation's own effort across a warm A→B→A switch", async () => {
@@ -2320,7 +2465,7 @@ describe("chatStore — switchTo", () => {
     // future scroll-up: dead history until a page refresh.
     // One full window plus one page, so there is genuinely more to scroll to.
     const items: ConversationItem[] = Array.from(
-      { length: INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE },
+      { length: INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE },
       (_, idx) => userMessage(`bh_${idx.toString().padStart(4, "0")}`, `bh ${idx}`),
     );
     seedSession("conv_scroll", items);
@@ -2352,7 +2497,7 @@ describe("chatStore — switchTo", () => {
     expect(scrolled.loadingMoreHistory).toBe(false);
     // ...and the page landed on the conversation it belongs to, in order.
     expect(scrolled.blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...items.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
     // The visible conversation gained nothing.
@@ -14853,7 +14998,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // Scroll-up still pages from the window's top, one page at a time.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
+      [...preGap.slice(-SCROLL_UP_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
     );
 
     const last = sinks[1]!;

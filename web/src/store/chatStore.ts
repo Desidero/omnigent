@@ -80,6 +80,7 @@ import {
   openSessionStream,
   postEvent,
   type ProviderSwitchApplied,
+  scrollUpHistoryPageSize,
   type SessionItemsPage,
   switchSessionProvider,
   updateSession,
@@ -106,6 +107,7 @@ import {
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { isMobileViewport } from "@/hooks/useIsMobileViewport";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -1390,6 +1392,13 @@ export interface ChatActions {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: (sessionId?: string) => Promise<void>;
+  /**
+   * Start fetching the next older page without prepending it, so the
+   * `loadMoreHistory` that follows lands it from memory. One page per
+   * conversation, keyed by the cursor it was fetched for; a repeat call for
+   * the same cursor, or while a page is in flight, is a no-op.
+   */
+  prefetchMoreHistory: (sessionId?: string) => void;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -1443,6 +1452,21 @@ let queryClient: QueryClient | null = null;
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+
+// The older page `prefetchMoreHistory` has in flight or ready per conversation,
+// consumed by the `loadMoreHistory` that asks for the same cursor.
+const prefetchedHistoryPages = new Map<
+  string,
+  { cursor: string; page: Promise<SessionItemsPage> }
+>();
+conversationRegistry.subscribeDisposed((id) => prefetchedHistoryPages.delete(id));
+
+function fetchOlderHistoryPage(conversationId: string, cursor: string): Promise<SessionItemsPage> {
+  return fetchSessionItemsPage(conversationId, {
+    olderThan: cursor,
+    limit: scrollUpHistoryPageSize(isMobileViewport()),
+  });
+}
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
@@ -3725,9 +3749,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       (setterForState(conversationId)?.historyGeneration ?? historyGeneration) !==
         historyGeneration;
     try {
-      const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
-        olderThan: oldestItemId,
-      });
+      const prefetched = prefetchedHistoryPages.get(conversationId);
+      prefetchedHistoryPages.delete(conversationId);
+      const { items, hasMore } = await (prefetched?.cursor === oldestItemId
+        ? prefetched.page
+        : fetchOlderHistoryPage(conversationId, oldestItemId));
       if (stale()) return;
       const newBlocks = itemsToBlocks(items);
       pageSet((state) => {
@@ -3755,6 +3781,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // would otherwise re-trigger the scroll listener on every scroll event.
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
     }
+  },
+
+  prefetchMoreHistory: (sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
+    const conversation = sessionId ? conversationRegistry.peek(sessionId)?.getState() : get();
+    if (!conversation || !conversationId) return;
+    const { oldestItemId, loadingMoreHistory, hasMoreHistory } = conversation;
+    if (!oldestItemId || loadingMoreHistory || !hasMoreHistory) return;
+    if (prefetchedHistoryPages.get(conversationId)?.cursor === oldestItemId) return;
+    const entry = {
+      cursor: oldestItemId,
+      page: fetchOlderHistoryPage(conversationId, oldestItemId),
+    };
+    prefetchedHistoryPages.set(conversationId, entry);
+    // A failed prefetch is forgotten: the reader's own request refetches and
+    // reports the failure the usual way.
+    entry.page.catch(() => {
+      if (prefetchedHistoryPages.get(conversationId) === entry) {
+        prefetchedHistoryPages.delete(conversationId);
+      }
+    });
   },
 }));
 
