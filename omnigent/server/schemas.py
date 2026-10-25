@@ -4378,6 +4378,13 @@ class ElicitationRequestEvent(_SSEEventBase):
     params: ElicitationRequestParams
 
 
+class UiOpenFileEvent(_SSEEventBase):
+    """Ask current session viewers to open a workspace-relative file; never replayed."""
+
+    type: Literal["ui.open_file"]
+    path: str
+
+
 class BrowserActionRequestEvent(_SSEEventBase):
     """
     Request that the desktop renderer perform one browser action.
@@ -5003,6 +5010,7 @@ ServerStreamEvent = Annotated[
     | ElicitationResolvedEvent
     # ── Transient (SSE-only) — embedded-browser action request ─
     | BrowserActionRequestEvent
+    | UiOpenFileEvent
     # ── Transient (SSE-only) — native policy DENY signal ───────
     | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────
