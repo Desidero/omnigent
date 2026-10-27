@@ -767,8 +767,8 @@ export async function createBundledSession(
     host_type?: string;
     workspace?: string;
     project_id?: string;
-    labels?: Record<string, string>;
-    apply_project_labels?: boolean;
+    /** Initial labels; a `null` value leaves that project default off the session. */
+    labels?: Record<string, string | null>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
     mcp_registry_services?: string[];

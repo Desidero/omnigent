@@ -210,7 +210,7 @@ choose Rename project. Start typing as soon as the dialog opens.
 **Labels:** open a session and hover or click the header's info icon (on
 mobile, the header menu's Agent info). The Labels section offers Add label and,
 per label, edit and remove. A view-only collaborator sees the labels without
-controls. For defaults, open a project folder's three-dot menu → Project
+controls, and no section at all when there are none. For defaults, open a project folder's three-dot menu → Project
 settings → Default labels, save, then start a session in that project. Closing
 the dialog with unsaved label changes warns once before discarding them. Before
 a session exists, the new-session composer's "+" menu → Labels opens the same

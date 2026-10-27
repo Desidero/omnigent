@@ -11,7 +11,7 @@ export const LABEL_VALUE_MAX_LENGTH = 256;
 /** Namespaces Omnigent writes for its own bookkeeping (pins, wrappers, cost). */
 const INTERNAL_LABEL_PREFIXES = ["omnigent.", "cost_control."] as const;
 
-/** Whether a label key is framework-owned rather than a user label. */
+/** Whether a label key is framework-owned rather than a user label; mirrors the server's `is_internal_label_key`. */
 export function isInternalLabelKey(key: string): boolean {
   return (
     key === PROJECT_LABEL_KEY || INTERNAL_LABEL_PREFIXES.some((prefix) => key.startsWith(prefix))
@@ -68,21 +68,19 @@ export function projectDefaultLabels(config: { labels?: unknown } | null | undef
 
 /**
  * A new session's labels: the project's defaults with this session's edits on
- * top, where a `null` edit leaves that default off this session.
- * `applyProjectLabels` is false once a default was removed, so the server
- * takes `labels` as the final set instead of adding the defaults back.
+ * top, where a `null` edit leaves that default off this session. `labels` is
+ * what the session will start with; `requestLabels` keeps the `null`s so the
+ * create request tells the server which defaults to leave off.
  */
 export function newSessionLabels(
   projectDefaults: Record<string, string>,
   edits: Record<string, string | null>,
-): { labels: Record<string, string>; applyProjectLabels: boolean } {
+): { labels: Record<string, string>; requestLabels: Record<string, string | null> } {
+  const requestLabels = { ...projectDefaults, ...edits };
   const labels = Object.fromEntries(
-    Object.entries({ ...projectDefaults, ...edits }).filter(
-      (entry): entry is [string, string] => entry[1] !== null,
-    ),
+    Object.entries(requestLabels).filter((entry): entry is [string, string] => entry[1] !== null),
   );
-  const removedDefault = Object.keys(projectDefaults).some((key) => edits[key] === null);
-  return { labels, applyProjectLabels: !removedDefault };
+  return { labels, requestLabels };
 }
 
 /** Whether two label maps hold the same entries. */

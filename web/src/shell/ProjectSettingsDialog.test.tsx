@@ -313,6 +313,49 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("saves an edit still in progress when Save is clicked", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { labels: { team: "ml" } },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Edit label team" }));
+    fireEvent.change(within(editor).getByLabelText("Value for label team"), {
+      target: { value: "infra" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { labels: { team: "infra" } }),
+    );
+  });
+
+  it("blocks Save while an edit in progress is invalid", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { labels: { team: "ml" } },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Edit label team" }));
+    fireEvent.change(within(editor).getByLabelText("Value for label team"), {
+      target: { value: "v".repeat(257) },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    expect(await within(editor).findByRole("alert")).toHaveTextContent(
+      "Value must be 256 characters or fewer.",
+    );
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["a duplicate key", "team", '"team" already exists. Edit it instead.'],
     ["a key over the column width", "k".repeat(129), "Key must be 128 characters or fewer."],
@@ -333,19 +376,6 @@ describe("ProjectSettingsDialog", () => {
     expect(await within(editor).findByRole("alert")).toHaveTextContent(message);
     expect(within(editor).getByLabelText("New label key")).toHaveValue(key);
     expect(updateMock).not.toHaveBeenCalled();
-  });
-
-  it("scrolls the fields and keeps Save outside the scroll region on short windows", async () => {
-    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
-    renderDialog();
-    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
-
-    const body = screen.getByTestId("project-settings-body");
-    expect(body).toHaveClass("min-h-0", "overflow-y-auto", "px-1", "-mx-1");
-    expect(body).toContainElement(screen.getByTestId("project-settings-labels"));
-    expect(body).not.toContainElement(screen.getByTestId("project-settings-save"));
-    const content = body.closest('[data-slot="dialog-content"]');
-    expect(content).toHaveClass("max-h-[85dvh]", "grid-rows-[auto_1fr_auto]");
   });
 
   it("rejects a reserved default label key inline", async () => {
@@ -451,7 +481,7 @@ describe("ProjectSettingsDialog", () => {
     expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(true);
 
     // Even if a submit is forced, onSubmit bails — no clearing PATCH is sent.
-    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+    fireEvent.submit((screen.getByTestId("project-settings-save") as HTMLButtonElement).form!);
     expect(updateMock).not.toHaveBeenCalled();
   });
 

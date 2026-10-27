@@ -2159,6 +2159,9 @@ interface LandingDraft {
   // neither turns an untouched seed into an "explicit" value nor the reverse.
   agentFromConfig: boolean;
   workspaceFromConfig: boolean;
+  // The new session's label edits: a value sets a label, `null` leaves a
+  // project default off.
+  labelEdits: Record<string, string | null>;
 }
 
 let landingDraft: LandingDraft | null = null;
@@ -2352,6 +2355,11 @@ export function NewChatLandingScreen() {
           // the other visit's workspace — drop the marker with it so the
           // seed/retract machinery starts clean for this visit.
           autoSeededBranch: "",
+          // Added labels come along; a removed default belonged to the other
+          // project.
+          labelEdits: Object.fromEntries(
+            Object.entries(landingDraft.labelEdits).filter(([, value]) => value !== null),
+          ),
         };
 
   const [message, setMessage] = useState<string>(() =>
@@ -2636,7 +2644,11 @@ export function NewChatLandingScreen() {
     () => projectDefaultLabels(storedProjectConfig),
     [storedProjectConfig],
   );
-  const sessionLabels = useNewSessionLabels(projectLabelDefaults, selectedProject);
+  const sessionLabels = useNewSessionLabels(
+    projectLabelDefaults,
+    selectedProject,
+    restoredDraft?.labelEdits,
+  );
   const [labelsDialogOpen, setLabelsDialogOpen] = useState(false);
   // The landing screen stays mounted while the `?project=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
@@ -2779,6 +2791,7 @@ export function NewChatLandingScreen() {
     costControlMode,
     agentFromConfig: agentFromConfigRef.current,
     workspaceFromConfig: workspaceFromConfigRef.current,
+    labelEdits: sessionLabels.edits,
   };
   useEffect(() => {
     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
@@ -5797,9 +5810,8 @@ export function NewChatLandingScreen() {
         // Custom agents upload their bundle with the session, then launch on the host below.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = {
-          labels: { ...sessionLabels.labels, ...createLabels },
+          labels: { ...sessionLabels.requestLabels, ...createLabels },
         };
-        if (!sessionLabels.applyProjectLabels) metadata.apply_project_labels = false;
         if (mcpServicesForLaunch.length) {
           metadata.mcp_registry_services = mcpServicesForLaunch;
         }
@@ -5932,13 +5944,13 @@ export function NewChatLandingScreen() {
           // placeholder, so the placeholder's wrapper labels, launch args and
           // model would all describe a CLI the router may not pick. The
           // server stamps the routed wrapper's labels once it has rebound.
+          // A removed project default rides along as null so the server
+          // leaves it off this session.
           labels: {
-            ...sessionLabels.labels,
+            ...sessionLabels.requestLabels,
             ...(smartRoutingHarnessSelected ? {} : createLabels),
             [CLIENT_CREATE_TOKEN_LABEL]: createToken,
           },
-          // The labels above already leave out a project default removed here.
-          ...(sessionLabels.applyProjectLabels ? {} : { apply_project_labels: false }),
           // Permission / approval / cursor mode → CLI flag pair, persisted as
           // terminal_launch_args. Omitted for the default and non-native agents.
           terminal_launch_args: smartRoutingHarnessSelected

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { newSessionLabels } from "@/lib/sessionLabels";
 import { overlayLabelsIntoCaches } from "@/lib/sessionListCache";
@@ -27,11 +27,21 @@ export function useUpdateSessionLabels(sessionId: string | null | undefined) {
  * session's edits. Removing a default only leaves it off this session.
  *
  * @param projectDefaults - The selected project's default labels, `{}` without one.
- * @param projectName - The selected project; switching it forgets removed defaults.
+ * @param projectName - The selected project; switching it forgets the removed
+ *   defaults (they belonged to the old project) but keeps added labels.
+ * @param initialEdits - Edits to start from, e.g. restored from a composer
+ *   draft: a value sets a label, `null` leaves a project default off.
  */
-export function useNewSessionLabels(projectDefaults: Record<string, string>, projectName: string) {
-  const [edits, setEdits] = useState<Record<string, string | null>>({});
+export function useNewSessionLabels(
+  projectDefaults: Record<string, string>,
+  projectName: string,
+  initialEdits: Record<string, string | null> = {},
+) {
+  const [edits, setEdits] = useState<Record<string, string | null>>(() => initialEdits);
+  const editedProject = useRef(projectName);
   useEffect(() => {
+    if (editedProject.current === projectName) return;
+    editedProject.current = projectName;
     setEdits((prev) => Object.fromEntries(Object.entries(prev).filter(([, v]) => v !== null)));
   }, [projectName]);
   const resolved = useMemo(
@@ -40,6 +50,8 @@ export function useNewSessionLabels(projectDefaults: Record<string, string>, pro
   );
   return {
     ...resolved,
+    /** The raw edits, for a draft to restore later. */
+    edits,
     setLabel: (key: string, value: string) => setEdits((prev) => ({ ...prev, [key]: value })),
     removeLabel: (key: string) =>
       setEdits((prev) => {
