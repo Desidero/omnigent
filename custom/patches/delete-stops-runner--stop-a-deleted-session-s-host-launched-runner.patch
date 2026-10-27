@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 22 Oct 2026 22:27:30 +0000
+Subject: [PATCH] fix(server): stop a deleted session's host-launched runner
+
+DELETE /v1/sessions/{id} tears down the session inside its runner but
+never asks the host to stop the runner process, unlike Stop and Archive.
+A host-launched runner therefore stayed online, holding its native pane
+and harness process, until runner.idle_timeout_s reaped it.
+
+After the rows are deleted, stop each host runner the session tree was
+bound to once no remaining session uses it. A sub-agent rides its
+parent's runner, so deleting only the sub-agent leaves that runner up;
+deleting the parent cascades to the tree and releases it, including a
+runner a sub-agent moved to after a relaunch.
+
+Not upstream yet: proposed from fix/delete-stops-runner; drop this copy once it merges.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/sessions.md                       |  5 +
+ .../server/routes/_sessions/orchestration.py  | 72 +++++++++++++++
+ .../server/routes/sessions/routes_events.py   | 13 +++
+ .../integration/test_session_host_launch.py   | 91 +++++++++++++++++++
+ 4 files changed, 181 insertions(+)
+
+diff --git a/feature-map/sessions.md b/feature-map/sessions.md
+index a4cbbf08c0cda9813df81a31316214a0bc733e8c..881eb44e9e55cf23402e5b6dd306bc34c3004dd6 100644
+--- a/feature-map/sessions.md
++++ b/feature-map/sessions.md
+@@ -463,6 +463,11 @@ plain `uv run pytest`, which starts a private server for the test.
+ - **`delete`:**
+   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
+   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
++- **`delete`, host-launched runner:**
++  `tests/server/integration/test_session_host_launch.py::test_delete_session_stops_host_runner_once_no_session_uses_it`
++  (plain `uv run pytest`): deleting a sub-agent keeps the runner it shares with
++  its parent; deleting the parent stops the runners the tree used. Manually:
++  delete a host session and expect its runner process to exit within seconds.
+ - **`export`, header menu (own environment):**
+   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
+   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 7123d1ff7afa5bfa1651fa706466247821a5ebef..88f055f039d7832a2b13fcb793cb90904e6f4b9b 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -794,6 +794,76 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
+             handle.task.cancel()
+ 
+ 
++async def _host_runner_bindings(
++    conversation_store: ConversationStore,
++    conv: Any,
++    descendant_ids: list[str],
++) -> set[tuple[str, str]]:
++    """Return the ``(host_id, runner_id)`` pairs a session tree is bound to.
++
++    Read before a delete removes the rows, so the runners can be stopped after.
++    """
++    rows = [conv]
++    if descendant_ids:
++        try:
++            descendants = await asyncio.to_thread(
++                conversation_store.get_conversations, descendant_ids
++            )
++            rows.extend(descendants.values())
++        except Exception:  # noqa: BLE001
++            _logger.warning(
++                "Cannot read the runner bindings of %s's sub-agents",
++                conv.id,
++                exc_info=True,
++                extra={"session_id": conv.id},
++            )
++    return {(row.host_id, row.runner_id) for row in rows if row.host_id and row.runner_id}
++
++
++async def _stop_released_host_runners(
++    session_id: str,
++    bindings: set[tuple[str, str]],
++    conversation_store: ConversationStore,
++    host_registry: Any,
++) -> None:
++    """Stop the host-launched runners a delete left with no bound session.
++
++    A sub-agent rides its parent's runner, so deleting only the sub-agent
++    keeps that runner; deleting the parent's whole tree releases it.
++    """
++    from omnigent.server.routes import sessions as _facade
++
++    for host_id, runner_id in sorted(bindings):
++        try:
++            still_bound = await asyncio.to_thread(
++                conversation_store.list_runner_session_statuses, runner_id, limit=1
++            )
++        except Exception:  # noqa: BLE001
++            _logger.warning(
++                "Cannot check whether runner %s still serves a session; leaving it running",
++                runner_id,
++                exc_info=True,
++                extra={"session_id": session_id},
++            )
++            continue
++        if still_bound:
++            continue
++        try:
++            # The runner may already have exited (idle timeout), so an
++            # unknown-runner reply is expected rather than a warning.
++            await _facade._stop_session_host_runner(
++                session_id, host_id, runner_id, host_registry, expect_already_stopped=True
++            )
++        except Exception:  # noqa: BLE001
++            _logger.warning(
++                "Stopping runner %s after deleting %s failed",
++                runner_id,
++                session_id,
++                exc_info=True,
++                extra={"session_id": session_id},
++            )
++
++
+ # Strong references to detached archive stops so the tasks can't be
+ # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
+ # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+@@ -13651,6 +13721,7 @@ __all__ = [
+     "_handle_mcp_tools_call",
+     "_heal_subagent_runner_binding_via_parent",
+     "_hold_native_ask_gate",
++    "_host_runner_bindings",
+     "_is_native_terminal_session",
+     "_kick_managed_relaunch",
+     "_kick_managed_wake",
+@@ -13686,6 +13757,7 @@ __all__ = [
+     "_spawn_native_approval_popup_forward",
+     "_spawn_native_blocked_notice_forward",
+     "_stop_host_runner_intentionally",
++    "_stop_released_host_runners",
+     "_wait_for_host_bound_runner_client",
+     "_wait_for_host_reconnect",
+     "_wake_parent_for_blocked_child",
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index ee8f4f0aec5de69b458caaccf16f9e015f4ca53c..34acc46abdf6016ff5b1332c2202fffb1dc24d5f 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -250,6 +250,7 @@ from omnigent.server.routes._sessions.orchestration import (
+     _evaluate_input_policy,
+     _evaluate_tool_call_policy,
+     _heal_subagent_runner_binding_via_parent,
++    _host_runner_bindings,
+     _is_native_terminal_session,
+     _mark_dispatch_in_flight,
+     _maybe_relaunch_managed_sandbox,
+@@ -268,6 +269,7 @@ from omnigent.server.routes._sessions.orchestration import (
+     _runner_live_on_another_replica_from_conversations,
+     _side_chat_source_id,
+     _stop_host_runner_intentionally,
++    _stop_released_host_runners,
+     _wait_for_host_bound_runner_client,
+     _wait_for_host_reconnect,
+     ensure_runner_connected,
+@@ -3646,6 +3648,9 @@ def register_events_routes(
+             raise _session_not_found()
+         # Capture relay IDs before subtree deletion removes parent links.
+         descendant_ids = await _best_effort_stop(session_id, conversation_store, runner_router)
++        host_runner_bindings = await _host_runner_bindings(
++            conversation_store, conv, descendant_ids
++        )
+         # Runner-side resource cleanup is best-effort: if the bound
+         # runner is offline or unbound, the session must still be
+         # deletable. Server-owned records (files and conversation row
+@@ -3741,6 +3746,14 @@ def register_events_routes(
+         # A relay still inside an offline runner's reconnect grace must not
+         # fail the deleted turns when that grace expires.
+         _cancel_runner_relays([session_id, *descendant_ids])
++        # The runner-side delete frees the session's resources but not the
++        # host-launched runner process, which would linger until idle timeout.
++        await _stop_released_host_runners(
++            session_id,
++            host_runner_bindings,
++            conversation_store,
++            getattr(request.app.state, "host_registry", None),
++        )
+         # The session is gone, so is its launch-progress state. Failed
+         # launches are retained in the cache for reload visibility while
+         # the session exists; without this eviction every deleted
+diff --git a/tests/server/integration/test_session_host_launch.py b/tests/server/integration/test_session_host_launch.py
+index 59280e0b4385cea58f7d5bf5190d109d2e95fc94..bca131818da89f6dc747a7210e4b3bb6ee46a1e0 100644
+--- a/tests/server/integration/test_session_host_launch.py
++++ b/tests/server/integration/test_session_host_launch.py
+@@ -1661,6 +1661,97 @@ async def test_stop_session_stops_host_launched_runner(
+     )
+ 
+ 
++async def _serve_one_stat(comm: ApplicationCommunicator) -> None:
++    """Answer the workspace ``host.stat`` a host-bound create sends."""
++    deadline = Deadline(20.0)
++    for _ in range(40):
++        output = await comm.receive_output(timeout=deadline.next_wait(10.0))
++        if output["type"] != "websocket.send":
++            continue
++        frame = decode_host_frame(output["text"])
++        if isinstance(frame, HostStatFrame):
++            reply = HostStatResultFrame(
++                request_id=frame.request_id,
++                status="ok",
++                exists=True,
++                type="directory",
++                canonical_path=frame.path,
++            )
++            await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(reply)})
++            return
++    raise AssertionError("host never received a stat frame")
++
++
++def _drain_stop_runner_ids(comm: ApplicationCommunicator) -> list[str]:
++    """Return the runner ids of stop frames already sent to the host, without waiting.
++
++    A ``receive_output`` timeout would cancel the mock host tunnel, so this only
++    reads frames that are already queued.
++    """
++    stopped: list[str] = []
++    while not comm.output_queue.empty():
++        output = comm.output_queue.get_nowait()
++        if output["type"] != "websocket.send":
++            continue
++        with contextlib.suppress(ValueError):
++            frame = decode_host_frame(output["text"])
++            if isinstance(frame, HostStopRunnerFrame):
++                stopped.append(frame.runner_id)
++    return stopped
++
++
++async def test_delete_session_stops_host_runner_once_no_session_uses_it(
++    client: httpx.AsyncClient,
++    app: FastAPI,
++    db_uri: str,
++) -> None:
++    """Deleting a session tree stops the host-launched runners it was using.
++
++    Sub-agents ride their parent's runner, so deleting one of them must leave
++    the runner up for the parent and siblings. Deleting the parent removes the
++    whole tree, after which nothing uses its runner, or the runner a sub-agent
++    moved to, and the host must stop both; otherwise they linger until their
++    idle timeout.
++    """
++    comm = await _connect_host(app)
++    parent = await _inline_launch_session(client, comm)
++    agent_id = (await client.get(f"/v1/sessions/{parent['id']}")).json()["agent_id"]
++    children = []
++    for title in ("child A", "child B", "child C"):
++        # A sub-agent keeps its parent's host and workspace and inherits its runner.
++        stat_responder = asyncio.create_task(_serve_one_stat(comm))
++        create_resp = await client.post(
++            "/v1/sessions",
++            json={
++                "agent_id": agent_id,
++                "host_id": _HOST_ID,
++                "parent_session_id": parent["id"],
++                "workspace": _WORKSPACE,
++                "title": title,
++            },
++        )
++        await stat_responder
++        assert create_resp.status_code == 201, create_resp.text
++        children.append(create_resp.json())
++    assert [child["runner_id"] for child in children] == [parent["runner_id"]] * 3
++    # Child C relaunched onto a runner of its own.
++    SqlAlchemyConversationStore(db_uri).replace_runner_id(children[2]["id"], "runner_child_own")
++
++    child_delete = await client.delete(f"/v1/sessions/{children[0]['id']}")
++    assert child_delete.status_code == 200, child_delete.text
++    assert _drain_stop_runner_ids(comm) == []
++
++    async def _serve_two_stops() -> set[str]:
++        return {await _serve_one_stop(comm), await _serve_one_stop(comm)}
++
++    stop_responder = asyncio.create_task(_serve_two_stops())
++    parent_delete = await client.delete(f"/v1/sessions/{parent['id']}")
++    assert parent_delete.status_code == 200, parent_delete.text
++    assert await stop_responder == {parent["runner_id"], "runner_child_own"}
++    for child in children[1:]:
++        assert (await client.get(f"/v1/sessions/{child['id']}")).status_code == 404
++
++
+ @pytest.mark.parametrize("runner_status", ["alive", "dead", "unknown", "offline", None])
+ async def test_stop_session_requires_confirmed_host_runner_exit(
+     client: httpx.AsyncClient,

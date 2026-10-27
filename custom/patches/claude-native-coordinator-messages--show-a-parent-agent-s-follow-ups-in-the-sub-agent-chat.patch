@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Mon, 19 Oct 2026 20:04:41 +0000
+Subject: [PATCH] fix(claude-native): show a parent agent's follow-ups in the
+ sub-agent chat
+
+When a Claude parent messages a running sub-agent (SendMessage to a
+background agent or teammate), Claude records the message in the child's
+transcript as hidden context: isMeta with origin {"kind": "coordinator"}
+and the text "The coordinator sent a message while you were working: ...".
+The bridge dropped every hidden record that was not a completion, so the
+child's chat in the web UI showed the child replying to a prompt nobody
+could see.
+
+Keep coordinator-origin records as hidden (is_meta) messages and render
+them in the child's chat as a muted "Message from parent agent" system
+marker, the same treatment a background-task wake already gets. Messages
+in the parent chat stay hidden, and a human typing the same text still
+gets an ordinary bubble.
+
+Not upstream yet: proposed from fix/claude-native-coordinator-messages; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (fix: a parent's follow-ups show in the sub-agent chat; no setting)
+---
+ omnigent/harnesses/claude_native/bridge.py    |   9 +-
+ .../test_claude_native_bridge.py              |  25 +++++
+ web/src/lib/itemsToBlocks.test.ts             |  26 +++++
+ web/src/lib/itemsToBlocks.ts                  |   9 +-
+ web/src/lib/systemMessage.ts                  |  26 +++++
+ web/src/store/chatStore.test.ts               | 104 +++++++++---------
+ web/src/store/chatStore.ts                    |   3 +-
+ 7 files changed, 149 insertions(+), 53 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 599d6172ede0049a8b10142f5b093a1e722b36ca..3223f9a610e9e290cb4d8ad37d0b6f1cb435de36 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -9246,6 +9246,11 @@ def _peer_message_shape(text: str) -> Literal["bare", "framed"] | None:
+     return None
+ 
+ 
++def _is_coordinator_origin(origin: object) -> bool:
++    """Whether Claude marked a sub-agent's input as a message from its parent agent."""
++    return isinstance(origin, dict) and origin.get("kind") == "coordinator"
++
++
+ def _subagent_handback_id(origin: object) -> str | None:
+     """Read Claude's explicit returned-result provenance, excluding teammate chatter."""
+     if (
+@@ -9442,10 +9447,12 @@ def _user_transcript_items_from_entry(
+         if isinstance(content, list)
+         else []
+     )
+-    # Keep hidden completion provenance so the parent can link the returned child.
++    # Keep hidden completion provenance so the parent can link the returned child,
++    # and a parent's follow-up so the child's chat shows what it is answering.
+     if (
+         entry.get("isMeta") is True
+         and return_id is None
++        and not _is_coordinator_origin(entry.get("origin"))
+         and not any(_is_task_completion_text(text) for text in notification_texts)
+     ):
+         return current_response_id, []
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 9a07c11045693f0812e00b3cbe0e07f743bc5cc8..ca9f986d151d4c027e7ed82e620820a031086c45 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -1509,6 +1509,31 @@ def test_completion_preserves_hidden_provenance(
+         assert response_id == "active"
+ 
+ 
++@pytest.mark.parametrize("as_blocks", [False, True])
++@pytest.mark.parametrize("origin", [{"kind": "coordinator"}, None])
++def test_parent_follow_up_reaches_the_child_as_hidden_context(
++    tmp_path: Path, origin: dict[str, str] | None, as_blocks: bool
++) -> None:
++    """A parent's message to its sub-agent is kept; other hidden context is not."""
++    text = (
++        "The coordinator sent a message while you were working:\nReply with: ok\n\n"
++        "Address this before completing your current task."
++    )
++    content = [{"type": "text", "text": text}] if as_blocks else text
++    _, response_id, items = _read_native_user(tmp_path, content, isMeta=True, origin=origin)
++    assert response_id == "active"
++    if origin is None:
++        assert items == []
++        return
++    [item] = items
++    assert item.data == {
++        "role": "user",
++        "is_meta": True,
++        "content": [{"type": "input_text", "text": text}],
++    }
++    assert item.subagent_return_id is None
++
++
+ @pytest.mark.parametrize("internal", [False, True])
+ def test_mixed_native_blocks_keep_human_text_and_hide_completion_guidance(
+     tmp_path: Path, internal: bool
+diff --git a/web/src/lib/itemsToBlocks.test.ts b/web/src/lib/itemsToBlocks.test.ts
+index 9fcb38224420b2583bcd0a63e79c4be1b59b4318..167bab501281cd92e0bd9e83016db5ef89636d64 100644
+--- a/web/src/lib/itemsToBlocks.test.ts
++++ b/web/src/lib/itemsToBlocks.test.ts
+@@ -168,6 +168,32 @@ describe("itemsToBlocks — flat shape", () => {
+     ]);
+   });
+ 
++  it("shows a parent agent's hidden follow-up in the sub-agent chat as a marker", () => {
++    const text =
++      "The coordinator sent a message while you were working:\nReply with: ok\n\n" +
++      "Address this before completing your current task.";
++    const message = (id: string, extra: Partial<ConversationItem>): ConversationItem =>
++      ({
++        id,
++        response_id: `resp_${id}`,
++        type: "message",
++        status: "completed",
++        role: "user",
++        content: [{ type: "input_text", text }],
++        ...extra,
++      }) as ConversationItem;
++
++    const blocks = itemsToBlocks([
++      message("follow_up", { is_meta: true }),
++      message("typed", { user_authored: true }),
++    ]);
++
++    expect(blocks.map((block) => (block as UserMessageBlock).content)).toEqual([
++      [{ type: "input_text", text: "[System: Message from parent agent]\nReply with: ok" }],
++      [{ type: "input_text", text }],
++    ]);
++  });
++
+   it("re-labels a Claude Monitor task notification with optional fields omitted", () => {
+     const items: ConversationItem[] = [
+       userMessage(
+diff --git a/web/src/lib/itemsToBlocks.ts b/web/src/lib/itemsToBlocks.ts
+index 1067b1481a84d9011f7a99a5d782bb6cebd8e40c..d1afe524a51695a7955e82ba4b1288046db97c94 100644
+--- a/web/src/lib/itemsToBlocks.ts
++++ b/web/src/lib/itemsToBlocks.ts
+@@ -61,7 +61,11 @@ import {
+ } from "./conversationItems";
+ import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
+ import { routingExtrasFromWire } from "./routingDecision";
+-import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
++import {
++  coordinatorMessageMarkerContent,
++  isClaudeAgentMessageContent,
++  taskNotificationMarkerContent,
++} from "./systemMessage";
+ import { readSubagentActivity } from "./subagentActivity";
+ 
+ // Claude built-ins whose call is a question TO the user rather than work
+@@ -266,7 +270,8 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
+     }
+   }
+   if (isMessageItem(item) && item.is_meta === true) {
+-    return null;
++    const marker = item.role === "user" ? coordinatorMessageMarkerContent(item.content) : null;
++    return marker === null ? null : { ...userMessageToBlock(item), content: marker };
+   }
+   if (isMessageItem(item) && item.role === "user") {
+     // Hide the compaction summary message injected by Claude Code
+diff --git a/web/src/lib/systemMessage.ts b/web/src/lib/systemMessage.ts
+index 9b62211ab84f2ab64d019a20ff89e9a861f33408..0d7608e229e78acdcd2de997b787fd008c10d4a0 100644
+--- a/web/src/lib/systemMessage.ts
++++ b/web/src/lib/systemMessage.ts
+@@ -17,6 +17,9 @@ const TEAMMATE_MESSAGE_PREFIXES = [
+   "Another Claude session sent a message while you were working:\n",
+   "A peer session sent a message while you were working:\n",
+ ];
++// Claude's framing of a parent agent's follow-up to one of its sub-agents.
++const COORDINATOR_MESSAGE_PREFIX = "The coordinator sent a message while you were working:\n";
++const COORDINATOR_MESSAGE_GUIDANCE = "Address this before completing your current task.";
+ const TEAMMATE_DELIVERY_GUIDANCE = [
+   "This came from another Claude session — not typed by your user,",
+   'That "other Claude session" is an agent working inside this same session —',
+@@ -241,6 +244,29 @@ export function claudeTaskNotificationMarker(text: string): string | null {
+   return summary ? `${header}\n${summary}` : header;
+ }
+ 
++/**
++ * System-marker content for a parent agent's follow-up to a Claude sub-agent.
++ * Claude stores it as hidden context, so the child's chat would otherwise show
++ * a reply with no visible prompt.
++ *
++ * :param content: Content of a hidden (``is_meta``) user message.
++ * :returns: One ``input_text`` block carrying the marker, or ``null`` when the
++ *   message is not a parent follow-up.
++ */
++export function coordinatorMessageMarkerContent(
++  content: MessageContentBlock[],
++): MessageContentBlock[] | null {
++  const [block, ...rest] = content;
++  if (block === undefined || rest.length > 0 || !isTextBlock(block)) return null;
++  if (!block.text.startsWith(COORDINATOR_MESSAGE_PREFIX)) return null;
++  let body = block.text.slice(COORDINATOR_MESSAGE_PREFIX.length).trim();
++  if (body.endsWith(COORDINATOR_MESSAGE_GUIDANCE)) {
++    body = body.slice(0, -COORDINATOR_MESSAGE_GUIDANCE.length).trim();
++  }
++  const header = "[System: Message from parent agent]";
++  return [{ type: "input_text", text: body ? `${header}\n${body}` : header }];
++}
++
+ /**
+  * System-marker content for a user message that is a Claude task notification.
+  *
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 6e5b0792dd5a514d6dbfb8c454c129c86aeeaa70..af7cc346bdab3d7738d7dd74d136c3068d1f9df2 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -8781,57 +8781,63 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
+       ]);
+     });
+ 
+-    it("renders a meta background-task wake as a system marker without consuming pending", () => {
+-      // Claude Code resumes on a finished background task with no human
+-      // message; the forwarder mirrors the notification as a meta user
+-      // item. It must land as a `[System: …]` boundary (so the finished
+-      // answer keeps its own bubble) and must not pop a queued web message.
+-      useChatStore.setState({
+-        blocks: [],
+-        pendingUserMessages: [
+-          { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
+-        ],
+-      });
+-
+-      handleSessionEvent({
+-        type: "session_input_consumed",
+-        itemId: "msg_wake",
+-        itemType: "message",
+-        isMeta: true,
+-        data: {
+-          role: "user",
+-          is_meta: true,
+-          content: [
+-            {
+-              type: "input_text",
+-              text: [
+-                "<task-notification>",
+-                "<task-id>b3f9a2c1d</task-id>",
+-                "<status>completed</status>",
+-                "<summary>Background command completed (exit code 0)</summary>",
+-                "</task-notification>",
+-              ].join("\n"),
+-            },
++    it.each([
++      {
++        input: [
++          "<task-notification>",
++          "<task-id>b3f9a2c1d</task-id>",
++          "<status>completed</status>",
++          "<summary>Background command completed (exit code 0)</summary>",
++          "</task-notification>",
++        ].join("\n"),
++        marker:
++          "[System: background task b3f9a2c1d completed]\n" +
++          "Background command completed (exit code 0)",
++      },
++      {
++        input:
++          "The coordinator sent a message while you were working:\nReply with: ok\n\n" +
++          "Address this before completing your current task.",
++        marker: "[System: Message from parent agent]\nReply with: ok",
++      },
++    ])(
++      "renders meta Claude context as a system marker without consuming pending: $marker",
++      ({ input, marker }) => {
++        // Claude Code resumes on a finished background task or a parent's
++        // follow-up with no human message; the forwarder mirrors it as a meta
++        // user item. It must land as a `[System: …]` boundary and must not pop
++        // a queued web message.
++        useChatStore.setState({
++          blocks: [],
++          pendingUserMessages: [
++            { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
+           ],
+-        },
+-      });
++        });
+ 
+-      const after = useChatStore.getState();
+-      expect(after.blocks).toHaveLength(1);
+-      expect(after.blocks[0]!.type).toBe("user_message");
+-      expect(after.blocks[0]!.ctx.itemId).toBe("msg_wake");
+-      expect((after.blocks[0] as UserMessageBlock).content).toEqual([
+-        {
+-          type: "input_text",
+-          text:
+-            "[System: background task b3f9a2c1d completed]\n" +
+-            "Background command completed (exit code 0)",
+-        },
+-      ]);
+-      expect(after.pendingUserMessages).toEqual([
+-        { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
+-      ]);
+-    });
++        handleSessionEvent({
++          type: "session_input_consumed",
++          itemId: "msg_wake",
++          itemType: "message",
++          isMeta: true,
++          data: {
++            role: "user",
++            is_meta: true,
++            content: [{ type: "input_text", text: input }],
++          },
++        });
++
++        const after = useChatStore.getState();
++        expect(after.blocks).toHaveLength(1);
++        expect(after.blocks[0]!.type).toBe("user_message");
++        expect(after.blocks[0]!.ctx.itemId).toBe("msg_wake");
++        expect((after.blocks[0] as UserMessageBlock).content).toEqual([
++          { type: "input_text", text: marker },
++        ]);
++        expect(after.pendingUserMessages).toEqual([
++          { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
++        ]);
++      },
++    );
+ 
+     const teamContent = [
+       {
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index bc98c2c403242c191b862c68020b53416103c39a..a85160023b13e68df30005cb0046d18a38b07778 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -157,6 +157,7 @@ import {
+ } from "./interactionTelemetry";
+ import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
+ import {
++  coordinatorMessageMarkerContent,
+   isClaudeAgentMessageContent,
+   isSystemUserContent,
+   taskNotificationMarkerContent,
+@@ -7059,7 +7060,7 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
+   // other meta message (injected skill text) stays hidden.
+   const marker = taskNotificationMarkerContent(content);
+   if (marker !== null) return marker;
+-  if (event.isMeta === true) return null;
++  if (event.isMeta === true) return coordinatorMessageMarkerContent(content);
+   return content;
+ }
+ 

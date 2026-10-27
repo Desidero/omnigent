@@ -1,0 +1,793 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 27 Oct 2026 04:16:28 +0000
+Subject: [PATCH] feat(server): bring session label deletes and project
+ defaults up to its PR
+
+A null label on session create leaves a project default off the new session,
+replacing apply_project_labels; malformed label keys are rejected with a 400
+before the write; PATCH applies deletes and upserts in one store transaction
+(set_labels(delete_keys=...)); is_internal_label_key() is shared by project
+defaults and the store. Matches
+https://github.com/omnigent-ai/omnigent/pull/11398.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ omnigent/server/API.md                        | 11 ++--
+ .../routes/_session_create_validation.py      | 41 +++++++-----
+ omnigent/server/routes/_sessions/helpers.py   | 26 +++++++-
+ .../server/routes/_sessions/orchestration.py  |  9 ++-
+ omnigent/server/routes/imports.py             |  2 +-
+ .../server/routes/sessions/routes_core.py     | 21 +++++--
+ omnigent/server/schemas.py                    | 24 +++----
+ .../stores/conversation_store/__init__.py     | 25 +++++++-
+ .../conversation_store/sqlalchemy_store.py    | 28 +++++++--
+ ...test_session_create_project_consistency.py | 44 ++++++++++---
+ tests/server/routes/test_sessions_crud.py     | 60 +++++++++++++++++-
+ tests/stores/test_conversation_labels.py      | 62 ++++++++++++++++++-
+ 12 files changed, 288 insertions(+), 65 deletions(-)
+
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index 3893c8f18080ab2bb76ba68056ac08e1ac5f5b94..dc38dad0f04ec6c6d0435735a4c54ffc7206ca7e 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -691,12 +691,11 @@ already uploaded or registered an agent. The response is the full
+     `PATCH /v1/sessions/{id}` (last-write-wins). See
+     `designs/NATIVE_RUNNER_SERVER_LAUNCH.md`.
+ 
+-  apply_project_labels (boolean, default true)
+-    A create with `project_id` merges the project's default labels (the
+-    project config's `labels`) under `labels`, and the request's labels
+-    win. `false` takes `labels` as the final set, so a default removed
+-    for this one session is not added back. Labels apply only at
+-    creation, not when a session moves into a project later.
++  A create with `project_id` merges the project's default labels (the
++  project config's `labels`) under the request's `labels`, and the
++  request's labels win. A `null` request value leaves that default off
++  the new session. Labels apply only at creation, not when a session
++  moves into a project later.
+ 
+ 400 Bad Request - invalid terminal_launch_args (count / length bounds)
+ 404 Not Found - no agent with that id
+diff --git a/omnigent/server/routes/_session_create_validation.py b/omnigent/server/routes/_session_create_validation.py
+index 2aa10e28b7791505e9828d6b835a8b79addc07c2..f0a5a4d74ed067ae24f9b4aee3f2a0a69d978232 100644
+--- a/omnigent/server/routes/_session_create_validation.py
++++ b/omnigent/server/routes/_session_create_validation.py
+@@ -23,10 +23,9 @@ from omnigent.runtime.agent_cache import AgentCache
+ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
+ from omnigent.server.routes._auth_helpers import require_access
+ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+-from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
++from omnigent.stores.conversation_store import is_internal_label_key
+ from omnigent.stores.host_store import host_is_live
+ from omnigent.stores.project_store import ProjectStore
+-from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
+ from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
+ 
+ _logger = logging.getLogger(__name__)
+@@ -40,10 +39,6 @@ class ProjectCreateResolution:
+     project_id: str | None = None
+ 
+ 
+-# Label namespaces written by Omnigent itself, never by a project default.
+-_INTERNAL_LABEL_PREFIXES = ("omnigent.", COST_CONTROL_LABEL_NAMESPACE)
+-
+-
+ def project_default_labels(config: Mapping[str, Any]) -> dict[str, str]:
+     """Return the user labels a project's opaque config stamps on new sessions.
+ 
+@@ -64,9 +59,26 @@ def project_default_labels(config: Mapping[str, Any]) -> dict[str, str]:
+         and isinstance(value, str)
+         and 0 < len(key) <= LABEL_KEY_MAX_LEN
+         and len(value) <= LABEL_VALUE_MAX_LEN
+-        and key != PROJECT_LABEL_KEY
+-        and not key.startswith(_INTERNAL_LABEL_PREFIXES)
++        and not is_internal_label_key(key)
++    }
++
++
++def create_labels(body: Any, project_defaults: Mapping[str, str] | None = None) -> dict[str, str]:
++    """Return a create body's labels with the project's defaults under them.
++
++    A ``null`` request value leaves that default off the new session, mirroring
++    the ``null`` delete on PATCH; for any other key it is simply ignored, so
++    after :func:`resolve_project_session_create` the result is the body's own
++    labels, typed without the nulls it dropped.
++
++    :param body: A session-create body, e.g. one with ``labels={"team": None}``.
++    :param project_defaults: The project's usable default labels, if any.
++    """
++    merged: dict[str, str | None] = {
++        **(project_defaults or {}),
++        **(getattr(body, "labels", None) or {}),
+     }
++    return {key: value for key, value in merged.items() if value is not None}
+ 
+ 
+ async def resolve_project_session_create(
+@@ -86,6 +98,8 @@ async def resolve_project_session_create(
+     if "project_id" not in fields_set or project_id is None:
+         if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
+             raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
++        if "labels" in body.__class__.model_fields:
++            body = body.model_copy(update={"labels": create_labels(body)})
+         return ProjectCreateResolution(body=body)
+     if project_store is None:
+         raise OmnigentError(
+@@ -101,15 +115,8 @@ async def resolve_project_session_create(
+     for field in ("agent_id", "workspace", "git"):
+         if field not in fields_set and field in config and field in body.__class__.model_fields:
+             updates[field] = config[field]
+-    # Project labels sit under the request's own labels, which win on conflict,
+-    # unless the client says its labels are already the final set.
+-    default_labels = project_default_labels(config)
+-    if (
+-        default_labels
+-        and "labels" in body.__class__.model_fields
+-        and getattr(body, "apply_project_labels", True)
+-    ):
+-        updates["labels"] = {**default_labels, **(getattr(body, "labels", None) or {})}
++    if "labels" in body.__class__.model_fields:
++        updates["labels"] = create_labels(body, project_default_labels(config))
+     resolved_data = body.model_dump()
+     resolved_data.update(updates)
+     # Re-validate project hints because config is intentionally stored as
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index c1a2903a1b1c72bde5018156f138f98e67cf2b1e..f45953e6134d3264e2b0ff330af4dc207a26c1af 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -42,6 +42,7 @@ from pydantic import ValidationError
+ from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
+ 
+ from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
++from omnigent.db.db_models import LABEL_KEY_MAX_LEN
+ from omnigent.db.utils import generate_task_id
+ from omnigent.db.workspace_cache import WorkspaceScopedCache
+ from omnigent.debug_logging import debug_event, runner_log_scope
+@@ -137,6 +138,7 @@ from omnigent.server.routes._auth_helpers import (
+ )
+ from omnigent.server.routes._host_worktree import CreatedWorktree
+ from omnigent.server.routes._session_create_validation import (
++    create_labels,
+     validate_existing_host_workspace,
+ )
+ 
+@@ -10578,7 +10580,7 @@ def _repl_terminal_ui_labels(
+     return {_CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
+ 
+ 
+-def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
++def _reject_reserved_cost_control_label_seed(labels: Mapping[str, str | None]) -> None:
+     """
+     Reject a session-create body that seeds policy-owned labels.
+ 
+@@ -10703,6 +10705,24 @@ def _reject_server_reserved_label_seed(labels: Mapping[str, str | None] | None)
+         )
+ 
+ 
++def _reject_malformed_label_keys(labels: Mapping[str, str | None] | None) -> None:
++    """
++    Reject an empty label key or one wider than the ``conversation_labels.key``
++    column, which PostgreSQL would otherwise refuse mid-write.
++
++    :param labels: The client-supplied label mapping, or ``None``.
++    :raises OmnigentError: 400 on a malformed key.
++    """
++    for key in labels or ():
++        if not key:
++            raise OmnigentError("label keys must not be empty", code=ErrorCode.INVALID_INPUT)
++        if len(key) > LABEL_KEY_MAX_LEN:
++            raise OmnigentError(
++                f"label key {key[:LABEL_KEY_MAX_LEN]!r}… exceeds {LABEL_KEY_MAX_LEN} characters",
++                code=ErrorCode.INVALID_INPUT,
++            )
++
++
+ def _require_cost_control_label_authority(
+     *,
+     reserved_keys: Sequence[str],
+@@ -10809,7 +10829,7 @@ def _persist_stored_session_bundle(
+             agent_bundle_location=agent_bundle_location,
+             agent_description=agent_description,
+             title=metadata.title,
+-            labels=metadata.labels,
++            labels=create_labels(metadata),
+             reasoning_effort=metadata.reasoning_effort,
+             workspace=metadata.workspace,
+             terminal_launch_args=metadata.terminal_launch_args,
+@@ -10896,7 +10916,7 @@ def _persist_session_for_uploaded_agent(
+             terminal_launch_args=metadata.terminal_launch_args,
+             project_id=metadata.project_id,
+             inference_snapshot=inference_snapshot,
+-            labels=metadata.labels,
++            labels=create_labels(metadata),
+             reasoning_effort=metadata.reasoning_effort,
+             model_override=inference_model,
+             chat_features_override=_metadata_chat_features_override(metadata),
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 88f055f039d7832a2b13fcb793cb90904e6f4b9b..df99eaf0a98f26df5508d5dcb9bcabc732d36811 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -335,6 +335,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _query_host_runner_status,
+     _read_state_entry,
+     _record_daily_cost,
++    _reject_malformed_label_keys,
+     _reject_reserved_cost_control_label_seed,
+     _reject_server_reserved_label_seed,
+     _relay_persist,
+@@ -11305,6 +11306,11 @@ async def _create_session_from_existing_agent(
+         resolve_project_session_create,
+     )
+ 
++    # Checked before the project merge: a null (a default left off this
++    # session) for a reserved key is rejected like a set would be.
++    _reject_malformed_label_keys(body.labels)
++    _reject_reserved_cost_control_label_seed(body.labels)
++    _reject_server_reserved_label_seed(body.labels)
+     project_resolution = await resolve_project_session_create(
+         body=body,
+         user_id=user_id,
+@@ -11314,9 +11320,6 @@ async def _create_session_from_existing_agent(
+     creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+     assert body.agent_id is not None
+ 
+-    _reject_reserved_cost_control_label_seed(body.labels)
+-    _reject_server_reserved_label_seed(body.labels)
+-
+     agent = await validate_session_agent(
+         user_id=user_id,
+         agent_id=body.agent_id,
+diff --git a/omnigent/server/routes/imports.py b/omnigent/server/routes/imports.py
+index 5492d6f25597923156bf4c92b2e55c1002def537..de3ef0ad514484a56404182be9c9e8caa07d1085 100644
+--- a/omnigent/server/routes/imports.py
++++ b/omnigent/server/routes/imports.py
+@@ -444,7 +444,7 @@ def create_imports_router(
+             )
+             await asyncio.to_thread(conversation_store.append, conversation.id, items)
+             labels = {
+-                # Project default labels resolved for an import into a project.
++                # Project defaults, when the import names a project.
+                 **resolved_create.body.labels,
+                 **native_agent.presentation_labels,
+                 IMPORT_SOURCE_LABEL_KEY: source,
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 417f4e61c0d19521289418bdfda85e5e6558991e..d63d111bb2a67133442c39126b3d297e112e4b8e 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -149,6 +149,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _publish_permission_mode,
+     _publish_sandbox_status,
+     _publish_terminal_pending,
++    _reject_malformed_label_keys,
+     _reject_reserved_cost_control_label_seed,
+     _reject_server_reserved_label_seed,
+     _require_codex_approval_mode_forward,
+@@ -1195,6 +1196,9 @@ def register_core_routes(
+             parent_session_id=parsed_metadata.parent_session_id,
+             host_type=parsed_metadata.host_type,
+         )
++        _reject_malformed_label_keys(parsed_metadata.labels)
++        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
++        _reject_server_reserved_label_seed(parsed_metadata.labels)
+         from omnigent.server.routes._session_create_validation import (
+             resolve_project_session_create,
+         )
+@@ -1210,8 +1214,6 @@ def register_core_routes(
+             parent_session_id=parsed_metadata.parent_session_id,
+             host_type=parsed_metadata.host_type,
+         )
+-        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+-        _reject_server_reserved_label_seed(parsed_metadata.labels)
+ 
+         inherited_runner_id: str | None = None
+         parent_conv = None
+@@ -2641,6 +2643,7 @@ def register_core_routes(
+                     code=ErrorCode.FORBIDDEN,
+                 )
+         if body.labels:
++            _reject_malformed_label_keys(body.labels)
+             _reject_server_reserved_label_seed(body.labels)
+             # Advisor-owned cost_control.* labels are written only by the
+             # session's bound runner; gate them on runner proof BEFORE any
+@@ -3380,9 +3383,17 @@ def register_core_routes(
+             if labels_to_set.get(_clear_key) == "":
+                 labels_to_set[_clear_key] = None
+         labels_to_upsert = {k: v for k, v in labels_to_set.items() if v is not None}
+-        for _delete_key in (k for k, v in labels_to_set.items() if v is None):
+-            await asyncio.to_thread(conversation_store.delete_label, session_id, _delete_key)
+-        if labels_to_upsert:
++        labels_to_delete = [k for k, v in labels_to_set.items() if v is None]
++        # One store transaction, so a failed upsert does not leave the deletes
++        # behind and a concurrent reader never sees a half-applied edit.
++        if labels_to_delete:
++            await asyncio.to_thread(
++                conversation_store.set_labels,
++                session_id,
++                labels_to_upsert,
++                delete_keys=labels_to_delete,
++            )
++        elif labels_to_upsert:
+             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_upsert)
+         # Only when the switch was forwarded: a silent PATCH writes no label,
+         # and an unconfirmed mode must not reach the picker.
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 422e2fc1fcdadc8f85028a3cc380cfc56309b90a..435d02b48abf72f3fff303363b7970b328bb0f1c 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -1521,7 +1521,9 @@ class _SessionCreateRequestBase(BaseModel):
+         single user ``"message"``.
+     :param title: Optional human-readable title for the session,
+         e.g. ``"debugging auth flow"``.
+-    :param labels: Initial guardrails labels to set on the session.
++    :param labels: Initial guardrails labels to set on the session. In a
++        project, its default labels fill in under these; a ``null`` value
++        leaves that default off the new session.
+     :param parent_session_id: Parent session for sub-agent spawns.
+         When set, the server inherits the parent's ``runner_id``
+         affinity and sets ``parent_conversation_id`` on the child
+@@ -1666,9 +1668,6 @@ class _SessionCreateRequestBase(BaseModel):
+     :param chat_features: Chat-feature keys to enable, e.g.
+         ``["run_commands"]``. ``None`` (the default) inherits the parent
+         session's set for a sub-agent, else uses the caller's saved default.
+-    :param apply_project_labels: Whether a ``project_id`` create adds the
+-        project's default labels under ``labels``. ``False`` when ``labels``
+-        is already the final set, e.g. a default removed for this session.
+     """
+ 
+     inference_configuration_revision: str | None = None
+@@ -1681,8 +1680,7 @@ class _SessionCreateRequestBase(BaseModel):
+     initial_input: SessionStartupInput | None = None
+     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+-    labels: dict[str, str] = Field(default_factory=dict)
+-    apply_project_labels: bool = True
++    labels: dict[str, str | None] = Field(default_factory=dict)
+     parent_session_id: str | None = None
+     sub_agent_name: str | None = None
+     host_type: Literal["external", "managed"] = "external"
+@@ -1877,7 +1875,9 @@ class SessionCreateMetadata(BaseModel):
+     :param title: Optional human-readable title for the session,
+         e.g. ``"debugging auth flow"``.
+     :param labels: Initial guardrails labels to set on the
+-        session. Empty dict (the default) starts with no labels.
++        session. Empty dict (the default) starts with no labels. In a
++        project, its default labels fill in under these; a ``null``
++        value leaves that default off the new session.
+     :param reasoning_effort: Optional per-session reasoning-effort
+         hint. Accepted metadata values are ``"none"``,
+         ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
+@@ -1920,8 +1920,6 @@ class SessionCreateMetadata(BaseModel):
+         valid with ``host_type: "managed"``.
+     :param chat_features: Chat-feature keys to enable, e.g.
+         ``["run_commands"]``. ``None`` uses the caller's saved default.
+-    :param apply_project_labels: Same as on the JSON create: ``False`` skips
+-        the project's default labels because ``labels`` is the final set.
+     """
+ 
+     inference_configuration_revision: str | None = None
+@@ -1930,8 +1928,7 @@ class SessionCreateMetadata(BaseModel):
+ 
+     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+     project_id: str | None = None
+-    labels: dict[str, str] = Field(default_factory=dict)
+-    apply_project_labels: bool = True
++    labels: dict[str, str | None] = Field(default_factory=dict)
+     reasoning_effort: str | None = None
+     host_id: str | None = None
+     workspace: str | None = None
+@@ -5282,7 +5279,10 @@ class ProjectObject(BaseModel):
+         workspace, harness, model, reasoning effort, git base-branch, …). Empty
+         when the project stores no defaults. The key vocabulary is owned by the
+         client; the server persists and returns it whole. Values are hints the
+-        new-chat dialog pre-fills, not enforced requirements.
++        new-chat dialog pre-fills, not enforced requirements, except that
++        session create reads ``agent_id``, ``workspace``, ``git`` and
++        ``labels`` (default labels, e.g. ``{"team": "ml"}``) from it. They are
++        not validated on write; a malformed entry is skipped at create time.
+     """
+ 
+     id: str
+diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
+index ccec9d13d584a171c9c8b979973a8ccb905b5507..eb2017b80016e74758011f6aeeb86ce433358b0a 100644
+--- a/omnigent/stores/conversation_store/__init__.py
++++ b/omnigent/stores/conversation_store/__init__.py
+@@ -4,7 +4,7 @@ import hashlib
+ import math
+ import time
+ from abc import ABC, abstractmethod
+-from collections.abc import Mapping
++from collections.abc import Iterable, Mapping
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, TypedDict
+ 
+@@ -16,6 +16,7 @@ from omnigent.entities import (
+     PagedList,
+ )
+ from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
++from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
+ 
+ # Pending inputs share the item store, but are not harness transcript history yet.
+ PENDING_INPUT_RESPONSE_ID = "pending_input"
+@@ -87,6 +88,20 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
+ # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
+ PROJECT_LABEL_KEY = "omni_project"
+ 
++# Label namespaces Omnigent writes for itself (pins, wrappers, cost telemetry).
++INTERNAL_LABEL_PREFIXES = ("omnigent.", COST_CONTROL_LABEL_NAMESPACE)
++
++
++def is_internal_label_key(key: str) -> bool:
++    """
++    Whether a label key is Omnigent's own bookkeeping rather than a user label.
++
++    :param key: A ``conversation_labels`` key, e.g. ``"omnigent.pinned"``.
++    :returns: ``True`` for ``omni_project`` and keys under ``omnigent.`` or
++        ``cost_control.``; ``False`` for a user label such as ``"team"``.
++    """
++    return key == PROJECT_LABEL_KEY or key.startswith(INTERNAL_LABEL_PREFIXES)
++
+ 
+ class DailyCostState(TypedDict):
+     """Daily cost state record returned by list_daily_cost_states.
+@@ -1209,12 +1224,17 @@ class ConversationStore(ABC):
+         conversation_id: str,
+         updates: dict[str, str],
+         updated_at: int | None = None,
++        *,
++        delete_keys: Iterable[str] = (),
+     ) -> None:
+         """
+         Upsert guardrails labels on a conversation.
+ 
+         Atomic batched UPSERT: either every key in *updates*
+         lands, or none of them do (matches POLICIES.md §6.3).
++        Keys in *delete_keys* are removed in the same
++        transaction, before the upsert, so a mixed edit (a
++        ``null`` and a value in one PATCH) is all-or-nothing.
+         Overwrites existing rows for the same keys;
+         non-mentioned keys are left untouched. The caller is
+         responsible for schema validation (``values`` /
+@@ -1245,6 +1265,9 @@ class ConversationStore(ABC):
+             audit trails aligned with the enforcement site
+             rather than wall-clock drift between evaluate()
+             and the actual DB write.
++        :param delete_keys: Label keys to delete first, e.g.
++            ``["team"]``; missing keys are ignored. Empty by
++            default.
+         """
+         ...
+ 
+diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
+index 691c43a477b3b870f0a37319703e3b0a3e881614..ad83470e4ab4679559e1eaed234ee5a3b5dcf474 100644
+--- a/omnigent/stores/conversation_store/sqlalchemy_store.py
++++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
+-from collections.abc import Mapping
++from collections.abc import Iterable, Mapping
+ from contextlib import suppress
+ from pathlib import PureWindowsPath
+ from typing import Any, Protocol, cast
+@@ -1495,6 +1495,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+         conversation_id: str,
+         updates: dict[str, str],
+         updated_at: int | None = None,
++        *,
++        delete_keys: Iterable[str] = (),
+     ) -> None:
+         """
+         Upsert guardrails labels on a conversation.
+@@ -1504,25 +1506,39 @@ class SqlAlchemyConversationStore(ConversationStore):
+         path dispatches to ``INSERT ... ON CONFLICT`` on
+         SQLite / PostgreSQL; other dialects fall back to
+         SELECT-then-INSERT/UPDATE inside the same transaction.
+-        Empty updates is a no-op.
++        *delete_keys* are removed first, in that transaction.
++        Empty updates and no deletes is a no-op.
+ 
+         :param conversation_id: The conversation to update,
+             e.g. ``"conv_abc123"``.
+         :param updates: Mapping from label key to new value.
+-            Example: ``{"integrity": "0"}``. Empty dict
+-            returns immediately without opening a transaction.
++            Example: ``{"integrity": "0"}``. Empty dict with
++            no *delete_keys* returns immediately without
++            opening a transaction.
+         :param updated_at: Caller-supplied timestamp
+             (``None`` → current wall-clock). See the abstract
+             method docstring for why callers may want to
+             pass their own.
++        :param delete_keys: Label keys to delete before the
++            upsert, e.g. ``["team"]``; missing keys are ignored.
+         """
+-        if not updates:
++        stable_deletes = tuple(delete_keys)
++        if not updates and not stable_deletes:
+             return
+         stamp = updated_at if updated_at is not None else now_epoch()
+         stable_updates = dict(updates)
+ 
+         def write(session: Session) -> None:
+-            _upsert_labels(session, conversation_id, stable_updates, stamp)
++            if stable_deletes:
++                session.execute(
++                    delete(SqlConversationLabel).where(
++                        SqlConversationLabel.workspace_id == current_workspace_id(),
++                        SqlConversationLabel.conversation_id == conversation_id,
++                        SqlConversationLabel.key.in_(stable_deletes),
++                    )
++                )
++            if stable_updates:
++                _upsert_labels(session, conversation_id, stable_updates, stamp)
+ 
+         run_write_transaction(self._conv_session_immediate, "set_labels", write)
+ 
+diff --git a/tests/server/routes/test_session_create_project_consistency.py b/tests/server/routes/test_session_create_project_consistency.py
+index a0d1ea0dfa3cf720f3c3ee5ed6bd900078431d4f..a3183bb4500ef1821fc38692eb9da7bc5b95d6d0 100644
+--- a/tests/server/routes/test_session_create_project_consistency.py
++++ b/tests/server/routes/test_session_create_project_consistency.py
+@@ -161,11 +161,12 @@ async def test_project_labels_fill_under_request_labels(
+     assert "k" * 129 not in labels
+ 
+ 
+-async def test_final_request_labels_skip_project_labels(
++async def test_null_request_label_leaves_project_default_off(
+     project_create_client: httpx.AsyncClient,
+ ) -> None:
+-    """A create whose labels are already the final set keeps a default removed
+-    for this session off it, and still applies the project's other defaults."""
++    """A ``null`` request label leaves that project default off the new session
++    (mirroring the ``null`` delete on PATCH), the other defaults still apply,
++    and a ``null`` for a key the project doesn't default is ignored."""
+     project_id = await _project(
+         project_create_client,
+         {"agent_id": CUSTOM_AGENT_ID, "labels": {"team": "ml", "env": "dev"}},
+@@ -174,8 +175,7 @@ async def test_final_request_labels_skip_project_labels(
+         "/v1/sessions",
+         json={
+             "project_id": project_id,
+-            "labels": {"env": "dev", "owner": "me"},
+-            "apply_project_labels": False,
++            "labels": {"team": None, "owner": "me", "never-set": None},
+         },
+         headers=_headers(),
+     )
+@@ -186,6 +186,36 @@ async def test_final_request_labels_skip_project_labels(
+     assert body["labels"]["env"] == "dev"
+     assert body["labels"]["owner"] == "me"
+     assert "team" not in body["labels"]
++    assert "never-set" not in body["labels"]
++
++
++async def test_null_label_without_project_is_ignored(
++    project_create_client: httpx.AsyncClient,
++) -> None:
++    response = await project_create_client.post(
++        "/v1/sessions",
++        json={"agent_id": CUSTOM_AGENT_ID, "labels": {"team": None, "owner": "me"}},
++        headers=_headers(),
++    )
++    assert response.status_code == 201, response.text
++    assert response.json()["labels"]["owner"] == "me"
++    assert "team" not in response.json()["labels"]
++
++
++@pytest.mark.parametrize("reserved_key", ["omnigent.archived_at", "cost_control.plan"])
++async def test_null_reserved_label_on_create_is_rejected(
++    project_create_client: httpx.AsyncClient,
++    reserved_key: str,
++) -> None:
++    """A ``null`` for a reserved key is rejected like setting it, even though
++    there is nothing to delete yet."""
++    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
++    response = await project_create_client.post(
++        "/v1/sessions",
++        json={"project_id": project_id, "labels": {reserved_key: None}},
++        headers=_headers(),
++    )
++    assert response.status_code == 400, response.text
+ 
+ 
+ @pytest.mark.parametrize("malformed_labels", ["team=ml", ["team"], None])
+@@ -547,13 +577,13 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
+     assert session.json()["labels"]["team"] == "ml"
+ 
+ 
+-async def test_multipart_final_labels_skip_project_labels(
++async def test_multipart_null_label_leaves_project_default_off(
+     project_create_client: httpx.AsyncClient,
+ ) -> None:
+     project_id = await _project(
+         project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
+     )
+-    metadata = {"project_id": project_id, "labels": {"env": "dev"}, "apply_project_labels": False}
++    metadata = {"project_id": project_id, "labels": {"env": "dev", "team": None}}
+     response = await project_create_client.post(
+         "/v1/sessions",
+         data={"metadata": json.dumps(metadata)},
+diff --git a/tests/server/routes/test_sessions_crud.py b/tests/server/routes/test_sessions_crud.py
+index 50d0f39e2b6aa47d9b98cfbde1f817628adef589..426c10c6fbe6791f0d2c75c131fdce762782e05b 100644
+--- a/tests/server/routes/test_sessions_crud.py
++++ b/tests/server/routes/test_sessions_crud.py
+@@ -624,6 +624,37 @@ async def test_patch_session_null_label_deletes_it(
+     assert conv.labels["owner"] == "ana"
+ 
+ 
++async def test_patch_session_mixed_label_edit_is_atomic(
++    client: httpx.AsyncClient,
++    session_id: str,
++    db_uri: str,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A PATCH that deletes one label and sets another applies both or
++    neither: when the upsert fails, the deleted label survives."""
++    from omnigent.stores.conversation_store import sqlalchemy_store
++
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    conv_store.set_labels(session_id, {"team": "ml"})
++
++    def failing_upsert(*args: object, **kwargs: object) -> None:
++        raise RuntimeError("upsert refused")
++
++    monkeypatch.setattr(sqlalchemy_store, "_upsert_prepared_labels", failing_upsert)
++    # The test transport re-raises the handler's exception instead of a 500.
++    with pytest.raises(RuntimeError, match="upsert refused"):
++        await client.patch(
++            f"/v1/sessions/{session_id}",
++            json={"labels": {"team": None, "env": "prod"}},
++            headers={"Content-Type": "application/json"},
++        )
++
++    conv = conv_store.get_conversation(session_id)
++    assert conv is not None
++    assert conv.labels["team"] == "ml"
++    assert "env" not in conv.labels
++
++
+ @pytest.mark.parametrize(
+     "reserved_key",
+     [
+@@ -656,18 +687,41 @@ async def test_patch_rejects_deleting_server_reserved_label(
+     assert conv.labels[reserved_key] == "server-written"
+ 
+ 
++@pytest.mark.parametrize("bad_key", ["", "k" * 129])
++async def test_patch_rejects_malformed_label_key(
++    client: httpx.AsyncClient,
++    session_id: str,
++    db_uri: str,
++    bad_key: str,
++) -> None:
++    """An empty or over-width key is a 400 before any write, not a database
++    error mid-request."""
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    resp = await client.patch(
++        f"/v1/sessions/{session_id}",
++        json={"labels": {bad_key: "x", "team": "ml"}},
++        headers={"Content-Type": "application/json"},
++    )
++    assert resp.status_code == 400, resp.text
++    conv = conv_store.get_conversation(session_id)
++    assert conv is not None
++    assert "team" not in conv.labels
++
++
+ # ── Pinned session label (omnigent.pinned) ───────────────────────────
+ 
+ 
++@pytest.mark.parametrize("unpin_value", ["", None])
+ async def test_patch_session_pins_and_unpins(
+     client: httpx.AsyncClient,
+     session_id: str,
+     db_uri: str,
++    unpin_value: str | None,
+ ) -> None:
+     """PATCH with the canonical ``labels: {"omnigent.pinned": <pin-time>}`` pins
+     the session for the CALLER: the server rewrites it to the per-user key
+     ``omnigent.pinned.<user>`` in storage (so it doesn't pin for others), and an
+-    empty value deletes that per-user key (unpin)."""
++    empty value (or ``null``) deletes that per-user key (unpin)."""
+     from omnigent.stores.conversation_store import pinned_label_key
+ 
+     conv_store = SqlAlchemyConversationStore(db_uri)
+@@ -688,10 +742,10 @@ async def test_patch_session_pins_and_unpins(
+     # …but the response collapses it back to the canonical key for the caller.
+     assert resp.json()["labels"].get("omnigent.pinned") == "1721760000000"
+ 
+-    # Unpin: empty string clears the per-user key.
++    # Unpin: an empty string or null clears the per-user key.
+     resp = await client.patch(
+         f"/v1/sessions/{session_id}",
+-        json={"labels": {"omnigent.pinned": ""}},
++        json={"labels": {"omnigent.pinned": unpin_value}},
+         headers={"Content-Type": "application/json"},
+     )
+     assert resp.status_code == 200
+diff --git a/tests/stores/test_conversation_labels.py b/tests/stores/test_conversation_labels.py
+index 0a9631a037afc264a3466baaab1333920753e170..f8840329dcd48aea7b03f9e61298b1b82176e983 100644
+--- a/tests/stores/test_conversation_labels.py
++++ b/tests/stores/test_conversation_labels.py
+@@ -17,7 +17,7 @@ from omnigent.entities import (
+     MessageData,
+     NewConversationItem,
+ )
+-from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
++from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY, is_internal_label_key
+ from omnigent.stores.conversation_store.sqlalchemy_store import (
+     SqlAlchemyConversationStore,
+ )
+@@ -151,6 +151,46 @@ def test_set_labels_many_keys_atomic(
+ # ── Survival across conversation_items churn ───────────
+ 
+ 
++def test_set_labels_deletes_keys_in_the_same_write(
++    conversation_store: SqlAlchemyConversationStore,
++) -> None:
++    """``delete_keys`` removes labels alongside the upsert; a missing key is
++    ignored and unmentioned keys stay."""
++    conv = conversation_store.create_conversation()
++    conversation_store.set_labels(conv.id, {"team": "ml", "env": "dev", "owner": "ana"})
++    conversation_store.set_labels(conv.id, {"env": "prod"}, delete_keys=["team", "never-set"])
++    got = conversation_store.get_conversation(conv.id)
++    assert got is not None
++    assert got.labels == {"env": "prod", "owner": "ana"}
++
++    conversation_store.set_labels(conv.id, {}, delete_keys=["owner"])
++    got = conversation_store.get_conversation(conv.id)
++    assert got is not None
++    assert got.labels == {"env": "prod"}
++
++
++def test_set_labels_rolls_back_deletes_when_the_upsert_fails(
++    conversation_store: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A delete and an upsert share one transaction: when the upsert raises,
++    the deleted label is still there afterwards."""
++    from omnigent.stores.conversation_store import sqlalchemy_store
++
++    conv = conversation_store.create_conversation()
++    conversation_store.set_labels(conv.id, {"team": "ml"})
++
++    def failing_upsert(*args: object, **kwargs: object) -> None:
++        raise RuntimeError("upsert refused")
++
++    monkeypatch.setattr(sqlalchemy_store, "_upsert_prepared_labels", failing_upsert)
++    with pytest.raises(RuntimeError, match="upsert refused"):
++        conversation_store.set_labels(conv.id, {"env": "prod"}, delete_keys=["team"])
++    got = conversation_store.get_conversation(conv.id)
++    assert got is not None
++    assert got.labels == {"team": "ml"}
++
++
+ def test_labels_survive_item_appends(
+     conversation_store: SqlAlchemyConversationStore,
+ ) -> None:
+@@ -489,3 +529,23 @@ def test_fork_does_not_inherit_archived_at_label(
+     forked = conversation_store.get_conversation(fork.id)
+     assert forked is not None
+     assert ARCHIVED_AT_LABEL_KEY not in forked.labels
++
++
++# ── Internal vs user label keys ────────────────────────
++
++
++@pytest.mark.parametrize(
++    ("key", "internal"),
++    [
++        ("omni_project", True),
++        ("omnigent.pinned.bob@example.com", True),
++        ("omnigent.archived_at", True),
++        ("cost_control.plan", True),
++        ("team", False),
++        ("omnigent", False),
++        ("omni_projects", False),
++    ],
++)
++def test_is_internal_label_key(key: str, internal: bool) -> None:
++    """Omnigent-owned keys are hidden from, and rejected for, user editing."""
++    assert is_internal_label_key(key) is internal

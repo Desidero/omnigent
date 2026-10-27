@@ -1,0 +1,1392 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 15 Oct 2026 18:01:43 +0000
+Subject: [PATCH] feat(web): long-press to select, copy and paste in the
+ terminal on touch
+
+The terminal draws to a canvas and xterm only selects with a mouse, so on a
+phone there was no way to copy terminal output and no Paste control.
+
+A still long-press selects the word under the finger (or offers Paste on a
+blank cell), keeps the rest of the gesture to extend the selection, and
+cancels the touchend so it never reaches the pane program as a click. Drag
+handles adjust the range and scroll the scrollback past the edges. A small
+menu offers Copy (through the existing terminal clipboard consent), Paste
+(xterm's paste, so bracketed paste applies) and Select screen.
+
+Not upstream yet: to be proposed after an issue is filed, as a follow-up
+to the extra-keys row.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/terminals.md                      |  18 +
+ .../components/blocks/TerminalSession.test.ts |  69 ++++
+ web/src/components/blocks/TerminalSession.ts  |  42 +-
+ .../blocks/TerminalTouchSelectionOverlay.tsx  | 128 ++++++
+ .../components/blocks/TerminalView.test.tsx   | 157 ++++++++
+ web/src/components/blocks/TerminalView.tsx    |  99 ++++-
+ .../blocks/terminalTouchSelection.test.ts     | 211 ++++++++++
+ .../blocks/terminalTouchSelection.ts          | 377 ++++++++++++++++++
+ 8 files changed, 1094 insertions(+), 7 deletions(-)
+ create mode 100644 web/src/components/blocks/TerminalTouchSelectionOverlay.tsx
+ create mode 100644 web/src/components/blocks/terminalTouchSelection.test.ts
+ create mode 100644 web/src/components/blocks/terminalTouchSelection.ts
+
+diff --git a/feature-map/terminals.md b/feature-map/terminals.md
+index 0420a402f2cbbd9eb74b04c311a784716952385f..da8a874d5a771ad94b47e72ea84a925298e19ab2 100644
+--- a/feature-map/terminals.md
++++ b/feature-map/terminals.md
+@@ -32,6 +32,9 @@ reattach when the session moves to another host.
+ - `touch-keys`: on touch devices an extra-keys row (Esc, Tab, arrows, sticky
+   Ctrl/Alt/Shift) under the terminal sends keys a soft keyboard can't. A
+   setting shows it on touch devices (default), always, or never.
++- `touch-select`: on touch devices a long-press selects the word under the
++  finger (or offers Paste on a blank cell); drag to extend it, adjust it with
++  the handles, then Copy, Paste or Select screen from its menu.
+ 
+ ## How to get to it (user POV)
+ 
+@@ -71,6 +74,12 @@ lock it, and tap a locked one to release it. Settings → Appearance → Touch &
+ mobile → **Extra keys row** chooses Auto (touch devices, the default), Always
+ (desktop too) or Never; the choice is saved in this browser or app.
+ 
++To copy terminal output on a touch screen, rest a finger on a word for about
++half a second: it is selected with a handle at each end. Keep dragging to
++extend it, or drag a handle (past the top or bottom edge to scroll), then
++choose Copy, Paste or Select screen. Copy follows Settings → General →
++Terminal → **Copying from terminals**. Long-press a blank cell for Paste alone.
++
+ **After the session moves:** open the host badge, choose "Switch host…", pick
+ another host, then look at both the terminal strip and the agent terminal.
+ Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+@@ -131,6 +140,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
+   `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_row_absent_on_fine_pointer`,
+   `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_send_the_expected_bytes`,
+   `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_keep_focus_and_scrollback`
++- **`touch-select`:** component coverage in
++  `web/src/components/blocks/terminalTouchSelection.test.ts` and
++  `web/src/components/blocks/TerminalView.test.tsx`; no browser test. By hand
++  on a phone or a touch-emulated phone viewport: long-press a word in a user
++  shell and expect it highlighted with two handles and the menu; choose Copy,
++  long-press a blank cell, choose Paste and expect the word at the prompt.
+ - **`reconnect`:**
+   `tests/e2e_ui/shells/test_terminal_bridge_reconnect.py::test_embedded_terminal_reconnects_after_transport_close`
+ - **`host-switch-reattach`:**
+@@ -174,6 +189,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
+ - Key bindings added for scrollback can change how full-screen harness terminals
+   behave. After a scrollback change, drive the harness terminal itself, not only
+   a plain shell.
++- A long-press in the terminal selects instead of opening the iOS text
++  callout, and never reaches the program as a click. A quick swipe still
++  scrolls; the long-press only starts after the finger rests.
+ - Terminal output is drawn on a canvas, so page text searches do not see it.
+   Use the tests' approach (the harness's own transcript or program input)
+   instead of reading the page.
+diff --git a/web/src/components/blocks/TerminalSession.test.ts b/web/src/components/blocks/TerminalSession.test.ts
+index 6631ac27850748ce325401360dd584412dd065fa..607071aa2d37ba17e17750457f7b63b39d553fc1 100644
+--- a/web/src/components/blocks/TerminalSession.test.ts
++++ b/web/src/components/blocks/TerminalSession.test.ts
+@@ -7,6 +7,7 @@
+ // open the right way — so we pin it here.
+ 
+ import { Terminal } from "@xterm/xterm";
++import { TOUCH_SELECT_LONG_PRESS_MS } from "./terminalTouchSelection";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
+   SHIFT_ENTER_CSI_U,
+@@ -1016,6 +1017,74 @@ describe("TerminalSession", () => {
+     session.dispose();
+   });
+ 
++  it("selects a word on long-press without scrolling or sending a tap to the program", async () => {
++    // WHY: xterm only selects with a mouse. The long-press must select through
++    // xterm, own the rest of the gesture, and cancel the touchend so iOS never
++    // turns it into a click that reaches the pane program as a mouse report.
++    const { session, container } = makeSession();
++    (session as unknown as { screenMetrics: () => WheelScreenMetrics }).screenMetrics = () => ({
++      left: 0,
++      top: 0,
++      cellWidth: 8,
++      cellHeight: 16,
++      cols: 80,
++      rows: 24,
++    });
++    const term = (session as unknown as { term: Terminal }).term;
++    await new Promise<void>((resolve) => {
++      term.write("git status", resolve);
++    });
++    const scrollSpy = vi.spyOn(term, "scrollLines");
++    const touchEvent = (type: string, points: { clientX: number; clientY: number }[]) => {
++      const ev = new Event(type, { bubbles: true, cancelable: true });
++      Object.defineProperty(ev, "touches", { value: points });
++      container.dispatchEvent(ev);
++      return ev;
++    };
++    vi.useFakeTimers();
++    try {
++      // Hold on "status" (cells 4-9) past the long-press delay.
++      touchEvent("touchstart", [{ clientX: 50, clientY: 8 }]);
++      vi.advanceTimersByTime(TOUCH_SELECT_LONG_PRESS_MS);
++      expect(term.getSelection()).toBe("status");
++
++      // The same finger now extends the selection instead of scrolling.
++      const move = touchEvent("touchmove", [{ clientX: 0, clientY: 12 }]);
++      expect(move.defaultPrevented).toBe(true);
++      expect(scrollSpy).not.toHaveBeenCalled();
++      expect(term.getSelection()).toBe("git status");
++      expect(touchEvent("touchend", []).defaultPrevented).toBe(true);
++      expect(session.touchSelection.isActive).toBe(true);
++
++      // A plain tap dismisses the selection and is left to the browser.
++      touchEvent("touchstart", [{ clientX: 50, clientY: 8 }]);
++      expect(touchEvent("touchend", []).defaultPrevented).toBe(false);
++      expect(term.hasSelection()).toBe(false);
++
++      // A scroll that starts before the delay never turns into a selection.
++      touchEvent("touchstart", [{ clientX: 50, clientY: 8 }]);
++      touchEvent("touchmove", [{ clientX: 50, clientY: 80 }]);
++      vi.advanceTimersByTime(TOUCH_SELECT_LONG_PRESS_MS);
++      touchEvent("touchend", []);
++      expect(term.hasSelection()).toBe(false);
++    } finally {
++      vi.useRealTimers();
++      session.dispose();
++    }
++  });
++
++  it("pastes through xterm so bracketed paste applies", () => {
++    const { session, socket } = makeSession();
++    const term = (session as unknown as { term: Terminal }).term;
++    const pasteSpy = vi.spyOn(term, "paste");
++    socket.open();
++
++    session.paste("echo hi\n");
++
++    expect(pasteSpy).toHaveBeenCalledWith("echo hi\n");
++    session.dispose();
++  });
++
+   it("writes inbound binary frames through xterm's ordered queue and fires onActivity", () => {
+     // WHY: ArrayBuffer message frames are raw pane bytes — they must reach the
+     // terminal through xterm's ordered public write queue and trigger the
+diff --git a/web/src/components/blocks/TerminalSession.ts b/web/src/components/blocks/TerminalSession.ts
+index 91199a941604069cf44081038ae753e65baa970c..7d16740266cb654e927421476ee4c7d21462f4d4 100644
+--- a/web/src/components/blocks/TerminalSession.ts
++++ b/web/src/components/blocks/TerminalSession.ts
+@@ -21,6 +21,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
+ import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
+ import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
+ import { TerminalLinkProvider } from "./TerminalLinkProvider";
++import { TerminalTouchSelection } from "./terminalTouchSelection";
+ import { SHIFT_ENTER_CSI_U } from "./terminalExtraKeysModel";
+ 
+ // Card background colors derived from the app's CSS palette.
+@@ -644,6 +645,8 @@ export class TerminalSession {
+   private readonly dataDispose: { dispose: () => void };
+   private readonly osc52Dispose: { dispose: () => void };
+   private readonly codexPalette: CodexTerminalPalette | null;
++  /** Long-press text selection; the view renders its handles and menu. */
++  readonly touchSelection: TerminalTouchSelection;
+   private readonly onClipboardRequest?: TerminalClipboardListener;
+   /** Whether this visible, interactive attach may write the local clipboard. */
+   private clipboardEnabled: boolean;
+@@ -753,6 +756,7 @@ export class TerminalSession {
+     // Load the GPU renderer after open() (it needs the mounted canvas).
+     // Falls back to the DOM renderer when WebGL is unavailable.
+     this.webgl = loadWebglRenderer(this.term);
++    this.touchSelection = new TerminalTouchSelection(this.term, () => this.screenMetrics());
+     try {
+       this.fit.fit();
+     } catch (err) {
+@@ -893,11 +897,13 @@ export class TerminalSession {
+         if (e.touches.length !== 1) {
+           this.touchStart = null;
+           this.touchScrolling = false;
++          this.touchSelection.cancelPress();
+           return;
+         }
+         this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+         this.touchScrolling = false;
+         this.touchPartialLines = 0;
++        this.touchSelection.touchStart(this.touchStart.x, this.touchStart.y);
+       },
+       { signal },
+     );
+@@ -906,6 +912,11 @@ export class TerminalSession {
+       (e) => {
+         if (this.touchStart === null || e.touches.length !== 1) return;
+         const touch = e.touches[0];
++        // After a long-press the finger extends the selection instead.
++        if (this.touchSelection.touchMove(touch.clientX, touch.clientY)) {
++          if (e.cancelable) e.preventDefault();
++          return;
++        }
+         if (!this.touchScrolling) {
+           // Slop gate: taps and long-press jitter stay with the browser.
+           // Past the slop, the dominant axis decides — a mostly-horizontal
+@@ -913,6 +924,7 @@ export class TerminalSession {
+           const dx = Math.abs(touch.clientX - this.touchStart.x);
+           const dy = Math.abs(touch.clientY - this.touchStart.y);
+           if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) return;
++          this.touchSelection.cancelPress();
+           if (dx > dy) {
+             this.touchStart = null;
+             return;
+@@ -949,8 +961,28 @@ export class TerminalSession {
+       this.touchScrolling = false;
+       this.touchPartialLines = 0;
+     };
+-    container.addEventListener("touchend", endTouch, { signal });
+-    container.addEventListener("touchcancel", endTouch, { signal });
++    container.addEventListener(
++      "touchend",
++      (e) => {
++        // Cancelling a long-press's touchend keeps iOS from turning it into a
++        // click, which would reach the pane program as a mouse report.
++        if (this.touchSelection.touchEnd()) {
++          if (e.cancelable) e.preventDefault();
++        } else if (this.touchStart !== null && !this.touchScrolling) {
++          this.touchSelection.tap();
++        }
++        endTouch();
++      },
++      { passive: false, signal },
++    );
++    container.addEventListener(
++      "touchcancel",
++      () => {
++        this.touchSelection.touchEnd();
++        endTouch();
++      },
++      { signal },
++    );
+ 
+     // ResizeObserver fires on any layout-affecting change (window
+     // resize, font load, CSS class change). tmux deduplicates same-
+@@ -1009,6 +1041,11 @@ export class TerminalSession {
+     this.ws.send(INPUT_ENCODER.encode(data));
+   }
+ 
++  /** Paste text the way a browser paste would (bracketed when the program asks). */
++  paste(text: string): void {
++    this.term.paste(text);
++  }
++
+   /** Whether the program enabled application cursor keys (DECCKM). */
+   applicationCursorKeys(): boolean {
+     return this.term.modes.applicationCursorKeysMode;
+@@ -1044,6 +1081,7 @@ export class TerminalSession {
+     this.resizeObserver.disconnect();
+     this.dataDispose.dispose();
+     this.osc52Dispose.dispose();
++    this.touchSelection.dispose();
+     try {
+       this.ws.close();
+     } catch {
+diff --git a/web/src/components/blocks/TerminalTouchSelectionOverlay.tsx b/web/src/components/blocks/TerminalTouchSelectionOverlay.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..343999737bdb7f41839754bd47ab2e926d87a053
+--- /dev/null
++++ b/web/src/components/blocks/TerminalTouchSelectionOverlay.tsx
+@@ -0,0 +1,128 @@
++// Drag handles and the Copy / Paste / Select screen menu for a touch
++// selection. Positions arrive in the terminal surface's local coordinates;
++// the session owns the selection itself (see terminalTouchSelection.ts).
++
++import { memo, type PointerEvent, type TouchEvent } from "react";
++import type { TouchSelectionHandle, TouchSelectionSnapshot } from "./terminalTouchSelection";
++
++/** Gap between the selection and the menu, in CSS px. */
++const MENU_GAP_PX = 10;
++/** Menu height used to decide whether it fits above the selection. */
++const MENU_HEIGHT_PX = 40;
++/** Extra clearance below the selection for the end handle's knob. */
++const END_KNOB_CLEARANCE_PX = 14;
++
++export interface TerminalTouchSelectionOverlayProps {
++  snapshot: TouchSelectionSnapshot;
++  canPaste: boolean;
++  /** Handle color, matched to the terminal's selection highlight. */
++  accent: string;
++  onCopy: () => void;
++  onPaste: () => void;
++  onSelectScreen: () => void;
++  onHandleDragStart: (handle: TouchSelectionHandle, x: number, y: number) => void;
++  onHandleDrag: (x: number, y: number) => void;
++  onHandleDragEnd: () => void;
++}
++
++// iOS moves focus to a tapped button even when pointerdown is prevented, which
++// blurs the terminal and drops the soft keyboard; cancelling touchend stops it.
++function keepTerminalFocus(e: PointerEvent | TouchEvent) {
++  e.preventDefault();
++}
++
++export const TerminalTouchSelectionOverlay = memo(function TerminalTouchSelectionOverlay({
++  snapshot,
++  canPaste,
++  accent,
++  onCopy,
++  onPaste,
++  onSelectScreen,
++  onHandleDragStart,
++  onHandleDrag,
++  onHandleDragEnd,
++}: TerminalTouchSelectionOverlayProps) {
++  const handle = (which: TouchSelectionHandle, anchor: { x: number; y: number } | null) => {
++    if (anchor === null) return null;
++    return (
++      <div
++        key={which}
++        data-testid={`terminal-selection-handle-${which}`}
++        aria-hidden
++        className="pointer-events-auto absolute flex w-11 touch-none justify-center"
++        style={{
++          left: anchor.x - 22,
++          top: anchor.y - snapshot.cellHeight - (which === "start" ? 14 : 0),
++          height: snapshot.cellHeight + 14,
++          flexDirection: which === "start" ? "column" : "column-reverse",
++          alignItems: "center",
++        }}
++        onPointerDown={(e) => {
++          if (!e.isPrimary) return;
++          e.preventDefault();
++          e.currentTarget.setPointerCapture(e.pointerId);
++          onHandleDragStart(which, e.clientX, e.clientY);
++        }}
++        onPointerMove={(e) => {
++          if (e.currentTarget.hasPointerCapture(e.pointerId)) onHandleDrag(e.clientX, e.clientY);
++        }}
++        onPointerUp={onHandleDragEnd}
++        onPointerCancel={onHandleDragEnd}
++        onTouchEnd={keepTerminalFocus}
++      >
++        <span className="size-3 shrink-0 rounded-full" style={{ backgroundColor: accent }} />
++        <span className="w-0.5 flex-1" style={{ backgroundColor: accent }} />
++      </div>
++    );
++  };
++
++  const menuTop =
++    snapshot.top - MENU_HEIGHT_PX - MENU_GAP_PX >= 0
++      ? snapshot.top - MENU_HEIGHT_PX - MENU_GAP_PX
++      : snapshot.bottom + MENU_GAP_PX + (snapshot.hasSelection ? END_KNOB_CLEARANCE_PX : 0);
++  const actions = [
++    snapshot.hasSelection ? { label: "Copy", run: onCopy } : null,
++    canPaste ? { label: "Paste", run: onPaste } : null,
++    { label: "Select screen", run: onSelectScreen },
++  ].filter((action) => action !== null);
++
++  return (
++    <div
++      className="pointer-events-none absolute inset-0 z-10"
++      data-testid="terminal-touch-selection"
++    >
++      {handle("start", snapshot.start)}
++      {handle("end", snapshot.end)}
++      {!snapshot.dragging && (
++        <div
++          role="toolbar"
++          aria-label="Terminal selection"
++          className="pointer-events-auto absolute left-1/2 flex -translate-x-1/2 overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground text-sm shadow-lg"
++          style={{ top: menuTop, height: MENU_HEIGHT_PX }}
++        >
++          {actions.map((action, index) => (
++            <button
++              key={action.label}
++              type="button"
++              tabIndex={-1}
++              className={
++                "whitespace-nowrap px-3.5 active:bg-accent" +
++                (index > 0 ? " border-l border-border" : "")
++              }
++              onPointerDown={keepTerminalFocus}
++              // Touch acts on touchend: it is a user gesture for the clipboard,
++              // and cancelling it suppresses the click that would run it twice.
++              onTouchEnd={(e) => {
++                e.preventDefault();
++                action.run();
++              }}
++              onClick={action.run}
++            >
++              {action.label}
++            </button>
++          ))}
++        </div>
++      )}
++    </div>
++  );
++});
+diff --git a/web/src/components/blocks/TerminalView.test.tsx b/web/src/components/blocks/TerminalView.test.tsx
+index 397da5cddac1a7766b08af55fc34d467ea8371f4..be64af841aaf2246432213e95082be8904cbd677 100644
+--- a/web/src/components/blocks/TerminalView.test.tsx
++++ b/web/src/components/blocks/TerminalView.test.tsx
+@@ -23,6 +23,7 @@ import {
+   writeTerminalClipboardPreference,
+ } from "@/lib/terminalClipboardPreferences";
+ import type { ConnectionState } from "./TerminalSession";
++import type { TouchSelectionSnapshot } from "./terminalTouchSelection";
+ import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
+ import {
+   TerminalView,
+@@ -84,9 +85,23 @@ const terminalSessionMock = vi.hoisted(() => ({
+     focus: ReturnType<typeof vi.fn>;
+     sendInput: ReturnType<typeof vi.fn>;
+     setInputTransform: ReturnType<typeof vi.fn>;
++    paste: ReturnType<typeof vi.fn>;
++    touchSelection: FakeTouchSelection;
+   }[],
+ }));
+ 
++/** The session's long-press selection, reduced to what the view calls. */
++interface FakeTouchSelection {
++  listener: ((snapshot: TouchSelectionSnapshot | null) => void) | null;
++  setListener: (fn: ((snapshot: TouchSelectionSnapshot | null) => void) | null) => void;
++  selectionText: ReturnType<typeof vi.fn>;
++  clear: ReturnType<typeof vi.fn>;
++  selectScreen: ReturnType<typeof vi.fn>;
++  beginHandleDrag: ReturnType<typeof vi.fn>;
++  dragHandle: ReturnType<typeof vi.fn>;
++  endHandleDrag: ReturnType<typeof vi.fn>;
++}
++
+ vi.mock("./TerminalSession", async (importOriginal) => ({
+   // Keep the real module (isUnexpectedTerminalClose and friends) —
+   // only the session class itself is replaced.
+@@ -99,6 +114,19 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
+     sendInput = vi.fn();
+     setInputTransform = vi.fn();
+     applicationCursorKeys = () => false;
++    paste = vi.fn();
++    touchSelection: FakeTouchSelection = {
++      listener: null,
++      setListener(fn) {
++        this.listener = fn;
++      },
++      selectionText: vi.fn(() => "selected words"),
++      clear: vi.fn(),
++      selectScreen: vi.fn(),
++      beginHandleDrag: vi.fn(),
++      dragHandle: vi.fn(),
++      endHandleDrag: vi.fn(),
++    };
+ 
+     constructor(
+       container: HTMLDivElement,
+@@ -127,6 +155,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
+         focus: this.focus,
+         sendInput: this.sendInput,
+         setInputTransform: this.setInputTransform,
++        paste: this.paste,
++        touchSelection: this.touchSelection,
+       });
+     }
+   },
+@@ -363,6 +393,133 @@ describe("control-mode terminal", () => {
+   });
+ });
+ 
++describe("touch selection menu", () => {
++  const selected: TouchSelectionSnapshot = {
++    start: { x: 40, y: 60 },
++    end: { x: 120, y: 60 },
++    top: 40,
++    bottom: 60,
++    cellHeight: 20,
++    hasSelection: true,
++    dragging: false,
++  };
++
++  async function renderSelectingView(readOnly = false) {
++    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly={readOnly} />);
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
++    const terminal = terminalSessionMock.instances[0];
++    act(() => terminal.onState({ kind: "connected" }));
++    expect(terminal.touchSelection.listener).toBeTypeOf("function");
++    return terminal;
++  }
++
++  function showSelection(
++    terminal: (typeof terminalSessionMock.instances)[number],
++    snap = selected,
++  ) {
++    act(() => terminal.touchSelection.listener!(snap));
++  }
++
++  /** Tap a menu button the way a phone does: the action runs on touchend. */
++  function tapMenu(name: string) {
++    const button = within(screen.getByRole("toolbar", { name: "Terminal selection" })).getByRole(
++      "button",
++      { name },
++    );
++    const notCancelled = fireEvent.touchEnd(button);
++    // Cancelled so iOS keeps focus (and the keyboard) on the terminal.
++    expect(notCancelled).toBe(false);
++  }
++
++  it("shows handles and the menu for a selection, and hides them when it ends", async () => {
++    const terminal = await renderSelectingView();
++    expect(screen.queryByTestId("terminal-touch-selection")).toBeNull();
++
++    showSelection(terminal);
++    expect(screen.getByTestId("terminal-selection-handle-start")).toBeInTheDocument();
++    expect(screen.getByTestId("terminal-selection-handle-end")).toBeInTheDocument();
++    const menu = screen.getByRole("toolbar", { name: "Terminal selection" });
++    expect(
++      within(menu)
++        .getAllByRole("button")
++        .map((b) => b.textContent),
++    ).toEqual(["Copy", "Paste", "Select screen"]);
++
++    // The menu steps aside while a handle is dragged.
++    showSelection(terminal, { ...selected, dragging: true });
++    expect(screen.queryByRole("toolbar", { name: "Terminal selection" })).toBeNull();
++
++    showSelection(terminal, null as unknown as TouchSelectionSnapshot);
++    expect(screen.queryByTestId("terminal-touch-selection")).toBeNull();
++  });
++
++  it("forwards handle drags to the session in client coordinates", async () => {
++    const terminal = await renderSelectingView();
++    showSelection(terminal);
++    const handle = screen.getByTestId("terminal-selection-handle-end");
++    handle.setPointerCapture = vi.fn();
++    handle.hasPointerCapture = () => true;
++
++    fireEvent.pointerDown(handle, { pointerId: 3, isPrimary: true, clientX: 121, clientY: 70 });
++    fireEvent.pointerMove(handle, { pointerId: 3, clientX: 150, clientY: 90 });
++    fireEvent.pointerUp(handle, { pointerId: 3 });
++
++    expect(terminal.touchSelection.beginHandleDrag).toHaveBeenCalledWith("end", 121, 70);
++    expect(terminal.touchSelection.dragHandle).toHaveBeenCalledWith(150, 90);
++    expect(terminal.touchSelection.endHandleDrag).toHaveBeenCalled();
++  });
++
++  it("copies the selection through the terminal clipboard consent", async () => {
++    writeTerminalClipboardPreference("allow");
++    const terminal = await renderSelectingView();
++    showSelection(terminal);
++
++    tapMenu("Copy");
++
++    expect(terminal.touchSelection.clear).toHaveBeenCalled();
++    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("selected words"));
++  });
++
++  it("asks for clipboard consent before the first touch copy", async () => {
++    const terminal = await renderSelectingView();
++    showSelection(terminal);
++
++    tapMenu("Copy");
++
++    await waitFor(() => expect(screen.queryByTestId("terminal-clipboard-consent")).not.toBeNull());
++    expect(clipboardMock.copyText).not.toHaveBeenCalled();
++  });
++
++  it("pastes the clipboard into the session", async () => {
++    const readText = vi.fn(async () => "npm test");
++    vi.stubGlobal("navigator", { ...navigator, clipboard: { readText } });
++    try {
++      const terminal = await renderSelectingView();
++      showSelection(terminal, { ...selected, start: null, end: null, hasSelection: false });
++      const menu = screen.getByRole("toolbar", { name: "Terminal selection" });
++      expect(within(menu).queryByRole("button", { name: "Copy" })).toBeNull();
++
++      tapMenu("Paste");
++
++      expect(readText).toHaveBeenCalledTimes(1);
++      await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("npm test"));
++      expect(terminal.touchSelection.clear).toHaveBeenCalled();
++    } finally {
++      vi.unstubAllGlobals();
++    }
++  });
++
++  it("selects the screen, and offers no Paste on a read-only terminal", async () => {
++    const terminal = await renderSelectingView(true);
++    showSelection(terminal);
++    const menu = screen.getByRole("toolbar", { name: "Terminal selection" });
++    expect(within(menu).queryByRole("button", { name: "Paste" })).toBeNull();
++
++    tapMenu("Select screen");
++    expect(terminal.touchSelection.selectScreen).toHaveBeenCalled();
++  });
++});
++
+ describe("terminal clipboard", () => {
+   async function renderClipboardView() {
+     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+diff --git a/web/src/components/blocks/TerminalView.tsx b/web/src/components/blocks/TerminalView.tsx
+index a1203e274d9b0879b160f3dc8a39135277e46be2..ac8e9fd3acc11a93e90ba39ba3a296ba10c2217d 100644
+--- a/web/src/components/blocks/TerminalView.tsx
++++ b/web/src/components/blocks/TerminalView.tsx
+@@ -56,6 +56,8 @@ import {
+   WS_CLOSE_WRONG_REPLICA,
+ } from "./TerminalSession";
+ import { TerminalExtraKeys, type ExtraKeysTarget } from "./TerminalExtraKeys";
++import { TerminalTouchSelectionOverlay } from "./TerminalTouchSelectionOverlay";
++import type { TouchSelectionHandle, TouchSelectionSnapshot } from "./terminalTouchSelection";
+ 
+ /**
+  * Backoff schedule for automatic re-attach after a transport-level
+@@ -294,6 +296,26 @@ export function TerminalView({
+   const isDarkRef = useRef(isDark);
+   isDarkRef.current = isDark;
+   const sessionRef = useRef<TerminalSession | null>(null);
++  // Long-press selection (touch): the session reports client coordinates;
++  // the overlay draws in the terminal surface's local ones.
++  const surfaceRef = useRef<HTMLDivElement | null>(null);
++  const [touchSelection, setTouchSelection] = useState<TouchSelectionSnapshot | null>(null);
++  const handleTouchSelection = useCallback((snapshot: TouchSelectionSnapshot | null) => {
++    const origin = surfaceRef.current?.getBoundingClientRect();
++    if (snapshot === null || !origin) {
++      setTouchSelection(null);
++      return;
++    }
++    const local = (point: { x: number; y: number } | null) =>
++      point && { x: point.x - origin.left, y: point.y - origin.top };
++    setTouchSelection({
++      ...snapshot,
++      start: local(snapshot.start),
++      end: local(snapshot.end),
++      top: snapshot.top - origin.top,
++      bottom: snapshot.bottom - origin.top,
++    });
++  }, []);
+   // Extra-keys row (touch devices). The row keeps its sticky-modifier rewrite
+   // here so a re-dialed session inherits it; the target resolves the live
+   // session at event time, so it is created once and never re-renders the row.
+@@ -384,11 +406,13 @@ export function TerminalView({
+   );
+ 
+   const notifyClipboardRequest = useCallback(
+-    (text: string, copyEvent?: ClipboardEvent) => {
++    // ``userSelection`` marks a copy the user asked for without a browser copy
++    // event (the touch selection menu); it is treated like a native copy.
++    (text: string, copyEvent?: ClipboardEvent, userSelection = copyEvent !== undefined) => {
+       if (
+         !clipboardMountedRef.current ||
+         !clipboardActiveRef.current ||
+-        (readOnly && !copyEvent) ||
++        (readOnly && !userSelection) ||
+         clipboardScopeRef.current.scope !== clipboardScope ||
+         clipboardScopeRef.current.epoch !== clipboardScopeEpoch
+       ) {
+@@ -408,7 +432,7 @@ export function TerminalView({
+         });
+         return;
+       }
+-      const source = copyEvent ? "selection" : "terminal";
++      const source = userSelection ? "selection" : "terminal";
+       if (
+         clipboardConsentRef.current.decision === "allow" &&
+         copyEvent?.clipboardData &&
+@@ -423,7 +447,7 @@ export function TerminalView({
+       }
+       if (
+         clipboardConsentRef.current.decision === "allow" &&
+-        (copyEvent || !clipboardNeedsClickRef.current)
++        (userSelection || !clipboardNeedsClickRef.current)
+       ) {
+         setClipboardPrompt(null);
+         queueSessionClipboardCopy({
+@@ -518,7 +542,55 @@ export function TerminalView({
+   const disposeActiveSession = useCallback(() => {
+     sessionRef.current?.dispose();
+     sessionRef.current = null;
++    setTouchSelection(null);
++  }, []);
++
++  const copyTouchSelection = useCallback(() => {
++    const selection = sessionRef.current?.touchSelection;
++    if (!selection) return;
++    const text = selection.selectionText();
++    selection.clear();
++    if (text) notifyClipboardRequest(text, undefined, true);
++  }, [notifyClipboardRequest]);
++
++  const pasteFromClipboard = useCallback(() => {
++    const session = sessionRef.current;
++    if (!session || readOnly) return;
++    session.touchSelection.clear();
++    if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
++      toast.error("Pasting isn't available in this browser.");
++      return;
++    }
++    // Called inside the tap so the browser treats it as a user paste; iOS
++    // then asks for a confirming tap on its own Paste bubble.
++    navigator.clipboard.readText().then(
++      (text) => {
++        if (text && sessionRef.current === session) session.paste(text);
++      },
++      (error: unknown) => {
++        // NotAllowedError: the user dismissed the system paste prompt.
++        if (error instanceof DOMException && error.name === "NotAllowedError") return;
++        toast.error("Couldn't read the clipboard.");
++      },
++    );
++  }, [readOnly]);
++
++  const selectTerminalScreen = useCallback(() => {
++    sessionRef.current?.touchSelection.selectScreen();
+   }, []);
++  const startSelectionHandleDrag = useCallback(
++    (handle: TouchSelectionHandle, x: number, y: number) =>
++      sessionRef.current?.touchSelection.beginHandleDrag(handle, x, y),
++    [],
++  );
++  const dragSelectionHandle = useCallback(
++    (x: number, y: number) => sessionRef.current?.touchSelection.dragHandle(x, y),
++    [],
++  );
++  const endSelectionHandleDrag = useCallback(
++    () => sessionRef.current?.touchSelection.endHandleDrag(),
++    [],
++  );
+ 
+   useLayoutEffect(() => {
+     mountedRef.current = true;
+@@ -624,6 +696,7 @@ export function TerminalView({
+         );
+         sessionRef.current = terminalSession;
+         terminalSession.setInputTransform(extraKeysTransformRef.current);
++        terminalSession.touchSelection.setListener(handleTouchSelection);
+         // Relay-connected with a direct URL on offer: negotiate the
+         // loopback upgrade in the background. In Chrome this is what
+         // raises the Local Network Access prompt; the probe socket
+@@ -655,6 +728,7 @@ export function TerminalView({
+       notifyInput,
+       notifyClipboardRequest,
+       notifyFileLink,
++      handleTouchSelection,
+       disposeActiveSession,
+     ],
+   );
+@@ -802,10 +876,25 @@ export function TerminalView({
+         />
+       )}
+       <div
+-        className="relative min-h-0 flex-1 overflow-hidden p-3"
++        ref={surfaceRef}
++        // No iOS long-press callout: the long-press selects terminal text instead.
++        className="relative min-h-0 flex-1 overflow-hidden p-3 [-webkit-touch-callout:none]"
+         style={{ backgroundColor: terminalBackground }}
+       >
+         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
++        {touchSelection !== null && state.kind === "connected" && (
++          <TerminalTouchSelectionOverlay
++            snapshot={touchSelection}
++            canPaste={!readOnly}
++            accent={isDark ? "#22d3ee" : "#0891b2"}
++            onCopy={copyTouchSelection}
++            onPaste={pasteFromClipboard}
++            onSelectScreen={selectTerminalScreen}
++            onHandleDragStart={startSelectionHandleDrag}
++            onHandleDrag={dragSelectionHandle}
++            onHandleDragEnd={endSelectionHandleDrag}
++          />
++        )}
+         {state.kind !== "connected" && (
+           <StatusOverlay
+             state={state}
+diff --git a/web/src/components/blocks/terminalTouchSelection.test.ts b/web/src/components/blocks/terminalTouchSelection.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b7bf2dd591df88a1acdf840ebbe4f6e595dbc70
+--- /dev/null
++++ b/web/src/components/blocks/terminalTouchSelection.test.ts
+@@ -0,0 +1,211 @@
++// Touch selection runs against a real xterm (as TerminalSession's tests do);
++// jsdom has no layout, so the grid geometry is supplied directly.
++
++import { Terminal } from "@xterm/xterm";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  TOUCH_SELECT_LONG_PRESS_MS,
++  TerminalTouchSelection,
++  boundaryAt,
++  extendRange,
++  rangeLength,
++  spanRange,
++  wordRangeAt,
++  type TouchGridMetrics,
++  type TouchSelectionSnapshot,
++} from "./terminalTouchSelection";
++
++const CELL_W = 10;
++const CELL_H = 20;
++const grid: TouchGridMetrics = {
++  left: 0,
++  top: 0,
++  cellWidth: CELL_W,
++  cellHeight: CELL_H,
++  cols: 20,
++  rows: 5,
++};
++
++/** Client point at the middle of a cell. */
++const at = (col: number, row: number) => [col * CELL_W + 5, row * CELL_H + 10] as const;
++
++async function makeTerminal(text: string) {
++  const container = document.createElement("div");
++  document.body.appendChild(container);
++  const term = new Terminal({ cols: grid.cols, rows: grid.rows, allowProposedApi: true });
++  term.open(container);
++  await new Promise<void>((resolve) => {
++    term.write(text, resolve);
++  });
++  return term;
++}
++
++describe("touch selection geometry", () => {
++  it("finds the word under a cell and nothing on blanks or separators", async () => {
++    const term = await makeTerminal("git push (origin)  x\r\n你好 ok");
++    const line = (row: number) => term.buffer.active.getLine(row);
++    const separators = term.options.wordSeparator ?? " ";
++
++    expect(wordRangeAt(line(0), 1, separators)).toEqual({ start: 0, end: 3 });
++    expect(wordRangeAt(line(0), 12, separators)).toEqual({ start: 10, end: 16 });
++    expect(wordRangeAt(line(0), 3, separators)).toBeNull(); // space
++    expect(wordRangeAt(line(0), 9, separators)).toBeNull(); // "("
++    // A wide character spans two cells; pressing either half takes both.
++    expect(wordRangeAt(line(1), 1, separators)).toEqual({ start: 0, end: 4 });
++    term.dispose();
++  });
++
++  it("maps points to cell boundaries and ranges to xterm select lengths", () => {
++    expect(boundaryAt(34, 50, grid, 100)).toEqual({ col: 3, row: 102 });
++    expect(boundaryAt(36, 50, grid, 100)).toEqual({ col: 4, row: 102 });
++    // Clamped to the grid on every side.
++    expect(boundaryAt(-40, -40, grid, 0)).toEqual({ col: 0, row: 0 });
++    expect(boundaryAt(999, 999, grid, 0)).toEqual({ col: 20, row: 4 });
++
++    const range = { start: { col: 15, row: 1 }, end: { col: 3, row: 2 } };
++    expect(rangeLength(range, 20)).toBe(8);
++  });
++
++  it("extends a pressed word toward the finger without dropping the word", () => {
++    const word = { start: { col: 4, row: 2 }, end: { col: 9, row: 2 } };
++    expect(extendRange(word, { col: 6, row: 2 })).toBe(word);
++    expect(extendRange(word, { col: 1, row: 1 })).toEqual({
++      start: { col: 1, row: 1 },
++      end: word.end,
++    });
++    expect(extendRange(word, { col: 12, row: 3 })).toEqual({
++      start: word.start,
++      end: { col: 12, row: 3 },
++    });
++  });
++
++  it("orders a dragged handle against the fixed end and refuses an empty span", () => {
++    const fixed = { col: 5, row: 1 };
++    expect(spanRange(fixed, { col: 2, row: 1 })).toEqual({ start: { col: 2, row: 1 }, end: fixed });
++    expect(spanRange(fixed, { col: 0, row: 2 })).toEqual({ start: fixed, end: { col: 0, row: 2 } });
++    expect(spanRange(fixed, { col: 5, row: 1 })).toBeNull();
++  });
++});
++
++describe("TerminalTouchSelection", () => {
++  let term: Terminal;
++  let selection: TerminalTouchSelection;
++  let snapshots: (TouchSelectionSnapshot | null)[];
++
++  beforeEach(async () => {
++    term = await makeTerminal("hello world\r\nfoo-bar baz\r\n\r\nlast line");
++    vi.useFakeTimers();
++    selection = new TerminalTouchSelection(term, () => grid);
++    snapshots = [];
++    selection.setListener((s) => snapshots.push(s));
++    // Subscribing reports the current (idle) state once.
++    expect(snapshots).toEqual([null]);
++    snapshots = [];
++  });
++
++  afterEach(() => {
++    selection.dispose();
++    term.dispose();
++    vi.useRealTimers();
++  });
++
++  function longPress(col: number, row: number) {
++    selection.touchStart(...at(col, row));
++    vi.advanceTimersByTime(TOUCH_SELECT_LONG_PRESS_MS);
++  }
++
++  it("selects the word under a long-press and anchors a handle at each end", () => {
++    longPress(8, 0);
++
++    expect(term.getSelection()).toBe("world");
++    expect(snapshots.at(-1)).toMatchObject({
++      start: { x: 6 * CELL_W, y: CELL_H },
++      end: { x: 11 * CELL_W, y: CELL_H },
++      top: 0,
++      bottom: CELL_H,
++      hasSelection: true,
++      dragging: false,
++    });
++    // Lifting the finger ends the long-press, which the caller must swallow.
++    expect(selection.touchEnd()).toBe(true);
++    expect(selection.isActive).toBe(true);
++  });
++
++  it("does nothing before the hold time, or once the finger starts scrolling", () => {
++    selection.touchStart(...at(8, 0));
++    vi.advanceTimersByTime(TOUCH_SELECT_LONG_PRESS_MS - 1);
++    expect(selection.touchEnd()).toBe(false);
++    vi.advanceTimersByTime(TOUCH_SELECT_LONG_PRESS_MS);
++    expect(term.hasSelection()).toBe(false);
++
++    selection.touchStart(...at(8, 0));
++    selection.cancelPress();
++    vi.advanceTimersByTime(TOUCH_SELECT_LONG_PRESS_MS);
++    expect(term.hasSelection()).toBe(false);
++    expect(snapshots).toEqual([]);
++  });
++
++  it("extends the pressed word as the same finger drags, then shows the menu on lift", () => {
++    longPress(8, 0);
++
++    expect(selection.touchMove(3 * CELL_W, 1 * CELL_H + 10)).toBe(true);
++    expect(term.getSelection()).toBe("world\nfoo");
++    expect(snapshots.at(-1)?.dragging).toBe(true);
++
++    // Dragging back before the word keeps the word and grows to the left.
++    selection.touchMove(2 * CELL_W, 10);
++    expect(term.getSelection()).toBe("llo world");
++
++    selection.touchEnd();
++    expect(snapshots.at(-1)?.dragging).toBe(false);
++  });
++
++  it("offers the menu without handles when the long-press lands on a blank cell", () => {
++    longPress(5, 2);
++
++    expect(term.hasSelection()).toBe(false);
++    expect(snapshots.at(-1)).toMatchObject({
++      start: null,
++      end: null,
++      top: 2 * CELL_H,
++      hasSelection: false,
++    });
++  });
++
++  it("moves the dragged handle and lets it cross the fixed end", () => {
++    longPress(8, 0);
++    selection.touchEnd();
++
++    // Grab the start handle a little below its boundary, as a finger would.
++    selection.beginHandleDrag("start", 6 * CELL_W + 3, 40);
++    selection.dragHandle(0 * CELL_W + 3, 40);
++    expect(term.getSelection()).toBe("hello world");
++
++    // Past the end handle, the dragged handle becomes the new end.
++    selection.dragHandle(4 * CELL_W + 3, 40 + CELL_H);
++    expect(term.getSelection()).toBe("\nfoo-");
++    selection.endHandleDrag();
++    expect(snapshots.at(-1)?.dragging).toBe(false);
++  });
++
++  it("selects the visible screen", () => {
++    selection.selectScreen();
++    expect(term.getSelection()).toBe("hello world\nfoo-bar baz\n\nlast line\n");
++    expect(snapshots.at(-1)?.hasSelection).toBe(true);
++  });
++
++  it("dismisses on a tap, and when xterm drops the selection itself", () => {
++    longPress(8, 0);
++    selection.touchEnd();
++    selection.tap();
++    expect(term.hasSelection()).toBe(false);
++    expect(snapshots.at(-1)).toBeNull();
++    expect(selection.isActive).toBe(false);
++
++    longPress(1, 1);
++    selection.touchEnd();
++    term.clearSelection();
++    expect(snapshots.at(-1)).toBeNull();
++    expect(selection.isActive).toBe(false);
++  });
++});
+diff --git a/web/src/components/blocks/terminalTouchSelection.ts b/web/src/components/blocks/terminalTouchSelection.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a954ebf43dfc80e6d040613c3ea256f894a0e19b
+--- /dev/null
++++ b/web/src/components/blocks/terminalTouchSelection.ts
+@@ -0,0 +1,377 @@
++// Touch text selection for the terminal. xterm only selects with a mouse, so
++// a long-press selects the word under the finger through xterm's public
++// select() API, drag handles adjust the range, and the view draws the menu.
++
++import type { IBufferLine, IDisposable, Terminal } from "@xterm/xterm";
++
++/** How long a still finger must rest before the word under it is selected. */
++export const TOUCH_SELECT_LONG_PRESS_MS = 450;
++
++/** Character-grid geometry in client (viewport) coordinates. */
++export interface TouchGridMetrics {
++  left: number;
++  top: number;
++  cellWidth: number;
++  cellHeight: number;
++  cols: number;
++  rows: number;
++}
++
++/** A boundary between cells: ``col`` in 0..cols, ``row`` an absolute buffer line. */
++export interface CellBoundary {
++  col: number;
++  row: number;
++}
++
++/** Half-open range between two boundaries, ``start`` before ``end``. */
++export interface CellRange {
++  start: CellBoundary;
++  end: CellBoundary;
++}
++
++export type TouchSelectionHandle = "start" | "end";
++
++/** What the view draws, in client coordinates. */
++export interface TouchSelectionSnapshot {
++  /** Each handle's anchor (boundary x, row bottom), or null while scrolled out of view. */
++  start: { x: number; y: number } | null;
++  end: { x: number; y: number } | null;
++  /** Vertical extent of the visible selection, or of the pressed row when nothing is selected. */
++  top: number;
++  bottom: number;
++  cellHeight: number;
++  hasSelection: boolean;
++  /** A finger is adjusting the range; the menu stays hidden until it lifts. */
++  dragging: boolean;
++}
++
++export type TouchSelectionListener = (snapshot: TouchSelectionSnapshot | null) => void;
++
++export function compareBoundaries(a: CellBoundary, b: CellBoundary): number {
++  return a.row - b.row || a.col - b.col;
++}
++
++/** Cell count xterm's ``select(col, row, length)`` needs to cover the range. */
++export function rangeLength(range: CellRange, cols: number): number {
++  return (range.end.row - range.start.row) * cols + range.end.col - range.start.col;
++}
++
++/** The cell under a point (long-press target), clamped to the grid. */
++export function cellAt(x: number, y: number, grid: TouchGridMetrics, viewportY: number) {
++  return {
++    col: clamp(Math.floor((x - grid.left) / grid.cellWidth), 0, grid.cols - 1),
++    row: clamp(Math.floor((y - grid.top) / grid.cellHeight), 0, grid.rows - 1) + viewportY,
++  };
++}
++
++/** The boundary nearest a point on the row under it (handle drags). */
++export function boundaryAt(
++  x: number,
++  y: number,
++  grid: TouchGridMetrics,
++  viewportY: number,
++): CellBoundary {
++  return {
++    col: clamp(Math.round((x - grid.left) / grid.cellWidth), 0, grid.cols),
++    row: clamp(Math.floor((y - grid.top) / grid.cellHeight), 0, grid.rows - 1) + viewportY,
++  };
++}
++
++/**
++ * Columns ``[start, end)`` of the word covering ``col``, or null on blank or
++ * separator cells. The trailing half of a wide character joins its word.
++ */
++export function wordRangeAt(
++  line: IBufferLine | undefined,
++  col: number,
++  separators: string,
++): { start: number; end: number } | null {
++  if (!line) return null;
++  const isWordCell = (x: number) => {
++    const cell = line.getCell(x);
++    if (!cell) return false;
++    if (cell.getWidth() === 0) return true;
++    const chars = cell.getChars();
++    return chars.trim() !== "" && !separators.includes(chars);
++  };
++  if (!isWordCell(col)) return null;
++  let start = col;
++  while (start > 0 && isWordCell(start - 1)) start -= 1;
++  let end = col + 1;
++  while (end < line.length && isWordCell(end)) end += 1;
++  return { start, end };
++}
++
++/** Grow a pressed word toward a dragging finger without ever dropping the word. */
++export function extendRange(anchor: CellRange, point: CellBoundary): CellRange {
++  if (compareBoundaries(point, anchor.start) < 0) return { start: point, end: anchor.end };
++  if (compareBoundaries(point, anchor.end) > 0) return { start: anchor.start, end: point };
++  return anchor;
++}
++
++/** The range spanned by a dragged handle and the opposite, fixed end. */
++export function spanRange(fixed: CellBoundary, point: CellBoundary): CellRange | null {
++  const order = compareBoundaries(point, fixed);
++  if (order === 0) return null;
++  return order < 0 ? { start: point, end: fixed } : { start: fixed, end: point };
++}
++
++function clamp(value: number, min: number, max: number): number {
++  return Math.min(Math.max(value, min), max);
++}
++
++/**
++ * Long-press / handle-drag state machine over one xterm instance. The owning
++ * session forwards its container's touch events; the view subscribes to
++ * snapshots and calls back for handle drags and menu actions.
++ */
++export class TerminalTouchSelection {
++  private readonly term: Terminal;
++  private readonly grid: () => TouchGridMetrics | null;
++  private readonly disposables: IDisposable[];
++  private listener: TouchSelectionListener | null = null;
++  private pressTimer: number | null = null;
++  private pressPoint: { x: number; y: number } | null = null;
++  /** The pressed word (or cell); a drag that follows the long-press extends it. */
++  private pressAnchor: CellRange | null = null;
++  private longPressed = false;
++  /** The selection mode is showing (handles and/or the menu). */
++  private active = false;
++  /** Absolute row the menu tracks after a long-press on a blank cell. */
++  private menuRow: number | null = null;
++  private dragging = false;
++  private dragFixed: CellBoundary | null = null;
++  private grabOffset = { dx: 0, dy: 0 };
++  private frame = 0;
++
++  constructor(term: Terminal, grid: () => TouchGridMetrics | null) {
++    this.term = term;
++    this.grid = grid;
++    this.disposables = [
++      // xterm clears the selection itself on resize, buffer switches and
++      // mouse-mode changes; the handles and menu go with it.
++      term.onSelectionChange(() => {
++        if (this.active && this.menuRow === null && !term.hasSelection()) this.dismiss();
++        else this.schedule();
++      }),
++      term.onScroll(() => this.schedule()),
++      term.onRender(() => this.schedule()),
++    ];
++  }
++
++  setListener(listener: TouchSelectionListener | null): void {
++    this.listener = listener;
++    listener?.(this.active ? this.snapshot() : null);
++  }
++
++  get isActive(): boolean {
++    return this.active;
++  }
++
++  /** A single finger touched the terminal: arm the long-press. */
++  touchStart(x: number, y: number): void {
++    this.cancelPress();
++    this.longPressed = false;
++    this.pressPoint = { x, y };
++    this.pressTimer = window.setTimeout(() => this.longPress(), TOUCH_SELECT_LONG_PRESS_MS);
++  }
++
++  /**
++   * The finger moved. Returns true while a long-press owns the gesture (the
++   * caller must not scroll); before that, any move the caller treats as a
++   * scroll should call {@link cancelPress}.
++   */
++  touchMove(x: number, y: number): boolean {
++    if (!this.longPressed) return false;
++    const grid = this.grid();
++    if (grid === null) return true;
++    const point = boundaryAt(x, y, grid, this.term.buffer.active.viewportY);
++    if (this.pressAnchor === null) {
++      // A long-press on a blank cell: dragging starts a selection from it.
++      const cell = cellAt(this.pressPoint!.x, this.pressPoint!.y, grid, viewportYOf(this.term));
++      this.pressAnchor = { start: cell, end: { col: cell.col + 1, row: cell.row } };
++    }
++    this.dragging = true;
++    this.menuRow = null;
++    this.selectRange(extendRange(this.pressAnchor, point));
++    return true;
++  }
++
++  /** The finger lifted. Returns true when it ended a long-press (suppress the tap). */
++  touchEnd(): boolean {
++    const wasLongPress = this.longPressed;
++    this.cancelPress();
++    if (wasLongPress) {
++      this.dragging = false;
++      this.emit();
++      return true;
++    }
++    return false;
++  }
++
++  /** The gesture became a scroll or a multi-touch: never fire the long-press. */
++  cancelPress(): void {
++    if (this.pressTimer !== null) window.clearTimeout(this.pressTimer);
++    this.pressTimer = null;
++    this.longPressed = false;
++    this.pressAnchor = null;
++  }
++
++  /** A plain tap on the terminal while selecting dismisses the selection. */
++  tap(): void {
++    if (this.active) this.clear();
++  }
++
++  beginHandleDrag(handle: TouchSelectionHandle, x: number, y: number): void {
++    const pos = this.term.getSelectionPosition();
++    const grid = this.grid();
++    if (!pos || grid === null) return;
++    const start = { col: pos.start.x, row: pos.start.y };
++    const end = { col: pos.end.x, row: pos.end.y };
++    const moving = handle === "start" ? start : end;
++    this.dragFixed = handle === "start" ? end : start;
++    // Track the handle's own boundary, not the fingertip, so it never jumps.
++    const viewportY = viewportYOf(this.term);
++    this.grabOffset = {
++      dx: x - (grid.left + moving.col * grid.cellWidth),
++      dy: y - (grid.top + (moving.row - viewportY + 0.5) * grid.cellHeight),
++    };
++    this.dragging = true;
++    this.emit();
++  }
++
++  dragHandle(x: number, y: number): void {
++    const grid = this.grid();
++    if (!this.dragging || this.dragFixed === null || grid === null) return;
++    const px = x - this.grabOffset.dx;
++    const py = y - this.grabOffset.dy;
++    // Past the top or bottom edge, scroll the scrollback toward the finger.
++    if (py < grid.top) this.term.scrollLines(-1);
++    else if (py > grid.top + grid.rows * grid.cellHeight) this.term.scrollLines(1);
++    const range = spanRange(this.dragFixed, boundaryAt(px, py, grid, viewportYOf(this.term)));
++    if (range !== null) this.selectRange(range);
++  }
++
++  endHandleDrag(): void {
++    this.dragging = false;
++    this.dragFixed = null;
++    this.emit();
++  }
++
++  /** Select every row currently on screen. */
++  selectScreen(): void {
++    const top = viewportYOf(this.term);
++    this.menuRow = null;
++    this.active = true;
++    this.term.selectLines(top, top + this.term.rows - 1);
++    this.emit();
++  }
++
++  selectionText(): string {
++    return this.term.getSelection();
++  }
++
++  clear(): void {
++    this.dismiss();
++    this.term.clearSelection();
++  }
++
++  dispose(): void {
++    this.cancelPress();
++    if (this.frame) window.cancelAnimationFrame(this.frame);
++    for (const d of this.disposables) d.dispose();
++    this.listener = null;
++  }
++
++  private longPress(): void {
++    this.pressTimer = null;
++    const grid = this.grid();
++    if (this.pressPoint === null || grid === null) return;
++    this.longPressed = true;
++    this.active = true;
++    const cell = cellAt(this.pressPoint.x, this.pressPoint.y, grid, viewportYOf(this.term));
++    const line = this.term.buffer.active.getLine(cell.row);
++    const word = wordRangeAt(line, cell.col, this.term.options.wordSeparator ?? " ");
++    if (word === null) {
++      // Nothing to select: offer the menu (Paste, Select screen) at the press.
++      this.pressAnchor = null;
++      this.menuRow = cell.row;
++      this.term.clearSelection();
++      this.emit();
++      return;
++    }
++    this.menuRow = null;
++    this.pressAnchor = {
++      start: { col: word.start, row: cell.row },
++      end: { col: word.end, row: cell.row },
++    };
++    this.selectRange(this.pressAnchor);
++  }
++
++  private selectRange(range: CellRange): void {
++    this.term.select(range.start.col, range.start.row, rangeLength(range, this.term.cols));
++    this.emit();
++  }
++
++  private dismiss(): void {
++    const wasActive = this.active;
++    this.active = false;
++    this.dragging = false;
++    this.dragFixed = null;
++    this.menuRow = null;
++    if (wasActive) this.listener?.(null);
++  }
++
++  /** Coalesce scroll/render bursts into one snapshot per frame. */
++  private schedule(): void {
++    if (!this.active || this.frame) return;
++    this.frame = window.requestAnimationFrame(() => {
++      this.frame = 0;
++      this.emit();
++    });
++  }
++
++  private emit(): void {
++    if (this.active) this.listener?.(this.snapshot());
++  }
++
++  private snapshot(): TouchSelectionSnapshot | null {
++    const grid = this.grid();
++    if (grid === null) return null;
++    const viewportY = viewportYOf(this.term);
++    const lastRow = viewportY + grid.rows - 1;
++    const rowTop = (row: number) => grid.top + (row - viewportY) * grid.cellHeight;
++    const visible = (row: number) => row >= viewportY && row <= lastRow;
++    const pos = this.term.getSelectionPosition();
++    if (pos) {
++      const anchor = (col: number, row: number) =>
++        visible(row)
++          ? { x: grid.left + col * grid.cellWidth, y: rowTop(row) + grid.cellHeight }
++          : null;
++      return {
++        start: anchor(pos.start.x, pos.start.y),
++        end: anchor(pos.end.x, pos.end.y),
++        top: rowTop(clamp(pos.start.y, viewportY, lastRow)),
++        bottom: rowTop(clamp(pos.end.y, viewportY, lastRow)) + grid.cellHeight,
++        cellHeight: grid.cellHeight,
++        hasSelection: true,
++        dragging: this.dragging,
++      };
++    }
++    if (this.menuRow === null) return null;
++    const row = clamp(this.menuRow, viewportY, lastRow);
++    return {
++      start: null,
++      end: null,
++      top: rowTop(row),
++      bottom: rowTop(row) + grid.cellHeight,
++      cellHeight: grid.cellHeight,
++      hasSelection: false,
++      dragging: false,
++    };
++  }
++}
++
++function viewportYOf(term: Terminal): number {
++  return term.buffer.active.viewportY;
++}

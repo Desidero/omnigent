@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 21 Oct 2026 04:00:38 +0000
+Subject: [PATCH] feat(web): start a new chat in a project from the command
+ palette
+
+The palette's "New chat" always opens a plain composer, so starting a
+session with a project's stored defaults (host, workspace, agent, model,
+worktree) meant leaving the keyboard for the sidebar's per-project pencil.
+
+Typing in the palette now also lists "New chat in <project>" rows, which
+open the composer at /?project=<name>, the same route the pencil uses.
+Every typed word must appear in the label, so "new omni" and "omni" both
+match. The rows stay hidden while the query is empty so a long project
+list doesn't push Actions out of view, and the sessions-only switcher
+leaves them out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit 6cc98f0bde341d08c447c2d5b0d324959b163036)
+---
+ feature-map/composer.md               | 14 ++++++++
+ web/src/shell/CommandPalette.test.tsx | 48 +++++++++++++++++++++++++++
+ web/src/shell/CommandPalette.tsx      | 37 ++++++++++++++++++++-
+ 3 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index ffff6958130b988b9253c6a7d193561561d0fc6d..0414c8cf9e9c0365d1f82da8bb11f9763037b414 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -104,6 +104,10 @@ and steers messages while the agent is busy.
+ - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
+   line indents it as a list item; the newline gesture continues the list
+   (numbers increment) and ends it after an empty item.
++- `palette-new-chat-in-project`: typing in the command palette also lists a
++  **New chat in <project>** row per matching project, which opens the
++  new-session composer with that project's defaults (host, workspace, agent,
++  model, worktree).
+ - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
+   in the session view (not on mobile).
+ - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
+@@ -218,6 +222,11 @@ and steers messages while the agent is busy.
+ - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
+   same menu on mobile and with a managed sandbox available. Offline rows remain
+   disabled; a remembered offline selection still requires an explicit switch.
++- Press ⌘K (macOS) or Ctrl+K (Windows/Linux), or use the sidebar's Search, and
++  type part of a project name, such as `new omni` or `omni`: every typed word
++  must appear in the row label. Choose **New chat in <project>** to land on
++  `/?project=<name>`, the same composer as the project's pencil. The rows stay
++  hidden while the query is empty, and the sessions-only switcher omits them.
+ - With the browser app focused, press ⌘+Shift+O (macOS) or
+   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
+   composer.
+@@ -572,6 +581,11 @@ Other connection providers alone do not enable the managed MCP picker.
+   a deployment that does.
+ - **`new-session-hotkey`:**
+   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
++- **`palette-new-chat-in-project`:** component coverage in
++  `web/src/shell/CommandPalette.test.tsx`; no browser test. By hand with two
++  projects: open the palette, type the first word of one project's name and
++  expect only its **New chat in …** row; choose it and expect the composer
++  with that project's host, workspace and agent preselected.
+ - **`import-bundle`:** no browser-level coverage; the web unit tests for the
+   Create custom agent and new-session dialogs cover it. Manually: open the agent
+   picker's custom agents, then Create custom agent → Import bundle, and pick a
+diff --git a/web/src/shell/CommandPalette.test.tsx b/web/src/shell/CommandPalette.test.tsx
+index 68fbdcf5184244fc3c6533d45556846b4d9eb38b..ea61ebd392c59ce32fc34767e693ca3814a4af43 100644
+--- a/web/src/shell/CommandPalette.test.tsx
++++ b/web/src/shell/CommandPalette.test.tsx
+@@ -10,8 +10,10 @@ vi.mock("@/lib/routing", () => ({
+ }));
+ 
+ const useConversations = vi.fn();
++const useProjects = vi.fn();
+ vi.mock("@/hooks/useConversations", () => ({
+   useConversations: (...args: unknown[]) => useConversations(...args),
++  useProjects: () => useProjects(),
+ }));
+ 
+ function conv(
+@@ -49,6 +51,7 @@ beforeEach(() => {
+   navigate.mockClear();
+   useConversations.mockReset();
+   setSessions([]);
++  useProjects.mockReturnValue({ data: [] });
+ });
+ afterEach(cleanup);
+ 
+@@ -342,6 +345,51 @@ describe("CommandPalette — match preview", () => {
+   });
+ });
+ 
++describe("CommandPalette — new chat in project", () => {
++  beforeEach(() => {
++    useProjects.mockReturnValue({
++      data: [
++        { id: "p1", name: "omnigent", icon: "🔥" },
++        { id: null, name: "home lab", icon: null },
++      ],
++    });
++  });
++
++  it("hides project rows until the user types", () => {
++    renderPalette();
++    expect(screen.queryByText("New chat in project")).toBeNull();
++    expect(screen.queryByText("New chat in omnigent")).toBeNull();
++  });
++
++  it("matches every typed word against the row label", () => {
++    renderPalette();
++    fireEvent.change(screen.getByTestId("command-palette-input"), {
++      target: { value: "new omni" },
++    });
++    expect(screen.getByText("New chat in omnigent")).toBeTruthy();
++    expect(screen.queryByText("New chat in home lab")).toBeNull();
++    expect(screen.getByTestId("project-icon").textContent).toBe("🔥");
++  });
++
++  it("opens the composer with the project's defaults and closes", () => {
++    const { onOpenChange } = renderPalette();
++    fireEvent.change(screen.getByTestId("command-palette-input"), {
++      target: { value: "home" },
++    });
++    fireEvent.click(screen.getByText("New chat in home lab"));
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++    expect(navigate).toHaveBeenCalledWith("/?project=home%20lab");
++  });
++
++  it("omits project rows in the sessions-only switcher", () => {
++    renderPalette({ sessionsOnly: true });
++    fireEvent.change(screen.getByTestId("command-palette-input"), {
++      target: { value: "omni" },
++    });
++    expect(screen.queryByText("New chat in omnigent")).toBeNull();
++  });
++});
++
+ describe("CommandPalette — input", () => {
+   it("uses the sessions-first placeholder", () => {
+     renderPalette();
+diff --git a/web/src/shell/CommandPalette.tsx b/web/src/shell/CommandPalette.tsx
+index d80515ff031193f4bf817fd9c8a39dd5b375fcaa..223a90a4197b8c8bec207fee3035a9828fb5b0a7 100644
+--- a/web/src/shell/CommandPalette.tsx
++++ b/web/src/shell/CommandPalette.tsx
+@@ -11,6 +11,9 @@
+ //     lifts the cap.
+ //   • Actions — static app commands (new chat, navigate, toggle panels).
+ //     Filtered client-side against the live query.
++//   • New chat in project — one row per project, opening the composer with that
++//     project's stored defaults (`/?project=`). Hidden until the user types, so
++//     a long project list doesn't push Actions out of view.
+ //
+ // cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
+ // sessions, and we filter the (tiny, static) action list ourselves so both
+@@ -30,7 +33,7 @@ import {
+   XIcon,
+ } from "lucide-react";
+ import { useNavigate } from "@/lib/routing";
+-import { useConversations } from "@/hooks/useConversations";
++import { useConversations, useProjects } from "@/hooks/useConversations";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { cn } from "@/lib/utils";
+ import { Button } from "@/components/ui/button";
+@@ -43,6 +46,7 @@ import {
+   CommandItem,
+   CommandList,
+ } from "@/components/ui/command";
++import { ProjectRowIcon } from "./ProjectPicker";
+ import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+ 
+ export interface CommandPaletteProps {
+@@ -189,6 +193,18 @@ export function CommandPalette({
+     );
+   }, [actions, query, sessionsOnly]);
+ 
++  const { data: projects = [] } = useProjects();
++  // Every typed word must appear in the row label, so "new omni" and "omni"
++  // both reach "New chat in omnigent".
++  const filteredProjects = useMemo(() => {
++    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
++    if (sessionsOnly || words.length === 0) return [];
++    return projects.filter((project) => {
++      const label = `new chat in ${project.name}`.toLowerCase();
++      return words.every((word) => label.includes(word));
++    });
++  }, [projects, query, sessionsOnly]);
++
+   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
+     useConversations(sessionsOnly ? "" : debouncedQuery, false, { enabled: open });
+   const loadedPages = data?.pages.length ?? 0;
+@@ -260,6 +276,11 @@ export function CommandPalette({
+     action.run();
+   };
+ 
++  const newChatInProject = (name: string): void => {
++    close();
++    navigate(`/?project=${encodeURIComponent(name)}`);
++  };
++
+   const goToSession = (id: string): void => {
+     close();
+     navigate(`/c/${id}`);
+@@ -417,6 +438,20 @@ export function CommandPalette({
+                 })}
+               </CommandGroup>
+             )}
++            {filteredProjects.length > 0 && (
++              <CommandGroup heading="New chat in project">
++                {filteredProjects.map((project) => (
++                  <CommandItem
++                    key={project.name}
++                    value={`project:${project.name}`}
++                    onSelect={() => newChatInProject(project.name)}
++                  >
++                    <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
++                    <span className="flex-1 truncate text-left">New chat in {project.name}</span>
++                  </CommandItem>
++                ))}
++              </CommandGroup>
++            )}
+           </CommandList>
+         </Command>
+       </DialogContent>

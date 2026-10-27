@@ -1,0 +1,4009 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 15 Oct 2026 15:44:32 +0000
+Subject: [PATCH] feat(web): Termux-style extra-keys row for the terminal on
+ touch devices
+
+Carried from upstream PR omnigent-ai/omnigent#6136 (btli), squashed from
+its head c5c34220 so we can try it on a phone before it merges. It adds
+Esc / Tab / Shift+Tab / arrows / PgUp / PgDn and sticky Ctrl, Alt and Shift
+under the terminal, with a Touch & mobile setting (Auto / Always / Never).
+
+Local fixes on top, found on an iPhone and to be proposed on the PR:
+- Cancel touchend on the row. iOS still focuses the tapped key on the
+  synthetic click when only pointerdown is prevented, which blurs xterm and
+  dismisses the soft keyboard after every key.
+- Pad the iOS terminal view's row by the bottom safe area unless the keyboard
+  is docked. The native bottom bar that used to reserve it is retired, so the
+  bottom keys sat under the rounded corners and home indicator.
+
+Not ours to upstream as-is: drop this commit when #6136 lands.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/terminals.md                      |  15 +
+ tests/e2e_ui/terminal/__init__.py             |   0
+ tests/e2e_ui/terminal/test_extra_keys.py      | 281 ++++++++++++
+ ...terminalextrakeys--phone-armed][linux].png | Bin 0 -> 12960 bytes
+ ...-terminalextrakeys--phone-idle][linux].png | Bin 0 -> 12467 bytes
+ ...erminalextrakeys--phone-locked][linux].png | Bin 0 -> 12939 bytes
+ ...terminalextrakeys--tablet-idle][linux].png | Bin 0 -> 8219 bytes
+ ...rminalextrakeys--tablet-locked][linux].png | Bin 0 -> 8949 bytes
+ .../blocks/TerminalExtraKeys.stories.tsx      | 117 +++++
+ .../blocks/TerminalExtraKeys.test.tsx         | 408 ++++++++++++++++++
+ .../components/blocks/TerminalExtraKeys.tsx   | 237 ++++++++++
+ .../components/blocks/TerminalSession.test.ts | 125 ++++++
+ web/src/components/blocks/TerminalSession.ts  |  64 ++-
+ .../components/blocks/TerminalView.test.tsx   | 129 ++++++
+ web/src/components/blocks/TerminalView.tsx    |  20 +
+ .../blocks/terminalExtraKeysModel.test.ts     | 196 +++++++++
+ .../blocks/terminalExtraKeysModel.ts          | 208 +++++++++
+ .../components/theme/AppearancePreviews.tsx   |  88 +++-
+ .../useTerminalExtraKeysVisibility.test.ts    | 146 +++++++
+ .../hooks/useTerminalExtraKeysVisibility.ts   |  32 ++
+ web/src/index.css                             |  54 +++
+ .../lib/terminalExtraKeysPreferences.test.ts  |  78 ++++
+ web/src/lib/terminalExtraKeysPreferences.ts   |  90 ++++
+ web/src/pages/SettingsPage.test.tsx           | 156 ++++++-
+ web/src/pages/SettingsPage.tsx                |  87 +++-
+ 25 files changed, 2506 insertions(+), 25 deletions(-)
+ create mode 100644 tests/e2e_ui/terminal/__init__.py
+ create mode 100644 tests/e2e_ui/terminal/test_extra_keys.py
+ create mode 100644 tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-armed][linux].png
+ create mode 100644 tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-idle][linux].png
+ create mode 100644 tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-locked][linux].png
+ create mode 100644 tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--tablet-idle][linux].png
+ create mode 100644 tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--tablet-locked][linux].png
+ create mode 100644 web/src/components/blocks/TerminalExtraKeys.stories.tsx
+ create mode 100644 web/src/components/blocks/TerminalExtraKeys.test.tsx
+ create mode 100644 web/src/components/blocks/TerminalExtraKeys.tsx
+ create mode 100644 web/src/components/blocks/terminalExtraKeysModel.test.ts
+ create mode 100644 web/src/components/blocks/terminalExtraKeysModel.ts
+ create mode 100644 web/src/hooks/useTerminalExtraKeysVisibility.test.ts
+ create mode 100644 web/src/hooks/useTerminalExtraKeysVisibility.ts
+ create mode 100644 web/src/lib/terminalExtraKeysPreferences.test.ts
+ create mode 100644 web/src/lib/terminalExtraKeysPreferences.ts
+
+diff --git a/feature-map/terminals.md b/feature-map/terminals.md
+index ab6b53549f1ee23aaad13806a56adb7269eaf28a..0420a402f2cbbd9eb74b04c311a784716952385f 100644
+--- a/feature-map/terminals.md
++++ b/feature-map/terminals.md
+@@ -29,6 +29,9 @@ reattach when the session moves to another host.
+   says so and routes the user to the terminal.
+ - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
+   into shell panes, resize them (each side stays within 25–75%), and close them.
++- `touch-keys`: on touch devices an extra-keys row (Esc, Tab, arrows, sticky
++  Ctrl/Alt/Shift) under the terminal sends keys a soft keyboard can't. A
++  setting shows it on touch devices (default), always, or never.
+ 
+ ## How to get to it (user POV)
+ 
+@@ -61,6 +64,13 @@ with their own terminal retain the switcher.
+   still being created, and it yields to a focused terminal or editor.
+ - Select an open shell from the rail's shell list; close it from its tab.
+ 
++**Touch devices:** the extra-keys row sits under the agent terminal and user
++shells on phones, tablets and the iOS and Android apps; read-only attaches
++don't get it. Tap Ctrl, Alt or Shift to apply it to the next key, hold it to
++lock it, and tap a locked one to release it. Settings → Appearance → Touch &
++mobile → **Extra keys row** chooses Auto (touch devices, the default), Always
++(desktop too) or Never; the choice is saved in this browser or app.
++
+ **After the session moves:** open the host badge, choose "Switch host…", pick
+ another host, then look at both the terminal strip and the agent terminal.
+ Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+@@ -116,6 +126,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
+ - **`scrollback`, keyboard:** no e2e coverage. In a Codex terminal with more
+   output than fits, press Page Up and expect older output; then check that the
+   Codex terminal's other keys still behave as before.
++- **`touch-keys`:**
++  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_row_shows_on_touch_at_phone_and_tablet_widths`,
++  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_row_absent_on_fine_pointer`,
++  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_send_the_expected_bytes`,
++  `tests/e2e_ui/terminal/test_extra_keys.py::test_extra_keys_keep_focus_and_scrollback`
+ - **`reconnect`:**
+   `tests/e2e_ui/shells/test_terminal_bridge_reconnect.py::test_embedded_terminal_reconnects_after_transport_close`
+ - **`host-switch-reattach`:**
+diff --git a/tests/e2e_ui/terminal/__init__.py b/tests/e2e_ui/terminal/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/tests/e2e_ui/terminal/test_extra_keys.py b/tests/e2e_ui/terminal/test_extra_keys.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3ed8d8b469d3f0c92beb8a76e3637adc3e2d6eb
+--- /dev/null
++++ b/tests/e2e_ui/terminal/test_extra_keys.py
+@@ -0,0 +1,281 @@
++"""E2E: the Termux-style extra-keys row under the terminal on touch devices.
++
++Soft keyboards cannot send Esc, Tab, Shift+Tab, Ctrl-x, Alt-x or the arrow
++keys, so touch devices get a fixed 2×7 row of those keys under the xterm
++mount (``TerminalExtraKeys`` in ``web/src/components/blocks``). Visibility is
++touch-based, never width-based: a ``has_touch`` context flips
++``(pointer: coarse)`` and shows the row at a phone *and* a tablet width, while
++the default fine-pointer context never renders it.
++
++The bytes a tap produces are asserted from a file the shell writes (a raw-mode
++``cat``), not from the screen: xterm renders to a WebGL canvas, so its output
++never reaches the DOM.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++import time
++from pathlib import Path
++
++from playwright.sync_api import Browser, BrowserContext, Page, expect
++
++from tests.e2e_ui.conftest import open_right_rail
++
++_PHONE = {"width": 390, "height": 844}
++_TABLET = {"width": 1024, "height": 1366}
++_ROW = "terminal-extra-keys"
++_COARSE = "matchMedia('(pointer: coarse)').matches"
++_NARROW = "matchMedia('(max-width: 767.98px)').matches"
++
++
++def _touch_context(browser: Browser, viewport: dict[str, int]) -> BrowserContext:
++    """A touch-primary context (``has_touch`` flips ``pointer: coarse``)."""
++    return browser.new_context(
++        viewport=viewport,
++        has_touch=True,
++        is_mobile=True,
++        record_video_dir=os.environ.get("OMNIGENT_E2E_RECORD_DIR"),
++    )
++
++
++def _ensure_coarse_pointer(page: Page) -> None:
++    """Assert the capability media the row keys on, with a CDP fallback.
++
++    Chromium reports ``pointer: coarse`` under touch emulation; if a renderer
++    ever stops doing so, force the feature through CDP so the test still pins
++    the row's behaviour rather than the emulation's.
++    """
++    if page.evaluate(_COARSE):
++        return
++    cdp = page.context.new_cdp_session(page)
++    cdp.send(
++        "Emulation.setEmulatedMedia",
++        {"features": [{"name": "pointer", "value": "coarse"}]},
++    )
++    assert page.evaluate(_COARSE), "touch context must report a coarse primary pointer"
++
++
++def _open_shell(page: Page, base_url: str, session_id: str):
++    """Open a fresh user shell and return its connected ``terminal-view``.
++
++    Narrow layouts create shells from the header kebab's Shells drawer (the
++    new shell then takes over the main column); wide layouts (the tablet, the
++    desktop default) use the workspace rail's "+" menu and render the shell in
++    the rail. Both end in a connected xterm, which is all the row needs.
++    """
++    page.goto(f"{base_url}/c/{session_id}")
++    if page.evaluate(_NARROW):
++        page.get_by_role("button", name="Conversation actions").click()
++        shells_entry = page.get_by_role("menuitem", name="Shells", exact=True)
++        expect(shells_entry).to_be_visible(timeout=10_000)
++        shells_entry.click()
++        drawer = page.get_by_test_id("shells-panel-drawer")
++        expect(drawer).to_have_attribute("data-state", "open")
++        drawer.get_by_role("button", name="New shell").click()
++        # A user shell takes over the main column on narrow layouts.
++        terminal_view = (
++            page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
++            .get_by_test_id("terminal-view")
++            .last
++        )
++    else:
++        open_right_rail(page)
++        rail = page.get_by_role("complementary", name="Workspace")
++        rail.get_by_role("button", name="Open new").click()
++        page.get_by_role("menuitem", name=re.compile("Shell")).click()
++        terminal_view = rail.get_by_test_id("terminal-view").last
++    expect(terminal_view).to_be_visible(timeout=60_000)
++    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
++    return terminal_view
++
++
++def _row_metrics(page: Page, row) -> dict[str, float]:
++    """Grid geometry the layout contract pins: columns, overflow, heights."""
++    return row.evaluate(
++        """(el) => {
++          const rect = el.getBoundingClientRect();
++          const columns = getComputedStyle(el).gridTemplateColumns.trim().split(/\\s+/).length;
++          const keys = [...el.querySelectorAll('button')].map((b) => b.getBoundingClientRect());
++          return {
++            height: rect.height,
++            width: rect.width,
++            columns,
++            overflows: el.scrollWidth > el.clientWidth + 1,
++            keyCount: keys.length,
++            minKeyHeight: Math.min(...keys.map((k) => k.height)),
++            rows: new Set(keys.map((k) => Math.round(k.top))).size,
++          };
++        }"""
++    )
++
++
++def test_extra_keys_row_shows_on_touch_at_phone_and_tablet_widths(
++    browser: Browser, terminal_session: tuple[str, str]
++) -> None:
++    """Touch shows the same fixed 2×7 row at 390px and at 1024px.
++
++    The tablet width is the width-independence proof: nothing in the row keys
++    on a viewport query, so an iPad-sized touch surface gets the row too, with
++    wider columns, identical height, no wrapping and no horizontal scroll.
++    """
++    base_url, session_id = terminal_session
++    heights: dict[str, float] = {}
++    for label, viewport in (("phone", _PHONE), ("tablet", _TABLET)):
++        context = _touch_context(browser, viewport)
++        page = context.new_page()
++        try:
++            terminal_view = _open_shell(page, base_url, session_id)
++            _ensure_coarse_pointer(page)
++
++            row = terminal_view.get_by_test_id(_ROW)
++            expect(row).to_be_visible()
++            expect(row.get_by_role("button")).to_have_count(14)
++            metrics = _row_metrics(page, row)
++            assert metrics["columns"] == 7, metrics
++            assert metrics["rows"] == 2, metrics
++            assert metrics["keyCount"] == 14, metrics
++            assert not metrics["overflows"], metrics
++            assert metrics["minKeyHeight"] >= 44, metrics
++            # The row spans its terminal surface edge to edge.
++            surface = terminal_view.bounding_box()
++            assert surface is not None
++            assert abs(metrics["width"] - surface["width"]) <= 2, (metrics, surface)
++            heights[label] = metrics["height"]
++        finally:
++            context.close()
++
++    assert abs(heights["phone"] - heights["tablet"]) < 1, heights
++
++
++def test_extra_keys_row_absent_on_fine_pointer(
++    page: Page, terminal_session: tuple[str, str]
++) -> None:
++    """The default desktop context never renders the row (not even hidden)."""
++    base_url, session_id = terminal_session
++    terminal_view = _open_shell(page, base_url, session_id)
++    assert not page.evaluate(_COARSE)
++    expect(terminal_view.get_by_test_id(_ROW)).to_have_count(0)
++
++
++def _wait_for_bytes(log: Path, expected: bytes, timeout_s: float = 15) -> bytes:
++    deadline = time.monotonic() + timeout_s
++    data = b""
++    while time.monotonic() < deadline:
++        data = log.read_bytes() if log.exists() else b""
++        if len(data) >= len(expected):
++            break
++        time.sleep(0.25)
++    return data
++
++
++def test_extra_keys_send_the_expected_bytes(
++    browser: Browser, terminal_session: tuple[str, str], tmp_path: Path
++) -> None:
++    """⇧Tab, Esc, Ctrl+c and Alt+p reach the shell as the right bytes.
++
++    A raw-mode ``cat`` records stdin to an absolute ``tmp_path`` file (the
++    shell and this test share a host). Expected stream: ``\\x1b[Z`` (legacy
++    CSI Z, never CSI-u), a lone ``\\x1b``, ``\\x03`` (armed Ctrl rewrote the
++    typed ``c``) and ``\\x1bp`` (armed Alt prefixed the typed ``p``). The
++    modifiers disarm after one use.
++    """
++    base_url, session_id = terminal_session
++    log = tmp_path / "keys.txt"
++    context = _touch_context(browser, _PHONE)
++    page = context.new_page()
++    try:
++        terminal_view = _open_shell(page, base_url, session_id)
++        _ensure_coarse_pointer(page)
++        row = terminal_view.get_by_test_id(_ROW)
++        expect(row).to_be_visible()
++
++        textarea = terminal_view.locator("textarea.xterm-helper-textarea")
++        textarea.focus()
++        page.keyboard.type(f"stty raw -echo; cat > '{log}'")
++        page.keyboard.press("Enter")
++        # Let the mode change round-trip before the first tap.
++        page.wait_for_timeout(1_500)
++
++        row.get_by_role("button", name="Shift Tab").tap()
++        row.get_by_role("button", name="Escape").tap()
++
++        ctrl = row.get_by_role("button", name="Control")
++        ctrl.tap()
++        expect(ctrl).to_have_attribute("aria-pressed", "true")
++        page.keyboard.type("c")
++        expect(ctrl).to_have_attribute("aria-pressed", "false")
++
++        alt = row.get_by_role("button", name="Alt")
++        alt.tap()
++        expect(alt).to_have_attribute("aria-pressed", "true")
++        page.keyboard.type("p")
++        expect(alt).to_have_attribute("aria-pressed", "false")
++
++        expected = b"\x1b[Z\x1b\x03\x1bp"
++        data = _wait_for_bytes(log, expected)
++        assert data == expected, f"shell received {data!r}, expected {expected!r}"
++    finally:
++        context.close()
++
++
++def test_extra_keys_keep_focus_and_scrollback(
++    browser: Browser, terminal_session: tuple[str, str]
++) -> None:
++    """Plain keys never move focus, and the terminal still scrolls with the row.
++
++    Esc must not summon or dismiss the soft keyboard: when xterm's textarea
++    is focused a tap leaves it focused, and when nothing is focused a tap
++    leaves focus alone. The row sits outside the xterm element, so the
++    scrollback still scrolls beneath it.
++    """
++    base_url, session_id = terminal_session
++    context = _touch_context(browser, _PHONE)
++    page = context.new_page()
++    try:
++        terminal_view = _open_shell(page, base_url, session_id)
++        _ensure_coarse_pointer(page)
++        row = terminal_view.get_by_test_id(_ROW)
++        expect(row).to_be_visible()
++        esc = row.get_by_role("button", name="Escape")
++
++        textarea = terminal_view.locator("textarea.xterm-helper-textarea")
++        textarea.focus()
++        page.keyboard.type("seq 1 400")
++        page.keyboard.press("Enter")
++        page.wait_for_timeout(1_500)
++
++        is_textarea_active = "document.activeElement?.classList.contains('xterm-helper-textarea')"
++        assert page.evaluate(is_textarea_active)
++        esc.tap()
++        assert page.evaluate(is_textarea_active), "Esc tap must keep xterm's textarea focused"
++
++        page.evaluate("document.activeElement?.blur()")
++        assert not page.evaluate(is_textarea_active)
++        esc.tap()
++        assert not page.evaluate(is_textarea_active), "a plain key must not focus the terminal"
++
++        # xterm 6 scrolls through a custom scrollable element (no DOM
++        # scrollTop); its vertical slider's offset tracks the scroll position.
++        slider = terminal_view.locator(".xterm-scrollable-element .scrollbar.vertical .slider")
++        expect(slider).to_have_count(1)
++        slider_top = "el => parseFloat(el.style.top) || 0"
++        before = slider.evaluate(slider_top)
++        assert before > 0, "seq output should have produced scrollback"
++        screen = terminal_view.locator(".xterm-screen").first
++        box = screen.bounding_box()
++        assert box is not None
++        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
++        page.mouse.wheel(0, -300)
++        deadline = time.monotonic() + 10
++        after = before
++        while time.monotonic() < deadline:
++            after = slider.evaluate(slider_top)
++            if after < before:
++                break
++            page.wait_for_timeout(200)
++        assert after < before, f"scrollback did not scroll (slider {before} -> {after})"
++        expect(row).to_be_visible()
++    finally:
++        context.close()
+diff --git a/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-armed][linux].png b/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-armed][linux].png
+new file mode 100644
+index 0000000000000000000000000000000000000000..67b268d460ed30482ceef2d02b4850a05debb6fe
+GIT binary patch
+literal 12960
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-idle][linux].png b/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-idle][linux].png
+new file mode 100644
+index 0000000000000000000000000000000000000000..81cf6c3016b5e719466bd8899ffb195308190513
+GIT binary patch
+literal 12467
+zcmeHuWmH_<w&lS>fFvY1!4e3;f&_O<NJ4OT3NHe|-3bX2G{IeiQxM!;3U?@+;7(Dv
+z71j0K`@J6B_r5Xub^qx<@6W0;_Nl$kK5Oq<d(OF5eOFd|{}BHvJ^%m@Wk0-C1pqAc
+zC5F&_O!P+q-e?>EJO*UnN~yc2?k_%6R|B`e5fRe#hD3+Y*@;-C^MiJxokatR12iep
+zR;k-{WXf{f?c$tv)r)IdAc&3OOrG~ilyQw+bJ;l%1Dvh!8N~fkvQ&mh+RqyMq)o2b
+z#f%3({rM!REIu&vVjvE&m5W|9C4T#J=c}m|m^L&lF|xFe95@jbxm>PydXJvbkLV}p
+ziTQUu_D9?G|G)N<fOd4u0c!Hew$d8Dz5N(y<9QcO@#OIzy2p<*)$d(hUEu+v5{HD6
+z?Cg+xZ-(elm(c!x{ItV4Eszf*;13qPyIj+?k^lU8AzKE;!)mp#J@y3?IQ_buCgO&D
+zakZHe9~~`Wx70LdSwal7=}qqbrV(+?{WW-Jhl+TBooRRYK+<G+q%X$Lu*tm~0Ny<3
+z<dooZ;YUgW*XuRF<e0<Ogpx!G4^wq%sUhH>_3RugO%UNLKR7Xni}@#c{t&ZLJ6Y~y
+zsH_AK^h5CSZc8GgO1tF=(8gG+5MXO<U0ibOhY36=?C)pePf-AXgar!!IW|@f0)XpR
+z7x7PbVWPjjijx@`896tniva}1y3?<&L4ninN&)u(Ao>k}Ua9D{bYOi+Ne$aSxJwq#
+z-+E~uL)B^`K3B;{p98&|4;VS`J@Yuaj6HR>Dd4g^hF0@{N798{n#R+fe-!fFRc9}M
+z004LhML<>2z#y|x2QjUGP_>*2VV)BgF;Vtl&`xRb?2O-Us)P-1nRnH(R4`YgQqOvV
+zlCoYr1ArHuR2Uy96Uxo2HEVrlM+jWDK%ko1Pp+=6*OyY*kwKM7pLp_ny3I+nt9h#5
+zk^umhpzVE0A4Ps@QtBtSkh?)jgP2Q&uXpQTn(&RAdR%-}dVYaPQ^%&fHHyoa=Tb^F
+z&b^QHiZy;j?IKQ&LuQjaz#K5&DP=vC#5A&rYS-=XeS(COaeC@yQE@N$6@eEx*tJyR
+zr1~opCv19JJ#{dh%E4~!c(icfoXqgDDNobwB`1%KC?x?!O(O2YHXOTCfNy7Hx5R<!
+z!Xh_H3qR*u5P_Z9FFPR}YnN-RV<;F*GnkCDY2TgY;jUnlo~WqcS&bdmib`x|WMeq(
+zh@Zvdi6_+s+s<;s%pHG5DUB>OdNy&0*z69Pdnh>YKyd~d>1G<;t^|=wjFl7oB={_|
+zSF@EnU`*i8*jfZ&1`)f`)xAC^SPqJ$BCi#Oo3)oZlRNY*J>;=D<h@Ed&^sR1pGXtB
+zJTWh>-O}I{9Fd!Tx!72i%Q^3>dU3V26{fiR4KbmwP#ynXJ_W)@ZedObDL^)59~muO
+z1=)$vjSi+3e_~!p*RWsF?e6<JPpHn!G!jXGUWhh^9veUWPCn~{z@~$0g{-xBKd%<e
+zlyo1i%lWD)8AahQ>se2p90#3LE2I&oxX5@2C+G>l_`{Q%S1iw~5Kr23uswd;`^M_;
+z*EtX+t!E`GXRXL9sDaHNR<9BZ9jn@JUxqlu<Rh<6_}pMN!o(%91RNdY06-DcG>Y|t
+zE<>fD@waszgPFDqjsz&)#gJA&ZLf;BcW(08yJ&~SuS&;=N}h3W9mS-o;^I-yl5>_(
+zXSm?dW#It+se%Eaw{^9zb;c_*lnNrl2udC>^~xe+6k(8(fXnt~BaP5|UVUEK$>SzG
+z1WHGEaBb)9*}nCQ4ghHR4DU-$&xOWhu&KolO+^yz^JMeI<Xe3Uy0^8+dQLYQmE5rK
+zS~)LVcDcewuBXaq3xipZmwvKH!pRU^)6bAMoJKh&W@T<ODiA&{ct{@ezH2CAkD9!4
+zT3wy@+wkoc$!oPf=!kxe_gtMyB<|of!4_4I`RCtC_3^<y>}+-V4)(^_PUy($zJ4io
+z8$pz&SLae}m_rFSBhBR(<MDcPy<YljO!;^q9QH^vG0je`&>*o|z<P}5oLLP83)r7Z
+z@(^~~-p2wTZ$<9ZFV$}O2{9luJ*+g_+ru3csucp7WVMXbMcw9V;T);;E8#-Uo99hm
+z2bc)>u9N4UT6YN|<Ey5asJ=n-OMTZO*m<C{wVACYF~R(1`RpRBk-dS62JuKgZZ+O>
+z;k^;K0aEuoN!Qcg-}qe_N>p^gx9I5Pgc!&aSi+Nh^w)2L&VZe|caWoK8&stHt}8qS
+zwksiU(Oh%uV3W$PUeK)XfSPkO|7MZewAl{nWvFs^(y>L_aC4Krp0!r}L^|T|q^wuG
+z&HgQbIm(2NQm?f`zQ5VeD&!*o{=CM12KXG08yG#BzPA{74+8*<LOf2&+R;bnB{t?`
+z^f5*Kf3TyEj|jhqJk8m^dLn=K#aP8u<4eHEi5Al6?)b`~s6||&A0%|{Wg4dlbG-9J
+zzUlD=@kkYa$3OXKjU5z@TuL+^Jsif4{622QyG%gYCZ}v=!45jr@8a?u1O7ZhJK*Dx
+zQy;PP?M?Y86H6<(gz21it-<SCs3NF=_h4sCj4UFZ%Wr2j_9mlaXyoQ7mU!GyR%2JZ
+z$;!&DIU8jvk%;QQt%If>EG~iUdVh86Ir&vv?POntjr&r2aV9*dqPcGM&Gg({)l%jA
+zXe{XsZpDraQ%Y;K?6Yp2E8oj?*FgCu3|=3f*x<>LcLzTVUKRt6NZ{C+fcYT70LXyo
+zBCT#>Pa3pd=Iwbs2p02f=h14a-*5{)gDm+jVc<>vYU0Y;Q6I~_c3pXXcI}DP`BIEU
+zU-+moV!j5+eIqIBa*=~&gR4}VLU@ocJ)*dN=Q$q_YPvEWn88zuINVZ7a_N@Ih)m-1
+zTm9{Rg8`(kH1ilq&N#`zaIl*^3Yws2m9W5ORV&rae58FxOcY+8(g4c2U_0he@jmKz
+z-Q-o}YQ}epMNPLgRm4vQ(zF!E8qp)Kk=&sS%8S^d>doC?rqJQ-r`_HCV32Og=er{U
+zjaw(;j=9}ZKj&2?rcwd?=ZG?-RUZ#V<dz5bUK-=7L^aem#lUewro7p9+0gHpps<fP
+z<AH6n!;Y18+hW|7U2iJo=4HdqcuK2?{o<Y5_^pAc-Jcmc4&B?1u8=?eHF<NzjKNW{
+zOP@*gkF<RKt_e8hGqwx19A#Ayq|m*zDtC=gWkewNU47zjKy7N40ZyV1UsI~W5vN4S
+zw?&v<_rROn$<Jo!=D5s{V{-It^@SaoQN##bFTZA!4DJ3P&|sAPD_<9=lQe8kY>Io<
+z<%Vs|aE=$*178-^o39@*s7jewd%qA$(KV4Lue`VjA3iTFKDbyKE_IdXgo2IKuje+_
+z`Y-my_XIWLB(z&r@-bwD>@<0WCDIS(bm!+VF)>?C2KLtl_a{Bq*7hJ}T}tlzyYF2H
+z(=0HIw4Yw>fl#{kxM3S90!uS{>+NGJG2pHsoclRY#njWc6JS5c>sk?=?Qf3b0dXhN
+zsO!VK+GSLUX~#(=lebg#v4wT8kFv$eH6!tz>+TUe%6H+hxR8s5^WM||>P#UxW`jW;
+zfvRvl_d}f`Z{5NqtfSJ;R!@xi==Pq@Z77L~m`->3U1nb{`-0rFIC#a``FcFhj<-Ot
+zSXBLGm!H0kmuJVph2KppA+?Cg?a!r!l`8r6){6sz=M(Ww!l1L+pGZ5p#&J>Go)c8T
+z?XIIvcf#~}s{yBoioW-%e4OLz1O{w?joQz@CFd+JX6sB#;SPl2-hl_!-yDy4Ptyt^
+znPLK4eQyI#LT@|sTB=-KN6$=gmpoAukzfnX<U2x;y1qd5z!b6HWe%RyR5!}CV0$&8
+z2&|Uz@V4r<vbEmbJfPKccmJDzaqb4+5RI6j9sDf({?m*7sJypT2135uy`P#*#w8R8
+zitjFCg3gyfWuwN^elIwhp785HB!1i6tPrP_!8}Bqe+DagavZ}GBuWqUH@$tpP^C5r
+z`NTV=n9e)b&E+L#L62tBRV6Y-N)MzdxN)Z2*I|5EQLpl1?F7C_HYIVlO)0fCliv@|
+z&+EQzK1C9Mbkk_J()6gZyszu~q^34Vt05dwonB|o-Xh0^TSRwR=O|xQFe$B6u~wNT
+za{%@o1uL-CB#tL6c%DzFc(?6hti;X-COi;VE-4m(E!JHlB5E9x%Omf6H`EYMS9Z%8
+z=yvv=o}rTb{zRC9TP$5#7C=|>3p06yQ8dK`rNym=y3V^{l0&}^w`|5USdi;^v)(6b
+z*`^7DrY}FKV;#~u)%cj7R+<jcAqy|pJS%rBWOinY^7xH^++tyVt0AkL)%R<DApyR~
+zDD^#9rD^ih{wzHM%a5eF`L#4zz$vDB3L7JCfZEO_mu9eDt>+b%Uysi^u5FjE#g>8&
+zw~fsGjch-Eg4>DNxFjg0)*H^dR~`=r^I;hK*!W3ec4qU=;Ss0P7E?p0ZzjLt=|;Tl
+zm^x3Rk%)v^NxWi#r3^-7__&v>=N-@1m18Z#Ip*rMh9l?ClS2nU!SdeI;$rWwCfAt)
+zsS+gk8nu^o#7ZMi6m2%I$)qUvN1jmtg~!)dWrfE|!E%Rm)jMck9w==3&ydG+M$q0Q
+zx<4hnPgaUMgG+ylMW=>SrO#jM4ACfKD<ju`MW`NFsIJs~yJ|GI$X<J^!D6e@WLe9f
+zByX@+n`AxIp;pueK(VkMkKUXk^`O`{DP@U`s!D1GK5~s8DZ*XVuF8qWIGZa>->V%&
+za2DD5x?X*b2%Ex+HU828%R4NsCYyk<W328S!{*7Ws%u?HCtvzL8HK6U&d$@1wxZ6e
+zs$Hx78ZYI~O|WYbT4E<_Ri8{Tu`o5-+fCKR(?47Dpw7O9sfaQ`qjCo0->GR?TH7J#
+zCi!)9Nh*JONS+DWY)vmk(Sf1)m*$ISQF~y8FgiWQk5~IKHW{>q{Ehm{vSP!LC+V#w
+zUu+ki16;T60zeYShJ@f^J}hu~L&A0XI3c~+WB;NRQege?_U^V?PUPf`mtKs{ecE}S
+z?qkBMyDlai<kZNZVtj3)g2hBWUCS&Vbd@&OeT;&J+0{Xi<H_ooJd0tsF7ATD#5CGT
+z(2y}J>BKq@sA%}uNAotLc`@Y;kXmZ<ZQ69(Yl#m@s0kU)LS5gBVdyXi%!XaT=1wV0
+z%cOnbsw*mjELnFBmv1lUV6S1?|9jD&Qk#cGv~HhTbv&Ono_-OMR1^~N-ABjQxEv8s
+zY%9vNzpdt4YX1VGrgCDf#vnX4F2OEuP(B2rCO+lLfC{RQI`b-n&N}#xY(JjbuIVY$
+zOTxgGENT+Kp4Pk=%SyfZs#r!q$E!=3^_kCb0`?v8_G-QAyKy}r>h&L5z~UPDCTHn1
+zj(p<l?xkip9lwyxPIi(KOB$!0fRE>5NqV}lc{qh6CPTVji}jw|i0dNO0cxfzsqd)+
+zbvKC5!Sk~blGNvdB=S5yj|_1<5f!!LP=Rz+t1eZc6!8fVEZC&uetrcdrrjH9gd3*A
+zKs2qE$l|cP2!tI3_3PJVMY%zfy9lA0iPjgx67VL^`ASwBynD!7x6UKi(;o4wdFP!*
+zj8%u)GV(V2%M_0w(#{XOCnDy%ACQxuFJHCnM0dG<`bnwA*P*$^C3Bw6UPMI1_F$gd
+zpzM;K%htCjPXRP0HoReiG-PvjNOi-fCg;(t^MK?<CEx>59IYa5hxZBdod{}er>uF`
+z(n_)?MFklDT+hOnKxkCMgxQMfC@vd%@Wjjfn}1C*>xmlPYj&`!IZd(c8KK8{zFdO5
+z-?*==bpv9o{PuRZ(KMC4b~*WUJiE{M9DCgPU`8ZZ?$qMOz-U0=75?kmK(U>Wm+TpL
+zpGK&_@Q6MZzRGxx<g;*O!z|3esM!v5KRg-HKb|3O3U{~U(Oe{n%_H{eN+&{i)V6RV
+zL~1!}^~FxZut+VyBUBV;oibsYN|E-r@_Iu_SdCHjO+IW~tQ)zxoLvRfXA6QZ>!Yu4
+z7Pb3j!(hX9645SQzDy0MM9Mu-+NHyA3ThTwdf($bS4&Md>Og#ajS{_&B=+mIU`j0w
+zH$#=@DdEzqFi6VX?3dK&lpKTRr8c|)KZLa0UHXk(l-t<d7t@w}D@eVEpHeT@9<Cso
+z-%p*uTCzXcsJx3Js1X<?M>$+Z5W{ZdLz)j0mgZ)Kz-SaN!nu6Z-*sLo)Y=RqX)dJ`
+zT*-x$iIXolHQHosqV`IU-+`gVu%4b_UDP=CqKI8XQ-*`!#GV8pAsqu3-cx@kG#a*j
+zBKXoORrT`PqI##j7IN3m6?f!<#Cn4{9FH3m@>O5qEMifQ=xguXdc*BvzV4K19LDA~
+z=k5@pi+P>j&Eixz<xQe83Uo$@Y?%j9zUF_+wOnGe4@x@soNM*%C1=FHYL^>On^#<?
+zZQ*?JpejA<&+#SRcM6e)jZKA#H}Mjqu7}9WQ>|{!Mcz(l%aQUC-J8mmJx^M}N8Keg
+z-eVVKv}6o-3?jfgG}p*CCh-?7WCIRFRfbaU!)~FsMnQSa6}JuF<Bze+sXp%&s|6^;
+z`FWpQ&`o(|M_}cwrW5cOu$G;l%0sgLK~^vy`@esPabGgy(zE~oBpvTd{;TzdD`Bv#
+zjcet1;|xHm$?=!i$Hn?<i_nr<)`}Cx2ihV9P>c5*vs3|Lv%b43*!KlWn-9&6KR)<^
+zraFDkfq%7#cR;i?&vEF|&~W0DEE2S^6O<}|`9ni1(I-<nJ>93~*jwtnB5AEp3eA+5
+zJ;3(|OGK`Ec4sH@I0mP2^5J574l71M@g&&jjv)eDfDRRF==tHC?~&P?0)7sYSoDBg
+zFPhG!LXJZUcZ#(*Q$*P7Hs#w#KqB^e=pg|LqNV$iX#GV8w{q)UNFS5e%5DtlL+?7C
+zzb0+CgHbV^I%t^abN93l7tPQx?XaI&ccPUh^y2`!cHHM^o$7ykDa4%35z^eI?)LEf
+zAmPo|p=#2Gmlg_Wa(8i354=b$Bc*B5e1Y!kj{nB!UtRm}&i?O~|MtKw&c)cC1X^DL
+zywgRnMv0Za;Q?HeEw>elXkC>86TP+mmP`LBn*OhLZMd<`b833pqFPr(Som<Ep22-F
+z<O##ONNUPIe@v?RgXe4Q!d&nT-~Y5-+1lEI!<Bf%o8A|G0PK6dVtkMng+L&yEUFa3
+zG>=RkuIg}eaVa;wTdKvBIgf#pvyhE?$mUVfjpwMm0O~f|pZ|`JkIxd5Ie(!^KYjAY
+zF_fBlnKRnLIl<WAult3-i}bj;`FR`={j}4vP6|CP^djsR<)V2a86H{>F#?FZN51Ae
+zwqGd!(i;sw<fab8_80fCdNg`4UyHNs1kxZ8vTOmp7~1COEdKy($K+#<{#c+G&%Y_k
+z?v*-0(tmpAMj0uCi4I)U&j8?=5L#vVuiDHO9UK5S`hb{ZlDbGa)12bV$%SId{NmST
+zB=-)KadY0nea;4B3>L8>8knL?X>AOZCxt|)3eNjq65mS^p1Z<7T&WDiBQuRtQGQ?C
+zm=3in;^r-;XYjG4Ba|aN3tQ{+@hju1|437)$)*qMTEQ?1dEf$6Y!lQ%IJp8B#a39d
+zK?@ayY&H+XidD2|xCPqtc(glmNYCMH%LDAA^Ia!ZS$QgCc~3^>D}Jw^C8_8#!H8}M
+z2DzJ48~J1z-G7Xbz0@vx1m3*AcWx(dPh!HCIy|eL-oOb~tmAs66Or%enii(pz+$ks
+zv%TH_2Dz&JFmN`h2j`|Tda)G_C(HXy`Osykqi*s*L|`b?SreAy>JCtd2Q}e-Ac?OM
+z5*X-ASZOb(c))FAqOV?gn0*(|$FI*3l^k<5OpSQ5R`{?Oze?mB{PyOZ`pIkuExXC}
+zY`v|QLxe(|#S>TXLz{cYi=foQj*`6407%l!qd2I|N#C*^5WPu&QQ#I|w3<p2++RAy
+zha1@af_<sU*4BAzs>h1i>qgmdr{4Odj@jq_A_cZ+(Mgb5p>T`oiTGM<oUDr-d2)13
+zYaE~4fr*P+_gHFelwnB;F@64^UNr(NyL(viIWM%6YKfIapqE#c0AyJIti6#&UtBNI
+zXq?7xPg!b*G)6jx%WbFs^wPdwBjIMZrl|LWTCSAX1z5HxU}0itE?2LXqYC^`ZVI>l
+z=47BWaXtClX)fDVk5{#!*Y#|wog7kUb%%S3q#IX{C(!0i+80_Q*5&feA3vx~SviE5
+zA|1OqXDVFGQyIJyodfIZ-w!xPgwAZmkdn0%th3sTpQr>fPQA2_o>4O|de!T)f0&v0
+z>xD}-hvn2=gf3XZS~#J8v%u3({tOZAm?JML9`xrD`{=_-pzP?-OM{K>(0+WVU&HRO
+zT4nh@<V`~X>5beH=R&n|u1Kt!{zhW>=laCTPkKq84X1y0Ag!zNvTf$&io|&3be^Ok
+zhHrwkK9Q=h=mgT$DN3vcGP!LTtKIf=GNM|n(@S2t`OQKOgFm}$Y(0(P-y)@1d_ACB
+zXLIAFv6QNLKoH1BRm?gda$%RNXt%3x$w$3hbH)DEVlm54A~lYl#BTAjX1E+~^HNRO
+zQ_~_Eany1ws|NxR7jlYfn3ucR9xU9}s8sHrF$CBA>J{&uOVrzm8*pcm>z>!S>If)N
+zU{S%BdJ@;bVqLiEK0U1V&basVI*ef^`OG}7LTHt<cLmgw{LvBL`MlY)*!lftmeo-I
+z8=3d6Lj*<4#R$cTq@q#^9GBQc-&YzQRQy{>s{%B>t=nff&owr#H^u!f`w^<fikgOF
+zccgQ>ok=2M=P8dQqrEe6d#AONP{sYXrEuwJ)ES{pA1gv0T#3hB-*3AzEfy2b|GqVF
+zNB2|ik0#r0YRF}&X4Cz`)rZgVLGF4KBuOoNTDj#)eac-DbUwGr_3gZD3y5hwGLo2U
+zlM2lekeJ)lc$jq<$5XPmUN+zQaq%lDIS=ODca|<HSOS_Qa+@X}CzXRgNylD>JHa3g
+z6|0cwB1Y>jJ9U-UDpu99H0s6~Z>_`dpU4mKuV|WoiWByMjlY0iOX#V#aHI6&82N|w
+z#JGwsNgJ!??CbkRujuzFKWJK2Ex!=t#WgBx6+G|nAQ~rUn!S-Do`_kV*Z#zXrz_>A
+zOBWk`=9ulX<TT!KdKv8#ur(QXpnbNg=h$xXI@wG%#kD6a$GBl4x2HFJh=96LM2KOn
+z)2ZIa<{d4Oh?}u$>}7H^$j}YKed3(^nvpeB@fmQqf`##cpTh%&rAE1K^?D=LZXx+N
+z=SSj<HpF$jMCj+LNpZJjRblj`l!3KO_edy_cYr>mf~+MjNu#iG8N<|?jOehr`w@QB
+zZgLUpJ>lv>Gp^Ytx3SYN9cIZ@Vs7AiO&Wv7a{b>IClvDBE@p0?4^^!LlG(b6a;P^#
+zBwqBI2lz+~?6ZZ5aYfwwy3$`C$m4hzC$VT)mcX37dPrBQ@|I~Nj4Vk0FQ052KhwEL
+z2z}<YrUM!3c_$S|F-}T$aAR;}1dEfWp`oIpA)%$D%HU<`FArnaOi`fCK1{D*Ctfr_
+zHj0eRnewQt7+AARK8?E#Egw;20Ja4((y+{4&vo5hqXt#Aiv~g+oeW1N*&dlQ7LiCv
+z1r*L%5>wk@Luy$EPAlr%4}L83vKhj7Y7^d;F1Rv_s2YzQ7?xKfmcFhgDpqRPPg=gF
+zv<dydsYr#G?J&c4`2kt5-0{4#$jMU4b1bJbm$HiURJ~4LJlV#g5PXfNqY(5i?6K`~
+z_t49j_wU=Jv$xm{P>W_S)vPBw;zF(DqWi^@29yg0W=*~gcS?@xbU9K((`UeDjb0QX
+z!TGst)ZY;>vxmFBYgmBopJKXimVEIC?k?tvJM6{ute@HkoEW;<sx-XqD1Ir7^Cr+p
+z*kll!WISwU%m0%sOX0~Mv-D!(MfWVjH(4!J+uw^`3~Y}yNT@j~mBxN=e+(-!dyQxK
+z;3+!x>Wi^(w59uX{D&6MYkzx5dUIH*9!JYbo=u#i!7&{rt4f7`JhE6JyqOQq<D79F
+zCU-^JKhv^ao62*7vPEd#Ky(;!%v}uA6&VPX^rM+cz@;M#&0x39&B3*MdRpeMb!V#s
+zI{HgHGymv2oyPVKced$j#e-ChiRAbVUkTcT`ig5Roa6lAZ{fl%$a7v(`Uv+eR-AXz
+zrsnvbUh5HI4Bc}g_A>`jkW`v!Wv`JvcCh?xs$ns`x>eb2Cv7q@ZS(OYkgA1ru4*##
+zj0z;L#rC=8nT>ZziTyy)!cnc}cPuw4<Jb6ahCAr&p1=r_s?7Gru{m9<E<YQan9K2V
+zmJTnZI!^ksJos+#+hv0U(Xr)h_Kr5K!8VZNL?A8r?T6dYeaQDW4tCXOl<{4CAm}c0
+z?~EMU*KoWYJH)AFJ9ta?o&RP=r^z+7W1c60#9_}34vVMeoZ_>dsCiN3wkh&XfV7;`
+z&Jdj?n<9al<z*(~=;(Ym$iR5<C`l&_mbYI^M<=Dmf1s2FC-kSfT0|E|xC{OxU3d4L
+zspF92vy~Omg4BL3j0$2kgv@ZT=A(>|{xI1V+!FBhE8KT6ik_WRgj<uWxR!e80LoOU
+zW4m)2!R@lX7*$Q`Nv3c9yMX>i3ju_k8XAk$7k?OF|0+XEwglg*P3#)`@uT3Vr8BuP
+zWsIRo_t%uF4Ojo<*b0_>gDvxT_JBd9MnY^-+>>IW8#kxv4GMDjeB7LmX`>AFOw9-$
+z0X&_=0(~m3{(fnF(e&(1oXX=jV0Dmy$my%&0nWXSPG|_|@*i~*R3Ji0Td2&Kfp_bN
+z<S~N<)n7ZS={7>E&q{n=I(?AuFB-Dmd@Dj|Vt}zdbmy1NgmJ&k|MC#c<=kTnh^AZ8
+zf7dKqGg&kzFa!S3BiJ8||A%T3cUB;RVkK;Bx21^LarB?_2r~T%j4~;u@uBfI%Vqk%
+zAy-jSe>3i+KVFB$q4c;z|3t@v|3Js;!12We;r;uMy}xTmX={uyk_ZX@4Th`!0>ikt
+z!|x-WZftEaUEV8?Zfk49O;B5xyz>3Yo74DUj~=6q?|;>uBoJ?BzDCsuEwuPF=H$FN
+zYCtoBaB3m$w)So-lG%J?6*EZz^1ab;A5ZMi+v9<TqodaW47BKa6so8Tstb>&XE-D~
+z9DhGP8_gAhyx#w-i`=~*J)RJ{dHWAu0rLpvAG-WOn~R<ZCE>kHv;<aFQxls1!FbzQ
+zFoZ7z-1pav?eMaCeUFj!-I&6heY|ULJb6R00hp*D_VoBTcU69Gde_G;Pg;G&pI93=
+zGUI55P!jgneNz9fN>wkf#y@gho`)jVYU_V4|M}Vz^ca~+v=1Z$;2uZn9GA4A&IIVa
+z@b?-FVKn&M)cohJei}{n=GysR2?uco7Mk+E2nPP|EL1H6dy%QQu;_M`H0Lp83Kt8S
+zRNU)Sg-oP;d*)*1Tqk`bI>4UR@|szd*risVliWTk=d4tRBzeZ&rmo3Lr@B2mB;0X2
+zkqo`v^CC6bXcx4rTjtD&*LN);bB$$KQM7xIBI|cyNVb3Si*=+fs8sp=yYqT(pl)as
+z`<YsI%R?$uCb_iPP{a`TP_&p`Y3N?dv92>+?9-f>n4Fs?61@lJ9yf9i-+fhyuVQo?
+zcvbygDSf&qdXTgXq?UUi(o|lo4Z}G_1wIHbq~~NiIgqQ#<kE36FddC`nVlc6#&4g~
+zj<2kL#R7&k^%~B%J0nJWZhw>@t*gcMUZ>5Mn^>1KzEWjOkjeeLRHdACWQm9Z)MjhW
+zpgFY%AEVYy774;y?B}mB)wF+gSny8r5v-}!!WVc4JoH@3%Hjo{Mg$0Z$V}(eQ@a37
+zM$AEN@>`Cs>5rCA;rXcJc93FgBg?e<4>fi39nVp#22Fis#|u3zlDY8x+PkBrpU9oi
+zB1fOfKPs9zrA;b4Vur4eeOm_(0*W>QN@bd<{ACWy)Jl}Zo#XLk-vk^kYdbi=URZIC
+z{92?lA9{DRcxnpoU@eQy-S;f}L+ID*#bmv*NDvhq8qE8R(PkLg=><hO9wL3%G{`S#
+zSOw0S@4RI473mf;A#<$<kdKiffFT#QnB>dFPiYE`9K&Ov><~qR>g-+j%I=p7*G7x0
+z2MNNaZ#NbS=ezw(rl}WOx%%@43>sc7KfC{2jqD}fRwyTBAd6n)<{%z?AzhyA1#vhs
+z1R(63D`4X(0GsD&9<VYCXs>$S`+h@Ue=WT*W@=>3KZm>61t!@yeNawmZOFlg$6t<r
+zgDIzh7$(h^W25?NqRJ13$PxuZUoAqIRP*<RVv{l*n=*@X*y3A!hb&N@2PZPpZa*tj
+z3CZB$g0YtBmN^=j3&ZNUJcYbpY0P~E9pm_St_nJ$tz!6OU$v?0{O~HsJPl=Ge#s(h
+z03pz=_A`|pnaYWV*)-IcfX8Ii_FrXrLzCY~JBAn5t*5r<MS^~t@AV5tJ_ZigkhIT=
+z(a=Z(`u3iS4`-C(Vv|RfyA?r3%t?YA`7n(EF_n<H+)AKa0*AgQ)L~J>Qmff*MRkR9
+z%|@#~FjkC_oWsXm0O=kkt7W0y4YjI5j17@$=|kD`IlE{`ezFv*T&Kw;m~WDSO1SZg
+zW;}Klu{3HdeCnTj$_|fp&PNA2)n94t!+(kB!N&t9ZpbVH4sG7kHXo%Ca;7fD5Ebg!
+zZ=W{Pi|KlEmh@CCxUe~%RXoE;e@tT53##;mvUL7%E>0{e4O!DY_xKcF)budrL>`gy
+zs1<a29q^dRrzW&OyBbndF=trfE|{RvziCFpB6>TZttPAZWw;aW2z(fLd<x7a+Z<;;
+zn|)SVh_A5Q)K!p`NM|(eV|hP0HcPW0Ag>@LjP)Twc22P6y%2g~Q&`IG8k{uY5R`(V
+zN_uIoHk~Y#7C}!iK4>5;@LZMS+fYi5kd_sf&YF+6W}&QBqT6k>6eC+NU$3W!J{fI-
+zus|QV#k@AFxFGwBU#HvOelH1EODyxdEmG4lk60Bki|cCI>}@<xDet%MPW0oI+S`6|
+z8q`ohQ*7uh$1(HjUCgUb6T|LtMpJ1VeD5qi8~!j-n&_jXq)Q(-ICyU^#hL`EpG8QU
+z8RPAQ#q95hzZSb{j)=P#lX-SbMF&Lvetuta)&Hl4Xy<qM<~>jT_&ySDW9CHXE!Kyg
+z#`B?a+=x_L%PNiOp$OWBfpmIL&3Bt64{kzWxb>}lvvnZGM~s4=$|MFJ?>PvbCdWTz
+z)>!CA!n?^g4Z;SsQ~yk0QFF&Br`JoN9H&j7wI(A|dr3E^czW^IZ#!a(S2rQydk0U{
+zx>cma1jNL|7rX+|*rU9BOlsw4IYKrjn;QD7+p4nf&Ez731Gh?<gw^Y$&)gbYV{9?Y
+zVxi{vh|3zhuY#Wdf8r%N%$VYA`i&mzpu<P@)>C5%<C>)EH})4bvLH=H%T?kvQ>N}7
+zrkCA8>Yx(dhbqmr;xn=5tF#7N?m_gP!_nlXHgV=to$hl5`lKl>z78d2O7I`=hx!(T
+zp|On)N`+%4O?47H?=yaXf;Kmj`^2%@u3SH`%cE2IaN3l+rv;JEAf}sI#9~2%duan1
+z*cYqU>bnZf&RRNl8tKz`Kg(4X?%iu!3;M&srSbV=QwcX`*+TmBR}BFRIT3SJU59$T
+z8x=pEWzCLmztM7*I}=J{Ki?Rlf|Y^T?rLo{vit2zN3hqk$g@KgCV4Xk*mwlfmptYC
+z`iwMW3KtfZ*O1Lz)JrpL*<0ooL&U7Cdk^A<@bp|ujt|7yGU)#ekq6xzM@^Yb`W#*N
+zq$QAiC-|g=j))`~SieGiJk<Jws`u0)=UNHA8~m*1xLOjKJh}|`$ghQ5IryGnxqZQt
+zzUrV93H&iB_P*vN^DELuva(m)uE?1()sKFRy`D=nn;c|sX8H8in<=|Od*4D{70bgC
+z%|!Q${Bc1cA{@uZM_Vw+1bndX!@`mW4xZdnG>_IoRi!8zMP99Lj`x(pr}JX(ODi9j
+zGU&*1aB`=!_+Aq8jMgBfWEzgPwk+#E5{A&*A`g*s(QCO47B+M7Z_kFkv)F3ptv(9e
+z{ZhY`=I20wMW%D1<0z~)g4@3YR?*a9_JsxwR2Q+a8#zB8U;Q0RabIRxP4DE-pDTuG
+z`Bc=@-WPk~VbrWhmhmP3cXB^;iF2POe_p*|zv|uJd%hJ!&)%@Wr{^M@q(fQGT3r4L
+zY!K;yXfY_XrB2z?Sx*2>2L?wyY5lui?ag^U*Lu;1C25HVPak)Fmrl8JT&+nRV!7F`
+zL`j>dYT771$k%()HcD9mU`wj1<5`20wAlcEyFdRZIQ!o+7yq7``S%utI`H&$2YJqv
+zkA}*6=HCDl`WMnl7q&)YNYx{;3k{i{UpM~=(f%povI2c(-0c?&TBI_MlHugCJPiZ(
+zuZYlv#zDY38nTLx;vB%?=(^`;mqg{X<wfao%#QYdBj!&()ADnM)rf)9ej72#RhELB
+zoSdy_m7I51!+0M`UT|?8wQrCJDgRF_jClJZJrWzR?}HDgiFCXn78sv2qZAWXe%XkE
+z7^ifiwPbkM`=#eCPpE|)&HTTHO)*y}b!PYa+j2~2QQq(_gjLOcW@lf%hs(B&f%zw3
+z9`i>*RyzsVc^$e$I=}R=cvLwq<0}9t*0BTMQFfm`kuDRkl1QN|opHi)b@r)=ymD|h
+z0Sx;-F(-dvCEhPz&XX`KoGJmpkSX2!UHB2P(p$_OTuIP^2UU}M&y!{M?@XC`wY%NM
+zm(P<Z0ZFSawTPkVm+7w5J4`>eu`(qVc(A7nozzxQ-6vxL%T+U<4-O7&XlQKb#es$Q
+z)JKjBIB+@=UftUU9^{WNz-b>6<HL43G5cxATQNEu|KLfU?FA%iaRHqY7-e$v)eUkV
+z-;oz;PWKTeC;AGAhNtHz;F|uByv7)n@U>NXA$IeHR{uU=i!dT0`XB*Z4~@JT`*w=e
+zHsLuW35?SD(kd{$r32F6onmm^Pe+Cci7Cl{dk!2*Z(|(&Xu4p+5;8{T_UKlI38m2(
+znS$)Ukhy_|cC?}M8gKvlkHCMDYWy#Z@OQ5}3G^^1)SZOM82aMgU*ll`Io24@qU5%R
+Q&@F(hjN;o;X`_Ju0lg@s5&!@I
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-locked][linux].png b/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-locked][linux].png
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebe5d10bb024537c5ef9da6a58d629a6f957786a
+GIT binary patch
+literal 12939
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--tablet-idle][linux].png b/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--tablet-idle][linux].png
+new file mode 100644
+index 0000000000000000000000000000000000000000..37973c805574839b4a3f6d205166ea9aed464128
+GIT binary patch
+literal 8219
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--tablet-locked][linux].png b/tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--tablet-locked][linux].png
+new file mode 100644
+index 0000000000000000000000000000000000000000..164db27feab2e84625cbe4f8180b5c66051c59f8
+GIT binary patch
+literal 8949
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/web/src/components/blocks/TerminalExtraKeys.stories.tsx b/web/src/components/blocks/TerminalExtraKeys.stories.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7aa1c55e08933e48a127d631204e760f2175bb9b
+--- /dev/null
++++ b/web/src/components/blocks/TerminalExtraKeys.stories.tsx
+@@ -0,0 +1,117 @@
++import type { Meta, StoryObj } from "@storybook/react-vite";
++import type { ReactNode } from "react";
++import { within } from "storybook/test";
++import { TerminalExtraKeys, type ExtraKeysTarget } from "./TerminalExtraKeys";
++import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
++
++const noopTarget: ExtraKeysTarget = {
++  send: () => {},
++  setTransform: () => {},
++  focus: () => {},
++  applicationCursor: () => false,
++};
++
++/** Widest surface the preview wrapper shows unclipped; wider ones are zoomed down. */
++const PREVIEW_MAX_WIDTH = 700;
++
++/**
++ * Keyboard-closed framing: the row is the bottom-most element of the
++ * terminal surface, docked under a (mock) xterm pane, with no soft keyboard
++ * below it. Width is the whole phone / tablet, so the columns widen but the
++ * fourteen keys never move or wrap.
++ */
++function Surface({ width, children }: { width: number; children: ReactNode }) {
++  return (
++    <div
++      style={{ width, zoom: Math.min(1, PREVIEW_MAX_WIDTH / width) }}
++      className="flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-sm"
++    >
++      <div
++        aria-hidden
++        className="h-40 bg-zinc-950 p-2 font-mono text-[13px] leading-5 text-zinc-100"
++      >
++        <div>$ claude</div>
++        <div className="text-zinc-400">⏵⏵ accept edits on (shift+tab to cycle)</div>
++        <div>
++          &gt; <span className="animate-pulse">▍</span>
++        </div>
++      </div>
++      {children}
++    </div>
++  );
++}
++
++const meta = {
++  title: "Components/Terminal/TerminalExtraKeys",
++  component: TerminalExtraKeys,
++  tags: ["visual-snapshot"],
++  args: { target: noopTarget },
++  parameters: { layout: "padded" },
++} satisfies Meta<typeof TerminalExtraKeys>;
++
++export default meta;
++type Story = StoryObj<typeof meta>;
++
++/**
++ * Press a modifier for ``holdMs`` with raw pointer events — the row acts on
++ * pointerdown/pointerup, and pointerId 1 is the browser's always-present mouse.
++ */
++async function pressModifier(canvasElement: HTMLElement, name: string, holdMs: number) {
++  const key = within(canvasElement).getByRole("button", { name });
++  const init = { pointerId: 1, isPrimary: true, button: 0, bubbles: true };
++  key.dispatchEvent(new PointerEvent("pointerdown", init));
++  await new Promise((resolve) => {
++    setTimeout(resolve, holdMs);
++  });
++  key.dispatchEvent(new PointerEvent("pointerup", init));
++}
++
++export const PhoneIdle: Story = {
++  render: (args) => (
++    <Surface width={390}>
++      <TerminalExtraKeys {...args} />
++    </Surface>
++  ),
++};
++
++export const PhoneArmed: Story = {
++  render: (args) => (
++    <Surface width={390}>
++      <TerminalExtraKeys {...args} />
++    </Surface>
++  ),
++  play: async ({ canvasElement }) => {
++    await pressModifier(canvasElement, "Control", 0);
++  },
++};
++
++export const PhoneLocked: Story = {
++  render: (args) => (
++    <Surface width={390}>
++      <TerminalExtraKeys {...args} />
++    </Surface>
++  ),
++  play: async ({ canvasElement }) => {
++    await pressModifier(canvasElement, "Control", LONG_PRESS_MS + 100);
++  },
++};
++
++export const TabletIdle: Story = {
++  render: (args) => (
++    <Surface width={1024}>
++      <TerminalExtraKeys {...args} />
++    </Surface>
++  ),
++};
++
++export const TabletLocked: Story = {
++  render: (args) => (
++    <Surface width={1024}>
++      <TerminalExtraKeys {...args} />
++    </Surface>
++  ),
++  play: async ({ canvasElement }) => {
++    await pressModifier(canvasElement, "Shift", LONG_PRESS_MS + 100);
++    await pressModifier(canvasElement, "Alt", 0);
++  },
++};
+diff --git a/web/src/components/blocks/TerminalExtraKeys.test.tsx b/web/src/components/blocks/TerminalExtraKeys.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f7989245862923153
+--- /dev/null
++++ b/web/src/components/blocks/TerminalExtraKeys.test.tsx
+@@ -0,0 +1,408 @@
++import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
++import { act } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  TerminalExtraKeys,
++  type ExtraKeysInputTransform,
++  type ExtraKeysTarget,
++} from "./TerminalExtraKeys";
++import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
++
++const keyboardInset = vi.hoisted(() => vi.fn(() => 0));
++vi.mock("@/hooks/useIOSNativeKeyboardInset", () => ({
++  useIOSNativeKeyboardInset: keyboardInset,
++}));
++
++function makeTarget(applicationCursor = false) {
++  return {
++    send: vi.fn<(data: string) => void>(),
++    setTransform: vi.fn<(fn: ExtraKeysInputTransform | null) => void>(),
++    focus: vi.fn<() => void>(),
++    applicationCursor: () => applicationCursor,
++  } satisfies ExtraKeysTarget;
++}
++
++/** The transform most recently installed on the target (null if cleared). */
++function installedTransform(target: ReturnType<typeof makeTarget>) {
++  const calls = target.setTransform.mock.calls;
++  return calls.length === 0 ? undefined : calls[calls.length - 1][0];
++}
++
++/** Run the installed transform the way xterm's onData would (outside React). */
++function typeThrough(target: ReturnType<typeof makeTarget>, data: string): string {
++  const transform = installedTransform(target);
++  expect(transform).toBeTypeOf("function");
++  let out = "";
++  act(() => {
++    out = transform!(data);
++  });
++  return out;
++}
++
++function pointerDown(el: Element, over: Partial<PointerEventInit> = {}) {
++  return fireEvent.pointerDown(el, {
++    pointerId: 1,
++    button: 0,
++    isPrimary: true,
++    pointerType: "touch",
++    ...over,
++  });
++}
++
++function pointerUp(el: Element, over: Partial<PointerEventInit> = {}) {
++  return fireEvent.pointerUp(el, {
++    pointerId: 1,
++    button: 0,
++    isPrimary: true,
++    pointerType: "touch",
++    ...over,
++  });
++}
++
++function tap(el: Element) {
++  pointerDown(el);
++  pointerUp(el);
++  // A real tap is followed by a compat click with detail 1; it must be ignored.
++  fireEvent.click(el, { detail: 1 });
++}
++
++function key(name: string) {
++  return screen.getByRole("button", { name });
++}
++
++beforeEach(() => {
++  vi.useFakeTimers();
++});
++
++afterEach(() => {
++  cleanup();
++  vi.useRealTimers();
++  vi.restoreAllMocks();
++});
++
++describe("TerminalExtraKeys layout", () => {
++  it("renders exactly 14 type=button keys in two rows of seven, unfocusable by Tab", () => {
++    render(<TerminalExtraKeys target={makeTarget()} />);
++    const toolbar = screen.getByRole("toolbar", { name: "Terminal extra keys" });
++    const buttons = within(toolbar).getAllByRole("button");
++    expect(buttons).toHaveLength(14);
++    expect(buttons.filter((b) => b.dataset.row === "1")).toHaveLength(7);
++    expect(buttons.filter((b) => b.dataset.row === "2")).toHaveLength(7);
++    for (const b of buttons) {
++      expect(b).toHaveAttribute("type", "button");
++      expect(b).toHaveAttribute("tabindex", "-1");
++    }
++    expect(buttons.map((b) => b.textContent)).toEqual([
++      "Esc",
++      "⇧Tab",
++      "Tab",
++      "Home",
++      "↑",
++      "End",
++      "PgUp",
++      "Ctrl",
++      "Alt",
++      "Shift",
++      "←",
++      "↓",
++      "→",
++      "PgDn",
++    ]);
++  });
++
++  it("exposes aria-pressed only on the modifiers", () => {
++    render(<TerminalExtraKeys target={makeTarget()} />);
++    expect(key("Control")).toHaveAttribute("aria-pressed", "false");
++    expect(key("Alt")).toHaveAttribute("aria-pressed", "false");
++    expect(key("Shift")).toHaveAttribute("aria-pressed", "false");
++    expect(key("Escape")).not.toHaveAttribute("aria-pressed");
++    expect(key("Arrow up")).not.toHaveAttribute("aria-pressed");
++  });
++});
++
++describe("TerminalExtraKeys pointer semantics", () => {
++  it("cancels touchend so an iOS tap never moves focus off the terminal", () => {
++    // WHY: iOS focuses the tapped button on the synthetic click even when
++    // pointerdown was prevented, which dismisses the soft keyboard.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const esc = key("Escape");
++
++    pointerDown(esc);
++    pointerUp(esc);
++    expect(fireEvent.touchEnd(esc)).toBe(false);
++    expect(target.send).toHaveBeenCalledTimes(1);
++  });
++
++  it("marks the row while the iOS keyboard is docked", () => {
++    const target = makeTarget();
++    keyboardInset.mockReturnValue(0);
++    const { rerender } = render(<TerminalExtraKeys target={target} />);
++    const row = screen.getByRole("toolbar", { name: "Terminal extra keys" });
++    expect(row).not.toHaveAttribute("data-keyboard-open");
++
++    keyboardInset.mockReturnValue(336);
++    rerender(<TerminalExtraKeys target={target} className="x" />);
++    expect(row).toHaveAttribute("data-keyboard-open", "true");
++  });
++
++  it("sends on pointerup exactly once per tap, and prevents the pointerdown default", () => {
++    // WHY: pointerdown preventDefault keeps focus on xterm's textarea (soft
++    // keyboard stays open) and suppresses compat mouse events; the trailing
++    // click must not fire the key a second time.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const esc = key("Escape");
++
++    const down = pointerDown(esc);
++    expect(down).toBe(false); // preventDefault() was called
++    expect(target.send).not.toHaveBeenCalled();
++
++    pointerUp(esc);
++    expect(target.send).toHaveBeenCalledTimes(1);
++    expect(target.send).toHaveBeenCalledWith("\x1b");
++
++    fireEvent.click(esc, { detail: 1 });
++    expect(target.send).toHaveBeenCalledTimes(1);
++  });
++
++  it("ignores non-primary pointers and secondary buttons", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const tab = key("Tab");
++
++    pointerDown(tab, { isPrimary: false, pointerId: 2 });
++    pointerUp(tab, { isPrimary: false, pointerId: 2 });
++    pointerDown(tab, { button: 2 });
++    pointerUp(tab, { button: 2 });
++    expect(target.send).not.toHaveBeenCalled();
++  });
++
++  it("pointercancel aborts the press: nothing is sent and no lock is armed", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++
++    pointerDown(key("Arrow up"));
++    fireEvent.pointerCancel(key("Arrow up"), { pointerId: 1 });
++    pointerUp(key("Arrow up"));
++    expect(target.send).not.toHaveBeenCalled();
++
++    pointerDown(key("Control"));
++    fireEvent.pointerCancel(key("Control"), { pointerId: 1 });
++    act(() => vi.advanceTimersByTime(LONG_PRESS_MS + 50));
++    expect(key("Control")).toHaveAttribute("aria-pressed", "false");
++  });
++
++  it("pointercancel after the long-press fired restores the modifier's pre-press state", () => {
++    // WHY: a scroll or palm that cancels the gesture after 500 ms must not
++    // leave Ctrl locked — whatever the timer did is undone.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const ctrl = key("Control");
++
++    pointerDown(ctrl);
++    act(() => vi.advanceTimersByTime(LONG_PRESS_MS + 50));
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
++    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
++    expect(installedTransform(target)).toBeNull();
++
++    // From an armed pre-state the cancel goes back to armed, not off.
++    tap(ctrl);
++    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
++    pointerDown(ctrl);
++    act(() => vi.advanceTimersByTime(LONG_PRESS_MS + 50));
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
++    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
++    expect(typeof installedTransform(target)).toBe("function");
++  });
++
++  it("pointercancel does not re-arm a modifier that typing consumed during the press", () => {
++    // WHY: the press only owns the long-press transition; an armed Ctrl spent
++    // by a keystroke while the finger was down must stay off after a cancel.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const ctrl = key("Control");
++
++    tap(ctrl);
++    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
++    pointerDown(ctrl);
++    act(() => vi.advanceTimersByTime(LONG_PRESS_MS / 2));
++    expect(typeThrough(target, "c")).toBe("\x03");
++    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
++
++    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
++    act(() => vi.advanceTimersByTime(LONG_PRESS_MS));
++    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
++    expect(installedTransform(target)).toBeNull();
++  });
++
++  it("pointercancel after a lock does not re-arm a one-shot that typing spent while held", () => {
++    // WHY: armed → held past the lock → a character goes out as Ctrl+char →
++    // cancel. The one-shot was consumed, so the restore must land on off.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const ctrl = key("Control");
++
++    tap(ctrl);
++    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
++    pointerDown(ctrl);
++    act(() => vi.advanceTimersByTime(LONG_PRESS_MS + 50));
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++    expect(typeThrough(target, "c")).toBe("\x03");
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++
++    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
++    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
++    expect(installedTransform(target)).toBeNull();
++  });
++
++  it("activates from a keyboard/AT click (detail 0) without pointer events", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    fireEvent.click(key("Tab"), { detail: 0 });
++    expect(target.send).toHaveBeenCalledWith("\t");
++  });
++
++  it("sends nothing while a plain key is held and honors DECCKM for arrows", () => {
++    const target = makeTarget(true);
++    render(<TerminalExtraKeys target={target} />);
++    tap(key("Arrow up"));
++    expect(target.send).toHaveBeenCalledWith("\x1bOA");
++  });
++});
++
++describe("TerminalExtraKeys focus policy", () => {
++  it("focuses the terminal from a modifier pointerdown and never from a plain key", () => {
++    // WHY: modifiers only make sense combined with the next typed character
++    // (WKWebView honors focus() only inside the gesture); Esc/arrows must not
++    // pop the soft keyboard and reflow the terminal.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++
++    pointerDown(key("Control"));
++    expect(target.focus).toHaveBeenCalledTimes(1);
++    pointerUp(key("Control"));
++
++    tap(key("Escape"));
++    tap(key("Arrow left"));
++    tap(key("Shift Tab"));
++    expect(target.focus).toHaveBeenCalledTimes(1);
++  });
++
++  it("focuses the terminal on assistive-tech activation of a modifier only", () => {
++    // WHY: a synthesized click never goes through pointerdown, so the
++    // focus a screen-reader user needs to combine Ctrl with a character
++    // must come from the activation itself; plain keys still never focus.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++
++    fireEvent.click(key("Control"), { detail: 0 });
++    expect(key("Control")).toHaveAttribute("aria-pressed", "true");
++    expect(target.focus).toHaveBeenCalledTimes(1);
++
++    fireEvent.click(key("Escape"), { detail: 0 });
++    fireEvent.click(key("Tab"), { detail: 0 });
++    expect(target.send).toHaveBeenCalledTimes(2);
++    expect(target.focus).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe("TerminalExtraKeys sticky modifiers", () => {
++  it("arms on tap (accent outline, aria-pressed) and installs the transform; a second tap disarms", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const ctrl = key("Control");
++
++    tap(ctrl);
++    expect(ctrl).toHaveAttribute("aria-pressed", "true");
++    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
++    expect(typeof installedTransform(target)).toBe("function");
++
++    tap(ctrl);
++    expect(ctrl).toHaveAttribute("aria-pressed", "false");
++    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
++    expect(installedTransform(target)).toBeNull();
++  });
++
++  it("does not install a transform while idle", () => {
++    // WHY: the onData hot path must be a single null check when nothing is
++    // armed — the row installs the transform only when a modifier activates.
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    tap(key("Escape"));
++    tap(key("Arrow down"));
++    const installs = target.setTransform.mock.calls.filter((c) => c[0] !== null);
++    expect(installs).toHaveLength(0);
++  });
++
++  it("armed Ctrl rewrites the next typed character via the transform and then disarms", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    tap(key("Control"));
++
++    expect(typeThrough(target, "c")).toBe("\x03");
++    expect(key("Control")).toHaveAttribute("aria-pressed", "false");
++    expect(installedTransform(target)).toBeNull();
++  });
++
++  it("armed modifiers apply to the next row key and are consumed by it", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    tap(key("Shift"));
++    tap(key("Arrow up"));
++    expect(target.send).toHaveBeenLastCalledWith("\x1b[1;2A");
++    expect(key("Shift")).toHaveAttribute("aria-pressed", "false");
++
++    tap(key("Alt"));
++    tap(key("Escape"));
++    // Esc is atomic: unmodified bytes, but the armed Alt is still cleared.
++    expect(target.send).toHaveBeenLastCalledWith("\x1b");
++    expect(key("Alt")).toHaveAttribute("aria-pressed", "false");
++  });
++
++  it("long-press locks (filled accent) and the lock survives use until tapped off", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const ctrl = key("Control");
++
++    pointerDown(ctrl);
++    act(() => vi.advanceTimersByTime(LONG_PRESS_MS - 1));
++    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
++    act(() => vi.advanceTimersByTime(1));
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++    expect(ctrl).toHaveAttribute("aria-pressed", "true");
++    // Releasing after the lock fired must not toggle it back off.
++    pointerUp(ctrl);
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++
++    expect(typeThrough(target, "r")).toBe("\x12");
++    expect(typeThrough(target, "c")).toBe("\x03");
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++    tap(key("Arrow right"));
++    expect(target.send).toHaveBeenLastCalledWith("\x1b[1;5C");
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++
++    tap(ctrl);
++    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
++    expect(installedTransform(target)).toBeNull();
++  });
++
++  it("multi-character chunks pass through the transform untouched but still clear an armed modifier", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    tap(key("Alt"));
++    expect(typeThrough(target, "paste me")).toBe("paste me");
++    expect(key("Alt")).toHaveAttribute("aria-pressed", "false");
++  });
++
++  it("clears the transform on unmount", () => {
++    const target = makeTarget();
++    const { unmount } = render(<TerminalExtraKeys target={target} />);
++    tap(key("Control"));
++    expect(typeof installedTransform(target)).toBe("function");
++    unmount();
++    expect(installedTransform(target)).toBeNull();
++  });
++});
+diff --git a/web/src/components/blocks/TerminalExtraKeys.tsx b/web/src/components/blocks/TerminalExtraKeys.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5d0c4adb5
+--- /dev/null
++++ b/web/src/components/blocks/TerminalExtraKeys.tsx
+@@ -0,0 +1,237 @@
++// Termux-style extra-keys row under the terminal on touch devices: a fixed
++// 2×7 grid of Esc / Tab / arrows plus sticky Ctrl / Alt / Shift. Modifier
++// state lives in a ref so a keystroke never waits on a React render.
++
++import {
++  memo,
++  useCallback,
++  useEffect,
++  useRef,
++  useState,
++  type MouseEvent,
++  type PointerEvent,
++} from "react";
++import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
++import { cn } from "@/lib/utils";
++import {
++  EXTRA_KEY_ROWS,
++  LONG_PRESS_MS,
++  MODIFIERS_OFF,
++  activeModifiers,
++  encodeExtraKey,
++  encodeModifiedInput,
++  hasActiveModifier,
++  reduceModifiers,
++  type ExtraKeyDef,
++  type ModifierState,
++  type ModifierStates,
++} from "./terminalExtraKeysModel";
++
++/** Rewrite applied to each typed ``onData`` chunk while a modifier is active. */
++export type ExtraKeysInputTransform = (data: string) => string;
++
++/**
++ * The slice of the live terminal bridge the row drives. Read at event time
++ * (never captured), so a re-dialed session needs no re-render of the row.
++ */
++export interface ExtraKeysTarget {
++  /** Send raw bytes as one frame, bypassing the input transform. */
++  send: (data: string) => void;
++  /** Install or clear (``null``) the typed-input rewrite on the live session. */
++  setTransform: (fn: ExtraKeysInputTransform | null) => void;
++  /** Focus xterm's textarea so the next soft-keyboard character combines. */
++  focus: () => void;
++  /** Whether the program enabled application cursor keys (DECCKM). */
++  applicationCursor: () => boolean;
++}
++
++interface TerminalExtraKeysProps {
++  target: ExtraKeysTarget;
++  className?: string;
++}
++
++interface PressState {
++  pointerId: number;
++  key: ExtraKeyDef;
++  timer: number | null;
++  longPressFired: boolean;
++  /** Modifier state before this press, restored if the gesture is cancelled. */
++  previous: ModifierState | null;
++  /** Input (typed or row key) went out while held; an armed one-shot is spent. */
++  inputSent: boolean;
++}
++
++export const TerminalExtraKeys = memo(function TerminalExtraKeys({
++  target,
++  className,
++}: TerminalExtraKeysProps) {
++  const [mods, setMods] = useState<ModifierStates>(MODIFIERS_OFF);
++  const modsRef = useRef<ModifierStates>(MODIFIERS_OFF);
++  const pressRef = useRef<PressState | null>(null);
++  const targetRef = useRef(target);
++  targetRef.current = target;
++  const transformRef = useRef<ExtraKeysInputTransform | null>(null);
++  const keyboardOpen = useIOSNativeKeyboardInset() > 0;
++
++  // Single write point for modifier state: the ref feeds the transform, the
++  // React state repaints the highlighted keys, and the session only carries
++  // a transform while something is armed or locked.
++  const commit = useCallback((next: ModifierStates) => {
++    if (next === modsRef.current) return;
++    modsRef.current = next;
++    setMods(next);
++    targetRef.current.setTransform(hasActiveModifier(next) ? transformRef.current : null);
++  }, []);
++
++  // Reads the ref, not React state, so a keystroke never waits on a render.
++  const transform = useCallback<ExtraKeysInputTransform>(
++    (data) => {
++      const state = modsRef.current;
++      const out = encodeModifiedInput(data, activeModifiers(state));
++      if (pressRef.current) pressRef.current.inputSent = true;
++      commit(reduceModifiers(state, { type: "consume" }));
++      return out;
++    },
++    [commit],
++  );
++  transformRef.current = transform;
++
++  const clearPress = useCallback(() => {
++    const press = pressRef.current;
++    if (press?.timer != null) window.clearTimeout(press.timer);
++    pressRef.current = null;
++  }, []);
++
++  // Clear the rewrite and any pending long-press when the row unmounts (the
++  // visibility preference flips, the pointer turns fine, the view closes).
++  useEffect(() => {
++    return () => {
++      clearPress();
++      targetRef.current.setTransform(null);
++    };
++  }, [clearPress]);
++
++  const activate = useCallback(
++    (key: ExtraKeyDef, focused: boolean) => {
++      if (key.kind === "modifier") {
++        // A modifier only pays off with the next typed character; pointer
++        // presses focused on pointerdown, assistive-tech clicks have not yet.
++        if (!focused) targetRef.current.focus();
++        commit(reduceModifiers(modsRef.current, { type: "tap", mod: key.id }));
++        return;
++      }
++      const state = modsRef.current;
++      const seq = encodeExtraKey(key.id, activeModifiers(state), {
++        applicationCursor: targetRef.current.applicationCursor(),
++      });
++      targetRef.current.send(seq);
++      if (pressRef.current) pressRef.current.inputSent = true;
++      commit(reduceModifiers(state, { type: "consume" }));
++    },
++    [commit],
++  );
++
++  const onPointerDown = useCallback(
++    (e: PointerEvent<HTMLButtonElement>, key: ExtraKeyDef) => {
++      if (e.button !== 0 || !e.isPrimary) return;
++      // Keep focus where it is (xterm's textarea, so the soft keyboard stays
++      // open) and suppress the compat mousedown/click pair.
++      e.preventDefault();
++      e.currentTarget.setPointerCapture(e.pointerId);
++      clearPress();
++      const press: PressState = {
++        pointerId: e.pointerId,
++        key,
++        timer: null,
++        longPressFired: false,
++        previous: key.kind === "modifier" ? modsRef.current[key.id] : null,
++        inputSent: false,
++      };
++      if (key.kind === "modifier") {
++        // WKWebView honors a programmatic focus only inside the trusted
++        // gesture; plain keys never focus (Esc must not summon the keyboard).
++        targetRef.current.focus();
++        press.timer = window.setTimeout(() => {
++          press.timer = null;
++          press.longPressFired = true;
++          commit(reduceModifiers(modsRef.current, { type: "longPress", mod: key.id }));
++        }, LONG_PRESS_MS);
++      }
++      pressRef.current = press;
++    },
++    [clearPress, commit],
++  );
++
++  const onPointerUp = useCallback(
++    (e: PointerEvent<HTMLButtonElement>) => {
++      const press = pressRef.current;
++      if (!press || press.pointerId !== e.pointerId) return;
++      clearPress();
++      if (!press.longPressFired) activate(press.key, true);
++    },
++    [activate, clearPress],
++  );
++
++  const onPointerCancel = useCallback(
++    (e: PointerEvent<HTMLButtonElement>) => {
++      const press = pressRef.current;
++      if (!press || press.pointerId !== e.pointerId) return;
++      clearPress();
++      // A cancelled gesture (scroll, palm) undoes the lock this press set —
++      // and only that; an armed one-shot that input already spent stays off.
++      if (press.longPressFired && press.key.kind === "modifier" && press.previous !== null) {
++        const restored = press.previous === "armed" && press.inputSent ? "off" : press.previous;
++        commit({ ...modsRef.current, [press.key.id]: restored });
++      }
++    },
++    [clearPress, commit],
++  );
++
++  const onClick = useCallback(
++    (e: MouseEvent<HTMLButtonElement>, key: ExtraKeyDef) => {
++      // Pointer taps are handled on pointerup; only keyboard / assistive-tech
++      // activation (a synthesized click, detail 0) reaches here.
++      if (e.detail !== 0) return;
++      activate(key, false);
++    },
++    [activate],
++  );
++
++  return (
++    <div
++      role="toolbar"
++      aria-label="Terminal extra keys"
++      data-testid="terminal-extra-keys"
++      data-keyboard-open={keyboardOpen || undefined}
++      className={cn("terminal-extra-keys", className)}
++      onContextMenu={(e) => e.preventDefault()}
++      // iOS moves focus on the tap's synthetic click even after pointerdown is
++      // prevented; cancelling touchend keeps xterm's textarea and the keyboard.
++      onTouchEnd={(e) => e.preventDefault()}
++    >
++      {EXTRA_KEY_ROWS.map((row, rowIndex) =>
++        row.map((key) => {
++          const modState = key.kind === "modifier" ? mods[key.id] : undefined;
++          return (
++            <button
++              key={key.id}
++              type="button"
++              tabIndex={-1}
++              aria-label={key.name}
++              aria-pressed={modState === undefined ? undefined : modState !== "off"}
++              data-key={key.id}
++              data-row={rowIndex + 1}
++              data-modifier-state={modState}
++              onPointerDown={(e) => onPointerDown(e, key)}
++              onPointerUp={onPointerUp}
++              onPointerCancel={onPointerCancel}
++              onClick={(e) => onClick(e, key)}
++            >
++              {key.label}
++            </button>
++          );
++        }),
++      )}
++    </div>
++  );
++});
+diff --git a/web/src/components/blocks/TerminalSession.test.ts b/web/src/components/blocks/TerminalSession.test.ts
+index 9f5a3efb109cf0a79690900597ecd6ebf42e6fe1..6631ac27850748ce325401360dd584412dd065fa 100644
+--- a/web/src/components/blocks/TerminalSession.test.ts
++++ b/web/src/components/blocks/TerminalSession.test.ts
+@@ -1211,6 +1211,131 @@ describe("TerminalSession", () => {
+     expect(socket.closed).toBe(false);
+   });
+ 
++  describe("sendInput / setInputTransform (extra-keys row seams)", () => {
++    function binaryFrames(socket: FakeWebSocket): Uint8Array[] {
++      // TextEncoder output comes from Node's realm, so `instanceof Uint8Array`
++      // is false under jsdom; strings are the only other frame type.
++      return socket.sent.filter((m): m is Uint8Array => typeof m !== "string");
++    }
++
++    it("sends a lone Esc as exactly one single-byte frame", () => {
++      // WHY: the harness distinguishes Esc from Alt+key by the read boundary
++      // (one WS frame = one tmux send-keys), so Esc must be its own frame —
++      // never merged with a following key or split.
++      const onInput = vi.fn();
++      const { socket, session } = makeSession(undefined, onInput);
++      socket.open();
++      const before = binaryFrames(socket).length;
++
++      session.sendInput("\x1b");
++
++      const frames = binaryFrames(socket).slice(before);
++      expect(frames).toHaveLength(1);
++      expect(Array.from(frames[0])).toEqual([0x1b]);
++      expect(onInput).toHaveBeenCalledTimes(1);
++      session.dispose();
++    });
++
++    it("sends Alt+x as one two-byte frame", () => {
++      const { socket, session } = makeSession();
++      socket.open();
++      const before = binaryFrames(socket).length;
++
++      session.sendInput("\x1bx");
++
++      const frames = binaryFrames(socket).slice(before);
++      expect(frames).toHaveLength(1);
++      expect(Array.from(frames[0])).toEqual([0x1b, 0x78]);
++      session.dispose();
++    });
++
++    it("applies the input transform to typed data but not to sendInput", () => {
++      // WHY: a sticky Ctrl rewrites the next typed character; row keys go out
++      // via sendInput and must bypass the rewrite (no double-application).
++      const { socket, session } = makeSession();
++      const term = (session as unknown as { term: Terminal }).term;
++      socket.open();
++      const before = binaryFrames(socket).length;
++
++      const transform = vi.fn((d: string) => (d === "c" ? "\x03" : d));
++      session.setInputTransform(transform);
++      term.input("c", true);
++      session.sendInput("c");
++
++      const frames = binaryFrames(socket).slice(before);
++      expect(frames.map((f) => Array.from(f))).toEqual([[0x03], [0x63]]);
++      expect(transform).toHaveBeenCalledTimes(1);
++
++      // Clearing the transform restores the passthrough path.
++      session.setInputTransform(null);
++      term.input("c", true);
++      expect(Array.from(binaryFrames(socket).at(-1)!)).toEqual([0x63]);
++      session.dispose();
++    });
++
++    it("routes wheel mouse reports around the transform so they neither consume nor inherit it", async () => {
++      // Capture the custom wheel handler at construction and drive it
++      // directly — jsdom has no layout, so a dispatched WheelEvent never
++      // reaches xterm's own listener.
++      let wheelHandler: ((e: WheelEvent) => boolean) | undefined;
++      vi.spyOn(Terminal.prototype, "attachCustomWheelEventHandler").mockImplementation(function (
++        this: Terminal,
++        handler,
++      ) {
++        wheelHandler = handler;
++      });
++      const { socket, session } = makeSession();
++      const term = (session as unknown as { term: Terminal }).term;
++      socket.open();
++      // Any-motion mouse tracking with SGR encoding — the mode set a
++      // mouse-aware TUI (Claude Code, OpenCode) uses.
++      await new Promise<void>((resolve) => {
++        term.write("\x1b[?1003h\x1b[?1006h", resolve);
++      });
++      vi.spyOn(
++        session as unknown as { sgrMouseEncodingActive: () => boolean },
++        "sgrMouseEncodingActive",
++      ).mockReturnValue(true);
++      vi.spyOn(
++        session as unknown as { screenMetrics: () => unknown },
++        "screenMetrics",
++      ).mockReturnValue({ left: 0, top: 0, cellWidth: 8, cellHeight: 16, cols: 80, rows: 24 });
++      const transform = vi.fn((d: string) => `T${d}`);
++      session.setInputTransform(transform);
++      const before = binaryFrames(socket).length;
++
++      expect(wheelHandler).toBeDefined();
++      const consumed = wheelHandler!({
++        deltaY: -32,
++        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
++        shiftKey: false,
++        clientX: 4,
++        clientY: 4,
++        preventDefault: () => {},
++      } as unknown as WheelEvent);
++
++      expect(consumed).toBe(false);
++      const frames = binaryFrames(socket).slice(before);
++      expect(frames).toHaveLength(1);
++      // Two whole lines → two raw SGR wheel-up reports, no "T" prefix.
++      expect(new TextDecoder().decode(frames[0])).toBe("\x1b[<64;1;1M\x1b[<64;1;1M");
++      expect(transform).not.toHaveBeenCalled();
++      session.dispose();
++    });
++
++    it("sends nothing while the socket is not open", () => {
++      // WHY: a reconnecting attach must not queue or throw.
++      const onInput = vi.fn();
++      const { socket, session } = makeSession(undefined, onInput);
++
++      session.sendInput("\x1b");
++
++      expect(socket.sent).toHaveLength(0);
++      expect(onInput).toHaveBeenCalledTimes(1);
++      session.dispose();
++    });
++  });
++
+   it("observes the container for resize", () => {
+     // WHY: layout changes (window resize, font load) must propagate a resize
+     // frame, so the session must register a ResizeObserver on its container.
+diff --git a/web/src/components/blocks/TerminalSession.ts b/web/src/components/blocks/TerminalSession.ts
+index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e65baa970c 100644
+--- a/web/src/components/blocks/TerminalSession.ts
++++ b/web/src/components/blocks/TerminalSession.ts
+@@ -21,6 +21,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
+ import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
+ import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
+ import { TerminalLinkProvider } from "./TerminalLinkProvider";
++import { SHIFT_ENTER_CSI_U } from "./terminalExtraKeysModel";
+ 
+ // Card background colors derived from the app's CSS palette.
+ // Light: --card: oklch(1.000 0 0) = pure white.
+@@ -234,8 +235,8 @@ export type TerminalActivityListener = () => void;
+ /** Listener for user keyboard input sent to the terminal. */
+ export type TerminalInputListener = () => void;
+ 
+-/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
+-export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
++// The constant lives with the pure key model; re-exported for existing callers.
++export { SHIFT_ENTER_CSI_U };
+ 
+ /** Readline line-editing bytes for the macOS Cmd key mappings below. */
+ export const CMD_BACKSPACE_LINE_KILL = "\x15"; // Ctrl-U: kill to line start
+@@ -655,6 +656,13 @@ export class TerminalSession {
+   private focusOnConnect: boolean;
+   /** ``performance.now()`` of the last keystroke; gates clipboard writes. */
+   private lastUserInputAt = 0;
++  private readonly onInput?: TerminalInputListener;
++  /**
++   * Rewrites each ``onData`` chunk before it is sent (the extra-keys row's
++   * sticky Ctrl/Alt/Shift). ``null`` while no modifier is active, so the idle
++   * hot path is a single null check.
++   */
++  private inputTransform: ((data: string) => string) | null = null;
+   /** Guards {@link dispose} so calling it twice is a safe no-op. */
+   private disposed = false;
+   /**
+@@ -711,6 +719,7 @@ export class TerminalSession {
+     this.clipboardEnabled = clipboardEnabled;
+     this.focusOnConnect = focusOnConnect;
+     this.onClipboardRequest = onClipboardRequest;
++    this.onInput = onInput;
+     // Read the user's code-font preference (Settings → Appearance) at
+     // construction; a mid-session change is applied live via setFont(). The
+     // xterm.js defaults (15px, no theme) feel out of place inside the app
+@@ -829,13 +838,11 @@ export class TerminalSession {
+       { signal },
+     );
+ 
++    // One onData chunk = one WS frame = one tmux `send-keys -H`. The harness
++    // tells Esc from Alt+key by that read boundary, so never split, merge or
++    // defer chunks here (no timers): a lone "\x1b" must stay its own frame.
+     this.dataDispose = this.term.onData((d) => {
+-      onInput?.();
+-      // Stamp before the readyState guard so clipboard trust still reflects
+-      // local input during a momentary WebSocket hiccup.
+-      this.lastUserInputAt = performance.now();
+-      if (this.ws.readyState !== WebSocket.OPEN) return;
+-      this.ws.send(INPUT_ENCODER.encode(d));
++      this.sendInput(this.inputTransform ? this.inputTransform(d) : d);
+     });
+ 
+     this.term.attachCustomKeyEventHandler((e) => {
+@@ -846,11 +853,7 @@ export class TerminalSession {
+       // the CSI-u sequence once, on keydown.
+       if (e.type === "keydown") {
+         e.preventDefault();
+-        onInput?.();
+-        this.lastUserInputAt = performance.now();
+-        if (this.ws.readyState === WebSocket.OPEN) {
+-          this.ws.send(INPUT_ENCODER.encode(payload));
+-        }
++        this.sendInput(payload);
+       }
+       return false;
+     });
+@@ -858,9 +861,9 @@ export class TerminalSession {
+     // Replace xterm's lossy wheel→mouse-report conversion (trackpad deltas
+     // are damped and capped to one report per event, which reads as
+     // "scrolling doesn't work" on macOS trackpads) with the accumulating
+-    // synthesis in wheelReportPayload. term.input routes the reports
+-    // through the normal onData path above, so they hit the WS send and
+-    // the input-activity bookkeeping like any keystroke.
++    // synthesis in wheelReportPayload. Reports go straight to sendInput —
++    // not through term.input/onData — so a sticky modifier never rewrites
++    // or gets consumed by a mouse report.
+     this.term.attachCustomWheelEventHandler((e) => {
+       const result = wheelReportPayload(
+         e,
+@@ -873,7 +876,7 @@ export class TerminalSession {
+       );
+       this.wheelPartialLines = result.partial;
+       if (!result.consume) return true;
+-      if (result.data) this.term.input(result.data, true);
++      if (result.data) this.sendInput(result.data);
+       e.preventDefault();
+       return false;
+     });
+@@ -984,6 +987,33 @@ export class TerminalSession {
+     this.term.focus();
+   }
+ 
++  /**
++   * Install (or clear with ``null``) a rewrite applied to every ``onData``
++   * chunk before it is sent. Used by the extra-keys row to turn a typed
++   * ``c`` into Ctrl-C while a modifier is armed or locked.
++   */
++  setInputTransform(fn: ((data: string) => string) | null): void {
++    this.inputTransform = fn;
++  }
++
++  /**
++   * Send raw input as exactly one binary frame, bypassing the input transform
++   * (row keys and mouse reports must never be rewritten by a sticky modifier).
++   */
++  sendInput(data: string): void {
++    this.onInput?.();
++    // Stamp before the readyState guard so clipboard trust still reflects
++    // local input during a momentary WebSocket hiccup.
++    this.lastUserInputAt = performance.now();
++    if (this.ws.readyState !== WebSocket.OPEN) return;
++    this.ws.send(INPUT_ENCODER.encode(data));
++  }
++
++  /** Whether the program enabled application cursor keys (DECCKM). */
++  applicationCursorKeys(): boolean {
++    return this.term.modes.applicationCursorKeysMode;
++  }
++
+   /**
+    * Update the terminal's code font without reconnecting —
+    * mirrors {@link setTheme}, mutating options in place. A new glyph size
+diff --git a/web/src/components/blocks/TerminalView.test.tsx b/web/src/components/blocks/TerminalView.test.tsx
+index 45a40e4490e143d5766c3f25d5450d5d5905d9f0..397da5cddac1a7766b08af55fc34d467ea8371f4 100644
+--- a/web/src/components/blocks/TerminalView.test.tsx
++++ b/web/src/components/blocks/TerminalView.test.tsx
+@@ -23,6 +23,7 @@ import {
+   writeTerminalClipboardPreference,
+ } from "@/lib/terminalClipboardPreferences";
+ import type { ConnectionState } from "./TerminalSession";
++import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
+ import {
+   TerminalView,
+   RECONNECT_BACKOFF_MS,
+@@ -81,6 +82,8 @@ const terminalSessionMock = vi.hoisted(() => ({
+     setTheme: ReturnType<typeof vi.fn>;
+     setClipboardEnabled: ReturnType<typeof vi.fn>;
+     focus: ReturnType<typeof vi.fn>;
++    sendInput: ReturnType<typeof vi.fn>;
++    setInputTransform: ReturnType<typeof vi.fn>;
+   }[],
+ }));
+ 
+@@ -93,6 +96,9 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
+     setTheme = vi.fn();
+     setClipboardEnabled = vi.fn();
+     focus = vi.fn();
++    sendInput = vi.fn();
++    setInputTransform = vi.fn();
++    applicationCursorKeys = () => false;
+ 
+     constructor(
+       container: HTMLDivElement,
+@@ -119,6 +125,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
+         setTheme: this.setTheme,
+         setClipboardEnabled: this.setClipboardEnabled,
+         focus: this.focus,
++        sendInput: this.sendInput,
++        setInputTransform: this.setInputTransform,
+       });
+     }
+   },
+@@ -137,11 +145,132 @@ beforeEach(() => {
+ afterEach(() => {
+   act(() => toast.dismiss());
+   cleanup();
++  delete (window as unknown as Record<string, unknown>).omnigentNative;
++  localStorage.clear();
+   vi.restoreAllMocks();
+   vi.unstubAllEnvs();
+   setSessionHost("conv_abc", null);
+ });
+ 
++/** Per-query matchMedia stub: only `(pointer: coarse)` reads `coarse`, live-changeable. */
++function stubCoarsePointer(initial: boolean) {
++  const listeners = new Set<(ev: { matches: boolean }) => void>();
++  let coarse = initial;
++  vi.spyOn(window, "matchMedia").mockImplementation(
++    (query: string) =>
++      ({
++        get matches() {
++          return query.includes("pointer: coarse") ? coarse : false;
++        },
++        media: query,
++        onchange: null,
++        addListener: () => {},
++        removeListener: () => {},
++        addEventListener: (_t: string, fn: (ev: { matches: boolean }) => void) => {
++          if (query.includes("pointer: coarse")) listeners.add(fn);
++        },
++        removeEventListener: (_t: string, fn: (ev: { matches: boolean }) => void) => {
++          listeners.delete(fn);
++        },
++        dispatchEvent: () => false,
++      }) as unknown as MediaQueryList,
++  );
++  return (next: boolean) => {
++    coarse = next;
++    for (const fn of listeners) fn({ matches: next });
++  };
++}
++
++describe("extra-keys row", () => {
++  it("renders the row on a coarse pointer, wired to the live session's sendInput", async () => {
++    stubCoarsePointer(true);
++    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
++    const row = screen.getByTestId("terminal-extra-keys");
++    expect(within(row).getAllByRole("button")).toHaveLength(14);
++
++    // A tapped key goes out through sendInput (one frame), never term.input.
++    const esc = within(row).getByRole("button", { name: "Escape" });
++    fireEvent.pointerDown(esc, { pointerId: 1, button: 0, isPrimary: true });
++    fireEvent.pointerUp(esc, { pointerId: 1, button: 0, isPrimary: true });
++    expect(terminalSessionMock.instances[0].sendInput).toHaveBeenCalledWith("\x1b");
++  });
++
++  it("does not render the row on a fine pointer (desktop DOM unchanged)", async () => {
++    stubCoarsePointer(false);
++    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
++    expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
++  });
++
++  it("renders the row on a fine pointer inside a native shell", async () => {
++    stubCoarsePointer(false);
++    (window as unknown as Record<string, unknown>).omnigentNative = { kind: "ios" };
++    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
++    expect(screen.getByTestId("terminal-extra-keys")).toBeInTheDocument();
++  });
++
++  it("hides the row for a read-only attach even on touch, so nothing can be sent", async () => {
++    stubCoarsePointer(true);
++    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
++    expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
++  });
++
++  it("removes the row live when the pointer turns fine", async () => {
++    const setCoarse = stubCoarsePointer(true);
++    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
++    expect(screen.getByTestId("terminal-extra-keys")).toBeInTheDocument();
++    act(() => setCoarse(false));
++    expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
++  });
++
++  it("installs the locked modifier transform on the session and re-applies it on re-dial", async () => {
++    // WHY: a locked Ctrl must survive an automatic reconnect — the fresh
++    // session is handed the row's current transform at attach time.
++    stubCoarsePointer(true);
++    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
++    const first = terminalSessionMock.instances[0];
++    expect(first.setInputTransform).toHaveBeenLastCalledWith(null);
++
++    // Hold Ctrl past the long-press threshold (real timers: the reconnect
++    // backoff below runs on them too) so it locks rather than arms.
++    const ctrl = screen.getByRole("button", { name: "Control" });
++    fireEvent.pointerDown(ctrl, { pointerId: 1, button: 0, isPrimary: true });
++    await act(async () => {
++      await new Promise((resolve) => {
++        setTimeout(resolve, LONG_PRESS_MS + 50);
++      });
++    });
++    fireEvent.pointerUp(ctrl, { pointerId: 1, button: 0, isPrimary: true });
++    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
++    const installed = first.setInputTransform.mock.calls.at(-1)?.[0];
++    expect(installed).toBeTypeOf("function");
++    expect(first.focus).toHaveBeenCalled();
++
++    // Transport drop → automatic re-dial creates a second session, which
++    // must start with the same transform installed.
++    act(() => {
++      first.onState({ kind: "connected" });
++    });
++    act(() => {
++      first.onState({ kind: "closed", reason: "", code: 1006 });
++    });
++    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2), {
++      timeout: RECONNECT_BACKOFF_MS[0] + 2_000,
++    });
++    const second = terminalSessionMock.instances[1];
++    expect(second.setInputTransform).toHaveBeenCalledWith(installed);
++    expect(screen.getByRole("button", { name: "Control" })).toHaveAttribute(
++      "data-modifier-state",
++      "locked",
++    );
++  });
++});
++
+ describe("buildAttachPath", () => {
+   it("addresses the terminal by resource id under /v1/sessions/.../resources/terminals", () => {
+     expect(buildAttachPath("conv_abc", "terminal_bash_s1", false)).toBe(
+diff --git a/web/src/components/blocks/TerminalView.tsx b/web/src/components/blocks/TerminalView.tsx
+index a03c1dee791c993fd50ea77b70eda47301c04eac..a1203e274d9b0879b160f3dc8a39135277e46be2 100644
+--- a/web/src/components/blocks/TerminalView.tsx
++++ b/web/src/components/blocks/TerminalView.tsx
+@@ -9,6 +9,7 @@
+ import { Loader2Icon } from "lucide-react";
+ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
++import { useTerminalExtraKeysVisibility } from "@/hooks/useTerminalExtraKeysVisibility";
+ import { Button } from "@/components/ui/button";
+ import { toast } from "sonner";
+ import {
+@@ -54,6 +55,7 @@ import {
+   terminalTheme,
+   WS_CLOSE_WRONG_REPLICA,
+ } from "./TerminalSession";
++import { TerminalExtraKeys, type ExtraKeysTarget } from "./TerminalExtraKeys";
+ 
+ /**
+  * Backoff schedule for automatic re-attach after a transport-level
+@@ -292,6 +294,20 @@ export function TerminalView({
+   const isDarkRef = useRef(isDark);
+   isDarkRef.current = isDark;
+   const sessionRef = useRef<TerminalSession | null>(null);
++  // Extra-keys row (touch devices). The row keeps its sticky-modifier rewrite
++  // here so a re-dialed session inherits it; the target resolves the live
++  // session at event time, so it is created once and never re-renders the row.
++  const showExtraKeys = useTerminalExtraKeysVisibility(readOnly);
++  const extraKeysTransformRef = useRef<((data: string) => string) | null>(null);
++  const [extraKeysTarget] = useState<ExtraKeysTarget>(() => ({
++    send: (data) => sessionRef.current?.sendInput(data),
++    focus: () => sessionRef.current?.focus(),
++    applicationCursor: () => sessionRef.current?.applicationCursorKeys() ?? false,
++    setTransform: (fn) => {
++      extraKeysTransformRef.current = fn;
++      sessionRef.current?.setInputTransform(fn);
++    },
++  }));
+   // Stable refs so callback prop changes never recreate the WS session.
+   const onStateChangeRef = useRef(onStateChange);
+   onStateChangeRef.current = onStateChange;
+@@ -607,6 +623,7 @@ export function TerminalView({
+           notifyFileLink,
+         );
+         sessionRef.current = terminalSession;
++        terminalSession.setInputTransform(extraKeysTransformRef.current);
+         // Relay-connected with a direct URL on offer: negotiate the
+         // loopback upgrade in the background. In Chrome this is what
+         // raises the Local Network Access prompt; the probe socket
+@@ -800,6 +817,9 @@ export function TerminalView({
+           />
+         )}
+       </div>
++      {/* Not rendered at all (rather than hidden) off touch devices, so the
++          desktop terminal DOM and refit behaviour are unchanged. */}
++      {showExtraKeys && <TerminalExtraKeys target={extraKeysTarget} />}
+     </div>
+   );
+ }
+diff --git a/web/src/components/blocks/terminalExtraKeysModel.test.ts b/web/src/components/blocks/terminalExtraKeysModel.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..595e298e4bd17657671258d2d8589205a7c3fccc
+--- /dev/null
++++ b/web/src/components/blocks/terminalExtraKeysModel.test.ts
+@@ -0,0 +1,196 @@
++import { describe, expect, it } from "vitest";
++import {
++  EXTRA_KEY_ROWS,
++  MODIFIERS_OFF,
++  NO_MODIFIERS,
++  SHIFT_ENTER_CSI_U,
++  activeModifiers,
++  encodeExtraKey,
++  encodeModifiedInput,
++  hasActiveModifier,
++  reduceModifiers,
++  type Modifiers,
++  type ModifierStates,
++} from "./terminalExtraKeysModel";
++
++const normal = { applicationCursor: false };
++const app = { applicationCursor: true };
++const mods = (over: Partial<Modifiers>): Modifiers => ({ ...NO_MODIFIERS, ...over });
++
++describe("EXTRA_KEY_ROWS", () => {
++  it("is the fixed Termux-style 2×7 grid with the three modifiers on row two", () => {
++    expect(EXTRA_KEY_ROWS).toHaveLength(2);
++    expect(EXTRA_KEY_ROWS.map((row) => row.map((k) => k.label))).toEqual([
++      ["Esc", "⇧Tab", "Tab", "Home", "↑", "End", "PgUp"],
++      ["Ctrl", "Alt", "Shift", "←", "↓", "→", "PgDn"],
++    ]);
++    const modifiers = EXTRA_KEY_ROWS.flat().filter((k) => k.kind === "modifier");
++    expect(modifiers.map((k) => k.id)).toEqual(["ctrl", "alt", "shift"]);
++  });
++});
++
++describe("encodeExtraKey", () => {
++  it("sends Esc as a bare 0x1b and ⇧Tab as legacy CSI Z, ignoring modifiers", () => {
++    // WHY: Claude Code gates Kitty CSI-u on a terminal allow-list, so CSI Z is
++    // the only Shift+Tab form every harness accepts; Esc must never grow a
++    // modifier prefix or it stops being Esc.
++    expect(encodeExtraKey("esc", NO_MODIFIERS, normal)).toBe("\x1b");
++    expect(encodeExtraKey("esc", mods({ ctrl: true, alt: true }), normal)).toBe("\x1b");
++    expect(encodeExtraKey("shift-tab", NO_MODIFIERS, normal)).toBe("\x1b[Z");
++    expect(encodeExtraKey("shift-tab", mods({ shift: true, alt: true }), app)).toBe("\x1b[Z");
++    expect(encodeExtraKey("shift-tab", NO_MODIFIERS, normal)).not.toContain(";2u");
++  });
++
++  it("encodes Tab plainly, as CSI Z under Shift, and Alt-prefixed under Alt", () => {
++    expect(encodeExtraKey("tab", NO_MODIFIERS, normal)).toBe("\t");
++    expect(encodeExtraKey("tab", mods({ shift: true }), normal)).toBe("\x1b[Z");
++    expect(encodeExtraKey("tab", mods({ alt: true }), normal)).toBe("\x1b\t");
++    expect(encodeExtraKey("tab", mods({ ctrl: true }), normal)).toBe("\t");
++  });
++
++  it("honors DECCKM for arrows and Home/End", () => {
++    expect(encodeExtraKey("up", NO_MODIFIERS, normal)).toBe("\x1b[A");
++    expect(encodeExtraKey("down", NO_MODIFIERS, normal)).toBe("\x1b[B");
++    expect(encodeExtraKey("right", NO_MODIFIERS, normal)).toBe("\x1b[C");
++    expect(encodeExtraKey("left", NO_MODIFIERS, normal)).toBe("\x1b[D");
++    expect(encodeExtraKey("home", NO_MODIFIERS, normal)).toBe("\x1b[H");
++    expect(encodeExtraKey("end", NO_MODIFIERS, normal)).toBe("\x1b[F");
++
++    expect(encodeExtraKey("up", NO_MODIFIERS, app)).toBe("\x1bOA");
++    expect(encodeExtraKey("down", NO_MODIFIERS, app)).toBe("\x1bOB");
++    expect(encodeExtraKey("right", NO_MODIFIERS, app)).toBe("\x1bOC");
++    expect(encodeExtraKey("left", NO_MODIFIERS, app)).toBe("\x1bOD");
++    expect(encodeExtraKey("home", NO_MODIFIERS, app)).toBe("\x1bOH");
++    expect(encodeExtraKey("end", NO_MODIFIERS, app)).toBe("\x1bOF");
++  });
++
++  it("encodes modified cursor keys as CSI 1;m X with the xterm bit sum, ignoring DECCKM", () => {
++    // m = 1 + Shift(1) + Alt(2) + Ctrl(4)
++    expect(encodeExtraKey("up", mods({ shift: true }), normal)).toBe("\x1b[1;2A");
++    expect(encodeExtraKey("left", mods({ alt: true }), normal)).toBe("\x1b[1;3D");
++    expect(encodeExtraKey("right", mods({ ctrl: true }), normal)).toBe("\x1b[1;5C");
++    expect(encodeExtraKey("down", mods({ ctrl: true, shift: true }), normal)).toBe("\x1b[1;6B");
++    expect(encodeExtraKey("home", mods({ ctrl: true, alt: true, shift: true }), normal)).toBe(
++      "\x1b[1;8H",
++    );
++    // Application cursor mode does not change the modified form.
++    expect(encodeExtraKey("end", mods({ ctrl: true }), app)).toBe("\x1b[1;5F");
++  });
++
++  it("encodes PgUp/PgDn with an optional modifier parameter", () => {
++    expect(encodeExtraKey("pgup", NO_MODIFIERS, normal)).toBe("\x1b[5~");
++    expect(encodeExtraKey("pgdn", NO_MODIFIERS, normal)).toBe("\x1b[6~");
++    expect(encodeExtraKey("pgup", NO_MODIFIERS, app)).toBe("\x1b[5~");
++    expect(encodeExtraKey("pgup", mods({ shift: true }), normal)).toBe("\x1b[5;2~");
++    expect(encodeExtraKey("pgdn", mods({ ctrl: true, alt: true }), normal)).toBe("\x1b[6;7~");
++  });
++});
++
++describe("encodeModifiedInput", () => {
++  it("maps Ctrl + letter to the control code regardless of case", () => {
++    expect(encodeModifiedInput("c", mods({ ctrl: true }))).toBe("\x03");
++    expect(encodeModifiedInput("C", mods({ ctrl: true }))).toBe("\x03");
++    expect(encodeModifiedInput("r", mods({ ctrl: true }))).toBe("\x12");
++    expect(encodeModifiedInput("a", mods({ ctrl: true }))).toBe("\x01");
++    expect(encodeModifiedInput("z", mods({ ctrl: true }))).toBe("\x1a");
++  });
++
++  it("maps the Ctrl edge keys @ [ \\ ] ^ _ ? (and their digit aliases)", () => {
++    const ctrl = mods({ ctrl: true });
++    expect(encodeModifiedInput("@", ctrl)).toBe("\x00");
++    expect(encodeModifiedInput(" ", ctrl)).toBe("\x00");
++    expect(encodeModifiedInput("2", ctrl)).toBe("\x00");
++    expect(encodeModifiedInput("[", ctrl)).toBe("\x1b");
++    expect(encodeModifiedInput("3", ctrl)).toBe("\x1b");
++    expect(encodeModifiedInput("\\", ctrl)).toBe("\x1c");
++    expect(encodeModifiedInput("4", ctrl)).toBe("\x1c");
++    expect(encodeModifiedInput("]", ctrl)).toBe("\x1d");
++    expect(encodeModifiedInput("5", ctrl)).toBe("\x1d");
++    expect(encodeModifiedInput("^", ctrl)).toBe("\x1e");
++    expect(encodeModifiedInput("6", ctrl)).toBe("\x1e");
++    expect(encodeModifiedInput("_", ctrl)).toBe("\x1f");
++    expect(encodeModifiedInput("7", ctrl)).toBe("\x1f");
++    expect(encodeModifiedInput("?", ctrl)).toBe("\x7f");
++    expect(encodeModifiedInput("8", ctrl)).toBe("\x7f");
++  });
++
++  it("passes a non-transformable character through unchanged under Ctrl", () => {
++    expect(encodeModifiedInput("1", mods({ ctrl: true }))).toBe("1");
++    expect(encodeModifiedInput("é", mods({ ctrl: true }))).toBe("é");
++  });
++
++  it("prefixes Alt + char with Esc in a single string", () => {
++    expect(encodeModifiedInput("p", mods({ alt: true }))).toBe("\x1bp");
++    expect(encodeModifiedInput("c", mods({ alt: true, ctrl: true }))).toBe("\x1b\x03");
++  });
++
++  it("encodes Shift + a typed Tab as CSI Z like the row's own Tab under Shift", () => {
++    expect(encodeModifiedInput("\t", mods({ shift: true }))).toBe("\x1b[Z");
++    expect(encodeModifiedInput("\t", mods({ shift: true, ctrl: true }))).toBe("\x1b[Z");
++    expect(encodeModifiedInput("\t", mods({ shift: true, alt: true }))).toBe("\x1b\x1b[Z");
++    expect(encodeModifiedInput("\t", NO_MODIFIERS)).toBe("\t");
++  });
++
++  it("encodes Shift + Enter as the shared CSI-u sequence and leaves other Shift chars alone", () => {
++    expect(encodeModifiedInput("\r", mods({ shift: true }))).toBe(SHIFT_ENTER_CSI_U);
++    expect(encodeModifiedInput("\r", mods({ shift: true, ctrl: true }))).toBe("\r");
++    expect(encodeModifiedInput("a", mods({ shift: true }))).toBe("a");
++    expect(encodeModifiedInput("\r", NO_MODIFIERS)).toBe("\r");
++  });
++
++  it("passes multi-character chunks (IME commit, paste) through untouched", () => {
++    expect(encodeModifiedInput("ls -la", mods({ ctrl: true, alt: true }))).toBe("ls -la");
++    expect(encodeModifiedInput("ab", mods({ shift: true }))).toBe("ab");
++    expect(encodeModifiedInput("", mods({ ctrl: true }))).toBe("");
++  });
++
++  it("is the identity with no modifiers", () => {
++    expect(encodeModifiedInput("c", NO_MODIFIERS)).toBe("c");
++    expect(encodeModifiedInput("\x1b", NO_MODIFIERS)).toBe("\x1b");
++  });
++});
++
++describe("reduceModifiers", () => {
++  const armedCtrl: ModifierStates = { ...MODIFIERS_OFF, ctrl: "armed" };
++  const lockedCtrl: ModifierStates = { ...MODIFIERS_OFF, ctrl: "locked" };
++
++  it("arms on tap, disarms on a second tap", () => {
++    expect(reduceModifiers(MODIFIERS_OFF, { type: "tap", mod: "ctrl" })).toEqual(armedCtrl);
++    expect(reduceModifiers(armedCtrl, { type: "tap", mod: "ctrl" })).toEqual(MODIFIERS_OFF);
++  });
++
++  it("locks on long-press from off or armed, and a tap on locked turns it off", () => {
++    expect(reduceModifiers(MODIFIERS_OFF, { type: "longPress", mod: "ctrl" })).toEqual(lockedCtrl);
++    expect(reduceModifiers(armedCtrl, { type: "longPress", mod: "ctrl" })).toEqual(lockedCtrl);
++    expect(reduceModifiers(lockedCtrl, { type: "tap", mod: "ctrl" })).toEqual(MODIFIERS_OFF);
++  });
++
++  it("consume clears armed modifiers but a lock survives", () => {
++    const both: ModifierStates = { ctrl: "locked", alt: "armed", shift: "armed" };
++    expect(reduceModifiers(both, { type: "consume" })).toEqual({
++      ctrl: "locked",
++      alt: "off",
++      shift: "off",
++    });
++    expect(reduceModifiers(lockedCtrl, { type: "consume" })).toEqual(lockedCtrl);
++  });
++
++  it("returns the same object when nothing changes so the hot path can skip React", () => {
++    // WHY: the onData transform dispatches consume on every chunk while a lock
++    // is held; a fresh object there would re-render the row per keystroke.
++    expect(reduceModifiers(MODIFIERS_OFF, { type: "consume" })).toBe(MODIFIERS_OFF);
++    expect(reduceModifiers(lockedCtrl, { type: "consume" })).toBe(lockedCtrl);
++    expect(reduceModifiers(lockedCtrl, { type: "longPress", mod: "ctrl" })).toBe(lockedCtrl);
++  });
++
++  it("exposes armed and locked alike as active modifiers", () => {
++    expect(activeModifiers({ ctrl: "armed", alt: "locked", shift: "off" })).toEqual({
++      ctrl: true,
++      alt: true,
++      shift: false,
++    });
++    expect(hasActiveModifier(MODIFIERS_OFF)).toBe(false);
++    expect(hasActiveModifier(armedCtrl)).toBe(true);
++    expect(hasActiveModifier(lockedCtrl)).toBe(true);
++  });
++});
+diff --git a/web/src/components/blocks/terminalExtraKeysModel.ts b/web/src/components/blocks/terminalExtraKeysModel.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..156438cddbf9cf5816c120f6fa20bf7182accae2
+--- /dev/null
++++ b/web/src/components/blocks/terminalExtraKeysModel.ts
+@@ -0,0 +1,208 @@
++// Pure key table, byte encoder and sticky-modifier reducer for the terminal
++// extra-keys row (Termux-style Esc / Tab / Ctrl / arrows bar for soft
++// keyboards). No DOM or xterm dependency so the whole matrix is unit-testable.
++
++/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
++export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
++
++export type ModifierId = "ctrl" | "alt" | "shift";
++
++export type PlainKeyId =
++  "esc" | "shift-tab" | "tab" | "home" | "up" | "end" | "pgup" | "left" | "down" | "right" | "pgdn";
++
++interface ExtraKeyBase {
++  /** Glyph shown on the key. */
++  label: string;
++  /** Accessible name (glyphs alone read poorly to screen readers). */
++  name: string;
++}
++
++export type ExtraKeyDef =
++  | (ExtraKeyBase & { id: PlainKeyId; kind: "key" })
++  | (ExtraKeyBase & { id: ModifierId; kind: "modifier" });
++
++/** Fixed Termux-style 2×7 grid; positions never move across widths. */
++export const EXTRA_KEY_ROWS: readonly (readonly ExtraKeyDef[])[] = [
++  [
++    { id: "esc", label: "Esc", name: "Escape", kind: "key" },
++    { id: "shift-tab", label: "⇧Tab", name: "Shift Tab", kind: "key" },
++    { id: "tab", label: "Tab", name: "Tab", kind: "key" },
++    { id: "home", label: "Home", name: "Home", kind: "key" },
++    { id: "up", label: "↑", name: "Arrow up", kind: "key" },
++    { id: "end", label: "End", name: "End", kind: "key" },
++    { id: "pgup", label: "PgUp", name: "Page up", kind: "key" },
++  ],
++  [
++    { id: "ctrl", label: "Ctrl", name: "Control", kind: "modifier" },
++    { id: "alt", label: "Alt", name: "Alt", kind: "modifier" },
++    { id: "shift", label: "Shift", name: "Shift", kind: "modifier" },
++    { id: "left", label: "←", name: "Arrow left", kind: "key" },
++    { id: "down", label: "↓", name: "Arrow down", kind: "key" },
++    { id: "right", label: "→", name: "Arrow right", kind: "key" },
++    { id: "pgdn", label: "PgDn", name: "Page down", kind: "key" },
++  ],
++];
++
++/** Holding a modifier this long locks it instead of arming it for one key. */
++export const LONG_PRESS_MS = 500;
++
++export interface Modifiers {
++  ctrl: boolean;
++  alt: boolean;
++  shift: boolean;
++}
++
++export const NO_MODIFIERS: Modifiers = { ctrl: false, alt: false, shift: false };
++
++export interface EncodeOptions {
++  /** DECCKM (application cursor keys) is set — arrows/Home/End use SS3. */
++  applicationCursor: boolean;
++}
++
++/** xterm modifier parameter: 1 + Shift(1) + Alt(2) + Ctrl(4). */
++function modifierParam(mods: Modifiers): number {
++  return 1 + (mods.shift ? 1 : 0) + (mods.alt ? 2 : 0) + (mods.ctrl ? 4 : 0);
++}
++
++const CURSOR_FINAL: Record<"up" | "down" | "right" | "left" | "home" | "end", string> = {
++  up: "A",
++  down: "B",
++  right: "C",
++  left: "D",
++  home: "H",
++  end: "F",
++};
++
++/**
++ * Bytes for a tapped row key under the given (armed or locked) modifiers.
++ *
++ * Esc and ⇧Tab are atomic: they ignore modifiers. ⇧Tab is always the legacy
++ * ``CSI Z`` — never CSI-u, which Claude Code only accepts on an allow-list of
++ * terminals.
++ */
++export function encodeExtraKey(key: PlainKeyId, mods: Modifiers, opts: EncodeOptions): string {
++  switch (key) {
++    case "esc":
++      return "\x1b";
++    case "shift-tab":
++      return "\x1b[Z";
++    case "tab": {
++      const base = mods.shift ? "\x1b[Z" : "\t";
++      return mods.alt ? `\x1b${base}` : base;
++    }
++    case "up":
++    case "down":
++    case "left":
++    case "right":
++    case "home":
++    case "end": {
++      const final = CURSOR_FINAL[key];
++      const m = modifierParam(mods);
++      if (m > 1) return `\x1b[1;${m}${final}`;
++      return opts.applicationCursor ? `\x1bO${final}` : `\x1b[${final}`;
++    }
++    case "pgup":
++    case "pgdn": {
++      const code = key === "pgup" ? 5 : 6;
++      const m = modifierParam(mods);
++      return m > 1 ? `\x1b[${code};${m}~` : `\x1b[${code}~`;
++    }
++    default: {
++      const exhaustive: never = key;
++      return exhaustive;
++    }
++  }
++}
++
++/** Characters whose Ctrl chord is a control byte outside the letter range. */
++const CTRL_EDGE_KEYS: Record<string, string> = {
++  "@": "\x00",
++  " ": "\x00",
++  "2": "\x00",
++  "[": "\x1b",
++  "3": "\x1b",
++  "\\": "\x1c",
++  "4": "\x1c",
++  "]": "\x1d",
++  "5": "\x1d",
++  "^": "\x1e",
++  "6": "\x1e",
++  _: "\x1f",
++  "7": "\x1f",
++  "?": "\x7f",
++  "8": "\x7f",
++};
++
++function ctrlChord(ch: string): string {
++  const code = ch.charCodeAt(0);
++  const isLetter = (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a);
++  if (isLetter) return String.fromCharCode(code & 0x1f);
++  return CTRL_EDGE_KEYS[ch] ?? ch;
++}
++
++/**
++ * Rewrite one soft-keyboard ``onData`` chunk under active modifiers.
++ *
++ * Only single-character chunks are transformable; anything longer (IME
++ * commit, paste) passes through untouched. Non-transformable characters also
++ * pass through unchanged — the caller still consumes armed modifiers either
++ * way (Termux semantics).
++ */
++export function encodeModifiedInput(data: string, mods: Modifiers): string {
++  if (data.length !== 1) return data;
++  if (data === "\r" && mods.shift && !mods.ctrl && !mods.alt) return SHIFT_ENTER_CSI_U;
++  // Shift + a soft-keyboard Tab is Shift+Tab, same as the row's own Tab key.
++  const base = data === "\t" && mods.shift ? "\x1b[Z" : mods.ctrl ? ctrlChord(data) : data;
++  return mods.alt ? `\x1b${base}` : base;
++}
++
++export type ModifierState = "off" | "armed" | "locked";
++export type ModifierStates = Readonly<Record<ModifierId, ModifierState>>;
++
++export const MODIFIERS_OFF: ModifierStates = { ctrl: "off", alt: "off", shift: "off" };
++
++export type ModifierAction =
++  | { type: "tap"; mod: ModifierId }
++  | { type: "longPress"; mod: ModifierId }
++  /** A row key or an ``onData`` chunk went out: armed → off, locked stays. */
++  | { type: "consume" };
++
++/**
++ * Sticky-modifier state machine. Returns the same object when nothing
++ * changes so callers can skip a React update on the hot path.
++ */
++export function reduceModifiers(state: ModifierStates, action: ModifierAction): ModifierStates {
++  switch (action.type) {
++    case "tap": {
++      const next: ModifierState = state[action.mod] === "off" ? "armed" : "off";
++      return { ...state, [action.mod]: next };
++    }
++    case "longPress":
++      return state[action.mod] === "locked" ? state : { ...state, [action.mod]: "locked" };
++    case "consume": {
++      if (state.ctrl !== "armed" && state.alt !== "armed" && state.shift !== "armed") return state;
++      return {
++        ctrl: state.ctrl === "armed" ? "off" : state.ctrl,
++        alt: state.alt === "armed" ? "off" : state.alt,
++        shift: state.shift === "armed" ? "off" : state.shift,
++      };
++    }
++    default: {
++      const exhaustive: never = action;
++      return exhaustive;
++    }
++  }
++}
++
++/** Armed or locked modifiers as the boolean set the encoders take. */
++export function activeModifiers(state: ModifierStates): Modifiers {
++  return {
++    ctrl: state.ctrl !== "off",
++    alt: state.alt !== "off",
++    shift: state.shift !== "off",
++  };
++}
++
++export function hasActiveModifier(state: ModifierStates): boolean {
++  return state.ctrl !== "off" || state.alt !== "off" || state.shift !== "off";
++}
+diff --git a/web/src/components/theme/AppearancePreviews.tsx b/web/src/components/theme/AppearancePreviews.tsx
+index 040166f4d28cb8cc73a237be447c2139fd3285ff..c0c8086aaf9ba862be489d255948f2646fd3963e 100644
+--- a/web/src/components/theme/AppearancePreviews.tsx
++++ b/web/src/components/theme/AppearancePreviews.tsx
+@@ -1,3 +1,4 @@
++import type { TerminalExtraKeysMode } from "@/lib/terminalExtraKeysPreferences";
+ import type { PaletteSwatch } from "@/lib/themePalette";
+ import type { ThemeMode } from "./themeMode";
+ 
+@@ -17,17 +18,16 @@ export const DARK_MODE_PREVIEW: PaletteSwatch = {
+   text: "#e6edf3",
+ };
+ 
++/** System's "/" split: the top layer shows only right of the diagonal. */
++const SPLIT_CLIP_PATH = "polygon(62% 0, 100% 0, 100% 100%, 38% 100%)";
++
+ export function ModePreview({ variant }: { variant: ThemeMode }) {
+   if (variant === "light") return <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />;
+   if (variant === "dark") return <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />;
+   return (
+     <div className="relative h-16 w-full">
+       <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />
+-      <div
+-        aria-hidden
+-        className="absolute inset-0"
+-        style={{ clipPath: "polygon(62% 0, 100% 0, 100% 100%, 38% 100%)" }}
+-      >
++      <div aria-hidden className="absolute inset-0" style={{ clipPath: SPLIT_CLIP_PATH }}>
+         <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />
+       </div>
+     </div>
+@@ -84,3 +84,81 @@ export function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
+     </div>
+   );
+ }
++
++function ExtraKeysScene({ swatch, keysRow }: { swatch: PaletteSwatch; keysRow: boolean }) {
++  return (
++    <div
++      aria-hidden
++      className="flex h-16 w-full flex-col gap-1 overflow-hidden rounded-lg p-1.5"
++      style={{ backgroundColor: swatch.bg, border: `1px solid ${swatch.border}` }}
++    >
++      <div
++        className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-hidden rounded-md p-1"
++        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
++      >
++        <div
++          className="h-1 w-3/5 shrink-0 rounded-full"
++          style={{ backgroundColor: swatch.text, opacity: 0.5 }}
++        />
++        <div
++          className="h-1 w-2/5 shrink-0 rounded-full"
++          style={{ backgroundColor: swatch.text, opacity: 0.3 }}
++        />
++        {!keysRow && (
++          <div
++            className="h-1 w-1/2 shrink-0 rounded-full"
++            style={{ backgroundColor: swatch.text, opacity: 0.3 }}
++          />
++        )}
++      </div>
++      {keysRow && (
++        <div data-testid="extra-keys-preview-pills" className="flex shrink-0 gap-0.5">
++          {Array.from({ length: 7 }, (_, index) => (
++            <div
++              key={index}
++              className="h-1.5 flex-1 rounded-sm"
++              style={{ backgroundColor: swatch.text, opacity: 0.5 }}
++            />
++          ))}
++        </div>
++      )}
++      <div
++        className="grid shrink-0 grid-cols-10 gap-0.5 rounded-md p-0.5"
++        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
++      >
++        {Array.from({ length: 20 }, (_, index) => (
++          <div
++            key={index}
++            className="h-1 rounded-sm"
++            style={{ backgroundColor: swatch.text, opacity: 0.2 }}
++          />
++        ))}
++      </div>
++    </div>
++  );
++}
++
++/**
++ * Terminal over an on-screen keyboard, with (Always) or without (Never) the
++ * extra-keys row. Auto splits Always / Never on System's diagonal.
++ */
++export function ExtraKeysPreview({
++  mode,
++  swatch,
++}: {
++  mode: TerminalExtraKeysMode;
++  swatch: PaletteSwatch;
++}) {
++  if (mode !== "auto") return <ExtraKeysScene swatch={swatch} keysRow={mode === "on"} />;
++  return (
++    // One grid cell for both layers so the frames, terminal and keyboard line up.
++    <div data-testid="extra-keys-preview-auto" className="grid h-16 w-full">
++      <div className="col-start-1 row-start-1">
++        <ExtraKeysScene swatch={swatch} keysRow />
++      </div>
++      <div aria-hidden className="col-start-1 row-start-1" style={{ clipPath: SPLIT_CLIP_PATH }}>
++        <ExtraKeysScene swatch={swatch} keysRow={false} />
++      </div>
++    </div>
++  );
++}
+diff --git a/web/src/hooks/useTerminalExtraKeysVisibility.test.ts b/web/src/hooks/useTerminalExtraKeysVisibility.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0bcfc913f31a4eb9b8356fe97c0cb8a42931506
+--- /dev/null
++++ b/web/src/hooks/useTerminalExtraKeysVisibility.test.ts
+@@ -0,0 +1,146 @@
++import { act, renderHook } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { writeTerminalExtraKeysMode } from "@/lib/terminalExtraKeysPreferences";
++import { useTerminalExtraKeysVisibility } from "./useTerminalExtraKeysVisibility";
++
++type ChangeListener = (ev: { matches: boolean }) => void;
++
++/**
++ * Per-query matchMedia stub: `(pointer: coarse)` reads `coarse.matches` and
++ * can fire `change`; every other query stays false.
++ */
++function stubMatchMedia(initialCoarse: boolean) {
++  const coarse = { matches: initialCoarse, listeners: new Set<ChangeListener>() };
++  vi.spyOn(window, "matchMedia").mockImplementation((query: string) => {
++    const isCoarse = query.includes("pointer: coarse");
++    return {
++      get matches() {
++        return isCoarse ? coarse.matches : false;
++      },
++      media: query,
++      onchange: null,
++      addListener: () => {},
++      removeListener: () => {},
++      addEventListener: (_type: string, fn: ChangeListener) => {
++        if (isCoarse) coarse.listeners.add(fn);
++      },
++      removeEventListener: (_type: string, fn: ChangeListener) => {
++        if (isCoarse) coarse.listeners.delete(fn);
++      },
++      dispatchEvent: () => false,
++    } as unknown as MediaQueryList;
++  });
++  return {
++    setCoarse(next: boolean) {
++      coarse.matches = next;
++      for (const fn of coarse.listeners) fn({ matches: next });
++    },
++    get listenerCount() {
++      return coarse.listeners.size;
++    },
++  };
++}
++
++const win = window as unknown as Record<string, unknown>;
++
++beforeEach(() => {
++  localStorage.clear();
++});
++
++afterEach(() => {
++  delete win.omnigentNative;
++  vi.restoreAllMocks();
++  // Also clears any write kept in memory after a refused storage write.
++  writeTerminalExtraKeysMode("auto");
++  localStorage.clear();
++});
++
++describe("useTerminalExtraKeysVisibility", () => {
++  it("shows on a coarse primary pointer and hides on a fine one (auto)", () => {
++    const mq = stubMatchMedia(true);
++    const { result, rerender } = renderHook(() => useTerminalExtraKeysVisibility(false));
++    expect(result.current).toBe(true);
++
++    // Live change (a Fold docking to a mouse) hides the row without a remount.
++    act(() => mq.setCoarse(false));
++    rerender();
++    expect(result.current).toBe(false);
++
++    act(() => mq.setCoarse(true));
++    rerender();
++    expect(result.current).toBe(true);
++  });
++
++  it("stays hidden on a fine pointer with no shell and no override", () => {
++    stubMatchMedia(false);
++    const { result } = renderHook(() => useTerminalExtraKeysVisibility(false));
++    expect(result.current).toBe(false);
++  });
++
++  it("shows on a fine pointer inside the iOS or Android native shell", () => {
++    // WHY: an iPad with a trackpad reports pointer: fine, but the shell is a
++    // touch device by construction and its keyboards often lack Esc.
++    stubMatchMedia(false);
++    win.omnigentNative = { kind: "ios" };
++    expect(renderHook(() => useTerminalExtraKeysVisibility(false)).result.current).toBe(true);
++
++    win.omnigentNative = { kind: "android" };
++    expect(renderHook(() => useTerminalExtraKeysVisibility(false)).result.current).toBe(true);
++  });
++
++  it("never shows for a read-only attach, whatever the device or preference", () => {
++    stubMatchMedia(true);
++    win.omnigentNative = { kind: "ios" };
++    writeTerminalExtraKeysMode("on");
++    const { result } = renderHook(() => useTerminalExtraKeysVisibility(true));
++    expect(result.current).toBe(false);
++  });
++
++  it("honors the preference: on forces the row on desktop, off hides it on touch", () => {
++    const mq = stubMatchMedia(false);
++    const { result, rerender } = renderHook(() => useTerminalExtraKeysVisibility(false));
++    expect(result.current).toBe(false);
++
++    act(() => writeTerminalExtraKeysMode("on"));
++    rerender();
++    expect(result.current).toBe(true);
++
++    act(() => mq.setCoarse(true));
++    act(() => writeTerminalExtraKeysMode("off"));
++    rerender();
++    expect(result.current).toBe(false);
++
++    act(() => writeTerminalExtraKeysMode("auto"));
++    rerender();
++    expect(result.current).toBe(true);
++  });
++
++  it("reflects a preference write even when storage refuses it", () => {
++    // WHY: the snapshot re-reads the store; if the write only lived in
++    // localStorage a quota error would leave the row's visibility stale.
++    stubMatchMedia(false);
++    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
++      throw new Error("quota");
++    });
++    const { result, rerender } = renderHook(() => useTerminalExtraKeysVisibility(false));
++    expect(result.current).toBe(false);
++
++    act(() => writeTerminalExtraKeysMode("on"));
++    rerender();
++    expect(result.current).toBe(true);
++    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
++  });
++
++  it("never consults viewport width", () => {
++    // WHY: the product constraint is touch-based visibility; a tablet at
++    // desktop width must still get the row, so no width query may be issued.
++    const spy = stubMatchMedia(true);
++    renderHook(() => useTerminalExtraKeysVisibility(false));
++    const queries = (window.matchMedia as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
++      (call: unknown[]) => String(call[0]),
++    );
++    expect(queries.length).toBeGreaterThan(0);
++    for (const q of queries) expect(q).not.toMatch(/width/);
++    expect(spy.listenerCount).toBe(1);
++  });
++});
+diff --git a/web/src/hooks/useTerminalExtraKeysVisibility.ts b/web/src/hooks/useTerminalExtraKeysVisibility.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..56ce2c85cdf501993eecb467de760bc65f894675
+--- /dev/null
++++ b/web/src/hooks/useTerminalExtraKeysVisibility.ts
+@@ -0,0 +1,32 @@
++// Whether the terminal extra-keys row should render. Touch-based, never
++// width-based: a phone, a foldable at any width, or an iPad all qualify; a
++// desktop browser never does. The Settings preference overrides both ways.
++
++import { useSyncExternalStore } from "react";
++import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
++import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
++import {
++  TERMINAL_EXTRA_KEYS_DEFAULT,
++  readTerminalExtraKeysMode,
++  subscribeTerminalExtraKeys,
++} from "@/lib/terminalExtraKeysPreferences";
++
++/**
++ * True when the extra-keys row belongs under this terminal.
++ *
++ * `!readOnly && (pref === "on" || (pref === "auto" && touchCapable))`, where
++ * touch-capable is the native iOS/Android shell (touch by construction, even
++ * with a trackpad or keyboard attached) or a coarse primary pointer.
++ */
++export function useTerminalExtraKeysVisibility(readOnly: boolean): boolean {
++  const pref = useSyncExternalStore(
++    subscribeTerminalExtraKeys,
++    readTerminalExtraKeysMode,
++    () => TERMINAL_EXTRA_KEYS_DEFAULT,
++  );
++  const coarsePointer = useIsCoarsePointer();
++  if (readOnly) return false;
++  if (pref === "on") return true;
++  if (pref === "off") return false;
++  return isIOSShell() || isAndroidShell() || coarsePointer;
++}
+diff --git a/web/src/index.css b/web/src/index.css
+index eaf736c73af7b41c2d07358b35d8efeb5eb97934..5099140cc032ae04d270a1f6b430e0963235109c 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -1171,6 +1171,60 @@ html[data-electron-mac] .breadcrumb-folder {
+   }
+ }
+ 
++/* Terminal extra-keys row for soft keyboards: fixed 2×7 grid in normal flow
++ * under the xterm mount, terminal-card chrome; columns widen, never wrap. */
++.terminal-extra-keys {
++  display: grid;
++  grid-template-columns: repeat(7, minmax(0, 1fr));
++  gap: 0.25rem;
++  flex: none;
++  padding: 0.375rem 0.25rem calc(0.25rem + var(--omnigent-safe-bottom));
++  border-top: 1px solid var(--border);
++  background: var(--card);
++  font-family: var(--font-mono);
++  /* Default terminal font size; keys clip rather than wrap in a narrow rail. */
++  font-size: 0.8125rem;
++  touch-action: manipulation;
++  user-select: none;
++  -webkit-user-select: none;
++  -webkit-touch-callout: none;
++}
++
++/* The mobile drawer already reserves the bottom inset, and a docked iOS
++   keyboard covers the home indicator; don't add the inset in either case. */
++:is([data-ios-native], [data-android-native]) .mobile-panel-drawer .terminal-extra-keys,
++[data-ios-native] .terminal-extra-keys[data-keyboard-open] {
++  padding-bottom: 0.25rem;
++}
++
++.terminal-extra-keys > button {
++  min-width: 0;
++  min-height: 44px;
++  padding: 0 0.125rem;
++  border: 1px solid transparent;
++  border-radius: 0.375rem;
++  background: var(--muted);
++  color: var(--foreground);
++  white-space: nowrap;
++  overflow: hidden;
++  touch-action: manipulation;
++}
++
++.terminal-extra-keys > button:active {
++  background: var(--accent);
++}
++
++.terminal-extra-keys > button[data-modifier-state="armed"] {
++  border-color: var(--primary);
++  color: var(--primary);
++}
++
++.terminal-extra-keys > button[data-modifier-state="locked"] {
++  border-color: var(--primary);
++  background: var(--primary);
++  color: var(--primary-foreground);
++}
++
+ /* Share button — glassy pink effect (both modes). The vertical
+  * gradient alone does the embossed work (lighter top = light catch,
+  * darker bottom = shadow, simulating a convex surface lit from above);
+diff --git a/web/src/lib/terminalExtraKeysPreferences.test.ts b/web/src/lib/terminalExtraKeysPreferences.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..51b5f6ec7fb96eda4ace2847b4be6b03964da2fa
+--- /dev/null
++++ b/web/src/lib/terminalExtraKeysPreferences.test.ts
+@@ -0,0 +1,78 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  TERMINAL_EXTRA_KEYS_DEFAULT,
++  isTerminalExtraKeysMode,
++  normalizeTerminalExtraKeysMode,
++  readTerminalExtraKeysMode,
++  subscribeTerminalExtraKeys,
++  writeTerminalExtraKeysMode,
++} from "./terminalExtraKeysPreferences";
++
++const KEY = "omnigent:terminal-extra-keys";
++
++afterEach(() => {
++  vi.restoreAllMocks();
++  // Also clears any write kept in memory after a refused storage write.
++  writeTerminalExtraKeysMode("auto");
++  localStorage.clear();
++});
++
++describe("terminalExtraKeysPreferences", () => {
++  it("defaults to auto and validates the three modes", () => {
++    expect(TERMINAL_EXTRA_KEYS_DEFAULT).toBe("auto");
++    expect(readTerminalExtraKeysMode()).toBe("auto");
++    expect(isTerminalExtraKeysMode("on")).toBe(true);
++    expect(isTerminalExtraKeysMode("off")).toBe(true);
++    expect(isTerminalExtraKeysMode("always")).toBe(false);
++    expect(normalizeTerminalExtraKeysMode("garbage")).toBe("auto");
++    expect(normalizeTerminalExtraKeysMode(null)).toBe("auto");
++  });
++
++  it("persists on/off, clears the key for auto, and reads back what it wrote", () => {
++    writeTerminalExtraKeysMode("on");
++    expect(localStorage.getItem(KEY)).toBe("on");
++    expect(readTerminalExtraKeysMode()).toBe("on");
++
++    writeTerminalExtraKeysMode("off");
++    expect(localStorage.getItem(KEY)).toBe("off");
++    expect(readTerminalExtraKeysMode()).toBe("off");
++
++    writeTerminalExtraKeysMode("auto");
++    expect(localStorage.getItem(KEY)).toBeNull();
++    expect(readTerminalExtraKeysMode()).toBe("auto");
++  });
++
++  it("falls back to auto for a corrupt stored value", () => {
++    localStorage.setItem(KEY, "sometimes");
++    expect(readTerminalExtraKeysMode()).toBe("auto");
++  });
++
++  it("notifies subscribers with the written mode and stops after unsubscribe", () => {
++    // WHY: a mounted terminal shows/hides the row live through this pub/sub.
++    const listener = vi.fn();
++    const unsubscribe = subscribeTerminalExtraKeys(listener);
++
++    writeTerminalExtraKeysMode("on");
++    expect(listener).toHaveBeenCalledWith("on");
++
++    unsubscribe();
++    writeTerminalExtraKeysMode("off");
++    expect(listener).toHaveBeenCalledTimes(1);
++  });
++
++  it("still notifies and reads back the value when the storage write throws", () => {
++    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
++      throw new Error("quota");
++    });
++    const listener = vi.fn();
++    subscribeTerminalExtraKeys(listener);
++    expect(() => writeTerminalExtraKeysMode("on")).not.toThrow();
++    expect(listener).toHaveBeenCalledWith("on");
++    // The refused write is still what readers see, until a write succeeds.
++    expect(readTerminalExtraKeysMode()).toBe("on");
++    vi.restoreAllMocks();
++    writeTerminalExtraKeysMode("off");
++    expect(readTerminalExtraKeysMode()).toBe("off");
++    expect(localStorage.getItem(KEY)).toBe("off");
++  });
++});
+diff --git a/web/src/lib/terminalExtraKeysPreferences.ts b/web/src/lib/terminalExtraKeysPreferences.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a35f3196c11640a21b11d84155514fc8dff2adcd
+--- /dev/null
++++ b/web/src/lib/terminalExtraKeysPreferences.ts
+@@ -0,0 +1,90 @@
++// Persisted preference for the terminal extra-keys row (Esc / Tab / Ctrl /
++// arrows under the terminal). `auto` shows it on touch-capable devices, `on`
++// forces it (desktop, convertibles, Electron), `off` hides it (a tablet with
++// a full hardware keyboard). Mirrors terminalThemePreferences: localStorage
++// key, typed read/write, and a pub/sub for useSyncExternalStore.
++
++const STORAGE_KEY = "omnigent:terminal-extra-keys";
++
++export const terminalExtraKeysModes = ["auto", "on", "off"] as const;
++export type TerminalExtraKeysMode = (typeof terminalExtraKeysModes)[number];
++export const TERMINAL_EXTRA_KEYS_DEFAULT: TerminalExtraKeysMode = "auto";
++
++/**
++ * The last mode written while storage was refusing writes (quota, private
++ * mode). `read` prefers it over the stale stored value so a
++ * `useSyncExternalStore` snapshot still reflects the write; a later successful
++ * write clears it.
++ */
++let unstoredWrite: TerminalExtraKeysMode | null = null;
++
++/** Return whether a string is one of the selectable extra-keys modes. */
++export function isTerminalExtraKeysMode(
++  value: string | null | undefined,
++): value is TerminalExtraKeysMode {
++  return value === "auto" || value === "on" || value === "off";
++}
++
++/** Normalize a stored value; unknown or corrupt entries fall back to `auto`. */
++export function normalizeTerminalExtraKeysMode(
++  value: string | null | undefined,
++): TerminalExtraKeysMode {
++  return isTerminalExtraKeysMode(value) ? value : TERMINAL_EXTRA_KEYS_DEFAULT;
++}
++
++/**
++ * Read the current extra-keys mode. Returns `auto` when nothing is stored, on
++ * a server render, or when storage is inaccessible — never throws.
++ */
++export function readTerminalExtraKeysMode(): TerminalExtraKeysMode {
++  if (unstoredWrite !== null) return unstoredWrite;
++  if (typeof window === "undefined") return TERMINAL_EXTRA_KEYS_DEFAULT;
++  try {
++    return normalizeTerminalExtraKeysMode(window.localStorage.getItem(STORAGE_KEY));
++  } catch {
++    return TERMINAL_EXTRA_KEYS_DEFAULT;
++  }
++}
++
++/**
++ * Persist the extra-keys mode, then notify subscribers so mounted terminals
++ * show or hide the row live. `auto` clears the key. A failed write is kept in
++ * memory so readers still see it.
++ */
++export function writeTerminalExtraKeysMode(mode: TerminalExtraKeysMode): void {
++  const normalized = normalizeTerminalExtraKeysMode(mode);
++  unstoredWrite = normalized;
++  if (typeof window !== "undefined") {
++    try {
++      if (normalized === TERMINAL_EXTRA_KEYS_DEFAULT) {
++        window.localStorage.removeItem(STORAGE_KEY);
++      } else {
++        window.localStorage.setItem(STORAGE_KEY, normalized);
++      }
++      unstoredWrite = null;
++    } catch {
++      // Storage refused the write; `unstoredWrite` keeps readers coherent.
++    }
++  }
++  emit(normalized);
++}
++
++type TerminalExtraKeysListener = (mode: TerminalExtraKeysMode) => void;
++
++const listeners = new Set<TerminalExtraKeysListener>();
++
++/**
++ * Subscribe to extra-keys mode changes; fires with the new mode after every
++ * write. Returns an unsubscribe function. The signature doubles as the
++ * `subscribe` argument of `useSyncExternalStore`.
++ */
++export function subscribeTerminalExtraKeys(listener: TerminalExtraKeysListener): () => void {
++  listeners.add(listener);
++  return () => {
++    listeners.delete(listener);
++  };
++}
++
++function emit(mode: TerminalExtraKeysMode): void {
++  for (const listener of listeners) listener(mode);
++}
+diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
+index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc1534695c 100644
+--- a/web/src/pages/SettingsPage.test.tsx
++++ b/web/src/pages/SettingsPage.test.tsx
+@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
+   setTheme: vi.fn(),
+   theme: "system" as string,
+   isEmbedded: false,
++  resolvedTheme: undefined as string | undefined,
+   archiveMutate: vi.fn(),
+   deleteMutate: vi.fn(),
+   bulkArchiveMutate: vi.fn(),
+@@ -51,7 +52,12 @@ const mocks = vi.hoisted(() => ({
+ }));
+ 
+ vi.mock("next-themes", () => ({
+-  useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
++  useTheme: () => ({
++    theme: mocks.theme,
++    resolvedTheme: mocks.resolvedTheme,
++    systemTheme: "light",
++    setTheme: mocks.setTheme,
++  }),
+ }));
+ vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
+ vi.mock("@/lib/CapabilitiesContext", () => ({
+@@ -236,6 +242,7 @@ beforeEach(() => {
+   mocks.conversationQuery.mockReset();
+   mocks.theme = "system";
+   mocks.isEmbedded = false;
++  mocks.resolvedTheme = undefined;
+   mocks.accountsEnabled = true;
+   mocks.importSessionsPanel.mockClear();
+   mocks.enabledConnections = [];
+@@ -592,6 +599,142 @@ describe("SettingsPage", () => {
+     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
+   });
+ 
++  it("renders the Extra keys row select in the Touch & mobile section, defaulting to Auto", () => {
++    renderPage("/settings/appearance");
++    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
++    expect(select.value).toBe("auto");
++    expect(screen.getByText("Auto (touch devices)")).toBeInTheDocument();
++    expect(screen.getByText("Always")).toBeInTheDocument();
++    expect(screen.getByText("Never")).toBeInTheDocument();
++    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
++
++    const touch = screen.getByRole("heading", { level: 2, name: "Touch & mobile" });
++    const codeWeight = screen.getByText("Heavier code font");
++    const extraKeys = screen.getByText("Extra keys row");
++    const exportButton = screen.getByTestId("export-settings-button");
++    const follows = (a: Node, b: Node) =>
++      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
++    expect(follows(codeWeight, touch)).toBe(true);
++    expect(follows(touch, extraKeys)).toBe(true);
++    expect(follows(extraKeys, exportButton)).toBe(true);
++  });
++
++  it("persists Always / Never for the extra keys row and clears the key for Auto", () => {
++    renderPage("/settings/appearance");
++    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
++
++    fireEvent.change(select, { target: { value: "on" } });
++    expect(select.value).toBe("on");
++    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("on");
++
++    fireEvent.change(select, { target: { value: "off" } });
++    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("off");
++
++    fireEvent.change(select, { target: { value: "auto" } });
++    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
++  });
++
++  it("reflects a stored extra keys row preference on mount", () => {
++    localStorage.setItem("omnigent:terminal-extra-keys", "off");
++    renderPage("/settings/appearance");
++    expect((screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement).value).toBe(
++      "off",
++    );
++  });
++
++  it("describes the extra keys row by the keys it adds, without truncating", () => {
++    renderPage("/settings/appearance");
++    const description = screen.getByText(
++      "Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.",
++    );
++    const card = description.closest<HTMLElement>(".rounded-xl");
++    expect(card).not.toBeNull();
++    // Nothing from the text up to the card may clip it to one line or a line count.
++    for (let el: HTMLElement | null = description; el && el !== card!.parentElement;) {
++      const utilities = Array.from(el.classList, (token) => token.split(":").pop()!);
++      expect(
++        utilities.filter(
++          (u) => u === "truncate" || u === "whitespace-nowrap" || u.startsWith("line-clamp-"),
++        ),
++      ).toEqual([]);
++      el = el.parentElement;
++    }
++  });
++
++  it("switches the extra keys preview between Always, Never and Auto", () => {
++    renderPage("/settings/appearance");
++    const preview = screen.getByTestId("terminal-extra-keys-preview");
++    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
++
++    // A scene is a frame of terminal lines, optional key pills, then a 20-key keyboard.
++    const scene = () => {
++      const parts = Array.from(preview.firstElementChild!.children);
++      return {
++        terminalLines: parts[0]!.children.length,
++        pills: parts.length === 3,
++        keyboardKeys: parts[parts.length - 1]!.children.length,
++      };
++    };
++
++    fireEvent.change(select, { target: { value: "on" } });
++    expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
++    expect(within(preview).getAllByTestId("extra-keys-preview-pills")).toHaveLength(1);
++    expect(scene()).toEqual({ terminalLines: 2, pills: true, keyboardKeys: 20 });
++
++    fireEvent.change(select, { target: { value: "off" } });
++    expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
++    expect(within(preview).queryByTestId("extra-keys-preview-pills")).toBeNull();
++    expect(scene()).toEqual({ terminalLines: 3, pills: false, keyboardKeys: 20 });
++
++    fireEvent.change(select, { target: { value: "auto" } });
++    expect(within(preview).getByTestId("extra-keys-preview-auto")).toBeInTheDocument();
++  });
++
++  it("composites Always and Never on System's diagonal for the Auto preview", () => {
++    renderPage("/settings/appearance");
++    const auto = within(screen.getByTestId("terminal-extra-keys-preview")).getByTestId(
++      "extra-keys-preview-auto",
++    );
++    const [always, never] = Array.from(auto.children) as HTMLElement[];
++    expect(auto).toHaveClass("grid");
++    expect(auto.children).toHaveLength(2);
++    // Both layers share one grid cell so the frames line up.
++    for (const layer of [always!, never!]) {
++      expect(layer).toHaveClass("col-start-1", "row-start-1");
++    }
++    expect(always!.style.clipPath).toBe("");
++    expect(within(always!).getByTestId("extra-keys-preview-pills")).toBeInTheDocument();
++    expect(never!.style.clipPath).toBe("polygon(62% 0, 100% 0, 100% 100%, 38% 100%)");
++    expect(within(never!).queryByTestId("extra-keys-preview-pills")).toBeNull();
++  });
++
++  it("draws the extra keys preview in the current light or dark palette", () => {
++    const frameColors = () =>
++      Array.from(
++        screen
++          .getByTestId("extra-keys-preview-auto")
++          .querySelectorAll<HTMLElement>(".h-16.p-1\\.5"),
++        (frame) => frame.style.backgroundColor,
++      );
++
++    renderPage("/settings/appearance");
++    expect(frameColors()).toEqual(["rgb(233, 235, 238)", "rgb(233, 235, 238)"]);
++    cleanup();
++
++    mocks.resolvedTheme = "dark";
++    renderPage("/settings/appearance");
++    expect(frameColors()).toEqual(["rgb(14, 16, 19)", "rgb(14, 16, 19)"]);
++
++    // Always and Never on their own use the dark palette too (DARK_MODE_PREVIEW.bg).
++    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
++    const frame = () =>
++      screen.getByTestId("terminal-extra-keys-preview").firstElementChild as HTMLElement;
++    for (const mode of ["on", "off"]) {
++      fireEvent.change(select, { target: { value: mode } });
++      expect(frame().style.backgroundColor).toBe("rgb(14, 16, 19)");
++    }
++  });
++
+   it("defaults transcripts to Chat and persists a Terminal default", () => {
+     renderPage("/settings/appearance");
+ 
+@@ -908,6 +1051,9 @@ describe("SettingsPage", () => {
+     mocks.theme = "dark";
+     fireEvent.click(screen.getByTestId("theme-dark"));
+     fireEvent.click(screen.getByTestId("terminal-theme-dark"));
++    fireEvent.change(screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement, {
++      target: { value: "on" },
++    });
+     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
+       target: { value: "github" },
+     });
+@@ -930,6 +1076,7 @@ describe("SettingsPage", () => {
+ 
+     // Sanity: the non-default choices were persisted.
+     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
++    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("on");
+     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
+     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
+@@ -960,8 +1107,13 @@ describe("SettingsPage", () => {
+     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
+     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
+ 
+-    // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
++    // Terminal theme, extra keys row, transcript view, workspace defaults, and
++    // harness visibility are restored.
+     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
++    expect((screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement).value).toBe(
++      "auto",
++    );
++    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
+     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+       "aria-checked",
+       "true",
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index e8ef3490575a78f15bc399c29823e5b8b766f5fd..c5191815f5944f282d0224f4d4d83d5c6ba51118 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -80,7 +80,13 @@ import { McpRegistryConnections } from "@/components/McpRegistry";
+ import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
+ import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+ import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
+-import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/AppearancePreviews";
++import {
++  DARK_MODE_PREVIEW,
++  ExtraKeysPreview,
++  LIGHT_MODE_PREVIEW,
++  PaletteChip,
++  PaletteSwatchPreview,
++} from "@/components/theme/AppearancePreviews";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { Switch } from "@/components/ui/switch";
+@@ -168,6 +174,14 @@ import {
+   writeCodeFontSizePx,
+   writeCodeFontWeight,
+ } from "@/lib/codeFontPreferences";
++import {
++  TERMINAL_EXTRA_KEYS_DEFAULT,
++  isTerminalExtraKeysMode,
++  readTerminalExtraKeysMode,
++  terminalExtraKeysModes,
++  writeTerminalExtraKeysMode,
++  type TerminalExtraKeysMode,
++} from "@/lib/terminalExtraKeysPreferences";
+ import {
+   readTerminalThemeMode,
+   TERMINAL_THEME_DEFAULT,
+@@ -411,6 +425,12 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
+   { mode: "dark", label: "Dark", icon: MoonIcon },
+ ];
+ 
++const terminalExtraKeysLabels: Record<TerminalExtraKeysMode, string> = {
++  auto: "Auto (touch devices)",
++  on: "Always",
++  off: "Never",
++};
++
+ const transcriptViewCards: {
+   value: TranscriptViewDefault;
+   label: string;
+@@ -531,6 +551,65 @@ function TerminalThemeControl() {
+   );
+ }
+ 
++/** Extra-keys row under the terminal on touch devices: a mode thumbnail beside its select. */
++function TerminalExtraKeysControl() {
++  const isDark = useResolvedThemeMode() === "dark";
++  const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
++  const labelId = useId();
++  const choose = useCallback((next: TerminalExtraKeysMode) => {
++    setMode(next);
++    writeTerminalExtraKeysMode(next);
++  }, []);
++  return (
++    <div className="overflow-hidden rounded-xl border bg-card/55">
++      <div className="flex flex-col gap-3 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
++        <div className="flex min-w-0 items-center gap-3">
++          <div
++            data-testid="terminal-extra-keys-preview"
++            className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm"
++          >
++            <ExtraKeysPreview
++              mode={mode}
++              swatch={isDark ? DARK_MODE_PREVIEW : LIGHT_MODE_PREVIEW}
++            />
++          </div>
++          <div className="min-w-0">
++            <div id={labelId} className="text-ui font-medium">
++              Extra keys row
++            </div>
++            <div className="text-sm text-muted-foreground">
++              Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.
++            </div>
++          </div>
++        </div>
++        <Select
++          value={mode}
++          onValueChange={(next) => {
++            if (isTerminalExtraKeysMode(next)) choose(next);
++          }}
++          componentId="settings.appearance.terminal_extra_keys"
++          valueHasNoPii
++        >
++          <SelectTrigger
++            aria-labelledby={labelId}
++            data-testid="terminal-extra-keys-select"
++            className="w-full shrink-0 sm:w-48"
++          >
++            <SelectValue />
++          </SelectTrigger>
++          <SelectContent>
++            {terminalExtraKeysModes.map((value) => (
++              <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
++                {terminalExtraKeysLabels[value]}
++              </SelectItem>
++            ))}
++          </SelectContent>
++        </Select>
++      </div>
++    </div>
++  );
++}
++
+ /** Default surface for terminal-first transcripts without a per-tab choice. */
+ function TranscriptViewDefaultControl() {
+   const [value, setValue] = useState(() => readTranscriptViewDefault());
+@@ -938,6 +1017,7 @@ function AppearanceSection() {
+     setTheme("system");
+ 
+     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
++    writeTerminalExtraKeysMode(TERMINAL_EXTRA_KEYS_DEFAULT);
+ 
+     writeThemePalette(DEFAULT_PALETTE);
+     applyThemePalette(DEFAULT_PALETTE);
+@@ -972,6 +1052,7 @@ function AppearanceSection() {
+           "omnigent:code-font-family",
+           "omnigent:code-font-weight",
+           "omnigent:terminal-theme",
++          "omnigent:terminal-extra-keys",
+           "omnigent:ui-theme-palette",
+           "omnigent:custom-theme",
+           "omnigent:default-transcript-view",
+@@ -1111,6 +1192,10 @@ function AppearanceSection() {
+               <UiCodeFontWeightControl />
+             </div>
+           </SettingsGroup>
++
++          <SettingsGroup title="Touch & mobile" testId="settings-group-touch">
++            <TerminalExtraKeysControl />
++          </SettingsGroup>
+         </div>
+ 
+         <SettingsGroup title="Settings data" testId="settings-group-data">

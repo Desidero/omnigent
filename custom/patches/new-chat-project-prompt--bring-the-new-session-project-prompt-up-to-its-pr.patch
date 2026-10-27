@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 27 Oct 2026 04:16:28 +0000
+Subject: [PATCH] feat(web): bring the new-session project prompt up to its PR
+
+Offer the project step while the project list is still loading and close it
+for the plain composer when the list fails or comes back empty; hide a stale
+session fetch error on the project step. More AppShell, palette and Settings
+tests. Matches https://github.com/omnigent-ai/omnigent/pull/11397.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (fix: the project step while the project list loads, fails or is empty; the feature-map entry still holds)
+---
+ web/src/hooks/useNewChatProjectPrompt.ts | 12 +--
+ web/src/pages/SettingsPage.test.tsx      | 18 +++++
+ web/src/shell/AppShell.test.tsx          | 99 ++++++++++++++++++------
+ web/src/shell/CommandPalette.test.tsx    | 23 ++++++
+ web/src/shell/CommandPalette.tsx         | 17 +++-
+ 5 files changed, 137 insertions(+), 32 deletions(-)
+
+diff --git a/web/src/hooks/useNewChatProjectPrompt.ts b/web/src/hooks/useNewChatProjectPrompt.ts
+index fe3b25a9a2cfa682651404d9daac5aa4a42a8982..76e9364623e4a6b759da58725766cec3630fc15f 100644
+--- a/web/src/hooks/useNewChatProjectPrompt.ts
++++ b/web/src/hooks/useNewChatProjectPrompt.ts
+@@ -5,11 +5,13 @@ import { readNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPrefe
+ 
+ /**
+  * Returns a check for whether starting a new session should first ask for a
+- * project: at least one project exists and the prompt isn't turned off in
+- * Settings. The preference is read at call time so a toggle applies at once.
++ * project: the project list may hold one and the prompt isn't turned off in
++ * Settings. Until the list resolves it counts as "may": the picker lists
++ * projects as they arrive and steps aside if none do (see `CommandPalette`).
++ * The preference is read at call time so a toggle applies at once.
+  */
+ export function useShouldPromptForProject(): () => boolean {
+-  const { data: projects = [] } = useProjects();
+-  const hasProjects = projects.length > 0;
+-  return useCallback(() => hasProjects && readNewChatProjectPromptEnabled(), [hasProjects]);
++  const { data: projects } = useProjects();
++  const mayHaveProjects = projects === undefined || projects.length > 0;
++  return useCallback(() => mayHaveProjects && readNewChatProjectPromptEnabled(), [mayHaveProjects]);
+ }
+diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
+index 392c967ca9350ec6aed8271e81a0736b9c72948b..590816a8dfb0cf285b3183555b3332a7e4f3a95d 100644
+--- a/web/src/pages/SettingsPage.test.tsx
++++ b/web/src/pages/SettingsPage.test.tsx
+@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ import type { Conversation } from "@/hooks/useConversations";
+ import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
++import { NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY } from "@/lib/newChatProjectPromptPreferences";
+ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+ import * as host from "@/lib/host";
+ import {
+@@ -342,6 +343,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
+ describe("SettingsPage", () => {
+   beforeEach(() => {
+     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
++    localStorage.removeItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY);
+   });
+ 
+   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
+@@ -380,6 +382,22 @@ describe("SettingsPage", () => {
+     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+   });
+ 
++  it("renders the new-session project prompt enabled by default", async () => {
++    renderPage("/settings/general");
++
++    expect(await screen.findByTestId("new-chat-project-prompt-toggle")).toBeChecked();
++  });
++
++  it("persists turning the new-session project prompt off", async () => {
++    renderPage("/settings/general");
++    const toggle = await screen.findByTestId("new-chat-project-prompt-toggle");
++
++    fireEvent.click(toggle);
++
++    expect(toggle).not.toBeChecked();
++    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("off");
++  });
++
+   it("asks before terminal copying by default and explains the scope", () => {
+     renderPage("/settings/general");
+     const select = screen.getByTestId("terminal-clipboard-preference-select");
+diff --git a/web/src/shell/AppShell.test.tsx b/web/src/shell/AppShell.test.tsx
+index cf76294a86222a37f7d540deae29292d76e344c2..944432dc1a7d7647e294ed593d27611c9feea513 100644
+--- a/web/src/shell/AppShell.test.tsx
++++ b/web/src/shell/AppShell.test.tsx
+@@ -12,7 +12,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
+ import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
+ import type * as SessionsApiModule from "@/lib/sessionsApi";
+ 
+-import { useCallback, useState } from "react";
++import { useCallback, useState, useSyncExternalStore } from "react";
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import {
+@@ -5703,35 +5703,37 @@ describe("new-session browser shortcut", () => {
+     setEmbedRoot(null);
+   });
+ 
++  function pressNewSession() {
++    mockConversations([{ id: "conv_abc", permission_level: null }]);
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    render(
++      shellTree(
++        client,
++        "/c/conv_abc",
++        <>
++          <Route index element={<p>New session route</p>} />
++          <Route path="c/:conversationId" element={<p>Session route</p>} />
++        </>,
++        <AppShell />,
++      ),
++    );
++    fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
++  }
++
++  function restoreNoProjects() {
++    vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
++      typeof useProjects
++    >);
++    localStorage.clear();
++  }
++
+   describe("with projects", () => {
+     beforeEach(() => {
+       vi.mocked(useProjects).mockReturnValue({
+         data: [{ id: "p1", name: "omnigent" }],
+       } as unknown as ReturnType<typeof useProjects>);
+     });
+-    afterEach(() => {
+-      vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
+-        typeof useProjects
+-      >);
+-      localStorage.clear();
+-    });
+-
+-    function pressNewSession() {
+-      mockConversations([{ id: "conv_abc", permission_level: null }]);
+-      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+-      render(
+-        shellTree(
+-          client,
+-          "/c/conv_abc",
+-          <>
+-            <Route index element={<p>New session route</p>} />
+-            <Route path="c/:conversationId" element={<p>Session route</p>} />
+-          </>,
+-          <AppShell />,
+-        ),
+-      );
+-      fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
+-    }
++    afterEach(restoreNoProjects);
+ 
+     it("asks for a project before opening the composer", () => {
+       pressNewSession();
+@@ -5749,4 +5751,53 @@ describe("new-session browser shortcut", () => {
+       expect(screen.getByText("New session route")).toBeInTheDocument();
+     });
+   });
++
++  describe("while the project list is still loading", () => {
++    interface ProjectsQuery {
++      data?: { id: string; name: string }[];
++      isSuccess?: boolean;
++    }
++    let projectsQuery: ProjectsQuery = {};
++    const subscribers = new Set<() => void>();
++    beforeEach(() => {
++      projectsQuery = {};
++      vi.mocked(useProjects).mockImplementation(
++        () =>
++          useSyncExternalStore(
++            (onChange) => {
++              subscribers.add(onChange);
++              return () => subscribers.delete(onChange);
++            },
++            () => projectsQuery,
++          ) as unknown as ReturnType<typeof useProjects>,
++      );
++    });
++    afterEach(() => {
++      subscribers.clear();
++      restoreNoProjects();
++    });
++
++    function resolveProjects(next: ProjectsQuery) {
++      projectsQuery = next;
++      act(() => subscribers.forEach((notify) => notify()));
++    }
++
++    it("asks for a project, then steps aside when the list resolves empty", () => {
++      pressNewSession();
++      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
++      expect(screen.queryByText("New session route")).toBeNull();
++
++      resolveProjects({ data: [], isSuccess: true });
++      expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
++      expect(screen.getByText("New session route")).toBeInTheDocument();
++    });
++
++    it("lists the projects once they arrive", () => {
++      pressNewSession();
++      resolveProjects({ data: [{ id: "p1", name: "omnigent" }], isSuccess: true });
++      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
++      expect(screen.getByText("omnigent")).toBeInTheDocument();
++      expect(screen.queryByText("New session route")).toBeNull();
++    });
++  });
+ });
+diff --git a/web/src/shell/CommandPalette.test.tsx b/web/src/shell/CommandPalette.test.tsx
+index cfbcb29be7be8b054ed9dfbc2aed091b5b6cf627..209d17e8459e49a335c2ef4fdb1647444800fdb6 100644
+--- a/web/src/shell/CommandPalette.test.tsx
++++ b/web/src/shell/CommandPalette.test.tsx
+@@ -454,6 +454,29 @@ describe("CommandPalette — project step", () => {
+     expect(onOpenChange).toHaveBeenCalledWith(false);
+     expect(navigate).toHaveBeenCalledWith(path);
+   });
++
++  it.each([
++    ["", "/"],
++    ["lab", "/?project=home%20lab"],
++  ])("opens the first row with Enter after typing %j", (typed, path) => {
++    const { onOpenChange } = renderPalette({ projectStep: true });
++    const input = screen.getByTestId("command-palette-input");
++    if (typed) fireEvent.change(input, { target: { value: typed } });
++    fireEvent.keyDown(input, { key: "Enter" });
++    expect(navigate).toHaveBeenCalledWith(path);
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++  });
++
++  it("hides a stale session-load error", () => {
++    useConversations.mockReturnValue({ isError: true, isFetching: false, refetch: vi.fn() });
++    renderPalette({ projectStep: true });
++    expect(screen.queryByText("Couldn't load sessions.")).toBeNull();
++    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
++      "No project",
++      "🔥omnigent",
++      "home lab",
++    ]);
++  });
+ });
+ 
+ describe("CommandPalette — input", () => {
+diff --git a/web/src/shell/CommandPalette.tsx b/web/src/shell/CommandPalette.tsx
+index 4325d79e78faeb21c151d011653fed1851bf5807..22a3992123a444cf893d41794e49bd73cea88f2e 100644
+--- a/web/src/shell/CommandPalette.tsx
++++ b/web/src/shell/CommandPalette.tsx
+@@ -214,16 +214,26 @@ export function CommandPalette({
+     );
+   }, [actions, query, sessionsOnly, projectStep]);
+ 
+-  const { data: projects = [] } = useProjects();
++  const { data: projects = [], isSuccess: projectsLoaded, isError: projectsFailed } = useProjects();
+   // Every typed word must appear in the row label or the group heading, so
+   // "new omni", "omni" and "project" all reach "New chat in omnigent". The
+   // project step lists every project until the user types, and matches names only.
+   const filteredProjects = useMemo(() => {
+     if (projectStep) return projects.filter((project) => matchesEveryWord(project.name, query));
+     if (sessionsOnly || query.trim() === "") return [];
+-    return projects.filter((project) => matchesEveryWord(`new chat in project ${project.name}`, query));
++    return projects.filter((project) =>
++      matchesEveryWord(`new chat in project ${project.name}`, query),
++    );
+   }, [projects, query, sessionsOnly, projectStep]);
+   const showNoProject = projectStep && matchesEveryWord("no project", query);
++  // The project step may open before the list resolves. Nothing to choose
++  // from means the plain composer, as if the prompt had never been offered.
++  const noProjectToOffer = projectsFailed || (projectsLoaded && projects.length === 0);
++  useEffect(() => {
++    if (!open || !projectStep || !noProjectToOffer) return;
++    onOpenChange(false);
++    navigate("/");
++  }, [open, projectStep, noProjectToOffer, onOpenChange, navigate]);
+ 
+   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
+     useConversations(sessionsOnly ? "" : debouncedQuery, false, {
+@@ -288,7 +298,8 @@ export function CommandPalette({
+     return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
+   }, [data, debouncedQuery, query, sessionsOnly, projectStep]);
+   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
+-  const loadError = isError || isFetchNextPageError;
++  // The project step never reads sessions, so a stale fetch error stays hidden.
++  const loadError = !projectStep && (isError || isFetchNextPageError);
+ 
+   const paletteLabel = projectStep
+     ? "New session"

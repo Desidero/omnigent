@@ -1,0 +1,931 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 15 Oct 2026 04:47:32 +0000
+Subject: [PATCH] feat(providers): Claude accounts that share sessions through
+ account tokens
+
+Carried on custom while the design is discussed on upstream issue #503;
+see docs/providers.md. Drop it once upstream has an equivalent.
+
+An account with its own config_dir also gets its own transcripts, settings,
+skills and plugins, so a conversation started on one Claude account cannot
+continue on another without moving files, and the accounts drift apart.
+
+A claude subscription entry now accepts token_ref, an env: or keychain:
+reference to a `claude setup-token` token. Claude reads it from
+CLAUDE_CODE_OAUTH_TOKEN, which takes precedence over the login stored in its
+config directory, so token accounts share one ~/.claude and differ only in
+which subscription pays:
+
+- The runner resolves the token itself and passes it only to the Claude
+  process: the native terminal's env, or the claude-sdk spawn env. It never
+  enters the runner's environment or the host launch frame.
+- The account is the agent's pinned provider, else the session's choice or
+  the host default. A missing token fails the launch with the command that
+  creates one, and a startup command or agent env that replaces the token
+  fails instead of running on another account.
+- A token account counts as signed in when its token resolves, for the host
+  provider listing, readiness and launch checks.
+- `omnigent setup` can add a token account (paste the token; it is stored in
+  the Omnigent secret store). Removing one deletes its token and never runs
+  `claude auth logout`, which would sign out the shared login.
+- Picker labels no longer include login directories.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (documented with its series in docs/providers.md)
+---
+ omnigent/cli_config.py                        | 77 +++++++++++++--
+ omnigent/onboarding/configure_models.py       |  6 +-
+ omnigent/onboarding/harness_readiness.py      | 10 +-
+ omnigent/onboarding/provider_config.py        | 44 ++++++++-
+ omnigent/onboarding/subscription_accounts.py  | 95 +++++++++++++++++--
+ omnigent/runner/native/orchestration.py       | 30 +++++-
+ omnigent/runtime/workflow.py                  |  6 +-
+ tests/cli/test_configure_models.py            | 67 ++++++++++++-
+ .../onboarding/test_subscription_accounts.py  | 83 +++++++++++++++-
+ .../test_app_claude_native_launch_args.py     | 63 ++++++++++++
+ tests/runtime/test_provider_spawn_env.py      | 25 +++++
+ 11 files changed, 475 insertions(+), 31 deletions(-)
+
+diff --git a/omnigent/cli_config.py b/omnigent/cli_config.py
+index abb352d7343c834fbc011b307d696d1ee9781580..8cb749990386afa066e9300cde18e57c6a8fd9ab 100644
+--- a/omnigent/cli_config.py
++++ b/omnigent/cli_config.py
+@@ -624,6 +624,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
+         RESPONSES_WIRE_API,
+         SUBSCRIPTION_CONFIG_DIR_ENV,
+         SUBSCRIPTION_KIND,
++        SUBSCRIPTION_TOKEN_ENV,
+         load_providers,
+         provider_entry_settings,
+         set_default_provider,
+@@ -831,12 +832,18 @@ def _configure_harness_add(family: str | None = None) -> str | None:
+         existing_subs = [
+             n
+             for n, e in load_providers(_load_global_config()).items()
+-            if e.kind == SUBSCRIPTION_KIND and e.cli == cli_name and e.config_dir is None
++            if e.kind == SUBSCRIPTION_KIND
++            and e.cli == cli_name
++            and e.config_dir is None
++            and e.token_ref is None
+         ]
+         account_name = ""
+         account_dir: str | None = None
++        account_token_ref: str | None = None
+         if existing_subs:
+             choices = ["Replace it", "Keep the current one"]
++            if cli_name in SUBSCRIPTION_TOKEN_ENV:
++                choices.append("Add another account (token, shares sessions)")
+             if cli_name in SUBSCRIPTION_CONFIG_DIR_ENV:
+                 choices.append("Add another account (own login directory)")
+             picked = select(
+@@ -854,17 +861,29 @@ def _configure_harness_add(family: str | None = None) -> str | None:
+                     return None
+                 if account_name in load_providers(_load_global_config()):
+                     return f"✗ A provider named {account_name!r} already exists"
+-                account_dir = prompt_text(
+-                    "Login directory for this account", default=f"~/.{account_name}"
+-                ).strip()
+-                if not account_dir:
+-                    return None
++                if "token" in action:
++                    console.print(
++                        f"  [dim]In another terminal, run `{cli_name} setup-token`, sign in "
++                        "as this account, and paste the token it prints.[/dim]"
++                    )
++                    token = prompt_text("Account token", hide_input=True).strip()
++                    if not token:
++                        return None
++                    secret_store.store_secret(account_name, token)
++                    account_token_ref = f"keychain:{account_name}"
++                else:
++                    account_dir = prompt_text(
++                        "Login directory for this account", default=f"~/.{account_name}"
++                    ).strip()
++                    if not account_dir:
++                        return None
+                 existing_subs = []
+             elif action != "Replace it":  # "Keep the current one" or Esc — abort the add
+                 return None
+         # CLIs listed in _CLI_LOGIN_BRAND (claude / codex) require a login step.
+         # CLIs not listed (pi) manage their own auth — no login step needed.
+-        if cli_name in _CLI_LOGIN_BRAND:
++        # A token account authenticates with its token; it has no login to drive.
++        if cli_name in _CLI_LOGIN_BRAND and account_token_ref is None:
+             from omnigent.onboarding.harness_install import harness_install_spec, harness_login
+ 
+             login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
+@@ -893,8 +912,10 @@ def _configure_harness_add(family: str | None = None) -> str | None:
+                 remaining = {k: v for k, v in block.items() if k not in existing_subs}
+                 _save_global_config({"providers": remaining})
+         # The default-login subscription's name is derived from the CLI.
+-        name = account_name if account_dir is not None else f"{cli_name}-subscription"
+-        entry = build_subscription_provider_entry(cli_name, account_dir)
++        name = account_name or f"{cli_name}-subscription"
++        entry = build_subscription_provider_entry(
++            cli_name, account_dir, token_ref=account_token_ref
++        )
+ 
+     elif kind == "gateway":
+         gemini_gateway = family == GEMINI_FAMILY
+@@ -3287,6 +3308,8 @@ def _remove_subscription(provider: str, family: str) -> str | None:
+     from omnigent.onboarding.subscription_accounts import subscription_home_env
+ 
+     entry = load_providers(_load_global_config()).get(provider)
++    if entry is not None and entry.token_ref is not None:
++        return _remove_token_account(provider, entry.token_ref, disp)
+     account_env = subscription_home_env(entry) if entry is not None else {}
+     if account_env:
+         logout_cmd = " ".join([*(f"{k}={v}" for k, v in account_env.items()), logout_cmd])
+@@ -3315,6 +3338,42 @@ def _remove_subscription(provider: str, family: str) -> str | None:
+     )
+ 
+ 
++def _remove_token_account(provider: str, token_ref: str, disp: str) -> str | None:
++    """Remove a subscription account that signs in with a stored token.
++
++    Token accounts share the CLI's default login directory, so this never runs
++    the CLI's logout; it deletes the stored token and drops our entry.
++
++    :param provider: The provider id, e.g. ``"claude-max2"``.
++    :param token_ref: The account's token reference, e.g. ``"keychain:claude-max2"``.
++    :param disp: The harness display name, e.g. ``"Claude Code"``.
++    :returns: A confirmation message, or ``None`` when the user declined.
++    """
++    from omnigent.onboarding import secrets as secret_store
++    from omnigent.onboarding.interactive import select
++
++    stored = token_ref.startswith("keychain:")
++    choice = select(
++        f"Remove {disp} account {provider!r}?",
++        ["Yes — remove it", "No — keep it"],
++        descriptions=[
++            "Deletes its stored token and removes it here. Your other "
++            f"{disp} logins are untouched."
++            if stored
++            else f"Removes it here. Its token in {token_ref} is left as is.",
++            "Leave the account untouched.",
++        ],
++        default=1,
++        clear_on_exit=True,
++    )
++    if choice != 0:
++        return None
++    if stored:
++        secret_store.delete_secret(token_ref[len("keychain:") :])
++    _remove_credential(provider)
++    return f"✓ Removed {disp} account {provider!r}"
++
++
+ def _remove_databricks_provider(provider: str) -> str:
+     """Remove a databricks provider and clean up ucode's harness wiring.
+ 
+diff --git a/omnigent/onboarding/configure_models.py b/omnigent/onboarding/configure_models.py
+index c3ba5b6cf19084a94a26851446b7a47ff9453187..22f4efc3793d40ce35bdc907a832166cdc38f558 100644
+--- a/omnigent/onboarding/configure_models.py
++++ b/omnigent/onboarding/configure_models.py
+@@ -914,7 +914,7 @@ def default_base_url_for_family(family: str) -> str:
+ 
+ 
+ def build_subscription_provider_entry(
+-    cli: str, config_dir: str | None = None
++    cli: str, config_dir: str | None = None, *, token_ref: str | None = None
+ ) -> dict[str, object]:
+     """Build a ``kind: subscription`` provider entry body.
+ 
+@@ -922,12 +922,16 @@ def build_subscription_provider_entry(
+         ``"codex"``.
+     :param config_dir: The account's own login directory, e.g.
+         ``"~/.claude-max2"``; ``None`` uses the CLI's default login.
++    :param token_ref: The account token's secret reference, e.g.
++        ``"keychain:claude-max2"``; ``None`` uses the stored login.
+     :returns: A provider entry body, e.g.
+         ``{"kind": "subscription", "cli": "claude"}``.
+     """
+     entry: dict[str, object] = {"kind": SUBSCRIPTION_KIND, "cli": cli}
+     if config_dir:
+         entry["config_dir"] = config_dir
++    if token_ref:
++        entry["token_ref"] = token_ref
+     return entry
+ 
+ 
+diff --git a/omnigent/onboarding/harness_readiness.py b/omnigent/onboarding/harness_readiness.py
+index 58a7bc91272a7661e44f57a0c3be1135b9af2571..87dbc538c2410102362327cb6932c5cf322da368 100644
+--- a/omnigent/onboarding/harness_readiness.py
++++ b/omnigent/onboarding/harness_readiness.py
+@@ -592,10 +592,10 @@ def _claude_token_env_configured() -> bool:
+ 
+ 
+ def _default_subscription_account(harness: str) -> ProviderEntry | None:
+-    """Return *harness*'s default provider when it is a subscription with its own login dir.
++    """Return *harness*'s default provider when it is a subscription with its own login.
+ 
+-    Such an account's login lives in its ``config_dir``, not the CLI's default
+-    location, so readiness must check it there. Never raises.
++    Such an account's login lives in its ``config_dir`` or its token, not the
++    CLI's default location, so readiness must check it there. Never raises.
+ 
+     :param harness: A canonical harness spelling, e.g. ``"claude-native"``.
+     :returns: The subscription entry, or ``None``.
+@@ -604,7 +604,9 @@ def _default_subscription_account(harness: str) -> ProviderEntry | None:
+         provider = default_provider_for_harness(load_config(), harness)
+     except Exception:
+         return None
+-    if provider is None or provider.kind != SUBSCRIPTION_KIND or provider.config_dir is None:
++    if provider is None or provider.kind != SUBSCRIPTION_KIND:
++        return None
++    if provider.config_dir is None and provider.token_ref is None:
+         return None
+     return provider
+ 
+diff --git a/omnigent/onboarding/provider_config.py b/omnigent/onboarding/provider_config.py
+index 3f8c7bbb2964ab64bc610d1518a7842c4d764c04..9184a37803beb5fceff6b5362d832f373b7efae8 100644
+--- a/omnigent/onboarding/provider_config.py
++++ b/omnigent/onboarding/provider_config.py
+@@ -137,6 +137,11 @@ SUBSCRIPTION_CONFIG_DIR_ENV: dict[str, str] = {
+     "codex": "CODEX_HOME",
+ }
+ 
++# The env var a subscription CLI reads a long-lived account token from. A
++# ``subscription`` entry's ``token_ref`` is resolved into it, so accounts that
++# share a login directory (and its sessions) differ only by credential.
++SUBSCRIPTION_TOKEN_ENV: dict[str, str] = {"claude": "CLAUDE_CODE_OAUTH_TOKEN"}
++
+ # The CLIs whose own config file this build knows how to drive for a
+ # ``cli-config`` provider. A ``cli-config`` entry naming any other CLI is a
+ # shape from a newer build (or a stale entry a newer build wrote, e.g. a
+@@ -430,6 +435,11 @@ class ProviderEntry:
+         CLI config directory holding this account's login, e.g.
+         ``"~/.claude-max2"``. Exported as ``CLAUDE_CONFIG_DIR`` / the source
+         ``CODEX_HOME``. Stored unexpanded; ``None`` uses the process default.
++    :param token_ref: For a ``claude`` ``subscription`` only: a secret
++        reference to the account's ``claude setup-token`` token, e.g.
++        ``"keychain:claude-max2"``. Given to Claude as
++        ``CLAUDE_CODE_OAUTH_TOKEN``, which takes precedence over the login
++        stored in the config directory. ``None`` uses that stored login.
+     :param default_families: The set of model families this provider is
+         the **default** for. Sourced from the entry's ``default:`` flag:
+         ``true`` → every family it serves (:func:`provider_families`); a
+@@ -454,6 +464,7 @@ class ProviderEntry:
+     # Databricks Gemini routing is opt-in and has a separate default scope.
+     native_gemini: bool = False
+     config_dir: str | None = None
++    token_ref: str | None = None
+ 
+     @property
+     def default(self) -> bool:
+@@ -988,6 +999,18 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
+                 f"supported for the {sorted(SUBSCRIPTION_CONFIG_DIR_ENV)} subscription CLIs.",
+                 code=ErrorCode.INVALID_INPUT,
+             )
++        token_ref_raw = raw.get("token_ref")
++        if token_ref_raw is not None and (
++            cli_raw not in SUBSCRIPTION_TOKEN_ENV
++            or not isinstance(token_ref_raw, str)
++            or not token_ref_raw.strip().startswith(("env:", "keychain:"))
++        ):
++            raise OmnigentError(
++                f"provider {name!r}: 'token_ref' must be an 'env:<VAR>' or "
++                "'keychain:<name>' reference and is only supported for the "
++                f"{sorted(SUBSCRIPTION_TOKEN_ENV)} subscription CLIs.",
++                code=ErrorCode.INVALID_INPUT,
++            )
+         # claude/codex subscriptions are locked to their own CLIs and cannot
+         # drive pi. A pi subscription explicitly opts into Pi's own native auth
+         # and may default the pi surface (pi_capable=True, served={}).
+@@ -999,6 +1022,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
+                 name, default_raw, served, pi_capable=(cli_raw == "pi")
+             ),
+             config_dir=config_dir_raw.strip() if isinstance(config_dir_raw, str) else None,
++            token_ref=token_ref_raw.strip() if isinstance(token_ref_raw, str) else None,
+         )
+ 
+     if kind == CLI_CONFIG_KIND:
+@@ -1716,12 +1740,28 @@ def subscription_config_dir(entry: ProviderEntry) -> Path | None:
+     return Path(expanded).expanduser().absolute()
+ 
+ 
++def subscription_token(entry: ProviderEntry) -> str | None:
++    """Return the account token of a subscription *entry*, if it uses one.
++
++    :param entry: Any provider entry.
++    :returns: The resolved ``token_ref`` secret, or ``None`` when the entry
++        carries none.
++    :raises OmnigentError: If the referenced secret is not set.
++    """
++    if entry.kind != SUBSCRIPTION_KIND or entry.token_ref is None:
++        return None
++    return resolve_secret(entry.token_ref)
++
++
+ def subscription_source_descriptor(entry: ProviderEntry) -> str:
+-    """Describe where a subscription's login lives, for readouts and labels.
++    """Describe where a subscription's credential lives, for readouts.
+ 
+     :param entry: A ``subscription`` provider entry.
+-    :returns: e.g. ``"claude CLI login"`` or ``"claude CLI login (~/.claude-max2)"``.
++    :returns: e.g. ``"claude CLI login"``, ``"claude CLI login (~/.claude-max2)"``,
++        or ``"claude account token (keychain:claude-max2)"``.
+     """
++    if entry.token_ref:
++        return f"{entry.cli} account token ({entry.token_ref})"
+     if entry.config_dir:
+         return f"{entry.cli} CLI login ({entry.config_dir})"
+     return f"{entry.cli} CLI login"
+diff --git a/omnigent/onboarding/subscription_accounts.py b/omnigent/onboarding/subscription_accounts.py
+index 9c15f3ea556f6772cb8eda8f173e5eef1d288e43..d7c98c163e0b5421c54b631de0c85e0c715b76e8 100644
+--- a/omnigent/onboarding/subscription_accounts.py
++++ b/omnigent/onboarding/subscription_accounts.py
+@@ -27,6 +27,7 @@ from omnigent.onboarding.provider_config import (
+     SESSION_PROVIDER_ENV,
+     SUBSCRIPTION_CONFIG_DIR_ENV,
+     SUBSCRIPTION_KIND,
++    SUBSCRIPTION_TOKEN_ENV,
+     ProviderEntry,
+     default_provider_for_harness,
+     harness_family,
+@@ -35,7 +36,7 @@ from omnigent.onboarding.provider_config import (
+     provider_families,
+     session_provider,
+     subscription_config_dir,
+-    subscription_source_descriptor,
++    subscription_token,
+ )
+ 
+ _logger = logging.getLogger(__name__)
+@@ -59,6 +60,52 @@ def subscription_home_env(entry: ProviderEntry) -> dict[str, str]:
+     return {var: str(path)}
+ 
+ 
++def subscription_token_env(entry: ProviderEntry) -> dict[str, str]:
++    """Return the env var that hands *entry*'s account token to its CLI.
++
++    :param entry: Any provider entry.
++    :returns: e.g. ``{"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-..."}``; empty
++        when the entry is not a subscription with a ``token_ref``.
++    :raises OmnigentError: ``harness_not_configured`` when the token is not set.
++    """
++    var = SUBSCRIPTION_TOKEN_ENV.get(entry.cli or "")
++    if var is None:
++        return {}
++    try:
++        token = subscription_token(entry)
++    except OmnigentError as exc:
++        raise OmnigentError(
++            f"Subscription account {entry.name!r} has no token: {exc.message} "
++            f"Create one with `{entry.cli} setup-token`.",
++            code=ErrorCode.HARNESS_NOT_CONFIGURED,
++        ) from exc
++    return {var: token} if token else {}
++
++
++def claude_account_env(pinned: str | None = None) -> dict[str, str]:
++    """Return the token env for the Claude account this process runs on.
++
++    The account is the agent's pinned provider, else the session's choice or
++    the host default (see
++    :func:`~omnigent.onboarding.provider_config.get_default_provider`).
++
++    :param pinned: The provider an agent spec pins via ``executor.auth``, if any.
++    :returns: e.g. ``{"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-..."}``; empty
++        for an account that uses its stored login.
++    :raises OmnigentError: ``harness_not_configured`` when the account's token
++        is not set.
++    """
++    config = load_config()
++    entry = (
++        load_providers(config).get(pinned)
++        if pinned
++        else default_provider_for_harness(config, "claude-sdk")
++    )
++    if entry is None or entry.kind != SUBSCRIPTION_KIND or entry.cli != "claude":
++        return {}
++    return subscription_token_env(entry)
++
++
+ def _default_login_dir(cli: str, env: Mapping[str, str]) -> Path:
+     """Return where *cli* keeps its login when no ``config_dir`` is configured."""
+     configured = env.get(SUBSCRIPTION_CONFIG_DIR_ENV[cli])
+@@ -84,10 +131,14 @@ def subscription_login_command(entry: ProviderEntry) -> str:
+     """Return the shell command that signs *entry*'s account in.
+ 
+     :param entry: A ``claude`` / ``codex`` subscription entry.
+-    :returns: e.g. ``"CLAUDE_CONFIG_DIR=/home/u/.claude-max2 claude auth login --claudeai"``.
++    :returns: e.g. ``"CLAUDE_CONFIG_DIR=/home/u/.claude-max2 claude auth login --claudeai"``,
++        or ``"claude setup-token"`` for a token account.
+     """
+     from omnigent.onboarding.harness_install import harness_install_spec
+ 
++    if entry.token_ref is not None:
++        return shlex.join([str(entry.cli), "setup-token"])
++
+     spec = harness_install_spec(_CLI_FAMILY[str(entry.cli)])
+     argv = [str(entry.cli), *(spec.login_args or ())] if spec is not None else [str(entry.cli)]
+     prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in subscription_home_env(entry).items())
+@@ -106,6 +157,11 @@ def subscription_logged_in(entry: ProviderEntry) -> bool:
+     """
+     from omnigent.onboarding.ambient import claude_auth_has_credential, codex_auth_has_credential
+ 
++    if entry.token_ref is not None:
++        try:
++            return bool(subscription_token(entry))
++        except OmnigentError:
++            return False
+     try:
+         directory = subscription_login_dir(entry)
+     except OmnigentError:
+@@ -135,6 +191,13 @@ def require_subscription_login(entry: ProviderEntry) -> None:
+         return
+     if subscription_logged_in(entry):
+         return
++    if entry.token_ref is not None:
++        raise OmnigentError(
++            f"Subscription account {entry.name!r} has no token stored as "
++            f"{entry.token_ref!r}. Create one with `{subscription_login_command(entry)}` "
++            "and add it with `omnigent setup`.",
++            code=ErrorCode.INVALID_INPUT,
++        )
+     raise OmnigentError(
+         f"Subscription account {entry.name!r} is not logged in "
+         f"(login directory {subscription_login_dir(entry)}). "
+@@ -165,22 +228,35 @@ def require_subscription_dir_active(entry: ProviderEntry, active_dir: Path) -> N
+     )
+ 
+ 
+-def require_session_account_dir(cli: str, launch_dir: Path) -> None:
++def require_session_account_dir(
++    cli: str, launch_dir: Path, launch_env: Mapping[str, str] | None = None
++) -> None:
+     """Fail when the session's *cli* account is not the login its CLI starts with.
+ 
+     The host points the runner at the account the session chose, but an agent
+     spec's ``env`` or the host's harness startup command can still move the
+-    CLI to another login directory.
++    CLI to another login directory or replace the account's token.
+ 
+     :param cli: The subscription CLI, e.g. ``"claude"``.
+     :param launch_dir: The login directory the CLI process would use, e.g.
+         ``Path("/srv/claude")``.
++    :param launch_env: The environment the CLI process starts with, used to
++        check a token account's token. ``None`` skips that check.
+     :raises OmnigentError: ``harness_not_configured`` when the session chose a
+-        *cli* subscription account whose login directory differs.
++        *cli* subscription account whose login directory or token differs.
+     """
+     entry = session_provider(load_config())
+     if entry is None or entry.kind != SUBSCRIPTION_KIND or entry.cli != cli:
+         return
++    token_env = subscription_token_env(entry)
++    if launch_env is not None and any(launch_env.get(k) != v for k, v in token_env.items()):
++        var = SUBSCRIPTION_TOKEN_ENV[cli]
++        raise OmnigentError(
++            f"This session runs on account {entry.name!r}, but the agent's env or this "
++            f"host's {cli} startup command sets a different {var}. Remove that setting, "
++            "or start the session on the account that token belongs to.",
++            code=ErrorCode.HARNESS_NOT_CONFIGURED,
++        )
+     expected = subscription_login_dir(entry)
+     if os.path.realpath(expected) == os.path.realpath(launch_dir):
+         return
+@@ -255,13 +331,15 @@ def default_accounts_env(config: dict[str, object]) -> dict[str, str]:
+ 
+ 
+ def apply_default_account_env(harness: str, env: MutableMapping[str, str] | None = None) -> None:
+-    """Point this process at the default account's login directory for *harness*.
++    """Point this process at the default account's login for *harness*.
+ 
+     For single-session CLI entry points (``omnigent claude`` / ``omnigent
+     codex``), whose children inherit the process environment.
+ 
+     :param harness: ``"claude-native"`` or ``"codex-native"``.
+     :param env: The environment to update; defaults to ``os.environ``.
++    :raises OmnigentError: ``harness_not_configured`` when the default account
++        is a token account whose token is not set.
+     """
+     target = os.environ if env is None else env
+     try:
+@@ -270,12 +348,15 @@ def apply_default_account_env(harness: str, env: MutableMapping[str, str] | None
+         return
+     if entry is not None:
+         target.update(subscription_home_env(entry))
++        target.update(subscription_token_env(entry))
+ 
+ 
+ def _provider_label(entry: ProviderEntry, family: str) -> str:
+     """Describe *entry* for a picker without resolving or revealing credentials."""
+     if entry.kind == SUBSCRIPTION_KIND:
+-        return subscription_source_descriptor(entry)
++        if entry.token_ref is not None:
++            return f"{entry.cli} account token"
++        return f"{entry.cli} login (own directory)" if entry.config_dir else f"{entry.cli} login"
+     if entry.kind == DATABRICKS_KIND:
+         return f"Databricks profile {entry.profile}" if entry.profile else "Databricks"
+     if entry.kind == CLI_CONFIG_KIND:
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 6732a943553a95075d712ce475ea3732467f9e61..0a3ab6eb215889c3dbf94ea6c3216b6b9725e1da 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -7442,6 +7442,21 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None)
+     return model
+ 
+ 
++def _claude_native_pinned_provider(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
++    """
++    Return the provider an agent spec pins through ``executor.auth``, if any.
++
++    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
++        ``spec`` attribute. ``None`` means no spec was available.
++    :returns: The ``providers:`` entry name, e.g. ``"claude-max2"``, or ``None``.
++    """
++    from omnigent.spec.types import ProviderAuth
++
++    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
++    auth = spec.executor.auth if spec is not None else None
++    return auth.name if isinstance(auth, ProviderAuth) else None
++
++
+ def _native_startup_raw_instructions_from_spec(
+     agent_spec: AgentSpec | ResolvedSpec | None,
+ ) -> str | None:
+@@ -8694,7 +8709,10 @@ async def _auto_create_claude_terminal(
+     )
+     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
+     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+-    from omnigent.onboarding.subscription_accounts import require_session_account_dir
++    from omnigent.onboarding.subscription_accounts import (
++        claude_account_env,
++        require_session_account_dir,
++    )
+ 
+     workspace = str(
+         _claude_session_workspace(
+@@ -9418,9 +9436,17 @@ async def _auto_create_claude_terminal(
+     # Seed trust and onboarding in the config selected by the terminal's launch
+     # environment, once that environment is known to log in to the session's account.
+     try:
++        if claude_config is None:
++            # Claude's own login: a token account hands Claude its token.
++            account_env = await asyncio.to_thread(
++                claude_account_env, _claude_native_pinned_provider(agent_spec)
++            )
++            env_spec = dataclasses.replace(env_spec, env={**env_spec.env, **account_env})
+         launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+         launch_env = _claude_terminal_launch_env(env_spec)
+-        require_session_account_dir("claude", claude_launch_config_dir(launch_cwd, launch_env))
++        require_session_account_dir(
++            "claude", claude_launch_config_dir(launch_cwd, launch_env), launch_env
++        )
+         ensure_claude_workspace_trusted(launch_cwd, env=launch_env)
+     except BaseException as seed_error:
+         # No forwarder owns the routers yet, so release the ones this launch started.
+diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
+index 761e2f1eaa361d7e64412e1a0d927278f281e4cb..76f3c043a735cb50336337e3c3b14ba82edad6c5 100644
+--- a/omnigent/runtime/workflow.py
++++ b/omnigent/runtime/workflow.py
+@@ -692,9 +692,13 @@ def configure_agent_harness_with_provider(
+         # An account with its own login directory: the harness process (and
+         # the CLI it drives) reads CLAUDE_CONFIG_DIR / the source CODEX_HOME.
+         if (harness_type, entry.cli) in (("claude-sdk", "claude"), ("codex", "codex")):
+-            from omnigent.onboarding.subscription_accounts import subscription_home_env
++            from omnigent.onboarding.subscription_accounts import (
++                subscription_home_env,
++                subscription_token_env,
++            )
+ 
+             env.update(subscription_home_env(entry))
++            env.update(subscription_token_env(entry))
+         return
+ 
+     if entry.kind == CLI_CONFIG_KIND:
+diff --git a/tests/cli/test_configure_models.py b/tests/cli/test_configure_models.py
+index 5569dfdb6603ae971e5497c44a983354204d6f8b..3bd9c5636a7d4b112502f3eacded8ba8e1fa870c 100644
+--- a/tests/cli/test_configure_models.py
++++ b/tests/cli/test_configure_models.py
+@@ -879,6 +879,38 @@ def test_remove_subscription_signs_out_and_removes(isolated_config, monkeypatch)
+     assert "claude-subscription" not in cfg.get("providers", {})
+ 
+ 
++def test_remove_token_account_keeps_the_shared_login(isolated_config, monkeypatch) -> None:
++    """Removing a token account deletes its token but never runs the CLI logout.
++
++    Token accounts share the default login directory, so a logout there would
++    sign the user out of their other Claude account.
++    """
++    from omnigent.onboarding import secrets
++
++    secrets.store_secret("claude-max2", "sk-ant-oat01-max2")
++    _seed_config(
++        isolated_config,
++        {
++            "claude-max2": {
++                "kind": "subscription",
++                "cli": "claude",
++                "token_ref": "keychain:claude-max2",
++            }
++        },
++    )
++    monkeypatch.setattr(
++        "omnigent.onboarding.harness_install.harness_logout",
++        lambda family, **_: pytest.fail("a token account must not sign out the shared login"),
++    )
++    # L1 1=Claude → L2 1=select the account → L3 2=Remove → confirm 1=Yes → L2 q → L1 q.
++    stdin = "\n".join(["1", "1", "2", "1", "q", "q"]) + "\n"
++    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
++    assert result.exit_code == 0, result.output
++
++    assert secrets.load_secret("claude-max2") is None
++    assert "claude-max2" not in _config_yaml(isolated_config).get("providers", {})
++
++
+ def test_remove_subscription_declined_keeps_it_and_login(isolated_config, monkeypatch) -> None:
+     """Declining the remove-confirm leaves the entry AND never logs out.
+ 
+@@ -1170,9 +1202,9 @@ def test_add_another_subscription_account_logs_into_its_own_dir(
+         lambda family, env=None: logins.append(dict(env or {})) or True,
+     )
+     account_dir = tmp_path / "claude-max2"
+-    # L1 1=Claude → L2 2=+Add → 2=Claude subscription → 3=Add another account →
+-    # name (default) → login dir → L2 q → L1 q.
+-    stdin = "\n".join(["1", "2", "2", "3", "", str(account_dir), "q", "q"]) + "\n"
++    # L1 1=Claude → L2 2=+Add → 2=Claude subscription → 4=Add another account (own
++    # login directory) → name (default) → login dir → L2 q → L1 q.
++    stdin = "\n".join(["1", "2", "2", "4", "", str(account_dir), "q", "q"]) + "\n"
+     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+     assert result.exit_code == 0, result.output
+ 
+@@ -1189,6 +1221,35 @@ def test_add_another_subscription_account_logs_into_its_own_dir(
+     assert get_default_provider(_config_yaml(isolated_config), "anthropic").name == "claude"
+ 
+ 
++def test_add_another_subscription_account_stores_its_token(isolated_config, monkeypatch) -> None:
++    """A token account stores the pasted token and shares the default login."""
++    from omnigent.onboarding import secrets
++
++    _seed_config(
++        isolated_config,
++        {"claude": {"kind": "subscription", "default": True, "cli": "claude"}},
++    )
++    monkeypatch.setattr(
++        "omnigent.onboarding.harness_install.harness_login",
++        lambda family, env=None: pytest.fail("a token account has no login to drive"),
++    )
++    # L1 1=Claude → L2 2=+Add → 2=Claude subscription → 3=Add another account
++    # (token) → name (default) → token → L2 q → L1 q.
++    stdin = "\n".join(["1", "2", "2", "3", "", "sk-ant-oat01-max2", "q", "q"]) + "\n"
++    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
++    assert result.exit_code == 0, result.output
++
++    assert "sk-ant-oat01-max2" not in result.output
++    assert secrets.load_secret("claude-account-2") == "sk-ant-oat01-max2"
++    providers = _config_yaml(isolated_config)["providers"]
++    assert providers["claude-account-2"] == {
++        "kind": "subscription",
++        "cli": "claude",
++        "token_ref": "keychain:claude-account-2",
++    }
++    assert get_default_provider(_config_yaml(isolated_config), "anthropic").name == "claude"
++
++
+ def test_add_second_key_different_source_keeps_both(isolated_config) -> None:
+     """A second API key from a new source coexists with the first.
+ 
+diff --git a/tests/onboarding/test_subscription_accounts.py b/tests/onboarding/test_subscription_accounts.py
+index 06a2bdeff91060fc5f42ac07ab93e10b2f47a32e..b02658a8006cba624ee5d4dd4accb12b3dde3f83 100644
+--- a/tests/onboarding/test_subscription_accounts.py
++++ b/tests/onboarding/test_subscription_accounts.py
+@@ -21,6 +21,7 @@ from omnigent.onboarding.provider_config import (
+ )
+ from omnigent.onboarding.subscription_accounts import (
+     apply_default_account_env,
++    claude_account_env,
+     default_accounts_env,
+     provider_choices,
+     require_session_account_dir,
+@@ -30,6 +31,7 @@ from omnigent.onboarding.subscription_accounts import (
+     subscription_home_env,
+     subscription_logged_in,
+     subscription_login_command,
++    subscription_token_env,
+ )
+ 
+ 
+@@ -340,6 +342,81 @@ def test_session_account_must_be_the_login_the_cli_starts_with(
+     require_session_account_dir("claude", tmp_path / "elsewhere")
+ 
+ 
++def _token_config() -> dict[str, object]:
++    return _providers(
++        max1={"kind": "subscription", "cli": "claude", "default": True},
++        max2={"kind": "subscription", "cli": "claude", "token_ref": "env:MAX2_TOKEN"},
++    )
++
++
++@pytest.mark.parametrize(
++    "cli,token_ref",
++    [("codex", "env:CODEX_TOKEN"), ("claude", "sk-ant-oat01-literal"), ("claude", 3)],
++)
++def test_token_ref_rejected_when_unsupported_or_inline(cli: str, token_ref: object) -> None:
++    with pytest.raises(OmnigentError, match="'token_ref' must be"):
++        load_providers(_providers(a={"kind": "subscription", "cli": cli, "token_ref": token_ref}))
++
++
++def test_token_account_signs_in_with_its_token(monkeypatch: pytest.MonkeyPatch) -> None:
++    entry = load_providers(_token_config())["max2"]
++    monkeypatch.delenv("MAX2_TOKEN", raising=False)
++
++    assert not subscription_logged_in(entry)
++    assert subscription_login_command(entry) == "claude setup-token"
++    with pytest.raises(OmnigentError, match="no token stored as 'env:MAX2_TOKEN'"):
++        require_subscription_login(entry)
++
++    monkeypatch.setenv("MAX2_TOKEN", "sk-ant-oat01-max2")
++    assert subscription_logged_in(entry)
++    assert subscription_token_env(entry) == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-max2"}
++    # A token account shares the default login directory, so it sets none.
++    assert subscription_home_env(entry) == {}
++    row = next(
++        r for r in provider_choices(_token_config(), "claude-native") if r["name"] == "max2"
++    )
++    assert row["label"] == "claude account token"
++    assert row["ready"] is True
++    assert "sk-ant-oat01" not in json.dumps(row)
++
++
++def test_claude_account_env_follows_the_pin_then_the_session(
++    config_home: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write_config(config_home, _token_config())
++    monkeypatch.setenv("MAX2_TOKEN", "sk-ant-oat01-max2")
++    token_env = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-max2"}
++
++    # The default account uses its stored login.
++    assert claude_account_env() == {}
++    assert claude_account_env("max2") == token_env
++
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "max2")
++    assert claude_account_env() == token_env
++    # An agent pinning the stored-login account keeps it.
++    assert claude_account_env("max1") == {}
++
++    monkeypatch.delenv("MAX2_TOKEN")
++    with pytest.raises(OmnigentError, match="setup-token") as failure:
++        claude_account_env()
++    assert failure.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
++
++
++def test_session_token_account_must_reach_the_cli(
++    config_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    _write_config(config_home, _token_config())
++    monkeypatch.setenv("MAX2_TOKEN", "sk-ant-oat01-max2")
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "shared"))
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "max2")
++    shared = tmp_path / "shared"
++
++    require_session_account_dir("claude", shared, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-max2"})
++    for launch_env in ({}, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-other"}):
++        with pytest.raises(OmnigentError, match="sets a different CLAUDE_CODE_OAUTH_TOKEN"):
++            require_session_account_dir("claude", shared, launch_env)
++
++
+ def test_provider_choices_list_family_providers_without_secrets(tmp_path: Path) -> None:
+     _write_claude_login(tmp_path / "m1")
+ 
+@@ -349,14 +426,14 @@ def test_provider_choices_list_family_providers_without_secrets(tmp_path: Path)
+         {
+             "name": "max1",
+             "kind": "subscription",
+-            "label": f"claude CLI login ({tmp_path / 'm1'})",
++            "label": "claude login (own directory)",
+             "default": True,
+             "ready": True,
+         },
+         {
+             "name": "max2",
+             "kind": "subscription",
+-            "label": f"claude CLI login ({tmp_path / 'm2'})",
++            "label": "claude login (own directory)",
+             "default": False,
+             "ready": False,
+         },
+@@ -376,6 +453,8 @@ def test_provider_choices_list_family_providers_without_secrets(tmp_path: Path)
+         },
+     ]
+     assert "sk-literal" not in json.dumps(rows)
++    # Picker labels never name the host's login directories.
++    assert str(tmp_path) not in json.dumps(rows)
+     assert provider_choices(_session_config(tmp_path), "cursor") == []
+ 
+ 
+diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
+index b38c4c9771796663026e26a4a574c52f1867d654..e827844491d1307c317a062a50a91a2a604f9bde 100644
+--- a/tests/runner/test_app_claude_native_launch_args.py
++++ b/tests/runner/test_app_claude_native_launch_args.py
+@@ -1216,6 +1216,69 @@ async def test_auto_create_claude_terminal_keeps_the_session_account(
+         registry.launch_required_terminal.assert_not_called()
+ 
+ 
++@pytest.mark.parametrize("wrapper_token", [None, "sk-ant-oat01-other"])
++async def test_auto_create_claude_terminal_hands_claude_the_account_token(
++    bridge_dir: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    wrapper_token: str | None,
++) -> None:
++    """
++    A session on a token account starts Claude with that account's token.
++
++    Token accounts share one login directory, so the token is what selects the
++    account; a startup command that replaces it fails before seeding.
++
++    :param wrapper_token: Token an ``env`` startup wrapper sets, or ``None``.
++    """
++    from unittest.mock import Mock
++
++    from omnigent.errors import ErrorCode, OmnigentError
++    from omnigent.onboarding.provider_config import SESSION_PROVIDER_ENV
++    from omnigent.runner.resource_registry import SessionResourceRegistry
++
++    account = {"kind": "subscription", "cli": "claude", "token_ref": "env:MAX2_TOKEN"}
++    config = {"providers": {"max2": account}}
++    seeded: list[dict[str, str] | None] = []
++    registry = Mock(spec=SessionResourceRegistry)
++    registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "max2")
++    monkeypatch.setenv("MAX2_TOKEN", "sk-ant-oat01-max2")
++    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", lambda: config)
++    monkeypatch.setattr("omnigent.onboarding.subscription_accounts.load_config", lambda: config)
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
++        lambda workspace, env=None: seeded.append(env),
++    )
++    if wrapper_token is not None:
++        monkeypatch.setattr(
++            "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
++        )
++        monkeypatch.setattr(
++            "omnigent.harness_startup_config.resolve_harness_args",
++            lambda _harness, cli_args, cfg=None: [
++                f"CLAUDE_CODE_OAUTH_TOKEN={wrapper_token}",
++                "claude",
++                *cli_args,
++            ],
++        )
++
++    expected = RuntimeError if wrapper_token is None else OmnigentError
++    with pytest.raises(expected) as failure:
++        await _auto_create_claude_terminal_for_test(
++            monkeypatch, session_id="conv_token_account", workspace=bridge_dir, registry=registry
++        )
++
++    if wrapper_token is None:
++        assert len(seeded) == 1
++        assert seeded[0] is not None
++        assert seeded[0]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-max2"
++    else:
++        assert isinstance(failure.value, OmnigentError)
++        assert failure.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
++        assert "sk-ant-oat01" not in failure.value.message
++        assert seeded == []
++
++
+ @pytest.mark.parametrize(
+     "subagent_started,turn_started",
+     [(True, True), (True, False), (False, True), (False, False)],
+diff --git a/tests/runtime/test_provider_spawn_env.py b/tests/runtime/test_provider_spawn_env.py
+index 7cf3eb02dd9c6a9855fea79f5ea3bd6f1af0280e..ba2eab2d77733e42764f902d0309cccb9bbdddf1 100644
+--- a/tests/runtime/test_provider_spawn_env.py
++++ b/tests/runtime/test_provider_spawn_env.py
+@@ -1734,6 +1734,31 @@ def test_spec_pinned_codex_account_sets_source_codex_home(
+     assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "openai"
+ 
+ 
++def test_token_account_hands_claude_sdk_its_token(
++    config_home: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A Claude token account sets CLAUDE_CODE_OAUTH_TOKEN and keeps the login dir."""
++    monkeypatch.setenv("MAX2_TOKEN", "sk-ant-oat01-max2")
++    _write_config(
++        config_home,
++        {
++            "providers": {
++                "max2": {
++                    "kind": "subscription",
++                    "cli": "claude",
++                    "token_ref": "env:MAX2_TOKEN",
++                    "default": True,
++                }
++            }
++        },
++    )
++
++    env = _build_claude_sdk_spawn_env(_make_spec(harness="claude-sdk"), workdir=None)
++
++    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-max2"
++    assert "CLAUDE_CONFIG_DIR" not in env
++
++
+ def test_default_login_subscription_leaves_login_dir_env_unset(config_home: Path) -> None:
+     """A subscription without config_dir keeps the process's own login dir."""
+     _write_config(

@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 23 Oct 2026 14:29:36 +0000
+Subject: [PATCH] feat(web): emphasize the items the latest reply mentions
+
+With several labelled items open, the Open items panel gave no hint which
+ones the agent's newest reply was about, so the user had to read the whole
+reply to find out. The index now records each item's newest mention and the
+latest agent reply; the panel lists the items that reply mentions first,
+tinted like the other amber marks, and includes an item the reply just
+closed, struck through, so what was resolved is visible too. Expanded, they
+sit under an "In the latest reply" heading ahead of the other open items and
+the Closed fold, and the chips' accessible names say so.
+
+Part of the local chat-item-labels series (item label chips, the Open items
+panel and item comments), which is local-only.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-item-labels.md                      |  4 +
+ web/src/components/blocks/ChatMarkdown.tsx    | 17 +++-
+ .../components/chat/OpenItemsPanel.test.tsx   | 35 ++++++++
+ web/src/components/chat/OpenItemsPanel.tsx    | 88 +++++++++++++++----
+ web/src/lib/itemLabels.test.ts                | 37 ++++++++
+ web/src/lib/itemLabels.ts                     | 27 +++++-
+ 6 files changed, 185 insertions(+), 23 deletions(-)
+
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+index 84e3c6d8471e5f560062849ca909cd5ee06c5c07..067c26d7013a56f966656297329143c6ef5c6049 100644
+--- a/docs/chat-item-labels.md
++++ b/docs/chat-item-labels.md
+@@ -46,6 +46,10 @@ channel; labels still render when you or the agent write them.
+   it. The newest mention decides, so a later plain mention reopens it.
+ - **Open items:** a bar above the thread lists the open labels as chips.
+   Expand it for every item with its title, closed ones under **Closed (N)**.
++- **Latest reply:** the Open items bar puts the items the agent's newest reply
++  mentions first, tinted, and includes an item that reply just closed, struck
++  through. Expanded, they sit under **In the latest reply**, ahead of the other
++  open items.
+ 
+ ## Comment on items
+ 
+diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
+index e7c7ddf62606e29716eb66d2897cac71a1bf9f94..ef0bb2d49fa609ed0c3f5c5e4af1ea790608318a 100644
+--- a/web/src/components/blocks/ChatMarkdown.tsx
++++ b/web/src/components/blocks/ChatMarkdown.tsx
+@@ -535,24 +535,35 @@ function citesSamePlace(
+ const ITEM_LABEL_BADGE_CLASS =
+   "inline-flex items-baseline rounded border border-border bg-muted px-1 font-mono text-[0.85em] leading-snug";
+ const ITEM_LABEL_CLOSED_CLASS = "line-through opacity-60";
++// Same amber as the draft dot and message highlight, for items the latest reply mentions.
++const ITEM_LABEL_RECENT_CLASS = "border-warning/60 bg-warning/15";
+ 
+-/** Classes for an item label chip: a clickable badge, struck through once closed. */
+-export function itemLabelChipClass(closed: boolean): string {
++/**
++ * Classes for an item label chip: a clickable badge, struck through once
++ * closed, tinted when `recent` (the latest reply mentions it).
++ */
++export function itemLabelChipClass(closed: boolean, recent = false): string {
+   return cn(
+     ITEM_LABEL_BADGE_CLASS,
+     "cursor-pointer text-link transition-colors hover:bg-accent",
++    recent && ITEM_LABEL_RECENT_CLASS,
+     closed && ITEM_LABEL_CLOSED_CLASS,
+   );
+ }
+ 
+-/** A chip's accessible name, e.g. "Show item Q2 (closed), 2 comments, 1 draft". */
++/**
++ * A chip's accessible name, e.g. "Show item Q2 (closed), mentioned in the
++ * latest reply, 2 comments, 1 draft".
++ */
+ export function itemLabelChipName(
+   label: string,
+   closed: boolean,
+   commentCount: number,
+   draftCount: number,
++  recent = false,
+ ): string {
+   const parts = [`Show item ${label}${closed ? " (closed)" : ""}`];
++  if (recent) parts.push("mentioned in the latest reply");
+   if (commentCount > 0) parts.push(`${commentCount} comment${commentCount === 1 ? "" : "s"}`);
+   if (draftCount > 0) parts.push(`${draftCount} draft${draftCount === 1 ? "" : "s"}`);
+   return parts.join(", ");
+diff --git a/web/src/components/chat/OpenItemsPanel.test.tsx b/web/src/components/chat/OpenItemsPanel.test.tsx
+index f52066696ec0c58c25b383b5ac1c3f8c6df738b0..95e1457a2b1592979e8cf5b64ad80eacea842f6f 100644
+--- a/web/src/components/chat/OpenItemsPanel.test.tsx
++++ b/web/src/components/chat/OpenItemsPanel.test.tsx
+@@ -45,6 +45,7 @@ describe("OpenItemsPanel", () => {
+       indexOf(
+         "- **[Q1] Backfill window.** Batch it?\n- **[Q2] Soft-deleted rows.** Copy or drop?",
+         "~~[Q1]~~ batching it.",
++        "Tests pass.",
+       ),
+     );
+ 
+@@ -55,6 +56,40 @@ describe("OpenItemsPanel", () => {
+       "Backfill window.",
+     );
+     expect(panel.textContent).toContain("Closed (1)");
++    expect(panel.textContent).not.toContain("In the latest reply");
++  });
++
++  it("puts the items the latest reply mentions first, tinted, including one it just closed", () => {
++    renderPanel(
++      indexOf(
++        ["Q1", "Q2", "Q3", "Q4"].map((label) => `- **[${label}] Item ${label}.**`).join("\n"),
++        "~~[Q1]~~ batched.",
++        "~~[Q2]~~ dropped. [Q3] is next.",
++      ),
++    );
++
++    const panel = screen.getByTestId("open-items");
++    expect(panel.textContent).toContain("Open items(2)");
++    const names = screen
++      .getAllByRole("button", { name: /^Show item/ })
++      .map((button) => button.getAttribute("aria-label"));
++    // Header chips, then the expanded rows: recent, other open, closed.
++    expect(names).toEqual([
++      "Show item Q2 (closed), mentioned in the latest reply",
++      "Show item Q3, mentioned in the latest reply",
++      "Show item Q4",
++      "Show item Q2 (closed), mentioned in the latest reply",
++      "Show item Q3, mentioned in the latest reply",
++      "Show item Q4",
++      "Show item Q1 (closed)",
++    ]);
++    const chipClass = (name: string) => screen.getAllByRole("button", { name })[0].className;
++    expect(chipClass("Show item Q3, mentioned in the latest reply")).toContain("bg-warning/15");
++    expect(chipClass("Show item Q2 (closed), mentioned in the latest reply")).toContain(
++      "line-through",
++    );
++    expect(chipClass("Show item Q4")).not.toContain("bg-warning/15");
++    expect(panel.textContent).toMatch(/In the latest reply.*Other open \(1\).*Closed \(1\)/);
+   });
+ 
+   it("collapses on a press outside it, but not inside it or a popover", () => {
+diff --git a/web/src/components/chat/OpenItemsPanel.tsx b/web/src/components/chat/OpenItemsPanel.tsx
+index bf6a1af9643dd83f424c22f02412a4da09a61f9f..a6ed9bc8820b6c095cdf853a6115af126c6c6b3e 100644
+--- a/web/src/components/chat/OpenItemsPanel.tsx
++++ b/web/src/components/chat/OpenItemsPanel.tsx
+@@ -10,6 +10,7 @@ import {
+   ItemLabelIndexContext,
+   ItemLabelSessionContext,
+   itemLabelTitle,
++  mentionedInLatestReply,
+   type ItemLabelEntry,
+ } from "@/lib/itemLabels";
+ import { revealItemCommentTray, useItemCommentDraftCounts } from "@/lib/itemCommentDrafts";
+@@ -87,17 +88,25 @@ export function useCollapseOnOutsidePress() {
+   return detailsRef;
+ }
+ 
+-function ItemRow({ item, draftCount }: { item: ItemLabelEntry; draftCount: number }) {
++function ItemRow({
++  item,
++  draftCount,
++  recent,
++}: {
++  item: ItemLabelEntry;
++  draftCount: number;
++  recent: boolean;
++}) {
+   const closed = item.closedBy !== null;
+   const title = useMemo(() => itemLabelTitle(item.source.text, item.label), [item]);
+   return (
+     <ItemLabelPopover item={item}>
+       <button
+         type="button"
+-        aria-label={itemLabelChipName(item.label, closed, item.comments.length, draftCount)}
++        aria-label={itemLabelChipName(item.label, closed, item.comments.length, draftCount, recent)}
+         className="flex w-full min-w-0 items-baseline gap-2 px-3 py-1.5 text-left text-ui hover:bg-muted"
+       >
+-        <span className={cn(itemLabelChipClass(closed), "shrink-0")}>
++        <span className={cn(itemLabelChipClass(closed, recent), "shrink-0")}>
+           {item.label}
+           <ItemLabelChipMarks commentCount={item.comments.length} draftCount={draftCount} />
+         </span>
+@@ -113,22 +122,31 @@ function ItemRow({ item, draftCount }: { item: ItemLabelEntry; draftCount: numbe
+  * Collapsible "Open items" tracker pinned above the chat thread, beside the
+  * Plan tracker. The header lists open item labels as chips, plus a jump to the
+  * comment drafts when there are any; expanding lists every item with its
+- * title, closed ones last. Self-hides until the transcript uses item labels.
++ * title, closed ones last. Items the latest reply mentions come first, tinted,
++ * one it just closed among them struck through. Self-hides until the
++ * transcript uses item labels.
+  */
+ export function OpenItemsPanel({ className }: { className?: string }) {
+   const index = useContext(ItemLabelIndexContext);
+   const sessionId = useContext(ItemLabelSessionContext);
+   const draftCounts = useItemCommentDraftCounts(sessionId);
+   const items = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
++  const isRecent = (item: ItemLabelEntry) => index !== null && mentionedInLatestReply(index, item);
++  const recent = items.filter(isRecent);
+   const open = items.filter((item) => item.closedBy === null);
+-  const closed = items.filter((item) => item.closedBy !== null);
+-  const chipKey = open
+-    .map((item) => `${item.label}:${item.comments.length}:${draftCounts.get(item.label) ?? 0}`)
++  const otherOpen = open.filter((item) => !isRecent(item));
++  const closed = items.filter((item) => item.closedBy !== null && !isRecent(item));
++  const chips = [...recent, ...otherOpen];
++  const chipKey = chips
++    .map(
++      (item) =>
++        `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}:${item.comments.length}:${draftCounts.get(item.label) ?? 0}`,
++    )
+     .join(" ");
+   const fit = useFittedChipCount(chipKey);
+   const detailsRef = useCollapseOnOutsidePress();
+   if (items.length === 0) return null;
+-  const headerChips = open.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
++  const headerChips = chips.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
+   const draftTotal = [...draftCounts.values()].reduce((total, count) => total + count, 0);
+ 
+   return (
+@@ -152,17 +170,22 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+           >
+             {headerChips.map((item) => {
+               const draftCount = draftCounts.get(item.label) ?? 0;
++              const recentChip = isRecent(item);
+               return (
+                 <ItemLabelPopover key={item.label} item={item} openOnHover>
+                   <button
+                     type="button"
+                     aria-label={itemLabelChipName(
+                       item.label,
+-                      false,
++                      item.closedBy !== null,
+                       item.comments.length,
+                       draftCount,
++                      recentChip,
++                    )}
++                    className={cn(
++                      itemLabelChipClass(item.closedBy !== null, recentChip),
++                      "shrink-0",
+                     )}
+-                    className={cn(itemLabelChipClass(false), "shrink-0")}
+                   >
+                     {item.label}
+                     <ItemLabelChipMarks
+@@ -173,9 +196,9 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+                 </ItemLabelPopover>
+               );
+             })}
+-            {open.length > headerChips.length && (
++            {chips.length > headerChips.length && (
+               <span className="shrink-0 text-xs text-muted-foreground">
+-                +{open.length - headerChips.length}
++                +{chips.length - headerChips.length}
+               </span>
+             )}
+           </span>
+@@ -184,8 +207,11 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+             aria-hidden="true"
+             className="pointer-events-none invisible absolute top-0 left-0 flex gap-1 font-normal whitespace-nowrap"
+           >
+-            {open.map((item) => (
+-              <span key={item.label} className={itemLabelChipClass(false)}>
++            {chips.map((item) => (
++              <span
++                key={item.label}
++                className={itemLabelChipClass(item.closedBy !== null, isRecent(item))}
++              >
+                 {item.label}
+                 <ItemLabelChipMarks
+                   commentCount={item.comments.length}
+@@ -193,7 +219,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+                 />
+               </span>
+             ))}
+-            <span className="text-xs">+{open.length}</span>
++            <span className="text-xs">+{chips.length}</span>
+           </span>
+           {draftTotal > 0 && (
+             <button
+@@ -212,8 +238,29 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+         </summary>
+         {/* Capped like the Plan tracker so a long list can't swallow the chat. */}
+         <div className="max-h-[180px] overflow-y-auto border-t border-border py-1">
+-          {open.map((item) => (
+-            <ItemRow key={item.label} item={item} draftCount={draftCounts.get(item.label) ?? 0} />
++          {recent.length > 0 && (
++            <div className="px-3 pt-1 pb-1 text-xs text-muted-foreground">In the latest reply</div>
++          )}
++          {recent.map((item) => (
++            <ItemRow
++              key={item.label}
++              item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
++              recent
++            />
++          ))}
++          {recent.length > 0 && otherOpen.length > 0 && (
++            <div className="px-3 pt-2 pb-1 text-xs text-muted-foreground">
++              Other open ({otherOpen.length})
++            </div>
++          )}
++          {otherOpen.map((item) => (
++            <ItemRow
++              key={item.label}
++              item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
++              recent={false}
++            />
+           ))}
+           {closed.length > 0 && (
+             <div className="px-3 pt-2 pb-1 text-xs text-muted-foreground">
+@@ -221,7 +268,12 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+             </div>
+           )}
+           {closed.map((item) => (
+-            <ItemRow key={item.label} item={item} draftCount={draftCounts.get(item.label) ?? 0} />
++            <ItemRow
++              key={item.label}
++              item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
++              recent={false}
++            />
+           ))}
+         </div>
+       </details>
+diff --git a/web/src/lib/itemLabels.test.ts b/web/src/lib/itemLabels.test.ts
+index 2bea08dd0329a8f62cc94bcf5a45541afa0fe3ba..12afe871a4463447991584ccd7728a5561f36839 100644
+--- a/web/src/lib/itemLabels.test.ts
++++ b/web/src/lib/itemLabels.test.ts
+@@ -7,8 +7,10 @@ import {
+   itemLabelTitle,
+   itemLabelTitleParts,
+   itemLabelsIn,
++  mentionedInLatestReply,
+   remarkItemLabels,
+   struckItemLabelsIn,
++  type ItemLabelIndex,
+   type ItemLabelSource,
+ } from "./itemLabels";
+ import { buildItemCommentMessage, scanItemLabelSource } from "./itemComments";
+@@ -160,6 +162,41 @@ describe("buildItemLabelIndex", () => {
+     expect(reopened.items.get("Q1")?.closedBy).toBeNull();
+   });
+ 
++  const recentLabels = (index: ItemLabelIndex) =>
++    [...index.items.values()]
++      .filter((item) => mentionedInLatestReply(index, item))
++      .map((item) => item.label);
++
++  it("tracks each item's newest mention and which items the latest reply is about", () => {
++    const defining = message("m1", "[Q1] Pick a cache. [Q2] Pick a queue. [Q3] Pick a region.");
++    const reply = message("m2", "~~[Q1]~~ per-user cache. [Q2] still deciding.");
++    // A tool-only turn has no text, so it doesn't replace the reply.
++    const index = buildItemLabelIndex([scan(defining), scan(reply), scan(message("m3", " "))]);
++    expect(index.latestReply).toBe(reply);
++    expect(index.items.get("Q1")?.lastMention).toBe(reply);
++    expect(index.items.get("Q3")?.lastMention).toBe(defining);
++    // The item the reply just closed counts, so the user sees what was resolved.
++    expect(recentLabels(index)).toEqual(["Q1", "Q2"]);
++  });
++
++  it("keeps the latest agent reply as the reference when the newest message is the user's", () => {
++    const defining = message("m1", "[Q1] Pick a cache. [Q2] Pick a queue.");
++    const reply = message("m2", "[Q1] Leaning per-user. [Q2] waits on it.");
++    const user: ItemLabelSource = {
++      messageId: "u1",
++      role: "user",
++      text: "Go with per-user for [Q1].",
++    };
++    const index = buildItemLabelIndex([scan(defining), scan(reply), scan(user)]);
++    expect(index.latestReply).toBe(reply);
++    expect(index.items.get("Q1")?.lastMention).toBe(user);
++    expect(recentLabels(index)).toEqual(["Q2"]);
++
++    const unanswered = buildItemLabelIndex([scan(user)]);
++    expect(unanswered.latestReply).toBeNull();
++    expect(recentLabels(unanswered)).toEqual([]);
++  });
++
+   it("stays disabled until labels recur or one message tags several items", () => {
+     const lone = buildItemLabelIndex([scan(message("m1", "Paper size [A4] only."))]);
+     expect(lone.enabled).toBe(false);
+diff --git a/web/src/lib/itemLabels.ts b/web/src/lib/itemLabels.ts
+index 5e19df7b3982f45192bb7fbc7095e5eb6848b92e..cb51604bf83670369533617da588d2cabd681a55 100644
+--- a/web/src/lib/itemLabels.ts
++++ b/web/src/lib/itemLabels.ts
+@@ -85,6 +85,8 @@ export interface ItemLabelEntry {
+   source: ItemLabelSource;
+   /** The message whose struck mention closed the item; null while open. */
+   closedBy: ItemLabelSource | null;
++  /** The newest message that mentions the label. */
++  lastMention: ItemLabelSource;
+   /** How many messages mention the label. */
+   messageCount: number;
+   /** Comments sent on the item, oldest first. */
+@@ -99,6 +101,8 @@ export interface ItemLabelIndex {
+   enabled: boolean;
+   /** Items in order of definition. */
+   items: ReadonlyMap<string, ItemLabelEntry>;
++  /** The newest agent message with any text; null before the agent has replied. */
++  latestReply: ItemLabelSource | null;
+ }
+ 
+ /** The transcript's label index; null on surfaces without a transcript. */
+@@ -138,6 +142,7 @@ function matchAttachment(name: string, files: readonly ItemLabelFile[]): ItemLab
+ export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIndex {
+   const items = new Map<string, ItemLabelEntry>();
+   let enabled = false;
++  let latestReply: ItemLabelSource | null = null;
+   let awaitingReply: { label: string; comment: ItemLabelComment }[] = [];
+   for (const { source, labels, struck, comments, commentHeadingOnly } of scans) {
+     if (labels.length > 1) enabled = true;
+@@ -145,14 +150,24 @@ export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIn
+       const closedBy = struck.includes(label) ? source : null;
+       const entry = items.get(label);
+       if (!entry) {
+-        items.set(label, { label, source, closedBy, messageCount: 1, comments: [] });
++        items.set(label, {
++          label,
++          source,
++          closedBy,
++          lastMention: source,
++          messageCount: 1,
++          comments: [],
++        });
+         continue;
+       }
+       if (!commentHeadingOnly?.includes(label)) entry.closedBy = closedBy;
++      entry.lastMention = source;
+       entry.messageCount += 1;
+       enabled = true;
+     }
+     if (source.role === "assistant") {
++      // A tool-only turn has no text and isn't the reply the user is reading.
++      if (source.text.trim() !== "") latestReply = source;
+       for (const { label, comment } of awaitingReply) {
+         const sentence = labels.includes(label) ? extractLabelSentence(source.text, label) : null;
+         if (sentence) comment.reply = { source, sentence };
+@@ -174,7 +189,15 @@ export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIn
+       }
+     }
+   }
+-  return { enabled, items };
++  return { enabled, items, latestReply };
++}
++
++/**
++ * Whether the latest agent reply mentions `item`, including by closing it, so
++ * the user sees at a glance which items the reply is about.
++ */
++export function mentionedInLatestReply(index: ItemLabelIndex, item: ItemLabelEntry): boolean {
++  return index.latestReply !== null && item.lastMention === index.latestReply;
+ }
+ 
+ export interface ScannedLine {

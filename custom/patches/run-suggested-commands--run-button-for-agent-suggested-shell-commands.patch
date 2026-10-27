@@ -1,0 +1,1563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Mon, 19 Oct 2026 19:47:20 +0000
+Subject: [PATCH] feat: Run button for agent-suggested shell commands
+
+When an agent asks the user to run something, the chat now offers Run on
+`!command` code blocks, shell-language blocks and inline `! cmd` spans.
+Run confirms the exact list, then queues each command as its own `!command`
+shell input. Claude-native already treats those as shell mode; codex-native
+now routes them to the app-server `thread/shellCommand` RPC and mirrors the
+run as terminal_command items.
+
+Carried on custom until the upstream PR (branch feat/run-suggested-commands)
+lands; drop this patch on rebase once it does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/run-suggested-commands.md                |  35 +++++
+ feature-map/native-harnesses.md               |  14 ++
+ omnigent/harnesses/codex_native/forwarder.py  | 132 +++++++++++++++++-
+ omnigent/inner/codex_native_executor.py       |  91 ++++++++++--
+ .../test_native_claude_shell_input.py         |  52 +++++++
+ .../messages/test_native_codex_shell_input.py |  76 ++++++++++
+ .../codex_native/test_codex_native.py         | 112 +++++++++++++++
+ tests/inner/test_codex_native_executor.py     |  57 ++++++++
+ web/src/components/ai-elements/message.tsx    | 120 ++++++++++++----
+ web/src/components/blocks/BlockRenderer.tsx   |   1 +
+ web/src/components/blocks/ChatMarkdown.tsx    |  26 +++-
+ .../chat/RunCommandsProvider.test.tsx         |  89 ++++++++++++
+ .../components/chat/RunCommandsProvider.tsx   |  85 +++++++++++
+ web/src/lib/runnableCommands.test.ts          |  79 +++++++++++
+ web/src/lib/runnableCommands.ts               |  90 ++++++++++++
+ web/src/pages/ChatPage.tsx                    |  56 ++++++--
+ 16 files changed, 1056 insertions(+), 59 deletions(-)
+ create mode 100644 docs/run-suggested-commands.md
+ create mode 100644 tests/e2e_ui/messages/test_native_codex_shell_input.py
+ create mode 100644 web/src/components/chat/RunCommandsProvider.test.tsx
+ create mode 100644 web/src/components/chat/RunCommandsProvider.tsx
+ create mode 100644 web/src/lib/runnableCommands.test.ts
+ create mode 100644 web/src/lib/runnableCommands.ts
+
+diff --git a/docs/run-suggested-commands.md b/docs/run-suggested-commands.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..70f7f781bbcea8b147d216718fb75c695e6dd9f7
+--- /dev/null
++++ b/docs/run-suggested-commands.md
+@@ -0,0 +1,35 @@
++# Run suggested commands
++
++When an agent asks you to run a shell command, the chat shows a Run button on
++it (beside Copy on a code block, titled **Run command** or **Run N commands**),
++so you don't have to retype it in the composer as a `!command`.
++
++## Where Run appears
++
++Run is offered in claude-native and codex-native sessions, whose web composer
++runs a `!command` message as a shell command on the session's host. Other
++harnesses show code blocks as before. It appears on the agent's finished
++messages, not on your own messages or on a reply that is still streaming:
++
++- A fenced code block whose lines start with `!`: each such line is one
++  command and the other lines are treated as commentary.
++- A code block tagged `bash`, `sh`, `shell`, `zsh`, `console` or
++  `shell-session`: one command per line, joining lines that end in `\`.
++  Lines starting with `#` are skipped, and when some lines start with a `$ `
++  prompt, only those lines count.
++- Inline code written as `` `! cmd` ``.
++
++Blocks with a heredoc (`<<`) or more than 10 commands read as scripts to study
++and get no Run.
++
++## What Run does
++
++Run opens a confirmation that lists the exact commands, in order. Confirm, and
++each one is queued as its own `!command` shell input, exactly as if you had
++typed it: the first goes as soon as the agent is idle and each later one after
++the previous finishes, so they never merge into one turn. Claude Code runs
++them in its shell mode; Codex runs them as shell commands in the session's
++thread and the chat shows each one as a terminal command.
++
++A `!command` you type yourself in a codex-native session's web composer now
++runs the same way, as a shell command rather than a prompt.
+diff --git a/feature-map/native-harnesses.md b/feature-map/native-harnesses.md
+index c93eeda2d4cc440f5e03e11a856c4cf87296c855..2107d28aebb8a4b3508ea3f6f136215702bc2aa4 100644
+--- a/feature-map/native-harnesses.md
++++ b/feature-map/native-harnesses.md
+@@ -38,6 +38,10 @@ implements them separately, so a fix for one harness does not reach the others.
+   Shell commands and multi-file patches have no file link. A shell row reads
+   `$ command` and expands to a terminal panel with the command, its output
+   and exit status.
++- `run-suggested-commands`: in claude-native and codex-native chats, **Run**
++  on a shell command an agent suggests queues it as a `!command` shell input
++  after a confirmation; see [Run suggested commands](../docs/run-suggested-commands.md).
++  A `!command` typed in a codex-native web composer runs in Codex's shell too.
+ - `working-status`: quiet work stays working; waiting for input is explained;
+   completion, interruption and process exit settle the indicator. A following
+   turn and reconnect must not leave a stale idle or working state.
+@@ -166,6 +170,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
+ follow-up in the side pane, then close its tab. The parent conversation stays
+ separate. See [sessions](./sessions.md) for all side-chat entry points.
+ 
++**Run suggested commands:** in a claude-native or codex-native session, ask
++the agent for a shell command in a `bash` block, click the block's Run button
++(titled **Run command**, beside Copy), check the list in the confirmation and
++choose **Run**.
++
+ **Matrix.** "Mock" means the verification instance can drive the harness with
+ the mock model; the others need their real CLI and vendor credentials. Test
+ columns name one journey test per harness; "—" means none exists yet.
+@@ -628,6 +637,11 @@ Cross-harness journeys:
+   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
+   prompt must remain a separate user turn outside the assistant's folded work,
+   including after reload. This browser contract does not launch the Claude CLI.
++- **`run-suggested-commands`:**
++  `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_run_button_queues_each_suggested_command`,
++  `tests/e2e_ui/messages/test_native_codex_shell_input.py::test_run_button_runs_each_suggested_command_in_codex_shell`
++  (real Claude Code or Codex and tmux, like the shell-command journeys above).
++  `web/src/lib/runnableCommands.test.ts` covers which blocks get Run.
+ - **`codex-plugin-skills`:** use the
+   [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
+   real CLI catalog regression and recorded browser journey across both
+diff --git a/omnigent/harnesses/codex_native/forwarder.py b/omnigent/harnesses/codex_native/forwarder.py
+index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c92bb151b 100644
+--- a/omnigent/harnesses/codex_native/forwarder.py
++++ b/omnigent/harnesses/codex_native/forwarder.py
+@@ -8,6 +8,7 @@ import hashlib
+ import json
+ import logging
+ import re
++import shlex
+ import urllib.error
+ import urllib.request
+ from collections.abc import AsyncIterator, Callable
+@@ -530,6 +531,8 @@ class _CodexForwarderState:
+     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
+     posted_user_turns: set[str] = field(default_factory=set)
+     posted_tool_calls: set[str] = field(default_factory=set)
++    # User shell commands whose input was mirrored at item start.
++    started_user_shell_items: set[str] = field(default_factory=set)
+     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
+     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
+     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
+@@ -3174,6 +3177,10 @@ async def _handle_event(
+             # ``item/completed`` guard below remains the backstop for the
+             # resume-backfill path, which replays only ``item/completed``.
+             await _ensure_user_message_posted(client, route_session_id, params, event_state)
++        elif isinstance(item, dict) and _user_shell_command(item) is not None:
++            if await _post_user_shell_input(client, route_session_id, params, item):
++                if event_state is not None and isinstance(item_id := item.get("id"), str):
++                    event_state.started_user_shell_items.add(item_id)
+         elif isinstance(item, dict) and item.get("type") == "commandExecution":
+             call_id = await _post_tool_call_item(client, route_session_id, params, item)
+             if call_id is not None and event_state is not None:
+@@ -4018,6 +4025,10 @@ async def _maybe_handle_delta_event(
+         if not isinstance(delta, str):
+             _logger.warning("Codex command output delta missing string delta: call_id=%s", call_id)
+             return True
++        if forwarder_state is not None and call_id in forwarder_state.started_user_shell_items:
++            # A user shell command has no tool call to stream into; its output
++            # is mirrored whole when the item completes.
++            return True
+         turn_id = _turn_id_from_payload(params)
+         if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
+             _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
+@@ -4512,7 +4523,11 @@ def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
+     if not isinstance(item, dict):
+         return False
+     item_type = item.get("type")
+-    return isinstance(item_type, str) and item_type != "userMessage"
++    return (
++        isinstance(item_type, str)
++        and item_type != "userMessage"
++        and _user_shell_command(item) is None
++    )
+ 
+ 
+ async def _post_mcp_startup(
+@@ -5411,6 +5426,16 @@ async def _handle_completed_item_inner(
+     if item_type == "plan":
+         await _post_plan_item(client, session_id, params, item, source_id=source_id)
+         return
++    if _user_shell_command(item) is not None:
++        await _post_user_shell_item(
++            client,
++            session_id,
++            params,
++            item,
++            forwarder_state=forwarder_state,
++            source_id=source_id,
++        )
++        return
+     if item_type in _REVIEW_MODE_ITEM_TYPES:
+         await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
+         return
+@@ -6483,6 +6508,111 @@ async def _post_tool_call_item(
+     return tool_call.call_id if posted else None
+ 
+ 
++def _user_shell_command(item: _JsonObject) -> str | None:
++    """
++    Return the command a person ran through Codex shell mode.
++
++    Codex reports the typed text wrapped as ``<shell> -lc '<command>'``; unwrap
++    it so the mirror matches the web ``!command`` that requested it.
++
++    :param item: Codex thread item, e.g. ``{"type": "commandExecution",
++        "source": "userShell", "command": "/bin/bash -lc 'ls -la'"}``.
++    :returns: The typed command, e.g. ``"ls -la"``, or ``None`` for any item
++        that is not a user shell command.
++    """
++    if item.get("type") != "commandExecution" or item.get("source") != "userShell":
++        return None
++    command = item.get("command")
++    if not isinstance(command, str) or not command:
++        return None
++    try:
++        argv = shlex.split(command)
++    except ValueError:
++        return command
++    if len(argv) == 3 and argv[1] in {"-c", "-lc"}:
++        return argv[2]
++    return command
++
++
++async def _post_user_shell_input(
++    client: httpx.AsyncClient,
++    session_id: str,
++    params: _JsonObject,
++    item: _JsonObject,
++    *,
++    source_id: str | None = None,
++) -> bool:
++    """
++    Mirror a user shell command's input as a ``terminal_command`` item.
++
++    Persisting it settles the matching web ``!command`` pending input.
++
++    :param client: HTTP client for Omnigent event posts.
++    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
++    :param params: Codex ``item/started`` or ``item/completed`` params.
++    :param item: Codex user-shell ``commandExecution`` item.
++    :param source_id: Stable native item id; derived from ``params`` when omitted.
++    :returns: Whether the item was accepted by the server.
++    """
++    command = _user_shell_command(item)
++    if command is None:
++        return False
++    return await _post_external_item(
++        client,
++        session_id,
++        item_type="terminal_command",
++        item_data={"kind": "input", "input": command},
++        response_id=_response_id(params),
++        source_id=f"{source_id or _source_id(params, item)}:input",
++    )
++
++
++async def _post_user_shell_item(
++    client: httpx.AsyncClient,
++    session_id: str,
++    params: _JsonObject,
++    item: _JsonObject,
++    *,
++    forwarder_state: _CodexForwarderState | None,
++    source_id: str,
++) -> None:
++    """
++    Mirror one completed user shell command as ``terminal_command`` items.
++
++    The input half is posted here only when ``item/started`` did not already
++    post it (e.g. resume backfill); the output half carries the aggregated
++    output and any non-zero exit code.
++
++    :param client: HTTP client for Omnigent event posts.
++    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
++    :param params: Codex ``item/completed`` params.
++    :param item: Codex user-shell ``commandExecution`` item.
++    :param forwarder_state: Optional state tracking inputs posted at item start.
++    :param source_id: Stable native item id used for server-side deduplication.
++    :returns: None.
++    """
++    item_id = item.get("id")
++    started = forwarder_state is not None and item_id in forwarder_state.started_user_shell_items
++    if started:
++        assert forwarder_state is not None
++        forwarder_state.started_user_shell_items.discard(item_id)
++    elif not await _post_user_shell_input(client, session_id, params, item, source_id=source_id):
++        return
++    tool_call = _codex_tool_call_from_item(item)
++    await _post_external_item(
++        client,
++        session_id,
++        item_type="terminal_command",
++        item_data={
++            "kind": "output",
++            "stdout": tool_call.output if tool_call is not None else "",
++            "stderr": None,
++        },
++        response_id=_response_id(params),
++        source_id=f"{source_id}:output",
++    )
++
++
+ async def _post_tool_item(
+     client: httpx.AsyncClient,
+     session_id: str,
+diff --git a/omnigent/inner/codex_native_executor.py b/omnigent/inner/codex_native_executor.py
+index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41463fb057 100644
+--- a/omnigent/inner/codex_native_executor.py
++++ b/omnigent/inner/codex_native_executor.py
+@@ -215,9 +215,17 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
+                 await client.close()
+ 
+ 
++_NativeDeliveryMethod = Literal["turn/start", "turn/steer", "thread/shellCommand"]
++_DELIVERY_STAGES: dict[str, str] = {
++    "turn/start": "turn_start",
++    "turn/steer": "turn_steer",
++    "thread/shellCommand": "shell_command",
++}
++
++
+ async def _native_delivery_request(
+     client: CodexAppServerClient,
+-    method: Literal["turn/start", "turn/steer"],
++    method: _NativeDeliveryMethod,
+     params: CodexParams,
+     state: CodexNativeBridgeState,
+     *,
+@@ -235,7 +243,7 @@ async def _native_delivery_request(
+             session_id=state.session_id,
+             thread_id=state.thread_id,
+             requested_native_turn_id=state.active_turn_id,
+-            stage="turn_start" if method == "turn/start" else "turn_steer",
++            stage=_DELIVERY_STAGES[method],
+             outcome="server_draining",
+             rpc_error_code=error.code,
+         )
+@@ -266,13 +274,13 @@ async def _native_delivery_request(
+ 
+ async def _native_delivery_request_once(
+     client: CodexAppServerClient,
+-    method: Literal["turn/start", "turn/steer"],
++    method: _NativeDeliveryMethod,
+     params: CodexParams,
+     state: CodexNativeBridgeState,
+ ) -> CodexMessage:
+     """Pair each RPC attempt with its result, including a rejected stale steer."""
+     attempt_id = uuid.uuid4().hex
+-    stage = "turn_start" if method == "turn/start" else "turn_steer"
++    stage = _DELIVERY_STAGES[method]
+     expected = params.get("expectedTurnId") if method == "turn/steer" else None
+     requested_turn_id = expected if isinstance(expected, str) else None
+     requested_thread = params.get("threadId")
+@@ -318,6 +326,8 @@ async def _native_delivery_request_once(
+     else:
+         turn_id = result.get("turnId") if result is not None else None
+     native_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
++    # A shell command's ack is empty; its turn arrives later via turn/started.
++    accepted = native_turn_id is not None or method == "thread/shellCommand"
+     log_input_event(
+         _logger,
+         "codex_native_delivery_finished",
+@@ -327,7 +337,7 @@ async def _native_delivery_request_once(
+         thread_id=thread_id,
+         requested_native_turn_id=requested_turn_id,
+         native_turn_id=native_turn_id,
+-        outcome="rpc_accepted" if native_turn_id else "rpc_accepted_missing_turn_id",
++        outcome="rpc_accepted" if accepted else "rpc_accepted_missing_turn_id",
+     )
+     return response
+ 
+@@ -437,6 +447,24 @@ async def _steer_codex_turn(
+         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+ 
+ 
++async def _run_codex_shell_command(
++    client: CodexAppServerClient,
++    *,
++    bridge_dir: Path,
++    state: CodexNativeBridgeState,
++    command: str,
++) -> None:
++    """Run a web ``!command`` in the thread's shell, inside any active turn."""
++    await _native_delivery_request(
++        client,
++        "thread/shellCommand",
++        {"threadId": state.thread_id, "command": command},
++        state,
++        bridge_dir=bridge_dir,
++    )
++    _logger.info("Codex native ran user shell command")
++
++
+ async def _inject_codex_turn(
+     client: CodexAppServerClient,
+     *,
+@@ -648,13 +676,19 @@ class CodexNativeExecutor(Executor):
+             if client is None:
+                 return False
+             try:
+-                await _inject_codex_turn(
+-                    client,
+-                    bridge_dir=self._bridge_dir,
+-                    state=state,
+-                    input_items=input_items,
+-                    settings_overrides={},
+-                )
++                shell_command = _shell_command_from_input_items(input_items)
++                if shell_command is not None:
++                    await _run_codex_shell_command(
++                        client, bridge_dir=self._bridge_dir, state=state, command=shell_command
++                    )
++                else:
++                    await _inject_codex_turn(
++                        client,
++                        bridge_dir=self._bridge_dir,
++                        state=state,
++                        input_items=input_items,
++                        settings_overrides={},
++                    )
+             except Exception as exc:
+                 ambiguous = isinstance(exc, InjectionDeliveryAmbiguous)
+                 _logger.warning(
+@@ -910,8 +944,20 @@ class CodexNativeExecutor(Executor):
+                     undelivered = True
+                 else:
+                     try:
++                        shell_command = (
++                            _shell_command_from_input_items(input_items)
++                            if goal_objective is None
++                            else None
++                        )
+                         side_question = side_chat.side_chat_question(input_items)
+-                        if side_question is not None:
++                        if shell_command is not None:
++                            await _run_codex_shell_command(
++                                client,
++                                bridge_dir=self._bridge_dir,
++                                state=state,
++                                command=shell_command,
++                            )
++                        elif side_question is not None:
+                             # /side opens an ephemeral fork as its own sub-agent chat.
+                             # The fork must happen on the forwarder's connection —
+                             # it owns the fork's event stream, while this client
+@@ -1089,6 +1135,25 @@ def _latest_user_content(messages: list[Message]) -> object:
+     return None
+ 
+ 
++def _shell_command_from_input_items(input_items: list[dict[str, object]]) -> str | None:
++    """
++    Return the command of a lone shell-mode text input.
++
++    :param input_items: Codex input items, e.g. ``[{"type": "text", "text": "!ls -la"}]``.
++    :returns: The command without its ``!`` prefix, e.g. ``"ls -la"``, or ``None``
++        when the input is a prompt (including ``!!`` and attachment-bearing input).
++    """
++    if len(input_items) != 1 or input_items[0].get("type") != "text":
++        return None
++    text = input_items[0].get("text")
++    if not isinstance(text, str):
++        return None
++    text = text.strip()
++    if not text.startswith("!") or text.startswith("!!"):
++        return None
++    return text[1:].strip() or None
++
++
+ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
+     """
+     Normalize executor content into Codex app-server input items.
+diff --git a/tests/e2e_ui/messages/test_native_claude_shell_input.py b/tests/e2e_ui/messages/test_native_claude_shell_input.py
+index 9cf394f86e72baac2ebef95f9c966c3a0352f7c8..adea1a5f0f1da27a8af70a2ecdb86f4eae6e0cdd 100644
+--- a/tests/e2e_ui/messages/test_native_claude_shell_input.py
++++ b/tests/e2e_ui/messages/test_native_claude_shell_input.py
+@@ -1,6 +1,7 @@
+ """A web shell command settles through the real Claude transcript forwarder."""
+ 
+ import shutil
++import time
+ import uuid
+ 
+ import httpx
+@@ -73,3 +74,54 @@ def test_web_shell_command_settles_before_the_next_prompt(
+     expect(page.locator(_USER)).to_have_count(2, timeout=30_000)
+     expect(shell).to_have_count(1)
+     expect(page.locator(_ASSISTANT, has_text=reply).first).to_be_visible()
++
++
++@pytest.mark.nightly
++@pytest.mark.timeout(240)
++def test_run_button_queues_each_suggested_command(
++    page: Page,
++    native_claude_mock_session: tuple[str, str],
++    mock_llm_server_url: str,
++) -> None:
++    base_url, session_id = native_claude_mock_session
++    first = f"run-first-{uuid.uuid4().hex[:8]}"
++    second = f"run-second-{uuid.uuid4().hex[:8]}"
++    reply = f"Please run:\n\n```\n!echo {first}\n!echo {second}\n```"
++    reset_mock_llm(mock_llm_server_url)
++    for model in ("default", _CLAUDE_MOCK_MODEL):
++        set_fallback_mock_llm(mock_llm_server_url, model, reply)
++
++    page.goto(f"{base_url}/c/{session_id}")
++    _open_terminal_view(page)
++    _wait_terminal_connected(page)
++    _ensure_chat_view(page)
++    _send(page, "What should I run?")
++    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
++
++    page.locator(_ASSISTANT).get_by_role("button", name="Run 2 commands").click()
++    page.get_by_role("dialog").get_by_role("button", name="Run", exact=True).click()
++
++    for marker in (first, second):
++        expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(1, timeout=60_000)
++    with httpx.Client(base_url=base_url, timeout=15) as client:
++
++        def shell_inputs() -> list[str]:
++            items = client.get(
++                f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
++            )
++            items.raise_for_status()
++            return [
++                item["input"]
++                for item in items.json()["data"]
++                if item["type"] == "terminal_command" and item["kind"] == "input"
++            ]
++
++        # Each command reaches Claude as its own shell input, in order.
++        expect(page.locator(_USER, has_text="!echo")).to_have_count(2)
++        deadline = time.monotonic() + 60
++        while shell_inputs() != [f"echo {first}", f"echo {second}"]:
++            assert time.monotonic() < deadline, shell_inputs()
++            time.sleep(1)
++        snapshot = client.get(f"/v1/sessions/{session_id}")
++        snapshot.raise_for_status()
++        assert snapshot.json()["pending_inputs"] == []
+diff --git a/tests/e2e_ui/messages/test_native_codex_shell_input.py b/tests/e2e_ui/messages/test_native_codex_shell_input.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f7c97e34cf145505f7773fc11d1a7a4e3802dff
+--- /dev/null
++++ b/tests/e2e_ui/messages/test_native_codex_shell_input.py
+@@ -0,0 +1,76 @@
++"""Web shell commands run through Codex's shell RPC, not as prompts."""
++
++import shutil
++import time
++import uuid
++
++import httpx
++import pytest
++from playwright.sync_api import Page, expect
++
++from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
++
++from .test_message_render_parity import _ASSISTANT, _USER, _WORKING, _ensure_chat_view, _send
++from .test_native_codex_render_parity import (
++    _CODEX_MOCK_MODEL,
++    _open_terminal_view,
++    _wait_terminal_connected,
++)
++
++
++@pytest.fixture(scope="session", autouse=True)
++def _requires_codex() -> None:
++    for binary in ("codex", "tmux"):
++        if shutil.which(binary) is None:
++            pytest.skip(f"requires the real {binary} executable")
++
++
++def _shell_inputs(client: httpx.Client, session_id: str) -> list[str]:
++    """Commands mirrored as ``terminal_command`` inputs, oldest first."""
++    items = client.get(f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"})
++    items.raise_for_status()
++    return [
++        item["input"]
++        for item in items.json()["data"]
++        if item["type"] == "terminal_command" and item["kind"] == "input"
++    ]
++
++
++@pytest.mark.nightly
++@pytest.mark.timeout(300)
++def test_run_button_runs_each_suggested_command_in_codex_shell(
++    page: Page,
++    native_codex_mock_session: tuple[str, str],
++    mock_llm_server_url: str,
++) -> None:
++    base_url, session_id = native_codex_mock_session
++    first = f"run-first-{uuid.uuid4().hex[:8]}"
++    second = f"run-second-{uuid.uuid4().hex[:8]}"
++    reply = f"Please run:\n\n```\n!echo {first}\n!echo {second}\n```"
++    reset_mock_llm(mock_llm_server_url)
++    for model in ("default", _CODEX_MOCK_MODEL):
++        set_fallback_mock_llm(mock_llm_server_url, model, reply)
++
++    page.goto(f"{base_url}/c/{session_id}")
++    _open_terminal_view(page)
++    _wait_terminal_connected(page)
++    _ensure_chat_view(page)
++    _send(page, "What should I run?")
++    expect(page.locator(_ASSISTANT, has_text="Please run:").first).to_be_visible(timeout=90_000)
++    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
++
++    page.locator(_ASSISTANT).get_by_role("button", name="Run 2 commands").click()
++    page.get_by_role("dialog").get_by_role("button", name="Run", exact=True).click()
++
++    for marker in (first, second):
++        expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(1, timeout=60_000)
++    with httpx.Client(base_url=base_url, timeout=15) as client:
++        deadline = time.monotonic() + 60
++        while _shell_inputs(client, session_id) != [f"echo {first}", f"echo {second}"]:
++            assert time.monotonic() < deadline, _shell_inputs(client, session_id)
++            time.sleep(1)
++        snapshot = client.get(f"/v1/sessions/{session_id}")
++        snapshot.raise_for_status()
++        assert snapshot.json()["pending_inputs"] == []
++        # The shell commands never reached the model as prompts.
++        assert page.locator(_ASSISTANT, has_text="Please run:").count() == 1
+diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
+index 05ae55fb2d18aa86a1a205e0185da3971ac363a8..a0b6f7368b15817297bea65673e903ffdb598229 100644
+--- a/tests/harnesses/codex_native/test_codex_native.py
++++ b/tests/harnesses/codex_native/test_codex_native.py
+@@ -6934,6 +6934,118 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path:
+     }
+ 
+ 
++@pytest.mark.parametrize(
++    ("raw_command", "typed_command"),
++    [
++        # Real app-server captures of ``thread/shellCommand`` items (codex 0.159).
++        ("/bin/bash -lc 'echo hi && pwd'", "echo hi && pwd"),
++        ('/bin/bash -lc "printf \\"x  y\\\\n\\" | cat"', 'printf "x  y\\n" | cat'),
++        ("/bin/bash -lc \"ls -la ~ && echo \\\\\"'$done'", "ls -la ~ && echo \\$done"),
++        ("/bin/bash -lc 'for i in 1 2; do\n  echo $i\ndone'", "for i in 1 2; do\n  echo $i\ndone"),
++        ("pwsh -NoProfile -Command ls", "pwsh -NoProfile -Command ls"),
++    ],
++)
++def test_user_shell_command_recovers_the_typed_command(
++    raw_command: str, typed_command: str
++) -> None:
++    """The mirrored input must equal the web ``!command`` so its bubble settles."""
++    item = {"type": "commandExecution", "source": "userShell", "command": raw_command}
++
++    assert codex_native_forwarder._user_shell_command(item) == typed_command
++    assert codex_native_forwarder._user_shell_command({**item, "source": "agent"}) is None
++
++
++@pytest.mark.parametrize("live", [True, False], ids=["live", "resume-backfill"])
++def test_forwarder_mirrors_user_shell_command_as_terminal_command(
++    tmp_path: Path, live: bool
++) -> None:
++    """A ``thread/shellCommand`` run is a terminal command, not a model tool call."""
++    write_bridge_state(
++        tmp_path,
++        CodexNativeBridgeState(
++            session_id="conv_123",
++            socket_path=str(tmp_path / "app-server.sock"),
++            thread_id="thread_123",
++            codex_home=str(tmp_path / "codex-home"),
++            active_turn_id="turn_123",
++        ),
++    )
++    posted: list[dict[str, Any]] = []
++    started_item = {
++        "type": "commandExecution",
++        "id": "shell_1",
++        "command": "/bin/bash -lc 'gcloud auth list'",
++        "cwd": "/repo",
++        "source": "userShell",
++        "status": "inProgress",
++    }
++    completed_item = {
++        **started_item,
++        "status": "completed",
++        "aggregatedOutput": "No credentialed accounts.\n",
++        "exitCode": 1,
++    }
++
++    def event(method: str, **params: Any) -> dict[str, Any]:
++        return {
++            "method": method,
++            "params": {"threadId": "thread_123", "turnId": "turn_123", **params},
++        }
++
++    events = (
++        [
++            event("item/started", item=started_item),
++            event("item/commandExecution/outputDelta", itemId="shell_1", delta="No credentialed"),
++        ]
++        if live
++        else []
++    )
++    events.append(event("item/completed", item=completed_item))
++    state = codex_native_forwarder._CodexForwarderState()
++
++    async def run() -> None:
++        async with httpx.AsyncClient(
++            base_url="http://127.0.0.1:8000",
++            transport=httpx.MockTransport(_capture_handler(posted)),
++        ) as client:
++            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
++                client, "conv_123", flush_interval_seconds=60.0, flush_char_threshold=1000
++            )
++            for codex_event in events:
++                await codex_native_forwarder._handle_event(
++                    client,
++                    session_id="conv_123",
++                    bridge_dir=tmp_path,
++                    usage_coalescer=_usage_coalescer(client),
++                    elicitation_tracker=_elicitation_tracker(),
++                    event=codex_event,
++                    delta_coalescer=coalescer,
++                    forwarder_state=state,
++                )
++            await coalescer.close()
++
++    asyncio.run(run())
++
++    assert [payload["data"] for payload in posted] == [
++        {
++            "item_type": "terminal_command",
++            "item_data": {"kind": "input", "input": "gcloud auth list"},
++            "response_id": "codex_turn_123",
++            "source_id": "thread_123:turn_123:shell_1:input",
++        },
++        {
++            "item_type": "terminal_command",
++            "item_data": {
++                "kind": "output",
++                "stdout": "No credentialed accounts.\n\n[exit code: 1]",
++                "stderr": None,
++            },
++            "response_id": "codex_turn_123",
++            "source_id": "thread_123:turn_123:shell_1:output",
++        },
++    ]
++
++
+ def test_forwarder_surfaces_failed_command_exit_code() -> None:
+     """
+     A non-zero command exit is surfaced in the mirrored output.
+diff --git a/tests/inner/test_codex_native_executor.py b/tests/inner/test_codex_native_executor.py
+index 812dcf34777c3d19d0013dc33c176334047d97c6..0c81c51dba368be7db8ff6c63950b3ce2278d6da 100644
+--- a/tests/inner/test_codex_native_executor.py
++++ b/tests/inner/test_codex_native_executor.py
+@@ -975,6 +975,63 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
+     ]
+ 
+ 
++@pytest.mark.parametrize(
++    ("active_turn_id", "live_injection"),
++    [(None, False), ("turn_existing", False), ("turn_existing", True)],
++    ids=["idle", "active-turn", "live-queue"],
++)
++def test_shell_input_runs_through_thread_shell_command(
++    active_turn_id: str | None,
++    live_injection: bool,
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    """A web ``!command`` runs in Codex's shell instead of prompting the model."""
++    _FakeCodexNativeClient.requests = []
++    _FakeCodexNativeClient.created = []
++    monkeypatch.setattr(
++        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
++        _FakeCodexNativeClient,
++    )
++    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
++    executor = CodexNativeExecutor(bridge_dir=tmp_path)
++
++    if live_injection:
++        assert asyncio.run(executor.enqueue_session_message("main", "  !gcloud auth login\n"))
++    else:
++        events = _collect_turn_events(executor, "  !gcloud auth login\n")
++        assert [type(event) for event in events] == [TurnComplete]
++
++    assert _FakeCodexNativeClient.requests == [
++        ("thread/shellCommand", {"threadId": "thread_123", "command": "gcloud auth login"})
++    ]
++    # Codex reports the shell's turn through turn/started; nothing is recorded here.
++    state = read_bridge_state(tmp_path)
++    assert state is not None
++    assert state.active_turn_id == active_turn_id
++
++
++@pytest.mark.parametrize("text", ["!!not a command", "!", "say !hi"])
++def test_non_shell_bang_text_is_sent_as_a_prompt(
++    text: str,
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    """Only a lone ``!command`` is shell input; anything else reaches the model."""
++    _FakeCodexNativeClient.requests = []
++    _FakeCodexNativeClient.created = []
++    _FakeCodexNativeClient.next_turn = 1
++    monkeypatch.setattr(
++        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
++        _FakeCodexNativeClient,
++    )
++    _seed_bridge(tmp_path)
++
++    _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), text)
++
++    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
++
++
+ def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
+     monkeypatch: pytest.MonkeyPatch,
+     tmp_path: Path,
+diff --git a/web/src/components/ai-elements/message.tsx b/web/src/components/ai-elements/message.tsx
+index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50fde28e205 100644
+--- a/web/src/components/ai-elements/message.tsx
++++ b/web/src/components/ai-elements/message.tsx
+@@ -6,6 +6,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
+ import { copyText } from "@/lib/clipboard";
+ import { getEmbedRoot } from "@/lib/host";
+ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
++import { extractRunnableCommands } from "@/lib/runnableCommands";
+ import { cn } from "@/lib/utils";
+ import type { UIMessage } from "ai";
+ import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
+@@ -310,7 +311,15 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
+   );
+ };
+ 
++/**
++ * Asks to run shell commands an agent suggested, or null where the session
++ * can't run them. Code blocks and `!` inline spans show a Run control when set.
++ */
++export const RunCommandsContext = createContext<((commands: string[]) => void) | null>(null);
++
+ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "mermaid"> & {
++  /** Offer Run on suggested commands (agent prose, not user text or streaming output). */
++  allowRunCommands?: boolean;
+   /**
+    * Hand file-path links to the `a` component override instead of letting the
+    * harden pass turn them into app-origin navigations or " [blocked]" text.
+@@ -362,6 +371,14 @@ function extractCodeText(children: ReactNode): string {
+   return "";
+ }
+ 
++/** The fence language of a code block's `<code>` child, e.g. `"bash"`. */
++function extractCodeLanguage(children: ReactNode): string | null {
++  if (!isValidElement(children)) return null;
++  const { className } = children.props as { className?: unknown };
++  if (typeof className !== "string") return null;
++  return /(?:^|\s)language-(\S+)/.exec(className)?.[1] ?? null;
++}
++
+ // Streamdown ships its own 16px icon set (filled, even-odd fill rule) rather
+ // than lucide, so the copy/wrap buttons we overlay on a code block header use
+ // the same glyphs as Streamdown's native buttons (e.g. copy/download in a
+@@ -514,6 +531,17 @@ const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
+   </svg>
+ );
+ 
++const CodeRunIcon = (props: CodeHeaderIconProps) => (
++  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
++    <path
++      d="M4.5 2.75 12.5 8l-8 5.25Z"
++      stroke="currentColor"
++      strokeLinejoin="round"
++      strokeWidth={1.5}
++    />
++  </svg>
++);
++
+ // Shared visual style for the buttons in a chat code block header (copy, wrap
+ // toggle). Keeps the frosted resting look that matches Streamdown's own button
+ // pill, but pins the hover background to that same frosted fill so the ghost
+@@ -570,6 +598,31 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
+   );
+ }
+ 
++export function RunCommandsButton({
++  commands,
++  onRun,
++  className,
++}: {
++  commands: string[];
++  onRun: (commands: string[]) => void;
++  className?: string;
++}) {
++  const label = commands.length === 1 ? "Run command" : `Run ${commands.length} commands`;
++  return (
++    <Button
++      aria-label={label}
++      className={cn(CODE_BLOCK_OVERLAY_BUTTON_CLASS, className)}
++      onClick={() => onRun(commands)}
++      size="icon-sm"
++      title={label}
++      type="button"
++      variant="ghost"
++    >
++      <CodeRunIcon />
++    </Button>
++  );
++}
++
+ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
+   return (
+     <Button
+@@ -597,6 +650,12 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+   // horizontal-scroll view for when column alignment matters.
+   const [wrap, setWrap] = useState(true);
+   const toggleWrap = useCallback(() => setWrap((w) => !w), []);
++  const requestRun = useContext(RunCommandsContext);
++  const language = extractCodeLanguage(children);
++  const commands = useMemo(
++    () => (requestRun ? extractRunnableCommands(code, language) : []),
++    [requestRun, code, language],
++  );
+   const block = isValidElement(children)
+     ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
+     : children;
+@@ -614,6 +673,9 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+       {/* Match Streamdown's action-pill height and reserve its rightmost slot
+           for download. All controls stay anchored to the header. */}
+       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
++        {requestRun && commands.length > 0 && (
++          <RunCommandsButton commands={commands} onRun={requestRun} />
++        )}
+         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
+         <ChatCodeBlockCopyButton getCode={getCode} />
+       </div>
+@@ -628,9 +690,11 @@ export const MessageResponse = memo(
+     controls,
+     markFileLinks = false,
+     allowGitHubAttachmentImages = false,
++    allowRunCommands = false,
+     ...props
+   }: MessageResponseProps) => {
+     const themeMode = useResolvedThemeMode();
++    const requestRun = useContext(RunCommandsContext);
+     const messageComponents = useMemo(
+       () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
+       [components],
+@@ -640,34 +704,36 @@ export const MessageResponse = memo(
+     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
+ 
+     return (
+-      <MarkdownErrorBoundary source={props.children}>
+-        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
++      <RunCommandsContext.Provider value={allowRunCommands ? requestRun : null}>
++        <MarkdownErrorBoundary source={props.children}>
++          {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+             so remount on theme change to recolor already-rendered diagrams. */}
+-        <Streamdown
+-          key={themeMode}
+-          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+-          className={cn(
+-            "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+-            className,
+-          )}
+-          plugins={STREAMDOWN_PLUGINS}
+-          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+-          // instead of Streamdown's default "Open external link?" modal.
+-          linkSafety={CHAT_LINK_SAFETY}
+-          {...props}
+-          components={messageComponents}
+-          controls={messageControls}
+-          mermaid={mermaidOptions}
+-          // Block remote image fetches that can exfiltrate data through URLs.
+-          rehypePlugins={
+-            markFileLinks
+-              ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
+-              : allowGitHubAttachmentImages
+-                ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
+-                : SECURE_STREAMDOWN_REHYPE_PLUGINS
+-          }
+-        />
+-      </MarkdownErrorBoundary>
++          <Streamdown
++            key={themeMode}
++            // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
++            className={cn(
++              "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
++              className,
++            )}
++            plugins={STREAMDOWN_PLUGINS}
++            // Let links open on a plain click (and cmd/ctrl-click in a new tab)
++            // instead of Streamdown's default "Open external link?" modal.
++            linkSafety={CHAT_LINK_SAFETY}
++            {...props}
++            components={messageComponents}
++            controls={messageControls}
++            mermaid={mermaidOptions}
++            // Block remote image fetches that can exfiltrate data through URLs.
++            rehypePlugins={
++              markFileLinks
++                ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
++                : allowGitHubAttachmentImages
++                  ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
++                  : SECURE_STREAMDOWN_REHYPE_PLUGINS
++            }
++          />
++        </MarkdownErrorBoundary>
++      </RunCommandsContext.Provider>
+     );
+   },
+ );
+diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
+index b7670550805bf4f9d47d99e5fcf8324f50d15d3e..efe793260a1b39e028216e9fa4b044b77aa4336c 100644
+--- a/web/src/components/blocks/BlockRenderer.tsx
++++ b/web/src/components/blocks/BlockRenderer.tsx
+@@ -748,6 +748,7 @@ function renderItem(
+           className={cn("min-w-0", followsText && "mt-2")}
+         >
+           <FilePathAwareMessageResponse
++            allowRunCommands={!isTextStreaming}
+             className="chat-markdown"
+             mode={isTextStreaming ? "streaming" : "static"}
+           >
+diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
+index b6f15d20d83473e3769e872590a3a09310251d63..a4e12e3b0621be2ce056972b1f1b01a2cc8982c2 100644
+--- a/web/src/components/blocks/ChatMarkdown.tsx
++++ b/web/src/components/blocks/ChatMarkdown.tsx
+@@ -11,13 +11,17 @@
+ // without importing the block dispatcher that renders them.
+ 
+ import type React from "react";
+-import { useMemo } from "react";
++import { useContext, useMemo } from "react";
+ import { CopyIcon, GitPullRequestIcon } from "lucide-react";
+ import { toast } from "sonner";
+ import { defaultRemarkPlugins } from "streamdown";
+ import remarkBreaks from "remark-breaks";
+ import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
+-import { MessageResponse } from "@/components/ai-elements/message";
++import {
++  MessageResponse,
++  RunCommandsButton,
++  RunCommandsContext,
++} from "@/components/ai-elements/message";
+ import {
+   shortFileCitationLabel,
+   splitWorkspaceFileCitation,
+@@ -37,6 +41,7 @@ import { withBasePath } from "@/lib/basePath";
+ import { copyText } from "@/lib/clipboard";
+ import { absoluteWorkspacePath } from "@/lib/composerContext";
+ import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
++import { extractInlineRunnableCommand } from "@/lib/runnableCommands";
+ import { cn } from "@/lib/utils";
+ import {
+   useFileViewer,
+@@ -179,6 +184,8 @@ function WorkspacePathInlineCode({
+   // non-openable one just stays styled inline code — only an explicit
+   // markdown link (WorkspaceFileLink) earns dead-path feedback.
+   const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
++  const requestRun = useContext(RunCommandsContext);
++  const inlineCommand = requestRun ? extractInlineRunnableCommand(text) : null;
+ 
+   if (openWorkspaceFile) {
+     const shortLabel = shortFileCitationLabel(text);
+@@ -216,7 +223,7 @@ function WorkspacePathInlineCode({
+   }
+   // Match Streamdown's default inline-code styling so non-path inline code
+   // looks unchanged.
+-  return (
++  const code = (
+     <code
+       className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
+       data-streamdown="inline-code"
+@@ -225,6 +232,19 @@ function WorkspacePathInlineCode({
+       {codeChildren}
+     </code>
+   );
++  if (requestRun && inlineCommand !== null) {
++    return (
++      <>
++        {code}
++        <RunCommandsButton
++          className="ml-1 size-5 align-middle"
++          commands={[inlineCommand]}
++          onRun={requestRun}
++        />
++      </>
++    );
++  }
++  return code;
+ }
+ 
+ // Streamdown's own anchor styling and marker attribute. Overriding the `a`
+diff --git a/web/src/components/chat/RunCommandsProvider.test.tsx b/web/src/components/chat/RunCommandsProvider.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e5c999ec77f306769760dcabddee9d994d830f4
+--- /dev/null
++++ b/web/src/components/chat/RunCommandsProvider.test.tsx
+@@ -0,0 +1,89 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
++import { RunCommandsProvider } from "./RunCommandsProvider";
++
++beforeEach(() => {
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () => new Response("{}", { status: 404 })),
++  );
++});
++
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++});
++
++function renderAgentText(
++  markdown: string,
++  { onRun = vi.fn(), allowRunCommands = true } = {},
++): (commands: string[]) => void {
++  render(
++    <QueryClientProvider client={new QueryClient()}>
++      <RunCommandsProvider onRun={onRun}>
++        <FilePathAwareMessageResponse allowRunCommands={allowRunCommands} mode="static">
++          {markdown}
++        </FilePathAwareMessageResponse>
++      </RunCommandsProvider>
++    </QueryClientProvider>,
++  );
++  return onRun;
++}
++
++describe("RunCommandsProvider", () => {
++  it("confirms a block's ! commands and runs them in order", async () => {
++    const onRun = renderAgentText("Please run:\n\n```\n! gcloud auth login\n!gh auth status\n```");
++
++    fireEvent.click(await screen.findByRole("button", { name: "Run 2 commands" }));
++    const dialog = await screen.findByRole("dialog", { name: "Run 2 commands?" });
++    expect(within(dialog).getByText("!gcloud auth login")).toBeInTheDocument();
++    expect(within(dialog).getByText("!gh auth status")).toBeInTheDocument();
++    expect(onRun).not.toHaveBeenCalled();
++
++    fireEvent.click(within(dialog).getByRole("button", { name: "Run" }));
++    expect(onRun).toHaveBeenCalledExactlyOnceWith(["gcloud auth login", "gh auth status"]);
++  });
++
++  it("runs nothing when the confirmation is cancelled", async () => {
++    const onRun = renderAgentText("```\n!make\n```");
++
++    fireEvent.click(await screen.findByRole("button", { name: "Run command" }));
++    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
++    expect(onRun).not.toHaveBeenCalled();
++  });
++
++  it("reads the fence language to offer a plain bash block", async () => {
++    renderAgentText("```bash\nnpm install\nnpm test\n```");
++    expect(await screen.findByRole("button", { name: "Run 2 commands" })).toBeInTheDocument();
++  });
++
++  it("offers an inline ! span", async () => {
++    const onRun = renderAgentText("Run `! gh auth login` and tell me when done.");
++
++    fireEvent.click(await screen.findByRole("button", { name: "Run command" }));
++    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Run" }));
++    expect(onRun).toHaveBeenCalledExactlyOnceWith(["gh auth login"]);
++  });
++
++  it("hides Run where the text does not opt in", async () => {
++    renderAgentText("```\n!make\n```\n\n`!ls`", { allowRunCommands: false });
++    await screen.findByRole("button", { name: "Copy Code" });
++    expect(screen.queryByRole("button", { name: /^Run/ })).not.toBeInTheDocument();
++  });
++
++  it("hides Run when the session cannot run shell inputs", async () => {
++    render(
++      <QueryClientProvider client={new QueryClient()}>
++        <RunCommandsProvider onRun={null}>
++          <FilePathAwareMessageResponse allowRunCommands mode="static">
++            {"```\n!make\n```"}
++          </FilePathAwareMessageResponse>
++        </RunCommandsProvider>
++      </QueryClientProvider>,
++    );
++    await screen.findByRole("button", { name: "Copy Code" });
++    expect(screen.queryByRole("button", { name: /^Run/ })).not.toBeInTheDocument();
++  });
++});
+diff --git a/web/src/components/chat/RunCommandsProvider.tsx b/web/src/components/chat/RunCommandsProvider.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e1b76d2bbe1c5285ca92734fdefbcc61e785003
+--- /dev/null
++++ b/web/src/components/chat/RunCommandsProvider.tsx
+@@ -0,0 +1,85 @@
++import type { ReactNode } from "react";
++import { useCallback, useMemo, useState } from "react";
++import { RunCommandsContext } from "@/components/ai-elements/message";
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++
++/**
++ * Lets agent messages offer Run on suggested shell commands, confirming the
++ * exact list before handing it to `onRun`. A null `onRun` hides every Run
++ * control, e.g. for a harness without a shell input mode.
++ */
++export function RunCommandsProvider({
++  onRun,
++  children,
++}: {
++  onRun: ((commands: string[]) => void) | null;
++  children: ReactNode;
++}) {
++  const [pendingCommands, setPendingCommands] = useState<string[] | null>(null);
++  const requestRun = useMemo(
++    () => (onRun ? (commands: string[]) => setPendingCommands(commands) : null),
++    [onRun],
++  );
++  const confirm = useCallback(() => {
++    if (onRun && pendingCommands) onRun(pendingCommands);
++    setPendingCommands(null);
++  }, [onRun, pendingCommands]);
++
++  // Each row keeps its position: the same command may repeat in one block.
++  const rows = useMemo(
++    () =>
++      (pendingCommands ?? []).map((command, position) => ({
++        id: `${position}:${command}`,
++        command,
++      })),
++    [pendingCommands],
++  );
++  const count = rows.length;
++  return (
++    <RunCommandsContext.Provider value={requestRun}>
++      {children}
++      <Dialog
++        open={pendingCommands !== null}
++        onOpenChange={(open) => {
++          if (!open) setPendingCommands(null);
++        }}
++      >
++        <DialogContent className="sm:max-w-lg">
++          <DialogHeader>
++            <DialogTitle>
++              {count === 1 ? "Run this command?" : `Run ${count} commands?`}
++            </DialogTitle>
++            <DialogDescription>
++              {count === 1
++                ? "It runs on the session's host as a shell input."
++                : "Each runs on the session's host as its own shell input, in this order."}
++            </DialogDescription>
++          </DialogHeader>
++          <ol className="flex max-h-64 flex-col gap-1.5 overflow-y-auto">
++            {rows.map(({ id, command }) => (
++              <li key={id}>
++                <pre className="whitespace-pre-wrap break-all rounded-md bg-muted px-2.5 py-1.5 font-mono text-xs">
++                  !{command}
++                </pre>
++              </li>
++            ))}
++          </ol>
++          <DialogFooter>
++            <Button variant="outline" onClick={() => setPendingCommands(null)}>
++              Cancel
++            </Button>
++            <Button onClick={confirm}>Run</Button>
++          </DialogFooter>
++        </DialogContent>
++      </Dialog>
++    </RunCommandsContext.Provider>
++  );
++}
+diff --git a/web/src/lib/runnableCommands.test.ts b/web/src/lib/runnableCommands.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad411592e5376f6dc49faf2c6e9cd500b7ed0ece
+--- /dev/null
++++ b/web/src/lib/runnableCommands.test.ts
+@@ -0,0 +1,79 @@
++import { describe, expect, it } from "vitest";
++import {
++  extractInlineRunnableCommand,
++  extractRunnableCommands,
++  harnessRunsShellCommands,
++  MAX_RUNNABLE_COMMANDS,
++} from "./runnableCommands";
++
++describe("extractRunnableCommands", () => {
++  it("splits each !-prefixed line into its own command", () => {
++    const code = "! gcloud auth login\n!gh auth status\n";
++    expect(extractRunnableCommands(code, undefined)).toEqual([
++      "gcloud auth login",
++      "gh auth status",
++    ]);
++  });
++
++  it("ignores commentary lines around ! commands, in any language", () => {
++    const code = "# first log in\n! gcloud auth login\nthen retry";
++    expect(extractRunnableCommands(code, "text")).toEqual(["gcloud auth login"]);
++  });
++
++  it("does not treat !! or a bare ! as a command", () => {
++    expect(extractRunnableCommands("!!\n!\n", "bash")).toEqual([]);
++  });
++
++  it("joins backslash continuations into one command", () => {
++    const code = "! docker run \\\n  --rm alpine";
++    expect(extractRunnableCommands(code, undefined)).toEqual(["docker run --rm alpine"]);
++  });
++
++  it("yields one command per line of a shell block, skipping comments", () => {
++    const code = "# install\nnpm install\n\nnpm test\n";
++    expect(extractRunnableCommands(code, "bash")).toEqual(["npm install", "npm test"]);
++    expect(extractRunnableCommands(code, "Shell")).toEqual(["npm install", "npm test"]);
++  });
++
++  it("keeps only prompted lines of a console transcript", () => {
++    const code = "$ git status\nOn branch main\n$ git log -1\n";
++    expect(extractRunnableCommands(code, "console")).toEqual(["git status", "git log -1"]);
++  });
++
++  it("offers nothing for non-shell blocks without ! lines", () => {
++    expect(extractRunnableCommands("print('hi')", "python")).toEqual([]);
++    expect(extractRunnableCommands("npm install", undefined)).toEqual([]);
++  });
++
++  it("offers nothing for a heredoc, which line splitting would break", () => {
++    expect(extractRunnableCommands("cat <<EOF > a.txt\nhi\nEOF", "bash")).toEqual([]);
++  });
++
++  it("offers nothing for a block longer than the command cap", () => {
++    const code = Array.from({ length: MAX_RUNNABLE_COMMANDS + 1 }, (_, i) => `!echo ${i}`).join(
++      "\n",
++    );
++    expect(extractRunnableCommands(code, undefined)).toEqual([]);
++  });
++});
++
++describe("extractInlineRunnableCommand", () => {
++  it("reads a ! inline span", () => {
++    expect(extractInlineRunnableCommand("! gcloud auth login")).toBe("gcloud auth login");
++    expect(extractInlineRunnableCommand("!ls")).toBe("ls");
++  });
++
++  it("rejects plain inline code", () => {
++    expect(extractInlineRunnableCommand("git status")).toBeNull();
++    expect(extractInlineRunnableCommand("!!")).toBeNull();
++  });
++});
++
++describe("harnessRunsShellCommands", () => {
++  it("allows only harnesses with a shell input mode", () => {
++    expect(harnessRunsShellCommands("claude-native")).toBe(true);
++    expect(harnessRunsShellCommands("codex-native")).toBe(true);
++    expect(harnessRunsShellCommands("claude-sdk")).toBe(false);
++    expect(harnessRunsShellCommands(null)).toBe(false);
++  });
++});
+diff --git a/web/src/lib/runnableCommands.ts b/web/src/lib/runnableCommands.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..edf73abd8b759f2a25e89fd6b2a00bd9f4d21469
+--- /dev/null
++++ b/web/src/lib/runnableCommands.ts
+@@ -0,0 +1,90 @@
++/**
++ * Detect shell commands an agent asks the user to run, so the chat can offer a
++ * one-tap "Run" that queues each as a `!command` shell input.
++ */
++
++/** Harnesses whose web composer treats a `!command` message as a shell input. */
++const SHELL_INPUT_HARNESSES = new Set(["claude-native", "codex-native"]);
++
++/** Fence languages whose whole body is commands, even without `!` prefixes. */
++const SHELL_LANGUAGES = new Set(["bash", "sh", "shell", "zsh", "console", "shell-session"]);
++
++/** More commands than this reads as a script to study, not steps to run. */
++export const MAX_RUNNABLE_COMMANDS = 10;
++
++const PROMPT_PREFIX = /^\$\s+/;
++
++/**
++ * Whether a session's harness runs a `!command` message as a shell input.
++ *
++ * @param harness - The session harness id, e.g. `"claude-native"`.
++ */
++export function harnessRunsShellCommands(harness: string | null | undefined): boolean {
++  return harness != null && SHELL_INPUT_HARNESSES.has(harness);
++}
++
++/** The command after a single leading `!`, or null when `line` is not one. */
++function bangCommand(line: string): string | null {
++  const trimmed = line.trim();
++  if (!trimmed.startsWith("!") || trimmed.startsWith("!!")) return null;
++  const command = trimmed.slice(1).trim();
++  return command === "" ? null : command;
++}
++
++/** Split code into logical lines, joining trailing-backslash continuations. */
++function logicalLines(code: string): string[] {
++  const lines: string[] = [];
++  let pending = "";
++  for (const line of code.split(/\r?\n/)) {
++    const piece = pending === "" ? line : line.trimStart();
++    if (/\\\s*$/.test(piece)) {
++      pending += `${piece.replace(/\\\s*$/, "").trimEnd()} `;
++      continue;
++    }
++    lines.push(pending + piece);
++    pending = "";
++  }
++  if (pending !== "") lines.push(pending);
++  return lines;
++}
++
++/**
++ * Commands a fenced code block asks the user to run, one per queued input.
++ *
++ * `!`-prefixed lines win: each becomes its own command and other lines are
++ * treated as commentary. Otherwise a shell-language block yields one command
++ * per line, keeping only `$ `-prompted lines when it shows a transcript.
++ * Heredocs and long scripts yield nothing, since splitting them would change
++ * what runs.
++ *
++ * @param code - The code block body.
++ * @param language - The fence language, e.g. `"bash"`, if any.
++ * @returns The commands without their `!` prefix, e.g. `["gcloud auth login"]`.
++ */
++export function extractRunnableCommands(code: string, language?: string | null): string[] {
++  const lines = logicalLines(code);
++  const bangCommands = lines.map(bangCommand).filter((command) => command !== null);
++  if (bangCommands.length > 0) {
++    return bangCommands.length <= MAX_RUNNABLE_COMMANDS ? bangCommands : [];
++  }
++
++  if (!language || !SHELL_LANGUAGES.has(language.toLowerCase())) return [];
++  if (code.includes("<<")) return [];
++
++  const nonBlank = lines.map((line) => line.trim()).filter((line) => line !== "");
++  const hasPrompts = nonBlank.some((line) => PROMPT_PREFIX.test(line));
++  const commands = nonBlank
++    .filter((line) => (hasPrompts ? PROMPT_PREFIX.test(line) : !/^[#!]/.test(line)))
++    .map((line) => line.replace(PROMPT_PREFIX, "").trim())
++    .filter((line) => line !== "");
++  return commands.length <= MAX_RUNNABLE_COMMANDS ? commands : [];
++}
++
++/**
++ * The command in an inline code span written as `` `! cmd` ``, or null.
++ *
++ * @param text - The inline code text, e.g. `"! gcloud auth login"`.
++ */
++export function extractInlineRunnableCommand(text: string): string | null {
++  return text.includes("\n") ? null : bangCommand(text);
++}
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e7754e375 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -116,6 +116,7 @@ import {
+ } from "@/lib/sideChat";
+ import { shouldQueueSend } from "@/lib/messageQueue";
+ import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
++import { harnessRunsShellCommands } from "@/lib/runnableCommands";
+ import { skillInvocationPrefix } from "@/lib/harnessSetup";
+ import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
+ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+@@ -284,6 +285,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
+ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { ConnectionIndicator } from "./ChatIndicators";
++import { RunCommandsProvider } from "@/components/chat/RunCommandsProvider";
+ import { Transcript } from "@/components/chat/Transcript";
+ 
+ /** Server-info as consumers see it: the probe's result, or "loading". */
+@@ -991,6 +993,22 @@ export function ChatPage() {
+     ],
+   );
+ 
++  // Agent-suggested commands queue as separate `!command` shell inputs, even
++  // when idle: the queue sends its head now and each later one on its own idle
++  // edge, so the commands never merge into one turn.
++  const onRunCommands = useCallback(
++    (commands: string[]) => {
++      if (!agentId || isTempConvId(urlConvId)) return;
++      if (urlConvId && isUnreachable) {
++        void reconnect();
++        return;
++      }
++      const chat = useChatStore.getState();
++      for (const command of commands) chat.enqueueMessage(`!${command}`);
++    },
++    [agentId, urlConvId, isUnreachable, reconnect],
++  );
++
+   const onSendSlashCommand = useCallback(
+     (name: string, args: string) => {
+       if (!agentId) return;
+@@ -1167,6 +1185,7 @@ export function ChatPage() {
+       agentsError={agentsError}
+       disabled={!agentId || agentsError !== null}
+       onSend={onSend}
++      onRunCommands={onRunCommands}
+       onNewSession={openNewSession}
+       onSendSlashCommand={onSendSlashCommand}
+       onStop={onStop}
+@@ -1314,6 +1333,8 @@ interface MainAgentSurfaceProps {
+   agentsError: unknown;
+   disabled: boolean;
+   onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
++  /** Queue agent-suggested shell commands, one `!command` input each. */
++  onRunCommands: (commands: string[]) => void;
+   /**
+    * Invoke a skill via the `slash_command` event path. Gated off inside
+    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
+@@ -1492,6 +1513,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+   agentsError,
+   disabled,
+   onSend,
++  onRunCommands,
+   onSendSlashCommand,
+   onNewSession,
+   onStop,
+@@ -1775,21 +1797,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+           {/* The scrolling transcript column owns every streaming-hot store
+           subscription and the bubble pipeline, so an SSE frame re-renders it
+           alone — this surface's composer and chrome below bail out. */}
+-          <Transcript
+-            hostId={hostId}
+-            setConversationEl={setConversationEl}
+-            containerEl={containerEl}
+-            scroller={scroller}
+-            setScroller={setScroller}
+-            sendScrollNonce={sendScrollNonce}
+-            hasMoreHistory={hasMoreHistory}
+-            loadingMoreHistory={loadingMoreHistory}
+-            isMobileViewport={isMobileViewport}
+-            showsWorking={showsWorking}
+-            agentsError={agentsError}
+-            sandboxLaunching={sandboxLaunching}
+-            spacerMeasureRef={spacerMeasureRef}
+-          />
++          <RunCommandsProvider
++            onRun={harnessRunsShellCommands(selectionSessionHarness) ? onRunCommands : null}
++          >
++            <Transcript
++              hostId={hostId}
++              setConversationEl={setConversationEl}
++              containerEl={containerEl}
++              scroller={scroller}
++              setScroller={setScroller}
++              sendScrollNonce={sendScrollNonce}
++              hasMoreHistory={hasMoreHistory}
++              loadingMoreHistory={loadingMoreHistory}
++              isMobileViewport={isMobileViewport}
++              showsWorking={showsWorking}
++              agentsError={agentsError}
++              sandboxLaunching={sandboxLaunching}
++              spacerMeasureRef={spacerMeasureRef}
++            />
++          </RunCommandsProvider>
+           {/* Floating reply button — scoped to the conversation container.
+           Withheld when the composer refuses quotes (read-only grant or a
+           structurally non-interactive session), as SideChatPane does. */}

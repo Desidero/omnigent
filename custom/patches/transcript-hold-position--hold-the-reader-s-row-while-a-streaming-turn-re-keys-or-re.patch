@@ -1,0 +1,507 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Sat, 24 Oct 2026 02:40:21 +0000
+Subject: [PATCH] fix(web): hold the reader's row while a streaming turn
+ re-keys or re-measures rows
+
+Scrolling up a little to re-read a reply that is still streaming worked until
+the model's first tool call: the view then jumped to the end of the reply
+(-1927px on a 1280x800 desktop, -7164px on an iPhone 14 viewport).
+
+The virtualized transcript keeps native scroll anchoring off and left in-list
+height changes to the virtualizer's own per-row scroll adjustment. A streaming
+assistant bubble is keyed `responseId:0` until its first item gets a
+store-assigned id, then remounts under the new key at the 280px estimate; the
+library reads that row's first measurement (a row starting above the viewport
+top) as an estimated block above the fold and scrolls by its height minus the
+estimate although nothing on screen moved. The same heuristic skips rows that
+span the viewport top and defers on iOS WebKit.
+
+Generalize the history-prepend hold into the one in-list hold: on every
+virtualizer change (once per measurement batch, before paint) and after every
+commit, compare the mounted rows with their list-relative offsets from the
+previous hold and move scrollTop by how far the row that was first fully
+visible shifted, a renamed row by its bottom edge as before. The library's own
+adjustment is off for good so nothing is counted twice; list-relative offsets
+keep the list-offset compensation disjoint; a re-keyed row with the same
+content holds nothing. Follow-tail at the bottom, the prepend lock release and
+synchronous page measurement, and the native-find mode are unchanged.
+
+Not upstream yet: proposed from fix/transcript-hold-position; drop this copy once it merges.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit 28e59914599d2c8794610b690a82c587f58b955e)
+Docs: none (fix: the transcript keeps the reader's place while a reply streams; no setting)
+---
+ .../chat/Transcript.scrollRestore.test.ts     |  60 ++++-
+ web/src/components/chat/Transcript.tsx        | 222 ++++++++++++------
+ .../chat/Transcript.virtualList.test.tsx      |  86 +++++++
+ 3 files changed, 290 insertions(+), 78 deletions(-)
+
+diff --git a/web/src/components/chat/Transcript.scrollRestore.test.ts b/web/src/components/chat/Transcript.scrollRestore.test.ts
+index 0f664b2cea4efc64f2e72677c5263b489375a0d7..36b22f3ea0e1658465ded2b8afe46af543bcebe1 100644
+--- a/web/src/components/chat/Transcript.scrollRestore.test.ts
++++ b/web/src/components/chat/Transcript.scrollRestore.test.ts
+@@ -1,5 +1,10 @@
+ import { describe, expect, it } from "vitest";
+-import { captureTranscriptViewSnapshot, resolveTranscriptViewOffset } from "./Transcript";
++import {
++  captureTranscriptViewSnapshot,
++  holdAnchorRow,
++  holdScrollDelta,
++  resolveTranscriptViewOffset,
++} from "./Transcript";
+ 
+ describe("transcript semantic scroll snapshots", () => {
+   it("stores bottom as a mode instead of a pixel offset", () => {
+@@ -51,3 +56,56 @@ describe("transcript semantic scroll snapshots", () => {
+     expect(resolveTranscriptViewOffset(snapshot, () => undefined)).toBe(4200);
+   });
+ });
++
++describe("transcript read-position hold", () => {
++  // Mounted rows as last held: 200px tall, 16px apart.
++  const rows = [
++    { key: "user-1", start: 0, end: 200 },
++    { key: "assistant-1", start: 216, end: 416 },
++    { key: "user-2", start: 432, end: 632 },
++    { key: "assistant-2", start: 648, end: 848 },
++  ];
++
++  it("holds the first row fully inside the viewport", () => {
++    expect(holdAnchorRow(rows, 100, 500)).toEqual(rows[1]);
++    expect(holdAnchorRow(rows, 216, 500)).toEqual(rows[1]);
++    expect(holdAnchorRow(rows, 217, 500)).toEqual(rows[2]);
++  });
++
++  it("falls back to the row crossing the viewport top when none fits", () => {
++    // A reply taller than the viewport: the reader is inside it.
++    const tall = [
++      { key: "user-1", start: 0, end: 200 },
++      { key: "assistant-1", start: 216, end: 3000 },
++    ];
++    expect(holdAnchorRow(tall, 500, 600)).toEqual(tall[1]);
++    // The viewport top sits in the gap before a row taller than the viewport.
++    expect(holdAnchorRow(tall, 205, 600)).toEqual(tall[1]);
++  });
++
++  it("holds nothing when no held row intersects the viewport", () => {
++    // After a long jump the last held rows are all off-screen.
++    expect(holdAnchorRow(rows, 5000, 500)).toBeUndefined();
++    expect(holdAnchorRow([], 0, 500)).toBeUndefined();
++  });
++
++  it("moves by the held row's start, either way", () => {
++    const anchor = rows[1]!;
++    expect(holdScrollDelta(anchor, { ...anchor, start: 316, end: 516 }, false)).toBe(100);
++    expect(holdScrollDelta(anchor, { ...anchor, start: 116, end: 316 }, false)).toBe(-100);
++    expect(holdScrollDelta(anchor, anchor, false)).toBe(0);
++  });
++
++  it("holds a row a history page renamed by its bottom edge", () => {
++    // The page grew the row at its top by 300 (the turn's earlier items) on
++    // top of 1000 of older rows inserted above it.
++    const anchor = rows[0]!;
++    const grown = { ...anchor, start: 1000, end: 1500 };
++    expect(holdScrollDelta(anchor, grown, true)).toBe(1300);
++    expect(holdScrollDelta(anchor, grown, false)).toBe(1000);
++  });
++
++  it("holds nothing when the held row is gone", () => {
++    expect(holdScrollDelta(rows[1]!, undefined, false)).toBeUndefined();
++  });
++});
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index 332f3a8107eaf780a32f47be692c33d6fe68aea6..bee9d203641afd811fa0a0c1d9fcc608fe2c7263 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -588,6 +588,49 @@ export function resolveTranscriptViewOffset(
+     : Math.max(0, anchorStart - snapshot.anchorOffset);
+ }
+ 
++/** A mounted row's offsets relative to the list's top, free of the list's own offset in the scroller. */
++export interface HeldRow {
++  key: string;
++  start: number;
++  end: number;
++}
++
++/**
++ * The row to hold while in-list heights change: the first row fully inside the
++ * viewport, else the topmost row intersecting it (one tall row filling the
++ * view). Undefined when no row intersects, e.g. right after a long jump.
++ * `rows` and `viewportTop` are list-relative.
++ */
++export function holdAnchorRow(
++  rows: readonly HeldRow[],
++  viewportTop: number,
++  viewportHeight: number,
++): HeldRow | undefined {
++  const viewportBottom = viewportTop + viewportHeight;
++  let partial: HeldRow | undefined;
++  for (const row of rows) {
++    if (row.end <= viewportTop || row.start >= viewportBottom) continue;
++    if (row.start >= viewportTop - 0.5 && row.end <= viewportBottom + 0.5) return row;
++    partial ??= row;
++  }
++  return partial;
++}
++
++/**
++ * How far the held row moved between two layouts: positive when content above
++ * it grew. A row a history page renamed grew at its own top (the turn's earlier
++ * items), so it is held by its bottom edge. Undefined when the row is gone (a
++ * re-keyed bubble renders the same content under a new key, so nothing moved).
++ */
++export function holdScrollDelta(
++  before: HeldRow,
++  after: HeldRow | undefined,
++  heldByEnd: boolean,
++): number | undefined {
++  if (after === undefined) return undefined;
++  return heldByEnd ? after.end - before.end : after.start - before.start;
++}
++
+ const MAX_CACHED_VIEWS = 24;
+ const transcriptViewCache = new Map<string, TranscriptViewSnapshot>();
+ function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): void {
+@@ -679,9 +722,9 @@ export function VirtualBubbleList({
+       // Content above the list changed height (the history indicator toggling,
+       // the task tracker mounting) while the reader is scrolled into the
+       // transcript: move by the same amount so the rows under them stay put.
+-      // This and the prepend hold below compensate disjoint changes: the list's
+-      // offset is scroll-invariant and only in-flow content above it moves it,
+-      // while the hold measures purely inside the list. Neither sees the other's
++      // This and the hold below compensate disjoint changes: the list's offset
++      // is scroll-invariant and only in-flow content above it moves it, while
++      // the hold measures purely inside the list. Neither sees the other's
+       // change, so their writes add rather than double-count.
+       // Native scroll anchoring would also answer the virtualizer's own row
+       // corrections, so it is off for this scroller (data-virtualized-transcript).
+@@ -730,9 +773,9 @@ export function VirtualBubbleList({
+   }, [scrollEl, bubbles.length, hasTasks, disableVirtualization]);
+ 
+   // Marks the scroller as virtualized so the stylesheet turns native scroll
+-  // anchoring off: the transcript holds its own position (see the prepend and
+-  // list-offset compensation above and below), and the browser adjusting for
+-  // the same in-flow change would double-count it.
++  // anchoring off: the transcript holds its own position (see the list-offset
++  // compensation above and the hold below), and the browser adjusting for the
++  // same in-flow change would double-count it.
+   useLayoutEffect(() => {
+     if (!scrollEl || disableVirtualization) return;
+     scrollEl.setAttribute("data-virtualized-transcript", "");
+@@ -740,11 +783,8 @@ export function VirtualBubbleList({
+   }, [scrollEl, disableVirtualization]);
+ 
+   // True from the render that lands a history prepend until its layout effect
+-  // has held the reader's position. Rows measured in that window are accounted
+-  // for by the hold with their measured sizes, so react-virtual's own per-row
+-  // scroll adjustment for them would double-count; the hold turns it off for
+-  // exactly that window. Set during render: this subtree renders synchronously
+-  // (no transitions or suspense), so every flagged render commits.
++  // has measured the page's rows. Set during render: this subtree renders
++  // synchronously (no transitions or suspense), so every flagged render commits.
+   const prependCommitRef = useRef(false);
+   // Row keys under which bubbles render; see the rename handling below the virtualizer.
+   const rowKeyAliasRef = useRef(new Map<string, string>());
+@@ -753,12 +793,21 @@ export function VirtualBubbleList({
+   const renderedBubblesRef = useRef<readonly Bubble[]>([]);
+   const renderedFirstKeyRef = useRef<string | undefined>(undefined);
+   const prevFirstKeyRef = useRef<string | undefined>(undefined);
+-  // Mounted rows with the offsets they hold, refreshed every render that is not
+-  // a prepend (react-virtual re-renders after each measurement, so this tracks
+-  // measured offsets) and after a prepend's own measurements below. The prepend
+-  // render leaves it alone: its offsets are pre-measure estimates, and the hold
+-  // needs the offsets from before the page landed.
+-  const rowSnapshotRef = useRef<{ key: string; start: number; end: number }[]>([]);
++  // Mounted rows with the list-relative offsets they held when the reader's
++  // position was last held (see holdReaderPosition below).
++  const rowSnapshotRef = useRef<HeldRow[]>([]);
++  // Latest props/state for the hold, which also runs outside render.
++  const scrollElRef = useRef(scrollEl);
++  scrollElRef.current = scrollEl;
++  const scrollMarginRef = useRef(scrollMargin);
++  scrollMarginRef.current = scrollMargin;
++  const virtualizationOffRef = useRef(disableVirtualization);
++  virtualizationOffRef.current = disableVirtualization;
++  const holdRef = useRef<() => void>(() => {});
++  // The held rows as of this render: mount measurements hold (and so refresh
++  // the baseline) before the layout effect below can tell a prepend from a
++  // conversation switch.
++  const rowsBeforeCommitRef = useRef<readonly HeldRow[]>([]);
+   // The list is reused across conversation switches; every baseline here
+   // (row keys, offsets, the list's own offset) describes one conversation.
+   const baselineConversationRef = useRef(conversationId);
+@@ -798,7 +847,16 @@ export function VirtualBubbleList({
+         ? measureElement(element, entry, instance)
+         : element.getBoundingClientRect().height;
+     },
++    // Fires once per measurement batch, synchronously before paint, and on
++    // every range change: hold the reader's row across each.
++    onChange: () => holdRef.current(),
+   });
++  // The hold below is the one in-list compensation. The library's own per-row
++  // scroll adjustment would double-count every measured change, and it
++  // misreads a re-keyed row's first measurement (a bubble remounting under a
++  // new key once its first item commits) as an estimated block above the fold,
++  // throwing a reader inside that row by its height minus the estimate.
++  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+ 
+   // An assistant bubble is keyed by its first item, so a history page that
+   // continues the top turn renames it. Keep rendering it under the key its row
+@@ -812,10 +870,7 @@ export function VirtualBubbleList({
+     firstBubbleKey !== undefined &&
+     firstBubbleKey !== renderedFirstKeyRef.current
+   ) {
+-    // Flagged in render so the mount-time measurements of this commit's rows
+-    // (which run before the layout effect below) already see it.
+     prependCommitRef.current = true;
+-    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+     const aliases = rowKeyAliasRef.current;
+     const renamed = renamedRowKeysRef.current;
+     renamed.clear();
+@@ -995,30 +1050,81 @@ export function VirtualBubbleList({
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [bubbles, scrollEl, range, totalSize, virtualizer]);
+ 
+-  // Older-history prepend compensation. Native scroll anchoring is off for
+-  // this scroller, so it can't hold the read position across a prepend.
+-  // Snapshot every mounted row's offset each render; when a
+-  // prepend lands, restore scrollTop so the topmost snapshotted row that still
+-  // exists keeps its pre-prepend viewport position. A bubble the page renamed
+-  // is skipped when any other row survives, and otherwise held by its bottom
+-  // edge: the page grew it at its top (the turn's earlier items), and what the
+-  // reader sees below it aligns to that edge, not to its start. Measured purely
+-  // from the virtualizer, so content above the list is irrelevant.
+-  const snapshotRows = () =>
+-    virtualizer
++  // Hold the reader's position across in-list height changes. Native scroll
++  // anchoring is off for this scroller, so nothing else keeps the row under the
++  // reader still when a row above re-measures from its estimate, a history page
++  // lands above, a tool bubble finishes, or an image loads. Each hold compares
++  // the mounted rows against their offsets from the previous hold, moves
++  // scrollTop by how far the row that was first fully visible shifted, and
++  // takes the new offsets as the next baseline. Offsets are list-relative, so
++  // the list-offset compensation above sees changes this never does and neither
++  // double-counts the other. At the bottom a change above the viewport shifts
++  // the bottom by the same amount, so holding the row keeps follow-tail intact.
++  const snapshotRows = (): HeldRow[] => {
++    const margin = scrollMarginRef.current;
++    return virtualizer
+       .getVirtualItems()
+       .flatMap((item) =>
+-        typeof item.key === "string" ? [{ key: item.key, start: item.start, end: item.end }] : [],
++        typeof item.key === "string"
++          ? [{ key: item.key, start: item.start - margin, end: item.end - margin }]
++          : [],
+       );
+-  if (!prependCommitRef.current) rowSnapshotRef.current = snapshotRows();
++  };
++  const holdReaderPosition = () => {
++    const previous = rowSnapshotRef.current;
++    const rows = snapshotRows();
++    rowSnapshotRef.current = rows;
++    const el = scrollElRef.current;
++    // The mount-time restore pins its own anchor until it settles.
++    if (!el || virtualizationOffRef.current || restoringRef.current !== null) return;
++    const margin = scrollMarginRef.current;
++    const anchor = holdAnchorRow(previous, el.scrollTop - margin, el.clientHeight);
++    if (anchor === undefined) return;
++    const delta = holdScrollDelta(
++      anchor,
++      rows.find((row) => row.key === anchor.key),
++      renamedRowKeysRef.current.has(anchor.key),
++    );
++    if (delta === undefined || Math.abs(delta) < 0.5) return;
++    // A transcript shorter than its viewport has no offset to hold yet.
++    if (el.scrollHeight - el.clientHeight <= 1) return;
++    // Write the offset through StickToBottom's state so it doesn't read the
++    // write as a reader scroll.
++    ctxRef.current.state.scrollTop = el.scrollTop + delta;
++  };
++  holdRef.current = holdReaderPosition;
++  rowsBeforeCommitRef.current = rowSnapshotRef.current;
+   useLayoutEffect(() => {
++    const firstKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
++    const prevFirstKey = prevFirstKeyRef.current;
++    prevFirstKeyRef.current = firstKey;
++    // A prepend grew or renamed the list at the top while some earlier row is
++    // still present. A switch replaces the list (no row survives) and is
++    // handled by the mount scroll-to-bottom; streaming appends leave the first
++    // key unchanged.
++    const currentKeys = new Set(bubbles.map(rowKey));
++    const prepended =
++      scrollEl !== null &&
++      prevFirstKey !== undefined &&
++      firstKey !== prevFirstKey &&
++      rowsBeforeCommitRef.current.some((row) => currentKeys.has(row.key));
++    if (prepended) {
++      // Older history is the opposite of the bottom: release the lock so
++      // StickToBottom doesn't answer the growth by snapping back down. Every
++      // prepend, even one that renames the only mounted bubble — a transcript
++      // too short to scroll fires no scroll event on wheel-up, so nothing else
++      // has released it by the time the page that makes it scrollable lands.
++      const c = ctxRef.current;
++      c.stopScroll();
++      c.state.isAtBottom = false;
++      c.state.escapedFromLock = true;
++    }
+     // react-virtual skips its mount-time measurement while the pane counts as
+     // scrolling and leaves it to a ResizeObserver that fires after paint — so
+     // rows a page lands mid-scroll would paint at the 280px estimate, then
+     // snap. Measure them now instead (resizeItem has no such skip), along with
+-    // the renamed rows the page grew; with the prepend flag still set the
+-    // library adjusts nothing, the hold below works from real sizes, and the
+-    // re-render this queues lands before paint.
++    // the renamed rows the page grew; each measurement holds the reader's row
++    // through onChange, and the re-render this queues lands before paint.
+     const wrapper = wrapperRef.current;
+     if (wrapper && prependCommitRef.current) {
+       for (const node of wrapper.querySelectorAll<HTMLElement>("[data-index]")) {
+@@ -1029,47 +1135,9 @@ export function VirtualBubbleList({
+       }
+     }
+     prependCommitRef.current = false;
+-    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+-    const firstKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
+-    const prevFirstKey = prevFirstKeyRef.current;
+-    const prevSnapshot = rowSnapshotRef.current;
+-    prevFirstKeyRef.current = firstKey;
+-    // The rows as measured in this commit, for the next prepend.
+-    rowSnapshotRef.current = snapshotRows();
+-    // Only a prepend (grew or was renamed at the top, some earlier row still
+-    // present). A switch replaces the list (no row survives) — handled by the
+-    // mount scroll-to-bottom. Streaming appends leave the first key unchanged.
+-    if (!scrollEl || prevFirstKey === undefined || firstKey === prevFirstKey) return;
+-    const indexByKey = new Map(bubbles.map((bubble, index) => [rowKey(bubble), index]));
+-    const survivors = prevSnapshot.filter((row) => indexByKey.has(row.key));
+-    const unrenamed = survivors.find((row) => !renamedRowKeysRef.current.has(row.key));
+-    const anchor = unrenamed ?? survivors[0];
+-    // No survivor means a conversation switch, not a prepend.
+-    if (!anchor) return;
+-    // Older history is the opposite of the bottom: release the lock so
+-    // StickToBottom doesn't answer the growth by snapping back down. Every
+-    // prepend, even one that renames the only mounted bubble — a transcript too
+-    // short to scroll fires no scroll event on wheel-up, so nothing else has
+-    // released it by the time the page that makes it scrollable lands.
+-    const c = ctxRef.current;
+-    c.stopScroll();
+-    c.state.isAtBottom = false;
+-    c.state.escapedFromLock = true;
+-    // Offsets are only rebuilt on the next read of the virtual items; read them
+-    // now so the anchor's offset reflects the sizes measured above. Read the raw
+-    // measurement — getOffsetForIndex is a scroll target and clamps to the
+-    // scrollable range, which on a transcript that only just outgrew its
+-    // viewport would shortchange the hold.
+-    virtualizer.getVirtualItems();
+-    const measured = virtualizer.measurementsCache[indexByKey.get(anchor.key)!];
+-    if (measured === undefined) return;
+-    const delta = unrenamed ? measured.start - anchor.start : measured.end - anchor.end;
+-    if (delta <= 0) return;
+-    // A transcript shorter than its viewport has no offset to hold yet.
+-    if (scrollEl.scrollHeight - scrollEl.clientHeight <= 1) return;
+-    // Write the offset through StickToBottom's state so it doesn't read the
+-    // write as a reader scroll.
+-    c.state.scrollTop = scrollEl.scrollTop + delta;
++    holdReaderPosition();
++    // Held by its bottom edge only across the page that grew it.
++    renamedRowKeysRef.current.clear();
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [bubbles, scrollEl, virtualizer]);
+ 
+diff --git a/web/src/components/chat/Transcript.virtualList.test.tsx b/web/src/components/chat/Transcript.virtualList.test.tsx
+index 757090baada785c307c10e783fb5fde6ef2b1c74..ac5c55df8742bd645707df327240858dd915b538 100644
+--- a/web/src/components/chat/Transcript.virtualList.test.tsx
++++ b/web/src/components/chat/Transcript.virtualList.test.tsx
+@@ -272,3 +272,89 @@ it("keeps a renamed top bubble's row across a history prepend", () => {
+     "user:user-1",
+   );
+ });
++
++it("holds the row under the reader while rows above it change height", () => {
++  // Rows the mocked virtualizer reports, list-relative; mutable so a
++  // re-measure or a re-key can be played back through the virtualizer's
++  // onChange, the way a ResizeObserver batch or a mount measurement reaches it.
++  interface Row {
++    key: string;
++    start: number;
++    size: number;
++  }
++  let rows: Row[] = [
++    { key: "user:user-0", start: 0, size: 200 },
++    { key: "user:user-1", start: 216, size: 200 },
++    { key: "user:user-2", start: 432, size: 200 },
++  ];
++  const passThrough = vi.mocked(useVirtualizer).getMockImplementation()!;
++  vi.mocked(useVirtualizer).mockImplementation(
++    (options) =>
++      ({
++        ...passThrough(options),
++        getVirtualItems: () =>
++          rows.map((row, index) => ({
++            index,
++            key: row.key,
++            start: options.scrollMargin! + row.start,
++            size: row.size,
++            end: options.scrollMargin! + row.start + row.size,
++            lane: 0,
++          })),
++        getTotalSize: () => rows.at(-1)!.start + rows.at(-1)!.size,
++      }) as never,
++  );
++  try {
++    const bubbles = ["user-0", "user-1", "user-2"].map((itemId) => ({ ...bubble, itemId }));
++    const view = render(list(false, document.createElement("div"), vi.fn(), false, bubbles));
++    // The hold writes through StickToBottom, so hand it StickToBottom's own scroller.
++    const scroller = view.container.querySelector<HTMLElement>('[role="log"] > div')!;
++    Object.defineProperties(scroller, {
++      scrollTop: { configurable: true, writable: true, value: 216 },
++      clientHeight: { configurable: true, value: 500 },
++      scrollHeight: { configurable: true, value: 1_000 },
++    });
++    scroller.getBoundingClientRect = () => ({ top: 0 }) as DOMRect;
++    // The list sits at the scroller's top, scrolled by 216: its offset is 0.
++    const wrapper = view.container.querySelector<HTMLElement>('[data-index="0"]')!.parentElement!;
++    wrapper.getBoundingClientRect = () => ({ top: -216 }) as DOMRect;
++    view.rerender(list(false, scroller, vi.fn(), false, bubbles));
++    expect(scroller.scrollTop).toBe(216);
++    const virtualizer = vi.mocked(useVirtualizer).mock.results.at(-1)!.value as {
++      shouldAdjustScrollPositionOnItemSizeChange?: () => boolean;
++    };
++    // The hold is the only in-list compensation; the library's own is off.
++    expect(virtualizer.shouldAdjustScrollPositionOnItemSizeChange?.()).toBe(false);
++    const notify = () =>
++      vi.mocked(useVirtualizer).mock.lastCall![0].onChange!(undefined as never, false);
++
++    // The row above the reader grows by 100: the reader's row keeps its place.
++    rows = [
++      { key: "user:user-0", start: 0, size: 300 },
++      { key: "user:user-1", start: 316, size: 200 },
++      { key: "user:user-2", start: 532, size: 200 },
++    ];
++    notify();
++    expect(scroller.scrollTop).toBe(316);
++
++    // It shrinks back: so does the offset.
++    rows = [
++      { key: "user:user-0", start: 0, size: 200 },
++      { key: "user:user-1", start: 216, size: 200 },
++      { key: "user:user-2", start: 432, size: 200 },
++    ];
++    notify();
++    expect(scroller.scrollTop).toBe(216);
++
++    // The reader's row remounts under a new key with the same content: nothing moved.
++    rows = [
++      { key: "user:user-0", start: 0, size: 200 },
++      { key: "assistant:renamed", start: 216, size: 200 },
++      { key: "user:user-2", start: 432, size: 200 },
++    ];
++    notify();
++    expect(scroller.scrollTop).toBe(216);
++  } finally {
++    vi.mocked(useVirtualizer).mockImplementation(passThrough);
++  }
++});

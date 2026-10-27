@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 20 Oct 2026 14:57:38 -0500
+Subject: [PATCH] fix(codex-native): let Codex apply its own Plan and Default
+ mode instructions
+
+Toggling Plan mode, and starting a Default-mode implementation turn,
+sent the configured developer_instructions as the collaboration mode's
+developer_instructions. Codex's app-server treats that field as the
+mode's instructions: a null is filled with the built-in Plan or Default
+preset (normalize_collaboration_mode, present since 0.129), and any
+value replaces it. The configured developer_instructions are a separate
+session setting that these updates never touch. Echoing them therefore
+dropped Plan mode's planning instructions for every agent with authored
+instructions and repeated the authored text in the mode section.
+
+Send null so Codex applies its preset; authored instructions keep
+reaching Codex through config.toml. The unreadable-config guard on the
+Plan toggle only protected the echoed value, so it is removed.
+
+Not upstream yet: a candidate for its own upstream PR; drop this copy
+once an equivalent fix lands.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (fix: Codex keeps its built-in Plan and Default mode instructions; no setting)
+---
+ omnigent/harnesses/codex_native/forwarder.py  |  4 +-
+ omnigent/runner/native_controls.py            | 29 +------
+ .../forwarder/test_instructions.py            | 16 ++--
+ ...st_app_sessions_native_events_lifecycle.py | 82 +++----------------
+ 4 files changed, 25 insertions(+), 106 deletions(-)
+
+diff --git a/omnigent/harnesses/codex_native/forwarder.py b/omnigent/harnesses/codex_native/forwarder.py
+index 78f53850558f2dadfa1afc23e8c3ae7c92bb151b..48295dbbb7d293f722dcc37a45a6426735ad3b15 100644
+--- a/omnigent/harnesses/codex_native/forwarder.py
++++ b/omnigent/harnesses/codex_native/forwarder.py
+@@ -5036,7 +5036,9 @@ def _default_collaboration_mode(
+         "settings": {
+             "model": forwarder_state.model,
+             "reasoning_effort": None,
+-            "developer_instructions": forwarder_state.developer_instructions,
++            # None selects Codex's built-in mode instructions; a value would replace
++            # them. Configured developer_instructions reach Codex separately.
++            "developer_instructions": None,
+         },
+     }
+ 
+diff --git a/omnigent/runner/native_controls.py b/omnigent/runner/native_controls.py
+index fa9ae61d4388d5ad1bae462ef85acb86acf9d36a..3c78732b6a0d98041a3a30dce561ca73898e20b9 100644
+--- a/omnigent/runner/native_controls.py
++++ b/omnigent/runner/native_controls.py
+@@ -791,30 +791,6 @@ def build_native_controls(
+                     "detail": "Codex-native plan-mode update requires a current model.",
+                 },
+             )
+-        from omnigent.harnesses.codex_native.bridge import (
+-            DeveloperInstructionsReadState,
+-            read_codex_config_developer_instructions_state_from_home,
+-        )
+-
+-        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
+-        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
+-            _logger.warning(
+-                "Codex-native plan-mode update skipped for %s: developer_instructions "
+-                "config unreadable — refusing to guess and risk wiping live state.",
+-                conv_id,
+-                extra={"session_id": conv_id},
+-            )
+-            return JSONResponse(
+-                status_code=503,
+-                content={
+-                    "error": "codex_native_settings_update_failed",
+-                    "detail": (
+-                        "Codex-native plan-mode update requires reading the current "
+-                        "developer_instructions config; it could not be read."
+-                    ),
+-                },
+-            )
+-        developer_instructions = _di_read.value
+         return await _handle_codex_native_settings_update(
+             conv_id,
+             {
+@@ -823,7 +799,10 @@ def build_native_controls(
+                     "settings": {
+                         "model": model,
+                         "reasoning_effort": effort,
+-                        "developer_instructions": developer_instructions,
++                        # None selects Codex's built-in Plan/Default instructions; a
++                        # value would replace them. Configured developer_instructions
++                        # reach Codex separately and are unaffected.
++                        "developer_instructions": None,
+                     },
+                 },
+             },
+diff --git a/tests/harnesses/codex_native/forwarder/test_instructions.py b/tests/harnesses/codex_native/forwarder/test_instructions.py
+index 01a9c30936d068720befd6db0dc17262bae61039..fda6e6e39f216c089cef6fa1417121bfeaf80061 100644
+--- a/tests/harnesses/codex_native/forwarder/test_instructions.py
++++ b/tests/harnesses/codex_native/forwarder/test_instructions.py
+@@ -50,14 +50,12 @@ def test_default_collaboration_mode_sends_none_when_confirmed_absent() -> None:
+     assert mode["settings"]["developer_instructions"] is None
+ 
+ 
+-def test_default_collaboration_mode_reuses_current_developer_instructions() -> None:
+-    """A Default-mode ``turn/start`` must not silently wipe developer_instructions.
+-
+-    Guards a self-inflicted overwrite: a ``_default_collaboration_mode`` that
+-    always sends ``developer_instructions: null`` has that null applied
+-    literally by Codex's app-server, clearing whatever
+-    ``build_codex_native_server`` persisted, the instant the user (or the
+-    plan-implementation flow) triggers a Default-mode turn.
++def test_default_collaboration_mode_keeps_codex_mode_instructions() -> None:
++    """A Default-mode ``turn/start`` never replaces Codex's built-in mode instructions.
++
++    Codex's app-server fills a null ``collaborationMode`` instruction with the
++    mode's preset; configured ``developer_instructions`` apply separately, so
++    echoing them here would only drop the preset.
+     """
+     state = fwd._CodexForwarderState()
+     state.model = "gpt-5.4"
+@@ -67,7 +65,7 @@ def test_default_collaboration_mode_reuses_current_developer_instructions() -> N
+     mode = fwd._default_collaboration_mode(state)
+ 
+     assert mode is not None
+-    assert mode["settings"]["developer_instructions"] == "Be a concise coding assistant."
++    assert mode["settings"]["developer_instructions"] is None
+ 
+ 
+ def test_note_thread_settings_updated_whitespace_nested_value_not_confirmed() -> None:
+diff --git a/tests/runner/test_app_sessions_native_events_lifecycle.py b/tests/runner/test_app_sessions_native_events_lifecycle.py
+index 75714519ddf55a002c606d6be58fbe9d5aae7bc6..ba99c175ccc5850f5dc6c09346fa644430d4c490 100644
+--- a/tests/runner/test_app_sessions_native_events_lifecycle.py
++++ b/tests/runner/test_app_sessions_native_events_lifecycle.py
+@@ -913,20 +913,18 @@ async def test_codex_native_concurrent_settings_use_the_applied_model(
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_events_codex_native_plan_mode_change_preserves_developer_instructions(
++async def test_events_codex_native_plan_mode_change_keeps_codex_mode_instructions(
+     monkeypatch: pytest.MonkeyPatch,
+     tmp_path: Path,
+ ) -> None:
+     """
+-    A plan-mode toggle must not silently wipe ``developer_instructions``.
+-
+-    Without the current-value read, the plan-mode collaboration-mode
+-    settings send always carried
+-    ``developer_instructions: null``, clearing whatever
+-    ``build_codex_native_server`` had persisted into the bridge's private
+-    ``config.toml`` the moment a user toggled Plan mode. This drives the
+-    real HTTP path end-to-end and asserts the current value is read back
+-    and threaded through to ``thread/settings/update``.
++    A plan-mode toggle lets Codex apply its built-in Plan instructions.
++
++    Codex's app-server fills a null ``collaborationMode`` instruction with the
++    mode's preset and treats any value as a replacement for it, while the
++    configured ``developer_instructions`` apply separately. Echoing the
++    configured value would drop the Plan preset, so the toggle sends null and
++    leaves the private ``config.toml`` as written.
+     """
+     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+     from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
+@@ -1003,74 +1001,16 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
+                     "settings": {
+                         "model": "gpt-5.4",
+                         "reasoning_effort": None,
+-                        "developer_instructions": "Be a concise coding assistant.",
++                        "developer_instructions": None,
+                     },
+                 },
+             },
+         ),
+     ], fake_client.requests
+-
+-
+-@pytest.mark.asyncio
+-async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
+-    monkeypatch: pytest.MonkeyPatch,
+-    tmp_path: Path,
+-) -> None:
+-    """
+-    A plan-mode toggle must fail loudly (503), not guess, when the private
+-    ``config.toml`` holding ``developer_instructions`` can't be read.
+-
+-    Regression guard: collapsing "unreadable" into "genuinely absent" would
+-    send ``developer_instructions: null`` on a transient read glitch,
+-    silently wiping live state — the same class of bug this whole codex
+-    plan-mode preservation feature exists to prevent. The tri-state read
+-    must refuse to guess instead.
+-    """
+-    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
+-
+-    conv_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
+-    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+-    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+-    codex_home = codex_home_for_bridge_dir(bridge_dir)
+-    codex_home.mkdir(parents=True)
+-    (codex_home / "config.toml").write_bytes(b"\xff\xfe not valid utf-8")
+-    codex_native_bridge.write_bridge_state(
+-        bridge_dir,
+-        codex_native_bridge.CodexNativeBridgeState(
+-            session_id=conv_id,
+-            socket_path="ws://127.0.0.1:43210",
+-            thread_id="thread_codex",
+-            codex_home=str(codex_home),
+-            active_turn_id=None,
+-        ),
++    assert codex_native_bridge.read_codex_config_developer_instructions(bridge_dir) == (
++        "Be a concise coding assistant."
+     )
+ 
+-    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
+-
+-    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+-        del args, kwargs
+-
+-    monkeypatch.setattr(
+-        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+-    )
+-
+-    app, _ = await _build_app_for_spec(codex_native_spec)
+-
+-    async with _runner_client(app) as client:
+-        create_resp = await client.post(
+-            "/v1/sessions",
+-            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+-        )
+-        assert create_resp.status_code == 201, create_resp.text
+-
+-        resp = await client.post(
+-            f"/v1/sessions/{conv_id}/events",
+-            json={"type": "plan_mode_change", "enabled": True},
+-        )
+-
+-    assert resp.status_code == 503, resp.text
+-    assert resp.json()["error"] == "codex_native_settings_update_failed"
+-
+ 
+ @pytest.mark.asyncio
+ async def test_events_codex_native_model_change_without_bridge_fails_loud(

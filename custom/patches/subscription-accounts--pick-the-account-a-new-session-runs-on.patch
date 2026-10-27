@@ -1,0 +1,1108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 29 Sep 2026 14:35:50 +0000
+Subject: [PATCH] feat(web): pick the account a new session runs on
+
+Carried on custom while the design is discussed on upstream issue #503;
+see docs/providers.md. Drop it once upstream has an equivalent.
+
+With several providers for one harness on a host, e.g. two Claude Max
+accounts and a Databricks workspace, the new-session composer had no way
+to choose between them.
+
+An Account section in the harness menu, next to Model and Effort, lists the
+host's providers for the selected harness and sends the pick as
+provider_override. It stays hidden unless there is more than one choice,
+defaults to the host's default provider, drops a pick that no longer applies
+after switching host or harness family, and shows accounts that are not
+signed in as disabled. It lives in the menu rather than the composer toolbar
+so the toolbar keeps room for Send on phones.
+
+Project settings gain an Account field, stored as `provider` in the
+project's client-owned config. New sessions in the project start on that
+account and the user can still pick another. Where the host can't run the
+harness on it, or it isn't signed in, the session uses the host default
+and the composer shows why instead of switching accounts silently.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (documented with its series in docs/providers.md)
+---
+ .../composer/accountSection.test.tsx          | 123 ++++++++++++++++++
+ .../components/composer/accountSection.tsx    |  89 +++++++++++++
+ web/src/hooks/useHostProviders.ts             |  36 +++++
+ web/src/lib/projectsApi.ts                    |   6 +
+ web/src/lib/sessionProvider.test.ts           |  83 ++++++++++++
+ web/src/lib/sessionProvider.ts                |  61 +++++++++
+ web/src/shell/NewChatDialog.flow.test.tsx     |  35 +++++
+ .../NewChatDialog.projectCreate.test.tsx      |   3 +
+ .../NewChatDialog.projectPrefill.test.tsx     | 112 ++++++++++++++++
+ web/src/shell/NewChatDialog.test.tsx          |   3 +
+ web/src/shell/NewChatDialog.tsx               |  65 +++++++--
+ web/src/shell/ProjectSettingsDialog.test.tsx  |  99 ++++++++++++++
+ web/src/shell/ProjectSettingsDialog.tsx       |  62 ++++++++-
+ web/src/shell/projectPrefill.ts               |   3 +
+ 14 files changed, 768 insertions(+), 12 deletions(-)
+ create mode 100644 web/src/components/composer/accountSection.test.tsx
+ create mode 100644 web/src/components/composer/accountSection.tsx
+ create mode 100644 web/src/hooks/useHostProviders.ts
+ create mode 100644 web/src/lib/sessionProvider.test.ts
+ create mode 100644 web/src/lib/sessionProvider.ts
+
+diff --git a/web/src/components/composer/accountSection.test.tsx b/web/src/components/composer/accountSection.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac58bf91a9037666bedc25f21aaecebd70a8c221
+--- /dev/null
++++ b/web/src/components/composer/accountSection.test.tsx
+@@ -0,0 +1,123 @@
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
++import type { HostProvider } from "@/hooks/useHostProviders";
++import {
++  buildAccountSection,
++  currentProvider,
++  inPlaceSwitchBlocked,
++  SEPARATE_LOGIN_HINT,
++} from "./accountSection";
++import { ComposerConfigSections, type ComposerConfigSection } from "./ComposerConfigSections";
++
++afterEach(cleanup);
++
++const MAX1: HostProvider = {
++  name: "claude-max1",
++  kind: "subscription",
++  label: "claude CLI login (~/.claude-max1)",
++  default: true,
++  ready: true,
++  switch_group: "claude-accounts",
++};
++const MAX2: HostProvider = {
++  ...MAX1,
++  name: "claude-max2",
++  label: "claude CLI login (~/.claude-max2)",
++  default: false,
++};
++// Older hosts omit switch_group entirely.
++const DBX: HostProvider = {
++  name: "databricks",
++  kind: "databricks",
++  label: "Databricks profile alt",
++  default: false,
++  ready: true,
++};
++
++function renderSection(section: ComposerConfigSection | undefined) {
++  return render(
++    <DropdownMenu open>
++      <DropdownMenuContent>
++        <ComposerConfigSections extra={section ? [section] : []} />
++      </DropdownMenuContent>
++    </DropdownMenu>,
++  );
++}
++
++describe("buildAccountSection", () => {
++  it("is omitted without a real choice", () => {
++    expect(
++      buildAccountSection({ providers: [MAX1], value: null, testIdPrefix: "t", onSelect: vi.fn() }),
++    ).toBeUndefined();
++  });
++
++  it("checks the default and maps picks to a name, or null for the default", () => {
++    const onSelect = vi.fn();
++    renderSection(
++      buildAccountSection({
++        providers: [MAX2, MAX1, DBX],
++        value: null,
++        testIdPrefix: "t",
++        onSelect,
++      }),
++    );
++
++    expect(screen.getByTestId("t-accounts")).toHaveTextContent(/^Account/);
++    const first = screen.getAllByRole("menuitemcheckbox")[0];
++    expect(first).toHaveTextContent("Default (claude-max1)");
++    expect(first).toHaveAttribute("aria-checked", "true");
++    fireEvent.click(screen.getByTestId("t-account-claude-max2"));
++    expect(onSelect).toHaveBeenLastCalledWith("claude-max2");
++  });
++
++  it("sends null when going back to the default", () => {
++    const onSelect = vi.fn();
++    renderSection(
++      buildAccountSection({
++        providers: [MAX1, MAX2],
++        value: "claude-max2",
++        testIdPrefix: "t",
++        onSelect,
++      }),
++    );
++
++    expect(screen.getByTestId("t-account-claude-max2")).toHaveAttribute("aria-checked", "true");
++    fireEvent.click(screen.getByTestId("t-account-claude-max1"));
++    expect(onSelect).toHaveBeenLastCalledWith(null);
++  });
++
++  it("disables an account that is not signed in", () => {
++    renderSection(
++      buildAccountSection({
++        providers: [MAX1, { ...MAX2, ready: false }],
++        value: null,
++        testIdPrefix: "t",
++        onSelect: vi.fn(),
++      }),
++    );
++
++    const option = screen.getByTestId("t-account-claude-max2");
++    expect(option).toHaveAttribute("data-disabled");
++    expect(option).toHaveTextContent("not signed in");
++  });
++});
++
++describe("inPlaceSwitchBlocked", () => {
++  it("allows only the running account's switch group", () => {
++    const current = currentProvider([MAX1, MAX2, DBX], null);
++    expect(current).toBe(MAX1);
++    expect(inPlaceSwitchBlocked(MAX1, current)).toBeUndefined();
++    expect(inPlaceSwitchBlocked(MAX2, current)).toBeUndefined();
++    expect(inPlaceSwitchBlocked(DBX, current)).toBe(SEPARATE_LOGIN_HINT);
++    expect(inPlaceSwitchBlocked({ ...MAX2, switch_group: "other" }, current)).toBe(
++      SEPARATE_LOGIN_HINT,
++    );
++  });
++
++  it("blocks every other account when the running one has no group", () => {
++    const current = currentProvider([MAX1, MAX2, DBX], "databricks");
++    expect(inPlaceSwitchBlocked(MAX1, current)).toBe(SEPARATE_LOGIN_HINT);
++    expect(inPlaceSwitchBlocked(DBX, current)).toBeUndefined();
++  });
++});
+diff --git a/web/src/components/composer/accountSection.tsx b/web/src/components/composer/accountSection.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4643ed7b0bcc8ee8699163e01ea6eb3af6304586
+--- /dev/null
++++ b/web/src/components/composer/accountSection.tsx
+@@ -0,0 +1,89 @@
++/**
++ * Build the "Account" section of the harness menu: which of the host's
++ * providers (e.g. one of several Claude subscriptions) a session runs on.
++ *
++ * Shared by the new-session dialog (picks the account a session starts on) and
++ * the in-session composer (switches a running session), so both list the same
++ * rows, labels and disabled states.
++ */
++import type { HostProvider } from "@/hooks/useHostProviders";
++import type { ComposerConfigSection } from "./ComposerConfigSections";
++
++export const SEPARATE_LOGIN_HINT = "Separate login — start a new session";
++
++/** The provider a session runs on: its override, else the host default. */
++export function currentProvider(
++  providers: readonly HostProvider[],
++  override: string | null | undefined,
++): HostProvider | undefined {
++  return override != null
++    ? providers.find((p) => p.name === override)
++    : providers.find((p) => p.default);
++}
++
++/**
++ * Why a running session can't move onto `provider` in place, or `undefined`
++ * when it can. Only providers sharing the current one's switch group share a
++ * login and conversation store.
++ */
++export function inPlaceSwitchBlocked(
++  provider: HostProvider,
++  current: HostProvider | undefined,
++): string | undefined {
++  if (provider === current) return undefined;
++  const group = current?.switch_group ?? null;
++  return group !== null && provider.switch_group === group ? undefined : SEPARATE_LOGIN_HINT;
++}
++
++export function buildAccountSection({
++  providers,
++  value,
++  testIdPrefix,
++  onSelect,
++  disabled = false,
++  blockedReason,
++}: {
++  providers: readonly HostProvider[];
++  /** The chosen provider name; `null` = the host default. */
++  value: string | null;
++  /** e.g. `new-chat-landing-agent` or `composer-agent`. */
++  testIdPrefix: string;
++  /** Called with the picked provider name, or `null` for the host default. */
++  onSelect: (name: string | null) => void;
++  disabled?: boolean;
++  /** Extra reason a ready row can't be picked (shown as its hint). */
++  blockedReason?: (provider: HostProvider) => string | undefined;
++}): ComposerConfigSection | undefined {
++  if (providers.length < 2) return undefined;
++  const selected = currentProvider(providers, value);
++  const ordered = [...providers.filter((p) => p.default), ...providers.filter((p) => !p.default)];
++  return {
++    testId: `${testIdPrefix}-accounts`,
++    header: "Account",
++    choices: ordered.map((provider) => {
++      const checked = provider === selected;
++      const blocked = provider.ready ? blockedReason?.(provider) : undefined;
++      const hint = !provider.ready
++        ? `${provider.label} · not signed in`
++        : (blocked ?? provider.label);
++      return {
++        key: provider.name,
++        label: (
++          <span className="flex min-w-0 flex-col">
++            <span className="truncate">
++              {provider.default ? `Default (${provider.name})` : provider.name}
++            </span>
++            <span className="truncate text-xs text-muted-foreground">{hint}</span>
++          </span>
++        ),
++        checked,
++        disabled: disabled || !provider.ready || blocked !== undefined,
++        onSelect: checked ? undefined : () => onSelect(provider.default ? null : provider.name),
++        testId: `${testIdPrefix}-account-${provider.name}`,
++        title: blocked ? `${provider.label} · ${blocked}` : hint,
++        className: "whitespace-normal [&>span:last-child]:min-w-0",
++        data: { "data-provider": provider.name },
++      };
++    }),
++  };
++}
+diff --git a/web/src/hooks/useHostProviders.ts b/web/src/hooks/useHostProviders.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..846aa5ce339828f2141756f2ce92f0623e0870af
+--- /dev/null
++++ b/web/src/hooks/useHostProviders.ts
+@@ -0,0 +1,36 @@
++import { useQuery } from "@tanstack/react-query";
++import { authenticatedFetch } from "@/lib/identity";
++
++/** A provider a host can run a harness on; never carries credentials. */
++export interface HostProvider {
++  name: string;
++  kind: string;
++  /** Where it authenticates, e.g. "claude CLI login (~/.claude-max2)". */
++  label: string;
++  /** Sessions use it when none is chosen. */
++  default: boolean;
++  /** False when a subscription account is not signed in on the host. */
++  ready: boolean;
++  /**
++   * Providers sharing a non-null group can swap in place within a running
++   * session; absent (older hosts) reads as `null`, i.e. no in-place switch.
++   */
++  switch_group?: string | null;
++}
++
++/** Providers the selected host can run `harness` on, for the Account menu section. */
++export function useHostProviders(hostId: string | null, harness: string | null) {
++  return useQuery({
++    queryKey: ["host-providers", hostId, harness],
++    queryFn: async (): Promise<HostProvider[]> => {
++      const res = await authenticatedFetch(
++        `/v1/hosts/${encodeURIComponent(hostId as string)}/providers?harness=${encodeURIComponent(harness as string)}`,
++      );
++      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
++      const body = (await res.json()) as { providers?: HostProvider[] };
++      return body.providers ?? [];
++    },
++    enabled: hostId !== null && harness !== null,
++    staleTime: 30_000,
++  });
++}
+diff --git a/web/src/lib/projectsApi.ts b/web/src/lib/projectsApi.ts
+index 0f7867734f4447179c5dc2741cfccfb9810f6721..d0653595336fdec6386f6b6e6de16ded01eca0ee 100644
+--- a/web/src/lib/projectsApi.ts
++++ b/web/src/lib/projectsApi.ts
+@@ -51,6 +51,12 @@ export interface ProjectConfig {
+    * the harness's own configured default.
+    */
+   model?: string;
++  /**
++   * Default account for new sessions: the name of a `providers:` entry on the
++   * session's host (e.g. "claude-max2"). Where the host can't run the chosen
++   * harness on it, the composer falls back to the host default and says so.
++   */
++  provider?: string;
+ }
+ 
+ /** A first-class project. Mirrors the `ProjectObject` response shape. */
+diff --git a/web/src/lib/sessionProvider.test.ts b/web/src/lib/sessionProvider.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..55b23fc49ed8525eca1cf9d133c54984e538e203
+--- /dev/null
++++ b/web/src/lib/sessionProvider.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, it } from "vitest";
++import type { HostProvider } from "@/hooks/useHostProviders";
++import { resolveSessionProvider } from "./sessionProvider";
++
++const MAX1: HostProvider = {
++  name: "max1",
++  kind: "subscription",
++  label: "a",
++  default: true,
++  ready: true,
++};
++const MAX2: HostProvider = { ...MAX1, name: "max2", label: "b", default: false };
++
++const base = { userPick: undefined, projectProvider: undefined, accountsApply: true };
++
++describe("resolveSessionProvider", () => {
++  it("runs on the host default with no pick and no project account", () => {
++    expect(resolveSessionProvider({ ...base, providers: [MAX1, MAX2] })).toEqual({
++      override: null,
++      projectFallback: null,
++    });
++  });
++
++  it("uses the project's account when the host lists it", () => {
++    expect(
++      resolveSessionProvider({ ...base, projectProvider: "max2", providers: [MAX1, MAX2] }),
++    ).toEqual({ override: "max2", projectFallback: null });
++  });
++
++  it("sends no override when the project's account is the host default", () => {
++    expect(
++      resolveSessionProvider({ ...base, projectProvider: "max1", providers: [MAX1, MAX2] }),
++    ).toEqual({ override: null, projectFallback: null });
++  });
++
++  it("lets the user's pick win over the project's account", () => {
++    expect(
++      resolveSessionProvider({
++        ...base,
++        userPick: null,
++        projectProvider: "max2",
++        providers: [MAX1, MAX2],
++      }),
++    ).toEqual({ override: null, projectFallback: null });
++  });
++
++  it("falls back with a reason when the host can't run the harness on it", () => {
++    const choice = resolveSessionProvider({
++      ...base,
++      projectProvider: "codex-alt",
++      providers: [MAX1, MAX2],
++    });
++    expect(choice.override).toBeNull();
++    expect(choice.projectFallback).toMatch(/"codex-alt" isn't available for this harness/);
++  });
++
++  it("falls back with a reason when the account is not signed in", () => {
++    const choice = resolveSessionProvider({
++      ...base,
++      projectProvider: "max2",
++      providers: [MAX1, { ...MAX2, ready: false }],
++    });
++    expect(choice.override).toBeNull();
++    expect(choice.projectFallback).toMatch(/isn't signed in/);
++  });
++
++  it("sends the project's account while the list loads, for the host to check", () => {
++    expect(
++      resolveSessionProvider({ ...base, projectProvider: "max2", providers: undefined }),
++    ).toEqual({ override: "max2", projectFallback: null });
++  });
++
++  it("says so when accounts don't apply to the session", () => {
++    const choice = resolveSessionProvider({
++      ...base,
++      projectProvider: "max2",
++      providers: undefined,
++      accountsApply: false,
++    });
++    expect(choice.override).toBeNull();
++    expect(choice.projectFallback).toMatch(/doesn't apply to sandbox or routed sessions/);
++  });
++});
+diff --git a/web/src/lib/sessionProvider.ts b/web/src/lib/sessionProvider.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa77a81add58d561bad0df8e369c7d7c1899b8a9
+--- /dev/null
++++ b/web/src/lib/sessionProvider.ts
+@@ -0,0 +1,61 @@
++import type { HostProvider } from "@/hooks/useHostProviders";
++
++export interface SessionProviderChoice {
++  /** `provider_override` to send; `null` runs on the host's default. */
++  override: string | null;
++  /** Why the project's default account is not used, shown under the composer. */
++  projectFallback: string | null;
++}
++
++/**
++ * Resolve the account a new session runs on. The user's pick wins; otherwise a
++ * project's default account applies where the host can run the harness on it,
++ * and falls back to the host default with a visible reason where it can't.
++ */
++export function resolveSessionProvider({
++  userPick,
++  projectProvider,
++  providers,
++  accountsApply,
++}: {
++  /** `undefined` = no pick yet; `null` = the user picked the host default. */
++  userPick: string | null | undefined;
++  /** The project's stored `provider`, if any. */
++  projectProvider: string | undefined;
++  /** The host's providers for the harness; `undefined` until listed. */
++  providers: HostProvider[] | undefined;
++  /** False for a sandbox or a routed harness, where host accounts don't apply. */
++  accountsApply: boolean;
++}): SessionProviderChoice {
++  const project = userPick === undefined ? projectProvider?.trim() || null : null;
++  if (!accountsApply) {
++    return {
++      override: null,
++      projectFallback: project
++        ? `Project account "${project}" doesn't apply to sandbox or routed sessions; using the default account.`
++        : null,
++    };
++  }
++  if (userPick !== undefined) {
++    // A pick from another host or harness family no longer applies.
++    const valid = providers?.some((p) => p.name === userPick && !p.default) ?? false;
++    return { override: valid ? userPick : null, projectFallback: null };
++  }
++  if (project === null) return { override: null, projectFallback: null };
++  // Not listed yet: send the project's account and let the host reject it loudly.
++  if (providers === undefined) return { override: project, projectFallback: null };
++  const match = providers.find((p) => p.name === project);
++  if (!match) {
++    return {
++      override: null,
++      projectFallback: `Project account "${project}" isn't available for this harness on this host; using the default account.`,
++    };
++  }
++  if (!match.ready) {
++    return {
++      override: null,
++      projectFallback: `Project account "${project}" isn't signed in on this host; using the default account.`,
++    };
++  }
++  return { override: match.default ? null : match.name, projectFallback: null };
++}
+diff --git a/web/src/shell/NewChatDialog.flow.test.tsx b/web/src/shell/NewChatDialog.flow.test.tsx
+index 968c4784a9195f30be1fe542f12c8c9be9724327..d8a1aa8bf4d2560a539a0e672c0d36b19e7c6840 100644
+--- a/web/src/shell/NewChatDialog.flow.test.tsx
++++ b/web/src/shell/NewChatDialog.flow.test.tsx
+@@ -46,6 +46,7 @@ vi.mock("@/lib/mcpRegistry", () => ({
+   authorizeRegistryService: vi.fn(),
+   registryRequest: vi.fn(),
+ }));
++import { useHostProviders } from "@/hooks/useHostProviders";
+ import { composerContextToLabels } from "@/lib/composerContextAdapters";
+ import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
+ import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+@@ -132,6 +133,9 @@ vi.mock("@/lib/identity", () => ({
+   getCurrentUserId: vi.fn(() => null),
+   resolveIdentity: vi.fn(async () => null),
+ }));
++vi.mock("@/hooks/useHostProviders", () => ({
++  useHostProviders: vi.fn(() => ({ data: [] })),
++}));
+ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: vi.fn(),
+   useHostModelOptions: vi.fn(() => ({
+@@ -808,6 +812,37 @@ describe("NewChatLandingScreen create flow", () => {
+     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+   });
+ 
++  it("posts the account picked for the session as provider_override", async () => {
++    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
++    vi.mocked(useHostProviders).mockReturnValue({
++      data: [
++        { name: "max1", kind: "subscription", label: "claude", default: true, ready: true },
++        { name: "max2", kind: "subscription", label: "claude", default: false, ready: true },
++      ],
++    } as unknown as ReturnType<typeof useHostProviders>);
++    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
++      ok: true,
++      json: async () => ({ id: "conv_new" }),
++    } as unknown as Response);
++
++    renderLanding();
++    await waitForWorkspaceSeed();
++    // The account choice lives in the harness menu, not a separate toolbar button.
++    expect(screen.queryByTestId("new-chat-landing-agent-accounts")).toBeNull();
++    openAgentModels("ag_native");
++    fireEvent.click(screen.getByTestId("new-chat-landing-agent-account-max2"));
++    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-accounts"), { key: "Escape" });
++    typeMessage("inspect the repo");
++    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
++
++    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
++    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
++    expect(JSON.parse(init.body as string).provider_override).toBe("max2");
++    vi.mocked(useHostProviders).mockReturnValue({ data: [] } as unknown as ReturnType<
++      typeof useHostProviders
++    >);
++  });
++
+   it("resolves a navigate-first create from the exact-token top-level pushed row", async () => {
+     let resolveCreate!: (response: Response) => void;
+     vi.mocked(authenticatedFetch).mockReturnValueOnce(
+diff --git a/web/src/shell/NewChatDialog.projectCreate.test.tsx b/web/src/shell/NewChatDialog.projectCreate.test.tsx
+index 6deb15b253c328724754135f423688fe162e9ac7..b580b49ce8efeb18525b797bb019f157c31fcbb1 100644
+--- a/web/src/shell/NewChatDialog.projectCreate.test.tsx
++++ b/web/src/shell/NewChatDialog.projectCreate.test.tsx
+@@ -88,6 +88,9 @@ vi.mock("@/components/ui/toast", async (importOriginal) => ({
+   ...(await importOriginal<typeof ToastModule>()),
+   showToast: vi.fn(),
+ }));
++vi.mock("@/hooks/useHostProviders", () => ({
++  useHostProviders: vi.fn(() => ({ data: [] })),
++}));
+ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: vi.fn(),
+   useHostModelOptions: vi.fn(() => ({ data: [] })),
+diff --git a/web/src/shell/NewChatDialog.projectPrefill.test.tsx b/web/src/shell/NewChatDialog.projectPrefill.test.tsx
+index 1935046833d9b2a96c9be090efa8edf976e932f5..3b9f1fc9b5334485124764e1f7cc6817fce75b4a 100644
+--- a/web/src/shell/NewChatDialog.projectPrefill.test.tsx
++++ b/web/src/shell/NewChatDialog.projectPrefill.test.tsx
+@@ -38,6 +38,7 @@ import type { ReactNode } from "react";
+ import { authenticatedFetch } from "@/lib/identity";
+ import type { Host } from "@/hooks/useHosts";
+ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
++import { useHostProviders, type HostProvider } from "@/hooks/useHostProviders";
+ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+ import type { ProjectConfig } from "@/lib/projectsApi";
+@@ -76,6 +77,9 @@ vi.mock("@/lib/identity", () => ({
+   getCurrentUserId: vi.fn(() => null),
+   resolveIdentity: vi.fn(async () => null),
+ }));
++vi.mock("@/hooks/useHostProviders", () => ({
++  useHostProviders: vi.fn(() => ({ data: [] })),
++}));
+ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: vi.fn(),
+   useHostModelOptions: vi.fn(() => ({ data: [] })),
+@@ -1128,3 +1132,111 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
+     expect(body.git).toBeUndefined();
+   });
+ });
++
++describe("NewChatLandingScreen project account", () => {
++  const MAX1: HostProvider = {
++    name: "max1",
++    kind: "subscription",
++    label: "claude CLI login (~/.claude)",
++    default: true,
++    ready: true,
++  };
++  const MAX2: HostProvider = { ...MAX1, name: "max2", label: "~/.claude-max2", default: false };
++
++  function setHostProviders(data: HostProvider[] | undefined): void {
++    vi.mocked(useHostProviders).mockReturnValue({ data } as ReturnType<typeof useHostProviders>);
++  }
++
++  afterEach(() => setHostProviders([]));
++
++  // Accounts are a Claude feature, so these run on the Claude Code harness.
++  beforeEach(() => {
++    vi.mocked(useAvailableAgents).mockReturnValue({
++      data: [
++        agent({
++          id: "ag_claude",
++          name: "claude-native-ui",
++          display_name: "Claude Code",
++          harness: "claude-native",
++        }),
++      ],
++    } as ReturnType<typeof useAvailableAgents>);
++    vi.mocked(useHostModelOptions).mockReturnValue({
++      data: [{ id: "opus", displayName: "Opus" }],
++    } as ReturnType<typeof useHostModelOptions>);
++  });
++
++  /** Open the harness menu's config page, where the Account section lives. */
++  function openAccounts(): void {
++    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
++    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-ag_claude"));
++  }
++
++  function closeAccounts(): void {
++    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-accounts"), { key: "Escape" });
++  }
++
++  function expectCheckedAccount(name: string): void {
++    expect(screen.getByTestId(`new-chat-landing-agent-account-${name}`)).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++  }
++
++  it("pre-selects the project's account and posts it as provider_override", async () => {
++    setHostProviders([MAX1, MAX2]);
++    setProjectConfig({ host_id: "host_1", workspace: REPO, provider: "max2" });
++    renderLanding();
++
++    await waitFor(() => expect(screen.getByTestId("new-chat-landing-agent-select")).toBeEnabled());
++    openAccounts();
++    expectCheckedAccount("max2");
++    closeAccounts();
++    expect(screen.queryByTestId("new-chat-landing-project-account-fallback")).toBeNull();
++    const body = await submitAndReadBody();
++    expect(body.provider_override).toBe("max2");
++  });
++
++  it("lets the user override the project's account", async () => {
++    setHostProviders([MAX1, MAX2]);
++    setProjectConfig({ host_id: "host_1", workspace: REPO, provider: "max2" });
++    renderLanding();
++
++    await waitFor(() => expect(screen.getByTestId("new-chat-landing-agent-select")).toBeEnabled());
++    openAccounts();
++    fireEvent.click(screen.getByTestId("new-chat-landing-agent-account-max1"));
++    expectCheckedAccount("max1");
++    closeAccounts();
++    const body = await submitAndReadBody();
++    expect("provider_override" in body).toBe(false);
++  });
++
++  it("falls back to the default with a visible hint when the host doesn't list it", async () => {
++    setHostProviders([MAX1, MAX2]);
++    setProjectConfig({ host_id: "host_1", workspace: REPO, provider: "codex-alt" });
++    renderLanding();
++
++    expect(
++      await screen.findByTestId("new-chat-landing-project-account-fallback"),
++    ).toHaveTextContent(/"codex-alt" isn't available for this harness on this host/);
++    openAccounts();
++    expectCheckedAccount("max1");
++    closeAccounts();
++    const body = await submitAndReadBody();
++    expect("provider_override" in body).toBe(false);
++  });
++
++  it("keeps today's behaviour for a project without an account", async () => {
++    setHostProviders([MAX1, MAX2]);
++    setProjectConfig({ host_id: "host_1", workspace: REPO });
++    renderLanding();
++
++    await waitFor(() => expect(screen.getByTestId("new-chat-landing-agent-select")).toBeEnabled());
++    openAccounts();
++    expectCheckedAccount("max1");
++    closeAccounts();
++    expect(screen.queryByTestId("new-chat-landing-project-account-fallback")).toBeNull();
++    const body = await submitAndReadBody();
++    expect("provider_override" in body).toBe(false);
++  });
++});
+diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
+index 951852a3ad05c4fa3b98b7fe35ec11f6e0d8a260..5a4853f2d2a8fe97a35ff088d5e2dc17e6505f52 100644
+--- a/web/src/shell/NewChatDialog.test.tsx
++++ b/web/src/shell/NewChatDialog.test.tsx
+@@ -195,6 +195,9 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+   getDesktopFeatures: vi.fn(async () => null),
+   connectArcaHost: vi.fn(async () => ({ ok: false })),
+ }));
++vi.mock("@/hooks/useHostProviders", () => ({
++  useHostProviders: vi.fn(() => ({ data: [] })),
++}));
+ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: vi.fn(),
+   useHostModelOptions: vi.fn(),
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index f743bf8afdc356561f6d4743993b098e08ef5f88..0fd2c9397e68ec13e86d541f76589d54a473ee05 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -271,6 +271,9 @@ import {
+   useSandboxModelOptions,
+   useSandboxUnsupportedAgents,
+ } from "@/hooks/useSandboxModelOptions";
++import { useHostProviders } from "@/hooks/useHostProviders";
++import { buildAccountSection } from "@/components/composer/accountSection";
++import { resolveSessionProvider } from "@/lib/sessionProvider";
+ import { useSkills } from "@/hooks/useSkills";
+ import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+@@ -2239,6 +2242,7 @@ export function NewChatLandingScreen() {
+       agentId: c.agent_id,
+       useWorktree: c.use_worktree,
+       model: c.model,
++      provider: c.provider,
+     };
+   }, [
+     projectParam,
+@@ -3457,10 +3461,6 @@ export function NewChatLandingScreen() {
+     const { [AUTO_HARNESS_ID]: _dropped, ...rest } = brainHarnessLabelsAll;
+     return rest;
+   }, [brainHarnessLabelsAll, brainRoutable]);
+-  const isEntryConfigurable = (agent: AvailableAgent) =>
+-    (sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
+-    agentHasModelSettings(agent) ||
+-    agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
+   // Only an eligible harness can display active per-turn Smart Routing.
+   const routingOn = smartRoutingEligible && costControlMode === "on";
+   // Both fully-auto flavors own harness and model, but only top-level Smart
+@@ -3917,6 +3917,38 @@ export function NewChatLandingScreen() {
+     setCostControlMode(null);
+     rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
+   };
++  const skillsHarness = autoRoutingSelected
++    ? null
++    : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
++  // Accounts live on the host, so a sandbox or a routed harness offers none.
++  const accountsApply = !sandboxSelected && !smartRoutingHarnessSelected && !autoRoutingSelected;
++  const accountHarness = accountsApply ? skillsHarness : null;
++  const { data: listedHostProviders } = useHostProviders(selectedHostId, accountHarness);
++  const hostProviders = listedHostProviders ?? [];
++  // The user's pick is scoped to the project it was made in, so another
++  // project's default account takes over after an in-place switch.
++  const [providerPick, setProviderPick] = useState<{
++    project: string;
++    name: string | null;
++  } | null>(null);
++  const { override: effectiveProviderOverride, projectFallback: projectAccountFallback } =
++    resolveSessionProvider({
++      userPick: providerPick?.project === projectParam ? providerPick.name : undefined,
++      projectProvider: prefillConfig?.provider,
++      providers: accountHarness !== null ? listedHostProviders : undefined,
++      accountsApply,
++    });
++  const accountSection = buildAccountSection({
++    providers: hostProviders,
++    value: effectiveProviderOverride,
++    testIdPrefix: "new-chat-landing-agent",
++    onSelect: (name) => setProviderPick({ project: projectParam, name }),
++    disabled: creating,
++  });
++  const isEntryConfigurable = (agent: AvailableAgent) =>
++    (agent.id === effectiveAgentId && (sandboxHasModelCatalog || accountSection !== undefined)) ||
++    agentHasModelSettings(agent) ||
++    agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
+   const selectedConfigContent =
+     selectedAgent && isEntryConfigurable(selectedAgent) ? (
+       <>
+@@ -4098,16 +4130,17 @@ export function NewChatLandingScreen() {
+                 }
+               : undefined
+           }
+-          extra={
+-            pickerFusion !== undefined && fusionSelected && !routingOn
++          extra={[
++            ...(pickerFusion !== undefined && fusionSelected && !routingOn
+               ? buildFusionSections({
+                   descriptor: pickerFusion,
+                   modelUid: fusionModelUid,
+                   testIdPrefix: "new-chat-landing-agent",
+                   onChange: selectFusionModel,
+                 })
+-              : undefined
+-          }
++              : []),
++            ...(accountSection ? [accountSection] : []),
++          ]}
+         />
+       </>
+     ) : null;
+@@ -4830,9 +4863,6 @@ export function NewChatLandingScreen() {
+   const sandboxRepoValid =
+     sandboxRepoSelections.every((r) => isValidSandboxRepoUrl(r.url)) && !sandboxRepoOverCap;
+ 
+-  const skillsHarness = autoRoutingSelected
+-    ? null
+-    : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
+   const skillsUnavailableMessage = sandboxSelected
+     ? "Host skills will be available after the sandbox starts."
+     : selectedAgent?.id === PENDING_AGENT_ID
+@@ -5250,6 +5280,8 @@ export function NewChatLandingScreen() {
+     { label: selectedAgentHasAdvancedSettings ? "Agent" : "Harness", value: agentLabel },
+     ...harnessTriggerDetails,
+     ...configSummary.filter((detail) => detail.label === "Connection"),
++    // Only a non-default account is worth calling out.
++    ...(effectiveProviderOverride ? [{ label: "Account", value: effectiveProviderOverride }] : []),
+   ];
+ 
+   // Pick top-level Smart Routing. The create call needs a concrete agent_id, so
+@@ -5908,6 +5940,7 @@ export function NewChatLandingScreen() {
+           harness_override: smartRoutingHarnessSelected
+             ? AUTO_HARNESS_ID
+             : (pickedHarness ?? undefined),
++          provider_override: effectiveProviderOverride ?? undefined,
+           smart_routing_message:
+             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
+         });
+@@ -7415,6 +7448,16 @@ export function NewChatLandingScreen() {
+             />
+           )}
+ 
++          {projectAccountFallback && (
++            <p
++              className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
++              data-testid="new-chat-landing-project-account-fallback"
++            >
++              <TriangleAlertIcon className="size-3.5 shrink-0" />
++              <span>{projectAccountFallback}</span>
++            </p>
++          )}
++
+           {/* Same slot, same styling as the readiness notice above: the host
+               switch took Smart Routing away, so say so instead of quietly
+               leaving a different agent selected. Suppressed while the
+diff --git a/web/src/shell/ProjectSettingsDialog.test.tsx b/web/src/shell/ProjectSettingsDialog.test.tsx
+index 94c8db3c3ad2e2ea727cc9e75336e4bce3cf2f6d..0579f5df75942b7ef6b2f9cc71aed9e516544ef6 100644
+--- a/web/src/shell/ProjectSettingsDialog.test.tsx
++++ b/web/src/shell/ProjectSettingsDialog.test.tsx
+@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+ import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+ import { TooltipProvider } from "@/components/ui/tooltip";
++import userEvent from "@testing-library/user-event";
+ 
+ vi.mock("@/lib/projectsApi", () => ({
+   getProject: vi.fn(),
+@@ -19,6 +20,8 @@ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
+   useHostModelOptions: hostModelOptionsMock,
+ }));
++const { hostProvidersMock } = vi.hoisted(() => ({ hostProvidersMock: vi.fn() }));
++vi.mock("@/hooks/useHostProviders", () => ({ useHostProviders: hostProvidersMock }));
+ // Hoisted so the vi.mock factory below can reference it; per-test overrides
+ // let cases control the agent catalog (the default is set in beforeEach).
+ const { availableAgentsMock } = vi.hoisted(() => ({ availableAgentsMock: vi.fn() }));
+@@ -83,6 +86,8 @@ beforeEach(() => {
+   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
+   hostModelOptionsMock.mockReset();
+   hostModelOptionsMock.mockReturnValue({ data: [] });
++  hostProvidersMock.mockReset();
++  hostProvidersMock.mockReturnValue({ data: [] });
+   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+ });
+ 
+@@ -420,4 +425,98 @@ describe("ProjectSettingsDialog", () => {
+       expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+     );
+   });
++
++  describe("account", () => {
++    const MAX1 = { name: "max1", kind: "subscription", label: "a", default: true, ready: true };
++    const MAX2 = { name: "max2", kind: "subscription", label: "b", default: false, ready: true };
++    const OFF = { name: "max3", kind: "subscription", label: "c", default: false, ready: false };
++
++    async function waitForSaveEnabled() {
++      await waitFor(() =>
++        expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
++          false,
++        ),
++      );
++    }
++
++    it("lists the host's accounts for the default agent and saves the pick", async () => {
++      hostProvidersMock.mockReturnValue({ data: [MAX1, MAX2, OFF] });
++      getProjectMock.mockResolvedValue({
++        id: "p_1",
++        name: "Work",
++        config: { host_id: "h1", agent_id: "ag_1" },
++      });
++      const user = userEvent.setup();
++      renderDialog();
++      await waitForSaveEnabled();
++      expect(hostProvidersMock).toHaveBeenLastCalledWith("h1", "claude-sdk");
++
++      await user.click(screen.getByTestId("project-settings-account"));
++      expect(await screen.findByRole("option", { name: /max3 · not signed in/ })).toHaveAttribute(
++        "data-disabled",
++      );
++      await user.click(screen.getByRole("option", { name: "max2" }));
++      await user.click(screen.getByTestId("project-settings-save"));
++
++      await waitFor(() =>
++        expect(updateMock).toHaveBeenCalledWith("p_1", {
++          host_id: "h1",
++          agent_id: "ag_1",
++          provider: "max2",
++        }),
++      );
++    });
++
++    it("keeps a stored account the host doesn't list, labeled, so saving can't drop it", async () => {
++      hostProvidersMock.mockReturnValue({ data: [MAX1] });
++      getProjectMock.mockResolvedValue({
++        id: "p_1",
++        name: "Work",
++        config: { host_id: "h1", agent_id: "ag_1", provider: "alt-max" },
++      });
++      renderDialog();
++      await waitForSaveEnabled();
++      await waitFor(() =>
++        expect(screen.getByTestId("project-settings-account")).toHaveTextContent(
++          "alt-max (not listed here)",
++        ),
++      );
++
++      fireEvent.click(screen.getByTestId("project-settings-save"));
++      await waitFor(() =>
++        expect(updateMock).toHaveBeenCalledWith("p_1", {
++          host_id: "h1",
++          agent_id: "ag_1",
++          provider: "alt-max",
++        }),
++      );
++    });
++
++    it("clears the account back to no default", async () => {
++      hostProvidersMock.mockReturnValue({ data: [MAX1, MAX2] });
++      getProjectMock.mockResolvedValue({
++        id: "p_1",
++        name: "Work",
++        config: { host_id: "h1", provider: "max2" },
++      });
++      const user = userEvent.setup();
++      renderDialog();
++      await waitForSaveEnabled();
++
++      await user.click(screen.getByTestId("project-settings-account"));
++      await user.click(await screen.findByRole("option", { name: "No default" }));
++      await user.click(screen.getByTestId("project-settings-save"));
++      await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1" }));
++    });
++
++    it("asks for a host and an agent before it can list accounts", async () => {
++      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
++      renderDialog();
++      await waitForSaveEnabled();
++
++      expect(hostProvidersMock).toHaveBeenLastCalledWith("h1", null);
++      expect(screen.getByText("Pick a host and an agent to list their accounts")).toBeVisible();
++      expect(screen.getByTestId("project-settings-account")).toBeDisabled();
++    });
++  });
+ });
+diff --git a/web/src/shell/ProjectSettingsDialog.tsx b/web/src/shell/ProjectSettingsDialog.tsx
+index e3c59575d6231112de163299517d0baa24d3c58f..e2ab37b3ddeb6ef82efc297b69876e1d592581b8 100644
+--- a/web/src/shell/ProjectSettingsDialog.tsx
++++ b/web/src/shell/ProjectSettingsDialog.tsx
+@@ -7,7 +7,8 @@
+ // whether new sessions start in a fresh git worktree, the base branch a
+ // worktree forks from (which overrides the user-global default in Settings ›
+ // Git), and — when the default agent is a native harness with a model choice
+-// (Claude Code / Codex) — a default model for new sessions. Reasoning-effort /
++// (Claude Code / Codex) — a default model for new sessions, plus the account
++// (a host `providers:` entry) new sessions run on. Reasoning-effort /
+ // harness stay per-agent run config, out of scope here. The host and agent
+ // pickers reuse the composer's components; the working directory reuses its
+ // filesystem browser (inline, so it scrolls inside the modal).
+@@ -36,6 +37,7 @@ import { Switch } from "@/components/ui/switch";
+ import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
+ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
++import { useHostProviders } from "@/hooks/useHostProviders";
+ import { selectableSessionAgents } from "@/lib/agentGrouping";
+ import { sandboxOptionLabel } from "@/lib/capabilities";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+@@ -140,6 +142,8 @@ export function ProjectSettingsDialog({
+   // Default model for new sessions, only meaningful when the default agent is
+   // a native harness with a model choice; NONE stores no default (unset key).
+   const [model, setModel] = useState<string>(NONE);
++  // Default account (provider name); NONE runs on the host's default.
++  const [provider, setProvider] = useState<string>(NONE);
+   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+ 
+   // The agent picker and the host Select portal their dropdowns OUTSIDE
+@@ -190,6 +194,7 @@ export function ProjectSettingsDialog({
+     setBaseBranch(c.base_branch ?? "");
+     setAgentId(c.agent_id ?? null);
+     setModel(c.model ?? NONE);
++    setProvider(c.provider ?? NONE);
+     setWorkspaceOpen(false);
+   }, [open, stored, loadFailed]);
+ 
+@@ -232,6 +237,9 @@ export function ProjectSettingsDialog({
+     const agentUnresolved = agentId != null && selectedAgent === null;
+     if (supportsModelDefault && model !== NONE) config.model = model;
+     else if (!agentUnresolved) delete config.model;
++    // A sandbox brings its own credentials, so a host account can't apply.
++    if (provider !== NONE && hostId !== SANDBOX_HOST_CHOICE) config.provider = provider;
++    else delete config.provider;
+ 
+     updateConfig.mutate(
+       { id: projectId, name: projectName, config },
+@@ -303,6 +311,23 @@ export function ProjectSettingsDialog({
+   // Offer the control only for a model-taking harness; when it can only render
+   // "No default" it stays visible but disabled with an explanatory hint.
+   const supportsModelDefault = harnessTakesModel;
++  // Accounts are listed per host and harness; with no host default, list the
++  // first online host's, like the model catalog above.
++  const accountHarness = selectedNativeSpec?.harness ?? selectedAgent?.harness ?? null;
++  const accountHostId = hostId === SANDBOX_HOST_CHOICE ? null : modelCatalogHostId;
++  const accountHost = onlineHosts.find((h) => h.host_id === accountHostId) ?? null;
++  const { data: accountOptions = [] } = useHostProviders(accountHostId, accountHarness);
++  // Keep unlisted accounts (the stored one included, so it is an option before
++  // the draft seeds to it) as labeled items so saving can't drop them.
++  const unlistedProviders = [
++    ...new Set([stored?.provider, provider].filter((p): p is string => !!p && p !== NONE)),
++  ].filter((name) => !accountOptions.some((p) => p.name === name));
++  const accountHint =
++    hostId === SANDBOX_HOST_CHOICE
++      ? "Sandbox sessions use the sandbox's own credentials"
++      : accountHost === null || accountHarness === null
++        ? "Pick a host and an agent to list their accounts"
++        : `Account new sessions run on (as listed on ${accountHost.name}); falls back to the host default where unavailable`;
+   // The host the agent picker's readiness badges check against (its config
+   // hints show whether a harness is set up there). Null when no concrete host.
+   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
+@@ -544,6 +569,41 @@ export function ProjectSettingsDialog({
+             </Field>
+           )}
+ 
++          <Field label="Account" hint={accountHint}>
++            <Select
++              value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
++              onValueChange={(v) => setProvider(v || NONE)}
++              onOpenChange={onDropdownOpenChange}
++              disabled={
++                isLoading ||
++                hostId === SANDBOX_HOST_CHOICE ||
++                (accountOptions.length === 0 && provider === NONE)
++              }
++            >
++              <SelectTrigger className="w-full" data-testid="project-settings-account">
++                <SelectValue placeholder="No default" />
++              </SelectTrigger>
++              <SelectContent>
++                <SelectItem value={NONE}>No default</SelectItem>
++                {accountOptions.map((p) => (
++                  <SelectItem
++                    key={p.name}
++                    value={p.name}
++                    disabled={!p.ready}
++                    data-testid={`project-settings-account-${p.name}`}
++                  >
++                    {p.name}
++                    {p.default ? " (host default)" : ""}
++                    {p.ready ? "" : " · not signed in"}
++                  </SelectItem>
++                ))}
++                {unlistedProviders.map((name) => (
++                  <SelectItem key={name} value={name}>{`${name} (not listed here)`}</SelectItem>
++                ))}
++              </SelectContent>
++            </Select>
++          </Field>
++
+           {loadFailed && (
+             <p
+               className="text-destructive text-ui"
+diff --git a/web/src/shell/projectPrefill.ts b/web/src/shell/projectPrefill.ts
+index 2af79a7c7630e96d2a847d1d15c8b962d316aff4..ab3ae02e443cbef658fccf9a0822a6d4991769fa 100644
+--- a/web/src/shell/projectPrefill.ts
++++ b/web/src/shell/projectPrefill.ts
+@@ -25,6 +25,9 @@ export interface ProjectPrefillConfig {
+    *  machine — the composer's harness-seed effect consumes it directly (it owns
+    *  the model slot and would otherwise clobber a machine write). */
+   model?: string;
++  /** Default account (provider name). Not seeded by this machine — the
++   *  composer resolves it against the host's providers for the harness. */
++  provider?: string;
+ }
+ 
+ export interface ProjectPrefillState {

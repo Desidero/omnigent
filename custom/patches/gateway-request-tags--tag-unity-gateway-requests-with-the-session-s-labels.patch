@@ -1,0 +1,1193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 21 Oct 2026 11:55:45 +0000
+Subject: [PATCH] feat(harnesses): tag Unity Gateway requests with the
+ session's labels
+
+Databricks Unity Gateway logs a per-request Databricks-Ai-Gateway-Request-Tags
+header (a JSON object of string tags) in the request_tags column of its usage
+tracking and inference tables. Omnigent forwarded no session information to
+any provider, so gateway usage could not be grouped or joined back to the
+session or its labels.
+
+When a harness targets a Databricks Unity Gateway URL, its requests now carry
+that header with omnigent_session_id plus the session's user labels.
+Omnigent-owned labels (omnigent.*, cost_control.*, omni_project) are skipped,
+the encoding is compact ASCII JSON, and labels are dropped in key order past
+8 KiB while the session id is always kept. Other gateways and providers never
+get the header. OMNIGENT_GATEWAY_REQUEST_TAGS=0 turns it off.
+
+- databricks_ai_gateway: the header, tag builder, opt-out switch and the
+  dict / ANTHROPIC_CUSTOM_HEADERS helpers, next to the attribution helpers.
+- claude-native: the CLI and runner launch paths append the tags to
+  ANTHROPIC_CUSTOM_HEADERS on gateway launches.
+- claude-sdk, codex, pi: the runner hands the encoded tags to the harness
+  process in OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE (envelope labels, or one
+  label fetch for harnesses that may reach a gateway). claude-sdk and pi add
+  the header on gateway providers (pi with its $ template escape); Codex
+  gateway providers map it through env_http_headers.
+- codex-native: the app-server env carries its own session's tags, from the
+  runner's launch snapshot or the CLI's session fetch.
+
+Native CLIs and harness processes read the tags at launch, so a label edit
+reaches the header after the next launch or respawn.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 4bc2be0e9857e5cfabe3cbf23de8ad134b40f3e5)
+---
+ docs/databricks.md                            |  28 +++++
+ omnigent/databricks_ai_gateway.py             | 110 +++++++++++++++++-
+ omnigent/harnesses/claude_native/main.py      |  45 ++++++-
+ omnigent/harnesses/codex_native/app_server.py |   9 ++
+ omnigent/harnesses/codex_native/main.py       |   4 +
+ omnigent/host/connect.py                      |   2 +
+ omnigent/inner/claude_sdk_executor.py         |   9 ++
+ omnigent/inner/codex_executor.py              |  21 +++-
+ omnigent/inner/pi_executor.py                 |  21 +++-
+ omnigent/runner/app.py                        |  61 ++++++++++
+ omnigent/runner/native/orchestration.py       |  19 ++-
+ tests/cli/test_host_daemon_env.py             |   1 +
+ .../app_server/test_launch_config.py          |  28 +++++
+ tests/inner/test_claude_sdk_executor.py       |  25 ++++
+ tests/inner/test_codex_executor.py            |  18 +++
+ tests/inner/test_pi_executor.py               |   9 +-
+ .../test_app_claude_native_launch_args.py     |  67 ++++++++++-
+ ...t_app_sessions_native_terminals_runtime.py |   8 +-
+ .../runner/test_codex_native_launch_config.py |   2 +
+ tests/runner/test_runner_dispatch.py          |  45 +++++++
+ tests/test_databricks_ai_gateway.py           |  76 ++++++++++++
+ 21 files changed, 586 insertions(+), 22 deletions(-)
+
+diff --git a/docs/databricks.md b/docs/databricks.md
+index 6d1b7b81ebd3b82d7ed137d00c8c45fe1d2f7d1f..f7996e6e149641a030724f1dedffebbf7d9c3c74 100644
+--- a/docs/databricks.md
++++ b/docs/databricks.md
+@@ -469,6 +469,33 @@ production / customer-facing work goes through the workspace
+ (API tier + Gateway), individual experimentation can use consumer
+ subscriptions but is out of band for compliance.
+ 
++### Session request tags
++
++When a harness sends inference to a Databricks Unity Gateway URL
++(`https://<id>.ai-gateway.cloud.databricks.com/...` or
++`https://<workspace>/ai-gateway/...`), Omnigent adds the
++[`Databricks-Ai-Gateway-Request-Tags`](https://docs.databricks.com/aws/en/ai-gateway/request-tagging)
++header to each request. Its value is a JSON object holding the session id
++(`omnigent_session_id`) and the session's user labels, so you can group or
++join the `request_tags` column of the usage tracking and inference tables by
++session:
++
++```text
++Databricks-Ai-Gateway-Request-Tags: {"omnigent_session_id":"conv_abc123","team":"ml"}
++```
++
++- Omnigent's own labels (`omnigent.*`, `cost_control.*` and `omni_project`)
++  are not sent. Past 8 KiB, labels are dropped in key order; the session id
++  is always kept.
++- Covered harnesses: claude-native, claude-sdk, codex, codex-native and pi.
++  Other gateways and providers never receive the header.
++- Harness processes and native CLIs read the tags when they start, so a label
++  edit shows up in requests after the harness or terminal is next launched.
++- Set `OMNIGENT_GATEWAY_REQUEST_TAGS=0` in the environment of the host daemon
++  (or of `omnigent claude` / `omnigent codex`) to stop sending it. The host
++  forwards it to its runners, and `omnigent host enable` keeps it in the
++  service definition. Restart the host, then start a new session.
++
+ ### What you get on Databricks vs raw provider calls
+ 
+ | Capability | Raw provider call from omnigent | Through Unity Gateway |
+@@ -617,6 +644,7 @@ explicit consent and PII handling in place.
+ | `OTEL_EXPORTER_OTLP_ENDPOINT` | Workspace URL (same as `DATABRICKS_HOST`) | Apps env |
+ | `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Bearer $DATABRICKS_TOKEN` | Apps env |
+ | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` to include message bodies in traces | Apps env (default off) |
++| `OMNIGENT_GATEWAY_REQUEST_TAGS` | `0` to stop tagging Unity Gateway requests with the session id and labels | Host daemon or CLI env (default on) |
+ 
+ ---
+ 
+diff --git a/omnigent/databricks_ai_gateway.py b/omnigent/databricks_ai_gateway.py
+index a88a807a780910a27f97eaa1d99a13f9875c28d4..445c336558e464eedc35f54c23ae8f4f6b13fc4b 100644
+--- a/omnigent/databricks_ai_gateway.py
++++ b/omnigent/databricks_ai_gateway.py
+@@ -6,11 +6,14 @@ whether a resolved harness launch is gateway-backed. Keeping one predicate here
+ means a look-alike host is rejected identically everywhere.
+ 
+ The usage-attribution headers every harness sends to the gateway live here too,
+-so each harness names the coding agent and client surfaces the same way.
++so each harness names the coding agent and client surfaces the same way, as do
++the request tags that carry a session's id and labels into gateway logs.
+ """
+ 
+ from __future__ import annotations
+ 
++import json
++import os
+ from collections.abc import Mapping
+ from typing import Final, TypeVar
+ from urllib.parse import urlparse
+@@ -159,3 +162,108 @@ def with_gateway_attribution_lines(
+     attribution = gateway_attribution_headers(coding_agent, via_ug=via_ug)
+     lines.extend(f"{name}: {value}" for name, value in attribution.items())
+     return "\n".join(lines)
++
++
++# Per-request tags the Unity Gateway logs in the ``request_tags`` column of its
++# usage tracking and inference tables: a JSON object of string keys to string
++# values. Omnigent sends the session id plus the session's user labels.
++REQUEST_TAGS_HEADER: Final[str] = "Databricks-Ai-Gateway-Request-Tags"
++SESSION_ID_REQUEST_TAG: Final[str] = "omnigent_session_id"
++# Set to ``0`` / ``false`` / ``no`` / ``off`` to stop sending session tags.
++REQUEST_TAGS_SWITCH_ENV: Final[str] = "OMNIGENT_GATEWAY_REQUEST_TAGS"
++# Carries a session's encoded tags from the runner into its harness process.
++REQUEST_TAGS_VALUE_ENV: Final[str] = "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE"
++# Keeps the header well under common proxy header-size limits.
++_REQUEST_TAGS_MAX_BYTES: Final[int] = 8 * 1024
++
++
++def gateway_request_tags_enabled(environ: Mapping[str, str] | None = None) -> bool:
++    """Whether session request tags are sent to the Unity Gateway (on by default).
++
++    :param environ: Environment to read; ``None`` reads ``os.environ``.
++    :returns: ``False`` only when :data:`REQUEST_TAGS_SWITCH_ENV` is falsy.
++    """
++    from omnigent.process_logging import env_truthy
++
++    source = os.environ if environ is None else environ
++    return env_truthy(source.get(REQUEST_TAGS_SWITCH_ENV) or "1")
++
++
++def _is_internal_label_key(key: str) -> bool:
++    """Whether *key* is an Omnigent-owned label rather than one a user set."""
++    from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
++    from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
++
++    return key.startswith(("omnigent.", COST_CONTROL_LABEL_NAMESPACE)) or key == PROJECT_LABEL_KEY
++
++
++def gateway_request_tags(session_id: str, labels: Mapping[str, str] | None) -> dict[str, str]:
++    """Build the Unity Gateway request tags for a session.
++
++    The session id always comes first. User labels follow in key order; one
++    that would push the encoded header past the size cap is dropped, so the
++    same labels always yield the same tags.
++
++    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
++    :param labels: The session's labels, e.g. ``{"team": "ml"}``; internal
++        ``omnigent.*``, ``cost_control.*`` and project labels are skipped.
++    :returns: e.g. ``{"omnigent_session_id": "conv_abc123", "team": "ml"}``.
++    """
++    tags = {SESSION_ID_REQUEST_TAG: session_id}
++    size = len(_encode_request_tags(tags))
++    for key, value in sorted((labels or {}).items()):
++        if key in tags or _is_internal_label_key(key):
++            continue
++        # Each entry adds ``,"key":"value"`` to the compact encoding.
++        entry_size = len(_encode_request_tags({key: value})) - 1
++        if size + entry_size > _REQUEST_TAGS_MAX_BYTES:
++            continue
++        tags[key] = value
++        size += entry_size
++    return tags
++
++
++def _encode_request_tags(tags: Mapping[str, str]) -> str:
++    """Encode tags as compact ASCII JSON, safe for an HTTP header value."""
++    return json.dumps(tags, separators=(",", ":"))
++
++
++def gateway_request_tags_value(session_id: str, labels: Mapping[str, str] | None) -> str | None:
++    """Return the encoded request-tags header value, or ``None`` when opted out."""
++    if not gateway_request_tags_enabled():
++        return None
++    return _encode_request_tags(gateway_request_tags(session_id, labels))
++
++
++def gateway_request_tags_env(session_id: str, labels: Mapping[str, str] | None) -> dict[str, str]:
++    """Return the harness-process env that carries a session's request tags.
++
++    :returns: ``{REQUEST_TAGS_VALUE_ENV: "<json>"}``, or ``{}`` when opted out.
++    """
++    value = gateway_request_tags_value(session_id, labels)
++    return {REQUEST_TAGS_VALUE_ENV: value} if value is not None else {}
++
++
++def gateway_request_tags_headers(environ: Mapping[str, str] | None = None) -> dict[str, str]:
++    """Return the request-tags header the runner handed this harness process.
++
++    :param environ: Environment to read; ``None`` reads ``os.environ``.
++    :returns: ``{REQUEST_TAGS_HEADER: "<json>"}``, or ``{}`` when none was handed over.
++    """
++    source = os.environ if environ is None else environ
++    value = source.get(REQUEST_TAGS_VALUE_ENV)
++    if not value or not gateway_request_tags_enabled(source):
++        return {}
++    return {REQUEST_TAGS_HEADER: value}
++
++
++def with_gateway_request_tags_line(custom_headers: str | None, tags_value: str) -> str:
++    """Append the request-tags header to Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
++
++    :param custom_headers: The existing newline-separated ``Name: value`` block, or ``None``.
++    :param tags_value: Encoded tags, e.g. from :func:`gateway_request_tags_value`.
++    :returns: The block with the request-tags line appended.
++    """
++    lines = [custom_headers] if custom_headers else []
++    lines.append(f"{REQUEST_TAGS_HEADER}: {tags_value}")
++    return "\n".join(lines)
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index d621f69fd375e2d436d6b3791e998009a2cdb62e..da875ce713f9ac845d63077f9c621ace32abd991 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -87,9 +87,11 @@ from omnigent.cli_invocation import cli_invocation
+ from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+ from omnigent.databricks_ai_gateway import (
+     CLAUDE_CODE_AGENT,
++    gateway_request_tags_value,
+     is_databricks_ai_gateway_url,
+     is_ug_route,
+     with_gateway_attribution_lines,
++    with_gateway_request_tags_line,
+ )
+ from omnigent.entities.session_resources import terminal_resource_id
+ from omnigent.harnesses.claude_native.bridge import (
+@@ -699,6 +701,39 @@ def claude_config_with_routed_arms_pinned(
+     return replace(claude_config, env=env)
+ 
+ 
++def claude_config_with_gateway_request_tags(
++    claude_config: ClaudeNativeUcodeConfig | None,
++    *,
++    session_id: str,
++    labels: Mapping[str, str] | None,
++) -> ClaudeNativeUcodeConfig | None:
++    """Tag a Unity Gateway launch's requests with the session id and labels.
++
++    Claude Code reads ``ANTHROPIC_CUSTOM_HEADERS`` once at start, so label
++    edits reach the header when the terminal is next launched.
++
++    :param claude_config: Resolved provider config for the terminal, or ``None``.
++    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
++    :param labels: The session's labels; only user labels are sent.
++    :returns: ``claude_config`` itself off the Unity Gateway or when opted out,
++        otherwise a copy whose custom headers carry the request tags.
++    """
++    if claude_config is None:
++        return None
++    base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
++    if not base_url or not is_databricks_ai_gateway_url(base_url):
++        return claude_config
++    tags_value = gateway_request_tags_value(session_id, labels)
++    if tags_value is None:
++        return claude_config
++    existing = claude_config.env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV) or os.environ.get(
++        _CLAUDE_CODE_CUSTOM_HEADERS_ENV
++    )
++    env = dict(claude_config.env)
++    env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_request_tags_line(existing, tags_value)
++    return replace(claude_config, env=env)
++
++
+ def claude_config_with_launch_model_pinned(
+     claude_config: ClaudeNativeUcodeConfig | None,
+     launch_model: str | None,
+@@ -5124,6 +5159,8 @@ async def _prepare_claude_terminal(
+         # single ``cold_resumed`` flag covers both.
+         cold_resumed = False
+         bridge_id: str | None = None
++        # A new session carries only internal labels, so it tags just the session id.
++        session_labels: dict[str, str] = {}
+         if session_id is not None:
+             record_startup_event("session_resolved", session_id=session_id)
+         if session_id is None:
+@@ -5153,13 +5190,13 @@ async def _prepare_claude_terminal(
+                 startup_progress=startup_progress,
+                 progress_message="Loading Claude session...",
+             )
+-            labels = await _fetch_claude_session_labels(client, session_id)
++            session_labels = await _fetch_claude_session_labels(client, session_id)
+             _mark_startup_step(
+                 startup_profiler,
+                 "resume session labels fetched",
+                 startup_progress=startup_progress,
+             )
+-            bridge_id = labels.get(BRIDGE_ID_LABEL_KEY) or session_id
++            bridge_id = session_labels.get(BRIDGE_ID_LABEL_KEY) or session_id
+             _mark_startup_step(
+                 startup_profiler,
+                 "checking existing terminal",
+@@ -5247,7 +5284,9 @@ async def _prepare_claude_terminal(
+             (*cold_resume_args, *claude_args),
+             command=command,
+             bridge_dir=bridge_dir,
+-            claude_config=claude_config,
++            claude_config=claude_config_with_gateway_request_tags(
++                claude_config, session_id=session_id, labels=session_labels
++            ),
+             append_system_prompt=append_system_prompt,
+         )
+         record_startup_event("terminal_available", session_id=session_id)
+diff --git a/omnigent/harnesses/codex_native/app_server.py b/omnigent/harnesses/codex_native/app_server.py
+index c9aafa2fc1fc837e7400a7b5beef6c2a4ee38e89..596acba9a3966cd30b309156c2c8f0737e030c8f 100644
+--- a/omnigent/harnesses/codex_native/app_server.py
++++ b/omnigent/harnesses/codex_native/app_server.py
+@@ -35,6 +35,7 @@ if TYPE_CHECKING:
+     from omnigent.spec.types import AgentSpec
+ 
+ from omnigent.cli_invocation import cli_invocation
++from omnigent.databricks_ai_gateway import REQUEST_TAGS_VALUE_ENV, gateway_request_tags_env
+ from omnigent.debug_logging import debug_event
+ from omnigent.errors import ErrorCode, OmnigentError
+ from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
+@@ -3523,6 +3524,7 @@ def build_codex_native_server(
+     model_catalog_rows: list[_JsonObject] | None = None,
+     reconcile_process_registry: bool = True,
+     terminal_launch_args: Sequence[str] = (),
++    session_labels: Mapping[str, str] | None = None,
+ ) -> CodexNativeAppServer:
+     """
+     Build a configured native Codex app-server process wrapper.
+@@ -3581,6 +3583,9 @@ def build_codex_native_server(
+     :param terminal_launch_args: Original CLI options used to select the Codex
+         config-file profile (distinct from the Databricks routing profile)
+         and the ``--add-dir`` roots the app-server owns.
++    :param session_labels: The session's labels, sent with *session_id* as
++        Unity Gateway request tags. Read once at start, so label edits reach
++        the header on the next launch.
+     :returns: Configured app-server process wrapper.
+     :raises ImportError: If no Codex CLI is available.
+     :raises OSError: If Databricks routing was requested but no
+@@ -3596,6 +3601,10 @@ def build_codex_native_server(
+             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
+         )
+     env = _clean_codex_env()
++    # Never inherit another session's tags; a Unity Gateway provider sends these.
++    env.pop(REQUEST_TAGS_VALUE_ENV, None)
++    if session_id is not None:
++        env.update(gateway_request_tags_env(session_id, session_labels))
+     config_overrides: list[str] = []
+     pinned_model = model
+     if profile is not None:
+diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
+index 738744495edbf35227c020ce05260654008f9c48..ea9b0cd102811ff7095cfc4d4f363645ef37eff2 100644
+--- a/omnigent/harnesses/codex_native/main.py
++++ b/omnigent/harnesses/codex_native/main.py
+@@ -1190,6 +1190,8 @@ async def _prepare_codex_terminal(
+     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
+         bridge_id: str
+         thread_id: str | None = None
++        # A new session carries only internal labels, so it tags just the session id.
++        session_labels: dict[str, str] = {}
+         if session_id is None:
+             if session_bundle is None:
+                 raise click.ClickException("Creating a Codex session requires a session bundle.")
+@@ -1208,6 +1210,7 @@ async def _prepare_codex_terminal(
+                     f"Conversation {session_id!r} is not a codex-native session."
+                 )
+             bridge_id = str(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
++            session_labels = {str(key): str(value) for key, value in labels.items()}
+             existing_terminal = await _find_running_codex_terminal(client, session_id)
+             external_session_id = payload.get("external_session_id")
+             thread_id = external_session_id if isinstance(external_session_id, str) else None
+@@ -1287,6 +1290,7 @@ async def _prepare_codex_terminal(
+             ap_auth_headers=headers,
+             developer_instructions=developer_instructions,
+             terminal_launch_args=codex_args,
++            session_labels=session_labels,
+         )
+         app_server.listen_url = codex_ws_url
+         event_client: CodexAppServerClient | None = None
+diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
+index afc66888b658096c5d34ecba8a30434849ae965c..697fd453b7fb536f2bd1047941cef9d3fed6a5e9 100644
+--- a/omnigent/host/connect.py
++++ b/omnigent/host/connect.py
+@@ -725,6 +725,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
+         "OMNIGENT_HARNESS_STDERR_ENABLED",
+         # Runner release flags must survive CLI -> daemon -> runner.
+         "OMNIGENT_FEATURES",
++        # Unity Gateway request-tags opt-out (a boolean); the runner reads it.
++        "OMNIGENT_GATEWAY_REQUEST_TAGS",
+         # Opaque request-routing headers (dev/test): a JSON header map folded by
+         # cli_auth.databricks_request_headers into every client→server connection
+         # so a request pins to a specific server instance/replica. Must reach the
+diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
+index 36590b66022a07a90542bf6806b9bee74187421e..7468df968237e0d7e4578408b43acdc53c1cacb6 100644
+--- a/omnigent/inner/claude_sdk_executor.py
++++ b/omnigent/inner/claude_sdk_executor.py
+@@ -48,9 +48,12 @@ from omnigent.claude_paths import claude_config_dir, claude_json_path
+ from omnigent.cli_invocation import cli_invocation
+ from omnigent.databricks_ai_gateway import (
+     CLAUDE_CODE_AGENT,
++    REQUEST_TAGS_HEADER,
++    gateway_request_tags_headers,
+     is_databricks_ai_gateway_url,
+     is_ug_route,
+     with_gateway_attribution_lines,
++    with_gateway_request_tags_line,
+ )
+ from omnigent.inner import _proc
+ from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+@@ -1388,6 +1391,12 @@ def _resolve_gateway_env(
+             CLAUDE_CODE_AGENT,
+             via_ug=is_ug_route(base_url),
+         )
++        # The runner hands each session's harness process its request tags.
++        tags_value = gateway_request_tags_headers().get(REQUEST_TAGS_HEADER)
++        if tags_value:
++            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_request_tags_line(
++                gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV], tags_value
++            )
+     else:
+         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+     return gateway_env
+diff --git a/omnigent/inner/codex_executor.py b/omnigent/inner/codex_executor.py
+index 6906674fb51cdd854f50b4d1591828a3a8cdcc6f..c4034e9eeff9b6feb2066e090174317d1c27a5cf 100644
+--- a/omnigent/inner/codex_executor.py
++++ b/omnigent/inner/codex_executor.py
+@@ -42,6 +42,8 @@ from packaging.version import InvalidVersion, Version
+ from omnigent._platform import resolve_cli_binary
+ from omnigent.databricks_ai_gateway import (
+     CODEX_AGENT,
++    REQUEST_TAGS_HEADER,
++    REQUEST_TAGS_VALUE_ENV,
+     is_databricks_ai_gateway_url,
+     with_gateway_attribution,
+ )
+@@ -1308,7 +1310,8 @@ def materialize_codex_provider_config(
+     Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
+     untouched: Codex rejects unsupported fields there by discarding the whole config.
+     Custom providers on a Databricks Unity Gateway also get the gateway's
+-    usage-attribution ``http_headers``.
++    usage-attribution ``http_headers`` and an ``env_http_headers`` entry that
++    sends the session's request tags.
+ 
+     :param codex_home: Private session ``CODEX_HOME`` directory.
+     :param config_overrides: Pending Codex config override strings.
+@@ -1379,6 +1382,12 @@ def materialize_codex_provider_config(
+             provider_config["http_headers"] = with_gateway_attribution(
+                 headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
+             )
++            # Codex sends the session's request tags only while its env carries them.
++            env_headers = provider_config.get("env_http_headers")
++            provider_config["env_http_headers"] = {
++                **(env_headers if isinstance(env_headers, Mapping) else {}),
++                REQUEST_TAGS_HEADER: REQUEST_TAGS_VALUE_ENV,
++            }
+ 
+     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
+     try:
+@@ -1714,14 +1723,16 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
+ 
+ 
+ #: Omnigent's own per-session signals for a codex launch: the subagent-router
+-#: rendezvous, its session id, and the extended-catalog request. The runner sets
+-#: them in the harness process env, and the executor reads them back out of
+-#: ``_clean_codex_env``'s filtered copy — so they must be allowed through it or
+-#: both features silently never engage on the wrapped ``codex`` harness.
++#: rendezvous, its session id, the extended-catalog request, and the Unity
++#: Gateway request tags. The runner sets them in the harness process env, and
++#: the executor reads them back out of ``_clean_codex_env``'s filtered copy — so
++#: they must be allowed through it or these features silently never engage on
++#: the wrapped ``codex`` harness.
+ _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
+     CODEX_ROUTER_DIR_ENV_VAR,
+     CODEX_ROUTER_SESSION_ID_ENV_VAR,
+     CODEX_EXTENDED_CATALOG_ENV_VAR,
++    REQUEST_TAGS_VALUE_ENV,
+ )
+ 
+ 
+diff --git a/omnigent/inner/pi_executor.py b/omnigent/inner/pi_executor.py
+index c4df66f72d53f4d07f03e622ae8989dd6794b622..4f9ec2d9383375616702ea96110b7476a4e38d8a 100644
+--- a/omnigent/inner/pi_executor.py
++++ b/omnigent/inner/pi_executor.py
+@@ -56,7 +56,12 @@ from importlib.resources import files
+ from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
+ from urllib.parse import urlparse as _urlparse
+ 
+-from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
++from omnigent.databricks_ai_gateway import (
++    PI_AGENT,
++    gateway_attribution_headers,
++    gateway_request_tags_headers,
++    is_ug_route,
++)
+ from omnigent.harnesses.pi_native.credentials import (
+     _databricks_workspace_url_for_gateway,
+     _is_databricks_ai_gateway_url,
+@@ -972,9 +977,17 @@ def _build_models_json(
+             provider["models"] = [*provider["models"], entry]
+     for provider_config in config["providers"].values():
+         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
+-            provider_config["headers"] = gateway_attribution_headers(
+-                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+-            )
++            provider_config["headers"] = {
++                **gateway_attribution_headers(
++                    PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
++                ),
++                # The runner hands each session's harness process its request tags.
++                # Pi expands ``$NAME`` in header values; ``$$`` keeps a label's ``$``.
++                **{
++                    name: value.replace("$", "$$")
++                    for name, value in gateway_request_tags_headers().items()
++                },
++            }
+     return config
+ 
+ 
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index bcaf48379146e7700b4161926c444ea054ff1dba..206dfaec2938d58546d9e6758190465e615d4551 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -39,6 +39,7 @@ from fastapi import FastAPI, Query, Request
+ from fastapi.responses import JSONResponse, Response, StreamingResponse
+ 
+ from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
++from omnigent.databricks_ai_gateway import gateway_request_tags_enabled, gateway_request_tags_env
+ from omnigent.debug_logging import (
+     debug_event,
+     phase_scope,
+@@ -2618,6 +2619,13 @@ def create_runner_app(
+                     session_id, "failed", error={"code": exc.code, "message": str(exc)}
+                 )
+                 raise
++            spawn_env = await _with_gateway_request_tags(
++                spawn_env,
++                harness=harness_name,
++                session_id=session_id,
++                labels=init_context.labels,
++                server_client=server_client,
++            )
+             if spawn_env is None:
+                 spawn_env = await _resolve_native_spawn_env(
+                     harness_name,
+@@ -5519,6 +5527,13 @@ def create_runner_app(
+                     },
+                 )
+ 
++        spawn_env = await _with_gateway_request_tags(
++            spawn_env,
++            harness=harness_name,
++            session_id=conv_id,
++            labels=startup_labels,
++            server_client=server_client,
++        )
+         if spawn_env is None:
+             spawn_env = await _resolve_native_spawn_env(
+                 harness_name,
+@@ -8407,6 +8422,52 @@ def _build_spawn_env_from_spec(
+     return env
+ 
+ 
++def _spawn_env_may_reach_unity_gateway(harness: str, spawn_env: Mapping[str, str]) -> bool:
++    """Whether an SDK harness spawned with *spawn_env* may send Unity Gateway requests.
++
++    claude-sdk and pi reach a gateway only behind their ``HARNESS_*_GATEWAY``
++    flag; codex may also route through a provider in the user's Codex config.
++    """
++    if harness == "codex":
++        return True
++    if harness in ("claude-sdk", "pi"):
++        return spawn_env.get(f"HARNESS_{harness.upper().replace('-', '_')}_GATEWAY") == "true"
++    return False
++
++
++async def _with_gateway_request_tags(
++    spawn_env: dict[str, str] | None,
++    *,
++    harness: str,
++    session_id: str,
++    labels: Mapping[str, str] | None,
++    server_client: httpx.AsyncClient | None,
++) -> dict[str, str] | None:
++    """Hand an SDK harness the session's Unity Gateway request tags.
++
++    The harness reads them once at spawn, so label edits reach the header
++    when the harness process is next spawned.
++
++    :param spawn_env: The harness spawn env, or ``None`` for a native harness.
++    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
++    :param session_id: Session/conversation id.
++    :param labels: Labels from the init envelope, or ``None`` to fetch them.
++    :param server_client: Runner's server client for the label fetch.
++    :returns: *spawn_env* plus the request-tags env, or *spawn_env* unchanged.
++    """
++    if (
++        spawn_env is None
++        or not _spawn_env_may_reach_unity_gateway(harness, spawn_env)
++        or not gateway_request_tags_enabled()
++    ):
++        return spawn_env
++    if labels is None and server_client is not None:
++        labels = await _session_labels_for_runner_spawn(
++            server_client=server_client, session_id=session_id
++        )
++    return {**spawn_env, **gateway_request_tags_env(session_id, labels)}
++
++
+ # ── Agent-start policy gate ────────────────────────────────────────────
+ 
+ 
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index c9798a2cc2aa51a4397e81ed8e7ed014fb6b5cac..38a4e1e793a830a986607ea79fdf3a777be73cbb 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -651,6 +651,7 @@ class _CodexNativeLaunchConfig:
+         reads. A session the forwarder rotated onto carries the original
+         session's id here. ``None`` when unlabelled: the bridge is then keyed
+         by the session id.
++    :param labels: The session's labels, for the Unity Gateway request tags.
+     """
+ 
+     workspace: Path
+@@ -667,6 +668,7 @@ class _CodexNativeLaunchConfig:
+     turn_routing: bool = False
+     reasoning_effort: str | None = None
+     bridge_id: str | None = None
++    labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
+ 
+ 
+ @dataclasses.dataclass(frozen=True)
+@@ -1474,6 +1476,11 @@ async def _codex_native_launch_config(
+         turn_routing=routing_class.turn_routing,
+         reasoning_effort=reasoning_effort,
+         bridge_id=bridge_id,
++        labels=(
++            {str(key): str(value) for key, value in labels.items()}
++            if isinstance(labels, dict)
++            else {}
++        ),
+     )
+ 
+ 
+@@ -5609,6 +5616,7 @@ async def _auto_create_codex_terminal(
+         terminal_launch_args=launch_config.terminal_launch_args or (),
+         reasoning_effort=launch_config.reasoning_effort,
+         model_catalog_rows=_fresh_codex_catalog,
++        session_labels=launch_config.labels,
+         # Codex can show project-trust and legacy-model migration prompts before
+         # creating a thread. This TUI runs detached for the web UI, so persist
+         # the runner-owned acknowledgements in the private session config.
+@@ -8427,6 +8435,8 @@ class _ClaudeSessionLaunchMetadata:
+     external_session_id: str | None = None
+     fork_source_external_id: str | None = None
+     fork_carry_history: bool = False
++    #: The session's labels, for the Unity Gateway request tags.
++    labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
+     #: Both routing fields come from ``routing_class_from_snapshot``, so an
+     #: auto-harness session always reads as routing-enabled too. Deriving them
+     #: separately was the bug: a sub-agent child of a routed parent carries the
+@@ -8474,6 +8484,7 @@ def _claude_launch_metadata_from_envelope(
+             fork_source if isinstance(fork_source, str) and fork_source else None
+         ),
+         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
++        labels=dict(snapshot.labels),
+     )
+ 
+ 
+@@ -8540,6 +8551,7 @@ async def _load_legacy_claude_launch_metadata(
+             fork_source if isinstance(fork_source, str) and fork_source else None
+         ),
+         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
++        labels={str(key): str(value) for key, value in labels.items()},
+     )
+     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
+     _logger.info(
+@@ -8841,6 +8853,7 @@ async def _auto_create_claude_terminal(
+ 
+     from omnigent.harnesses.claude_native.main import (
+         build_native_claude_terminal_env,
++        claude_config_with_gateway_request_tags,
+         claude_config_with_launch_model_pinned,
+         claude_config_with_routed_arms_pinned,
+         resolve_claude_native_model_selection,
+@@ -9421,7 +9434,11 @@ async def _auto_create_claude_terminal(
+         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
+         # etc.) when derived. Empty provider config still forces
+         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
+-        env=build_native_claude_terminal_env(claude_config),
++        env=build_native_claude_terminal_env(
++            claude_config_with_gateway_request_tags(
++                claude_config, session_id=session_id, labels=launch_metadata.labels
++            )
++        ),
+         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
+         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
+         # inherit this env and several build ``WorkspaceClient`` without pinning
+diff --git a/tests/cli/test_host_daemon_env.py b/tests/cli/test_host_daemon_env.py
+index 845ba41c2967d35a01b1b47d21885b9a5fec85b4..98d7d4eef7443f7f10c18b7acde201d59b5c7993 100644
+--- a/tests/cli/test_host_daemon_env.py
++++ b/tests/cli/test_host_daemon_env.py
+@@ -232,6 +232,7 @@ def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
+         ("OMNIGENT_FEATURES", "usage_page,claude_osc_status", True),
+         ("OMNIGENT_FEATURES", "usage_page,-claude_osc_status", False),
+         ("OMNIGENT_FEATURES", "-claude_osc_status,claude_osc_status", False),
++        ("OMNIGENT_GATEWAY_REQUEST_TAGS", "0", True),
+     ],
+ )
+ def test_release_controls_reach_daemon_and_runner(
+diff --git a/tests/harnesses/codex_native/app_server/test_launch_config.py b/tests/harnesses/codex_native/app_server/test_launch_config.py
+index b20c234cc4289cb1aae2b21b5ea08071b978b83d..ccfce06978f16702df35c4cfa58cb2a461ae4f7d 100644
+--- a/tests/harnesses/codex_native/app_server/test_launch_config.py
++++ b/tests/harnesses/codex_native/app_server/test_launch_config.py
+@@ -298,6 +298,34 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
+         }
+ 
+ 
++def test_native_codex_app_server_carries_its_own_session_request_tags(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The app-server env holds this session's tags, never ones it inherited."""
++    monkeypatch.delenv("OMNIGENT_GATEWAY_REQUEST_TAGS", raising=False)
++    monkeypatch.setenv("OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE", '{"omnigent_session_id":"other"}')
++
++    def build(**session: Any) -> Any:
++        return build_codex_native_server(
++            socket_path=tmp_path / "codex.sock",
++            codex_home=tmp_path / "codex-home",
++            cwd=tmp_path,
++            model=None,
++            profile=None,
++            bridge_dir=tmp_path / "bridge",
++            codex_path=sys.executable,
++            **session,
++        )
++
++    tagged = build(session_id="conv_1", session_labels={"team": "ml", "omnigent.ui": "terminal"})
++
++    assert tagged.env["OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE"] == (
++        '{"omnigent_session_id":"conv_1","team":"ml"}'
++    )
++    assert "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE" not in build().env
++
++
+ def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/inner/test_claude_sdk_executor.py b/tests/inner/test_claude_sdk_executor.py
+index 82cc0ce66ad8a8ab27137fd88f023069f908c9e0..8864299d0f5494b98b2f5f0e827ae3358e7f632d 100644
+--- a/tests/inner/test_claude_sdk_executor.py
++++ b/tests/inner/test_claude_sdk_executor.py
+@@ -1767,6 +1767,31 @@ class TestResolveGatewayEnv(unittest.TestCase):
+         self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+         self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
+ 
++    def test_only_databricks_gateway_sends_the_runner_request_tags(self):
++        """The session tags the runner hands the harness reach only a Unity Gateway."""
++        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
++        from omnigent.inner.databricks_executor import DatabricksCredentials
++
++        tags = '{"omnigent_session_id":"conv_1","team":"ml"}'
++        for host, tagged in (
++            ("https://wkspc.cloud.databricks.com", True),
++            ("https://example.databricks.com", False),
++        ):
++            with (
++                self.subTest(host=host),
++                patch.dict(
++                    "os.environ", {"OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE": tags}, clear=True
++                ),
++                patch(
++                    "omnigent.inner.databricks_executor._read_databrickscfg",
++                    return_value=DatabricksCredentials(host=host, token="t"),
++                ),
++            ):
++                headers = _resolve_gateway_env()["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
++            self.assertEqual(
++                f"Databricks-Ai-Gateway-Request-Tags: {tags}" in headers, tagged, headers
++            )
++
+     def test_strips_trailing_slash(self):
+         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+         from omnigent.inner.databricks_executor import DatabricksCredentials
+diff --git a/tests/inner/test_codex_executor.py b/tests/inner/test_codex_executor.py
+index a321425c55d063951f0052fc5d08eee36e88c6ae..d43203e982f53f7c1ab7fb75962e484a954d2952 100644
+--- a/tests/inner/test_codex_executor.py
++++ b/tests/inner/test_codex_executor.py
+@@ -4574,6 +4574,8 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
+         f'[model_providers.Databricks]\nbase_url = "{gateway_url}"\n\n'
+         "[model_providers.Databricks.http_headers]\n"
+         'User-Agent = "ucode/0.1.0 codex/0.145.0"\n\n'
++        "[model_providers.Databricks.env_http_headers]\n"
++        'X-Team = "TEAM_ENV"\n\n'
+         '[model_providers.other]\nbase_url = "https://openrouter.ai/api/v1"\n'
+     )
+ 
+@@ -4595,6 +4597,11 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
+         "Databricks-Custom-Client-Surfaces": "omnigent",
+     }
+     assert "http_headers" not in providers["other"]
++    # Codex sends the session's request tags from the env the runner hands it.
++    tags_mapping = {"Databricks-Ai-Gateway-Request-Tags": "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE"}
++    assert providers["Databricks"]["env_http_headers"] == {"X-Team": "TEAM_ENV", **tags_mapping}
++    assert providers["omnigent_databricks"]["env_http_headers"] == tags_mapping
++    assert "env_http_headers" not in providers["other"]
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -4709,6 +4716,17 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
+     assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+ 
+ 
++def test_clean_codex_env_keeps_the_runner_request_tags(monkeypatch) -> None:
++    """The request tags the runner hands the harness reach codex's env_http_headers."""
++    from omnigent.inner.codex_executor import _clean_codex_env
++
++    monkeypatch.setenv("OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE", '{"omnigent_session_id":"conv_1"}')
++
++    env = _clean_codex_env()
++
++    assert env["OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE"] == '{"omnigent_session_id":"conv_1"}'
++
++
+ # ---------------------------------------------------------------------------
+ # Tests for _to_codex_input_items — input_file → inline text conversion
+ # ---------------------------------------------------------------------------
+diff --git a/tests/inner/test_pi_executor.py b/tests/inner/test_pi_executor.py
+index 7b583aedd302b24439f8e7c309ee19e459d1377e..bea8abb2e6a6da895210a01ab14d52bf967e90a3 100644
+--- a/tests/inner/test_pi_executor.py
++++ b/tests/inner/test_pi_executor.py
+@@ -4377,8 +4377,13 @@ def test_models_json_lists_only_live_gateway_models() -> None:
+     ]
+ 
+ 
+-def test_models_json_attributes_only_unity_gateway_providers() -> None:
++def test_models_json_attributes_only_unity_gateway_providers(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
+     """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
++    monkeypatch.setenv(
++        "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE", '{"omnigent_session_id":"conv_1","budget":"$HOME"}'
++    )
+     providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
+ 
+     attributed = {name for name, provider in providers.items() if "headers" in provider}
+@@ -4386,6 +4391,8 @@ def test_models_json_attributes_only_unity_gateway_providers() -> None:
+     assert providers["databricks-openai"]["headers"] == {
+         "Databricks-Custom-Coding-Agent": "pi",
+         "Databricks-Custom-Client-Surfaces": "omnigent",
++        # Pi would expand a bare ``$HOME``; the escape keeps the label literal.
++        "Databricks-Ai-Gateway-Request-Tags": '{"omnigent_session_id":"conv_1","budget":"$$HOME"}',
+     }
+ 
+ 
+diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
+index e827844491d1307c317a062a50a91a2a604f9bde..be75f670fca5577e6093ae6dd9e830074a84e26e 100644
+--- a/tests/runner/test_app_claude_native_launch_args.py
++++ b/tests/runner/test_app_claude_native_launch_args.py
+@@ -1040,12 +1040,15 @@ def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
+     assert sorted(path.name for path in workspace.iterdir()) == []
+ 
+ 
+-def _claude_auto_create_session_init(session_id: str, workspace: Path):
++def _claude_auto_create_session_init(
++    session_id: str, workspace: Path, labels: dict[str, str] | None = None
++):
+     """
+     Build the session-init envelope ``_auto_create_claude_terminal`` consumes.
+ 
+     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
+     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
++    :param labels: Session labels, e.g. ``{"team": "ml"}``; ``None`` sets none.
+     :returns: A :class:`RunnerSessionInitEnvelope` rooted at *workspace*.
+     """
+     from omnigent.runner.session_init_protocol import (
+@@ -1059,7 +1062,9 @@ def _claude_auto_create_session_init(session_id: str, workspace: Path):
+         server_version="test",
+         session_id=session_id,
+         agent_id="agent",
+-        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(workspace)),
++        snapshot=RunnerSessionInitSnapshot(
++            created_at=0, updated_at=0, workspace=str(workspace), labels=labels or {}
++        ),
+     )
+ 
+ 
+@@ -1069,6 +1074,8 @@ async def _auto_create_claude_terminal_for_test(
+     session_id: str,
+     workspace: Path,
+     registry: object,
++    labels: dict[str, str] | None = None,
++    launch_config: ClaudeNativeUcodeConfig | None = None,
+ ) -> None:
+     """
+     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
+@@ -1077,6 +1084,8 @@ async def _auto_create_claude_terminal_for_test(
+     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
+     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
+     :param registry: Session resource registry double.
++    :param labels: Session labels carried by the init envelope.
++    :param launch_config: Provider config the launch resolves; ``None`` uses Claude's login.
+     :returns: None. Raises whatever the auto-create path raises.
+     """
+     from unittest.mock import AsyncMock, Mock
+@@ -1095,9 +1104,9 @@ async def _auto_create_claude_terminal_for_test(
+         registry,
+         Mock(),
+         server_client=AsyncMock(spec=httpx.AsyncClient),
+-        session_init=_claude_auto_create_session_init(session_id, workspace),
++        session_init=_claude_auto_create_session_init(session_id, workspace, labels),
+         auth_token_factory=lambda: None,
+-        resolve_launch_config=AsyncMock(return_value=None),
++        resolve_launch_config=AsyncMock(return_value=launch_config),
+     )
+ 
+ 
+@@ -1279,6 +1288,56 @@ async def test_auto_create_claude_terminal_hands_claude_the_account_token(
+         assert seeded == []
+ 
+ 
++@pytest.mark.parametrize(
++    ("base_url", "tagged"),
++    [
++        ("https://dbc-1.cloud.databricks.com/ai-gateway/anthropic", True),
++        ("https://gateway.example/anthropic", False),
++    ],
++    ids=["unity-gateway", "other-gateway"],
++)
++async def test_auto_create_claude_terminal_tags_unity_gateway_requests_with_session_labels(
++    bridge_dir: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    base_url: str,
++    tagged: bool,
++) -> None:
++    """The pane's custom headers carry the session id and user labels, only for a Unity Gateway."""
++    from unittest.mock import Mock
++
++    from omnigent.runner.resource_registry import SessionResourceRegistry
++
++    monkeypatch.delenv("OMNIGENT_GATEWAY_REQUEST_TAGS", raising=False)
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
++        lambda *_args, **_kwargs: None,
++    )
++    registry = Mock(spec=SessionResourceRegistry)
++    registry.launch_required_terminal.side_effect = RuntimeError("stop at launch")
++    launch_config = ClaudeNativeUcodeConfig(
++        env={"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_CUSTOM_HEADERS": "X-Existing: 1"},
++        api_key_helper="printf %s token",
++    )
++
++    with pytest.raises(RuntimeError, match="stop at launch"):
++        await _auto_create_claude_terminal_for_test(
++            monkeypatch,
++            session_id="conv_tags",
++            workspace=bridge_dir,
++            registry=registry,
++            labels={"team": "ml", "omnigent.ui": "terminal"},
++            launch_config=launch_config,
++        )
++
++    terminal_env = registry.launch_required_terminal.await_args.kwargs["spec"].env
++    expected = ["X-Existing: 1"]
++    if tagged:
++        expected.append(
++            'Databricks-Ai-Gateway-Request-Tags: {"omnigent_session_id":"conv_tags","team":"ml"}'
++        )
++    assert terminal_env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == expected
++
++
+ @pytest.mark.parametrize(
+     "subagent_started,turn_started",
+     [(True, True), (True, False), (False, True), (False, False)],
+diff --git a/tests/runner/test_app_sessions_native_terminals_runtime.py b/tests/runner/test_app_sessions_native_terminals_runtime.py
+index 14c275ea7bef73c9b271514d092e1f7ddd4e3d2e..3872fb3387c92893a305f9b0138a1f31797426ff 100644
+--- a/tests/runner/test_app_sessions_native_terminals_runtime.py
++++ b/tests/runner/test_app_sessions_native_terminals_runtime.py
+@@ -567,9 +567,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+     bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
+     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(bridge_id)
+     session_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+-    session_labels: dict[str, str] = (
+-        {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
+-    )
++    session_labels: dict[str, str] = {"team": "ml"}
++    if rotated:
++        session_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
+     launch_snapshot = RunnerSessionInitSnapshot(
+         created_at=10,
+         updated_at=11,
+@@ -898,6 +898,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+     assert build_calls[0]["developer_instructions"] == (
+         f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
+     )
++    # The session's labels feed the app-server's Unity Gateway request tags.
++    assert build_calls[0]["session_labels"]["team"] == "ml"
+     # Persisted pass-through args must reach launch resolution (--profile layering).
+     assert resolve_calls and all(
+         call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
+diff --git a/tests/runner/test_codex_native_launch_config.py b/tests/runner/test_codex_native_launch_config.py
+index 6b47a5b16521f9cb0efb404a6c4f6c0b0d0a2e5c..f46bec128cc6b409b316af656f4de8b44afde73b 100644
+--- a/tests/runner/test_codex_native_launch_config.py
++++ b/tests/runner/test_codex_native_launch_config.py
+@@ -285,6 +285,7 @@ async def test_happy_path_parses_full_config(
+             "omnigent.fork.source_external_session_id": "thread_src",
+             "omnigent.fork.carry_history": "1",
+             "omnigent.codex_native.bypass_sandbox": "1",
++            "team": "ml",
+         },
+     }
+     client = _Client(_Resp(200, snapshot))
+@@ -304,6 +305,7 @@ async def test_happy_path_parses_full_config(
+     assert cfg.fork_source_external_id == "thread_src"
+     assert cfg.fork_carry_history is True, "carry_history label '1' should parse to True."
+     assert cfg.bypass_sandbox is True, "bypass_sandbox label '1' should parse to True."
++    assert cfg.labels["team"] == "ml", "Labels feed the Unity Gateway request tags."
+     assert cfg.auto_harness is True
+     assert cfg.routing_enabled is True
+     assert cfg.turn_routing is True
+diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
+index 6cc2db9fbde45706f287babd5c8341c0712a5f71..0e4ca57145e505a9e8aeced9246ea37e144f4ef3 100644
+--- a/tests/runner/test_runner_dispatch.py
++++ b/tests/runner/test_runner_dispatch.py
+@@ -46,6 +46,7 @@ import threading
+ from collections.abc import AsyncIterator, Callable
+ from contextlib import asynccontextmanager, suppress
+ from dataclasses import dataclass
++from functools import partial
+ from pathlib import Path
+ from types import SimpleNamespace, TracebackType
+ from typing import Any, cast
+@@ -85,6 +86,7 @@ from omnigent.runner.app import (
+     _harness_error_response_error,
+     _normalize_turn_error,
+     _resolve_harness_config,
++    _with_gateway_request_tags,
+ )
+ from omnigent.runner.policy_proxy import (
+     _evaluate_policy_via_omnigent,
+@@ -2131,6 +2133,49 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
+     assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
+ 
+ 
++@pytest.mark.asyncio
++async def test_sdk_spawn_env_carries_the_session_request_tags(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """SDK harnesses that may reach a Unity Gateway get the session's request tags.
++
++    Envelope labels are used as-is; without them the labels are fetched, but
++    only for a harness that could send them.
++    """
++    monkeypatch.delenv("OMNIGENT_GATEWAY_REQUEST_TAGS", raising=False)
++    fetched: list[str] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        fetched.append(request.url.path)
++        return httpx.Response(200, json={"labels": {"team": "fetched"}})
++
++    tags_env = "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE"
++    gateway_claude = {"HARNESS_CLAUDE_SDK_GATEWAY": "true"}
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://server"
++    ) as client:
++        tag = partial(_with_gateway_request_tags, session_id="conv_1", server_client=client)
++
++        from_envelope = await tag(gateway_claude, harness="claude-sdk", labels={"team": "ml"})
++        assert from_envelope is not None
++        assert from_envelope[tags_env] == '{"omnigent_session_id":"conv_1","team":"ml"}'
++        assert fetched == []
++
++        direct_claude = await tag(
++            {"HARNESS_CLAUDE_SDK_MODEL": "m"}, harness="claude-sdk", labels=None
++        )
++        assert direct_claude == {"HARNESS_CLAUDE_SDK_MODEL": "m"}
++        assert await tag(None, harness="claude-native", labels=None) is None
++        assert fetched == []
++
++        codex = await tag({}, harness="codex", labels=None)
++        assert codex == {tags_env: '{"omnigent_session_id":"conv_1","team":"fetched"}'}
++        assert fetched == ["/v1/sessions/conv_1/labels"]
++
++        monkeypatch.setenv("OMNIGENT_GATEWAY_REQUEST_TAGS", "0")
++        assert await tag(gateway_claude, harness="claude-sdk", labels={}) == gateway_claude
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.asyncio
+ @pytest.mark.asyncio
+diff --git a/tests/test_databricks_ai_gateway.py b/tests/test_databricks_ai_gateway.py
+index acf3f0d7a68830d97f01b4705851a3f93b496fc5..19884f63c726b780d82b81590952ceba9dfdb69d 100644
+--- a/tests/test_databricks_ai_gateway.py
++++ b/tests/test_databricks_ai_gateway.py
+@@ -66,3 +66,79 @@ def test_ug_configured_workspace_marks_a_provider_without_a_ug_user_agent(
+         "Databricks-Custom-Coding-Agent": "codex",
+         "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+     }
++
++
++def test_gateway_request_tags_send_the_session_id_and_user_labels_only() -> None:
++    from omnigent.databricks_ai_gateway import gateway_request_tags_value
++
++    labels = {
++        "team": "ml",
++        "project": "chat bot",
++        "omnigent.wrapper": "claude-code-native-ui",
++        "omni_project": "sidebar",
++        "cost_control.plan": "{}",
++        # A label cannot replace the session id.
++        "omnigent_session_id": "spoofed",
++    }
++
++    assert gateway_request_tags_value("conv_abc123", labels) == (
++        '{"omnigent_session_id":"conv_abc123","project":"chat bot","team":"ml"}'
++    )
++
++
++def test_gateway_request_tags_drop_labels_past_the_cap_but_keep_the_session_id() -> None:
++    from omnigent.databricks_ai_gateway import gateway_request_tags, gateway_request_tags_value
++
++    labels = {"a": "x" * 5000, "b": "y" * 5000, "c": "small", "d\n": "é"}
++
++    tags = gateway_request_tags("conv_1", labels)
++
++    assert list(tags) == ["omnigent_session_id", "a", "c", "d\n"]
++    encoded = gateway_request_tags_value("conv_1", labels)
++    assert encoded is not None and encoded.isascii() and "\n" not in encoded
++    assert len(encoded) <= 8 * 1024
++    assert gateway_request_tags("conv_1", {"a": "x" * 9000}) == {"omnigent_session_id": "conv_1"}
++
++
++@pytest.mark.parametrize(
++    ("switch", "enabled"), [(None, True), ("1", True), ("0", False), ("off", False)]
++)
++def test_gateway_request_tags_switch(
++    monkeypatch: pytest.MonkeyPatch, switch: str | None, enabled: bool
++) -> None:
++    from omnigent.databricks_ai_gateway import (
++        REQUEST_TAGS_SWITCH_ENV,
++        REQUEST_TAGS_VALUE_ENV,
++        gateway_request_tags_env,
++        gateway_request_tags_headers,
++    )
++
++    if switch is None:
++        monkeypatch.delenv(REQUEST_TAGS_SWITCH_ENV, raising=False)
++    else:
++        monkeypatch.setenv(REQUEST_TAGS_SWITCH_ENV, switch)
++
++    env = gateway_request_tags_env("conv_1", {"team": "ml"})
++    harness_env = {REQUEST_TAGS_VALUE_ENV: '{"omnigent_session_id":"conv_1"}'}
++    if switch is not None:
++        harness_env[REQUEST_TAGS_SWITCH_ENV] = switch
++
++    assert bool(env) is enabled
++    assert gateway_request_tags_headers(harness_env) == (
++        {"Databricks-Ai-Gateway-Request-Tags": '{"omnigent_session_id":"conv_1"}'}
++        if enabled
++        else {}
++    )
++    assert gateway_request_tags_headers({}) == {}
++
++
++def test_with_gateway_request_tags_line_appends_to_the_claude_block() -> None:
++    from omnigent.databricks_ai_gateway import with_gateway_request_tags_line
++
++    assert with_gateway_request_tags_line(None, '{"omnigent_session_id":"c"}') == (
++        'Databricks-Ai-Gateway-Request-Tags: {"omnigent_session_id":"c"}'
++    )
++    assert with_gateway_request_tags_line("X-A: 1", "{}").splitlines() == [
++        "X-A: 1",
++        "Databricks-Ai-Gateway-Request-Tags: {}",
++    ]

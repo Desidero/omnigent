@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lazar Gopcevic <lazgop@gmail.com>
+Date: Fri, 11 Sep 2026 12:29:46 +0200
+Subject: [PATCH] refactor(claude): resolve Claude's config dir in one place
+
+Carried on custom until upstream PR #9617 (CLAUDE_CONFIG_DIR) merges; the
+account work below needs it.
+
+The session-status reader and the local session importer each rebuilt
+the "$CLAUDE_CONFIG_DIR, else ~/.claude" rule by hand, while other
+paths skipped it and hardcoded ~/.claude. Give the rule one home,
+including where .claude.json lives, so every caller shares it.
+
+Signed-off-by: Lazar Gopcevic <lazgop@gmail.com>
+(cherry picked from commit 4e66f92b873dbfc58da02a976d6dfa4dcc1658c2)
+Signed-off-by: omni-resolve-agent[bot] <omni-resolve-agent[bot]@users.noreply.github.com>
+Docs: none (refactor: one helper resolves Claude's config dir; no behavior change)
+---
+ omnigent/claude_paths.py                      | 34 +++++++++
+ .../harnesses/claude_native/status_file.py    |  9 ++-
+ omnigent/session_import/local.py              |  9 +--
+ tests/test_claude_paths.py                    | 69 +++++++++++++++++++
+ 4 files changed, 110 insertions(+), 11 deletions(-)
+ create mode 100644 omnigent/claude_paths.py
+ create mode 100644 tests/test_claude_paths.py
+
+diff --git a/omnigent/claude_paths.py b/omnigent/claude_paths.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ccbb4f1cf54c217ed4d0f1f6084b339139d8611
+--- /dev/null
++++ b/omnigent/claude_paths.py
+@@ -0,0 +1,34 @@
++"""Where the Claude CLI keeps its per-user files.
++
++``CLAUDE_CONFIG_DIR`` selects a Claude profile. Anything Omnigent reads or writes
++on Claude's behalf has to follow the same choice, or it lands in the wrong profile.
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++
++def _configured_dir() -> Path | None:
++    configured = os.environ.get("CLAUDE_CONFIG_DIR")
++    return Path(configured).expanduser() if configured else None
++
++
++def claude_config_dir() -> Path:
++    """Return Claude's config dir: ``$CLAUDE_CONFIG_DIR`` when set, else ``~/.claude``.
++
++    :returns: The directory holding ``settings.json``, ``projects/`` and ``sessions/``.
++    """
++    return _configured_dir() or Path.home() / ".claude"
++
++
++def claude_json_path() -> Path:
++    """Return Claude's user-scope config file.
++
++    It lives inside ``$CLAUDE_CONFIG_DIR`` when that is set, and otherwise in the
++    home directory beside ``~/.claude`` rather than inside it.
++
++    :returns: ``$CLAUDE_CONFIG_DIR/.claude.json`` or ``~/.claude.json``.
++    """
++    return (_configured_dir() or Path.home()) / ".claude.json"
+diff --git a/omnigent/harnesses/claude_native/status_file.py b/omnigent/harnesses/claude_native/status_file.py
+index b7e6acd63e5c9bb50f78c0953c95f1cd4d90cb2e..58415c386d7cfb77dc39e5635339684d36bfa359 100644
+--- a/omnigent/harnesses/claude_native/status_file.py
++++ b/omnigent/harnesses/claude_native/status_file.py
+@@ -28,13 +28,14 @@ from __future__ import annotations
+ 
+ import json
+ import logging
+-import os
+ import threading
+ import time
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
++from omnigent.claude_paths import claude_config_dir
++
+ _logger = logging.getLogger(__name__)
+ 
+ # Runner-side status vocabulary the file maps onto. ``busy`` and
+@@ -102,7 +103,7 @@ def sessions_dir(config_dir: Path | None = None) -> Path:
+     """Return Claude Code's ``sessions`` directory.
+ 
+     Mirrors Claude's own resolution: ``CLAUDE_CONFIG_DIR`` when set,
+-    otherwise ``~/.claude`` — matching :mod:`omnigent.session_import.local`.
++    otherwise ``~/.claude``.
+ 
+     :param config_dir: Explicit Claude config dir override (tests). When
+         ``None`` the environment / home default is used.
+@@ -110,9 +111,7 @@ def sessions_dir(config_dir: Path | None = None) -> Path:
+     """
+     if config_dir is not None:
+         return config_dir / "sessions"
+-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+-    home = Path(configured).expanduser() if configured else Path.home() / ".claude"
+-    return home / "sessions"
++    return claude_config_dir() / "sessions"
+ 
+ 
+ def _read_json_file(path: Path) -> dict[str, object] | None:
+diff --git a/omnigent/session_import/local.py b/omnigent/session_import/local.py
+index f3567ec123e30d77e7117bbcdf9a858fc885311c..9b7ca538a7059b3bfdf0996507696b488d1e5bfd 100644
+--- a/omnigent/session_import/local.py
++++ b/omnigent/session_import/local.py
+@@ -12,6 +12,7 @@ from hashlib import sha256
+ from pathlib import Path
+ from typing import get_args
+ 
++from omnigent.claude_paths import claude_config_dir
+ from omnigent.entities import NewConversationItem, parse_item_data
+ from omnigent.harnesses.claude_native.bridge import (
+     ClaudeTranscriptItem,
+@@ -325,9 +326,7 @@ def _recent_local_sessions_with_recency(
+ ) -> list[tuple[str, float]]:
+     """List recent ``(session_id, recency)`` pairs for one local harness, newest first."""
+     if source == "claude":
+-        configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+-        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
+-        root = home / "projects"
++        root = claude_config_dir() / "projects"
+         candidates = [
+             (path, path.stem)
+             for path in root.rglob("*.jsonl")
+@@ -547,9 +546,7 @@ def load_claude_session(
+     claude_home: Path | None = None,
+ ) -> LocalSessionImport:
+     """Load one Claude Code parent session from its local JSONL transcript."""
+-    configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+-    home = claude_home or (Path(configured_home).expanduser() if configured_home else None)
+-    root = (home or Path.home() / ".claude") / "projects"
++    root = (claude_home or claude_config_dir()) / "projects"
+     transcript_path = _find_transcript(root, session_id)
+     if transcript_path is None:
+         raise SessionImportNotFoundError(f"Claude Code session {session_id!r} was not found")
+diff --git a/tests/test_claude_paths.py b/tests/test_claude_paths.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1aca14e75074d2716c92d11177438823e0f73782
+--- /dev/null
++++ b/tests/test_claude_paths.py
+@@ -0,0 +1,69 @@
++"""Tests for resolving Claude Code's files the way the Claude CLI does."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from omnigent.claude_paths import claude_config_dir, claude_json_path
++
++
++@pytest.fixture
++def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    """Point ``Path.home()`` at a temp dir.
++
++    :param tmp_path: Pytest temp dir.
++    :param monkeypatch: Pytest monkeypatch fixture.
++    :returns: The fake home, e.g. ``tmp_path / "home"``.
++    """
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HOME", str(home))
++    return home
++
++
++def test_claude_config_dir_defaults_to_dot_claude(home: Path) -> None:
++    """Without ``CLAUDE_CONFIG_DIR`` Claude keeps its state in ``~/.claude``."""
++    assert claude_config_dir() == home / ".claude"
++
++
++def test_claude_config_dir_follows_claude_config_dir(
++    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A profile selected via ``CLAUDE_CONFIG_DIR`` replaces ``~/.claude`` entirely."""
++    profile = tmp_path / "work-profile"
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++
++    assert claude_config_dir() == profile
++
++
++def test_claude_config_dir_expands_tilde(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    """A ``~``-relative ``CLAUDE_CONFIG_DIR`` resolves against the user's home."""
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/profiles/work")
++
++    assert claude_config_dir() == home / "profiles" / "work"
++
++
++def test_claude_config_dir_treats_empty_value_as_unset(
++    home: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """An empty ``CLAUDE_CONFIG_DIR`` falls back to ``~/.claude``, as the CLI does."""
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
++
++    assert claude_config_dir() == home / ".claude"
++
++
++def test_claude_json_defaults_to_home(home: Path) -> None:
++    """The user-scope config sits beside ``~/.claude``, not inside it."""
++    assert claude_json_path() == home / ".claude.json"
++
++
++def test_claude_json_moves_into_claude_config_dir(
++    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """With ``CLAUDE_CONFIG_DIR`` set, the CLI reads ``.claude.json`` from inside it."""
++    profile = tmp_path / "work-profile"
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++
++    assert claude_json_path() == profile / ".claude.json"

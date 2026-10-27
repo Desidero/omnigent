@@ -1,0 +1,741 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Mon, 19 Oct 2026 13:34:25 +0000
+Subject: [PATCH] feat(claude-sdk): opt into Claude Code's WebSearch and
+ WebFetch
+
+The claude-sdk harness pins Claude Code's built-in tools to Skill and
+ToolSearch, so a claude-sdk agent cannot use Claude's own web search even
+on a first-party subscription. Omnigent's web_search builtin needs a
+separate search backend and key, and is not the same tool.
+
+Add executor.config.native_tools, accepting WebSearch and WebFetch. The
+named tools join the CLI's base tool set. They stay off allowed_tools so
+every call still reaches the TOOL_CALL policy gate; in auto mode the gate
+then approves them without a human prompt, as it does for Omnigent's own
+tools. WebSearch is withheld when ANTHROPIC_BASE_URL points at a
+non-Anthropic gateway, which cannot serve the nested web_search request;
+Bedrock, Vertex and Foundry gate it themselves.
+
+Carried on custom so claude-sdk chat sessions can search the web;
+not upstream yet (proposal pending). Drop once it lands upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/AGENT_YAML_SPEC.md                    |  19 +++
+ omnigent/inner/claude_sdk_executor.py      |  56 ++++++++-
+ omnigent/inner/claude_sdk_harness.py       |  45 ++++++-
+ omnigent/inner/datamodel.py                |  22 ++++
+ omnigent/inner/loader.py                   |   7 ++
+ omnigent/runtime/workflow.py               |   4 +
+ omnigent/spec/_omnigent_compat.py          |  10 +-
+ omnigent/spec/omnigent.py                  |   4 +
+ omnigent/spec/parser.py                    |   2 +-
+ tests/inner/test_claude_sdk_executor.py    | 129 +++++++++++++++++++++
+ tests/inner/test_claude_sdk_harness.py     |  35 ++++++
+ tests/runtime/test_claude_sdk_spawn_env.py |  15 +++
+ tests/spec/test_claude_sdk_native_tools.py |  81 +++++++++++++
+ 13 files changed, 424 insertions(+), 5 deletions(-)
+ create mode 100644 tests/spec/test_claude_sdk_native_tools.py
+
+diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
+index 7734c5c0c9ed7367a823741a5e31f10ba0e4dd77..59b5eadb581ba41a8a99c5e4fed9e836878178cc 100644
+--- a/docs/AGENT_YAML_SPEC.md
++++ b/docs/AGENT_YAML_SPEC.md
+@@ -89,6 +89,25 @@ authoritative approval surface; supported one-time tool approvals can also be
+ mirrored into Chat cards, while persistent trust choices remain explicit Kiro
+ TUI/flag actions. See `kiro-native-elicitation.md`.
+ 
++### Claude SDK built-in web tools
++
++`harness: claude-sdk` hides Claude Code's built-in tools by default; file and
++shell access go through the sandboxed `sys_os_*` tools instead. Set
++`native_tools` to turn on Claude Code's own web search and fetch:
++
++```yaml
++executor:
++  harness: claude-sdk
++  native_tools: [WebSearch, WebFetch]
++```
++
++In a directory bundle, put it under `executor.config.native_tools`. Only
++`WebSearch` and `WebFetch` are accepted. Both run inside the Claude CLI, still
++pass Omnigent `TOOL_CALL` policies, and are pre-approved in the default `auto`
++permission mode. `WebSearch` is served by Anthropic's API, so it is withheld
++when `ANTHROPIC_BASE_URL` points at a non-Anthropic gateway (Bedrock, Vertex
++and Foundry gate it themselves); `WebFetch` stays available.
++
+ ### Antigravity (Gemini)
+ 
+ `harness: antigravity` runs the agent through Google's
+diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
+index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee74187421e 100644
+--- a/omnigent/inner/claude_sdk_executor.py
++++ b/omnigent/inner/claude_sdk_executor.py
+@@ -41,6 +41,7 @@ from contextlib import ExitStack, contextmanager, suppress
+ from dataclasses import dataclass
+ from types import ModuleType
+ from typing import Any, NamedTuple, Protocol, TypeAlias, cast
++from urllib.parse import urlparse
+ 
+ from omnigent._platform import resolve_cli_binary, stable_user_id
+ from omnigent.claude_paths import claude_config_dir, claude_json_path
+@@ -63,6 +64,7 @@ from omnigent.models.claude_model_vocabulary import (
+     served_canonical_overrides,
+ )
+ from omnigent.models.model_metadata import concrete_reported_model
++from omnigent.process_logging import env_truthy
+ from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+ from omnigent.spec.types import RetryPolicy
+ from omnigent.util.json_serialization import json_dumps_transport_safe
+@@ -822,6 +824,40 @@ def _kill_process_tree(process: _Process | None) -> None:
+     _proc.kill_tree(process)
+ 
+ 
++#: Env flags that put Claude Code in a cloud-provider mode where it gates
++#: WebSearch itself and ignores ``ANTHROPIC_BASE_URL``.
++_CLAUDE_CLOUD_PROVIDER_FLAG_ENVS: tuple[str, ...] = (
++    "CLAUDE_CODE_USE_BEDROCK",
++    "CLAUDE_CODE_USE_VERTEX",
++    "CLAUDE_CODE_USE_FOUNDRY",
++)
++
++
++def _native_tools_for_endpoint(native_tools: Sequence[str], cli_env: dict[str, str]) -> list[str]:
++    """Drop native tools the CLI's endpoint cannot serve.
++
++    Claude Code runs WebSearch as a nested ``web_search`` request to
++    ``ANTHROPIC_BASE_URL``, which non-Anthropic gateways reject. Cloud-provider
++    modes gate the tool themselves. ``cli_env`` overrides the inherited env,
++    as it does for the CLI.
++
++    :param native_tools: Opted-in tool names, e.g. ``("WebSearch", "WebFetch")``.
++    :param cli_env: The env passed to the CLI via ``ClaudeAgentOptions.env``.
++    :returns: The tools to expose, in their original order.
++    """
++
++    def effective(name: str) -> str | None:
++        return cli_env.get(name) or os.environ.get(name) or None
++
++    if any(env_truthy(effective(name)) for name in _CLAUDE_CLOUD_PROVIDER_FLAG_ENVS):
++        return list(native_tools)
++    base_url = effective("ANTHROPIC_BASE_URL")
++    host = (urlparse(base_url).hostname or "").lower() if base_url else ""
++    if not base_url or host == "anthropic.com" or host.endswith(".anthropic.com"):
++        return list(native_tools)
++    return [name for name in native_tools if name != "WebSearch"]
++
++
+ @contextmanager
+ def _unset_env_var(name: str) -> Iterator[None]:
+     """
+@@ -1689,6 +1725,7 @@ class ClaudeSDKExecutor(Executor):
+         skills_filter: str | list[str] = "all",
+         api_key_helper: str | None = None,
+         system_prompt_preset: str | None = None,
++        native_tools: list[str] | None = None,
+     ) -> None:
+         """Create a ClaudeSDKExecutor.
+ 
+@@ -1764,6 +1801,10 @@ class ClaudeSDKExecutor(Executor):
+                 Injected into ``_extra_env`` as
+                 :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
+                 the SDK's ``settings.apiKeyHelper`` option at turn time.
++            native_tools: Claude Code built-in tools to expose, e.g.
++                ``["WebSearch", "WebFetch"]``. They run inside the CLI,
++                still pass the TOOL_CALL policy gate, and are pre-approved
++                in ``auto`` mode like Omnigent's own tools.
+         """
+         # Fail loud: a ``databricks-*`` model requires the gateway transport.
+         if not gateway and model is not None and model.startswith("databricks-"):
+@@ -1793,6 +1834,7 @@ class ClaudeSDKExecutor(Executor):
+         self._bundle_dir = bundle_dir
+         self._agent_name = agent_name
+         self._skills_filter = skills_filter
++        self._native_tools: tuple[str, ...] = tuple(native_tools or ())
+         # Write the bundle's plugin manifest now (idempotent) so that
+         # ``--plugin-dir <bundle>`` produces clean
+         # ``<agent-name>:<skill-name>`` labels in Claude's skill
+@@ -2585,6 +2627,11 @@ class ClaudeSDKExecutor(Executor):
+         # never prompt; otherwise defer to the elicitation gate.
+         if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
+             return PermissionResultAllow()
++        # Opted-in built-ins are pre-approved in auto mode, like the
++        # ``mcp__omnigent__*`` tools in ``allowed_tools``. They stay off
++        # ``allowed_tools`` because that would skip the policy gate above.
++        if self._permission_mode == "auto" and tool_name in self._native_tools:
++            return PermissionResultAllow()
+         return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
+ 
+     async def run_turn(
+@@ -2755,8 +2802,13 @@ class ClaudeSDKExecutor(Executor):
+         # OS-environment tools are provided via Omnigent ``sys_os_*``
+         # MCP tools (declared via ``os_env`` in the spec), not the
+         # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
+-        # the base set so MCP definitions can be discovered on demand.
+-        base_tools: list[str] = ["Skill", "ToolSearch"]
++        # the base set so MCP definitions can be discovered on demand, plus
++        # any built-ins the spec opted into (``native_tools``).
++        base_tools: list[str] = [
++            "Skill",
++            "ToolSearch",
++            *_native_tools_for_endpoint(self._native_tools, env),
++        ]
+         # Translate the spec's host-skill filter into the SDK
+         # options. Falls back to ``"all"`` semantics when the
+         # field is malformed (the parser already validates, so
+diff --git a/omnigent/inner/claude_sdk_harness.py b/omnigent/inner/claude_sdk_harness.py
+index d196e46bdf620e44d9e59bd1c6b8b6f7e3bac67f..1984071071a75fcaefd8c888665c48329e9c9eb3 100644
+--- a/omnigent/inner/claude_sdk_harness.py
++++ b/omnigent/inner/claude_sdk_harness.py
+@@ -77,6 +77,13 @@ Env vars read at startup:
+   surface as agent-bundled skills (regardless of
+   ``skills_filter``). Unset for agents without a bundled-skills
+   directory.
++- ``HARNESS_CLAUDE_SDK_NATIVE_TOOLS``: JSON-encoded list of
++  Claude Code built-in tools to enable, carrying
++  ``executor.config.native_tools``, e.g.
++  ``["WebSearch", "WebFetch"]``. Names outside
++  :data:`~omnigent.inner.datamodel.CLAUDE_SDK_NATIVE_TOOLS` are
++  dropped with a warning. When unset, no built-ins beyond
++  ``Skill`` / ``ToolSearch`` are enabled.
+ - ``HARNESS_CLAUDE_SDK_AGENT_NAME``: Agent display name. Used
+   when ``HARNESS_CLAUDE_SDK_BUNDLE_DIR`` is set to write the
+   bundle's ``.claude-plugin/plugin.json`` manifest with a
+@@ -95,7 +102,7 @@ from pathlib import Path
+ from fastapi import FastAPI
+ 
+ from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
++from omnigent.inner.datamodel import CLAUDE_SDK_NATIVE_TOOLS, OSEnvSandboxSpec, OSEnvSpec
+ from omnigent.inner.executor import Executor
+ from omnigent.inner.os_env_serialization import decode_sandbox_spec
+ from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+@@ -118,6 +125,7 @@ _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
+ _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
+ _ENV_BUNDLE_DIR = "HARNESS_CLAUDE_SDK_BUNDLE_DIR"
+ _ENV_AGENT_NAME = "HARNESS_CLAUDE_SDK_AGENT_NAME"
++_ENV_NATIVE_TOOLS = "HARNESS_CLAUDE_SDK_NATIVE_TOOLS"
+ _ENV_GATEWAY_BASE_URL = "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"
+ _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"
+ _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+@@ -254,6 +262,40 @@ def _resolve_skills_filter() -> str | list[str]:
+     return "all"
+ 
+ 
++def _resolve_native_tools() -> list[str]:
++    """
++    Resolve the Claude Code built-in tools to enable from env config.
++
++    Reads :data:`_ENV_NATIVE_TOOLS` (a JSON list of tool names). A
++    missing or malformed value enables none; unsupported names are
++    dropped, since spec validation should already have rejected them.
++
++    :returns: Supported tool names, e.g. ``["WebSearch", "WebFetch"]``.
++    """
++    raw = os.environ.get(_ENV_NATIVE_TOOLS, "").strip()
++    if not raw:
++        return []
++    try:
++        decoded = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        _logger.warning(
++            "%s is not valid JSON (%s); enabling no native tools", _ENV_NATIVE_TOOLS, exc
++        )
++        return []
++    if not isinstance(decoded, list):
++        _logger.warning("%s is not a list; enabling no native tools", _ENV_NATIVE_TOOLS)
++        return []
++    supported = [name for name in decoded if name in CLAUDE_SDK_NATIVE_TOOLS]
++    if len(supported) != len(decoded):
++        _logger.warning(
++            "%s named unsupported tools %r; enabling only %r",
++            _ENV_NATIVE_TOOLS,
++            decoded,
++            supported,
++        )
++    return supported
++
++
+ def _build_claude_sdk_executor() -> Executor:
+     """
+     Construct a :class:`ClaudeSDKExecutor` from env-var config.
+@@ -301,6 +343,7 @@ def _build_claude_sdk_executor() -> Executor:
+         agent_name=agent_name,
+         skills_filter=_resolve_skills_filter(),
+         api_key_helper=os.environ.get(_ENV_API_KEY_HELPER) or None,
++        native_tools=_resolve_native_tools(),
+     )
+ 
+ 
+diff --git a/omnigent/inner/datamodel.py b/omnigent/inner/datamodel.py
+index cacac0a6ed9ae62df1a863fa5eea95096b00c75d..62179f32c1ad5206867b1ef76d36b99b77ab233a 100644
+--- a/omnigent/inner/datamodel.py
++++ b/omnigent/inner/datamodel.py
+@@ -335,6 +335,25 @@ class SessionState(enum.Enum):
+ # ExecutorSpec (lightweight)
+ # ---------------------------------------------------------------------------
+ 
++#: Claude Code built-in tools a ``claude-sdk`` spec may opt into via
++#: ``native_tools``. OS tools stay on the sandboxed ``sys_os_*`` path.
++CLAUDE_SDK_NATIVE_TOOLS: frozenset[str] = frozenset({"WebSearch", "WebFetch"})
++
++
++def claude_sdk_native_tools_error(value: object) -> str | None:
++    """Describe why *value* is not a valid ``native_tools`` list.
++
++    :param value: The raw ``native_tools`` value from the spec.
++    :returns: An error message, or ``None`` when the value is valid.
++    """
++    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
++        return "must be a list of tool names"
++    unknown = sorted(set(value) - CLAUDE_SDK_NATIVE_TOOLS)
++    if unknown:
++        supported = ", ".join(sorted(CLAUDE_SDK_NATIVE_TOOLS))
++        return f"unsupported tool(s) {', '.join(unknown)}; supported: {supported}"
++    return None
++
+ 
+ @dataclass
+ class ExecutorSpec:
+@@ -355,6 +374,8 @@ class ExecutorSpec:
+         re-reading raw YAML.
+     :param context_files: Pi context-file discovery override. None uses Pi's default.
+     :param system_prompt_mode: Pi prompt delivery: append (default) or replace its base prompt.
++    :param native_tools: Claude Code built-in tools to enable on ``claude-sdk``,
++        e.g. ``["WebSearch", "WebFetch"]``. None enables none.
+     """
+ 
+     model: str | None = None
+@@ -363,6 +384,7 @@ class ExecutorSpec:
+     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
+     context_files: bool | None = None
+     system_prompt_mode: str | None = None
++    native_tools: list[str] | None = None
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/omnigent/inner/loader.py b/omnigent/inner/loader.py
+index 28eecfd7ba4d2b2aed546850e13cc84fecf8c9ce..13be407d2dcf5f1865492d88bdb1b48b641a4d6b 100644
+--- a/omnigent/inner/loader.py
++++ b/omnigent/inner/loader.py
+@@ -18,6 +18,7 @@ from .datamodel import (
+     OSEnvSpec,
+     ParamDef,
+     TerminalEnvSpec,
++    claude_sdk_native_tools_error,
+     parse_write_paths,
+ )
+ from .policies import (
+@@ -705,6 +706,11 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
+         system_prompt_mode = data.get("system_prompt_mode")
+         if "system_prompt_mode" in data and system_prompt_mode not in ("append", "replace"):
+             raise ValueError("executor.system_prompt_mode must be 'append' or 'replace'")
++        native_tools = data.get("native_tools")
++        if "native_tools" in data:
++            native_tools_error = claude_sdk_native_tools_error(native_tools)
++            if native_tools_error:
++                raise ValueError(f"executor.native_tools {native_tools_error}")
+         return ExecutorSpec(
+             model=data.get("model"),
+             harness=data.get("harness"),
+@@ -712,6 +718,7 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
+             auth=auth,
+             context_files=context_files,
+             system_prompt_mode=system_prompt_mode,
++            native_tools=native_tools,
+         )
+     return None
+ 
+diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
+index 76f3c043a735cb50336337e3c3b14ba82edad6c5..1935d7d3491f46f1d80b4c8909675078f9e7078e 100644
+--- a/omnigent/runtime/workflow.py
++++ b/omnigent/runtime/workflow.py
+@@ -1448,6 +1448,10 @@ def _build_claude_sdk_spawn_env(
+     # Explicitly clear inherited presets for agents that have not opted in.
+     preset = spec.executor.config.get("system_prompt_preset")
+     env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
++    # Claude Code built-ins the spec opted into, e.g. WebSearch / WebFetch.
++    native_tools = spec.executor.config.get("native_tools")
++    if native_tools:
++        env["HARNESS_CLAUDE_SDK_NATIVE_TOOLS"] = json.dumps(native_tools)
+     return env
+ 
+ 
+diff --git a/omnigent/spec/_omnigent_compat.py b/omnigent/spec/_omnigent_compat.py
+index 60fe4fb6c4ce19bd7b2e5cc9116cf5eff435d634..06358d62a335c60a7f3064c28665197a99e2f9e0 100644
+--- a/omnigent/spec/_omnigent_compat.py
++++ b/omnigent/spec/_omnigent_compat.py
+@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING
+ import yaml
+ 
+ from omnigent.errors import ErrorCode, OmnigentError
+-from omnigent.harness_aliases import canonicalize_harness
++from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
+ from omnigent.harness_plugins import (
+     accepted_harnesses,
+     missing_install_packages,
+@@ -209,6 +209,14 @@ def validate_omnigent_executor(
+                 "instructions",
+                 "pi-native system_prompt_mode='replace' requires non-empty authored instructions",
+             )
++    if "native_tools" in spec.executor.config:
++        from omnigent.inner.datamodel import claude_sdk_native_tools_error
++
++        native_tools_error = claude_sdk_native_tools_error(spec.executor.config["native_tools"])
++        if native_tools_error:
++            result.add("executor.config.native_tools", native_tools_error)
++        if not is_claude_sdk_harness_name(harness):
++            result.add("executor.config.native_tools", "only supported with harness 'claude-sdk'")
+     if not harness:
+         result.add(
+             "executor.config.harness",
+diff --git a/omnigent/spec/omnigent.py b/omnigent/spec/omnigent.py
+index 90d44d9f5819d47599b0cea50d188e30f44ed76b..c455df6bab9d337198b66873691dcb9a7e0af9e7 100644
+--- a/omnigent/spec/omnigent.py
++++ b/omnigent/spec/omnigent.py
+@@ -160,6 +160,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
+         profile=spec.executor.config.get("profile"),
+         context_files=spec.executor.config.get("context_files"),
+         system_prompt_mode=spec.executor.config.get("system_prompt_mode"),
++        native_tools=spec.executor.config.get("native_tools"),
+     )
+ 
+     # ``AgentDef.name`` / ``AgentDef.prompt`` are ``str | None`` — pass
+@@ -457,6 +458,7 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
+             profile=profile,
+             context_files=sub.executor.config.get("context_files"),
+             system_prompt_mode=sub.executor.config.get("system_prompt_mode"),
++            native_tools=sub.executor.config.get("native_tools"),
+         ),
+     )
+ 
+@@ -1768,6 +1770,8 @@ def _translate_executor_from_def(
+         config["context_files"] = oa_executor.context_files
+     if oa_executor is not None and oa_executor.system_prompt_mode is not None:
+         config["system_prompt_mode"] = oa_executor.system_prompt_mode
++    if oa_executor is not None and oa_executor.native_tools is not None:
++        config["native_tools"] = list(oa_executor.native_tools)
+     # These are not fields on the omnigent inner ExecutorSpec, so read them
+     # from the raw YAML dict and carry them forward explicitly.
+     # The openai-agents harness spawn-env builder reads
+diff --git a/omnigent/spec/parser.py b/omnigent/spec/parser.py
+index c12722c51ad7f77b4158ea704ae8f169e375e5f7..e27f79b197da78b965dc2b37331dbaeadb6da2fa 100644
+--- a/omnigent/spec/parser.py
++++ b/omnigent/spec/parser.py
+@@ -105,7 +105,7 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+ 
+ # ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
+ _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
+-    {"context_files", "system_prompt_mode"}
++    {"context_files", "system_prompt_mode", "native_tools"}
+ )
+ 
+ # Copy the resolver dict onto the subclass before mutating — it's inherited
+diff --git a/tests/inner/test_claude_sdk_executor.py b/tests/inner/test_claude_sdk_executor.py
+index 2c3d7c8407b7dc92fb4212a25b20a006bd9a9814..82cc0ce66ad8a8ab27137fd88f023069f908c9e0 100644
+--- a/tests/inner/test_claude_sdk_executor.py
++++ b/tests/inner/test_claude_sdk_executor.py
+@@ -3516,6 +3516,53 @@ def test_unset_env_var_restores_on_exception(monkeypatch):
+     assert os.environ["CLAUDECODE"] == "original"
+ 
+ 
++_GATEWAY_URL = "https://gateway.example.com/anthropic"
++
++
++@pytest.mark.parametrize(
++    ("cli_env", "inherited_env", "expected"),
++    [
++        ({}, {}, ["WebSearch", "WebFetch"]),
++        ({"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, {}, ["WebSearch", "WebFetch"]),
++        ({"ANTHROPIC_BASE_URL": _GATEWAY_URL}, {}, ["WebFetch"]),
++        ({}, {"ANTHROPIC_BASE_URL": _GATEWAY_URL}, ["WebFetch"]),
++        (
++            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
++            {"ANTHROPIC_BASE_URL": _GATEWAY_URL},
++            ["WebSearch", "WebFetch"],
++        ),
++        (
++            {"ANTHROPIC_BASE_URL": _GATEWAY_URL, "CLAUDE_CODE_USE_BEDROCK": "1"},
++            {},
++            ["WebSearch", "WebFetch"],
++        ),
++    ],
++    ids=[
++        "first-party",
++        "anthropic-host",
++        "gateway",
++        "inherited-gateway",
++        "cli-env-wins",
++        "bedrock",
++    ],
++)
++def test_native_tools_for_endpoint_withholds_websearch_on_gateways(
++    monkeypatch, cli_env, inherited_env, expected
++) -> None:
++    """WebSearch is dropped only when the CLI's endpoint is a non-Anthropic gateway."""
++    from omnigent.inner.claude_sdk_executor import (
++        _CLAUDE_CLOUD_PROVIDER_FLAG_ENVS,
++        _native_tools_for_endpoint,
++    )
++
++    for name in ("ANTHROPIC_BASE_URL", *_CLAUDE_CLOUD_PROVIDER_FLAG_ENVS):
++        monkeypatch.delenv(name, raising=False)
++    for name, value in inherited_env.items():
++        monkeypatch.setenv(name, value)
++
++    assert _native_tools_for_endpoint(("WebSearch", "WebFetch"), cli_env) == expected
++
++
+ def test_databricks_model_without_routing_raises() -> None:
+     """``databricks-*`` model with ``gateway=False`` raises ``ValueError``.
+ 
+@@ -5144,6 +5191,88 @@ class TestToolCallPolicyGate(unittest.TestCase):
+ 
+         _run(_t())
+ 
++    def test_native_tools_are_exposed_but_not_pre_approved(self):
++        """Opted-in built-ins join the base tool set but stay off
++        allowed_tools, so every call still reaches the policy gate."""
++        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
++
++        async def _t():
++            executor = ClaudeSDKExecutor(
++                permission_mode="auto", native_tools=["WebSearch", "WebFetch"]
++            )
++            captured = {}
++
++            async def fake_get_or_create_client(sdk, *, session_key, options, model):
++                captured["tools"] = options.tools
++                captured["allowed_tools"] = options.allowed_tools
++                raise RuntimeError("stop after options build")
++
++            with (
++                patch.dict(os.environ),
++                patch.object(
++                    executor, "_get_or_create_client", side_effect=fake_get_or_create_client
++                ),
++            ):
++                os.environ.pop("ANTHROPIC_BASE_URL", None)
++                with self.assertRaises(RuntimeError):
++                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
++                        pass
++
++            self.assertEqual(captured["tools"], ["Skill", "ToolSearch", "WebSearch", "WebFetch"])
++            self.assertEqual(captured["allowed_tools"], [])
++
++        _run(_t())
++
++    def test_native_tool_skips_prompt_in_auto_mode_but_not_policy(self):
++        """In auto mode an opted-in built-in is allowed without a human
++        prompt once policy allows it; a policy DENY still blocks it, and
++        other tools still prompt."""
++        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
++
++        async def _t():
++            executor = self._make_executor(permission_mode="auto")
++            executor._native_tools = ("WebSearch",)
++            evaluator = AsyncMock(return_value=self._verdict("POLICY_ACTION_ALLOW"))
++            executor._policy_evaluator = evaluator
++            elicit = AsyncMock(return_value=True)
++            executor._elicitation_handler = elicit
++
++            allowed = await executor._can_use_tool_gate(
++                "WebSearch", {"query": "x"}, self._perm_ctx()
++            )
++            self.assertIsInstance(allowed, PermissionResultAllow)
++            evaluator.assert_awaited_once()
++            elicit.assert_not_awaited()
++
++            evaluator.return_value = self._verdict("POLICY_ACTION_DENY", reason="no search")
++            denied = await executor._can_use_tool_gate(
++                "WebSearch", {"query": "x"}, self._perm_ctx()
++            )
++            self.assertIsInstance(denied, PermissionResultDeny)
++            self.assertEqual(denied.message, "no search")
++
++            evaluator.return_value = self._verdict("POLICY_ACTION_ALLOW")
++            await executor._can_use_tool_gate("mcp__github__issue_read", {}, self._perm_ctx())
++            elicit.assert_awaited_once()
++
++        _run(_t())
++
++    def test_native_tool_still_prompts_outside_auto_mode(self):
++        """Pre-approval is limited to auto mode; default mode keeps the
++        human-consent prompt for opted-in built-ins."""
++
++        async def _t():
++            executor = self._make_executor(permission_mode="default")
++            executor._native_tools = ("WebSearch",)
++            elicit = AsyncMock(return_value=True)
++            executor._elicitation_handler = elicit
++
++            await executor._can_use_tool_gate("WebSearch", {"query": "x"}, self._perm_ctx())
++
++            elicit.assert_awaited_once_with("WebSearch", {"query": "x"})
++
++        _run(_t())
++
+ 
+ # ---------------------------------------------------------------------------
+ # Tests: Compaction detection via PreCompact hook
+diff --git a/tests/inner/test_claude_sdk_harness.py b/tests/inner/test_claude_sdk_harness.py
+index 0a8362da853ed3c3e0c58ee6b49e57e94d73a937..8d18dd4bf16931b6d16c67fa0a5a2c356c3c8481 100644
+--- a/tests/inner/test_claude_sdk_harness.py
++++ b/tests/inner/test_claude_sdk_harness.py
+@@ -439,6 +439,41 @@ def test_skills_filter_env_var_malformed_json_falls_back_to_all(
+     assert captured["skills_filter"] == "all"
+ 
+ 
++@pytest.mark.parametrize(
++    ("raw_value", "expected"),
++    [
++        (None, []),
++        ('["WebSearch", "WebFetch"]', ["WebSearch", "WebFetch"]),
++        ('["WebSearch", "Bash"]', ["WebSearch"]),
++        ('"WebSearch"', []),
++        ("{not-json", []),
++    ],
++    ids=["unset", "both", "unsupported-dropped", "not-a-list", "malformed"],
++)
++def test_native_tools_env_var_decodes(
++    raw_value: str | None,
++    expected: list[str],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """``HARNESS_CLAUDE_SDK_NATIVE_TOOLS`` reaches the executor as supported names only."""
++    if raw_value is None:
++        monkeypatch.delenv("HARNESS_CLAUDE_SDK_NATIVE_TOOLS", raising=False)
++    else:
++        monkeypatch.setenv("HARNESS_CLAUDE_SDK_NATIVE_TOOLS", raw_value)
++    captured: dict[str, Any] = {}
++
++    def _fake_init(self: Any, **kwargs: Any) -> None:
++        captured.update(kwargs)
++
++    with patch(
++        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
++        _fake_init,
++    ):
++        claude_sdk_harness._build_claude_sdk_executor()
++
++    assert captured["native_tools"] == expected
++
++
+ def test_bundle_dir_and_agent_name_env_vars_thread_through(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+diff --git a/tests/runtime/test_claude_sdk_spawn_env.py b/tests/runtime/test_claude_sdk_spawn_env.py
+index b0f39d3bd123ca06d7b6a464773c2e842d2f6c5d..b4df185f8681816793b702196b8e5868de5382a9 100644
+--- a/tests/runtime/test_claude_sdk_spawn_env.py
++++ b/tests/runtime/test_claude_sdk_spawn_env.py
+@@ -125,6 +125,21 @@ def test_bare_model_is_passed_through_unchanged() -> None:
+     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+ 
+ 
++@pytest.mark.parametrize(
++    ("native_tools", "expected"),
++    [(None, None), (["WebSearch", "WebFetch"], '["WebSearch", "WebFetch"]')],
++    ids=["unset", "both"],
++)
++def test_native_tools_threads_to_env(native_tools: list[str] | None, expected: str | None) -> None:
++    """``executor.config.native_tools`` reaches the harness as a JSON list."""
++    spec = _make_spec(model="claude-sonnet-4-6")
++    if native_tools is not None:
++        spec.executor.config["native_tools"] = native_tools
++    env = _build_claude_sdk_spawn_env(spec, workdir=None)
++
++    assert env.get("HARNESS_CLAUDE_SDK_NATIVE_TOOLS") == expected
++
++
+ def test_api_key_auth_sets_helper_env_var() -> None:
+     """
+     ``executor.auth: {type: api_key, api_key: …}`` sets
+diff --git a/tests/spec/test_claude_sdk_native_tools.py b/tests/spec/test_claude_sdk_native_tools.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f33464e7a8ec62cdd6bd5ca8ec56b1add9c34858
+--- /dev/null
++++ b/tests/spec/test_claude_sdk_native_tools.py
+@@ -0,0 +1,81 @@
++"""Claude SDK ``native_tools`` survive YAML loading and CLI bundle transport."""
++
++from pathlib import Path
++
++import pytest
++import yaml
++
++from omnigent.chat import _bundle_agent
++from omnigent.errors import OmnigentError
++from omnigent.spec import load
++from omnigent.spec.omnigent import agent_def_to_agent_spec, agent_spec_to_agent_def
++
++
++def _write_agent(tmp_path: Path, *, directory: bool, executor: dict) -> Path:
++    source = tmp_path / "agent"
++    source.mkdir()
++    if directory:
++        executor_config = dict(executor)
++        model = executor_config.pop("model", None)
++        config = {
++            "spec_version": 1,
++            "name": "claude-native-tools",
++            "executor": {"type": "omnigent", "model": model, "config": executor_config},
++            "prompt": "Explicit agent instructions.",
++        }
++        (source / "config.yaml").write_text(yaml.safe_dump(config))
++        return source
++    config = {
++        "name": "claude-native-tools",
++        "executor": executor,
++        "prompt": "Explicit agent instructions.",
++    }
++    path = source / "agent.yaml"
++    path.write_text(yaml.safe_dump(config))
++    return path
++
++
++@pytest.mark.parametrize("directory", [False, True], ids=["yaml", "bundle"])
++@pytest.mark.parametrize(
++    "native_tools", [None, ["WebSearch"], ["WebSearch", "WebFetch"]], ids=["unset", "one", "both"]
++)
++def test_native_tools_survives_bundle_transport(
++    tmp_path: Path, directory: bool, native_tools: list[str] | None
++) -> None:
++    executor: dict[str, object] = {"harness": "claude-sdk", "model": "claude-sonnet-4-6"}
++    if native_tools is not None:
++        executor["native_tools"] = native_tools
++    path = _write_agent(tmp_path, directory=directory, executor=executor)
++    spec = load(_bundle_agent(path), dest=tmp_path / "uploaded")
++
++    for candidate in (spec, agent_def_to_agent_spec(agent_spec_to_agent_def(spec))):
++        assert candidate.executor.config.get("native_tools") == native_tools
++
++
++@pytest.mark.parametrize("directory", [False, True], ids=["yaml", "bundle"])
++@pytest.mark.parametrize(
++    ("value", "message"),
++    [
++        (["Bash"], r"native_tools.*unsupported tool\(s\) Bash"),
++        ("WebSearch", r"native_tools.*must be a list"),
++        ([1], r"native_tools.*must be a list"),
++    ],
++    ids=["unsupported", "string", "non-string-item"],
++)
++def test_native_tools_rejects_invalid_values(
++    tmp_path: Path, directory: bool, value: object, message: str
++) -> None:
++    path = _write_agent(
++        tmp_path, directory=directory, executor={"harness": "claude-sdk", "native_tools": value}
++    )
++    with pytest.raises((OmnigentError, ValueError), match=message):
++        load(path)
++
++
++@pytest.mark.parametrize("harness", ["claude-native", "codex"])
++def test_native_tools_rejects_unsupported_harness(tmp_path: Path, harness: str) -> None:
++    path = _write_agent(
++        tmp_path, directory=False, executor={"harness": harness, "native_tools": ["WebSearch"]}
++    )
++    with pytest.raises(OmnigentError, match=r"native_tools.*only supported.*claude-sdk"):
++        load(path)

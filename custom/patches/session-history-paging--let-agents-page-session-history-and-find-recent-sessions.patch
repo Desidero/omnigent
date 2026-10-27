@@ -1,0 +1,1313 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 29 Sep 2026 14:21:26 +0000
+Subject: [PATCH] feat(sessions): let agents page session history and find
+ recent sessions
+
+Carried on custom until upstream answers the feature request for it
+(not opened yet) and a PR merges.
+
+Agents that review past sessions (e.g. a scheduled retro) could only list
+sessions in creation order with no timestamps, and could only read the
+last 50 items of a session, so walking a long transcript or finding what
+changed since the previous run was impossible.
+
+- sys_session_list: optional updated_after (ISO-8601), order_by
+  (created|updated) and ownership (any|mine|shared) filters for the
+  global view; each row now reports created_at, updated_at and owner.
+  Backed by a new updated_after query param on GET /v1/sessions.
+- sys_session_get_history: optional order='asc' and an 'after' item
+  cursor read forward from the start or from a saved position, reusing
+  GET /v1/sessions/{id}/items. Results carry next_cursor and has_more,
+  plus has_older on a most-recent read; an unresolvable cursor returns
+  invalid_cursor. Imports the database layer only when a history read
+  needs it, so host startup stays free of it.
+  Defaults, the tail_items cap and the character budget are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/AGENT_YAML_SPEC.md                       |  11 +
+ omnigent/runner/tool_dispatch.py              | 194 +++++++++++---
+ omnigent/server/API.md                        |   4 +
+ .../server/routes/sessions/routes_core.py     |   5 +
+ .../stores/conversation_store/__init__.py     |   5 +
+ .../conversation_store/sqlalchemy_store.py    |   5 +
+ omnigent/tools/builtins/spawn.py              | 208 ++++++++++++---
+ openapi.json                                  |  18 ++
+ tests/runner/test_runner_dispatch.py          | 244 ++++++++++++++++++
+ .../integration/test_sessions_endpoints.py    |  22 ++
+ tests/stores/test_conversation_store.py       |  35 +++
+ tests/tools/builtins/test_sys_session.py      | 113 ++++++++
+ 12 files changed, 787 insertions(+), 77 deletions(-)
+
+diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
+index 8cdf10f20c3766bb9ab9a2b3b3c89cc9b9b50c2d..7734c5c0c9ed7367a823741a5e31f10ba0e4dd77 100644
+--- a/docs/AGENT_YAML_SPEC.md
++++ b/docs/AGENT_YAML_SPEC.md
+@@ -905,6 +905,17 @@ have no key: any agent in a multi-agent session needs the reads, and async work
+ handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
+ session viewers to open a workspace-relative file without switching sessions.
+ 
++`sys_session_list` can narrow its session view with `updated_after` (an
++ISO-8601 time; sessions active since then), `order_by` (`created`, the
++default, or `updated`) and `ownership` (`any`, `mine` or `shared`); each row
++reports `created_at`, `updated_at` and `owner`. `sys_session_get_history`
++returns the most recent items by default. With `order: "asc"` it reads forward
++from the first item, and `after` set to a `next_cursor` from an earlier read
++resumes just after it, so an agent can walk a long transcript in pages or pick
++up where its last run stopped. Results carry `next_cursor` and `has_more`
++(plus `has_older` on a most-recent read); a cursor that no longer resolves
++returns `invalid_cursor`.
++
+ ## Complete example
+ 
+ ```yaml
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index a3dcfedc277019104ed92e1b2313db277f220ceb..9b953e506decf4617ec0c5116ae24e9164679819 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -32,6 +32,7 @@ import uuid
+ import weakref
+ from collections.abc import Awaitable, Callable
+ from dataclasses import dataclass
++from datetime import UTC, datetime
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Protocol, cast
+ 
+@@ -98,6 +99,8 @@ from omnigent.tools.builtins.spawn import (
+     _clamp_history_content_chars,
+     _clamp_history_offset_chars,
+     _clamp_tail_items,
++    _history_page_fields,
++    _parse_history_window,
+ )
+ from omnigent.tools.builtins.sys_terminal import (
+     SysTerminalCloseTool,
+@@ -5075,20 +5078,17 @@ async def _execute_session_query_tool(
+         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+ 
+     if tool_name == "sys_session_list":
+-        agent_name = args.get("agent_name")
+-        window = _discovery_list_window(
+-            args,
+-            tool_name,
+-            ("sessions",),
+-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+-        )
++        session_filters = _parse_session_list_filters(args)
++        if isinstance(session_filters, str):
++            return session_filters
++        window = _discovery_list_window(args, tool_name, ("sessions",), session_filters)
+         if isinstance(window, str):
+             return window
+         limit, cursor_state, continued = window
+         return await _session_list_via_rest(
+             conversation_id,
+             server_client,
+-            agent_name,
++            session_filters,
+             limit=limit,
+             cursor_state=cursor_state,
+             continued=continued,
+@@ -6028,10 +6028,67 @@ def _project_agent_list(
+     }
+ 
+ 
++def _parse_session_list_filters(args: _JsonObject) -> _JsonObject | str:
++    """
++    Validate the ``sys_session_list`` filters for the global ``sessions`` view.
++
++    ``updated_after`` is accepted as ISO-8601 (a naive value is read as UTC)
++    and normalized to epoch seconds for ``GET /v1/sessions``. The result is
++    also what a continuation cursor is bound to, so a cursor cannot be
++    replayed under different filters.
++
++    :param args: Parsed tool arguments, e.g.
++        ``{"agent_name": "researcher", "updated_after": "2026-09-01T00:00:00Z"}``.
++    :returns: ``{"agent_name", "updated_after", "order_by", "ownership"}``
++        with defaults filled in, or a JSON error string for the model.
++    """
++    agent_name = args.get("agent_name")
++    raw_updated_after = args.get("updated_after")
++    updated_after: int | None = None
++    if raw_updated_after is not None:
++        if not isinstance(raw_updated_after, str) or not raw_updated_after:
++            return json.dumps(
++                {"error": "sys_session_list: 'updated_after' must be an ISO-8601 string"}
++            )
++        try:
++            parsed = datetime.fromisoformat(raw_updated_after)
++        except ValueError:
++            return json.dumps(
++                {
++                    "error": "sys_session_list: 'updated_after' is not a valid ISO-8601 "
++                    f"timestamp: {raw_updated_after!r}"
++                }
++            )
++        if parsed.tzinfo is None:
++            parsed = parsed.replace(tzinfo=UTC)
++        updated_after = max(0, int(parsed.timestamp()))
++    order_by = args.get("order_by", "created")
++    if order_by not in ("created", "updated"):
++        return json.dumps({"error": "sys_session_list: 'order_by' must be 'created' or 'updated'"})
++    ownership = args.get("ownership", "any")
++    if ownership not in ("any", "mine", "shared"):
++        return json.dumps(
++            {"error": "sys_session_list: 'ownership' must be 'any', 'mine', or 'shared'"}
++        )
++    return {
++        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
++        "updated_after": updated_after,
++        "order_by": order_by,
++        "ownership": ownership,
++    }
++
++
++def _epoch_to_iso(value: object) -> str | None:
++    """Render Unix epoch seconds as an ISO-8601 UTC string, or ``None``."""
++    if isinstance(value, bool) or not isinstance(value, int | float):
++        return None
++    return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
++
++
+ async def _session_list_via_rest(
+     conversation_id: str,
+     server_client: httpx.AsyncClient,
+-    agent_name: object = None,
++    filters: _JsonObject,
+     *,
+     limit: int | None,
+     cursor_state: dict[str, _DiscoveryState],
+@@ -6044,15 +6101,15 @@ async def _session_list_via_rest(
+     parent/siblings when the caller is itself a child) — see
+     :func:`_collect_sub_agents`. ``sessions`` is the **global**,
+     permission-bounded list of every session the caller can access, each
+-    annotated with status + runner connectivity, optionally filtered by
+-    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
+-    best-effort: a failure in either view yields an empty list for it
+-    rather than failing the whole call.
++    annotated with status + runner connectivity, optionally filtered —
++    see :func:`_collect_global_sessions`. Both are best-effort: a failure
++    in either view yields an empty list for it rather than failing the
++    whole call.
+ 
+     :param conversation_id: The caller session id, e.g. ``"conv_root1"``.
+     :param server_client: HTTP client pointed at the Omnigent server.
+-    :param agent_name: Optional agent-name filter for the global
+-        ``sessions`` view; ignored for ``sub_agents``.
++    :param filters: Global ``sessions`` view filters from
++        :func:`_parse_session_list_filters`; ignored for ``sub_agents``.
+     :param limit: Optional maximum rows returned from the global sessions view. When
+         omitted, the complete legacy result is preserved while it fits.
+     :param cursor_state: Opaque continuation position for the global sessions view.
+@@ -6065,7 +6122,7 @@ async def _session_list_via_rest(
+         if cursor_state["sessions"][0] == _DISCOVERY_END
+         else await _collect_global_sessions(
+             server_client,
+-            agent_name,
++            filters,
+             after=cursor_state["sessions"][1],
+             limit=limit or _AGENT_LIST_PAGE_LIMIT,
+         )
+@@ -6076,7 +6133,7 @@ async def _session_list_via_rest(
+         cursor_state=cursor_state,
+         continued=continued,
+         tool_name="sys_session_list",
+-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
++        filters=filters,
+         source_pages={"sessions": sessions_page},
+         page_sections=("sessions",),
+     )
+@@ -6293,7 +6350,7 @@ async def _resolve_runner_online_map(
+ 
+ async def _collect_global_sessions(
+     server_client: httpx.AsyncClient,
+-    agent_name: object,
++    filters: _JsonObject,
+     *,
+     after: str | None,
+     limit: int,
+@@ -6302,23 +6359,34 @@ async def _collect_global_sessions(
+     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
+ 
+     Projects each accessible session to ``{session_id, agent_name, title,
+-    status, runner_id, runner_online, parent_session_id}``.
++    status, runner_id, runner_online, parent_session_id, created_at,
++    updated_at, owner}`` (timestamps as ISO-8601 UTC).
+     ``runner_online`` is resolved once per unique bound runner (see
+-    :func:`_resolve_runner_online_map`). An optional ``agent_name``
+-    filters the list server-side. Permission-bounded by the server (the
+-    runner's request carries the owning user's identity). Best-effort:
+-    returns ``[]`` on a fetch failure.
++    :func:`_resolve_runner_online_map`). The ``agent_name``,
++    ``updated_after``, ``order_by`` and ``ownership`` filters are applied
++    server-side. Permission-bounded by the server (the runner's request
++    carries the owning user's identity). Best-effort: returns ``[]`` on a
++    fetch failure.
+ 
+     :param server_client: HTTP client pointed at the Omnigent server.
+-    :param agent_name: Optional agent-name filter; applied only when a
+-        non-empty string.
++    :param filters: Normalized filters from :func:`_parse_session_list_filters`.
+     :param after: Server cursor from the previous page, if any.
+     :param limit: Maximum number of source rows to fetch.
+     :returns: Projected global session entries and continuation metadata.
+     """
+-    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
++    ownership = filters.get("ownership")
++    params: dict[str, str | int] = {
++        "limit": limit,
++        "order": "desc",
++        "sort_by": "updated_at" if filters.get("order_by") == "updated" else "created_at",
++        "visibility": ownership if ownership in ("mine", "shared") else "all",
++    }
++    agent_name = filters.get("agent_name")
+     if isinstance(agent_name, str) and agent_name:
+         params["agent_name"] = agent_name
++    updated_after = filters.get("updated_after")
++    if isinstance(updated_after, int):
++        params["updated_after"] = updated_after
+     if after is not None:
+         params["after"] = after
+     try:
+@@ -6350,6 +6418,9 @@ async def _collect_global_sessions(
+                 "runner_id": r.get("runner_id"),
+                 "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
+                 "parent_session_id": r.get("parent_session_id"),
++                "created_at": _epoch_to_iso(r.get("created_at")),
++                "updated_at": _epoch_to_iso(r.get("updated_at")),
++                "owner": _optional_string(r.get("owner")),
+             }
+             for r in rows
+         ],
+@@ -6412,6 +6483,19 @@ async def _session_parent_id(
+     return parent if isinstance(parent, str) and parent else None
+ 
+ 
++async def _session_exists(target_id: str, server_client: httpx.AsyncClient) -> bool:
++    """Return whether ``GET /v1/sessions/{id}`` resolves the session."""
++    try:
++        resp = await server_client.get(
++            _session_url(target_id),
++            params={"include_items": "false", "include_liveness": "false"},
++            timeout=30.0,
++        )
++    except Exception:  # noqa: BLE001
++        return False
++    return resp.status_code == 200
++
++
+ async def _session_get_history_via_rest(
+     args: _JsonObject,
+     server_client: httpx.AsyncClient,
+@@ -6428,8 +6512,8 @@ async def _session_get_history_via_rest(
+     may read).
+ 
+     :param args: Parsed tool arguments; requires ``conversation_id``,
+-        optional ``tail_items``, ``content_max_chars``, and
+-        ``content_offset_chars``.
++        optional ``tail_items``, ``content_max_chars``,
++        ``content_offset_chars``, ``order``, and ``after``.
+     :param server_client: HTTP client pointed at the Omnigent server.
+     :returns: JSON peek result, or a JSON error object.
+     """
+@@ -6453,44 +6537,68 @@ async def _session_get_history_via_rest(
+     content_offset_chars = _clamp_history_offset_chars(args.get("content_offset_chars", 0))
+     if isinstance(content_offset_chars, str):
+         return content_offset_chars
++    window = _parse_history_window(args)
++    if isinstance(window, str):
++        return window
++    order, after = window
++    params: dict[str, str | int] = {"limit": tail_items, "order": order}
++    if after is not None:
++        params["after"] = after
+     try:
+         resp = await server_client.get(
+             f"{_session_url(target_id)}/items",
+-            params={"limit": tail_items, "order": "desc"},
++            params=params,
+             timeout=30.0,
+         )
+     except Exception as exc:  # noqa: BLE001
+         return json.dumps({"error": f"sys_session_get_history failed: {exc}"})
++    if after is not None and resp.status_code in (400, 404):
++        # An unknown ``after`` id is a 400 stale cursor and a malformed one a
++        # 404; tell those apart from a missing session with one snapshot read.
++        if resp.status_code == 400 or await _session_exists(target_id, server_client):
++            return json.dumps({"error": "invalid_cursor", "conversation_id": target_id})
+     if resp.status_code == 404:
+         return json.dumps({"error": "session_not_found", "conversation_id": target_id})
+     if resp.status_code in (401, 403):
+         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
+     if resp.status_code != 200:
+         return json.dumps({"error": f"sys_session_get_history returned {resp.status_code}"})
+-    data: list[_JsonObject] = resp.json().get("data", [])
+-    # ``order="desc"`` returns newest-first; reverse to chronological so
+-    # the LLM reads top-to-bottom (matches the in-process peek).
++    body = resp.json()
++    data: list[_JsonObject] = body.get("data", [])
++    has_more = body.get("has_more") is True
++    # Tail reads come back newest-first; list chronologically (matches the
++    # in-process peek).
++    chronological = data if order == "asc" else list(reversed(data))
+     items: list[_JsonObject] = [
+         _project_api_item(it, max_chars=content_max_chars, offset_chars=content_offset_chars)
+-        for it in reversed(data)
++        for it in chronological
+     ]
+     meta = await _fetch_peek_meta(target_id, server_client)
+-    # Load the server's pending-index helpers only when a history tool needs them.
+-    from omnigent.runtime import pending_elicitations
+-
+-    # A parked elicitation never lands in the conversation store (it
+-    # lives only in the Omnigent server's pending-elicitations index, replayed
+-    # on the snapshot), so append the snapshot's outstanding prompts
+-    # after the stored tail — they are the sub-agent's most recent act.
+-    items.extend(
+-        pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
+-    )
++    if order == "desc" or not has_more:
++        # Load the server's pending-index helpers only when a history tool needs them.
++        from omnigent.runtime import pending_elicitations
++
++        # A parked elicitation never lands in the conversation store (it
++        # lives only in the Omnigent server's pending-elicitations index, replayed
++        # on the snapshot), so append the outstanding prompts after the newest
++        # stored item — they are the sub-agent's most recent act.
++        items.extend(
++            pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
++        )
+     return json.dumps(
+         {
+             "conversation_id": target_id,
+             "agent": meta.agent,
+             "title": meta.title,
+             "items": items,
++            **_history_page_fields(
++                order=order,
++                after=after,
++                newest_item_id=_optional_string(chronological[-1].get("id"))
++                if chronological
++                else None,
++                has_more=has_more,
++            ),
+         }
+     )
+ 
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index 625c61cb835c9308db27e409c1003992197bd54a..0459828226737cb5b0463cab4f0b8669cf8ee255 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -709,6 +709,10 @@ minus `items` and snapshot-only fields.
+ Supports cursor pagination and filters such as `search_query` and
+ `include_archived`.
+ 
++`updated_after` (Unix epoch seconds) lists only sessions whose `updated_at` is
++later than that time; combine it with `sort_by=updated_at` to read the most
++recently active sessions first.
++
+ Clients should always send `visibility` explicitly: `mine` lists owned
+ active sessions, `shared` lists accessible active sessions owned by someone
+ else, `archived` lists accessible archived sessions, and `all` lists all
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 5c82574857e5a42ec9c8b0ddaf4ce91929550273..80dcdde064171b76d61dfa012eb6d4aaa95c27b3 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -1642,6 +1642,7 @@ def register_core_routes(
+         project: str | None = Query(default=None),
+         pinned: bool = Query(default=False),
+         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
++        updated_after: int | None = Query(default=None, ge=0),
+     ) -> PaginatedList:
+         """
+         List sessions with cursor-based pagination.
+@@ -1695,6 +1696,9 @@ def register_core_routes(
+             owned. ``"archived"`` returns only archived sessions.
+             ``"all"`` (default) returns all accessible non-archived
+             sessions, matching the legacy behaviour.
++        :param updated_after: When set, only return sessions whose
++            ``updated_at`` (Unix epoch seconds of last activity) is
++            strictly later than this value. ``None`` disables the filter.
+         :returns: A :class:`PaginatedList` of
+             :class:`SessionListItem`.
+         """
+@@ -1782,6 +1786,7 @@ def register_core_routes(
+             pinned=pinned,
+             # Pins are per-user: filter to the caller's own pin key.
+             pinned_owner=user_id,
++            updated_after=updated_after,
+         )
+         # Side chats surface only as Workspace-rail tabs, so drop any
+         # side-chat-labeled fork from the sidebar list (it is still a normal
+diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
+index 8362b1bbcfae1b04987a4d423307ab10266ce453..07c7e7568e9f7d639efb22519c73b0de8c3d072a 100644
+--- a/omnigent/stores/conversation_store/__init__.py
++++ b/omnigent/stores/conversation_store/__init__.py
+@@ -844,6 +844,7 @@ class ConversationStore(ABC):
+         pinned: bool = False,
+         pinned_owner: str | None = None,
+         title: str | None = None,
++        updated_after: int | None = None,
+     ) -> PagedList[Conversation]:
+         """
+         List conversations with cursor-based pagination.
+@@ -955,6 +956,10 @@ class ConversationStore(ABC):
+             Powers the ``(agent, title)`` child-session lookup in
+             ``sys_session_send`` so the server can resolve the target
+             in a single indexed query instead of fetching all children.
++        :param updated_after: When set, only return conversations whose
++            ``updated_at`` (Unix epoch seconds, bumped on every item
++            append) is strictly greater than this value. ``None``
++            disables the filter.
+         :returns: A :class:`PagedList` of :class:`Conversation`
+             objects.
+         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
+index bb8dd3adc3ebb9ef3b756458dd153fa98f1d8900..aa8de296bfaa20042204a8638e3b88301f501bbb 100644
+--- a/omnigent/stores/conversation_store/sqlalchemy_store.py
++++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
+@@ -2923,6 +2923,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+         pinned: bool = False,
+         pinned_owner: str | None = None,
+         title: str | None = None,
++        updated_after: int | None = None,
+     ) -> PagedList[Conversation]:
+         """
+         List conversations with cursor-based pagination.
+@@ -2990,6 +2991,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+             can access but does NOT own — i.e. sessions shared with them
+             by another user. Requires ``accessible_by`` to be set.
+             ``False`` (default) disables the filter.
++        :param updated_after: When set, only return conversations whose
++            ``updated_at`` is strictly greater than this epoch-seconds value.
+         :returns: A :class:`PagedList` of :class:`Conversation`
+             objects.
+         """
+@@ -3181,6 +3184,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
+             if title is not None:
+                 stmt = stmt.where(SqlConversation.title == title)
++            if updated_after is not None:
++                stmt = stmt.where(SqlConversation.updated_at > updated_after)
+             if search_query:
+                 pattern = f"%{search_query.lower()}%"
+                 title_match = func.lower(SqlConversation.title).like(pattern)
+diff --git a/omnigent/tools/builtins/spawn.py b/omnigent/tools/builtins/spawn.py
+index 2548311b9c2b12d9ce7fbca758fdeae934eeeca5..7acd50c67c2b4a597564ab30d416121afb5f8c85 100644
+--- a/omnigent/tools/builtins/spawn.py
++++ b/omnigent/tools/builtins/spawn.py
+@@ -16,6 +16,7 @@ from omnigent.entities import (
+     Conversation,
+     ConversationItem,
+ )
++from omnigent.errors import StaleCursorError
+ from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
+ from omnigent.spec import AgentSpec
+ from omnigent.stores import ConversationStore
+@@ -514,8 +515,9 @@ class SysSessionListTool(Tool):
+       ``sys_session_get_info`` / ``sys_session_close``.
+     - ``sessions`` — a **global** view of every session the caller can
+       access (bounded by the server's per-user permission model), each
+-      with its status and runner connectivity. An optional
+-      ``agent_name`` filter narrows this list. This powers
++      with its status, runner connectivity, timestamps and owner.
++      Optional ``agent_name`` / ``updated_after`` / ``ownership``
++      filters narrow this list and ``order_by`` sorts it. This powers
+       orchestration: discovering sessions to inspect
+       (``sys_agent_get`` / ``sys_session_get_info``) or drive
+       (``sys_session_send`` by ``session_id``).
+@@ -542,8 +544,13 @@ class SysSessionListTool(Tool):
+             "you can access, each with status + runner connectivity, "
+             "for orchestration (inspect via sys_agent_get / "
+             "sys_session_get_info, or drive via sys_session_send by "
+-            "session_id). Pass agent_name to filter the global list to "
+-            "sessions running that agent. Calls without pagination keep "
++            "session_id). Each global entry carries created_at and "
++            "updated_at (last activity, ISO-8601 UTC) and its owner. "
++            "Filter the global list with agent_name, updated_after "
++            "(sessions active since a time — e.g. to review what changed "
++            "since your last check), and ownership (mine/shared); "
++            "order_by='updated' lists the most recently active first. "
++            "Calls without pagination keep "
+             "the complete result while it fits the tool-output budget; "
+             "larger global session lists return a page with has_more "
+             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
+@@ -575,6 +582,34 @@ class SysSessionListTool(Tool):
+                                 "affect the 'sub_agents' view."
+                             ),
+                         },
++                        "updated_after": {
++                            "type": "string",
++                            "description": (
++                                "Optional ISO-8601 timestamp, e.g. "
++                                "'2026-09-01T00:00:00Z' (no offset means "
++                                "UTC). Only return sessions in 'sessions' "
++                                "whose last activity (updated_at) is later "
++                                "than this."
++                            ),
++                        },
++                        "order_by": {
++                            "type": "string",
++                            "enum": ["created", "updated"],
++                            "description": (
++                                "Sort 'sessions' newest first by creation "
++                                "time ('created', default) or by last "
++                                "activity ('updated')."
++                            ),
++                        },
++                        "ownership": {
++                            "type": "string",
++                            "enum": ["any", "mine", "shared"],
++                            "description": (
++                                "Restrict 'sessions' to ones you own "
++                                "('mine'), ones another user shared with "
++                                "you ('shared'), or both ('any', default)."
++                            ),
++                        },
+                         "limit": {
+                             "type": "integer",
+                             "minimum": 1,
+@@ -1509,6 +1544,58 @@ def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) ->
+     return min(content_max_chars, _HISTORY_MAX_TOTAL_CHARS // tail_items)
+ 
+ 
++def _parse_history_window(args: dict[str, Any]) -> tuple[str, str | None] | str:
++    """
++    Validate the ``order`` / ``after`` history paging arguments.
++
++    ``order="desc"`` (the default) reads the most recent items. ``"asc"``
++    reads forward from the start, or from just after the ``after`` item
++    cursor; passing ``after`` alone implies ``"asc"``.
++
++    :param args: Parsed tool arguments, e.g. ``{"after": "msg_abc"}``.
++    :returns: ``(order, after)`` on success, or a JSON error string
++        suitable for returning to the model.
++    """
++    after = args.get("after")
++    if after is not None and (not isinstance(after, str) or not after):
++        return json.dumps({"error": "after must be a non-empty item id string"})
++    order = args.get("order", "asc" if after is not None else "desc")
++    if order not in ("asc", "desc"):
++        return json.dumps({"error": f"order must be 'asc' or 'desc', got {order!r}"})
++    if after is not None and order != "asc":
++        return json.dumps({"error": "after requires order='asc'"})
++    return order, after
++
++
++def _history_page_fields(
++    *,
++    order: str,
++    after: str | None,
++    newest_item_id: str | None,
++    has_more: bool,
++) -> dict[str, Any]:
++    """
++    Build the paging fields appended to a ``sys_session_get_history`` result.
++
++    ``next_cursor`` is the newest returned item (or the unchanged ``after``
++    when a forward read found nothing new), so it always resumes forward, and
++    ``has_more`` always says whether items follow it. A most-recent read ends
++    at the newest item, so it has none after it; ``has_older`` says instead
++    whether earlier history precedes the page.
++
++    :param order: ``"asc"`` or ``"desc"``.
++    :param after: The request's ``after`` cursor, if any.
++    :param newest_item_id: Id of the newest item returned, if any.
++    :param has_more: Whether the store reported more items past the page in
++        the read's own direction.
++    :returns: ``{"next_cursor": ..., "has_more": ...}``, plus ``has_older``
++        for a most-recent read.
++    """
++    if order == "asc":
++        return {"next_cursor": newest_item_id or after, "has_more": has_more}
++    return {"next_cursor": newest_item_id or after, "has_more": False, "has_older": has_more}
++
++
+ class SysSessionGetHistoryTool(Tool):
+     """
+     Return the recent conversation items (history) of a session.
+@@ -1548,14 +1635,22 @@ class SysSessionGetHistoryTool(Tool):
+     def description(cls) -> str:
+         """:returns: Human-readable description of the tool."""
+         return (
+-            "Read the most recent items from a session's conversation "
+-            "without sending input. Global read — any session you can "
+-            "access (not just sub-agents in your spawn tree), bounded "
+-            "by the server's per-user permission model. Returns the "
+-            "tail of conversation items (assistant/user messages, tool "
+-            "calls, tool results) in chronological order. Returns "
+-            "session_not_found if conversation_id is unknown, or "
+-            "session_out_of_tree if the server denies read access."
++            "Read items from a session's conversation without sending "
++            "input. Global read — any session you can access (not just "
++            "sub-agents in your spawn tree), bounded by the server's "
++            "per-user permission model. By default returns the most "
++            "recent tail_items conversation items (assistant/user "
++            "messages, tool calls, tool results) in chronological order. "
++            "To read a whole session from the beginning, pass "
++            "order='asc'; then pass the returned next_cursor as 'after' "
++            "to fetch the following page until has_more is false. A "
++            "next_cursor saved from any earlier read also resumes from "
++            "where you left off. A most-recent read reports has_more "
++            "false (nothing follows the newest item) and has_older true "
++            "when earlier history exists. Returns session_not_found if "
++            "conversation_id is unknown, session_out_of_tree if the "
++            "server denies read access, or invalid_cursor if 'after' "
++            "does not name an item in the session."
+         )
+ 
+     def get_schema(self) -> dict[str, Any]:
+@@ -1589,12 +1684,34 @@ class SysSessionGetHistoryTool(Tool):
+                             "minimum": 1,
+                             "maximum": _HISTORY_MAX_TAIL,
+                             "description": (
+-                                f"Number of recent items to return. "
++                                "Number of items to return: the most "
++                                "recent ones by default, or the next page "
++                                "when reading forward (order='asc'). "
+                                 f"Defaults to {_HISTORY_DEFAULT_TAIL}; "
+                                 f"clamped to {_HISTORY_MAX_TAIL} to keep "
+                                 "prompt size bounded."
+                             ),
+                         },
++                        "order": {
++                            "type": "string",
++                            "enum": ["desc", "asc"],
++                            "description": (
++                                "'desc' (default): return the most recent "
++                                "items. 'asc': read forward from the first "
++                                "item, or from just after 'after'. Items "
++                                "are always listed oldest first."
++                            ),
++                        },
++                        "after": {
++                            "type": "string",
++                            "description": (
++                                "Item cursor to read forward from: the "
++                                "next_cursor of a previous "
++                                "sys_session_get_history result. Returns "
++                                "only items added after it. Implies "
++                                "order='asc'."
++                            ),
++                        },
+                         "content_max_chars": {
+                             "type": "integer",
+                             "minimum": 1,
+@@ -1664,34 +1781,51 @@ class SysSessionGetHistoryTool(Tool):
+         )
+         if isinstance(content_offset_chars, str):
+             return content_offset_chars
+-        page = resolution.conv_store.list_items(
+-            resolution.child.id,
+-            limit=tail_items,
+-            order="desc",
+-        )
+-        # ``list_items(order="desc")`` returns newest-first; reverse
+-        # to chronological order so the LLM reads top-to-bottom.
++        window = _parse_history_window(resolution.args)
++        if isinstance(window, str):
++            return window
++        order, after = window
++        # Host startup must not load the database layer; only history reads need it.
++        from sqlalchemy.exc import StatementError
++
++        from omnigent.db.db_models import InvalidUuidError
++
++        try:
++            page = resolution.conv_store.list_items(
++                resolution.child.id,
++                limit=tail_items,
++                after=after,
++                order=order,
++            )
++        except (StaleCursorError, StatementError) as exc:
++            # A malformed item id fails at bind time rather than as a stale cursor.
++            if isinstance(exc, StatementError) and not isinstance(exc.orig, InvalidUuidError):
++                raise
++            return json.dumps({"error": "invalid_cursor", "conversation_id": resolution.child.id})
++        # Tail reads come back newest-first; list chronologically.
++        chronological = list(page.data) if order == "asc" else list(reversed(page.data))
+         items: list[dict[str, Any]] = [
+             _project_activity_item(
+                 item,
+                 max_chars=content_max_chars,
+                 offset_chars=content_offset_chars,
+             )
+-            for item in reversed(page.data)
++            for item in chronological
+         ]
+-        # The server's pending index imports ORM models for workspace scoping.
+-        from omnigent.runtime import pending_elicitations
+-
+-        # A parked elicitation never lands in the conversation store
+-        # (it lives only in the pending-elicitations index), so without
+-        # this a peek on a sub-agent blocked on AskUserQuestion would
+-        # show no sign it needs input. Append the index's outstanding
+-        # prompts after the stored tail — they are the most recent
+-        # thing the sub-agent did.
+-        items.extend(
+-            pending_elicitations.project_for_peek(event)
+-            for event in pending_elicitations.snapshot_for(resolution.child.id)
+-        )
++        reached_end = order == "desc" or not page.has_more
++        if reached_end:
++            # The server's pending index imports ORM models for workspace scoping.
++            from omnigent.runtime import pending_elicitations
++
++            # A parked elicitation never lands in the conversation store
++            # (it lives only in the pending-elicitations index), so without
++            # this a peek on a sub-agent blocked on AskUserQuestion would
++            # show no sign it needs input. Append the outstanding prompts
++            # after the newest stored item — they are its most recent act.
++            items.extend(
++                pending_elicitations.project_for_peek(event)
++                for event in pending_elicitations.snapshot_for(resolution.child.id)
++            )
+         labelled = _agent_title_from_conversation(resolution.child)
+         return json.dumps(
+             {
+@@ -1699,6 +1833,12 @@ class SysSessionGetHistoryTool(Tool):
+                 "agent": labelled.agent,
+                 "title": labelled.title,
+                 "items": items,
++                **_history_page_fields(
++                    order=order,
++                    after=after,
++                    newest_item_id=chronological[-1].id if chronological else None,
++                    has_more=page.has_more,
++                ),
+             }
+         )
+ 
+diff --git a/openapi.json b/openapi.json
+index 4a877bca1277a53ccfe55ab90784c1d374bb6de2..759ad12874e87fbce29d92518a11cad5709d9274 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -13449,6 +13449,24 @@
+               "title": "Visibility",
+               "type": "string"
+             }
++          },
++          {
++            "description": "When set, only return sessions whose `updated_at` (Unix epoch seconds of last activity) is strictly later than this value. `None` disables the filter.",
++            "in": "query",
++            "name": "updated_after",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "minimum": 0,
++                  "type": "integer"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Updated After"
++            }
+           }
+         ],
+         "responses": {
+diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
+index 0054b62e906dfb85135c22488cb06fd10ef532e9..143139370bccc95ba543f3f0484b3ce8076093d1 100644
+--- a/tests/runner/test_runner_dispatch.py
++++ b/tests/runner/test_runner_dispatch.py
+@@ -6970,6 +6970,127 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
+     ]
+ 
+ 
++def _api_message(item_id: str, text: str) -> dict[str, object]:
++    """Build one API-shaped assistant message item."""
++    return {
++        "id": item_id,
++        "type": "message",
++        "role": "assistant",
++        "content": [{"type": "output_text", "text": text}],
++    }
++
++
++@pytest.mark.asyncio
++async def test_session_history_forward_page_uses_items_cursor() -> None:
++    """
++    A forward read asks ``GET /items`` for ``order=asc`` after the cursor,
++    keeps the server's chronological order, and returns the newest item as
++    ``next_cursor`` with the server's ``has_more``.
++    """
++    from omnigent.runner.tool_dispatch import _execute_session_query_tool
++
++    items_params: dict[str, str] = {}
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/v1/sessions/conv_target/items":
++            items_params.update(dict(request.url.params))
++            return httpx.Response(
++                200,
++                json={
++                    "object": "list",
++                    "data": [_api_message("i3", "third"), _api_message("i4", "fourth")],
++                    "has_more": True,
++                },
++            )
++        if request.url.path == "/v1/sessions/conv_target":
++            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
++        raise AssertionError(f"unexpected path {request.url.path}")
++
++    async with _session_query_client(handler) as client:
++        out = json.loads(
++            await _execute_session_query_tool(
++                "sys_session_get_history",
++                json.dumps({"conversation_id": "conv_target", "after": "i2", "tail_items": 2}),
++                conversation_id="conv_caller",
++                server_client=client,
++            )
++        )
++    assert items_params == {"limit": "2", "order": "asc", "after": "i2"}
++    assert [i["text"] for i in out["items"]] == ["third", "fourth"]
++    assert out["next_cursor"] == "i4"
++    assert out["has_more"] is True
++
++
++@pytest.mark.asyncio
++async def test_session_history_tail_read_returns_resume_cursor() -> None:
++    """A default tail read resumes after its newest item and flags earlier history."""
++    from omnigent.runner.tool_dispatch import _execute_session_query_tool
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/v1/sessions/conv_target/items":
++            assert "after" not in request.url.params
++            return httpx.Response(
++                200,
++                json={
++                    "data": [_api_message("i2", "new"), _api_message("i1", "old")],
++                    # Newest-first: more items precede the page.
++                    "has_more": True,
++                },
++            )
++        if request.url.path == "/v1/sessions/conv_target":
++            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
++        raise AssertionError(f"unexpected path {request.url.path}")
++
++    async with _session_query_client(handler) as client:
++        out = json.loads(
++            await _execute_session_query_tool(
++                "sys_session_get_history",
++                json.dumps({"conversation_id": "conv_target"}),
++                conversation_id="conv_caller",
++                server_client=client,
++            )
++        )
++    assert [i["text"] for i in out["items"]] == ["old", "new"]
++    assert out["next_cursor"] == "i2"
++    assert (out["has_more"], out["has_older"]) == (False, True)
++
++
++@pytest.mark.parametrize(
++    ("items_status", "session_status", "error"),
++    [
++        pytest.param(400, 200, "invalid_cursor", id="stale-cursor"),
++        pytest.param(404, 200, "invalid_cursor", id="malformed-cursor"),
++        pytest.param(404, 404, "session_not_found", id="missing-session"),
++    ],
++)
++@pytest.mark.asyncio
++async def test_session_history_distinguishes_bad_cursor_from_missing_session(
++    items_status: int,
++    session_status: int,
++    error: str,
++) -> None:
++    """A rejected ``after`` cursor is reported as such, not as a missing session."""
++    from omnigent.runner.tool_dispatch import _execute_session_query_tool
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/v1/sessions/conv_target/items":
++            return httpx.Response(items_status, json={"error": {"code": "x"}})
++        if request.url.path == "/v1/sessions/conv_target":
++            return httpx.Response(session_status, json={"id": "conv_target"})
++        raise AssertionError(f"unexpected path {request.url.path}")
++
++    async with _session_query_client(handler) as client:
++        out = json.loads(
++            await _execute_session_query_tool(
++                "sys_session_get_history",
++                json.dumps({"conversation_id": "conv_target", "after": "i_gone"}),
++                conversation_id="conv_caller",
++                server_client=client,
++            )
++        )
++    assert out == {"error": error, "conversation_id": "conv_target"}
++
++
+ @pytest.mark.asyncio
+ async def test_session_peek_rest_projects_tool_calls_and_unknown_items() -> None:
+     """REST history preserves tool-call/result items and unknown item types."""
+@@ -7905,6 +8026,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+             "runner_id": "r1",
+             "runner_online": True,
+             "parent_session_id": None,
++            "created_at": None,
++            "updated_at": None,
++            "owner": None,
+         },
+         {
+             "session_id": "s2",
+@@ -7914,6 +8038,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+             "runner_id": "r1",
+             "runner_online": True,
+             "parent_session_id": None,
++            "created_at": None,
++            "updated_at": None,
++            "owner": None,
+         },
+     ]
+     # Connectivity resolved once per UNIQUE runner — two sessions share
+@@ -7922,6 +8049,123 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+     assert runner_status_calls == ["r1"]
+ 
+ 
++def _global_sessions_handler(
++    sessions_params: dict[str, str],
++    rows: list[dict[str, object]],
++) -> Callable[[httpx.Request], httpx.Response]:
++    """Answer the requests ``sys_session_list`` makes, recording list params."""
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        path = request.url.path
++        if path == "/v1/sessions/conv_x/child_sessions":
++            return httpx.Response(200, json={"object": "list", "data": []})
++        if path == "/v1/sessions/conv_x":
++            return httpx.Response(200, json={"id": "conv_x", "parent_session_id": None})
++        if path == "/v1/sessions":
++            sessions_params.update(dict(request.url.params))
++            return httpx.Response(200, json={"object": "list", "data": rows})
++        raise AssertionError(f"unexpected path {path}")
++
++    return handler
++
++
++@pytest.mark.asyncio
++async def test_session_list_forwards_activity_filters_and_reports_timestamps() -> None:
++    """
++    ``updated_after`` (ISO-8601) reaches ``GET /v1/sessions`` as epoch
++    seconds alongside ``sort_by`` / ``visibility``, and each global row
++    reports its creation, last-activity time and owner.
++    """
++    from omnigent.runner.tool_dispatch import _execute_session_query_tool
++
++    sessions_params: dict[str, str] = {}
++    rows: list[dict[str, object]] = [
++        {
++            "id": "s1",
++            "agent_name": "researcher",
++            "title": "auth",
++            "status": "idle",
++            "created_at": 1_788_000_000,
++            "updated_at": 1_788_003_600,
++            "owner": "alice@example.com",
++        }
++    ]
++    async with _session_query_client(_global_sessions_handler(sessions_params, rows)) as client:
++        out = json.loads(
++            await _execute_session_query_tool(
++                "sys_session_list",
++                json.dumps(
++                    {
++                        "updated_after": "2026-09-01T00:00:00+02:00",
++                        "order_by": "updated",
++                        "ownership": "shared",
++                    }
++                ),
++                conversation_id="conv_x",
++                server_client=client,
++            )
++        )
++
++    # 2026-08-31T22:00:00Z: the offset is honored, not dropped.
++    assert sessions_params["updated_after"] == "1788213600"
++    assert sessions_params["sort_by"] == "updated_at"
++    assert sessions_params["visibility"] == "shared"
++    [row] = out["sessions"]
++    assert row["created_at"] == "2026-08-29T10:40:00Z"
++    assert row["updated_at"] == "2026-08-29T11:40:00Z"
++    assert row["owner"] == "alice@example.com"
++
++
++@pytest.mark.asyncio
++async def test_session_list_defaults_keep_legacy_query() -> None:
++    """Without the new filters the list query is unchanged (created order, all)."""
++    from omnigent.runner.tool_dispatch import _execute_session_query_tool
++
++    sessions_params: dict[str, str] = {}
++    async with _session_query_client(_global_sessions_handler(sessions_params, [])) as client:
++        await _execute_session_query_tool(
++            "sys_session_list",
++            "{}",
++            conversation_id="conv_x",
++            server_client=client,
++        )
++    assert sessions_params["sort_by"] == "created_at"
++    assert sessions_params["visibility"] == "all"
++    assert "updated_after" not in sessions_params
++
++
++@pytest.mark.parametrize(
++    ("arguments", "error"),
++    [
++        pytest.param({"updated_after": "yesterday"}, "not a valid ISO-8601", id="bad-iso"),
++        pytest.param({"updated_after": 1788000000}, "must be an ISO-8601", id="number"),
++        pytest.param({"order_by": "title"}, "'order_by' must be", id="bad-order-by"),
++        pytest.param({"ownership": "theirs"}, "'ownership' must be", id="bad-ownership"),
++    ],
++)
++@pytest.mark.asyncio
++async def test_session_list_rejects_invalid_filters(
++    arguments: dict[str, object],
++    error: str,
++) -> None:
++    """Invalid filters fail before any server request."""
++    from omnigent.runner.tool_dispatch import _execute_session_query_tool
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        raise AssertionError(f"unexpected request {request.url.path}")
++
++    async with _session_query_client(handler) as client:
++        out = json.loads(
++            await _execute_session_query_tool(
++                "sys_session_list",
++                json.dumps(arguments),
++                conversation_id="conv_x",
++                server_client=client,
++            )
++        )
++    assert error in out["error"]
++
++
+ @pytest.mark.asyncio
+ async def test_sys_agent_download_rejects_path_in_dest_filename(tmp_path: Path) -> None:
+     """
+diff --git a/tests/server/integration/test_sessions_endpoints.py b/tests/server/integration/test_sessions_endpoints.py
+index d314b49d12612086e1cf400e4ada442d2e365ce9..e0917e71c13758b3d5edf7606f0f78d0968745d2 100644
+--- a/tests/server/integration/test_sessions_endpoints.py
++++ b/tests/server/integration/test_sessions_endpoints.py
+@@ -967,6 +967,28 @@ async def test_list_sessions_pagination(
+     assert page2["data"][0]["id"] != page1["data"][0]["id"]
+ 
+ 
++async def test_list_sessions_updated_after_filters_by_last_activity(
++    client: httpx.AsyncClient,
++) -> None:
++    """``updated_after`` keeps only sessions active strictly after the cutoff."""
++    agent = await create_test_agent(client)
++    created = await _create_session(client, agent["id"], title="recent")
++
++    listed = (await client.get("/v1/sessions")).json()["data"]
++    updated_at = next(s["updated_at"] for s in listed if s["id"] == created["id"])
++
++    before = await client.get("/v1/sessions", params={"updated_after": updated_at - 1})
++    assert before.status_code == 200
++    assert created["id"] in {s["id"] for s in before.json()["data"]}
++
++    at = await client.get("/v1/sessions", params={"updated_after": updated_at})
++    assert at.status_code == 200
++    assert created["id"] not in {s["id"] for s in at.json()["data"]}
++
++    negative = await client.get("/v1/sessions", params={"updated_after": -1})
++    assert negative.status_code == 422
++
++
+ async def test_list_sessions_deleted_cursor_returns_stale_cursor_400(
+     client: httpx.AsyncClient,
+ ) -> None:
+diff --git a/tests/stores/test_conversation_store.py b/tests/stores/test_conversation_store.py
+index d37c0e4a35b19954e6d82f4d6baae90ae44400af..dec38fba9e0766304c50406813e0fdd973c13a6f 100644
+--- a/tests/stores/test_conversation_store.py
++++ b/tests/stores/test_conversation_store.py
+@@ -2921,6 +2921,41 @@ def test_list_conversations_sort_by_updated_at(
+     )
+ 
+ 
++def test_list_conversations_updated_after_is_exclusive(
++    conversation_store: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """
++    ``updated_after`` keeps conversations whose ``updated_at`` is strictly
++    later than the cutoff, so an item append brings an old one back in.
++    """
++    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
++
++    monkeypatch.setattr(store_mod, "now_epoch", lambda: 100)
++    stale = conversation_store.create_conversation()
++    revived = conversation_store.create_conversation()
++    monkeypatch.setattr(store_mod, "now_epoch", lambda: 200)
++    boundary = conversation_store.create_conversation()
++    monkeypatch.setattr(store_mod, "now_epoch", lambda: 300)
++    conversation_store.append(
++        revived.id,
++        [
++            NewConversationItem(
++                type="message",
++                response_id="resp_updated_after",
++                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
++            ),
++        ],
++    )
++
++    page = conversation_store.list_conversations(
++        kind=None, sort_by="updated_at", order="desc", updated_after=200
++    )
++    assert [c.id for c in page.data] == [revived.id]
++    unfiltered = conversation_store.list_conversations(kind=None, updated_after=None)
++    assert {stale.id, revived.id, boundary.id} <= {c.id for c in unfiltered.data}
++
++
+ def test_list_conversations_sort_by_updated_at_with_pagination(
+     conversation_store: SqlAlchemyConversationStore,
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/tools/builtins/test_sys_session.py b/tests/tools/builtins/test_sys_session.py
+index c2a30329534773bdd1f56d47e5847b0115c9be94..b3f259696aa86ab3e48d28c4450161f28e4384f3 100644
+--- a/tests/tools/builtins/test_sys_session.py
++++ b/tests/tools/builtins/test_sys_session.py
+@@ -16,6 +16,7 @@ from __future__ import annotations
+ import json
+ from collections.abc import Iterator
+ from dataclasses import dataclass
++from typing import Any, cast
+ 
+ import pytest
+ 
+@@ -334,7 +335,10 @@ def test_peek_schema_required_fields_and_no_extra_props() -> None:
+         "tail_items",
+         "content_max_chars",
+         "content_offset_chars",
++        "order",
++        "after",
+     }
++    assert params["properties"]["order"]["enum"] == ["desc", "asc"]
+ 
+ 
+ def test_peek_schema_tail_items_bounds() -> None:
+@@ -913,6 +917,112 @@ def test_peek_no_pending_elicitation_when_index_empty(
+     assert all(item["type"] != "pending_elicitation" for item in items)
+ 
+ 
++def _append_user_texts(session_fixture: _Fixture, texts: list[str]) -> None:
++    """Append one user message per text to the fixture's child session."""
++    session_fixture.conv_store.append(
++        session_fixture.child_conv_id,
++        [
++            NewConversationItem(
++                type="message",
++                response_id="resp_paging",
++                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
++            )
++            for text in texts
++        ],
++    )
++
++
++def _peek(session_fixture: _Fixture, **arguments: object) -> dict[str, Any]:
++    """Invoke ``sys_session_get_history`` on the fixture child and decode it."""
++    raw = SysSessionGetHistoryTool().invoke(
++        json.dumps({"conversation_id": session_fixture.child_conv_id, **arguments}),
++        session_fixture.ctx,
++    )
++    return cast(dict[str, Any], json.loads(raw))
++
++
++def test_peek_forward_paging_walks_whole_session(session_fixture: _Fixture) -> None:
++    """
++    ``order='asc'`` reads from the first item and ``next_cursor`` pages
++    forward until ``has_more`` is false, visiting every item exactly once.
++    """
++    _append_user_texts(session_fixture, ["m3", "m4", "m5"])
++
++    first = _peek(session_fixture, order="asc", tail_items=2)
++    assert [i["content"] for i in first["items"]] == [
++        "find the auth bug",
++        "looking at handlers.py",
++    ]
++    assert first["has_more"] is True
++
++    second = _peek(session_fixture, after=first["next_cursor"], tail_items=2)
++    assert [i["content"] for i in second["items"]] == ["m3", "m4"]
++    assert second["has_more"] is True
++
++    third = _peek(session_fixture, after=second["next_cursor"], tail_items=2)
++    assert [i["content"] for i in third["items"]] == ["m5"]
++    assert third["has_more"] is False
++
++    # Caught up: nothing new, and the cursor stays put for the next poll.
++    idle = _peek(session_fixture, after=third["next_cursor"])
++    assert idle["items"] == []
++    assert idle["has_more"] is False
++    assert idle["next_cursor"] == third["next_cursor"]
++
++
++def test_peek_tail_cursor_resumes_with_new_items(session_fixture: _Fixture) -> None:
++    """A default tail read's ``next_cursor`` returns only later items."""
++    tail = _peek(session_fixture)
++    # Nothing follows the newest item, and this tail is the whole session.
++    assert (tail["has_more"], tail["has_older"]) == (False, False)
++    newest = _peek(session_fixture, tail_items=1)
++    assert (newest["has_more"], newest["has_older"]) == (False, True)
++
++    _append_user_texts(session_fixture, ["later"])
++    resumed = _peek(session_fixture, after=tail["next_cursor"])
++    assert [i["content"] for i in resumed["items"]] == ["later"]
++    assert resumed["has_more"] is False
++
++
++def test_peek_forward_page_defers_pending_elicitation_to_last_page(
++    session_fixture: _Fixture,
++) -> None:
++    """Parked prompts are appended only once a forward read reaches the end."""
++    pending_elicitations.record_publish(
++        session_fixture.child_conv_id,
++        {
++            "type": "response.elicitation_request",
++            "elicitation_id": "elicit_paging",
++            "params": {"mode": "form", "message": "Pick one", "requestedSchema": {}},
++        },
++    )
++    first = _peek(session_fixture, order="asc", tail_items=1)
++    assert all(i["type"] != "pending_elicitation" for i in first["items"])
++    last = _peek(session_fixture, after=first["next_cursor"], tail_items=1)
++    assert last["has_more"] is False
++    assert last["items"][-1]["type"] == "pending_elicitation"
++
++
++@pytest.mark.parametrize(
++    ("arguments", "error"),
++    [
++        pytest.param({"after": "item_missing"}, "invalid_cursor", id="unknown-cursor"),
++        pytest.param({"after": ""}, "after must be a non-empty item id string", id="empty"),
++        pytest.param({"order": "sideways"}, "order must be 'asc' or 'desc'", id="bad-order"),
++        pytest.param(
++            {"order": "desc", "after": "item_x"}, "after requires order='asc'", id="desc-after"
++        ),
++    ],
++)
++def test_peek_rejects_invalid_paging_arguments(
++    session_fixture: _Fixture,
++    arguments: dict[str, object],
++    error: str,
++) -> None:
++    """Malformed or unresolvable paging arguments return a model-facing error."""
++    assert error in _peek(session_fixture, **arguments)["error"]
++
++
+ def test_peek_default_tail_when_omitted(session_fixture: _Fixture) -> None:
+     """
+     Omitting ``tail_items`` falls back to ``_HISTORY_DEFAULT_TAIL``.
+@@ -1438,6 +1548,9 @@ def test_session_list_schema_exposes_bounded_pagination() -> None:
+     assert "default" not in properties["limit"]
+     assert properties["limit"]["maximum"] == 100
+     assert properties["cursor"]["type"] == "string"
++    assert properties["updated_after"]["type"] == "string"
++    assert properties["order_by"]["enum"] == ["created", "updated"]
++    assert properties["ownership"]["enum"] == ["any", "mine", "shared"]
+ 
+ 
+ def test_close_unknown_conversation_id_returns_not_found(

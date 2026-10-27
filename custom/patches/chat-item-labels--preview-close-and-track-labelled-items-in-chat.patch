@@ -1,0 +1,2831 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 20 Oct 2026 13:34:58 +0000
+Subject: [PATCH] feat(web): preview, close and track labelled items in chat
+
+Long agent sessions raise several items in one verbose reply, then refer
+back to them across many short updates ("still need your call on the
+cache question"). Finding the original detail means scrolling back or
+spending a turn asking for a recap.
+
+Item labels give those references a target. When a message tags an item
+with a short bracketed label such as [Q2] or [R1], the first message
+carrying that label defines it. Later mentions, in agent or user
+messages, render as chips; clicking one opens a popover with the
+defining block (its list item, heading section, table row, or
+paragraph), plus a "Show in conversation" link that reuses the existing
+?message= deep link.
+
+A struck-through mention (~~[Q2]~~) closes the item: its chips are
+struck everywhere and the popover adds the sentence that closed it. The
+newest mention decides, so a later plain mention reopens it. A pinned
+"Open items" panel above the thread lists open labels as chips and, when
+expanded, every item with its title.
+
+Labels only render once the transcript uses them (a label recurs across
+messages, or one message tags several items), so a stray bracketed code
+like [A4] in an unrelated session stays plain text.
+
+Agents only label and close items when told to, so Omnigent adds a
+framework instruction with the labelling and closing rules. SDK
+harnesses get it every turn with the other framework instructions.
+claude-native and codex-native take instructions only at launch, so the
+static instruction is appended to the agent's own instructions on
+--append-system-prompt and developer_instructions, for both
+runner-created and CLI-launched sessions. Claude Code honours only the
+last --append-system-prompt, so a user-supplied one is now merged into
+the single flag rather than shadowed. codex-native relies on the
+collaboration-mode fix so the always-present developer_instructions
+no longer replace Plan mode's built-in instructions. Other native
+harnesses have no instruction channel and are unchanged.
+
+Not upstream yet: proposed from feat/chat-item-citations; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-item-labels.md                      |  48 +++
+ omnigent/harnesses/claude_native/bridge.py    |  33 +-
+ omnigent/harnesses/claude_native/main.py      |  20 +-
+ omnigent/harnesses/codex_native/main.py       |   8 +-
+ omnigent/runner/native/orchestration.py       |  12 +-
+ omnigent/runtime/prompt.py                    |  46 +-
+ tests/e2e_ui/chat/test_item_label_chips.py    | 138 ++++++
+ .../claude_native/test_claude_native.py       |   3 +
+ .../test_claude_native_bridge.py              |  26 ++
+ .../codex_native/test_codex_native.py         |   3 +
+ ...pp_sessions_native_terminals_autocreate.py |  25 +-
+ ...t_app_sessions_native_terminals_runtime.py |   9 +-
+ tests/runner/test_runner_dispatch.py          |   7 +-
+ tests/runtime/test_prompt.py                  |  82 ++--
+ tests/spec/test_resolve_agent_bundle.py       |   6 +-
+ .../blocks/ChatMarkdown.itemLabels.test.tsx   | 157 +++++++
+ web/src/components/blocks/ChatMarkdown.tsx    | 199 ++++++++-
+ .../components/chat/OpenItemsPanel.test.tsx   | 128 ++++++
+ web/src/components/chat/OpenItemsPanel.tsx    | 182 ++++++++
+ web/src/components/chat/Transcript.tsx        |  23 +-
+ web/src/components/chat/chatBubbleParts.tsx   |  69 ++-
+ web/src/hooks/useHoverPopover.test.tsx        | 130 ++++++
+ web/src/hooks/useHoverPopover.ts              |  95 +++++
+ web/src/lib/itemLabels.test.ts                | 276 ++++++++++++
+ web/src/lib/itemLabels.ts                     | 399 ++++++++++++++++++
+ 25 files changed, 2034 insertions(+), 90 deletions(-)
+ create mode 100644 docs/chat-item-labels.md
+ create mode 100644 tests/e2e_ui/chat/test_item_label_chips.py
+ create mode 100644 web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
+ create mode 100644 web/src/components/chat/OpenItemsPanel.test.tsx
+ create mode 100644 web/src/components/chat/OpenItemsPanel.tsx
+ create mode 100644 web/src/hooks/useHoverPopover.test.tsx
+ create mode 100644 web/src/hooks/useHoverPopover.ts
+ create mode 100644 web/src/lib/itemLabels.test.ts
+ create mode 100644 web/src/lib/itemLabels.ts
+
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7881ca781760c7cfc9e083aca49de413028acb7b
+--- /dev/null
++++ b/docs/chat-item-labels.md
+@@ -0,0 +1,48 @@
++# Item labels in chat
++
++Long sessions often raise several questions, risks or follow-ups in one reply
++and then refer back to them across many short updates. Item labels give each
++one a short tag such as `[Q2]`, and the chat turns later mentions of the tag
++into a preview of the original item, so you don't have to scroll back or ask
++for a recap. There is nothing to turn on.
++
++## How agents label items
++
++Omnigent adds a framework instruction to every agent: tag an item that needs
++your decision or attention later once, at its start, with a bracketed label
++and a short bold title, then refer to it by the label.
++
++```markdown
++[Q2] **Docker socket access?** The build needs the host's Docker socket...
++```
++
++The instruction suggests `[Q1]`, `[Q2]` for questions, `[R1]` for risks,
++`[F1]` for findings and `[T1]` for follow-up tasks, and asks the agent to close
++a settled item by writing its label struck through (`~~[Q2]~~`) in the
++sentence that says how it ended.
++
++SDK harnesses get the instruction with every turn. claude-native and
++codex-native take instructions only at launch, so it is appended to the
++agent's own instructions there: through Claude Code's `--append-system-prompt`
++(merged with one you pass yourself, since Claude honours only the last) and
++Codex's `developer_instructions`. Other native harnesses have no instruction
++channel; labels still render when you or the agent write them.
++
++## What the chat shows
++
++- **Labels:** one to three capital letters and one to three digits in square
++  brackets, such as `[Q2]` or `[R12]`. Labels in code, task-list boxes
++  (`[x]`), numeric footnotes (`[1]`) and link text are ignored.
++- **Only once used:** labels render only when the transcript uses them, that
++  is, a label recurs in another message or one message tags several items. A
++  stray `[A4]` in an unrelated session stays plain text.
++- **Chips:** the first message carrying a label defines the item. Later
++  mentions, in your messages or the agent's, show as chips. Click one (or
++  hover it with a mouse) for a popover with the defining block (its list
++  item, heading section, table row or paragraph) and **Show in
++  conversation**, which scrolls to it.
++- **Closing:** a struck-through mention, `~~[Q2]~~`, closes the item. Its chips
++  are struck through everywhere and the popover adds the sentence that closed
++  it. The newest mention decides, so a later plain mention reopens it.
++- **Open items:** a bar above the thread lists the open labels as chips.
++  Expand it for every item with its title, closed ones under **Closed (N)**.
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 3223f9a610e9e290cb4d8ad37d0b6f1cb435de36..b7dea0a5cf2787a74f7142556042c3651a677796 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -2844,8 +2844,7 @@ def augment_claude_args(
+             str(settings_path),
+         ]
+     )
+-    if append_system_prompt:
+-        args.extend(["--append-system-prompt", append_system_prompt])
++    args = _merge_append_system_prompt(args, append_system_prompt)
+     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
+     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
+ 
+@@ -2905,6 +2904,36 @@ def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
+     )
+ 
+ 
++def _merge_append_system_prompt(args: list[str], addition: str | None) -> list[str]:
++    """Append ``addition`` to the ``--append-system-prompt`` text in ``args``.
++
++    Claude Code honours only the last ``--append-system-prompt``, so a second
++    flag would silently replace a user-supplied value; fold both into one flag.
++
++    :param args: Claude CLI argument list.
++    :param addition: Omnigent's text to append, or ``None`` to leave ``args`` as is.
++    :returns: ``args`` with at most one ``--append-system-prompt`` flag.
++    """
++    if not addition:
++        return args
++    flag = "--append-system-prompt"
++    existing = _arg_value(tuple(args), flag)
++    merged: list[str] = []
++    skip_value = False
++    for idx, arg in enumerate(args):
++        if skip_value:
++            skip_value = False
++            continue
++        if arg.startswith(f"{flag}="):
++            continue
++        if arg == flag:
++            skip_value = idx + 1 < len(args) and not args[idx + 1].startswith("--")
++            continue
++        merged.append(arg)
++    merged.extend([flag, f"{existing}\n\n{addition}" if existing else addition])
++    return merged
++
++
+ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
+     """Merge framework-approved tools into Claude's ``--allowedTools`` flag.
+ 
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index 272387ada848d5e1cfbbc342789e591503b2da65..d621f69fd375e2d436d6b3791e998009a2cdb62e 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -25,6 +25,7 @@ import uuid
+ 
+ from omnigent.claude_paths import claude_config_dir
+ from omnigent.llms.adapters._content import redact_binary_payloads
++from omnigent.runtime.prompt import native_startup_instructions
+ from omnigent.runtime.tool_result_replay import (
+     blocks_from_parsed_list,
+     image_payloads_in_blocks,
+@@ -3765,7 +3766,9 @@ def _run_with_local_server(
+                     claude_config=claude_config,
+                     startup_profiler=startup_profiler,
+                     startup_progress=progress,
+-                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
++                    append_system_prompt=native_startup_instructions(
++                        _wrapper_spec_raw_instructions(spec_path)
++                    ),
+                 )
+             )
+             _mark_startup_step(
+@@ -5095,7 +5098,8 @@ async def _prepare_claude_terminal(
+         marks. ``None`` disables output.
+     :param startup_progress: Optional user-visible progress renderer,
+         e.g. a handle from :func:`runner_startup_progress`.
+-    :param append_system_prompt: Raw author instructions for
++    :param append_system_prompt: Author instructions plus static framework
++        guidance (:func:`native_startup_instructions`) for
+         ``--append-system-prompt``, applied on fresh launch and cold
+         resume only — the hot-reattach fast path below returns before
+         this is used, so it never relaunches or duplicates the flag.
+@@ -6331,9 +6335,9 @@ async def _launch_claude_terminal(
+     :param bridge_dir: Bridge directory shared with Claude's MCP
+         MCP server and the web-chat harness.
+     :param claude_config: Optional ucode-derived Claude Code config.
+-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+-        (author-supplied, not framework-composed) for this fresh native
+-        session.
++    :param append_system_prompt: Optional author instructions plus static
++        framework guidance (never per-turn framework text) for this fresh
++        native session.
+     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
+         for this native session.
+     :returns: Terminal resource id.
+@@ -6510,9 +6514,9 @@ def _claude_terminal_request(
+     :param ap_auth_headers: Auth headers for the
+         ``PermissionRequest`` command hook.
+     :param claude_config: Optional ucode-derived Claude Code config.
+-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+-        (author-supplied, not framework-composed) to append to Claude
+-        Code's system prompt.
++    :param append_system_prompt: Optional author instructions plus static
++        framework guidance (never per-turn framework text) to append to
++        Claude Code's system prompt.
+     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
+         for this native session.
+     :returns: JSON body for ``POST /resources/terminals``.
+diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
+index 17294a88ff5095de32af6e9bde05fd6b8b9eed90..738744495edbf35227c020ce05260654008f9c48 100644
+--- a/omnigent/harnesses/codex_native/main.py
++++ b/omnigent/harnesses/codex_native/main.py
+@@ -108,6 +108,7 @@ from omnigent.native.native_terminal import request_with_429_retry
+ from omnigent.native.native_terminal import (
+     terminal_attach_url as _attach_url,
+ )
++from omnigent.runtime.prompt import native_startup_instructions
+ from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
+ from omnigent.util.http_retry import jittered_retry_delay
+ from omnigent.util.json_types import JsonObject as _JsonObject
+@@ -743,7 +744,9 @@ def _run_with_local_server(
+                     command=command,
+                     model=model,
+                     startup_progress=progress,
+-                    developer_instructions=_wrapper_spec_raw_instructions(spec_path),
++                    developer_instructions=native_startup_instructions(
++                        _wrapper_spec_raw_instructions(spec_path)
++                    ),
+                 )
+             if resolved_session_id is None:
+                 _record_launch_for_fresh_session(prepared.session_id)
+@@ -1174,7 +1177,8 @@ async def _prepare_codex_terminal(
+     :param model: Optional model id.
+     :param startup_progress: Optional user-visible progress renderer,
+         e.g. a handle from :func:`runner_startup_progress`.
+-    :param developer_instructions: Raw author instructions persisted into
++    :param developer_instructions: Author instructions plus static framework
++        guidance (:func:`native_startup_instructions`) persisted into
+         Codex's private per-session config, applied on fresh launch and
+         cold resume only — the reattach branch below returns before this
+         is used, so it never relaunches or duplicates the value.
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 0a3ab6eb215889c3dbf94ea6c3216b6b9725e1da..c9798a2cc2aa51a4397e81ed8e7ed014fb6b5cac 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -96,6 +96,7 @@ from omnigent.runner.session_init_protocol import (
+     RunnerSessionInitEnvelope,
+ )
+ from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
++from omnigent.runtime.prompt import native_startup_instructions
+ from omnigent.spec.types import AgentSpec
+ 
+ _logger = logging.getLogger("omnigent.runner.app")
+@@ -5580,7 +5581,9 @@ async def _auto_create_codex_terminal(
+         "\n\n".join(
+             x
+             for x in [
+-                _native_startup_raw_instructions_from_spec(agent_spec),
++                native_startup_instructions(
++                    _native_startup_raw_instructions_from_spec(agent_spec)
++                ),
+                 _codex_routing_note,
+             ]
+             if x
+@@ -9358,7 +9361,12 @@ async def _auto_create_claude_terminal(
+         subagent_router_dir=subagent_router_dir,
+         append_system_prompt="\n\n".join(
+             x
+-            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
++            for x in [
++                native_startup_instructions(
++                    _native_startup_raw_instructions_from_spec(agent_spec)
++                ),
++                routed_spawn_note,
++            ]
+             if x
+         )
+         or None,
+diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
+index 3096ba10e4628fbd637e6812ec217af708c29ba7..2487d3da3f7de8b5e2dfbfb02f792bbacd657f96 100644
+--- a/omnigent/runtime/prompt.py
++++ b/omnigent/runtime/prompt.py
+@@ -58,6 +58,32 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
+     "attached) or for non-interactive bulk fetching."
+ )
+ 
++# The chat renders a later mention of a bracketed label as a chip that previews
++# where the item was raised, and a struck-through label as a closed item
++# (web/src/lib/itemLabels.ts matches the label shape).
++ITEM_LABEL_INSTRUCTION = (
++    "Item labels: when you raise something that needs the user's decision or "
++    "attention later (a question, risk, finding, or follow-up), tag it once at "
++    "the start of that item with a short bracketed label: [Q1], [Q2] for "
++    "questions, [R1] for risks, [F1] for findings, [T1] for follow-up tasks. "
++    "Follow the label with a short bold title of a few words, then the full "
++    "detail: [Q2] **Docker socket access?** Full detail... The chat UI lists "
++    "items by that title and shows the whole item when the label is mentioned "
++    "later. Afterwards, refer to the item "
++    'by its label ("still need your call on [Q2]") instead of restating it. '
++    "Labels are session-wide: keep counting up across messages and never reuse "
++    "a label for a different item. When the user writes a label, it means that "
++    "item. Don't wrap labels in backticks or code, and use labels only for items "
++    "like these.\n\n"
++    "Closing items: when an item is resolved, decided, rejected, done, or no "
++    "longer relevant, close it by writing its label struck through, as in "
++    '~~[Q2]~~, inside the sentence that says how it ended ("~~[Q2]~~ copied the '
++    'rows as-is, per your answer"). Close each item once, as soon as it is '
++    "settled. After that, write its label struck through whenever you mention it "
++    "again; a plain mention reopens it. The chat UI pins a list of open items, so "
++    "closing settled ones keeps that list accurate."
++)
++
+ 
+ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+     """
+@@ -72,11 +98,12 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+     The embedded-browser priority guidance follows the ``browser_*``
+     registration gate (``ToolManager._register_browser_tools``): every
+     agent unless the spec sets ``tool_groups.browser: false``, in which
+-    case the prompt must not steer the model toward tools it lacks.
++    case the prompt must not steer the model toward tools it lacks. The
++    item-label guidance applies to every agent, since every transcript
++    renders label chips.
+ 
+     :param spec: The parsed AgentSpec.
+-    :returns: The applicable spec-level framework instructions; empty for
+-        an agent with no sub-agents and the browser group disabled.
++    :returns: The applicable spec-level framework instructions, never empty.
+     """
+     instructions: list[str] = []
+     dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+@@ -84,9 +111,22 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
+     if spec.tool_groups.browser:
+         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
++    instructions.append(ITEM_LABEL_INSTRUCTION)
+     return instructions
+ 
+ 
++def native_startup_instructions(author_instructions: str | None) -> str | None:
++    """Author instructions plus the framework text a native launch channel carries.
++
++    Native harnesses take instructions once, at launch, so only framework
++    instructions that hold for every turn of every session belong here.
++
++    :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
++    :returns: The combined text, or ``None`` when there is nothing to send.
++    """
++    return append_framework_instructions(author_instructions, [ITEM_LABEL_INSTRUCTION])
++
++
+ def append_framework_instructions(
+     instructions: str | None,
+     framework_instructions: Sequence[str],
+diff --git a/tests/e2e_ui/chat/test_item_label_chips.py b/tests/e2e_ui/chat/test_item_label_chips.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4bb89de6735438a06e1e6413e3c197783361cd1
+--- /dev/null
++++ b/tests/e2e_ui/chat/test_item_label_chips.py
+@@ -0,0 +1,138 @@
++"""UI journey: an item label in a later message previews where it was raised.
++
++An agent raises labelled items (``[Q2]``) in a verbose reply, then refers to
++them by label in a later status update. Clicking the later chip must preview
++the defining item's own block, not the whole message, without scrolling the
++transcript; "Show in conversation" then jumps to the defining message. Closing
++an item (``~~[Q2]~~``) strikes its chips, the popover shows how it was closed,
++and the pinned Open items panel lists only what is still open.
++"""
++
++from __future__ import annotations
++
++import re
++import uuid
++
++from playwright.sync_api import Page, expect
++
++from tests.e2e_ui.conftest import configure_mock_llm
++
++_COMPOSER = "Send a message…"
++_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
++_WORKING = '[data-testid="working-indicator"]'
++
++_AUDIT_REPLY = """\
++I finished the migration audit. A few things need your call before I continue:
++
++1. **[Q1] Backfill window.** The `events` table has 41M rows; one backfill
++   transaction would hold locks for ~20 minutes. I can batch by `created_at`
++   day (about 900 batches, ~35 min total) or run it in the maintenance window.
++2. **[Q2] Soft-deleted rows.** 3,112 rows have `deleted_at` set but still
++   reference live accounts. Options:
++   - copy them as-is (keeps audit history)
++   - drop them (cleaner, but the audit export loses them)
++3. **[Q3] Index naming.** Upstream uses `ix_<table>_<cols>`, ours uses
++   `<table>_<cols>_idx`. Renaming touches 14 indexes.
++
++[R1] Heads-up: the `ON DELETE CASCADE` on `sessions.account_id` will cascade
++through the new table too, so deleting an account removes its migrated events."""
++
++_STATUS_REPLY = (
++    "Batching is underway (412 of 900 days). [Q1] is settled by the batching. "
++    "Still need your decision on [Q2] and [Q3], and [R1] still applies."
++)
++
++_CLOSING_REPLY = (
++    "Done. ~~[Q2]~~ copied the soft-deleted rows as-is. ~~[Q3]~~ keeping our index naming."
++)
++
++
++def _send(page: Page, text: str) -> None:
++    composer = page.get_by_placeholder(_COMPOSER)
++    expect(composer).to_be_visible()
++    composer.fill(text)
++    page.get_by_role("button", name="Send", exact=True).click()
++
++
++def _settle(page: Page, assistant_count: int) -> None:
++    expect(page.locator(_ASSISTANT)).to_have_count(assistant_count, timeout=60_000)
++    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
++
++
++def test_item_label_chip_previews_defining_item(
++    page: Page,
++    seeded_session: tuple[str, str],
++    mock_llm_server_url: str,
++) -> None:
++    base_url, session_id = seeded_session
++    run = uuid.uuid4().hex[:8]
++
++    configure_mock_llm(
++        mock_llm_server_url, [{"text": _AUDIT_REPLY}], key=f"audit-{run}", match=f"audit {run}"
++    )
++    configure_mock_llm(
++        mock_llm_server_url, [{"text": _STATUS_REPLY}], key=f"status-{run}", match=f"status {run}"
++    )
++    configure_mock_llm(
++        mock_llm_server_url,
++        [{"text": _CLOSING_REPLY}],
++        key=f"answer-{run}",
++        match=f"answers {run}",
++    )
++
++    page.set_viewport_size({"width": 1280, "height": 900})
++    page.goto(f"{base_url}/c/{session_id}")
++    _send(page, f"Run the migration audit {run}")
++    _settle(page, 1)
++    _send(page, f"What's the status {run}?")
++    _settle(page, 2)
++    _send(page, f"My answers {run}: [Q2] copy them as-is. [Q3] keep our naming.")
++    _settle(page, 3)
++
++    status = page.locator(_ASSISTANT).nth(1)
++    # The defining message shows static badges; the status update shows chips.
++    expect(
++        page.locator(_ASSISTANT).first.get_by_role("button", name="Show item Q2")
++    ).to_have_count(0)
++
++    status.get_by_role("button", name="Show item Q2").click()
++    popover = page.locator('[data-slot="popover-content"][data-state="open"]')
++    expect(popover).to_contain_text("Soft-deleted rows")
++    expect(popover).to_contain_text("drop them")
++    expect(popover).not_to_contain_text("Backfill window")
++    page.keyboard.press("Escape")
++
++    status.get_by_role("button", name="Show item R1").click()
++    expect(popover).to_contain_text("ON DELETE CASCADE")
++    page.keyboard.press("Escape")
++
++    user_reply = page.locator('[data-testid="message-bubble"][data-role="user"]').nth(2)
++    user_reply.get_by_role("button", name="Show item Q3 (closed)").click()
++    expect(popover).to_contain_text("Index naming")
++    expect(popover).to_contain_text("Closed · Agent")
++    expect(popover).to_contain_text("keeping our index naming")
++    page.keyboard.press("Escape")
++
++    # The panel lists what is still open; closed items fold under "Closed".
++    panel = page.get_by_test_id("open-items")
++    expect(panel).to_contain_text("Open items")
++    expect(panel).to_contain_text("(2)")
++    panel.get_by_role("button", name="Show item R1").first.click()
++    expect(popover).to_contain_text("ON DELETE CASCADE")
++    page.keyboard.press("Escape")
++    panel.locator("summary").click()
++    expect(panel.get_by_role("button", name="Show item Q2 (closed)")).to_contain_text(
++        "Soft-deleted rows"
++    )
++
++    status.get_by_role("button", name="Show item Q2 (closed)").click()
++    popover.get_by_role("button", name="Show in conversation").click()
++    expect(page).to_have_url(re.compile(r"[?&]message="), timeout=5_000)
++
++    # Reloaded history at phone width resolves labels the same way.
++    page.set_viewport_size({"width": 390, "height": 844})
++    page.goto(f"{base_url}/c/{session_id}")
++    expect(page.locator(_ASSISTANT)).to_have_count(3, timeout=15_000)
++    page.locator(_ASSISTANT).nth(1).scroll_into_view_if_needed()
++    page.locator(_ASSISTANT).nth(1).get_by_role("button", name="Show item R1").click()
++    expect(popover).to_contain_text("ON DELETE CASCADE")
+diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
+index cbd4b425cfa94fab874b3b72907cf7e474af3d5d..c00a59975e0ec93910323e4db04b111a4e27344d 100644
+--- a/tests/harnesses/claude_native/test_claude_native.py
++++ b/tests/harnesses/claude_native/test_claude_native.py
+@@ -40,6 +40,7 @@ from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
+ from omnigent.native import native_terminal
+ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+ from omnigent.runtime import tool_result_replay as trc
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+ from omnigent.spec import load_omnigent_yaml
+ from omnigent.terminals.ws_common import (
+     WS_CLOSE_TERMINAL_DETACHED,
+@@ -1688,6 +1689,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+     assert (
+         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+     )
++    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
+ 
+ 
+ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
+@@ -1775,6 +1777,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
+     assert (
+         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+     )
++    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
+ 
+ 
+ def test_local_resume_does_not_print_redundant_resume_hint(
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index ca9f986d151d4c027e7ed82e620820a031086c45..9c98a3c224550e62d5259043130b211d7c7e5d1b 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -4038,6 +4038,32 @@ def test_augment_claude_args_appends_caller_system_prompt(
+     assert args[index + 1] == framework_instruction
+ 
+ 
++@pytest.mark.parametrize(
++    "user_args",
++    [
++        ("--append-system-prompt", "User guidance.", "--verbose"),
++        ("--append-system-prompt=User guidance.", "--verbose"),
++    ],
++    ids=["split", "joined"],
++)
++def test_augment_claude_args_merges_caller_system_prompt(
++    tmp_path: Path, user_args: tuple[str, ...]
++) -> None:
++    """Framework text extends a user-supplied system prompt rather than shadowing it."""
++    args = augment_claude_args(
++        user_args,
++        bridge_dir=tmp_path,
++        python_executable="/venv/bin/python",
++        append_system_prompt="Framework guidance.",
++    )
++
++    prompt_flags = [arg for arg in args if arg.startswith("--append-system-prompt")]
++    assert prompt_flags == ["--append-system-prompt"]
++    index = args.index("--append-system-prompt")
++    assert args[index + 1] == "User guidance.\n\nFramework guidance."
++    assert "--verbose" in args
++
++
+ def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
+     """Framework preapproval extends rather than replaces the user's allowlist."""
+     args = augment_claude_args(
+diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
+index a0b6f7368b15817297bea65673e903ffdb598229..c68825f1946efc1dfbef62eade9bbdca8457a8d3 100644
+--- a/tests/harnesses/codex_native/test_codex_native.py
++++ b/tests/harnesses/codex_native/test_codex_native.py
+@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
+ )
+ from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+ from omnigent.inner.native_attachments import attachment_cache_dir
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+ from omnigent.spec import load
+ 
+ # The default-stance auto-review override normalize_codex_permission_launch_args
+@@ -8971,6 +8972,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+ 
+     assert captured.get("developer_instructions") is not None
+     assert "Codex is running in the session terminal" in captured["developer_instructions"]
++    assert captured["developer_instructions"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
+ 
+ 
+ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
+@@ -9053,6 +9055,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
+ 
+     assert captured.get("developer_instructions") is not None
+     assert "Codex is running in the session terminal" in captured["developer_instructions"]
++    assert captured["developer_instructions"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+index 73aab7fcd6f99e73fe179751e01c96f44935bc60..1edee01083977e32bba34488d00d9f20b229ce1e 100644
+--- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
++++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+@@ -74,6 +74,7 @@ from omnigent.runner.resource_registry import (
+     SessionResourceRegistry,
+ )
+ from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+ from omnigent.spec.types import AgentSpec, ExecutorSpec
+ from omnigent.terminals import TerminalRegistry
+ from tests._helpers.pi_native import seed_pi_own_login_catalog
+@@ -128,6 +129,13 @@ def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
+     return json.loads(settings_path.read_text(encoding="utf-8"))
+ 
+ 
++def _appended_system_prompt(args: list[str]) -> str | None:
++    """Return the ``--append-system-prompt`` value, or None when it is absent."""
++    if "--append-system-prompt" not in args:
++        return None
++    return args[args.index("--append-system-prompt") + 1]
++
++
+ def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
+     tmp_path: Path,
+ ) -> None:
+@@ -2272,7 +2280,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+ ) -> None:
+     """
+     Host-spawned launch emits ``--append-system-prompt`` with the agent's
+-    raw author instructions.
++    raw author instructions, followed by the item-label guidance.
+ 
+     The managed-host wiring in ``runner/native/orchestration.py``
+     (``augment_claude_args(..., append_system_prompt=
+@@ -2339,10 +2347,9 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+         agent_spec=agent_spec,
+     )
+ 
+-    args = captured["spec"].args
+-    assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
+-    idx = args.index("--append-system-prompt")
+-    assert args[idx + 1] == "Be a concise, careful coding assistant."
++    assert _appended_system_prompt(captured["spec"].args) == (
++        f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
++    )
+ 
+ 
+ @pytest.mark.asyncio
+@@ -3082,7 +3089,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+ 
+     # Session titles are generated by an isolated background job, so neither
+     # fresh nor resumed Claude terminals receive framework rename instructions.
+-    assert "--append-system-prompt" not in launched_args
++    assert _appended_system_prompt(launched_args) == ITEM_LABEL_INSTRUCTION
+ 
+ 
+ @pytest.mark.asyncio
+@@ -5510,7 +5517,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
+     # early no longer cascades into "no server running" (#540).
+     assert spec.keep_alive_after_exit is True
+     args = spec.args
+-    assert "--append-system-prompt" not in args
++    assert _appended_system_prompt(args) == ITEM_LABEL_INSTRUCTION
+     settings = _load_claude_invocation_settings(args)
+     assert "PermissionRequest" in settings["hooks"]
+     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
+@@ -5725,7 +5732,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+     # A pinned session's spawns stay on the claude family, so it gets neither
+     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
+-    assert "--append-system-prompt" not in spec.args
++    assert _appended_system_prompt(spec.args) == ITEM_LABEL_INSTRUCTION
+ 
+ 
+ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
+@@ -5753,7 +5760,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
+     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+     # And the auto-harness extras, which only make sense alongside the router.
+-    assert "--append-system-prompt" in spec.args
++    assert (_appended_system_prompt(spec.args) or "").startswith(f"{ITEM_LABEL_INSTRUCTION}\n\n")
+     allowed = spec.args[spec.args.index("--allowedTools") + 1]
+     assert "mcp__omnigent__sys_session_create" in allowed
+ 
+diff --git a/tests/runner/test_app_sessions_native_terminals_runtime.py b/tests/runner/test_app_sessions_native_terminals_runtime.py
+index 75f97eb88ca022bbc0a1f0ddf4e48e33a85f0509..14c275ea7bef73c9b271514d092e1f7ddd4e3d2e 100644
+--- a/tests/runner/test_app_sessions_native_terminals_runtime.py
++++ b/tests/runner/test_app_sessions_native_terminals_runtime.py
+@@ -47,6 +47,7 @@ from omnigent.runner.session_init_protocol import (
+     RunnerSessionInitEnvelope,
+     RunnerSessionInitSnapshot,
+ )
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+ from omnigent.spec.types import AgentSpec, ExecutorSpec
+ from tests.budgets import budget
+ from tests.runner.conftest import (
+@@ -894,7 +895,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+     assert build_calls[0]["cwd"] == tmp_path / "workspace"
+     assert build_calls[0]["trust_project"] is True
+     assert build_calls[0]["reconcile_process_registry"] is False
+-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
++    assert build_calls[0]["developer_instructions"] == (
++        f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
++    )
+     # Persisted pass-through args must reach launch resolution (--profile layering).
+     assert resolve_calls and all(
+         call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
+@@ -1862,7 +1865,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
+         "mean the session snapshot workspace was ignored."
+     )
+     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
+-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
++    assert build_calls[0]["developer_instructions"] == (
++        f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
++    )
+ 
+     # Sandbox-override regression: the launched Codex terminal must inherit
+     # the agent's sandbox: none rather than falling back to the platform
+diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
+index 143139370bccc95ba543f3f0484b3ce8076093d1..6cc2db9fbde45706f287babd5c8341c0712a5f71 100644
+--- a/tests/runner/test_runner_dispatch.py
++++ b/tests/runner/test_runner_dispatch.py
+@@ -96,7 +96,10 @@ from omnigent.runtime.harnesses._executor_adapter import (
+ )
+ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
+ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
++from omnigent.runtime.prompt import (
++    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
++    ITEM_LABEL_INSTRUCTION,
++)
+ from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
+ from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
+ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+@@ -12634,7 +12637,7 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
+ 
+ def _contract_composed_instructions(*parts: str) -> str:
+     """Compose expected author/request text with framework guidance."""
+-    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
++    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, ITEM_LABEL_INSTRUCTION))
+ 
+ 
+ async def _contract_run_no_harness(
+diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
+index bd1e19757a3bd4826e13bdc0c0077d9341eca95d..6f3b96135bde6c2aa8a12f293fde03c7fdba15db 100644
+--- a/tests/runtime/test_prompt.py
++++ b/tests/runtime/test_prompt.py
+@@ -1,6 +1,7 @@
+ """Tests for canonical system-instruction composition."""
+ 
+ import json
++import re
+ from types import SimpleNamespace
+ from typing import cast
+ 
+@@ -13,18 +14,21 @@ from omnigent.runner.subagent_work import (
+ from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+ from omnigent.runtime.prompt import (
+     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
++    ITEM_LABEL_INSTRUCTION,
+     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+     SUBAGENT_WAKE_NOTICE_SHAPE,
+     append_framework_instructions,
+     build_instructions,
+     build_instructions_nullable,
+     history_to_input_items,
++    native_startup_instructions,
+     raw_author_instructions,
+ )
+ from omnigent.spec import AgentSpec
+ from tests._image_fixtures import _TINY_PNG_BASE64
+ 
+ _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
++_EVERY_AGENT_GUIDANCE = f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+ 
+ 
+ def _spec(
+@@ -260,8 +264,7 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
+     )
+ 
+     assert result == (
+-        "Agent prompt\n\nRequest prompt\n\n"
+-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
++        f"Agent prompt\n\nRequest prompt\n\n{_EVERY_AGENT_GUIDANCE}\n\nFramework prompt"
+     )
+ 
+ 
+@@ -269,7 +272,7 @@ def test_empty_framework_instructions_do_not_change_default() -> None:
+     spec = _spec(None)
+ 
+     assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
+-        f"You are a helpful assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
++        f"You are a helpful assistant.\n\n{_EVERY_AGENT_GUIDANCE}"
+     )
+ 
+ 
+@@ -283,7 +286,7 @@ def test_build_instructions_nullable_unauthored_never_fabricates_fallback() -> N
+     guidance applies to every agent)."""
+     spec = _spec(None)
+     result = build_instructions_nullable(spec, None, [])
+-    assert result == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
++    assert result == _EVERY_AGENT_GUIDANCE
+     assert "You are a helpful assistant." not in result
+ 
+ 
+@@ -292,13 +295,11 @@ def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None
+     raw_author_instructions' non-empty/non-whitespace gate, so authored_present
+     and composed agree on what counts as "authored"."""
+     spec = _spec("   \n  ")
+-    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
++    assert build_instructions_nullable(spec, None, []) == _EVERY_AGENT_GUIDANCE
+     result = build_instructions_nullable(
+         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+     )
+-    assert result == (
+-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+-    )
++    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
+ 
+ 
+ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_absent() -> None:
+@@ -306,15 +307,11 @@ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_abse
+     the same non-empty/non-whitespace gate applies to both instruction
+     sources, not just spec.instructions."""
+     spec = _spec(None)
+-    assert (
+-        build_instructions_nullable(spec, "   \n  ", []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+-    )
++    assert build_instructions_nullable(spec, "   \n  ", []) == _EVERY_AGENT_GUIDANCE
+     result = build_instructions_nullable(
+         spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+     )
+-    assert result == (
+-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+-    )
++    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
+ 
+ 
+ def test_build_instructions_nullable_authored_present() -> None:
+@@ -324,8 +321,7 @@ def test_build_instructions_nullable_authored_present() -> None:
+         spec, "Request prompt", [], framework_instructions=("Framework prompt",)
+     )
+     assert result == (
+-        "Agent prompt\n\nRequest prompt\n\n"
+-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
++        f"Agent prompt\n\nRequest prompt\n\n{_EVERY_AGENT_GUIDANCE}\n\nFramework prompt"
+     )
+ 
+ 
+@@ -343,9 +339,7 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
+     result = build_instructions_nullable(
+         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+     )
+-    assert result == (
+-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+-    )
++    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
+     assert "You are a helpful assistant." not in (result or "")
+ 
+     # The comparison this helper replaces would have misclassified the
+@@ -378,28 +372,27 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
+     result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
+     assert result == (
+         f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
+-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nTurn note"
++        f"{_EVERY_AGENT_GUIDANCE}\n\nTurn note"
+     )
+ 
+     unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
+     assert build_instructions_nullable(unauthored, None, []) == (
+-        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
++        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{_EVERY_AGENT_GUIDANCE}"
+     )
+ 
+ 
+-def test_embedded_browser_guidance_included_for_every_agent() -> None:
++def test_every_agent_guidance_included_for_every_agent() -> None:
+     """
+-    Every agent's composed prompt steers the model to the embedded browser.
++    Every agent's composed prompt carries the embedded-browser and item-label guidance.
+ 
+     The ``browser_*`` tools are auto-registered for every agent without a
+     spec gate (``ToolManager._register_browser_tools``); a tool description
+     alone loses to a model's native web tooling, so the system prompt must
+-    carry the preference for any spec — authored or not.
++    carry the preference for any spec — authored or not. Every transcript
++    renders item-label chips, so the labelling guidance applies equally.
+     """
+     authored = _spec("Agent prompt")
+-    assert build_instructions(authored, None, []) == (
+-        f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+-    )
++    assert build_instructions(authored, None, []) == (f"Agent prompt\n\n{_EVERY_AGENT_GUIDANCE}")
+ 
+ 
+ def test_embedded_browser_guidance_names_registered_tools() -> None:
+@@ -445,12 +438,16 @@ def test_raw_author_instructions_verbatim_and_none() -> None:
+ def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
+     """
+     With the ``browser_*`` tools unregistered, the prompt must not steer
+-    the model toward them: author text composes alone, and an unauthored
+-    spec yields ``None`` rather than guidance for tools it lacks.
++    the model toward them: only the every-agent label guidance follows the
++    author text, and an unauthored spec yields that guidance alone.
+     """
+     spec = _spec("You are a helpful assistant.", browser=False)
+-    assert build_instructions_nullable(spec, None, []) == "You are a helpful assistant."
+-    assert build_instructions_nullable(_spec(None, browser=False), None, []) is None
++    assert build_instructions_nullable(spec, None, []) == (
++        f"You are a helpful assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
++    )
++    assert build_instructions_nullable(_spec(None, browser=False), None, []) == (
++        ITEM_LABEL_INSTRUCTION
++    )
+ 
+ 
+ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+@@ -458,5 +455,26 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+     wake notice still rides its own dispatch gate."""
+     spec = _spec(None, spawn=True, browser=False)
+     result = build_instructions_nullable(spec, None, [])
+-    assert result == SUBAGENT_WAKE_NOTICE_INSTRUCTION
++    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
++
++
++def test_native_startup_instructions_append_item_labels_after_author_text() -> None:
++    """Native launch channels carry the author text first, then the label guidance."""
++    assert native_startup_instructions("  Agent prompt  ") == (
++        f"  Agent prompt  \n\n{ITEM_LABEL_INSTRUCTION}"
++    )
++    assert native_startup_instructions(None) == ITEM_LABEL_INSTRUCTION
++
++
++def test_item_label_examples_match_the_chat_label_shape() -> None:
++    """Every example label must match the shape web/src/lib/itemLabels.ts renders as a chip."""
++    examples = re.findall(r"\[[^\]]*\]", ITEM_LABEL_INSTRUCTION)
++    assert examples
++    for example in examples:
++        assert re.fullmatch(r"\[[A-Z]{1,3}\d{1,3}\]", example)
++
++
++def test_item_label_instruction_shows_a_bold_title_after_the_label() -> None:
++    """The example puts a bold title right after the label, which the chat UI lists items by."""
++    assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
+diff --git a/tests/spec/test_resolve_agent_bundle.py b/tests/spec/test_resolve_agent_bundle.py
+index bcf8bd62a0936d371de5206d8f870c217ea9354d..cb1702d12f8de92a141c3352afb4ef853d6083fd 100644
+--- a/tests/spec/test_resolve_agent_bundle.py
++++ b/tests/spec/test_resolve_agent_bundle.py
+@@ -7,7 +7,7 @@ import pytest
+ from omnigent.cli import _bundle
+ from omnigent.inner.bundle_skills import claude_native_skill_args
+ from omnigent.runner.tool_dispatch import _execute_skill_tool
+-from omnigent.runtime.prompt import build_instructions
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, build_instructions
+ from omnigent.server.bundles import validate_agent_bundle
+ from omnigent.spec import load, materialize_bundle
+ from omnigent.tools.builtins.load_skill import LoadSkillTool, list_skill_resources
+@@ -62,7 +62,9 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() ->
+     tool = LoadSkillTool(spec.skills, skills_filter="none")
+     prompt = build_instructions(spec, None, [tool.get_schema()])
+ 
+-    assert len(prompt.split()) < 1500
++    # The item-label rules are framework text appended to every agent, not resolve-agent content.
++    assert ITEM_LABEL_INSTRUCTION in prompt
++    assert len(prompt.split()) - len(ITEM_LABEL_INSTRUCTION.split()) < 1500
+     assert spec.skills
+     for skill in spec.skills:
+         assert skill.name in prompt
+diff --git a/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx b/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7dc1949fb52c0cb7094a9a55e34b5d56963d659
+--- /dev/null
++++ b/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
+@@ -0,0 +1,157 @@
++// Item labels (`[Q2]`) in chat markdown: a later mention previews the block
++// that defined the item (and how it was closed), the defining message shows a
++// static badge, and a transcript not using labels keeps the text as written.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import type React from "react";
++import { MemoryRouter, useLocation } from "react-router-dom";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  ItemLabelIndexContext,
++  ItemLabelMessageContext,
++  buildItemLabelIndex,
++  type ItemLabelIndex,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import { FilePathAwareMessageResponse } from "./ChatMarkdown";
++
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++});
++
++const DEFINING: ItemLabelSource = {
++  messageId: "resp_defining",
++  role: "assistant",
++  text: [
++    "Open questions:",
++    "",
++    "1. [Q1] Unrelated first item.",
++    "2. [Q2] Should the cache be per-user? It changes eviction.",
++  ].join("\n"),
++};
++const INDEX = buildItemLabelIndex([{ source: DEFINING, labels: ["Q1", "Q2"], struck: [] }]);
++const CLOSING: ItemLabelSource = {
++  messageId: "msg_closing",
++  role: "user",
++  text: "Thanks. ~~[Q2]~~ keep it global for now. Ship it.",
++};
++const CLOSED_INDEX = buildItemLabelIndex([
++  { source: DEFINING, labels: ["Q1", "Q2"], struck: [] },
++  { source: CLOSING, labels: ["Q2"], struck: ["Q2"] },
++]);
++
++function LocationProbe() {
++  return <output data-testid="location">{useLocation().search}</output>;
++}
++
++function renderMarkdown(markdown: string, messageId: string, index: ItemLabelIndex | null = INDEX) {
++  const message = (
++    <ItemLabelMessageContext.Provider value={messageId}>
++      <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
++    </ItemLabelMessageContext.Provider>
++  );
++  const tree: React.ReactNode = (
++    <ItemLabelIndexContext.Provider value={index}>{message}</ItemLabelIndexContext.Provider>
++  );
++  return render(
++    <QueryClientProvider client={new QueryClient()}>
++      <MemoryRouter initialEntries={["/c/conv_1"]}>
++        {tree}
++        <LocationProbe />
++      </MemoryRouter>
++    </QueryClientProvider>,
++  );
++}
++
++describe("item labels in chat markdown", () => {
++  it("previews the defining item from a later mention and links to its message", async () => {
++    renderMarkdown("Still waiting on [Q2].", "resp_later");
++
++    fireEvent.click(await screen.findByRole("button", { name: "Show item Q2" }));
++
++    expect(await screen.findByText(/Should the cache be per-user\?/)).toBeTruthy();
++    expect(screen.queryByText(/Unrelated first item/)).toBeNull();
++
++    fireEvent.click(screen.getByRole("button", { name: "Show in conversation" }));
++    expect(screen.getByTestId("location").textContent).toBe("?message=resp_defining");
++  });
++
++  it("renders the label as a static badge in the message that defines it", async () => {
++    renderMarkdown(DEFINING.text, DEFINING.messageId);
++
++    expect(await screen.findByText("Q2")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: /Show item/ })).toBeNull();
++  });
++
++  it("keeps the written text where no transcript index is available", async () => {
++    renderMarkdown("Still waiting on [Q2].", "resp_later", null);
++
++    expect(await screen.findByText("Still waiting on [Q2].")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: /Show item/ })).toBeNull();
++  });
++
++  it("keeps a lone label as written until the transcript uses labels", async () => {
++    const lone = buildItemLabelIndex([
++      { source: { ...DEFINING, text: "Use [A4] paper." }, labels: ["A4"], struck: [] },
++    ]);
++    renderMarkdown("Use [A4] paper.", DEFINING.messageId, lone);
++
++    expect(await screen.findByText("Use [A4] paper.")).toBeTruthy();
++  });
++
++  it("strikes a closed item and shows how it was closed", async () => {
++    renderMarkdown("Recap: [Q1] and [Q2].", "resp_recap", CLOSED_INDEX);
++
++    fireEvent.click(await screen.findByRole("button", { name: "Show item Q2 (closed)" }));
++
++    expect(await screen.findByText(/Should the cache be per-user\?/)).toBeTruthy();
++    expect(screen.getByText(/^Closed · User/)).toBeTruthy();
++    expect(screen.getByText(/keep it global for now\./)).toBeTruthy();
++    expect(screen.queryByText(/Ship it/)).toBeNull();
++
++    fireEvent.click(screen.getByRole("button", { name: "Show" }));
++    expect(screen.getByTestId("location").textContent).toBe("?message=msg_closing");
++  });
++
++  const wait = (ms: number) =>
++    new Promise<void>((resolve) => {
++      setTimeout(resolve, ms);
++    });
++  const stubHoverDevice = () =>
++    vi.stubGlobal(
++      "matchMedia",
++      vi.fn((query: string) => ({ matches: query.includes("hover: hover"), media: query })),
++    );
++
++  it("previews on a desktop mouse hover and stays open over the popover", async () => {
++    stubHoverDevice();
++    renderMarkdown("Still waiting on [Q2].", "resp_later");
++    const chip = await screen.findByRole("button", { name: "Show item Q2" });
++
++    fireEvent.pointerEnter(chip, { pointerType: "mouse" });
++    const show = await screen.findByRole("button", { name: "Show in conversation" });
++    // Focus stays put, so hovering never pulls it out of the composer.
++    expect(document.activeElement).not.toBe(show);
++    fireEvent.pointerLeave(chip, { pointerType: "mouse" });
++    const popover = show.closest<HTMLElement>("[data-slot=popover-content]")!;
++    fireEvent.pointerEnter(popover, { pointerType: "mouse" });
++    await wait(300);
++    expect(screen.getByRole("button", { name: "Show in conversation" })).toBe(show);
++
++    fireEvent.pointerLeave(popover, { pointerType: "mouse" });
++    await waitFor(() =>
++      expect(screen.queryByRole("button", { name: "Show in conversation" })).toBeNull(),
++    );
++  });
++
++  it("does not preview on touch", async () => {
++    stubHoverDevice();
++    renderMarkdown("Still waiting on [Q2].", "resp_later");
++    const chip = await screen.findByRole("button", { name: "Show item Q2" });
++    fireEvent.pointerEnter(chip, { pointerType: "touch" });
++    await wait(400);
++    expect(screen.queryByText(/Should the cache be per-user\?/)).toBeNull();
++  });
++});
+diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
+index a4e12e3b0621be2ce056972b1f1b01a2cc8982c2..1b83961c7160b772fef2481675dd5df8a99bd454 100644
+--- a/web/src/components/blocks/ChatMarkdown.tsx
++++ b/web/src/components/blocks/ChatMarkdown.tsx
+@@ -1,11 +1,12 @@
+ // Markdown rendering for chat text: assistant bubbles, user bubbles, and any
+ // other surface that shows agent-authored markdown.
+ //
+-// Two affordances beyond plain markdown, both routing to the FileViewer so a
+-// file the agent names is one click away:
++// Three affordances beyond plain markdown. The first two route to the
++// FileViewer so a file the agent names is one click away:
+ //
+ //   1. Inline-code paths (`` `src/App.tsx` ``): see `WorkspacePathInlineCode`.
+ //   2. Markdown links whose href is a file path: see `WorkspaceFileLink`.
++//   3. Item labels (`[Q3]`) that preview where they were raised: see `ItemLabelChip`.
+ //
+ // Lives apart from `BlockRenderer` so approval cards can render agent markdown
+ // without importing the block dispatcher that renders them.
+@@ -36,12 +37,27 @@ import {
+ } from "@/components/ui/context-menu";
+ import { VideoPlayer } from "@/components/VideoPlayer";
+ import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
++import { useHoverPopover } from "@/hooks/useHoverPopover";
+ import { useThrottledValue } from "@/hooks/useThrottledValue";
+ import { withBasePath } from "@/lib/basePath";
+ import { copyText } from "@/lib/clipboard";
+ import { absoluteWorkspacePath } from "@/lib/composerContext";
+ import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+ import { extractInlineRunnableCommand } from "@/lib/runnableCommands";
++import {
++  ITEM_LABEL_HREF_PREFIX,
++  ItemLabelIndexContext,
++  ItemLabelMessageContext,
++  extractItemBlock,
++  extractLabelSentence,
++  remarkItemLabels,
++  type ItemLabelEntry,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
++import { relativeTime } from "@/lib/relativeTime";
++import { useSearchParams } from "@/lib/routing";
++import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ import { cn } from "@/lib/utils";
+ import {
+   useFileViewer,
+@@ -501,6 +517,163 @@ function citesSamePlace(
+   );
+ }
+ 
++const ITEM_LABEL_BADGE_CLASS =
++  "inline-flex items-baseline rounded border border-border bg-muted px-1 font-mono text-[0.85em] leading-snug";
++const ITEM_LABEL_CLOSED_CLASS = "line-through opacity-60";
++
++/** Classes for an item label chip: a clickable badge, struck through once closed. */
++export function itemLabelChipClass(closed: boolean): string {
++  return cn(
++    ITEM_LABEL_BADGE_CLASS,
++    "cursor-pointer text-link transition-colors hover:bg-accent",
++    closed && ITEM_LABEL_CLOSED_CLASS,
++  );
++}
++
++function describeSource(source: ItemLabelSource): string {
++  const age = source.createdAtS === undefined ? "" : relativeTime(source.createdAtS * 1000);
++  const when = age === "now" ? "just now" : age && `${age} ago`;
++  return `${source.role === "user" ? "User" : "Agent"}${when ? ` · ${when}` : ""}`;
++}
++
++/** The block that defined an item, plus how it was closed, as the messages show them. */
++function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: () => void }) {
++  const { label, source, closedBy } = item;
++  // Only mounted inside a transcript, which always sits under a router.
++  const [, setSearchParams] = useSearchParams();
++  const block = useMemo(() => extractItemBlock(source.text, label), [source.text, label]);
++  const closing = useMemo(
++    () => (closedBy ? extractLabelSentence(closedBy.text, label) : null),
++    [closedBy, label],
++  );
++  const showMessage = (messageId: string) => {
++    onClose();
++    setSearchParams((previous) => {
++      const next = new URLSearchParams(previous);
++      next.set(MESSAGE_QUERY_PARAM, messageId);
++      return next;
++    });
++  };
++  return (
++    <>
++      <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
++        <span>
++          <span className="font-mono font-medium text-foreground">{label}</span>
++          {` · ${describeSource(source)}`}
++        </span>
++        <button
++          type="button"
++          className="shrink-0 text-link hover:underline"
++          onClick={() => showMessage(source.messageId)}
++        >
++          Show in conversation
++        </button>
++      </div>
++      {/* Labels inside the preview resolve relative to the defining message. */}
++      <ItemLabelMessageContext.Provider value={source.messageId}>
++        <FilePathAwareMessageResponse>{block ?? source.text}</FilePathAwareMessageResponse>
++      </ItemLabelMessageContext.Provider>
++      {closedBy && (
++        <div className="flex flex-col gap-1 border-t border-border pt-2">
++          <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
++            <span>{`Closed · ${describeSource(closedBy)}`}</span>
++            <button
++              type="button"
++              className="shrink-0 text-link hover:underline"
++              onClick={() => showMessage(closedBy.messageId)}
++            >
++              Show
++            </button>
++          </div>
++          {closing && (
++            <ItemLabelMessageContext.Provider value={closedBy.messageId}>
++              <FilePathAwareMessageResponse>{closing}</FilePathAwareMessageResponse>
++            </ItemLabelMessageContext.Provider>
++          )}
++        </div>
++      )}
++    </>
++  );
++}
++
++/**
++ * A popover previewing `item`, opened by clicking the `children` trigger; with
++ * `openOnHover`, a desktop mouse hover previews it too.
++ */
++export function ItemLabelPopover({
++  item,
++  openOnHover = false,
++  children,
++}: {
++  item: ItemLabelEntry;
++  openOnHover?: boolean;
++  children: React.ReactElement;
++}) {
++  const { open, onOpenChange, triggerProps, contentProps } = useHoverPopover(openOnHover);
++  return (
++    <Popover open={open} onOpenChange={onOpenChange}>
++      <PopoverTrigger asChild {...triggerProps}>
++        {children}
++      </PopoverTrigger>
++      <PopoverContent
++        align="start"
++        className="max-h-[min(28rem,60vh)] w-[min(36rem,calc(100vw-2rem))] overflow-y-auto"
++        {...contentProps}
++      >
++        <ItemLabelPreview item={item} onClose={() => onOpenChange(false)} />
++      </PopoverContent>
++    </Popover>
++  );
++}
++
++/**
++ * Renders an item label. In the message that defines it the label is a static
++ * badge; anywhere later it is a chip whose popover previews the defining block
++ * with a link to the message. Both are struck through once the item is closed.
++ * Until the transcript uses labels, or for a label with no loaded definition or
++ * outside a transcript, it stays as the text that was written.
++ */
++function ItemLabelChip({ label, children }: { label: string; children: React.ReactNode }) {
++  const index = useContext(ItemLabelIndexContext);
++  const messageId = useContext(ItemLabelMessageContext);
++  const item = index?.enabled ? index.items.get(label) : undefined;
++
++  if (!item) return children;
++  const closed = item.closedBy !== null;
++  if (item.source.messageId === messageId) {
++    return (
++      <span
++        className={cn(ITEM_LABEL_BADGE_CLASS, "font-medium", closed && ITEM_LABEL_CLOSED_CLASS)}
++      >
++        {label}
++      </span>
++    );
++  }
++  return (
++    <ItemLabelPopover item={item} openOnHover>
++      <button
++        type="button"
++        aria-label={`Show item ${label}${closed ? " (closed)" : ""}`}
++        className={itemLabelChipClass(closed)}
++      >
++        {label}
++      </button>
++    </ItemLabelPopover>
++  );
++}
++
++/** Routes item-label links to {@link ItemLabelChip} and every other link to {@link WorkspaceFileLink}. */
++function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
++  if (props.href?.startsWith(ITEM_LABEL_HREF_PREFIX)) {
++    return (
++      <ItemLabelChip label={props.href.slice(ITEM_LABEL_HREF_PREFIX.length)}>
++        {props.children}
++      </ItemLabelChip>
++    );
++  }
++  return <WorkspaceFileLink {...props} />;
++}
++
+ // Markdown images open in the shared lightbox on click, matching uploaded and
+ // generated images. (Remote `src`s are still gated by Streamdown's image
+ // security; this only adds the zoom affordance to whatever does render.)
+@@ -519,9 +692,14 @@ function ZoomableMarkdownImage({
+ const FILE_PATH_AWARE_COMPONENTS = {
+   inlineCode: WorkspacePathInlineCode,
+   img: ZoomableMarkdownImage,
+-  a: WorkspaceFileLink,
++  a: ChatMarkdownLink,
+ };
+ 
++// Streamdown's `remarkPlugins` prop replaces its defaults rather than merging,
++// so both lists extend them (keeping remark-gfm). Module-level for stable identity.
++const CHAT_REMARK_PLUGINS = [...Object.values(defaultRemarkPlugins), remarkItemLabels];
++const CHAT_REMARK_PLUGINS_WITH_BREAKS = [...CHAT_REMARK_PLUGINS, remarkBreaks];
++
+ // How often the live (growing) assistant bubble re-parses its markdown. The
+ // store pump commits a new, longer text up to once per animation frame (~60/s);
+ // without this the whole accumulated message is re-parsed on every commit. ~10/s
+@@ -604,13 +782,12 @@ function PlainTextFallback({ text }: { text: string }) {
+  * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
+  * block rendering too, stripping `<pre>` and collapsing whitespace.
+  *
++ * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`.
++ *
+  * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
+  * instead of collapsing to spaces per CommonMark. Used for user bubbles,
+  * where people type multi-line messages without blank-line paragraph
+- * separators and expect their line breaks preserved. NOTE: Streamdown's
+- * `remarkPlugins` prop *replaces* its defaults rather than merging, so we
+- * extend `defaultRemarkPlugins` (which carries remark-gfm) — passing
+- * `[remarkBreaks]` alone would silently drop GFM tables / strikethrough.
++ * separators and expect their line breaks preserved.
+  */
+ export function FilePathAwareMessageResponse({
+   children,
+@@ -619,13 +796,7 @@ export function FilePathAwareMessageResponse({
+ }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean }) {
+   const components = FILE_PATH_AWARE_COMPONENTS;
+ 
+-  // Extend (don't replace) Streamdown's defaults so remark-gfm survives;
+-  // append remark-breaks only when `breaks` is requested. When `breaks` is
+-  // false we pass `undefined` so Streamdown uses its own defaults unchanged.
+-  const remarkPlugins = useMemo(
+-    () => (breaks ? [...Object.values(defaultRemarkPlugins), remarkBreaks] : undefined),
+-    [breaks],
+-  );
++  const remarkPlugins = breaks ? CHAT_REMARK_PLUGINS_WITH_BREAKS : CHAT_REMARK_PLUGINS;
+ 
+   // Throttle the markdown so the live (still-growing) bubble re-parses a few
+   // times per second instead of on every store commit. `children` is a string
+diff --git a/web/src/components/chat/OpenItemsPanel.test.tsx b/web/src/components/chat/OpenItemsPanel.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f52066696ec0c58c25b383b5ac1c3f8c6df738b0
+--- /dev/null
++++ b/web/src/components/chat/OpenItemsPanel.test.tsx
+@@ -0,0 +1,128 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  ItemLabelIndexContext,
++  buildItemLabelIndex,
++  itemLabelsIn,
++  struckItemLabelsIn,
++  type ItemLabelIndex,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import { OpenItemsPanel, fitItemChipCount } from "./OpenItemsPanel";
++
++afterEach(() => {
++  cleanup();
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++});
++
++function indexOf(...texts: string[]): ItemLabelIndex {
++  return buildItemLabelIndex(
++    texts.map((text, position) => {
++      const source: ItemLabelSource = { messageId: `m${position}`, role: "assistant", text };
++      return { source, labels: itemLabelsIn(text), struck: struckItemLabelsIn(text) };
++    }),
++  );
++}
++
++function renderPanel(index: ItemLabelIndex) {
++  return render(
++    <QueryClientProvider client={new QueryClient()}>
++      <MemoryRouter>
++        <ItemLabelIndexContext.Provider value={index}>
++          <OpenItemsPanel />
++        </ItemLabelIndexContext.Provider>
++      </MemoryRouter>
++    </QueryClientProvider>,
++  );
++}
++
++describe("OpenItemsPanel", () => {
++  it("lists open items in the header and every item with its title below", () => {
++    renderPanel(
++      indexOf(
++        "- **[Q1] Backfill window.** Batch it?\n- **[Q2] Soft-deleted rows.** Copy or drop?",
++        "~~[Q1]~~ batching it.",
++      ),
++    );
++
++    const panel = screen.getByTestId("open-items");
++    expect(panel.textContent).toContain("Open items(1)");
++    expect(screen.getAllByRole("button", { name: "Show item Q2" })).toHaveLength(2);
++    expect(screen.getByRole("button", { name: "Show item Q1 (closed)" }).textContent).toContain(
++      "Backfill window.",
++    );
++    expect(panel.textContent).toContain("Closed (1)");
++  });
++
++  it("collapses on a press outside it, but not inside it or a popover", () => {
++    renderPanel(
++      indexOf("- **[Q1] Backfill window.** Batch it?\n- **[Q2] Soft-deleted rows.** Drop?"),
++    );
++    const panel = screen.getByTestId("open-items") as HTMLDetailsElement;
++    const popover = document.createElement("div");
++    popover.dataset.slot = "popover-content";
++    document.body.append(popover);
++    panel.open = true;
++
++    fireEvent.pointerDown(panel.querySelector("summary")!);
++    fireEvent.pointerDown(popover);
++    expect(panel.open).toBe(true);
++    fireEvent.pointerDown(document.body);
++    expect(panel.open).toBe(false);
++    popover.remove();
++  });
++
++  it("hides until the transcript uses labels", () => {
++    renderPanel(indexOf("Use [A4] paper."));
++    expect(screen.queryByTestId("open-items")).toBeNull();
++  });
++
++  it("shows as many header chips as fit the row, then +N", () => {
++    const observers: ResizeObserverCallback[] = [];
++    vi.stubGlobal(
++      "ResizeObserver",
++      class {
++        constructor(callback: ResizeObserverCallback) {
++          observers.push(callback);
++        }
++        observe() {}
++        disconnect() {}
++      },
++    );
++    // jsdom does no layout: chips measure 30px, the "+N" count 20px.
++    let rowWidth = 100;
++    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(() => rowWidth);
++    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
++      this: HTMLElement,
++    ) {
++      return { width: this.textContent?.startsWith("+") ? 20 : 30 } as DOMRect;
++    });
++    const labels = ["Q1", "Q2", "Q3", "Q4", "Q5"];
++    renderPanel(indexOf(labels.map((label) => `- [${label}] Item.`).join("\n")));
++
++    // Each item has a row in the expanded list, plus a header chip when shown.
++    const headerChipCount = () => screen.getAllByRole("button", { name: /^Show item/ }).length - 5;
++    expect(headerChipCount()).toBe(2);
++    expect(screen.getByText("+3")).toBeTruthy();
++
++    rowWidth = 200;
++    act(() => observers.forEach((callback) => callback([], {} as ResizeObserver)));
++    expect(headerChipCount()).toBe(5);
++    expect(screen.queryByText("+3")).toBeNull();
++  });
++});
++
++describe("fitItemChipCount", () => {
++  it("fits chips and gaps, reserving room for +N only when some are left out", () => {
++    // All three fit without a count: 30 + 4 + 30 + 4 + 30.
++    expect(fitItemChipCount([30, 30, 30], 98, 4, 20)).toBe(3);
++    // Two then the count: 30 + 4 + 30 + 4 + 20.
++    expect(fitItemChipCount([30, 30, 30], 97, 4, 20)).toBe(2);
++    expect(fitItemChipCount([30, 30, 30], 87, 4, 20)).toBe(1);
++    expect(fitItemChipCount([60, 30], 50, 4, 20)).toBe(0);
++    expect(fitItemChipCount([], 50, 4, 20)).toBe(0);
++  });
++});
+diff --git a/web/src/components/chat/OpenItemsPanel.tsx b/web/src/components/chat/OpenItemsPanel.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..77a05f5690427b3656f637ae80a03073a62b38d1
+--- /dev/null
++++ b/web/src/components/chat/OpenItemsPanel.tsx
+@@ -0,0 +1,182 @@
++import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
++import { ChevronDownIcon, MessageSquareDotIcon } from "lucide-react";
++import { ItemLabelPopover, itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
++import { ItemLabelIndexContext, itemLabelTitle, type ItemLabelEntry } from "@/lib/itemLabels";
++import { cn } from "@/lib/utils";
++
++// Header chips shown before the row has been measured (or without layout).
++const UNMEASURED_CHIP_LIMIT = 6;
++
++/**
++ * How many chips of `chipWidths` fit in `available` pixels, `gap` apart,
++ * leaving room for an `overflowWidth` "+N" count whenever some are left out.
++ */
++export function fitItemChipCount(
++  chipWidths: readonly number[],
++  available: number,
++  gap: number,
++  overflowWidth: number,
++): number {
++  let used = 0;
++  for (const [index, width] of chipWidths.entries()) {
++    used += (index > 0 ? gap : 0) + width;
++    const leftOut = index < chipWidths.length - 1;
++    if (used + (leftOut ? gap + overflowWidth : 0) > available) return index;
++  }
++  return chipWidths.length;
++}
++
++/**
++ * Fits the header chips to the row's width: `measureRef` holds an invisible
++ * copy of every chip then the "+N" count, which `rowRef` is sized against.
++ * Null until measured, and in environments without layout.
++ */
++function useFittedChipCount(chipKey: string) {
++  const rowRef = useRef<HTMLSpanElement>(null);
++  const measureRef = useRef<HTMLSpanElement>(null);
++  const [count, setCount] = useState<number | null>(null);
++  useLayoutEffect(() => {
++    const row = rowRef.current;
++    const measure = measureRef.current;
++    if (!row || !measure || typeof ResizeObserver === "undefined") return;
++    const update = () => {
++      if (row.clientWidth === 0) return;
++      const widths = [...measure.children].map((child) => child.getBoundingClientRect().width);
++      const overflowWidth = widths.pop() ?? 0;
++      const gap = Number.parseFloat(getComputedStyle(row).columnGap) || 0;
++      setCount(fitItemChipCount(widths, row.clientWidth, gap, overflowWidth));
++    };
++    update();
++    // The row is flex-1 with a zero basis, so showing fewer chips never resizes it.
++    const observer = new ResizeObserver(update);
++    observer.observe(row);
++    observer.observe(measure);
++    return () => observer.disconnect();
++  }, [chipKey]);
++  return { rowRef, measureRef, count };
++}
++
++/**
++ * Collapses an expanded `<details>` when the user presses outside it. Presses
++ * inside a popover don't count, since the panel's chips open popovers.
++ */
++export function useCollapseOnOutsidePress() {
++  const detailsRef = useRef<HTMLDetailsElement>(null);
++  useEffect(() => {
++    const onPointerDown = (event: PointerEvent) => {
++      const details = detailsRef.current;
++      const target = event.target as Element | null;
++      if (!details?.open || !target || details.contains(target)) return;
++      if (target.closest("[data-slot=popover-content]")) return;
++      details.open = false;
++    };
++    document.addEventListener("pointerdown", onPointerDown);
++    return () => document.removeEventListener("pointerdown", onPointerDown);
++  }, []);
++  return detailsRef;
++}
++
++function ItemRow({ item }: { item: ItemLabelEntry }) {
++  const closed = item.closedBy !== null;
++  const title = useMemo(() => itemLabelTitle(item.source.text, item.label), [item]);
++  return (
++    <ItemLabelPopover item={item}>
++      <button
++        type="button"
++        aria-label={`Show item ${item.label}${closed ? " (closed)" : ""}`}
++        className="flex w-full min-w-0 items-baseline gap-2 px-3 py-1.5 text-left text-ui hover:bg-muted"
++      >
++        <span className={cn(itemLabelChipClass(closed), "shrink-0")}>{item.label}</span>
++        <span className={cn("truncate", closed && "text-muted-foreground line-through")}>
++          {title}
++        </span>
++      </button>
++    </ItemLabelPopover>
++  );
++}
++
++/**
++ * Collapsible "Open items" tracker pinned above the chat thread, beside the
++ * Plan tracker. The header lists open item labels as chips; expanding lists
++ * every item with its title, closed ones last. Self-hides until the transcript
++ * uses item labels.
++ */
++export function OpenItemsPanel({ className }: { className?: string }) {
++  const index = useContext(ItemLabelIndexContext);
++  const items = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
++  const open = items.filter((item) => item.closedBy === null);
++  const closed = items.filter((item) => item.closedBy !== null);
++  const chipKey = open.map((item) => item.label).join(" ");
++  const fit = useFittedChipCount(chipKey);
++  const detailsRef = useCollapseOnOutsidePress();
++  if (items.length === 0) return null;
++  const headerChips = open.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
++
++  return (
++    <div className={cn("shrink-0 px-3 md:px-4", className)}>
++      <details
++        ref={detailsRef}
++        data-testid="open-items"
++        className="group mx-auto mb-1 max-w-3xl overflow-hidden rounded-xl border border-border bg-card shadow-sm"
++      >
++        <summary className="relative flex cursor-pointer list-none select-none items-center gap-2 px-3 py-2 text-ui font-medium [&::-webkit-details-marker]:hidden">
++          <MessageSquareDotIcon className="size-4 shrink-0 text-muted-foreground" />
++          <span className="shrink-0">Open items</span>
++          <span className="shrink-0 opacity-70">({open.length})</span>
++          {/* Chips open their popover; keep their clicks from toggling the panel. */}
++          <span
++            ref={fit.rowRef}
++            className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden font-normal"
++            onClick={(event) => {
++              if ((event.target as Element).closest("button")) event.preventDefault();
++            }}
++          >
++            {headerChips.map((item) => (
++              <ItemLabelPopover key={item.label} item={item} openOnHover>
++                <button
++                  type="button"
++                  aria-label={`Show item ${item.label}`}
++                  className={cn(itemLabelChipClass(false), "shrink-0")}
++                >
++                  {item.label}
++                </button>
++              </ItemLabelPopover>
++            ))}
++            {open.length > headerChips.length && (
++              <span className="shrink-0 text-xs text-muted-foreground">
++                +{open.length - headerChips.length}
++              </span>
++            )}
++          </span>
++          <span
++            ref={fit.measureRef}
++            aria-hidden="true"
++            className="pointer-events-none invisible absolute top-0 left-0 flex gap-1 font-normal whitespace-nowrap"
++          >
++            {open.map((item) => (
++              <span key={item.label} className={itemLabelChipClass(false)}>
++                {item.label}
++              </span>
++            ))}
++            <span className="text-xs">+{open.length}</span>
++          </span>
++          <ChevronDownIcon className="size-4 shrink-0 transition-transform group-open:rotate-180" />
++        </summary>
++        {/* Capped like the Plan tracker so a long list can't swallow the chat. */}
++        <div className="max-h-[180px] overflow-y-auto border-t border-border py-1">
++          {open.map((item) => (
++            <ItemRow key={item.label} item={item} />
++          ))}
++          {closed.length > 0 && (
++            <div className="px-3 pt-2 pb-1 text-xs text-muted-foreground">
++              Closed ({closed.length})
++            </div>
++          )}
++          {closed.map((item) => (
++            <ItemRow key={item.label} item={item} />
++          ))}
++        </div>
++      </details>
++    </div>
++  );
++}
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index 866f46f9e235ed613344855faf5beecc06719425..d0481788f89fde902b21ce6fe0ec3d819cd780f2 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -31,9 +31,11 @@ import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
+ import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
+ import { useSearchParams } from "@/lib/routing";
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
++import { ItemLabelIndexContext } from "@/lib/itemLabels";
+ import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
+ import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+ import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
++import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
+ import {
+   RunnerStartingIndicator,
+   McpStartupIndicator,
+@@ -44,6 +46,7 @@ import {
+   type ConversationScroller,
+   BubbleView,
+   ConversationScrollRefBridge,
++  buildBubbleItemLabelIndex,
+   HistoryAutoLoader,
+   HistoryLoadingIndicator,
+   JumpToTopButton,
+@@ -320,14 +323,26 @@ function TranscriptImpl({
+   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+   const arcaWarning = useArcaShutdownBanner();
+   const showArcaBanner = arcaWarning.showForHost(hostId);
+-  const hasPinnedBanner = display.hasTasks || showArcaBanner;
++  const itemLabelIndex = useMemo(
++    () => buildBubbleItemLabelIndex(display.bubbles),
++    [display.bubbles],
++  );
++  const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
++  const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
+   return (
+-    <>
++    <ItemLabelIndexContext.Provider value={itemLabelIndex}>
+       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
+       overlay) so it shrinks the scroll area rather than covering messages.
+       Self-hides with no tasks. */}
+       <ChatPlanAccordion className="mt-14 md:mt-12" />
+-      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
++      {/* The first pinned row clears the header; chat-plan-accordion adds the
++      native shells' safe-area shift (index.css). */}
++      <OpenItemsPanel
++        className={display.hasTasks ? undefined : "chat-plan-accordion mt-14 md:mt-12"}
++      />
++      {showArcaBanner && (
++        <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks || hasOpenItems} />
++      )}
+       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
+       conversation area without requiring Conversation to forward refs. */}
+       <div
+@@ -455,7 +470,7 @@ function TranscriptImpl({
+           />
+         )}
+       </div>
+-    </>
++    </ItemLabelIndexContext.Provider>
+   );
+ }
+ 
+diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
+index 06e8a0e51f636c1254e303a1b4737e4ad79befae..a5a1ac147235ad04351229765a86702acd19f85d 100644
+--- a/web/src/components/chat/chatBubbleParts.tsx
++++ b/web/src/components/chat/chatBubbleParts.tsx
+@@ -81,6 +81,15 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
+ import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+ import { InlineImage, SessionImage } from "@/components/SessionImage";
+ import { buildMessageDeepLink } from "@/lib/messageDeepLink";
++import {
++  ItemLabelMessageContext,
++  buildItemLabelIndex,
++  itemLabelsIn,
++  struckItemLabelsIn,
++  type ItemLabelIndex,
++  type ItemLabelScan,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
+ import { copyText } from "@/lib/clipboard";
+ import { copyMarkdown } from "@/lib/copyMarkdown";
+ import { showToast } from "@/components/ui/toast";
+@@ -167,6 +176,42 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
+     .trim();
+ }
+ 
++// Finalized bubbles are reused by reference across rebuilds, so each is scanned once.
++const itemLabelScans = new WeakMap<Bubble, ItemLabelScan>();
++
++function scanBubbleItemLabels(bubble: Bubble): ItemLabelScan | null {
++  if (bubble.kind !== "user" && bubble.kind !== "assistant") return null;
++  const cached = itemLabelScans.get(bubble);
++  if (cached) return cached;
++  const source: ItemLabelSource =
++    bubble.kind === "user"
++      ? { messageId: bubble.itemId, role: "user", text: extractUserText(bubble.content) }
++      : {
++          messageId: bubble.responseId,
++          role: "assistant",
++          text: collectBubbleMarkdown(bubble.items),
++        };
++  if (bubble.createdAtS !== undefined) source.createdAtS = bubble.createdAtS;
++  const labels = itemLabelsIn(source.text);
++  const scan = {
++    source,
++    labels,
++    struck: labels.length > 0 ? struckItemLabelsIn(source.text) : [],
++  };
++  itemLabelScans.set(bubble, scan);
++  return scan;
++}
++
++/** Maps each item label in the transcript to the message that first carried it. */
++export function buildBubbleItemLabelIndex(bubbles: readonly Bubble[]): ItemLabelIndex {
++  return buildItemLabelIndex(
++    bubbles.flatMap((bubble) => {
++      const scan = scanBubbleItemLabels(bubble);
++      return scan && scan.labels.length > 0 ? [scan] : [];
++    }),
++  );
++}
++
+ const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
+ const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
+ const MERMAID_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})mermaid(?:\s|$)/im;
+@@ -567,7 +612,13 @@ export const BubbleView = memo(
+     /** Hide retry/recovery controls when the surrounding session is sealed. */
+     recoveryDisabled?: boolean;
+   }) {
+-    if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
++    if (bubble.kind === "user") {
++      return (
++        <ItemLabelMessageContext.Provider value={bubble.itemId}>
++          <UserBubble bubble={bubble} />
++        </ItemLabelMessageContext.Provider>
++      );
++    }
+     if (bubble.kind === "compaction_loading") {
+       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
+     }
+@@ -587,13 +638,15 @@ export const BubbleView = memo(
+       );
+     }
+     return (
+-      <AssistantBubble
+-        bubble={bubble}
+-        isLastAssistant={isLastAssistant}
+-        showsWorking={showsWorking}
+-        actionsPersistent={actionsPersistent}
+-        recoveryDisabled={recoveryDisabled}
+-      />
++      <ItemLabelMessageContext.Provider value={bubble.responseId}>
++        <AssistantBubble
++          bubble={bubble}
++          isLastAssistant={isLastAssistant}
++          showsWorking={showsWorking}
++          actionsPersistent={actionsPersistent}
++          recoveryDisabled={recoveryDisabled}
++        />
++      </ItemLabelMessageContext.Provider>
+     );
+   },
+   (prev, next) =>
+diff --git a/web/src/hooks/useHoverPopover.test.tsx b/web/src/hooks/useHoverPopover.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..da621cf5b173282920d7651a8d2847ddbd1723d6
+--- /dev/null
++++ b/web/src/hooks/useHoverPopover.test.tsx
+@@ -0,0 +1,130 @@
++import { act, renderHook } from "@testing-library/react";
++import type React from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  HOVER_CLOSE_DELAY_MS,
++  HOVER_OPEN_DELAY_MS,
++  canHoverPreview,
++  useHoverPopover,
++} from "./useHoverPopover";
++
++const mouse = { pointerType: "mouse" } as React.PointerEvent;
++const touch = { pointerType: "touch" } as React.PointerEvent;
++
++function stubHoverDevice(canHover: boolean) {
++  vi.stubGlobal(
++    "matchMedia",
++    vi.fn((query: string) => ({ matches: canHover, media: query })),
++  );
++}
++
++beforeEach(() => {
++  vi.useFakeTimers();
++  stubHoverDevice(true);
++});
++
++afterEach(() => {
++  vi.useRealTimers();
++  vi.unstubAllGlobals();
++});
++
++describe("canHoverPreview", () => {
++  it("needs a mouse on a device whose primary pointer can hover", () => {
++    expect(canHoverPreview(mouse)).toBe(true);
++    expect(canHoverPreview(touch)).toBe(false);
++    stubHoverDevice(false);
++    expect(canHoverPreview(mouse)).toBe(false);
++  });
++});
++
++describe("useHoverPopover", () => {
++  it("opens after the hover delay and closes after leaving the trigger", () => {
++    const { result } = renderHook(() => useHoverPopover(true));
++    act(() => result.current.triggerProps.onPointerEnter(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_OPEN_DELAY_MS - 1));
++    expect(result.current.open).toBe(false);
++    act(() => vi.advanceTimersByTime(1));
++    expect(result.current.open).toBe(true);
++    expect(result.current.pinned).toBe(false);
++
++    act(() => result.current.triggerProps.onPointerLeave(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS));
++    expect(result.current.open).toBe(false);
++  });
++
++  it("stays open while the pointer moves onto the popover", () => {
++    const { result } = renderHook(() => useHoverPopover(true));
++    act(() => result.current.triggerProps.onPointerEnter(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_OPEN_DELAY_MS));
++    act(() => result.current.triggerProps.onPointerLeave(mouse));
++    act(() => result.current.contentProps.onPointerEnter());
++    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS * 2));
++    expect(result.current.open).toBe(true);
++    act(() => result.current.contentProps.onPointerLeave(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS));
++    expect(result.current.open).toBe(false);
++  });
++
++  it("does not open when the pointer leaves before the delay", () => {
++    const { result } = renderHook(() => useHoverPopover(true));
++    act(() => result.current.triggerProps.onPointerEnter(mouse));
++    act(() => result.current.triggerProps.onPointerLeave(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_OPEN_DELAY_MS));
++    expect(result.current.open).toBe(false);
++  });
++
++  it("pins a hover preview on click, which then ignores leaving", () => {
++    const { result } = renderHook(() => useHoverPopover(true));
++    act(() => result.current.triggerProps.onPointerEnter(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_OPEN_DELAY_MS));
++    const click = { preventDefault: vi.fn() } as unknown as React.MouseEvent;
++    act(() => result.current.triggerProps.onClick(click));
++    // The click is kept from toggling the popover shut.
++    expect(click.preventDefault).toHaveBeenCalled();
++    expect(result.current.pinned).toBe(true);
++    act(() => result.current.triggerProps.onPointerLeave(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS * 2));
++    expect(result.current.open).toBe(true);
++
++    act(() => result.current.onOpenChange(false));
++    expect(result.current).toMatchObject({ open: false, pinned: false });
++  });
++
++  it("keeps focus in place for a hover preview but not for a click-opened popover", () => {
++    const { result } = renderHook(() => useHoverPopover(true));
++    const focusEvent = () => ({ preventDefault: vi.fn() }) as unknown as Event;
++    act(() => result.current.triggerProps.onPointerEnter(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_OPEN_DELAY_MS));
++    const hoverOpen = focusEvent();
++    result.current.contentProps.onOpenAutoFocus(hoverOpen);
++    expect(hoverOpen.preventDefault).toHaveBeenCalled();
++    act(() => result.current.triggerProps.onPointerLeave(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS));
++    const hoverClose = focusEvent();
++    result.current.contentProps.onCloseAutoFocus(hoverClose);
++    expect(hoverClose.preventDefault).toHaveBeenCalled();
++
++    act(() => result.current.onOpenChange(true));
++    const clickOpen = focusEvent();
++    result.current.contentProps.onOpenAutoFocus(clickOpen);
++    expect(clickOpen.preventDefault).not.toHaveBeenCalled();
++    act(() => result.current.onOpenChange(false));
++    const clickClose = focusEvent();
++    result.current.contentProps.onCloseAutoFocus(clickClose);
++    expect(clickClose.preventDefault).not.toHaveBeenCalled();
++  });
++
++  it("ignores touch, devices without hover, and hover turned off", () => {
++    const touchOnly = renderHook(() => useHoverPopover(true));
++    act(() => touchOnly.result.current.triggerProps.onPointerEnter(touch));
++    const clickOnly = renderHook(() => useHoverPopover(false));
++    act(() => clickOnly.result.current.triggerProps.onPointerEnter(mouse));
++    stubHoverDevice(false);
++    const noHover = renderHook(() => useHoverPopover(true));
++    act(() => noHover.result.current.triggerProps.onPointerEnter(mouse));
++    act(() => vi.advanceTimersByTime(HOVER_OPEN_DELAY_MS));
++    expect(touchOnly.result.current.open).toBe(false);
++    expect(clickOnly.result.current.open).toBe(false);
++    expect(noHover.result.current.open).toBe(false);
++  });
++});
+diff --git a/web/src/hooks/useHoverPopover.ts b/web/src/hooks/useHoverPopover.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..09496eb482ece5b34b986d3d266b8f226f0fd7bf
+--- /dev/null
++++ b/web/src/hooks/useHoverPopover.ts
+@@ -0,0 +1,95 @@
++// Open state for a click popover that also previews on desktop hover.
++//
++// Hovering the trigger with a mouse opens it after a short delay, and leaving
++// both the trigger and the popover closes it. A click pins it open, so it then
++// stays until dismissed like any popover. Touch input never hovers.
++
++import { useCallback, useEffect, useRef, useState } from "react";
++import type React from "react";
++
++export const HOVER_OPEN_DELAY_MS = 300;
++export const HOVER_CLOSE_DELAY_MS = 200;
++const HOVER_QUERY = "(hover: hover) and (pointer: fine)";
++
++/** Whether `event` comes from a mouse on a device whose primary pointer can hover. */
++export function canHoverPreview(event: Pick<React.PointerEvent, "pointerType">): boolean {
++  if (event.pointerType !== "mouse") return false;
++  if (typeof window === "undefined" || !window.matchMedia) return false;
++  return window.matchMedia(HOVER_QUERY).matches;
++}
++
++/**
++ * Popover open state with a hover preview. Spread `triggerProps` on the
++ * trigger and `contentProps` on the content; `hover` false keeps click only.
++ */
++export function useHoverPopover(hover: boolean) {
++  const [open, setOpen] = useState(false);
++  const [pinned, setPinned] = useState(false);
++  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++  // Whether the popover being closed had been pinned, so focus returns to the trigger.
++  const restoreFocusRef = useRef(false);
++
++  const clearTimer = useCallback(() => {
++    if (timerRef.current === null) return;
++    clearTimeout(timerRef.current);
++    timerRef.current = null;
++  }, []);
++  useEffect(() => clearTimer, [clearTimer]);
++
++  const schedule = (next: boolean, delay: number) => {
++    clearTimer();
++    timerRef.current = setTimeout(() => {
++      timerRef.current = null;
++      restoreFocusRef.current = false;
++      setOpen(next);
++    }, delay);
++  };
++
++  const onOpenChange = (next: boolean) => {
++    clearTimer();
++    restoreFocusRef.current = pinned;
++    setOpen(next);
++    setPinned(next);
++  };
++
++  const leave = (event: React.PointerEvent) => {
++    if (!hover || event.pointerType !== "mouse" || pinned) return;
++    if (open) schedule(false, HOVER_CLOSE_DELAY_MS);
++    else clearTimer();
++  };
++
++  const triggerProps = {
++    onClick: (event: React.MouseEvent) => {
++      // A click on a hover preview pins it instead of toggling it shut.
++      if (!open || pinned) return;
++      event.preventDefault();
++      clearTimer();
++      setPinned(true);
++    },
++    onPointerEnter: (event: React.PointerEvent) => {
++      if (!hover || !canHoverPreview(event)) return;
++      if (open) clearTimer();
++      else schedule(true, HOVER_OPEN_DELAY_MS);
++    },
++    onPointerLeave: leave,
++  };
++
++  const contentProps = {
++    onPointerEnter: () => {
++      if (open && !pinned) clearTimer();
++    },
++    onPointerLeave: leave,
++    onPointerDown: () => {
++      if (open && !pinned) setPinned(true);
++    },
++    // A hover preview leaves focus where it was, both opening and closing.
++    onOpenAutoFocus: (event: Event) => {
++      if (!pinned) event.preventDefault();
++    },
++    onCloseAutoFocus: (event: Event) => {
++      if (!restoreFocusRef.current) event.preventDefault();
++    },
++  };
++
++  return { open, pinned, onOpenChange, triggerProps, contentProps };
++}
+diff --git a/web/src/lib/itemLabels.test.ts b/web/src/lib/itemLabels.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0abe54cf4d5808231608b8defa7941ce3f777d95
+--- /dev/null
++++ b/web/src/lib/itemLabels.test.ts
+@@ -0,0 +1,276 @@
++import { describe, expect, it } from "vitest";
++import {
++  ITEM_LABEL_HREF_PREFIX,
++  buildItemLabelIndex,
++  extractItemBlock,
++  extractLabelSentence,
++  itemLabelTitle,
++  itemLabelTitleParts,
++  itemLabelsIn,
++  remarkItemLabels,
++  struckItemLabelsIn,
++  type ItemLabelSource,
++} from "./itemLabels";
++
++describe("itemLabelsIn", () => {
++  it("finds distinct labels in order and ignores code, links, and non-label brackets", () => {
++    const markdown = [
++      "**[Q2] Cache scope.** Also see [Q1] and [Q2].",
++      "- [x] done, footnote [1], [note], [A1](https://example.com)",
++      "Inline `[Q9]` is code.",
++      "```",
++      "[Q8] inside a fence",
++      "```",
++      "Then [R10].",
++    ].join("\n");
++    expect(itemLabelsIn(markdown)).toEqual(["Q2", "Q1", "R10"]);
++  });
++});
++
++describe("extractItemBlock", () => {
++  it("returns the list item holding the label with its nested content, unmarked", () => {
++    const markdown = [
++      "Open questions:",
++      "",
++      "1. [Q1] First thing.",
++      "2. [Q2] Should the cache be per-user?",
++      "   It changes eviction.",
++      "   - option a",
++      "   - option b",
++      "",
++      "   ```ts",
++      "   const x = 1;",
++      "   ```",
++      "3. [Q3] Third.",
++    ].join("\n");
++    expect(extractItemBlock(markdown, "Q2")).toBe(
++      [
++        "[Q2] Should the cache be per-user?",
++        "It changes eviction.",
++        "- option a",
++        "- option b",
++        "",
++        "```ts",
++        "const x = 1;",
++        "```",
++      ].join("\n"),
++    );
++  });
++
++  it("returns a nested list item on its own", () => {
++    const markdown = ["- Parent", "  - [R1] Child detail", "  - Sibling"].join("\n");
++    expect(extractItemBlock(markdown, "R1")).toBe("[R1] Child detail");
++  });
++
++  it("returns a heading's section up to the next heading of the same level", () => {
++    const markdown = [
++      "## [Q4] Migration order",
++      "Run A before B.",
++      "### Details",
++      "More.",
++      "## Next",
++      "Unrelated.",
++    ].join("\n");
++    expect(extractItemBlock(markdown, "Q4")).toBe(
++      ["## [Q4] Migration order", "Run A before B.", "### Details", "More."].join("\n"),
++    );
++  });
++
++  it("returns a table row with the table header", () => {
++    const markdown = [
++      "| Id | Finding |",
++      "| --- | --- |",
++      "| [F1] | Slow query |",
++      "| [F2] | Leaky cache |",
++    ].join("\n");
++    expect(extractItemBlock(markdown, "F2")).toBe(
++      ["| Id | Finding |", "| --- | --- |", "| [F2] | Leaky cache |"].join("\n"),
++    );
++  });
++
++  it("returns a paragraph, including a list it introduces", () => {
++    const markdown = [
++      "Intro.",
++      "",
++      "[Q5] Pick a retry policy. Options:",
++      "",
++      "- exponential",
++      "- fixed",
++      "",
++      "Unrelated paragraph.",
++    ].join("\n");
++    expect(extractItemBlock(markdown, "Q5")).toBe(
++      ["[Q5] Pick a retry policy. Options:", "", "- exponential", "- fixed"].join("\n"),
++    );
++  });
++
++  it("prefers the item a label starts over an earlier passing mention", () => {
++    const markdown = [
++      "**[Q1] Why k3s?** The goal changes how much tooling you adopt in [Q7].",
++      "",
++      "**[Q7] Which tooling?** Manifests, Kustomize, or Helm.",
++    ].join("\n");
++    expect(extractItemBlock(markdown, "Q7")).toBe(
++      "**[Q7] Which tooling?** Manifests, Kustomize, or Helm.",
++    );
++    expect(itemLabelsIn(markdown)).toEqual(["Q1", "Q7"]);
++    expect(itemLabelTitle(markdown, "Q7")).toBe("Which tooling?");
++  });
++
++  it("returns null when the label only appears in code", () => {
++    expect(extractItemBlock("`[Q1]`\n```\n[Q1]\n```", "Q1")).toBeNull();
++  });
++});
++
++function message(messageId: string, text: string): ItemLabelSource {
++  return { messageId, role: "assistant", text };
++}
++
++function scan(source: ItemLabelSource) {
++  return {
++    source,
++    labels: itemLabelsIn(source.text),
++    struck: struckItemLabelsIn(source.text),
++  };
++}
++
++describe("buildItemLabelIndex", () => {
++  it("defines each label at its first message and counts later mentions", () => {
++    const first = message("m1", "[Q1] [Q2]");
++    const second = message("m2", "[Q2] [Q3]");
++    const index = buildItemLabelIndex([scan(first), scan(second)]);
++    expect(index.items.get("Q2")).toMatchObject({ source: first, messageCount: 2 });
++    expect(index.items.get("Q3")).toMatchObject({ source: second, messageCount: 1 });
++    expect([...index.items.keys()]).toEqual(["Q1", "Q2", "Q3"]);
++  });
++
++  it("closes an item on a struck mention and reopens it on a later plain one", () => {
++    const defining = message("m1", "[Q1] Pick a cache. [Q2] Pick a queue.");
++    const closing = message("m2", "~~[Q1]~~ settled: per-user cache.");
++    const closed = buildItemLabelIndex([scan(defining), scan(closing)]);
++    expect(closed.items.get("Q1")?.closedBy).toBe(closing);
++    expect(closed.items.get("Q2")?.closedBy).toBeNull();
++
++    const reopened = buildItemLabelIndex([
++      scan(defining),
++      scan(closing),
++      scan(message("m3", "Reopening [Q1]: per-user eviction is too costly.")),
++    ]);
++    expect(reopened.items.get("Q1")?.closedBy).toBeNull();
++  });
++
++  it("stays disabled until labels recur or one message tags several items", () => {
++    const lone = buildItemLabelIndex([scan(message("m1", "Paper size [A4] only."))]);
++    expect(lone.enabled).toBe(false);
++    expect(lone.items.size).toBe(1);
++
++    const recurring = buildItemLabelIndex([
++      scan(message("m1", "[Q1] One question.")),
++      scan(message("m2", "Still waiting on [Q1].")),
++    ]);
++    expect(recurring.enabled).toBe(true);
++
++    const several = buildItemLabelIndex([scan(message("m1", "[Q1] One. [Q2] Two."))]);
++    expect(several.enabled).toBe(true);
++  });
++});
++
++describe("struckItemLabelsIn", () => {
++  it("finds labels inside strikethrough spans, outside code", () => {
++    const markdown = [
++      "- ~~[Q1]~~ done, ~~[Q2] dropped~~, [Q3] still open",
++      "`~~[Q4]~~`",
++      "```",
++      "~~[Q5]~~",
++      "```",
++    ].join("\n");
++    expect(struckItemLabelsIn(markdown)).toEqual(["Q1", "Q2"]);
++  });
++});
++
++describe("extractLabelSentence", () => {
++  it("returns the sentence with the struck mention, without its list marker", () => {
++    const markdown = [
++      "Status: [Q2] came up again earlier.",
++      "",
++      "- Batching is done. ~~[Q2]~~ copied as-is to keep audit history. Moving on.",
++    ].join("\n");
++    expect(extractLabelSentence(markdown, "Q2")).toBe(
++      "~~[Q2]~~ copied as-is to keep audit history.",
++    );
++  });
++
++  it("falls back to a plain mention and returns null when absent", () => {
++    expect(extractLabelSentence("Done with [Q3]. Next.", "Q3")).toBe("Done with [Q3].");
++    expect(extractLabelSentence("Nothing here.", "Q3")).toBeNull();
++  });
++});
++
++describe("itemLabelTitle", () => {
++  it("takes the item's leading bold span, inside or after the label", () => {
++    const markdown = "1. **[Q2] Soft-deleted rows.** 3,112 rows still reference `accounts`.";
++    expect(itemLabelTitle(markdown, "Q2")).toBe("Soft-deleted rows.");
++    expect(itemLabelTitle("- [Q2] **Docker socket access?** Mount it read-only.", "Q2")).toBe(
++      "Docker socket access?",
++    );
++    expect(itemLabelTitle("[N1] **Note:** keep [Q2] open.", "N1")).toBe("Note");
++  });
++
++  it("falls back to the first sentence without the label or markup", () => {
++    expect(itemLabelTitle("[R1]: the cascade reaches `events`. It also locks.", "R1")).toBe(
++      "the cascade reaches events.",
++    );
++    expect(itemLabelTitle("[R2] A **partial** bold. Then more.", "R2")).toBe("A partial bold.");
++    expect(itemLabelTitle("[R3] ** ** No title here", "R3")).toBe("No title here");
++  });
++});
++
++describe("itemLabelTitleParts", () => {
++  it("returns the first line's text after the title as the rest", () => {
++    expect(itemLabelTitleParts("[Q2] **Docker socket?** Mount it. Or not.", "Q2")).toEqual({
++      title: "Docker socket?",
++      rest: "Mount it. Or not.",
++    });
++    expect(itemLabelTitleParts("[R1] Cascade reaches events. It also locks.", "R1")).toEqual({
++      title: "Cascade reaches events.",
++      rest: "It also locks.",
++    });
++    expect(itemLabelTitleParts("Nothing labelled here.", "Q9")).toEqual({ title: "", rest: "" });
++  });
++});
++
++describe("remarkItemLabels", () => {
++  it("splits labels in text into links and leaves links and code alone", () => {
++    const tree = {
++      type: "root",
++      children: [
++        {
++          type: "paragraph",
++          children: [
++            { type: "text", value: "See [Q1] and [R2]." },
++            { type: "inlineCode", value: "[Q3]" },
++            { type: "link", url: "https://x", children: [{ type: "text", value: "[Q4]" }] },
++          ],
++        },
++      ],
++    };
++    remarkItemLabels()(tree);
++    expect(tree.children[0].children).toEqual([
++      { type: "text", value: "See " },
++      {
++        type: "link",
++        url: `${ITEM_LABEL_HREF_PREFIX}Q1`,
++        children: [{ type: "text", value: "[Q1]" }],
++      },
++      { type: "text", value: " and " },
++      {
++        type: "link",
++        url: `${ITEM_LABEL_HREF_PREFIX}R2`,
++        children: [{ type: "text", value: "[R2]" }],
++      },
++      { type: "text", value: "." },
++      { type: "inlineCode", value: "[Q3]" },
++      { type: "link", url: "https://x", children: [{ type: "text", value: "[Q4]" }] },
++    ]);
++  });
++});
+diff --git a/web/src/lib/itemLabels.ts b/web/src/lib/itemLabels.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2a0ea93fee6f5ee35ded8963a90902167182107
+--- /dev/null
++++ b/web/src/lib/itemLabels.ts
+@@ -0,0 +1,399 @@
++// Item labels: short bracketed tags such as `[Q3]` or `[R12]` that an agent
++// attaches to an item when it first raises it, then reuses to refer back to it.
++// The first message carrying a label defines the item; later mentions render as
++// chips that preview the defining block without scrolling the transcript. A
++// struck-through mention (`~~[Q3]~~`) closes the item; the newest mention wins.
++
++import { createContext } from "react";
++
++/** Fragment href a label link carries from the remark pass to the link renderer. */
++export const ITEM_LABEL_HREF_PREFIX = "#omnigent-item-";
++
++// One to three capitals then one to three digits, so task-list `[x]`, numeric
++// footnotes `[1]`, and prose in brackets never match. A label followed by `(`
++// is the text of a markdown link, not a label.
++const ITEM_LABEL_SOURCE = String.raw`\[([A-Z]{1,3}\d{1,3})\](?!\()`;
++
++function itemLabelPattern(): RegExp {
++  return new RegExp(ITEM_LABEL_SOURCE, "g");
++}
++
++/** A transcript message that may define item labels. */
++export interface ItemLabelSource {
++  messageId: string;
++  role: "user" | "assistant";
++  text: string;
++  createdAtS?: number;
++}
++
++/** What one message says about labels. */
++export interface ItemLabelScan {
++  source: ItemLabelSource;
++  /** Distinct labels in order of first appearance. */
++  labels: readonly string[];
++  /** Labels this message mentions struck through. */
++  struck: readonly string[];
++}
++
++/** One labelled item across the transcript. */
++export interface ItemLabelEntry {
++  label: string;
++  /** The message that first carried the label. */
++  source: ItemLabelSource;
++  /** The message whose struck mention closed the item; null while open. */
++  closedBy: ItemLabelSource | null;
++  /** How many messages mention the label. */
++  messageCount: number;
++}
++
++export interface ItemLabelIndex {
++  /**
++   * Whether the transcript uses labels: some label recurs across messages, or
++   * one message tags several items. A lone bracketed code stays plain text.
++   */
++  enabled: boolean;
++  /** Items in order of definition. */
++  items: ReadonlyMap<string, ItemLabelEntry>;
++}
++
++/** The transcript's label index; null on surfaces without a transcript. */
++export const ItemLabelIndexContext = createContext<ItemLabelIndex | null>(null);
++
++/** Id of the message whose markdown is being rendered. */
++export const ItemLabelMessageContext = createContext<string | null>(null);
++
++/** Builds the index from messages in transcript order; the first definition wins. */
++export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIndex {
++  const items = new Map<string, ItemLabelEntry>();
++  let enabled = false;
++  for (const { source, labels, struck } of scans) {
++    if (labels.length > 1) enabled = true;
++    for (const label of labels) {
++      const closedBy = struck.includes(label) ? source : null;
++      const entry = items.get(label);
++      if (!entry) {
++        items.set(label, { label, source, closedBy, messageCount: 1 });
++        continue;
++      }
++      entry.closedBy = closedBy;
++      entry.messageCount += 1;
++      enabled = true;
++    }
++  }
++  return { enabled, items };
++}
++
++interface ScannedLine {
++  text: string;
++  /** Inside a fenced code block, or one of its fence lines. */
++  inFence: boolean;
++}
++
++const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
++
++function scanLines(markdown: string): ScannedLine[] {
++  const lines: ScannedLine[] = [];
++  let fence: string | null = null;
++  for (const text of markdown.split("\n")) {
++    if (fence === null) {
++      const open = text.match(FENCE_OPEN_RE);
++      if (open) fence = open[1];
++      lines.push({ text, inFence: open !== null });
++      continue;
++    }
++    const close = text.trim();
++    if (close.length >= fence.length && close === fence[0].repeat(close.length)) fence = null;
++    lines.push({ text, inFence: true });
++  }
++  return lines;
++}
++
++/** Blanks out inline code spans so a label inside backticks is never matched. */
++function withoutInlineCode(line: string): string {
++  return line.replace(/(`+)[^`]*?\1/g, (span) => " ".repeat(span.length));
++}
++
++function labelsInLine(line: string): string[] {
++  return Array.from(withoutInlineCode(line).matchAll(itemLabelPattern()), (match) => match[1]);
++}
++
++/** The distinct labels in `markdown`, in order of definition, skipping code. */
++export function itemLabelsIn(markdown: string): string[] {
++  const lines = scanLines(markdown);
++  const seen = new Set<string>();
++  for (const line of lines) {
++    if (line.inFence) continue;
++    for (const label of labelsInLine(line.text)) seen.add(label);
++  }
++  if (seen.size < 2) return [...seen];
++  // Stable sort: labels defined on the same line keep their written order.
++  const definedAt = new Map([...seen].map((label) => [label, definitionLineIndex(lines, label)]));
++  return [...seen].sort((a, b) => (definedAt.get(a) ?? 0) - (definedAt.get(b) ?? 0));
++}
++
++const STRIKETHROUGH_RE = /~~(?=\S)(.*?\S)~~/g;
++
++function struckLabelsInLine(line: string): string[] {
++  return Array.from(withoutInlineCode(line).matchAll(STRIKETHROUGH_RE), (span) =>
++    labelsInLine(span[1]),
++  ).flat();
++}
++
++/** The distinct labels `markdown` mentions inside strikethrough, skipping code. */
++export function struckItemLabelsIn(markdown: string): string[] {
++  const seen = new Set<string>();
++  for (const line of scanLines(markdown)) {
++    if (line.inFence) continue;
++    for (const label of struckLabelsInLine(line.text)) seen.add(label);
++  }
++  return [...seen];
++}
++
++const SENTENCE_BREAK_RE = /(?<=[.!?])\s+(?=\S)/;
++const LEADING_MARKER_RE = /^\s*(?:[-*+]\s+|\d{1,9}[.)]\s+|#{1,6}\s+|>\s*)*/;
++
++/** Whether `line` starts with `label`, after list, heading, and emphasis markers. */
++function startsWithLabel(line: string, label: string): boolean {
++  const rest = line.replace(LEADING_MARKER_RE, "").replace(/^(?:\*\*|__|\*|_|~~)+/, "");
++  return labelsInLine(rest).includes(label) && rest.startsWith(`[${label}]`);
++}
++
++/**
++ * Index of the line that defines `label`: the first line the label starts,
++ * since an item can be mentioned in passing before its own entry; otherwise
++ * the first line that mentions it. -1 when absent.
++ */
++function definitionLineIndex(lines: ScannedLine[], label: string): number {
++  const leading = lines.findIndex((line) => !line.inFence && startsWithLabel(line.text, label));
++  if (leading >= 0) return leading;
++  return lines.findIndex((line) => !line.inFence && labelsInLine(line.text).includes(label));
++}
++
++/**
++ * The sentence in `markdown` that mentions `label`, preferring a struck
++ * mention: the line that closed an item says how it was resolved.
++ */
++export function extractLabelSentence(markdown: string, label: string): string | null {
++  const lines = scanLines(markdown).filter((line) => !line.inFence);
++  const line =
++    lines.find((candidate) => struckLabelsInLine(candidate.text).includes(label)) ??
++    lines.find((candidate) => labelsInLine(candidate.text).includes(label));
++  if (!line) return null;
++  const text = line.text.replace(LEADING_MARKER_RE, "").trim();
++  const sentences = text.split(SENTENCE_BREAK_RE);
++  return sentences.find((sentence) => labelsInLine(sentence).includes(label)) ?? text;
++}
++
++const LEADING_BOLD_RE = /^(\*\*|__)(?!\s*\1)(.+?)\1/;
++const plainText = (text: string) => text.replace(/\*\*|__|~~|`/g, "").trim();
++
++/**
++ * An item's short title and the text after it on its block's first line, both
++ * without markup: the leading bold span if there is one, else the first sentence.
++ */
++export function itemLabelTitleParts(
++  markdown: string,
++  label: string,
++): { title: string; rest: string } {
++  const block = extractItemBlock(markdown, label) ?? "";
++  const first = block.split("\n").find((line) => line.trim() !== "") ?? "";
++  const line = first
++    .replace(LEADING_MARKER_RE, "")
++    .replace(itemLabelPattern(), (match, found: string) => (found === label ? "" : match))
++    .replace(/^[\s:.\-–—]+/, "");
++  const bold = line.match(LEADING_BOLD_RE);
++  if (bold) {
++    const title = plainText(bold[2]).replace(/^[\s:.\-–—]+|:$/g, "");
++    if (title) return { title, rest: plainText(line.slice(bold[0].length)) };
++  }
++  const [title = "", ...rest] = plainText(line).split(SENTENCE_BREAK_RE);
++  return { title, rest: rest.join(" ") };
++}
++
++/** A short plain-text title for an item; see `itemLabelTitleParts`. */
++export function itemLabelTitle(markdown: string, label: string): string {
++  return itemLabelTitleParts(markdown, label).title;
++}
++
++const LIST_ITEM_RE = /^(\s*)(?:[-*+]|\d{1,9}[.)])\s+/;
++const HEADING_RE = /^ {0,3}(#{1,6})\s/;
++const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
++
++const isBlank = (line: ScannedLine | undefined) => line !== undefined && line.text.trim() === "";
++const indentOf = (text: string) => text.length - text.trimStart().length;
++
++function headingLevel(line: ScannedLine): number | null {
++  if (line.inFence) return null;
++  const match = line.text.match(HEADING_RE);
++  return match ? match[1].length : null;
++}
++
++function listItemIndent(line: ScannedLine): number | null {
++  if (line.inFence) return null;
++  const match = line.text.match(LIST_ITEM_RE);
++  return match ? match[1].length : null;
++}
++
++/** First line index past the list that starts at `start`. */
++function endOfList(lines: ScannedLine[], start: number, indent: number): number {
++  let end = start + 1;
++  while (end < lines.length) {
++    const line = lines[end];
++    if (isBlank(line)) {
++      let next = end + 1;
++      while (isBlank(lines[next])) next += 1;
++      const following = lines[next];
++      if (!following) break;
++      const nested = following.inFence || indentOf(following.text) > indent;
++      if (!nested && listItemIndent(following) !== indent) break;
++      end = next;
++      continue;
++    }
++    if (headingLevel(line) !== null) break;
++    end += 1;
++  }
++  return end;
++}
++
++/** First line index past the list item that starts at `start`. */
++function endOfListItem(lines: ScannedLine[], start: number, indent: number): number {
++  let end = start + 1;
++  while (end < lines.length) {
++    const line = lines[end];
++    if (isBlank(line)) {
++      let next = end + 1;
++      while (isBlank(lines[next])) next += 1;
++      const following = lines[next];
++      if (!following || (!following.inFence && indentOf(following.text) <= indent)) break;
++      end = next;
++      continue;
++    }
++    if (line.inFence) {
++      end += 1;
++      continue;
++    }
++    const itemIndent = listItemIndent(line);
++    if (itemIndent !== null && itemIndent <= indent) break;
++    if (headingLevel(line) !== null) break;
++    end += 1;
++  }
++  return end;
++}
++
++function dedent(texts: string[], amount: number): string[] {
++  return texts.map((text) => (indentOf(text) >= amount ? text.slice(amount) : text.trimStart()));
++}
++
++/**
++ * The markdown block where `label` is first defined in `markdown`: its list
++ * item (with nested content), heading section, table row (with the header), or
++ * paragraph (with a list it introduces). Returns null when the label is absent.
++ */
++export function extractItemBlock(markdown: string, label: string): string | null {
++  const lines = scanLines(markdown);
++  const at = definitionLineIndex(lines, label);
++  if (at < 0) return null;
++  const slice = (start: number, end: number) => lines.slice(start, end).map((line) => line.text);
++  const finish = (texts: string[]) => texts.join("\n").trim();
++
++  const level = headingLevel(lines[at]);
++  if (level !== null) {
++    let end = at + 1;
++    while (end < lines.length) {
++      const nextLevel = headingLevel(lines[end]);
++      if (nextLevel !== null && nextLevel <= level) break;
++      end += 1;
++    }
++    return finish(slice(at, end));
++  }
++
++  // The innermost list item holding the label: walk up its paragraph lines.
++  let itemStart = at;
++  while (
++    itemStart >= 0 &&
++    !isBlank(lines[itemStart]) &&
++    headingLevel(lines[itemStart]) === null &&
++    listItemIndent(lines[itemStart]) === null
++  ) {
++    itemStart -= 1;
++  }
++  if (itemStart >= 0) {
++    const marker = lines[itemStart].inFence ? null : lines[itemStart].text.match(LIST_ITEM_RE);
++    if (marker) {
++      // Drop the item's own marker so it previews as a standalone block.
++      const [first, ...rest] = slice(itemStart, endOfListItem(lines, itemStart, marker[1].length));
++      return finish([first.slice(marker[0].length), ...dedent(rest, marker[0].length)]);
++    }
++  }
++
++  let start = at;
++  while (start > 0 && !isBlank(lines[start - 1]) && !lines[start - 1].inFence) start -= 1;
++  let end = at + 1;
++  while (end < lines.length && !isBlank(lines[end]) && !lines[end].inFence) end += 1;
++
++  if (lines[at].text.includes("|") && TABLE_SEPARATOR_RE.test(lines[start + 1]?.text ?? "")) {
++    return at <= start + 1
++      ? finish(slice(start, end))
++      : finish([...slice(start, start + 2), lines[at].text]);
++  }
++
++  // A paragraph ending in ":" introduces the list that follows it.
++  if (lines[end - 1].text.trimEnd().endsWith(":")) {
++    let next = end;
++    while (isBlank(lines[next])) next += 1;
++    const indent = lines[next] ? listItemIndent(lines[next]) : null;
++    if (indent !== null)
++      return finish([...slice(start, end), "", ...slice(next, endOfList(lines, next, indent))]);
++  }
++  return finish(slice(start, end));
++}
++
++interface MdastNode {
++  type: string;
++  value?: string;
++  url?: string;
++  children?: MdastNode[];
++}
++
++// Text under these nodes is already a link, code, or raw markup.
++const NON_LABEL_PARENTS = new Set([
++  "link",
++  "linkReference",
++  "definition",
++  "inlineCode",
++  "code",
++  "html",
++]);
++
++function splitLabelText(node: MdastNode): MdastNode[] {
++  const text = node.value ?? "";
++  const parts: MdastNode[] = [];
++  let last = 0;
++  for (const match of text.matchAll(itemLabelPattern())) {
++    const index = match.index ?? 0;
++    if (index > last) parts.push({ type: "text", value: text.slice(last, index) });
++    parts.push({
++      type: "link",
++      url: `${ITEM_LABEL_HREF_PREFIX}${match[1]}`,
++      children: [{ type: "text", value: match[0] }],
++    });
++    last = index + match[0].length;
++  }
++  if (parts.length === 0) return [node];
++  if (last < text.length) parts.push({ type: "text", value: text.slice(last) });
++  return parts;
++}
++
++function linkifyItemLabels(node: MdastNode): void {
++  if (!node.children || NON_LABEL_PARENTS.has(node.type)) return;
++  node.children = node.children.flatMap((child) => {
++    if (child.type === "text") return splitLabelText(child);
++    linkifyItemLabels(child);
++    return [child];
++  });
++}
++
++/** Remark plugin turning each item label into a link the chat renderer draws as a chip. */
++export function remarkItemLabels() {
++  return (tree: MdastNode) => linkifyItemLabels(tree);
++}

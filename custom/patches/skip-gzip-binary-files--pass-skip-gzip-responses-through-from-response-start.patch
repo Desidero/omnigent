@@ -1,0 +1,722 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 20 Oct 2026 13:51:20 +0000
+Subject: [PATCH] fix(server): pass skip_gzip responses through from response
+ start
+
+Starlette 1.8.0 checks the gzip responder's exclusion flag on
+http.response.start, but our skip_gzip opt-out only set it on the first
+body message. Binary file reads (images, PDFs) and downloads then never
+sent their start message, and the server answered 500, so the FileViewer
+showed "Error loading file: 500" for every image. The server image
+installs without the lockfile, so it picks up Starlette 1.8.0.
+
+Squashed copy of upstream PR #10585 (issue #10481), which also hardens
+the download proxy's stream cleanup and runner-offline errors.
+
+Not upstream yet: pulled from upstream PR #10585; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (fix: images and PDFs load in the file viewer again; no setting)
+---
+ omnigent/server/routes/_gzip_route.py         |  29 +-
+ .../routes/sessions/routes_resources.py       |  82 +++-
+ tests/server/routes/test_session_resources.py | 447 ++++++++++++++++++
+ 3 files changed, 532 insertions(+), 26 deletions(-)
+
+diff --git a/omnigent/server/routes/_gzip_route.py b/omnigent/server/routes/_gzip_route.py
+index 71477a690d4e3f1ec4bded4edfe3b09ec6faa1b6..bda962d011a10579fb5fbc7d8259afd13c64ffa5 100644
+--- a/omnigent/server/routes/_gzip_route.py
++++ b/omnigent/server/routes/_gzip_route.py
+@@ -96,19 +96,16 @@ class _StateAwareGZipResponder(GZipResponder):
+     """
+     Gzip responder that honours a handler's :func:`skip_gzip` opt-out.
+ 
+-    The flag can only be read at send time: the handler sets it while running,
+-    which is after ``handle`` dispatches but before the response body is
+-    emitted. Reuses Starlette's own ``content_type_is_excluded`` opt-out — the
+-    flag it already sets for ``text/event-stream`` — so an excluded response
+-    takes the library's untouched pass-through path rather than a parallel one
+-    here.
++    The handler sets the flag before response headers are sent. This responder
++    reads it on ``http.response.start`` and passes the start and every body
++    message through unchanged, so Starlette's buffered start is never stranded.
+ 
+     :param app: The wrapped ASGI app (the route's own ``handle``).
+     :param minimum_size: Minimum body size to compress, e.g. ``1024``.
+     :param compresslevel: gzip level passed through to Starlette.
+     :param state: The request's ``scope["state"]`` dict — the same mapping
+-        ``request.state`` writes to, so the handler's later opt-out is visible
+-        through this reference.
++        ``request.state`` writes to, so the handler's opt-out is visible when
++        the response starts.
+     """
+ 
+     def __init__(
+@@ -120,22 +117,20 @@ class _StateAwareGZipResponder(GZipResponder):
+     ) -> None:
+         super().__init__(app, minimum_size, compresslevel=compresslevel)
+         self._state = state
++        self._skip = False
+ 
+     async def send_with_compression(self, message: Message) -> None:
+         """
+-        Widen Starlette's exclusion set when the handler opted out.
++        Pass an opted-out response through from its start message.
+ 
+         :param message: The outgoing ASGI message.
+         :returns: None.
+         """
+-        if (
+-            message["type"] == "http.response.body"
+-            and not self.started
+-            and self._state.get(SKIP_GZIP_STATE_KEY)
+-        ):
+-            # Starlette reads this flag on the first body message, then emits
+-            # the start message it buffered — untouched.
+-            self.content_type_is_excluded = True
++        if message["type"] == "http.response.start" and self._state.get(SKIP_GZIP_STATE_KEY):
++            self._skip = True
++        if self._skip:
++            await self.send(message)
++            return
+         await super().send_with_compression(message)
+ 
+ 
+diff --git a/omnigent/server/routes/sessions/routes_resources.py b/omnigent/server/routes/sessions/routes_resources.py
+index a72fc2455a926d9cf8a4f8d4d27fe0ea5a22bbbb..3bb5345668b0bdd0c97089bf1335e5cac9ff3d93 100644
+--- a/omnigent/server/routes/sessions/routes_resources.py
++++ b/omnigent/server/routes/sessions/routes_resources.py
+@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Annotated, Any, cast
+ 
++import anyio
+ import httpx
+ from fastapi import (
+     APIRouter,
+@@ -116,6 +117,24 @@ if TYPE_CHECKING:
+     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+ 
+ 
++class _ShieldedCloseByteStream(httpx.AsyncByteStream):
++    """Keep an upstream stream's cleanup running through request cancellation.
++
++    :param stream: The upstream httpx byte stream to delegate to.
++    """
++
++    def __init__(self, stream: httpx.AsyncByteStream) -> None:
++        self._stream = stream
++
++    async def __aiter__(self) -> AsyncIterator[bytes]:
++        async for chunk in self._stream:
++            yield chunk
++
++    async def aclose(self) -> None:
++        with anyio.CancelScope(shield=True):
++            await self._stream.aclose()
++
++
+ class _RunnerStreamResponse(StreamingResponse):
+     """Stream a runner response body and close it however the send ends.
+ 
+@@ -123,13 +142,22 @@ class _RunnerStreamResponse(StreamingResponse):
+     send that fails before that, or a client that disconnects (where
+     Starlette skips background tasks), would leak the tunnel request.
+     Closing in ``__call__`` covers every exit.
++    The route wraps ``upstream.stream`` in ``_ShieldedCloseByteStream`` before
++    constructing this response, so the ``finally`` close completes on cancellation.
+ 
+     :param upstream: The runner's streamed response.
+     :param headers: Response headers to forward.
++    :param content: Async iterator of body chunks, including the prefetched first chunk.
+     """
+ 
+-    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
+-        super().__init__(upstream.aiter_raw(), headers=headers)
++    def __init__(
++        self,
++        upstream: httpx.Response,
++        *,
++        headers: Mapping[str, str],
++        content: AsyncIterator[bytes],
++    ) -> None:
++        super().__init__(content, headers=headers)
+         self._upstream = upstream
+ 
+     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+@@ -422,9 +450,10 @@ def register_resources_routes(
+         :returns: The attachment, streamed as the runner sends it, or the
+             runner's own error body and status for a missing file, a
+             directory, or an out-of-grant path.
+-        :raises OmnigentError: ``runner_unavailable`` when the runner
+-            predates downloads.
+-        :raises HTTPException: 502 when no runner can be reached.
++        :raises OmnigentError: ``runner_unavailable`` when no runner is
++            available, a send-time connection failure shows it is unreachable,
++            or the runner predates downloads.
++        :raises HTTPException: 502 when a download or error-body read fails.
+         """
+         try:
+             runner_client = await _get_runner_client_for_resource_access(
+@@ -450,9 +479,9 @@ def register_resources_routes(
+                 conversation=conversation,
+             )
+         if runner_client is None:
+-            raise HTTPException(
+-                status_code=502,
+-                detail="no runner available for resource access",
++            raise OmnigentError(
++                "No runner is available to download this file.",
++                code=ErrorCode.RUNNER_UNAVAILABLE,
+             )
+         try:
+             resp = await runner_client.send(
+@@ -460,10 +489,16 @@ def register_resources_routes(
+                 stream=True,
+             )
+         except (httpx.HTTPError, ConnectionError) as exc:
++            if isinstance(exc, (httpx.ConnectError, ConnectionError)):
++                raise OmnigentError(
++                    "The session runner is offline. Reconnect the host and retry.",
++                    code=ErrorCode.RUNNER_UNAVAILABLE,
++                ) from exc
+             raise HTTPException(
+                 status_code=502,
+                 detail="runner download endpoint unavailable",
+             ) from exc
++        resp.stream = _ShieldedCloseByteStream(cast(httpx.AsyncByteStream, resp.stream))
+         if resp.status_code == 200 and "content-disposition" in resp.headers:
+             skip_gzip(request)
+             forwarded = {
+@@ -478,9 +513,38 @@ def register_resources_routes(
+                 )
+                 if name in resp.headers
+             }
+-            return _RunnerStreamResponse(resp, headers=forwarded)
++            chunks = resp.aiter_raw()
++            try:
++                first_chunk = await anext(chunks)
++            except StopAsyncIteration:
++                first_chunk = None
++            except BaseException as exc:
++                with contextlib.suppress(BaseException):
++                    await resp.aclose()
++                if isinstance(exc, (httpx.HTTPError, ConnectionError)):
++                    _logger.warning("Runner download failed before streaming began: %s", exc)
++                    raise HTTPException(
++                        status_code=502,
++                        detail="runner download failed",
++                    ) from exc
++                raise
++
++            async def stream_chunks() -> AsyncIterator[bytes]:
++                if first_chunk is not None:
++                    yield first_chunk
++                async for chunk in chunks:
++                    yield chunk
++
++            return _RunnerStreamResponse(
++                resp,
++                headers=forwarded,
++                content=stream_chunks(),
++            )
+         try:
+             await resp.aread()
++        except (httpx.HTTPError, ConnectionError) as exc:
++            _logger.warning("Runner download error response could not be read: %s", exc)
++            raise HTTPException(status_code=502, detail="runner download failed") from exc
+         finally:
+             await resp.aclose()
+         if resp.status_code == 200:
+diff --git a/tests/server/routes/test_session_resources.py b/tests/server/routes/test_session_resources.py
+index 44675766db1013730606c4bce9417ed75a39aa1d..17d5f65d3f25a04bb4da4721583e2f2935e2453f 100644
+--- a/tests/server/routes/test_session_resources.py
++++ b/tests/server/routes/test_session_resources.py
+@@ -15,6 +15,7 @@ from typing import Any
+ from unittest.mock import Mock
+ from urllib.parse import quote
+ 
++import anyio
+ import httpx
+ import pytest
+ from fastapi import FastAPI, HTTPException, Request
+@@ -41,6 +42,10 @@ from omnigent.server.auth import (
+ )
+ from omnigent.server.host_registry import HostRegistry
+ from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
++from omnigent.server.routes.sessions.routes_resources import (
++    _RunnerStreamResponse,
++    _ShieldedCloseByteStream,
++)
+ from omnigent.server.schemas import SessionEventInput
+ from omnigent.stores.host_store import HostStore
+ from tests._helpers.polling import poll_until_async
+@@ -3953,10 +3958,384 @@ async def test_filesystem_download_streams_runner_attachment(
+     assert resp.content == payload
+     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+     assert resp.headers["content-length"] == str(len(payload))
++    assert "content-encoding" not in resp.headers
+     assert resp.headers["cache-control"] == "no-store"
+     assert seen == [("data/big.bin", True, "reach")]
+ 
+ 
++@pytest.mark.asyncio
++async def test_filesystem_download_with_http_middleware_preserves_bytes(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++    tmp_path: Path,
++) -> None:
++    payload = bytes(range(256)) * 64
++    (tmp_path / "big.bin").write_bytes(payload)
++
++    @app.middleware("http")
++    async def pass_through(request: Request, call_next: Callable[..., Any]) -> Any:
++        return await call_next(request)
++
++    runner = FastAPI()
++
++    @runner.get(_FS_ROUTE)
++    async def _serve(
++        session_id: str,
++        environment_id: str,
++        relative_path: str,
++        download: bool = False,
++        scope: str | None = None,
++    ) -> FileResponse:
++        del session_id, environment_id, relative_path, download, scope
++        return FileResponse(tmp_path / "big.bin", filename="big.bin")
++
++    async with _runner_app_client(runner):
++        resp = await client.get(
++            _DOWNLOAD_URL,
++            headers={"Accept-Encoding": "gzip, deflate, br"},
++        )
++
++    assert resp.status_code == 200, resp.text
++    assert resp.content == payload
++    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
++    assert resp.headers["content-length"] == str(len(payload))
++    assert "content-encoding" not in resp.headers
++
++
++@pytest.mark.asyncio
++async def test_filesystem_download_runner_abort_before_first_chunk_is_typed(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++) -> None:
++    @app.middleware("http")
++    async def pass_through(request: Request, call_next: Callable[..., Any]) -> Any:
++        return await call_next(request)
++
++    class AbortingStream(httpx.AsyncByteStream):
++        async def __aiter__(self) -> AsyncIterator[bytes]:
++            raise ConnectionError("runner disconnected before first chunk")
++            yield b""
++
++        async def aclose(self) -> None:
++            return None
++
++    class AbortingRunnerClient:
++        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
++            del kwargs
++            return httpx.Request(method, f"http://runner{url}")
++
++        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
++            del stream
++            return httpx.Response(
++                200,
++                headers={"content-disposition": 'attachment; filename="big.bin"'},
++                stream=AbortingStream(),
++                request=request,
++            )
++
++    set_runner_router(_FakeRunnerRouter(AbortingRunnerClient()))  # type: ignore[arg-type]
++    resp = await client.get(
++        _DOWNLOAD_URL,
++        headers={"Accept-Encoding": "gzip, deflate, br"},
++    )
++
++    assert resp.status_code == 502
++    assert resp.json() == {"detail": "runner download failed"}
++
++
++@pytest.mark.asyncio
++async def test_filesystem_download_runner_unavailable_is_typed(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++) -> None:
++    set_runner_client(None)
++    set_runner_router(None)
++
++    resp = await client.get(_DOWNLOAD_URL)
++
++    assert resp.status_code == 503
++    assert resp.json()["error"]["code"] == ErrorCode.RUNNER_UNAVAILABLE
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("error_type", [httpx.ConnectError, ConnectionError])
++async def test_filesystem_download_connect_error_is_typed_unavailable(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++    error_type: type[Exception],
++) -> None:
++    class OfflineRunnerClient:
++        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
++            del kwargs
++            return httpx.Request(method, f"http://runner{url}")
++
++        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
++            del stream
++            raise error_type("runner is offline")
++
++    set_runner_router(_FakeRunnerRouter(OfflineRunnerClient()))  # type: ignore[arg-type]
++    resp = await client.get(_DOWNLOAD_URL)
++
++    assert resp.status_code == 503
++    assert resp.json()["error"]["code"] == ErrorCode.RUNNER_UNAVAILABLE
++
++
++@pytest.mark.asyncio
++async def test_filesystem_download_cancelled_prefetch_shields_stream_cleanup(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++) -> None:
++    started = asyncio.Event()
++    cleaned = asyncio.Event()
++
++    class BlockingStream(httpx.AsyncByteStream):
++        async def __aiter__(self) -> AsyncIterator[bytes]:
++            started.set()
++            await asyncio.Event().wait()
++            yield b""
++
++        async def aclose(self) -> None:
++            await asyncio.sleep(0)
++            cleaned.set()
++
++    class BlockingRunnerClient:
++        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
++            del kwargs
++            return httpx.Request(method, f"http://runner{url}")
++
++        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
++            del stream
++            return httpx.Response(
++                200,
++                headers={"content-disposition": 'attachment; filename="big.bin"'},
++                stream=BlockingStream(),
++                request=request,
++            )
++
++    set_runner_router(_FakeRunnerRouter(BlockingRunnerClient()))  # type: ignore[arg-type]
++    cancelled: list[BaseException] = []
++
++    async def request_download() -> None:
++        try:
++            await client.get(_DOWNLOAD_URL)
++        except BaseException as exc:
++            cancelled.append(exc)
++
++    async with anyio.create_task_group() as task_group:
++        task_group.start_soon(request_download)
++        await started.wait()
++        task_group.cancel_scope.cancel()
++
++    assert cleaned.is_set()
++    assert len(cancelled) == 1
++    assert isinstance(cancelled[0], asyncio.CancelledError)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("close_path", ["empty_prefetch", "error_aread", "stream_exhaustion"])
++async def test_filesystem_download_cancellation_waits_for_automatic_stream_close(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++    close_path: str,
++) -> None:
++    close_started = asyncio.Event()
++    allow_close = asyncio.Event()
++    close_completed = asyncio.Event()
++
++    @app.middleware("http")
++    async def checkpoint_after_response(
++        request: Request,
++        call_next: Callable[..., Any],
++    ) -> Any:
++        response = await call_next(request)
++        await anyio.lowlevel.checkpoint()
++        return response
++
++    class ClosingStream(httpx.AsyncByteStream):
++        async def __aiter__(self) -> AsyncIterator[bytes]:
++            if close_path == "empty_prefetch":
++                return
++            if close_path == "error_aread":
++                yield b'{"error":{"code":"not_found","message":"missing"}}'
++            else:
++                yield b"complete attachment"
++
++        async def aclose(self) -> None:
++            close_started.set()
++            await allow_close.wait()
++            close_completed.set()
++
++    class ClosingRunnerClient:
++        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
++            del kwargs
++            return httpx.Request(method, f"http://runner{url}")
++
++        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
++            del stream
++            is_attachment = close_path != "error_aread"
++            return httpx.Response(
++                200 if is_attachment else 404,
++                headers=(
++                    {"content-disposition": 'attachment; filename="big.bin"'}
++                    if is_attachment
++                    else {"content-type": "application/json"}
++                ),
++                stream=ClosingStream(),
++                request=request,
++            )
++
++    set_runner_router(_FakeRunnerRouter(ClosingRunnerClient()))  # type: ignore[arg-type]
++    cancelled: list[BaseException] = []
++
++    async def request_download() -> None:
++        try:
++            await client.get(_DOWNLOAD_URL)
++        except BaseException as exc:
++            cancelled.append(exc)
++
++    async with anyio.create_task_group() as task_group:
++        task_group.start_soon(request_download)
++        await close_started.wait()
++        task_group.cancel_scope.cancel()
++        allow_close.set()
++
++    assert close_completed.is_set()
++    assert len(cancelled) == 1
++    assert isinstance(cancelled[0], asyncio.CancelledError)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("error_type", [httpx.ReadError, ConnectionError])
++async def test_filesystem_download_error_body_read_failure_is_502_and_closes_stream(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++    error_type: type[Exception],
++) -> None:
++    closed = asyncio.Event()
++
++    class FailingReadStream(httpx.AsyncByteStream):
++        async def __aiter__(self) -> AsyncIterator[bytes]:
++            raise error_type("runner error body read failed")
++            yield b""
++
++        async def aclose(self) -> None:
++            await asyncio.sleep(0)
++            closed.set()
++
++    class FailingRunnerClient:
++        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
++            del kwargs
++            return httpx.Request(method, f"http://runner{url}")
++
++        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
++            del stream
++            return httpx.Response(404, stream=FailingReadStream(), request=request)
++
++    set_runner_router(_FakeRunnerRouter(FailingRunnerClient()))  # type: ignore[arg-type]
++    resp = await client.get(_DOWNLOAD_URL)
++
++    assert resp.status_code == 502
++    assert resp.json() == {"detail": "runner download failed"}
++    assert closed.is_set()
++
++
++@pytest.mark.asyncio
++async def test_runner_stream_response_disconnect_shields_upstream_cleanup() -> None:
++    sent_chunk = asyncio.Event()
++    cleaned = asyncio.Event()
++
++    class UpstreamStream(httpx.AsyncByteStream):
++        async def __aiter__(self) -> AsyncIterator[bytes]:
++            yield b"first chunk"
++
++        async def aclose(self) -> None:
++            await asyncio.sleep(0)
++            cleaned.set()
++
++    upstream = httpx.Response(200, stream=_ShieldedCloseByteStream(UpstreamStream()))
++
++    async def content() -> AsyncIterator[bytes]:
++        yield b"first chunk"
++        await asyncio.Event().wait()
++
++    response = _RunnerStreamResponse(upstream, headers={}, content=content())
++    sent_messages: list[dict[str, Any]] = []
++    cancelled: list[BaseException] = []
++
++    async def receive() -> dict[str, Any]:
++        await sent_chunk.wait()
++        return {"type": "http.disconnect"}
++
++    async def send(message: dict[str, Any]) -> None:
++        sent_messages.append(message)
++        if message["type"] == "http.response.body" and message.get("body"):
++            sent_chunk.set()
++
++    async def run_response() -> None:
++        try:
++            await response(
++                {
++                    "type": "http",
++                    "asgi": {"version": "3.0"},
++                    "method": "GET",
++                    "path": "/",
++                },
++                receive,
++                send,
++            )
++        except BaseException as exc:
++            cancelled.append(exc)
++
++    async with anyio.create_task_group() as task_group:
++        task_group.start_soon(run_response)
++        await sent_chunk.wait()
++        task_group.cancel_scope.cancel()
++
++    assert any(message.get("body") == b"first chunk" for message in sent_messages)
++    assert cleaned.is_set()
++    assert len(cancelled) == 1
++    assert isinstance(cancelled[0], asyncio.CancelledError)
++
++
++@pytest.mark.asyncio
++async def test_filesystem_download_prefetch_failure_closes_runner_response(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++) -> None:
++    class FailingStream(httpx.AsyncByteStream):
++        def __init__(self) -> None:
++            self.closed = False
++
++        async def __aiter__(self) -> AsyncIterator[bytes]:
++            raise RuntimeError("runner stream failed unexpectedly")
++            yield b""
++
++        async def aclose(self) -> None:
++            self.closed = True
++
++    failing_stream = FailingStream()
++
++    class FailingRunnerClient:
++        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
++            del kwargs
++            return httpx.Request(method, f"http://runner{url}")
++
++        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
++            del stream
++            return httpx.Response(
++                200,
++                headers={"content-disposition": 'attachment; filename="big.bin"'},
++                stream=failing_stream,
++                request=request,
++            )
++
++    set_runner_router(_FakeRunnerRouter(FailingRunnerClient()))  # type: ignore[arg-type]
++    with pytest.raises(RuntimeError, match="runner stream failed unexpectedly"):
++        await client.get(_DOWNLOAD_URL)
++
++    assert failing_stream.closed
++
++
+ @pytest.mark.asyncio
+ async def test_filesystem_download_rejects_runner_without_download_support(
+     client: httpx.AsyncClient,
+@@ -9566,6 +9945,52 @@ def _fs_binary_read_payload(size: int = 256 * 1024) -> dict[str, object]:
+ _FS_BASE = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+ 
+ 
++@pytest.mark.asyncio
++async def test_skip_gzip_responder_forwards_start_before_bodies() -> None:
++    from starlette.types import Message, Receive, Scope, Send
++
++    from omnigent.server.routes._gzip_route import (
++        GZIP_COMPRESSLEVEL,
++        GZIP_MINIMUM_SIZE,
++        SKIP_GZIP_STATE_KEY,
++        _StateAwareGZipResponder,
++    )
++
++    start: Message = {
++        "type": "http.response.start",
++        "status": 200,
++        "headers": [(b"content-type", b"application/json")],
++    }
++    first_body: Message = {"type": "http.response.body", "body": b"first chunk", "more_body": True}
++    final_body: Message = {"type": "http.response.body", "body": b"last chunk", "more_body": False}
++    sent: list[Message] = []
++
++    async def app(scope: Scope, receive: Receive, send: Send) -> None:
++        del scope, receive
++        await send(start)
++        assert sent == [start]
++        await send(first_body)
++        await send(final_body)
++
++    async def receive() -> Message:
++        return {"type": "http.disconnect"}
++
++    async def send(message: Message) -> None:
++        sent.append(message)
++
++    responder = _StateAwareGZipResponder(
++        app,
++        GZIP_MINIMUM_SIZE,
++        GZIP_COMPRESSLEVEL,
++        {SKIP_GZIP_STATE_KEY: True},
++    )
++    await responder({"type": "http"}, receive, send)
++
++    assert sent == [start, first_body, final_body]
++    assert b"content-encoding" not in dict(sent[0]["headers"])
++    assert b"vary" not in dict(sent[0]["headers"])
++
++
+ @pytest.mark.asyncio
+ async def test_file_read_is_gzipped(client: httpx.AsyncClient) -> None:
+     """A text file read is compressed, and the body survives the round-trip.
+@@ -9622,6 +10047,28 @@ async def test_binary_file_read_is_not_gzipped(client: httpx.AsyncClient) -> Non
+     assert resp.json() == payload
+ 
+ 
++@pytest.mark.asyncio
++async def test_binary_file_read_with_http_middleware_skips_gzip(
++    app: FastAPI,
++    client: httpx.AsyncClient,
++) -> None:
++    payload = _fs_binary_read_payload()
++    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
++
++    @app.middleware("http")
++    async def pass_through(request: Request, call_next: Callable[..., Any]) -> Any:
++        return await call_next(request)
++
++    resp = await client.get(
++        f"{_FS_BASE}/filesystem/docs/logo.png",
++        headers={"Accept-Encoding": "gzip, deflate, br"},
++    )
++
++    assert resp.status_code == 200, resp.text
++    assert resp.json() == payload
++    assert "content-encoding" not in resp.headers
++
++
+ @pytest.mark.asyncio
+ async def test_deeply_nested_binary_read_is_not_gzipped(client: httpx.AsyncClient) -> None:
+     """A long ``path`` must not push the ``encoding`` field out of range.

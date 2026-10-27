@@ -1,0 +1,2164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 29 Sep 2026 14:24:02 +0000
+Subject: [PATCH] feat(sessions): choose the provider per session
+
+Carried on custom while the design is discussed on upstream issue #503;
+see docs/providers.md. Drop it once upstream has an equivalent.
+
+Accounts could be configured side by side on a host, but every session
+still ran on its family's default provider, so there was no way to put one
+claude-native session on Max #1, another on Max #2 and a third on
+Databricks.
+
+POST /v1/sessions now accepts provider_override, the name of a providers:
+entry on the session's host. It is stored with the other session
+overrides, returned on the session, carried on forks that keep model
+settings, and inherited by sub-agents that run in the same provider family
+on the same host.
+
+The server only checks the name's shape, that the session is bound to a
+host that supports the choice, and that the agent does not pin another
+credential in executor.auth. The host resolves the name when launching the
+runner: an unknown provider, one that cannot serve the session's harness,
+or a subscription account that is not logged in fails the launch with the
+command that signs it in. The runner gets OMNIGENT_SESSION_PROVIDER plus the
+account's login directory, and the chosen provider becomes the default for
+the families it serves inside that runner, so SDK and native harnesses and
+co-located sub-agents all resolve to it.
+
+The agent's env and the host's claude-native startup command apply after
+that, so a claude-native runner checks the terminal's final launch env and
+refuses to start Claude on a login directory other than the chosen
+account's, with a message the web UI shows.
+
+GET /v1/hosts/{host_id}/providers?harness=... lists the providers a host
+can run a harness on, with non-secret labels, the default, and whether a
+subscription account is logged in, for the new-session picker. A listing
+in flight fails as soon as its host disconnects.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (documented with its series in docs/providers.md)
+---
+ omnigent/entities/conversation.py             |   5 +
+ omnigent/harnesses/claude_native/bridge.py    |  18 ++
+ omnigent/harnesses/codex_native/app_server.py |   8 +-
+ omnigent/host/connect.py                      |  56 +++++-
+ omnigent/host/frames.py                       |  90 ++++++++++
+ omnigent/onboarding/provider_config.py        |  37 +++-
+ omnigent/onboarding/subscription_accounts.py  | 127 ++++++++++++++
+ omnigent/runner/native/orchestration.py       |  13 +-
+ omnigent/server/app.py                        |   6 +
+ omnigent/server/host_registry.py              |  12 ++
+ omnigent/server/routes/_sessions/helpers.py   |  94 +++++++++++
+ .../server/routes/_sessions/orchestration.py  |  35 ++++
+ omnigent/server/routes/host_providers.py      | 116 +++++++++++++
+ omnigent/server/routes/host_tunnel.py         |   6 +
+ omnigent/server/routes/hosts.py               |   1 +
+ .../server/routes/sessions/routes_core.py     |   1 +
+ omnigent/server/schemas.py                    |  11 ++
+ .../stores/conversation_store/__init__.py     |   2 +
+ .../stores/conversation_store/overrides.py    |   3 +
+ .../conversation_store/sqlalchemy_store.py    |   6 +
+ openapi.json                                  | 121 +++++++++++++
+ .../test_claude_native_bridge.py              |  19 +++
+ tests/host/test_frames.py                     |  47 ++++++
+ .../onboarding/test_subscription_accounts.py  | 159 +++++++++++++++++-
+ .../test_app_claude_native_launch_args.py     |  64 +++++++
+ .../integration/test_session_host_launch.py   |  79 ++++++++-
+ tests/server/routes/test_host_providers.py    | 142 ++++++++++++++++
+ .../routes/test_session_provider_override.py  |  90 ++++++++++
+ tests/server/test_host_registry.py            |  18 ++
+ 29 files changed, 1368 insertions(+), 18 deletions(-)
+ create mode 100644 omnigent/server/routes/host_providers.py
+ create mode 100644 tests/server/routes/test_host_providers.py
+ create mode 100644 tests/server/routes/test_session_provider_override.py
+
+diff --git a/omnigent/entities/conversation.py b/omnigent/entities/conversation.py
+index 068eb4506d2d8886c8e3f6cd3e99b05059f20cc4..994d401427573199c0211835bffb73b17612429e 100644
+--- a/omnigent/entities/conversation.py
++++ b/omnigent/entities/conversation.py
+@@ -144,6 +144,10 @@ class Conversation:
+         Mutable via ``PATCH /v1/sessions/{id}`` at any time; read per
+         spawn by the route-subagent relay, so a change takes effect on
+         the next spawn.
++    :param provider_override: Name of the host ``providers:`` entry the
++        session runs on, e.g. ``"claude-max2"``. ``None`` uses the family
++        default. Set at session creation and immutable; the host resolves
++        it when launching the session's runner.
+     :param harness_override: Per-session harness override for the
+         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
+         ``None`` means use the harness declared in the agent spec
+@@ -253,6 +257,7 @@ class Conversation:
+     cost_control_mode_override: str | None = None
+     subagent_routing_override: str | None = None
+     harness_override: str | None = None
++    provider_override: str | None = None
+     share_workspace_files: bool = False
+     sub_agent_name: str | None = None
+     task_summary: str | None = None
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 3169062b3269b64cc1ba45cd465bbf846f9cf74d..e0f7b7344670ae09b5b158f00632b4fc5d3aa9d7 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -1888,6 +1888,24 @@ def claude_global_config_path(
+     return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
+ 
+ 
++def claude_launch_config_dir(cwd: Path, env: Mapping[str, str]) -> Path:
++    """
++    Return the config dir, and so the login, Claude uses for a launch.
++
++    ``$CLAUDE_CONFIG_DIR``, else ``$HOME/.claude``, joined the way
++    :func:`claude_global_config_path` joins it; an empty value is Claude's
++    working directory.
++
++    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
++    :param env: Claude's launch environment, e.g. ``{"CLAUDE_CONFIG_DIR": "/srv/claude"}``.
++    :returns: The directory, e.g. ``Path("/srv/claude")``.
++    """
++    config_dir = env.get("CLAUDE_CONFIG_DIR")
++    if config_dir is None:
++        config_dir = os.path.join(env.get("HOME") or str(_account_home_dir()), ".claude")
++    return _claude_joined_path(cwd, config_dir, "")
++
++
+ def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
+     """
+     Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
+diff --git a/omnigent/harnesses/codex_native/app_server.py b/omnigent/harnesses/codex_native/app_server.py
+index 59cd2134dafc2a4404d81baa8498f370f1c4b577..c9aafa2fc1fc837e7400a7b5beef6c2a4ee38e89 100644
+--- a/omnigent/harnesses/codex_native/app_server.py
++++ b/omnigent/harnesses/codex_native/app_server.py
+@@ -4097,9 +4097,11 @@ def _resolve_subscription_launch(
+             profile=None,
+             summary=f"Codex CLI login (subscription provider {entry.name!r}; Codex is logged in)",
+         )
+-    # An account with its own login dir never falls through to another
+-    # credential: the user must sign that account in.
+-    explicit_account = entry.config_dir is not None
++    from omnigent.onboarding.provider_config import session_provider_name
++
++    # A named account (own login dir, or chosen for this session) never falls
++    # through to another credential: the user must sign that account in.
++    explicit_account = entry.config_dir is not None or entry.name == session_provider_name()
+     fallback = (
+         None
+         if explicit_account
+diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
+index 5eff22acab77e08a50a59acaca9c6e613712bbf0..afc66888b658096c5d34ecba8a30434849ae965c 100644
+--- a/omnigent/host/connect.py
++++ b/omnigent/host/connect.py
+@@ -54,6 +54,7 @@ from omnigent.errors import (
+     ErrorCategory,
+     ErrorImpact,
+     ErrorPhase,
++    OmnigentError,
+     category_for_code,
+     phase_for_code,
+ )
+@@ -104,6 +105,8 @@ from omnigent.host.frames import (
+     HostModelOptionsResultFrame,
+     HostPluginsFrame,
+     HostPluginsResultFrame,
++    HostProvidersFrame,
++    HostProvidersResultFrame,
+     HostRefreshHarnessesFrame,
+     HostRefreshHarnessesResultFrame,
+     HostRemoveWorktreeFrame,
+@@ -863,6 +866,25 @@ class HostConnectError(Exception):
+     """
+ 
+ 
++def _runner_account_env(frame: HostLaunchRunnerFrame) -> dict[str, str]:
++    """Return the provider env for a runner launched without a saved inference config.
++
++    :param frame: The launch request.
++    :returns: The session provider and login-dir env vars.
++    :raises OmnigentError: When the chosen provider cannot run here.
++    """
++    from omnigent.onboarding.provider_config import load_config
++    from omnigent.onboarding.subscription_accounts import (
++        default_accounts_env,
++        session_runner_env,
++    )
++
++    config = load_config()
++    if frame.provider is None:
++        return default_accounts_env(config)
++    return session_runner_env(config, frame.provider, frame.harness)
++
++
+ def _build_runner_env(
+     base_env: Mapping[str, str],
+     *,
+@@ -2001,12 +2023,16 @@ class HostProcess:
+                 )
+             env["OMNIGENT_INFERENCE_CONFIG"] = str(inference_path)
+         else:
+-            from omnigent.onboarding.provider_config import load_config
+-            from omnigent.onboarding.subscription_accounts import default_accounts_env
+-
+-            # Subscription accounts with their own login dir: the runner's CLIs
+-            # and Claude/Codex file reads follow CLAUDE_CONFIG_DIR / CODEX_HOME.
+-            env.update(await asyncio.to_thread(lambda: default_accounts_env(load_config())))
++            # The session's provider and subscription login dirs: the runner's
++            # CLIs and Claude/Codex file reads follow CLAUDE_CONFIG_DIR / CODEX_HOME.
++            try:
++                env.update(await asyncio.to_thread(_runner_account_env, frame))
++            except OmnigentError as exc:
++                # Same category as a missing harness: the session cannot run here
++                # until the user configures or signs in to the chosen provider.
++                return self._launch_failed(
++                    frame, str(exc), error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE
++                )
+         # The runner serves one primary session (plus any co-located subagents);
+         # pass it so runner-level log records can be attributed to that session.
+         if frame.session_id:
+@@ -3455,6 +3481,21 @@ class HostProcess:
+             )
+         return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
+ 
++    def _handle_providers(self, frame: HostProvidersFrame) -> HostProvidersResultFrame:
++        """List the providers a harness can run on, in a worker thread."""
++        from omnigent.onboarding.provider_config import load_config
++        from omnigent.onboarding.subscription_accounts import provider_choices
++
++        try:
++            providers = provider_choices(load_config(), frame.harness)
++        except OmnigentError as exc:
++            return HostProvidersResultFrame(
++                request_id=frame.request_id, status="failed", error=str(exc)
++            )
++        return HostProvidersResultFrame(
++            request_id=frame.request_id, status="ok", providers=providers
++        )
++
+     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
+         """Read the bound session bundle using this host's existing credentials."""
+         from urllib.parse import quote
+@@ -5258,6 +5299,9 @@ class HostProcess:
+         elif isinstance(frame, HostMcpServersFrame):
+             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
+             await self._send_text(ws, encode_host_frame(mcp_result))
++        elif isinstance(frame, HostProvidersFrame):
++            providers_result = await asyncio.to_thread(self._handle_providers, frame)
++            await self._send_text(ws, encode_host_frame(providers_result))
+         elif isinstance(frame, HostModelOptionsFrame):
+             # Every dispatched frame already runs on its own task (see
+             # _start_frame_task), so a cold harness probe here cannot stall
+diff --git a/omnigent/host/frames.py b/omnigent/host/frames.py
+index cc5ca63c6d766b4a992b121a801624276c8efc85..f113a5bd0f92e05348a5ae330edd3d70323d831b 100644
+--- a/omnigent/host/frames.py
++++ b/omnigent/host/frames.py
+@@ -74,6 +74,8 @@ CAP_SKILL_CONTENT = "skill_content"
+ CAP_MCP_TOOLS = "mcp_tools"
+ CAP_REFRESH_HARNESSES = "refresh_harnesses"
+ CAP_MCP_REGISTRY = "mcp_registry"
++# The host honors a launch frame's ``provider`` and answers ``host.providers``:
++CAP_SESSION_PROVIDER = "session_provider"
+ 
+ # Every capability THIS build supports; reported verbatim in the hello frame.
+ HOST_CAPABILITIES: list[str] = [
+@@ -86,6 +88,7 @@ HOST_CAPABILITIES: list[str] = [
+     CAP_MCP_REGISTRY,
+     CAP_MCP_INVENTORY,
+     CAP_HARNESS_STARTUP,
++    CAP_SESSION_PROVIDER,
+     CAP_REFRESH_HARNESSES,
+ ]
+ 
+@@ -184,6 +187,8 @@ class HostFrameKind(str, Enum):
+     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
+     MCP_SERVERS = "host.mcp_servers"
+     MCP_SERVERS_RESULT = "host.mcp_servers_result"
++    PROVIDERS = "host.providers"
++    PROVIDERS_RESULT = "host.providers_result"
+     IMPORT_LOCAL = "host.import_local"
+     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
+     IMPORT_LOCAL_SESSION = "host.import_local_session"
+@@ -302,6 +307,8 @@ class HostLaunchRunnerFrame:
+         falls back to stopping every runner launched for ``session_id``; an
+         empty tuple stops none, e.g. after /clear moved the old runner to
+         another session.
++    :param provider: The session's chosen ``providers:`` entry on this host,
++        e.g. ``"claude-max2"``; ``None`` uses the family defaults.
+     """
+ 
+     request_id: str
+@@ -311,6 +318,7 @@ class HostLaunchRunnerFrame:
+     harness: str | None = None
+     inference_config: dict[str, Any] | None = None
+     superseded_runner_ids: tuple[str, ...] | None = None
++    provider: str | None = None
+ 
+ 
+ @dataclass
+@@ -1195,6 +1203,29 @@ class HostMcpToolsResultFrame:
+     error: str | None = None
+ 
+ 
++@dataclass
++class HostProvidersFrame:
++    """Server → host: list the providers a harness can run on."""
++
++    request_id: str
++    harness: str
++
++
++@dataclass
++class HostProvidersResultFrame:
++    """Host → server: provider choices for a harness, never credentials.
++
++    :param providers: One row per provider, e.g. ``{"name": "claude-max2",
++        "kind": "subscription", "label": "claude CLI login (~/.claude-max2)",
++        "default": False, "ready": True}``.
++    """
++
++    request_id: str
++    status: str
++    providers: list[dict[str, str | bool]] = field(default_factory=list)
++    error: str | None = None
++
++
+ @dataclass
+ class HostImportedLocalSession:
+     """One local transcript the host read, normalized for import.
+@@ -1367,6 +1398,8 @@ HostFrame = (
+     | HostHarnessStartupResultFrame
+     | HostMcpServersFrame
+     | HostMcpServersResultFrame
++    | HostProvidersFrame
++    | HostProvidersResultFrame
+     | HostImportLocalFrame
+     | HostImportLocalByIdFrame
+     | HostImportLocalSessionFrame
+@@ -1454,6 +1487,7 @@ def encode_host_frame(frame: HostFrame) -> str:
+             "session_id": frame.session_id,
+             "harness": frame.harness,
+             "inference_config": frame.inference_config,
++            "provider": frame.provider,
+         }
+         if frame.superseded_runner_ids is not None:
+             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
+@@ -1886,6 +1920,24 @@ def encode_host_frame(frame: HostFrame) -> str:
+                 "error": frame.error,
+             }
+         )
++    if isinstance(frame, HostProvidersFrame):
++        return _encode_payload(
++            {
++                "kind": HostFrameKind.PROVIDERS.value,
++                "request_id": frame.request_id,
++                "harness": frame.harness,
++            }
++        )
++    if isinstance(frame, HostProvidersResultFrame):
++        return _encode_payload(
++            {
++                "kind": HostFrameKind.PROVIDERS_RESULT.value,
++                "request_id": frame.request_id,
++                "status": frame.status,
++                "providers": frame.providers,
++                "error": frame.error,
++            }
++        )
+     if isinstance(frame, HostImportLocalFrame):
+         return _encode_payload(
+             {
+@@ -2301,6 +2353,13 @@ def _decode_known_host_frame(
+             )
+         case HostFrameKind.MCP_TOOLS_RESULT:
+             return _decode_mcp_tools_result(msg)
++        case HostFrameKind.PROVIDERS:
++            return HostProvidersFrame(
++                request_id=_required_str(msg, "request_id"),
++                harness=_required_str(msg, "harness"),
++            )
++        case HostFrameKind.PROVIDERS_RESULT:
++            return _decode_providers_result(msg)
+         case HostFrameKind.IMPORT_LOCAL:
+             return _decode_import_local(msg)
+         case HostFrameKind.IMPORT_LOCAL_BY_ID:
+@@ -2379,6 +2438,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
+             if "superseded_runner_ids" in msg
+             else None
+         ),
++        provider=_optional_nullable_str(msg, "provider"),
+     )
+ 
+ 
+@@ -3018,6 +3078,36 @@ def _decode_plugins_result(msg: _JsonObject) -> HostPluginsResultFrame:
+     )
+ 
+ 
++_PROVIDER_STR_FIELDS = ("name", "kind", "label")
++_PROVIDER_BOOL_FIELDS = ("default", "ready")
++
++
++def _decode_providers_result(msg: _JsonObject) -> HostProvidersResultFrame:
++    """Decode provider choices, keeping only the allow-listed fields."""
++    raw = msg.get("providers", [])
++    if not isinstance(raw, list):
++        raise ValueError("frame field must be a list of providers: 'providers'")
++    providers: list[dict[str, str | bool]] = []
++    for item in raw:
++        if not isinstance(item, dict):
++            raise ValueError("frame field must be a list of providers: 'providers'")
++        row: dict[str, str | bool] = {
++            key: _required_str(item, key) for key in _PROVIDER_STR_FIELDS
++        }
++        for key in _PROVIDER_BOOL_FIELDS:
++            value = item.get(key)
++            if not isinstance(value, bool):
++                raise ValueError(f"provider field must be a boolean: {key!r}")
++            row[key] = value
++        providers.append(row)
++    return HostProvidersResultFrame(
++        request_id=_required_str(msg, "request_id"),
++        status=_required_str(msg, "status"),
++        providers=providers,
++        error=_optional_nullable_str(msg, "error"),
++    )
++
++
+ def _decode_skill_content_result(msg: _JsonObject) -> HostSkillContentResultFrame:
+     request_id = _required_str(msg, "request_id")
+     try:
+diff --git a/omnigent/onboarding/provider_config.py b/omnigent/onboarding/provider_config.py
+index f2b23ff6d46876d11ed758820943aee4c4ecf459..3f8c7bbb2964ab64bc610d1518a7842c4d764c04 100644
+--- a/omnigent/onboarding/provider_config.py
++++ b/omnigent/onboarding/provider_config.py
+@@ -125,6 +125,10 @@ DATABRICKS_KIND: Literal["databricks"] = "databricks"
+ CLI_CONFIG_KIND = "cli-config"
+ BEDROCK_KIND = "bedrock"
+ 
++# Set by the host on a runner whose session chose a provider: that entry
++# becomes the default for every family it serves inside the runner.
++SESSION_PROVIDER_ENV = "OMNIGENT_SESSION_PROVIDER"
++
+ # The env var each subscription CLI reads its login directory from. A
+ # ``subscription`` entry's ``config_dir`` is exported under this name so
+ # several accounts of the same CLI can coexist on one host.
+@@ -1339,12 +1343,40 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
+     return frozenset()
+ 
+ 
++def session_provider_name() -> str | None:
++    """Return the provider this runner's session chose, if any."""
++    return os.environ.get(SESSION_PROVIDER_ENV) or None
++
++
++def session_provider(config: dict[str, object]) -> ProviderEntry | None:
++    """Return the entry this runner's session chose, if any.
++
++    :param config: The parsed config mapping (``providers:`` block).
++    :returns: The chosen :class:`ProviderEntry`, or ``None`` when the session
++        chose none.
++    :raises OmnigentError: If the chosen provider is not configured.
++    """
++    name = session_provider_name()
++    if name is None:
++        return None
++    entry = load_providers(config).get(name)
++    if entry is None:
++        raise OmnigentError(
++            f"This session runs on provider {name!r}, which is no longer configured "
++            "under 'providers:' in ~/.omnigent/config.yaml on this host.",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    return entry
++
++
+ def get_default_provider(config: dict[str, object], family: str) -> ProviderEntry | None:
+     """Return the ``default: true`` provider serving *family*, if any.
+ 
+     Defaults are per-family: a Claude (``anthropic``) default and a Codex
+     (``openai``) default coexist independently. At most one default may
+-    serve a given family.
++    serve a given family. Inside a runner whose session chose a provider
++    (:data:`SESSION_PROVIDER_ENV`), that provider wins for the families it
++    serves.
+ 
+     :param config: The parsed config mapping (``providers:`` block).
+     :param family: The scope to resolve a default for, ``"anthropic"``,
+@@ -1354,6 +1386,9 @@ def get_default_provider(config: dict[str, object], family: str) -> ProviderEntr
+     :raises OmnigentError: If any provider is malformed, or more than one
+         ``default: true`` provider serves *family*.
+     """
++    session = session_provider(config)
++    if session is not None and family in provider_families(session):
++        return session
+     candidates = [
+         entry for entry in load_providers(config).values() if family in entry.default_families
+     ]
+diff --git a/omnigent/onboarding/subscription_accounts.py b/omnigent/onboarding/subscription_accounts.py
+index 4c73e577e24fb04662217fcb5140ef0da2ee3a53..9c15f3ea556f6772cb8eda8f173e5eef1d288e43 100644
+--- a/omnigent/onboarding/subscription_accounts.py
++++ b/omnigent/onboarding/subscription_accounts.py
+@@ -15,17 +15,27 @@ import shlex
+ import sys
+ from collections.abc import Mapping, MutableMapping
+ from pathlib import Path
++from urllib.parse import urlparse
+ 
+ from omnigent.errors import ErrorCode, OmnigentError
+ from omnigent.onboarding.provider_config import (
+     ANTHROPIC_FAMILY,
++    BEDROCK_KIND,
++    CLI_CONFIG_KIND,
++    DATABRICKS_KIND,
+     OPENAI_FAMILY,
++    SESSION_PROVIDER_ENV,
+     SUBSCRIPTION_CONFIG_DIR_ENV,
+     SUBSCRIPTION_KIND,
+     ProviderEntry,
+     default_provider_for_harness,
++    harness_family,
+     load_config,
++    load_providers,
++    provider_families,
++    session_provider,
+     subscription_config_dir,
++    subscription_source_descriptor,
+ )
+ 
+ _logger = logging.getLogger(__name__)
+@@ -155,6 +165,74 @@ def require_subscription_dir_active(entry: ProviderEntry, active_dir: Path) -> N
+     )
+ 
+ 
++def require_session_account_dir(cli: str, launch_dir: Path) -> None:
++    """Fail when the session's *cli* account is not the login its CLI starts with.
++
++    The host points the runner at the account the session chose, but an agent
++    spec's ``env`` or the host's harness startup command can still move the
++    CLI to another login directory.
++
++    :param cli: The subscription CLI, e.g. ``"claude"``.
++    :param launch_dir: The login directory the CLI process would use, e.g.
++        ``Path("/srv/claude")``.
++    :raises OmnigentError: ``harness_not_configured`` when the session chose a
++        *cli* subscription account whose login directory differs.
++    """
++    entry = session_provider(load_config())
++    if entry is None or entry.kind != SUBSCRIPTION_KIND or entry.cli != cli:
++        return
++    expected = subscription_login_dir(entry)
++    if os.path.realpath(expected) == os.path.realpath(launch_dir):
++        return
++    raise OmnigentError(
++        f"This session runs on account {entry.name!r} ({expected}), but its {cli} "
++        f"terminal would start with the login in {launch_dir}: the agent's env or this "
++        f"host's {cli} startup command changes {SUBSCRIPTION_CONFIG_DIR_ENV[cli]} or HOME. "
++        "Remove that setting, or start the session on the account that uses that directory.",
++        code=ErrorCode.HARNESS_NOT_CONFIGURED,
++    )
++
++
++def session_runner_env(
++    config: dict[str, object], provider: str, harness: str | None
++) -> dict[str, str]:
++    """Return the runner env for a session that chose *provider*.
++
++    Validates the choice on this host and fails loudly rather than letting
++    the session run on another credential.
++
++    :param config: The parsed ``~/.omnigent/config.yaml`` mapping.
++    :param provider: The chosen ``providers:`` entry name, e.g. ``"claude-max2"``.
++    :param harness: The session's canonical harness, or ``None`` when unknown.
++    :returns: :data:`SESSION_PROVIDER_ENV` plus the login-dir env, the chosen
++        provider's directory winning for the family it serves.
++    :raises OmnigentError: When the provider is not configured here, cannot
++        serve the harness, or is a subscription that is not logged in.
++    """
++    entry = load_providers(config).get(provider)
++    if entry is None:
++        raise OmnigentError(
++            f"Provider {provider!r} is not configured on this host. Add it under "
++            "'providers:' in ~/.omnigent/config.yaml.",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    family = harness_family(harness) if harness else None
++    if family is not None and family not in provider_families(entry):
++        raise OmnigentError(
++            f"Provider {provider!r} cannot run the {harness!r} harness.",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    require_subscription_login(entry)
++    env = default_accounts_env(config)
++    for cli, cli_harness in _CLI_HARNESS.items():
++        if entry.cli == cli or harness_family(cli_harness) in provider_families(entry):
++            # The chosen provider owns this CLI's family: drop the default's dir.
++            env.pop(SUBSCRIPTION_CONFIG_DIR_ENV[cli], None)
++    env.update(subscription_home_env(entry))
++    env[SESSION_PROVIDER_ENV] = provider
++    return env
++
++
+ def default_accounts_env(config: dict[str, object]) -> dict[str, str]:
+     """Return the login-dir env for each CLI whose default provider pins one.
+ 
+@@ -192,3 +270,52 @@ def apply_default_account_env(harness: str, env: MutableMapping[str, str] | None
+         return
+     if entry is not None:
+         target.update(subscription_home_env(entry))
++
++
++def _provider_label(entry: ProviderEntry, family: str) -> str:
++    """Describe *entry* for a picker without resolving or revealing credentials."""
++    if entry.kind == SUBSCRIPTION_KIND:
++        return subscription_source_descriptor(entry)
++    if entry.kind == DATABRICKS_KIND:
++        return f"Databricks profile {entry.profile}" if entry.profile else "Databricks"
++    if entry.kind == CLI_CONFIG_KIND:
++        return entry.display_name or f"{entry.cli} provider {entry.model_provider}"
++    if entry.kind == BEDROCK_KIND:
++        return "AWS Bedrock"
++    raw = entry.families.get(family)
++    host = urlparse(raw.base_url).netloc if raw is not None else ""
++    return f"{entry.kind} · {host}" if host else entry.kind
++
++
++def provider_choices(config: dict[str, object], harness: str) -> list[dict[str, str | bool]]:
++    """List the configured providers a session of *harness* could run on.
++
++    :param config: The parsed ``~/.omnigent/config.yaml`` mapping.
++    :param harness: A canonical harness, e.g. ``"claude-native"``.
++    :returns: Rows of ``name`` / ``kind`` / ``label`` / ``default`` / ``ready``;
++        ``ready`` is ``False`` for a subscription account that is not logged in.
++        Empty for a harness with no provider family.
++    :raises OmnigentError: If the provider config is malformed.
++    """
++    family = harness_family(harness)
++    if family is None:
++        return []
++    default = default_provider_for_harness(config, harness)
++    rows: list[dict[str, str | bool]] = []
++    for entry in load_providers(config).values():
++        if family not in provider_families(entry):
++            continue
++        if entry.kind == BEDROCK_KIND and harness != "claude-native":
++            continue
++        rows.append(
++            {
++                "name": entry.name,
++                "kind": entry.kind,
++                "label": _provider_label(entry, family),
++                "default": default is not None and default.name == entry.name,
++                "ready": entry.cli not in _CLI_FAMILY
++                or entry.kind != SUBSCRIPTION_KIND
++                or subscription_logged_in(entry),
++            }
++        )
++    return rows
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 8aebea8975dcbb865b42bfe6b1b7f3aefb52c58a..6732a943553a95075d712ce475ea3732467f9e61 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -8687,12 +8687,14 @@ async def _auto_create_claude_terminal(
+     from omnigent.harnesses.claude_native.bridge import (
+         BRIDGE_ID_LABEL_KEY,
+         augment_claude_args,
++        claude_launch_config_dir,
+         ensure_claude_workspace_trusted,
+         prepare_bridge_dir,
+         validate_claude_hook_interpreter_compatibility,
+     )
+     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
+     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
++    from omnigent.onboarding.subscription_accounts import require_session_account_dir
+ 
+     workspace = str(
+         _claude_session_workspace(
+@@ -9413,12 +9415,13 @@ async def _auto_create_claude_terminal(
+         # the watcher reports the exit deterministically via `#{pane_dead}`.
+         keep_alive_after_exit=True,
+     )
+-    # Seed trust and onboarding in the config selected by the terminal's launch environment.
++    # Seed trust and onboarding in the config selected by the terminal's launch
++    # environment, once that environment is known to log in to the session's account.
+     try:
+-        ensure_claude_workspace_trusted(
+-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
+-            env=_claude_terminal_launch_env(env_spec),
+-        )
++        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
++        launch_env = _claude_terminal_launch_env(env_spec)
++        require_session_account_dir("claude", claude_launch_config_dir(launch_cwd, launch_env))
++        ensure_claude_workspace_trusted(launch_cwd, env=launch_env)
+     except BaseException as seed_error:
+         # No forwarder owns the routers yet, so release the ones this launch started.
+         # A ``None`` handle would shut down whichever router is registered now.
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index db712d36df92fffd404dbd0e8681ebad5340a4a4..c64fccea70b6f9168f67d6843f988c52ea2ff27b 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -4529,6 +4529,7 @@ def create_app(
+     # not enabled (host connects get 404), rather than silently broken.
+     if host_store is not None:
+         from omnigent.server.routes.harness_startup import create_harness_startup_router
++        from omnigent.server.routes.host_providers import create_host_providers_router
+         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
+         from omnigent.server.routes.hosts import create_hosts_router
+         from omnigent.server.routes.mcp_servers import create_mcp_servers_router
+@@ -4608,6 +4609,11 @@ def create_app(
+             prefix="/v1",
+             tags=["hosts"],
+         )
++        app.include_router(
++            create_host_providers_router(host_registry, host_store, auth_provider=auth_provider),
++            prefix="/v1",
++            tags=["hosts"],
++        )
+         # Host-facing credential vending: a sandbox fetches its owner's
+         # per-provider credential over the launch-token-authenticated channel
+         # instead of having it injected. One generic route serves every provider
+diff --git a/omnigent/server/host_registry.py b/omnigent/server/host_registry.py
+index a815523cf40fa3f429c81e8fb80a2a45b3def65c..fb4b57def570732fc8e90d6ca034dd8ec182f617 100644
+--- a/omnigent/server/host_registry.py
++++ b/omnigent/server/host_registry.py
+@@ -44,6 +44,7 @@ from omnigent.host.frames import (
+     HostMcpServersResultFrame,
+     HostMcpToolsResultFrame,
+     HostPluginsResultFrame,
++    HostProvidersResultFrame,
+     HostSkillContentResultFrame,
+     HostSkillsResultFrame,
+ )
+@@ -186,6 +187,11 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
+     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+ 
+ 
++def _fail_pending_providers(conn: HostConnection) -> None:
++    """Fail provider listings as soon as their host disappears."""
++    _fail_pending_inventory(conn.pending_providers, conn.host_id)
++
++
+ # How long a runner exit report stays answerable, and how many are kept.
+ # Reports only matter while a client is still waiting for the runner to
+ # come online (a 60s window today); 10 minutes covers slow retries with
+@@ -412,6 +418,7 @@ class HostConnection:
+     :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
+     :param pending_skill_content: Per-request futures for transient SKILL.md reads.
+     :param pending_mcp_tools: Per-request futures for lazy MCP discovery.
++    :param pending_providers: Per-``request_id`` futures for provider listings.
+     """
+ 
+     workspace_id: int
+@@ -501,6 +508,9 @@ class HostConnection:
+     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
+         default_factory=dict,
+     )
++    pending_providers: dict[str, asyncio.Future[HostProvidersResultFrame]] = field(
++        default_factory=dict,
++    )
+     # Import streams one session per frame, so the tunnel pushes each onto a
+     # per-request queue the /imports/local handler drains (vs a single future).
+     # Each item is a ("session", dict) or ("done", dict) tuple.
+@@ -616,6 +626,7 @@ class HostRegistry:
+                 _fail_pending_mcp_tools(old)
+                 _fail_pending_skills(old)
+                 _fail_pending_mcp_servers(old)
++                _fail_pending_providers(old)
+             self._hosts[key] = conn
+             if hello.interactive_shells is not None:
+                 self._interactive_shells[host_id] = normalize_interactive_shells(
+@@ -665,6 +676,7 @@ class HostRegistry:
+         _fail_pending_mcp_tools(removed)
+         _fail_pending_skills(removed)
+         _fail_pending_mcp_servers(removed)
++        _fail_pending_providers(removed)
+         return True
+ 
+     def mark_frame_seen(self, conn: HostConnection) -> bool:
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index edacb09396ad8b216e59d87a5030e9c2a1de33f8..64755517c245ac2e5f4d0bb2d9dfc574ee3aaea4 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -2072,6 +2072,97 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
+     return value if namespaced_acp else canonical
+ 
+ 
++# A ``providers:`` key: the server only checks its shape; the host owns the list.
++_PROVIDER_OVERRIDE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
++
++
++def _validated_provider_override(
++    value: str | None,
++    agent: Agent,
++    *,
++    host_id: str | None,
++    host_type: str,
++    sub_agent_name: str | None = None,
++) -> str | None:
++    """
++    Validate a session-create ``provider_override``.
++
++    The name is resolved against the host's ``providers:`` when the host
++    launches the runner, so here it only needs a sane shape, a host to resolve
++    on, and an agent that does not already pin its own credential.
++
++    :param value: The requested provider name, e.g. ``"claude-max2"``.
++    :param agent: The bound agent row.
++    :param host_id: The session's host, or ``None``.
++    :param host_type: ``"external"`` or ``"managed"``.
++    :param sub_agent_name: The sub-agent whose spec runs, if any.
++    :returns: *value*, or ``None`` when unset.
++    :raises OmnigentError: ``invalid_input`` when the name is malformed, the
++        session is not bound to an external host, or the spec pins another
++        credential through ``executor.auth``.
++    """
++    if value is None:
++        return None
++    if not _PROVIDER_OVERRIDE_RE.fullmatch(value):
++        raise OmnigentError(
++            f"invalid provider_override {value!r}: expected a providers: entry name",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    if host_id is None or host_type != "external":
++        raise OmnigentError(
++            "provider_override selects one of a host's providers and requires a "
++            "session bound to a connected host",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    from omnigent.runtime import get_agent_cache
++    from omnigent.runtime.workflow import _find_spec_by_name
++    from omnigent.spec.types import ProviderAuth
++
++    try:
++        spec = (
++            get_agent_cache()
++            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
++            .spec
++        )
++    except (KeyError, AttributeError, ValueError, ImportError, OSError):
++        return value
++    if sub_agent_name:
++        spec = _find_spec_by_name(spec, sub_agent_name) or spec
++    auth = spec.executor.auth
++    if auth is not None and not (isinstance(auth, ProviderAuth) and auth.name == value):
++        raise OmnigentError(
++            f"agent {agent.name!r} pins its credential in executor.auth, so its "
++            "provider cannot be chosen per session",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    return value
++
++
++def _inherited_provider_override(
++    parent: Conversation | None, *, child_harness: str | None, child_host_id: str | None
++) -> str | None:
++    """
++    Return the parent's provider for a sub-agent that runs in the same family.
++
++    :param parent: The parent session, or ``None``.
++    :param child_harness: The child's canonical harness, e.g. ``"claude-native"``.
++    :param child_host_id: The child's host; ``None`` co-locates on the parent's runner.
++    :returns: The parent's ``provider_override`` when the child runs on the same
++        host and in the same provider family, else ``None``.
++    """
++    if parent is None or parent.provider_override is None:
++        return None
++    if child_host_id is not None and child_host_id != parent.host_id:
++        return None
++    from omnigent.onboarding.provider_config import provider_family_for_harness
++
++    child_family = provider_family_for_harness(child_harness)
++    parent_family = provider_family_for_harness(_resolve_harness(parent))
++    if child_family is None or child_family != parent_family:
++        return None
++    return parent.provider_override
++
++
+ def _validated_harness_override_executor_type(agent: Agent) -> None:
+     """Validate that *agent* is an ``executor.type: omnigent`` spec.
+ 
+@@ -6275,6 +6366,7 @@ async def _launch_runner_on_host_locked(
+                 # Only the binding we just replaced: an unbound session's old
+                 # runner may now serve its /clear or /switch successor.
+                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
++                provider=conv.provider_override,
+             )
+         )
+         try:
+@@ -12143,6 +12235,7 @@ __all__ = [
+     "_handle_mcp_tools_list",
+     "_host_model_options_via_registry",
+     "_if_none_match_matches",
++    "_inherited_provider_override",
+     "_invalidate_runner_backed_snapshot_state",
+     "_is_claude_native_subagent",
+     "_is_codex_native_subagent",
+@@ -12288,6 +12381,7 @@ __all__ = [
+     "_validated_cost_control_mode_override",
+     "_validated_harness_override",
+     "_validated_harness_override_executor_type",
++    "_validated_provider_override",
+     "_validated_spec_smart_routing_harness",
+     "_validated_subagent_routing_override",
+     "_wait_for_managed_runner_tunnel",
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 0ee57e0d1da204efb5480ff1b77f15ab42b38f6c..0b097cd642771bf2030bba891b220f0d5caa927b 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -280,6 +280,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _get_runner_client,
+     _handle_advise_models_mcp,
+     _HostRunnerStopAttempt,
++    _inherited_provider_override,
+     _invalidate_runner_backed_snapshot_state,
+     _is_codex_native_subagent,
+     _is_kiro_native_session,
+@@ -358,6 +359,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _validated_cost_control_mode_override,
+     _validated_harness_override,
+     _validated_harness_override_executor_type,
++    _validated_provider_override,
+     _validated_spec_smart_routing_harness,
+     _validated_subagent_routing_override,
+     _wait_for_managed_runner_tunnel,
+@@ -1500,6 +1502,7 @@ def _build_session_response(
+         llm_model=llm_model,
+         harness=harness,
+         model_override=conv.model_override,
++        provider_override=conv.provider_override,
+         cost_control_mode_override=conv.cost_control_mode_override,
+         subagent_routing_override=conv.subagent_routing_override,
+         share_workspace_files=conv.share_workspace_files,
+@@ -11471,6 +11474,36 @@ async def _create_session_from_existing_agent(
+             _validated_harness_override, body.harness_override, agent
+         )
+ 
++    provider_override = await asyncio.to_thread(
++        lambda: _validated_provider_override(
++            body.provider_override,
++            agent,
++            host_id=body.host_id,
++            host_type=body.host_type,
++            sub_agent_name=body.sub_agent_name,
++        )
++    )
++    if body.provider_override is not None:
++        from omnigent.host.frames import CAP_SESSION_PROVIDER
++
++        _registry: HostRegistry | None = getattr(request.app.state, "host_registry", None)
++        _conn = _registry.get(body.host_id) if _registry is not None and body.host_id else None
++        if _conn is not None and CAP_SESSION_PROVIDER not in _conn.hello.capabilities:
++            raise OmnigentError(
++                "Update the host to choose a provider per session.",
++                code=ErrorCode.INVALID_INPUT,
++            )
++    if provider_override is None and _parent_for_routing is not None:
++        # A sub-agent in the parent's family runs on the parent's account.
++        _parent = _parent_for_routing
++        provider_override = await asyncio.to_thread(
++            lambda: _inherited_provider_override(
++                _parent,
++                child_harness=_create_resolved_harness(agent, harness_override, agent_cache),
++                child_host_id=body.host_id,
++            )
++        )
++
+     inference_snapshot = None
+     selection_spec = None
+     from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+@@ -11813,6 +11846,7 @@ async def _create_session_from_existing_agent(
+                 "cost_control_mode_override": cost_control_mode_override,
+                 "subagent_routing_override": subagent_routing_override,
+                 "harness_override": harness_override,
++                "provider_override": provider_override,
+             }
+         )
+         with creation_stage("create_persistence_ms"):
+@@ -11834,6 +11868,7 @@ async def _create_session_from_existing_agent(
+                 cost_control_mode_override=cost_control_mode_override,
+                 subagent_routing_override=subagent_routing_override,
+                 harness_override=harness_override,
++                provider_override=provider_override,
+                 **snapshot_kwargs,
+             )
+     except NameAlreadyExistsError as exc:
+diff --git a/omnigent/server/routes/host_providers.py b/omnigent/server/routes/host_providers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6887885dd8b77ee1805bcf5ec2da1c72b53f48f
+--- /dev/null
++++ b/omnigent/server/routes/host_providers.py
+@@ -0,0 +1,116 @@
++"""Providers a connected host can run a harness on, for the new-session picker."""
++
++from __future__ import annotations
++
++import asyncio
++import secrets
++
++from fastapi import APIRouter, HTTPException, Query, Request
++from pydantic import BaseModel
++
++from omnigent.host.frames import (
++    CAP_SESSION_PROVIDER,
++    HostProvidersFrame,
++    HostProvidersResultFrame,
++    encode_host_frame,
++)
++from omnigent.server.auth import AuthProvider
++from omnigent.server.host_registry import HostConnection, HostRegistry
++from omnigent.server.routes._auth_helpers import require_user
++from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
++from omnigent.stores.host_store import HostStore
++
++_PROVIDERS_TIMEOUT_S = 15.0
++
++
++class HostProviderSummary(BaseModel):
++    """A provider a session can choose, without credentials.
++
++    :param name: The ``providers:`` entry name, e.g. ``"claude-max2"``.
++    :param kind: ``subscription``, ``key``, ``gateway``, ``local``,
++        ``databricks``, ``cli-config``, or ``bedrock``.
++    :param label: Where it authenticates, e.g. ``"claude CLI login (~/.claude-max2)"``.
++    :param default: Whether sessions use it when none is chosen.
++    :param ready: ``False`` when a subscription account is not logged in.
++    """
++
++    name: str
++    kind: str
++    label: str
++    default: bool
++    ready: bool
++
++
++class HostProvidersResponse(BaseModel):
++    """Providers a host can run the requested harness on."""
++
++    providers: list[HostProviderSummary]
++
++
++def create_host_providers_router(
++    host_registry: HostRegistry,
++    host_store: HostStore,
++    *,
++    auth_provider: AuthProvider | None = None,
++) -> APIRouter:
++    """Build the host provider listing route, mounted under ``/v1``."""
++    router = APIRouter()
++
++    @router.get("/hosts/{host_id}/providers")
++    async def get_host_providers(
++        request: Request, host_id: str, harness: str = Query(min_length=1)
++    ) -> HostProvidersResponse:
++        """List the providers configured on a host that can run *harness*.
++
++        Names and non-secret labels only; the caller must own the host.
++        """
++        user_id = require_user(request, auth_provider)
++        host = await asyncio.to_thread(
++            resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
++        )
++        conn = host_registry.get(host_id)
++        if conn is None:
++            raise host_absent_error(host)
++        if CAP_SESSION_PROVIDER not in conn.hello.capabilities:
++            return HostProvidersResponse(providers=[])
++        result = await request_host_providers(
++            host_registry=host_registry, host_conn=conn, harness=harness
++        )
++        if result.status != "ok":
++            raise HTTPException(
++                status_code=502, detail=result.error or "host provider listing failed"
++            )
++        return HostProvidersResponse(
++            providers=[HostProviderSummary.model_validate(p) for p in result.providers]
++        )
++
++    return router
++
++
++async def request_host_providers(
++    *, host_registry: HostRegistry, host_conn: HostConnection, harness: str
++) -> HostProvidersResultFrame:
++    """Request the provider listing over the host tunnel, with bounded waiting."""
++    request_id = secrets.token_hex(8)
++    future: asyncio.Future[HostProvidersResultFrame] = asyncio.get_running_loop().create_future()
++    host_conn.pending_providers[request_id] = future
++    try:
++        host_registry.send_text(
++            host_conn,
++            encode_host_frame(HostProvidersFrame(request_id=request_id, harness=harness)),
++        )
++        return await asyncio.wait_for(future, timeout=_PROVIDERS_TIMEOUT_S)
++    except ConnectionError as exc:
++        raise HTTPException(
++            status_code=502, detail=f"host '{host_conn.host_id}' connection lost"
++        ) from exc
++    except TimeoutError as exc:
++        raise HTTPException(
++            status_code=504,
++            detail=(
++                f"host '{host_conn.host_id}' did not list providers "
++                f"within {_PROVIDERS_TIMEOUT_S:.0f}s"
++            ),
++        ) from exc
++    finally:
++        host_conn.pending_providers.pop(request_id, None)
+diff --git a/omnigent/server/routes/host_tunnel.py b/omnigent/server/routes/host_tunnel.py
+index 64675f3925a2e957ca405e8622c26f1b372168a1..502769e0ae2ceb12c5fa9d3f6cca198fee0594c7 100644
+--- a/omnigent/server/routes/host_tunnel.py
++++ b/omnigent/server/routes/host_tunnel.py
+@@ -54,6 +54,7 @@ from omnigent.host.frames import (
+     HostMcpToolsResultFrame,
+     HostModelOptionsResultFrame,
+     HostPluginsResultFrame,
++    HostProvidersResultFrame,
+     HostRefreshHarnessesResultFrame,
+     HostRemoveWorktreeResultFrame,
+     HostRunnerExitedFrame,
+@@ -1056,6 +1057,11 @@ async def _receive_loop(
+             if tools_future is not None and not tools_future.done():
+                 tools_future.set_result(frame)
+             continue
++        if isinstance(frame, HostProvidersResultFrame):
++            providers_future = conn.pending_providers.pop(frame.request_id, None)
++            if providers_future is not None and not providers_future.done():
++                providers_future.set_result(frame)
++            continue
+         if isinstance(frame, HostImportLocalSessionFrame):
+             queue = conn.pending_import_local.get(frame.request_id)
+             if queue is not None:
+diff --git a/omnigent/server/routes/hosts.py b/omnigent/server/routes/hosts.py
+index 1407b8f5c1764149e02f7ec48f7a2d3f10ebe823..ee65f00b40f1cc1a00089f1a215ada2fde22ceae 100644
+--- a/omnigent/server/routes/hosts.py
++++ b/omnigent/server/routes/hosts.py
+@@ -1178,6 +1178,7 @@ def create_hosts_router(
+                 ),
+                 # The session had no runner bound, so nothing is superseded.
+                 superseded_runner_ids=(),
++                provider=target.conv.provider_override,
+             )
+         )
+         try:
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index cbbf9afa7e2e6e7b8e5c120e2d43c8f91b0431b2..e11f743a2bf0af72b118e83299244f4a5286c95b 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -807,6 +807,7 @@ def register_core_routes(
+                 ),
+                 # The session had no runner bound, so nothing is superseded.
+                 superseded_runner_ids=(),
++                provider=target.conv.provider_override,
+             )
+         )
+         launch_timeout_s = resolve_launch_timeout_s()
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index fd48880f16d5a033dbc0aa4e59f2232513f92459..504d8555089429b1480bd3844b5b906e3af04ad2 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -1643,6 +1643,13 @@ class _SessionCreateRequestBase(BaseModel):
+         the spec's declared harness. Create-time only — there is no
+         PATCH path, since the harness process spawns on the first
+         turn.
++    :param provider_override: Optional name of a ``providers:`` entry on the
++        session's host, e.g. ``"claude-max2"`` for a second Claude
++        subscription account. The host validates it against its providers
++        for the session's harness family when launching the runner, and a
++        missing login fails the launch. ``None`` uses the family default.
++        Create-time only; host-bound sessions only. Sub-agents inherit it
++        when they run in the same family.
+     :param smart_routing_message: The user's first-message text, used to
+         route the harness at create time. Only read on the top-level
+         Smart Routing path (``harness_override: "auto"`` on a native
+@@ -1682,6 +1689,7 @@ class _SessionCreateRequestBase(BaseModel):
+     cost_control_mode_override: str | None = None
+     subagent_routing_override: str | None = None
+     harness_override: str | None = None
++    provider_override: str | None = None
+     smart_routing_message: str | None = None
+ 
+     @model_validator(mode="after")
+@@ -2255,6 +2263,8 @@ class SessionResponse(BaseModel):
+         a row created before this became explicit inherits nothing.
+         Stamped ``"on"`` at create for Smart Routing sessions; also set
+         via ``PATCH /v1/sessions/{id}``.
++    :param provider_override: The host provider the session was created on,
++        e.g. ``"claude-max2"``; ``None`` for the family default.
+     :param share_workspace_files: Whether the owner opted into letting
+         view-level collaborators browse the workspace (Files/Changes/GitHub
+         surfaces). ``False`` by default — read grants share the conversation
+@@ -2416,6 +2426,7 @@ class SessionResponse(BaseModel):
+     llm_model: str | None = None
+     harness: str | None = None
+     model_override: str | None = None
++    provider_override: str | None = None
+     cost_control_mode_override: str | None = None
+     subagent_routing_override: str | None = None
+     share_workspace_files: bool = False
+diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
+index 3ee1f3a3621af1c7b6df4b5f732a81e78307717f..e66b8b6230043ebaeaf4ed2ec83e7f69bc0bfa54 100644
+--- a/omnigent/stores/conversation_store/__init__.py
++++ b/omnigent/stores/conversation_store/__init__.py
+@@ -503,6 +503,7 @@ class ConversationStore(ABC):
+         cost_control_mode_override: str | None = None,
+         subagent_routing_override: str | None = None,
+         harness_override: str | None = None,
++        provider_override: str | None = None,
+     ) -> Conversation:
+         """
+         Create a new conversation. Generates a unique
+@@ -565,6 +566,7 @@ class ConversationStore(ABC):
+         :param cost_control_mode_override: Optional per-session cost-control mode.
+         :param subagent_routing_override: Optional per-session sub-agent routing mode.
+         :param harness_override: Optional per-session harness override.
++        :param provider_override: Optional host provider the session runs on.
+         :returns: The newly created :class:`Conversation`.
+         :raises NameAlreadyExistsError: If
+             ``parent_conversation_id`` is not ``None`` and a
+diff --git a/omnigent/stores/conversation_store/overrides.py b/omnigent/stores/conversation_store/overrides.py
+index 8c7650ac94f75c216c5793fecceb612c26ab5f41..c285cea491b905e0a20e33bbc0f591474363159d 100644
+--- a/omnigent/stores/conversation_store/overrides.py
++++ b/omnigent/stores/conversation_store/overrides.py
+@@ -18,6 +18,9 @@ _SESSION_OVERRIDE_KEYS = (
+     "cost_control_mode_override",
+     "subagent_routing_override",
+     "harness_override",
++    # Name of the host provider (subscription account, gateway, ...) the
++    # session runs on; set at create and immutable.
++    "provider_override",
+     # Stored as the string ``"on"`` when the owner shares workspace files
+     # with view-level collaborators; absent (SQL NULL blob key) otherwise.
+     "share_workspace_files",
+diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
+index 26879d5bcc57b65974d06a5ceaa66060768f7a6c..ad2d6c954eb5dd0092f8e0031c26e9ea42b6c83d 100644
+--- a/omnigent/stores/conversation_store/sqlalchemy_store.py
++++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
+@@ -243,6 +243,7 @@ def _to_conversation(
+         cost_control_mode_override=overrides["cost_control_mode_override"],
+         subagent_routing_override=overrides["subagent_routing_override"],
+         harness_override=overrides["harness_override"],
++        provider_override=overrides["provider_override"],
+         # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
+         share_workspace_files=overrides["share_workspace_files"] == "on",
+         sub_agent_name=meta.sub_agent_name if meta else None,
+@@ -1001,6 +1002,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+         cost_control_mode_override: str | None = None,
+         subagent_routing_override: str | None = None,
+         harness_override: str | None = None,
++        provider_override: str | None = None,
+     ) -> Conversation:
+         """
+         Create a new conversation in the database.
+@@ -1081,6 +1083,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+                 "cost_control_mode_override": cost_control_mode_override,
+                 "subagent_routing_override": subagent_routing_override,
+                 "harness_override": harness_override,
++                "provider_override": provider_override,
+             }
+         )
+         prepared_labels = _prepare_label_updates(labels) if labels else {}
+@@ -4896,6 +4899,9 @@ class SqlAlchemyConversationStore(ConversationStore):
+                     "harness_override": (
+                         source_overrides["harness_override"] if copy_model_settings else None
+                     ),
++                    "provider_override": (
++                        source_overrides["provider_override"] if copy_model_settings else None
++                    ),
+                 }
+             )
+             new_conv_values: dict[str, Any] = {
+diff --git a/openapi.json b/openapi.json
+index ee3a017d4d5895b496dae787e42a6aab7fb77d3e..2e77aec5a2922c7983467096a90c888f66818211 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -3244,6 +3244,62 @@
+         "title": "HostModelOptionsResponse",
+         "type": "object"
+       },
++      "HostProviderSummary": {
++        "description": "A provider a session can choose, without credentials.",
++        "properties": {
++          "default": {
++            "description": "Whether sessions use it when none is chosen.",
++            "title": "Default",
++            "type": "boolean"
++          },
++          "kind": {
++            "description": "`subscription`, `key`, `gateway`, `local`, `databricks`, `cli-config`, or `bedrock`.",
++            "title": "Kind",
++            "type": "string"
++          },
++          "label": {
++            "description": "Where it authenticates, e.g. `\"claude CLI login (~/.claude-max2)\"`.",
++            "title": "Label",
++            "type": "string"
++          },
++          "name": {
++            "description": "The `providers:` entry name, e.g. `\"claude-max2\"`.",
++            "title": "Name",
++            "type": "string"
++          },
++          "ready": {
++            "description": "`False` when a subscription account is not logged in.",
++            "title": "Ready",
++            "type": "boolean"
++          }
++        },
++        "required": [
++          "name",
++          "kind",
++          "label",
++          "default",
++          "ready"
++        ],
++        "title": "HostProviderSummary",
++        "type": "object"
++      },
++      "HostProvidersResponse": {
++        "description": "Providers a host can run the requested harness on.",
++        "properties": {
++          "providers": {
++            "items": {
++              "$ref": "#/components/schemas/HostProviderSummary"
++            },
++            "title": "Providers",
++            "type": "array"
++          }
++        },
++        "required": [
++          "providers"
++        ],
++        "title": "HostProvidersResponse",
++        "type": "object"
++      },
+       "ImportFailureRef": {
+         "description": "One session that could not be imported, with a user-facing reason.\n\n`external_session_id` / `source` name the source session when known (a\nhost that reports only a count leaves them `None`); `reason` explains the\nfailure so the UI can show it instead of an anonymous \"N failed\". Also the\nshape of each `{\"event\": \"failed\", ...}` line on the stream endpoint.",
+         "properties": {
+@@ -8150,6 +8206,18 @@
+             ],
+             "title": "Project Id"
+           },
++          "provider_override": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "The host provider the session was created on, e.g. `\"claude-max2\"`; `None` for the family default.",
++            "title": "Provider Override"
++          },
+           "reasoning_effort": {
+             "anyOf": [
+               {
+@@ -12029,6 +12097,59 @@
+         ]
+       }
+     },
++    "/v1/hosts/{host_id}/providers": {
++      "get": {
++        "description": "List the providers configured on a host that can run *harness*.\n\nNames and non-secret labels only; the caller must own the host.",
++        "operationId": "get_host_providers_v1_hosts__host_id__providers_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "host_id",
++            "required": true,
++            "schema": {
++              "title": "Host Id",
++              "type": "string"
++            }
++          },
++          {
++            "in": "query",
++            "name": "harness",
++            "required": true,
++            "schema": {
++              "minLength": 1,
++              "title": "Harness",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HostProvidersResponse"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Host Providers",
++        "tags": [
++          "hosts"
++        ]
++      }
++    },
+     "/v1/hosts/{host_id}/runners": {
+       "post": {
+         "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 292eac59e83200ca384120d87aa1d7b6866e66a7..c4dae38ece2bd7d023f7f01252e003203c4719a2 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -47,6 +47,7 @@ from omnigent.harnesses.claude_native.bridge import (
+     _occupying_surface,
+     augment_claude_args,
+     claude_global_config_path,
++    claude_launch_config_dir,
+     count_hook_events,
+     display_cost_approval_popup,
+     ensure_claude_workspace_trusted,
+@@ -9063,6 +9064,24 @@ def test_claude_global_config_path_uses_launch_env_and_cwd(
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    "env,expected",
++    [
++        ({"HOME": "/home/u"}, "/home/u/.claude"),
++        ({"HOME": "/home/u", "CLAUDE_CONFIG_DIR": "/srv/claude/"}, "/srv/claude"),
++        # Relative and empty selectors resolve against Claude's working directory.
++        ({"CLAUDE_CONFIG_DIR": "x/../cfg"}, "/work/cfg"),
++        ({"CLAUDE_CONFIG_DIR": ""}, "/work"),
++        ({"CLAUDE_CONFIG_DIR": "~/cfg"}, "/work/~/cfg"),
++    ],
++)
++def test_claude_launch_config_dir_follows_claude_resolution(
++    env: dict[str, str], expected: str
++) -> None:
++    """The login directory Claude starts with, for its launch env and working directory."""
++    assert claude_launch_config_dir(Path("/work"), env) == Path(expected)
++
++
+ def test_claude_global_config_path_removes_dot_dot_like_path_join(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/host/test_frames.py b/tests/host/test_frames.py
+index 3015181ceadb4d05087879039dfd71c1125e0002..4147f9d5c9ff0c1ff1a75df7ff6d814b1ffd0b8e 100644
+--- a/tests/host/test_frames.py
++++ b/tests/host/test_frames.py
+@@ -45,6 +45,8 @@ from omnigent.host.frames import (
+     HostModelOptionsResultFrame,
+     HostPluginsFrame,
+     HostPluginsResultFrame,
++    HostProvidersFrame,
++    HostProvidersResultFrame,
+     HostRefreshHarnessesFrame,
+     HostRefreshHarnessesResultFrame,
+     HostRemoveWorktreeFrame,
+@@ -401,6 +403,51 @@ def test_mcp_servers_result_validates_reported_account_state(
+     assert frame.mcp_servers == [{**server, **expected}]
+ 
+ 
++@pytest.mark.parametrize(
++    "frame",
++    [
++        HostProvidersFrame(request_id="req_p", harness="claude-native"),
++        HostProvidersResultFrame(
++            request_id="req_p",
++            status="ok",
++            providers=[
++                {
++                    "name": "claude-max2",
++                    "kind": "subscription",
++                    "label": "claude CLI login (~/.claude-max2)",
++                    "default": False,
++                    "ready": True,
++                }
++            ],
++        ),
++        HostProvidersResultFrame(request_id="req_p", status="failed", error="boom"),
++        HostLaunchRunnerFrame(
++            request_id="r", binding_token="t", workspace="/w", provider="claude-max2"
++        ),
++    ],
++)
++def test_provider_frames_round_trip(
++    frame: HostProvidersFrame | HostProvidersResultFrame | HostLaunchRunnerFrame,
++) -> None:
++    assert decode_host_frame(encode_host_frame(frame)) == frame
++
++
++def test_providers_result_drops_unknown_fields() -> None:
++    row = {"name": "k", "kind": "key", "label": "key", "default": True, "ready": True}
++    frame = decode_host_frame(
++        json.dumps(
++            {
++                "kind": "host.providers_result",
++                "request_id": "r",
++                "status": "ok",
++                "providers": [{**row, "api_key": "secret"}],
++            }
++        )
++    )
++    assert isinstance(frame, HostProvidersResultFrame)
++    assert frame.providers == [row]
++
++
+ def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
+     frame = decode_host_frame(
+         json.dumps(
+diff --git a/tests/onboarding/test_subscription_accounts.py b/tests/onboarding/test_subscription_accounts.py
+index 2e706b5059e19128afa226a54115b1561d272db5..06a2bdeff91060fc5f42ac07ab93e10b2f47a32e 100644
+--- a/tests/onboarding/test_subscription_accounts.py
++++ b/tests/onboarding/test_subscription_accounts.py
+@@ -10,18 +10,23 @@ from typing import Any
+ import pytest
+ import yaml
+ 
+-from omnigent.errors import OmnigentError
++from omnigent.errors import ErrorCode, OmnigentError
+ from omnigent.onboarding import harness_install, harness_readiness
+ from omnigent.onboarding.provider_config import (
++    SESSION_PROVIDER_ENV,
+     describe_active_credential,
++    get_default_provider,
+     load_providers,
+     subscription_config_dir,
+ )
+ from omnigent.onboarding.subscription_accounts import (
+     apply_default_account_env,
+     default_accounts_env,
++    provider_choices,
++    require_session_account_dir,
+     require_subscription_dir_active,
+     require_subscription_login,
++    session_runner_env,
+     subscription_home_env,
+     subscription_logged_in,
+     subscription_login_command,
+@@ -238,3 +243,155 @@ def test_codex_account_without_login_does_not_fall_back(
+     launch = app_server._resolve_subscription_launch(load_providers(config)["b"], None, config)
+ 
+     assert launch.login_required
++
++
++def _session_config(tmp_path: Path) -> dict[str, object]:
++    return _providers(
++        max1={
++            "kind": "subscription",
++            "cli": "claude",
++            "config_dir": str(tmp_path / "m1"),
++            "default": True,
++        },
++        max2={"kind": "subscription", "cli": "claude", "config_dir": str(tmp_path / "m2")},
++        codex_b={
++            "kind": "subscription",
++            "cli": "codex",
++            "config_dir": str(tmp_path / "cb"),
++            "default": True,
++        },
++        dbx={"kind": "databricks", "profile": "alt"},
++        openrouter={
++            "kind": "gateway",
++            "anthropic": {"base_url": "https://openrouter.ai/api", "api_key": "sk-literal"},
++        },
++    )
++
++
++def test_session_runner_env_swaps_in_the_chosen_account(tmp_path: Path) -> None:
++    _write_claude_login(tmp_path / "m2")
++
++    env = session_runner_env(_session_config(tmp_path), "max2", "claude-native")
++
++    assert env == {
++        "CLAUDE_CONFIG_DIR": str(tmp_path / "m2"),
++        "CODEX_HOME": str(tmp_path / "cb"),
++        SESSION_PROVIDER_ENV: "max2",
++    }
++
++
++def test_session_runner_env_drops_account_dirs_a_gateway_replaces(tmp_path: Path) -> None:
++    env = session_runner_env(_session_config(tmp_path), "dbx", "claude-sdk")
++
++    # Databricks serves both families, so neither default login dir applies.
++    assert env == {SESSION_PROVIDER_ENV: "dbx"}
++
++
++@pytest.mark.parametrize(
++    "provider,harness,message",
++    [
++        ("nope", "claude-native", "'nope' is not configured on this host"),
++        ("codex_b", "claude-native", "cannot run the 'claude-native' harness"),
++        ("max2", "claude-sdk", "'max2' is not logged in"),
++    ],
++)
++def test_session_runner_env_fails_loudly(
++    tmp_path: Path, provider: str, harness: str, message: str
++) -> None:
++    with pytest.raises(OmnigentError, match=message):
++        session_runner_env(_session_config(tmp_path), provider, harness)
++
++
++def test_session_provider_becomes_the_default_for_its_family(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    config = _session_config(tmp_path)
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "max2")
++
++    assert get_default_provider(config, "anthropic").name == "max2"  # type: ignore[union-attr]
++    # Other families keep their own defaults.
++    assert get_default_provider(config, "openai").name == "codex_b"  # type: ignore[union-attr]
++
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "gone")
++    with pytest.raises(OmnigentError, match="'gone', which is no longer configured"):
++        get_default_provider(config, "anthropic")
++
++
++def test_session_account_must_be_the_login_the_cli_starts_with(
++    config_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    _write_config(config_home, _session_config(tmp_path))
++    (tmp_path / "m2").mkdir()
++    (tmp_path / "link").symlink_to(tmp_path / "m2")
++
++    # Without a session choice the launch's own login stands.
++    require_session_account_dir("claude", tmp_path / "elsewhere")
++
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "max2")
++    require_session_account_dir("claude", tmp_path / "m2")
++    require_session_account_dir("claude", tmp_path / "link")
++    with pytest.raises(OmnigentError, match="runs on account 'max2'") as failure:
++        require_session_account_dir("claude", tmp_path / "elsewhere")
++    # The native-terminal error payload shows this code's message to the user.
++    assert failure.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
++
++    # A gateway account has no login directory for the launch to diverge from.
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "dbx")
++    require_session_account_dir("claude", tmp_path / "elsewhere")
++
++
++def test_provider_choices_list_family_providers_without_secrets(tmp_path: Path) -> None:
++    _write_claude_login(tmp_path / "m1")
++
++    rows = provider_choices(_session_config(tmp_path), "claude-native")
++
++    assert rows == [
++        {
++            "name": "max1",
++            "kind": "subscription",
++            "label": f"claude CLI login ({tmp_path / 'm1'})",
++            "default": True,
++            "ready": True,
++        },
++        {
++            "name": "max2",
++            "kind": "subscription",
++            "label": f"claude CLI login ({tmp_path / 'm2'})",
++            "default": False,
++            "ready": False,
++        },
++        {
++            "name": "dbx",
++            "kind": "databricks",
++            "label": "Databricks profile alt",
++            "default": False,
++            "ready": True,
++        },
++        {
++            "name": "openrouter",
++            "kind": "gateway",
++            "label": "gateway · openrouter.ai",
++            "default": False,
++            "ready": True,
++        },
++    ]
++    assert "sk-literal" not in json.dumps(rows)
++    assert provider_choices(_session_config(tmp_path), "cursor") == []
++
++
++def test_host_launch_env_uses_defaults_or_the_session_choice(
++    config_home: Path, tmp_path: Path
++) -> None:
++    from omnigent.host.connect import _runner_account_env
++    from omnigent.host.frames import HostLaunchRunnerFrame
++
++    _write_config(config_home, _session_config(tmp_path))
++    frame = HostLaunchRunnerFrame(request_id="r", binding_token="t", workspace="/w")
++
++    assert _runner_account_env(frame) == {
++        "CLAUDE_CONFIG_DIR": str(tmp_path / "m1"),
++        "CODEX_HOME": str(tmp_path / "cb"),
++    }
++    frame.provider, frame.harness = "max2", "claude-native"
++    with pytest.raises(OmnigentError, match="not logged in"):
++        _runner_account_env(frame)
+diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
+index aba8e2308878570313b60aabadde289dfbb0ef9b..b38c4c9771796663026e26a4a574c52f1867d654 100644
+--- a/tests/runner/test_app_claude_native_launch_args.py
++++ b/tests/runner/test_app_claude_native_launch_args.py
+@@ -1152,6 +1152,70 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
+     registry.launch_required_terminal.assert_awaited_once()
+ 
+ 
++@pytest.mark.parametrize("launch_dir", ["account", "other"])
++async def test_auto_create_claude_terminal_keeps_the_session_account(
++    bridge_dir: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    launch_dir: str,
++) -> None:
++    """
++    A launch whose env moves Claude off the session's account fails before seeding.
++
++    The host exports the chosen account's directory, but an ``env`` wrapper
++    (or the agent's ``env``) is applied later and would otherwise run the pane
++    on another login.
++
++    :param launch_dir: Directory under ``tmp_path`` the wrapper selects.
++    """
++    from unittest.mock import Mock
++
++    from omnigent.errors import ErrorCode, OmnigentError
++    from omnigent.onboarding.provider_config import SESSION_PROVIDER_ENV
++    from omnigent.runner.resource_registry import SessionResourceRegistry
++
++    account = {"kind": "subscription", "cli": "claude", "config_dir": str(tmp_path / "account")}
++    config = {"providers": {"max2": account}}
++    seeded: list[Path] = []
++    registry = Mock(spec=SessionResourceRegistry)
++    registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "max2")
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "account"))
++    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", lambda: config)
++    monkeypatch.setattr("omnigent.onboarding.subscription_accounts.load_config", lambda: config)
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
++        lambda workspace, env=None: seeded.append(workspace),
++    )
++    monkeypatch.setattr(
++        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
++    )
++    monkeypatch.setattr(
++        "omnigent.harness_startup_config.resolve_harness_args",
++        lambda _harness, cli_args, cfg=None: [
++            f"CLAUDE_CONFIG_DIR={tmp_path / launch_dir}",
++            "claude",
++            *cli_args,
++        ],
++    )
++
++    expected = RuntimeError if launch_dir == "account" else OmnigentError
++    with pytest.raises(expected) as failure:
++        await _auto_create_claude_terminal_for_test(
++            monkeypatch, session_id="conv_session_account", workspace=bridge_dir, registry=registry
++        )
++
++    if launch_dir == "account":
++        assert len(seeded) == 1
++        registry.launch_required_terminal.assert_awaited_once()
++    else:
++        assert isinstance(failure.value, OmnigentError)
++        assert failure.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
++        assert "runs on account 'max2'" in failure.value.message
++        assert seeded == []
++        registry.launch_required_terminal.assert_not_called()
++
++
+ @pytest.mark.parametrize(
+     "subagent_started,turn_started",
+     [(True, True), (True, False), (False, True), (False, False)],
+diff --git a/tests/server/integration/test_session_host_launch.py b/tests/server/integration/test_session_host_launch.py
+index 4372a350e11efbd91ca3cf4b7db66410887e4c94..abc565ff31d896fec6c33942aa5b13ffb995f8ce 100644
+--- a/tests/server/integration/test_session_host_launch.py
++++ b/tests/server/integration/test_session_host_launch.py
+@@ -37,6 +37,7 @@ from omnigent.cli_invocation import cli_invocation
+ from omnigent.entities import Conversation
+ from omnigent.host.connect import HostProcess
+ from omnigent.host.frames import (
++    CAP_SESSION_PROVIDER,
+     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+     WORKSPACE_MISSING_ERROR_CODE,
+     HostHelloFrame,
+@@ -157,12 +158,15 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
+     )
+ 
+ 
+-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
++async def _connect_host(
++    app: FastAPI, capabilities: list[str] | None = None
++) -> ApplicationCommunicator:
+     """Connect a mock host over the WebSocket tunnel and wait for it
+     to register in the app's host registry.
+ 
+     :param app: The FastAPI app under test (its ``state.host_registry``
+         is the same instance the session-create launch path reads).
++    :param capabilities: Capabilities the host announces, if any.
+     :returns: The connected ASGI communicator, ready to exchange frames.
+     """
+     path = f"/v1/hosts/{_HOST_ID}/tunnel"
+@@ -172,7 +176,12 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+     assert accepted["type"] == "websocket.accept"
+ 
+     hello = encode_host_frame(
+-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
++        HostHelloFrame(
++            version="0.1.0-test",
++            frame_protocol_version=1,
++            name="laptop",
++            capabilities=capabilities or [],
++        )
+     )
+     await comm.send_input({"type": "websocket.receive", "text": hello})
+     registry = app.state.host_registry
+@@ -467,6 +476,72 @@ async def test_inline_launch_binds_runner_and_returns_host(
+     assert conv.workspace == _WORKSPACE
+ 
+ 
++async def test_inline_launch_carries_the_session_provider(
++    client: httpx.AsyncClient,
++    app: FastAPI,
++    db_uri: str,
++) -> None:
++    """A chosen provider is persisted and handed to the host at launch.
++
++    The host resolves it against its own ``providers:``; without it in the
++    frame the session would silently run on the host's default account.
++    """
++    comm = await _connect_host(app, [CAP_SESSION_PROVIDER])
++    agent = await create_test_agent(client)
++
++    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
++    resp = await client.post(
++        "/v1/sessions",
++        json={
++            "agent_id": agent["id"],
++            "host_id": _HOST_ID,
++            "workspace": _WORKSPACE,
++            "provider_override": "claude-max2",
++        },
++    )
++    frame = await responder
++
++    assert resp.status_code == 201, resp.text
++    assert resp.json()["provider_override"] == "claude-max2"
++    assert frame.provider == "claude-max2"
++    conv = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["id"])
++    assert conv is not None
++    assert conv.provider_override == "claude-max2"
++
++
++@pytest.mark.parametrize(
++    "payload,capabilities,detail",
++    [
++        ({}, [CAP_SESSION_PROVIDER], "requires a session bound to a connected host"),
++        ({"host_id": _HOST_ID, "workspace": _WORKSPACE}, [], "Update the host"),
++        (
++            {"host_id": _HOST_ID, "workspace": _WORKSPACE, "provider_override": "../x"},
++            [CAP_SESSION_PROVIDER],
++            "invalid provider_override",
++        ),
++    ],
++)
++async def test_session_provider_is_rejected_where_it_cannot_apply(
++    client: httpx.AsyncClient,
++    app: FastAPI,
++    payload: dict[str, str],
++    capabilities: list[str],
++    detail: str,
++) -> None:
++    """A provider choice fails the create instead of being ignored."""
++    comm = await _connect_host(app, capabilities)
++    agent = await create_test_agent(client)
++
++    resp = await client.post(
++        "/v1/sessions",
++        json={"agent_id": agent["id"], "provider_override": "claude-max2", **payload},
++    )
++
++    assert resp.status_code == 400, resp.text
++    assert detail in resp.text
++    del comm
++
++
+ async def test_inline_launch_stamps_terminal_view_label_at_creation(
+     client: httpx.AsyncClient,
+     app: FastAPI,
+diff --git a/tests/server/routes/test_host_providers.py b/tests/server/routes/test_host_providers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9804d0669fa7f3e7a3106f5be44b011fd42d7bd4
+--- /dev/null
++++ b/tests/server/routes/test_host_providers.py
+@@ -0,0 +1,142 @@
++"""The host provider listing is owner-only and empty for older hosts."""
++
++from __future__ import annotations
++
++import asyncio
++from unittest.mock import AsyncMock
++
++import httpx
++import pytest
++from fastapi import FastAPI, Request
++from fastapi.responses import JSONResponse
++
++from omnigent.errors import OmnigentError
++from omnigent.host.frames import (
++    CAP_SESSION_PROVIDER,
++    HostHelloFrame,
++    HostProvidersFrame,
++    HostProvidersResultFrame,
++    decode_host_frame,
++)
++from omnigent.server.host_registry import HostConnection, HostRegistry
++from omnigent.server.routes.host_providers import create_host_providers_router
++from omnigent.stores.host_store import HostStore
++
++_HOST_ID = "a828988dc0b441fb8d04dad3761773b9"
++_MAX2: dict[str, str | bool] = {
++    "name": "claude-max2",
++    "kind": "subscription",
++    "label": "claude CLI login (~/.claude-max2)",
++    "default": False,
++    "ready": True,
++}
++
++
++class _Auth:
++    def get_user_id(self, request: Request) -> str | None:
++        return request.headers.get("x-test-user")
++
++
++def _register(registry: HostRegistry, *capabilities: str) -> HostConnection:
++    return registry.register(
++        _HOST_ID,
++        AsyncMock(),
++        HostHelloFrame(
++            version="test",
++            frame_protocol_version=1,
++            name="laptop",
++            capabilities=list(capabilities),
++        ),
++        owner="owner",
++    )
++
++
++@pytest.fixture
++def providers_app(db_uri: str) -> tuple[FastAPI, HostRegistry]:
++    registry = HostRegistry()
++    hosts = HostStore(db_uri)
++    hosts.upsert_on_connect(_HOST_ID, "laptop", "owner")
++    app = FastAPI()
++    app.include_router(
++        create_host_providers_router(registry, hosts, auth_provider=_Auth()), prefix="/v1"
++    )
++
++    @app.exception_handler(OmnigentError)
++    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
++        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
++
++    return app, registry
++
++
++def _client(app: FastAPI) -> httpx.AsyncClient:
++    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
++
++
++async def test_owner_gets_providers_for_the_harness(providers_app) -> None:
++    app, registry = providers_app
++    conn = _register(registry, CAP_SESSION_PROVIDER)
++    async with _client(app) as client:
++        task = asyncio.create_task(
++            client.get(
++                f"/v1/hosts/{_HOST_ID}/providers",
++                params={"harness": "claude-native"},
++                headers={"x-test-user": "owner"},
++            )
++        )
++        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
++        assert isinstance(frame, HostProvidersFrame)
++        assert frame.harness == "claude-native"
++        conn.pending_providers[frame.request_id].set_result(
++            HostProvidersResultFrame(frame.request_id, "ok", providers=[_MAX2])
++        )
++        response = await task
++    assert response.status_code == 200
++    assert response.json() == {"providers": [_MAX2]}
++    assert not conn.pending_providers
++
++
++async def test_non_owner_does_not_reach_the_host(providers_app) -> None:
++    app, registry = providers_app
++    conn = _register(registry, CAP_SESSION_PROVIDER)
++    async with _client(app) as client:
++        response = await client.get(
++            f"/v1/hosts/{_HOST_ID}/providers",
++            params={"harness": "codex"},
++            headers={"x-test-user": "stranger"},
++        )
++    assert response.status_code == 403
++    assert conn.outbound_queue.empty()
++
++
++async def test_older_host_lists_nothing(providers_app) -> None:
++    app, registry = providers_app
++    conn = _register(registry)
++    async with _client(app) as client:
++        response = await client.get(
++            f"/v1/hosts/{_HOST_ID}/providers",
++            params={"harness": "codex"},
++            headers={"x-test-user": "owner"},
++        )
++    assert response.status_code == 200
++    assert response.json() == {"providers": []}
++    assert conn.outbound_queue.empty()
++
++
++async def test_host_failure_is_a_bad_gateway(providers_app) -> None:
++    app, registry = providers_app
++    conn = _register(registry, CAP_SESSION_PROVIDER)
++    async with _client(app) as client:
++        task = asyncio.create_task(
++            client.get(
++                f"/v1/hosts/{_HOST_ID}/providers",
++                params={"harness": "codex"},
++                headers={"x-test-user": "owner"},
++            )
++        )
++        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
++        conn.pending_providers[frame.request_id].set_result(
++            HostProvidersResultFrame(frame.request_id, "failed", error="bad config")
++        )
++        response = await task
++    assert response.status_code == 502
++    assert response.json()["detail"] == "bad config"
+diff --git a/tests/server/routes/test_session_provider_override.py b/tests/server/routes/test_session_provider_override.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..61e0b501c7a779c700f033f297ddd553e0afcc87
+--- /dev/null
++++ b/tests/server/routes/test_session_provider_override.py
+@@ -0,0 +1,90 @@
++"""Sub-agents inherit their parent's provider only within its family and host."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++
++from omnigent.entities import Conversation
++from omnigent.errors import OmnigentError
++from omnigent.server.routes._sessions.helpers import (
++    _inherited_provider_override,
++    _validated_provider_override,
++)
++from omnigent.spec.types import ApiKeyAuth, ProviderAuth
++
++
++def _parent(**overrides: Any) -> Conversation:
++    values: dict[str, Any] = {
++        "id": "conv_parent",
++        "root_conversation_id": "conv_parent",
++        "created_at": 0,
++        "updated_at": 0,
++        "host_id": "host-a",
++        "provider_override": "claude-max2",
++    }
++    values.update(overrides)
++    return Conversation(**values)
++
++
++@pytest.fixture(autouse=True)
++def _parent_runs_claude(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(
++        "omnigent.server.routes.sessions._resolve_harness", lambda *_a, **_k: "claude-native"
++    )
++
++
++@pytest.mark.parametrize(
++    "child_harness,child_host,expected",
++    [
++        ("claude-sdk", "host-a", "claude-max2"),
++        ("claude-native", None, "claude-max2"),
++        ("codex", "host-a", None),
++        ("claude-sdk", "host-b", None),
++    ],
++)
++def test_child_inherits_within_family_and_host(
++    child_harness: str, child_host: str | None, expected: str | None
++) -> None:
++    assert (
++        _inherited_provider_override(
++            _parent(), child_harness=child_harness, child_host_id=child_host
++        )
++        == expected
++    )
++
++
++def test_parent_without_provider_passes_nothing_on() -> None:
++    assert (
++        _inherited_provider_override(
++            _parent(provider_override=None), child_harness="claude-sdk", child_host_id="host-a"
++        )
++        is None
++    )
++
++
++def _agent_with_auth(monkeypatch: pytest.MonkeyPatch, auth: object) -> SimpleNamespace:
++    spec = SimpleNamespace(executor=SimpleNamespace(auth=auth))
++    cache = SimpleNamespace(load=lambda *_a, **_k: SimpleNamespace(spec=spec))
++    monkeypatch.setattr("omnigent.runtime.get_agent_cache", lambda: cache)
++    return SimpleNamespace(id="ag", name="pinned", bundle_location="x", session_id=None)
++
++
++def test_agent_pinning_another_credential_rejects_a_session_provider(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    agent = _agent_with_auth(monkeypatch, ApiKeyAuth(api_key="k"))
++
++    with pytest.raises(OmnigentError, match="pins its credential"):
++        _validated_provider_override("claude-max2", agent, host_id="host-a", host_type="external")
++
++
++def test_agent_pinning_the_same_provider_accepts_it(monkeypatch: pytest.MonkeyPatch) -> None:
++    agent = _agent_with_auth(monkeypatch, ProviderAuth(name="claude-max2"))
++
++    assert (
++        _validated_provider_override("claude-max2", agent, host_id="host-a", host_type="external")
++        == "claude-max2"
++    )
+diff --git a/tests/server/test_host_registry.py b/tests/server/test_host_registry.py
+index 5f8bb31801440a5f5fe43623417b1b1bef4b2bda..f4fe5cd48f9ae3043bebbe81082cd05c4e7898cd 100644
+--- a/tests/server/test_host_registry.py
++++ b/tests/server/test_host_registry.py
+@@ -254,6 +254,24 @@ async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
+     closed_mcp.cancel()
+ 
+ 
++@pytest.mark.parametrize("reconnect", [False, True], ids=["deregister", "replace"])
++async def test_lost_host_fails_pending_provider_listings(reconnect: bool) -> None:
++    """A provider listing in flight fails at once instead of waiting out its timeout."""
++    registry = HostRegistry()
++    conn = registry.register("host_providers", FakeWebSocket(), _make_hello(), owner="bob")
++    pending = asyncio.get_running_loop().create_future()
++    conn.pending_providers["live"] = pending
++
++    if reconnect:
++        registry.register("host_providers", FakeWebSocket(), _make_hello(), owner="bob")
++    else:
++        assert registry.deregister(conn.host_id) is True
++
++    with pytest.raises(ConnectionError, match="disconnected"):
++        pending.result()
++    assert conn.pending_providers == {}
++
++
+ def test_deregister_returns_false_for_unknown() -> None:
+     """
+     Verify that deregister reports whether it removed an entry.

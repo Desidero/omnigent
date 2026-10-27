@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mhavant <matthew.hoelting@avant.com>
+Date: Fri, 23 Oct 2026 22:36:07 -0500
+Subject: [PATCH] fix(web): show the error instead of a blank page when
+ rendering crashes
+
+Any render error other than a failed chunk load unmounted the whole React
+tree, leaving a blank window with nothing in the server logs. Wrap the app
+in a last-resort boundary that shows the error, the component stack and
+the path, with Reload and Copy details buttons.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: mhavant <matthew.hoelting@avant.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (error screen shown only when the web app crashes while rendering; no setting)
+---
+ web/src/App.test.tsx                         | 36 ++++++--
+ web/src/App.tsx                              |  9 +-
+ web/src/components/AppErrorBoundary.test.tsx | 88 ++++++++++++++++++++
+ web/src/components/AppErrorBoundary.tsx      | 62 ++++++++++++++
+ 4 files changed, 185 insertions(+), 10 deletions(-)
+ create mode 100644 web/src/components/AppErrorBoundary.test.tsx
+ create mode 100644 web/src/components/AppErrorBoundary.tsx
+
+diff --git a/web/src/App.test.tsx b/web/src/App.test.tsx
+index c879673a3bfc9f1c3f75cdbf4f89f2c3353e57c4..14dbe454fccb7f4b35da8bde8f6d75931e024a7c 100644
+--- a/web/src/App.test.tsx
++++ b/web/src/App.test.tsx
+@@ -64,12 +64,17 @@ vi.mock("@/extensions/ExtensionProvider", () => ({
+ 
+ import App from "./App";
+ 
+-const chunkError = vi.hoisted(
+-  () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
+-);
++const { chunkError, renderError, tasksPageError } = vi.hoisted(() => {
++  const missingChunk = new TypeError("Failed to fetch dynamically imported module: /assets/old.js");
++  return {
++    chunkError: missingChunk,
++    renderError: new Error("Application bug"),
++    tasksPageError: { current: missingChunk },
++  };
++});
+ vi.mock("@/pages/TasksPage", () => ({
+   TasksPage: () => {
+-    throw chunkError;
++    throw tasksPageError.current;
+   },
+ }));
+ vi.mock("@/pages/SetupPage", () => ({
+@@ -78,14 +83,15 @@ vi.mock("@/pages/SetupPage", () => ({
+   },
+ }));
+ 
+-// Assert the recovery boundary surrounds both the normal and first-run route trees.
+-describe("chunk load recovery", () => {
++// Assert the recovery boundaries surround both the normal and first-run route trees.
++describe("render error recovery", () => {
+   const reload = vi.fn();
+   function suppressExpectedError(event: ErrorEvent) {
+-    if (event.error === chunkError) event.preventDefault();
++    if (event.error === chunkError || event.error === renderError) event.preventDefault();
+   }
+ 
+   beforeEach(() => {
++    tasksPageError.current = chunkError;
+     sessionStorage.clear();
+     reload.mockReset();
+     vi.stubGlobal("location", { reload });
+@@ -119,6 +125,22 @@ describe("chunk load recovery", () => {
+     expect(await screen.findByRole("alert")).toHaveTextContent("Unable to load this page");
+     expect(reload).toHaveBeenCalledOnce();
+   });
++
++  it.each([
++    { path: "/tasks", basename: undefined },
++    { path: "/mount/tasks", basename: "/mount" },
++  ])("shows the error instead of a blank page when $path throws", async ({ path, basename }) => {
++    tasksPageError.current = renderError;
++    render(
++      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
++        <MemoryRouter initialEntries={[path]}>
++          <App basename={basename} />
++        </MemoryRouter>
++      </CapabilitiesProvider>,
++    );
++    expect(await screen.findByRole("alert")).toHaveTextContent("Application bug");
++    expect(reload).not.toHaveBeenCalled();
++  });
+ });
+ 
+ function renderUsageRoute(enabled: boolean) {
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 0a4a4db7bdf4d32b8a8300891378d79e1fdab219..cfeaec1b41067c3f2ade2f130fc1e24b0e4c3968 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -5,6 +5,7 @@ import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
+ import { useOmnigentPageView } from "@/lib/analytics";
+ import { PageLoading } from "@/components/PageLoading";
+ import { Spinner } from "@/components/ui/spinner";
++import { AppErrorBoundary } from "@/components/AppErrorBoundary";
+ import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
+ import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+@@ -238,8 +239,10 @@ function AppRoutes({ basename }: AppProps) {
+ 
+ export default function App(props: AppProps = {}) {
+   return (
+-    <ChunkLoadErrorBoundary>
+-      <AppRoutes {...props} />
+-    </ChunkLoadErrorBoundary>
++    <AppErrorBoundary>
++      <ChunkLoadErrorBoundary>
++        <AppRoutes {...props} />
++      </ChunkLoadErrorBoundary>
++    </AppErrorBoundary>
+   );
+ }
+diff --git a/web/src/components/AppErrorBoundary.test.tsx b/web/src/components/AppErrorBoundary.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c38eef3c14b29a663a17698d73b8d204a488e5bd
+--- /dev/null
++++ b/web/src/components/AppErrorBoundary.test.tsx
+@@ -0,0 +1,88 @@
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { StrictMode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { AppErrorBoundary } from "./AppErrorBoundary";
++
++const { copyText } = vi.hoisted(() => ({ copyText: vi.fn(async () => {}) }));
++vi.mock("@/lib/clipboard", () => ({ copyText }));
++
++const reload = vi.fn();
++const renderError = new Error("Cannot read properties of undefined (reading 'items')");
++
++// Every test here throws on purpose; keep jsdom from reporting those as uncaught.
++function suppressExpectedError(event: ErrorEvent) {
++  event.preventDefault();
++}
++
++function Throws({ value }: { value: unknown }): never {
++  throw value;
++}
++
++function renderCrash(value: unknown) {
++  return render(
++    <StrictMode>
++      <AppErrorBoundary>
++        <Throws value={value} />
++      </AppErrorBoundary>
++    </StrictMode>,
++  );
++}
++
++beforeEach(() => {
++  window.addEventListener("error", suppressExpectedError);
++  vi.stubGlobal("location", { reload, pathname: "/c/abc" });
++  vi.spyOn(console, "error").mockImplementation(() => {});
++});
++
++afterEach(() => {
++  cleanup();
++  window.removeEventListener("error", suppressExpectedError);
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++  copyText.mockReset();
++  copyText.mockImplementation(async () => {});
++  reload.mockReset();
++});
++
++describe("AppErrorBoundary", () => {
++  it("renders children when nothing throws", () => {
++    render(
++      <AppErrorBoundary>
++        <p>Page loaded</p>
++      </AppErrorBoundary>,
++    );
++    expect(screen.getByText("Page loaded")).toBeInTheDocument();
++  });
++
++  it("replaces a crashed tree with the error, a reload and copyable details", () => {
++    renderCrash(renderError);
++    const alert = screen.getByRole("alert");
++    expect(alert).toHaveTextContent("Something went wrong");
++    expect(alert).toHaveTextContent("reading 'items'");
++    expect(alert).toHaveTextContent("Throws");
++    expect(alert).toHaveTextContent("/c/abc");
++
++    fireEvent.click(screen.getByRole("button", { name: "Copy details" }));
++    expect(copyText).toHaveBeenCalledWith(expect.stringMatching(/reading 'items'[\s\S]*Throws/));
++
++    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
++    expect(reload).toHaveBeenCalledOnce();
++  });
++
++  it.each([
++    { label: "null", value: null, shown: "null" },
++    { label: "a string", value: "plain string", shown: "plain string" },
++    { label: "an object without a prototype", value: Object.create(null), shown: "Unknown error" },
++  ])("shows the fallback when $label is thrown", ({ value, shown }) => {
++    renderCrash(value);
++    expect(screen.getByRole("alert")).toHaveTextContent(shown);
++  });
++
++  it("keeps the fallback when the clipboard write fails", async () => {
++    copyText.mockRejectedValueOnce(new Error("Clipboard API not available"));
++    renderCrash(renderError);
++    fireEvent.click(screen.getByRole("button", { name: "Copy details" }));
++    await Promise.resolve();
++    expect(screen.getByRole("alert")).toHaveTextContent("Something went wrong");
++  });
++});
+diff --git a/web/src/components/AppErrorBoundary.tsx b/web/src/components/AppErrorBoundary.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d8d0d885a2c3288dc844b7d69693ec273fb7a40
+--- /dev/null
++++ b/web/src/components/AppErrorBoundary.tsx
+@@ -0,0 +1,62 @@
++import { Component, type ErrorInfo, type ReactNode } from "react";
++import { Button } from "@/components/ui/button";
++import { copyText } from "@/lib/clipboard";
++
++interface AppErrorBoundaryState {
++  failed: boolean;
++  error?: unknown;
++  componentStack?: string;
++}
++
++/** Last-resort boundary: without it, any render error unmounts the app and leaves a blank page. */
++export class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBoundaryState> {
++  override state: AppErrorBoundaryState = { failed: false };
++
++  static getDerivedStateFromError(error: unknown) {
++    return { failed: true, error };
++  }
++
++  override componentDidCatch(error: unknown, info: ErrorInfo) {
++    console.error("Unhandled render error", error, info.componentStack);
++    this.setState({ componentStack: info.componentStack ?? undefined });
++  }
++
++  override render() {
++    const { failed, error, componentStack } = this.state;
++    if (!failed) return this.props.children;
++    const details = [
++      describeError(error),
++      componentStack ? `Component stack:${componentStack}` : "",
++      `Path: ${location.pathname}`,
++    ]
++      .filter(Boolean)
++      .join("\n\n");
++    return (
++      <div role="alert" className="flex min-h-dvh flex-col items-center justify-center gap-4 p-8">
++        <h1 className="text-lg font-medium">Something went wrong</h1>
++        <p className="max-w-md text-center text-sm text-muted-foreground">
++          The app hit an error while drawing this page. Reload to continue.
++        </p>
++        <div className="flex gap-2">
++          <Button onClick={() => location.reload()}>Reload</Button>
++          <Button variant="outline" onClick={() => void copyText(details).catch(() => {})}>
++            Copy details
++          </Button>
++        </div>
++        <pre className="max-h-80 w-full max-w-3xl overflow-auto rounded-md bg-muted p-3 font-mono text-xs whitespace-pre-wrap select-text">
++          {details}
++        </pre>
++      </div>
++    );
++  }
++}
++
++function describeError(error: unknown): string {
++  if (error instanceof Error) return error.stack ?? `${error.name}: ${error.message}`;
++  try {
++    return String(error);
++  } catch {
++    // Objects without a prototype have no toString; the fallback must not throw.
++    return "Unknown error";
++  }
++}

@@ -1,0 +1,3022 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 21 Oct 2026 11:33:14 +0000
+Subject: [PATCH] feat(web): view and edit session labels, and default labels
+ per project
+
+Sessions carry user labels (tags), but the web UI had no way to see or
+change them, a label could not be deleted through the API, and projects
+had no way to tag the sessions created in them.
+
+Server:
+- PATCH /v1/sessions/{id} deletes a label whose value is null. Reserved
+  and cost_control.* keys are rejected for a delete exactly as for a set;
+  the empty-string clear for omni_project and the pin key is unchanged.
+- Session create in a project merges the project's config.labels under
+  the request's labels (request wins). Internal, over-length and
+  non-string entries are skipped, and the merged labels still pass the
+  reserved-label checks. Imports into a project get them too. Labels apply
+  only at creation, not when a session is moved into a project later.
+- A create with apply_project_labels: false takes its labels as the
+  final set, so a default removed for one session isn't added back.
+
+Web:
+- A Labels section in the session info popover lists user labels and,
+  with edit access, adds, edits and removes them, with inline validation
+  of the key (128) and value (256) column widths. Internal labels
+  (omnigent.*, cost_control.*, omni_project) stay hidden.
+- Project settings gain a "Default labels" editor using the same
+  LabelEditor component, stored as config.labels. A label still typed in
+  the add row is saved with the dialog, and an invalid one blocks Save
+  with its inline message.
+  "Add" there only edits the draft, so closing the dialog with unsaved
+  label changes warns once before discarding them.
+- The project settings dialog is capped to the viewport (85dvh): its
+  fields scroll while the header and Save/Cancel stay visible, since the
+  labels editor made it taller than short windows. Upstream PR #5194
+  targets the same problem there.
+- The new-session composer's "+" menu gains Labels, opening the same
+  editor for the session about to be created, with or without a project.
+  A project's defaults are filled in, marked "from project", and
+  removable for that session only. The labels show as chips in the
+  composer and go with the create request.
+- The list-cache overlay is shared by title, archive and label updates.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit f0c4dfa6e1d6acc3b386c7f3582fee2c233454ba)
+---
+ feature-map/sessions.md                       |  27 +
+ omnigent/db/db_models.py                      |   4 +-
+ omnigent/server/API.md                        |  11 +-
+ .../routes/_session_create_validation.py      |  42 ++
+ omnigent/server/routes/_sessions/helpers.py   |   2 +-
+ omnigent/server/routes/imports.py             |   2 +
+ .../server/routes/sessions/routes_core.py     |  34 +-
+ omnigent/server/schemas.py                    |  13 +-
+ omnigent/util/cost_plan.py                    |   2 +-
+ openapi.json                                  |  11 +-
+ ...test_session_create_project_consistency.py | 117 +++-
+ .../routes/test_sessions_cost_labels.py       |  31 +-
+ tests/server/routes/test_sessions_crud.py     |  70 ++-
+ web/src/components/AgentInfo.test.tsx         | 127 +++++
+ web/src/components/AgentInfo.tsx              |  38 +-
+ web/src/components/LabelEditor.tsx            | 323 +++++++++++
+ .../components/composer/ComposerAddMenu.tsx   |  32 +-
+ .../components/composer/NewSessionLabels.tsx  | 116 ++++
+ web/src/hooks/useSessionLabels.ts             |  51 ++
+ web/src/lib/projectsApi.ts                    |   9 +-
+ web/src/lib/sessionLabels.test.ts             | 111 ++++
+ web/src/lib/sessionLabels.ts                  |  92 +++
+ web/src/lib/sessionListCache.test.ts          |  21 +
+ web/src/lib/sessionListCache.ts               |  88 +--
+ web/src/lib/sessionsApi.ts                    |  10 +-
+ .../NewChatDialog.projectCreate.test.tsx      |  43 +-
+ web/src/shell/NewChatDialog.test.tsx          |  19 +
+ web/src/shell/NewChatDialog.tsx               |  37 +-
+ web/src/shell/ProjectSettingsDialog.test.tsx  | 162 +++++-
+ web/src/shell/ProjectSettingsDialog.tsx       | 531 ++++++++++--------
+ 30 files changed, 1863 insertions(+), 313 deletions(-)
+ create mode 100644 web/src/components/LabelEditor.tsx
+ create mode 100644 web/src/components/composer/NewSessionLabels.tsx
+ create mode 100644 web/src/hooks/useSessionLabels.ts
+ create mode 100644 web/src/lib/sessionLabels.test.ts
+ create mode 100644 web/src/lib/sessionLabels.ts
+
+diff --git a/feature-map/sessions.md b/feature-map/sessions.md
+index cb81e352cee3d0194381b8feae9b0d8258298e1a..a4cbbf08c0cda9813df81a31316214a0bc733e8c 100644
+--- a/feature-map/sessions.md
++++ b/feature-map/sessions.md
+@@ -49,6 +49,12 @@ the header menu), and each place is a separate entry point.
+   project folder from the row menu, the header menu, or the header's folder tag.
+ - `project-rename`: the project menu opens a dialog with the name selected;
+   typing replaces it without losing characters as the menu closes.
++- `labels`: the session info popover lists the session's labels (tags) and,
++  with edit access, adds, edits and removes them; internal labels stay hidden.
++  A project's settings hold default labels that sessions created in it receive;
++  a label set at creation wins, and moving a session in later adds none. The
++  new-session composer's "+" menu → Labels sets a new session's labels, with
++  the project's defaults filled in and removable for that session only.
+ - `bulk-actions`: select several rows, then mark as read or unread, archive,
+   unarchive, or delete them.
+ - `fork`: fork the whole session or from a message; the fork keeps images and
+@@ -201,6 +207,15 @@ session), archive or unarchive, and delete.
+ **Project folder:** right-click its header or open its three-dot menu, then
+ choose Rename project. Start typing as soon as the dialog opens.
+ 
++**Labels:** open a session and hover or click the header's info icon (on
++mobile, the header menu's Agent info). The Labels section offers Add label and,
++per label, edit and remove. A view-only collaborator sees the labels without
++controls. For defaults, open a project folder's three-dot menu → Project
++settings → Default labels, save, then start a session in that project. Closing
++the dialog with unsaved label changes warns once before discarding them. Before
++a session exists, the new-session composer's "+" menu → Labels opens the same
++editor; its labels show as chips in the composer and go with the create.
++
+ **Pinned section drag:** drag a pinned row onto another pinned row to reorder
+ the Pinned section, or drop an unpinned row onto a pinned row to pin it into
+ that slot.
+@@ -472,6 +487,18 @@ plain `uv run pytest`, which starts a private server for the test.
+   `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
+   Repeat from the header menu's Add to project by hand and expect the row to
+   regroup under that project.
++- **`labels`, info popover and project settings:** component coverage in
++  `web/src/components/AgentInfo.test.tsx` and
++  `web/src/shell/ProjectSettingsDialog.test.tsx`; server coverage of deletion
++  and project defaults in `tests/server/routes/test_sessions_crud.py` and
++  `tests/server/routes/test_session_create_project_consistency.py`, without a
++  browser test. By hand: add `team: ml` in the popover, reload, and expect it
++  kept; remove it and expect it gone. Then set a project default label, start
++  a session in the project, and expect the label in its popover. The composer's
++  "+" menu → Labels has component coverage in
++  `web/src/shell/NewChatDialog.projectCreate.test.tsx`; by hand, remove the
++  project default there, add another label, start the session, and expect only
++  the added label in its popover.
+ - **Right-click menu:**
+   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
+ - **`project-rename`, project header right-click and three-dot menus:**
+diff --git a/omnigent/db/db_models.py b/omnigent/db/db_models.py
+index 14e8aaac8acba1284e44f68ea8ce1d0beb91a7ab..45d69882eb83b4bd21b41ed293e094af8b98a2bd 100644
+--- a/omnigent/db/db_models.py
++++ b/omnigent/db/db_models.py
+@@ -991,6 +991,8 @@ class SqlConversationItem(ConversationBase):
+ # (and the session-status error-label path) can clamp values to fit instead
+ # of letting an over-length write raise ``DataError`` on PostgreSQL.
+ LABEL_VALUE_MAX_LEN = 256
++# Width of the ``conversation_labels.key`` column.
++LABEL_KEY_MAX_LEN = 128
+ 
+ 
+ class SqlConversationLabel(ConversationBase):
+@@ -1037,7 +1039,7 @@ class SqlConversationLabel(ConversationBase):
+         Uuid16(),
+         primary_key=True,
+     )
+-    key: Mapped[str] = mapped_column(String(128), primary_key=True)
++    key: Mapped[str] = mapped_column(String(LABEL_KEY_MAX_LEN), primary_key=True)
+     value: Mapped[str] = mapped_column(String(LABEL_VALUE_MAX_LEN))
+     updated_at: Mapped[int] = mapped_column(Integer)
+ 
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index 0459828226737cb5b0463cab4f0b8669cf8ee255..407e2337fffe9e795cb3ae7ad359c45bc81f4f7e 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -691,6 +691,13 @@ already uploaded or registered an agent. The response is the full
+     `PATCH /v1/sessions/{id}` (last-write-wins). See
+     `designs/NATIVE_RUNNER_SERVER_LAUNCH.md`.
+ 
++  apply_project_labels (boolean, default true)
++    A create with `project_id` merges the project's default labels (the
++    project config's `labels`) under `labels`, and the request's labels
++    win. `false` takes `labels` as the final set, so a default removed
++    for this one session is not added back. Labels apply only at
++    creation, not when a session moves into a project later.
++
+ 400 Bad Request - invalid terminal_launch_args (count / length bounds)
+ 404 Not Found - no agent with that id
+ 409 Conflict - a managed create's host_id names an existing host, or
+@@ -886,7 +893,9 @@ Request body:
+     Session title update. `null` leaves the title unchanged.
+ 
+   labels (object, optional)
+-    Labels to merge into the existing session labels.
++    Labels to merge into the existing session labels. A `null` value
++    deletes that label; reserved and `cost_control.*` keys are rejected
++    for a delete exactly as for a set.
+ 
+   reasoning_effort (string or null, optional)
+     Per-session reasoning-effort hint. Accepted metadata values are
+diff --git a/omnigent/server/routes/_session_create_validation.py b/omnigent/server/routes/_session_create_validation.py
+index 10d06fbc8043489ce904777c842034c26a7026d7..2aa10e28b7791505e9828d6b835a8b79addc07c2 100644
+--- a/omnigent/server/routes/_session_create_validation.py
++++ b/omnigent/server/routes/_session_create_validation.py
+@@ -10,19 +10,23 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++from collections.abc import Mapping
+ from dataclasses import dataclass
+ from typing import Any
+ 
+ from pydantic import ValidationError
+ 
++from omnigent.db.db_models import LABEL_KEY_MAX_LEN, LABEL_VALUE_MAX_LEN
+ from omnigent.errors import ErrorCode, OmnigentError
+ from omnigent.models.model_override import validate_model_override
+ from omnigent.runtime.agent_cache import AgentCache
+ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
+ from omnigent.server.routes._auth_helpers import require_access
+ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
++from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
+ from omnigent.stores.host_store import host_is_live
+ from omnigent.stores.project_store import ProjectStore
++from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
+ from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
+ 
+ _logger = logging.getLogger(__name__)
+@@ -36,6 +40,35 @@ class ProjectCreateResolution:
+     project_id: str | None = None
+ 
+ 
++# Label namespaces written by Omnigent itself, never by a project default.
++_INTERNAL_LABEL_PREFIXES = ("omnigent.", COST_CONTROL_LABEL_NAMESPACE)
++
++
++def project_default_labels(config: Mapping[str, Any]) -> dict[str, str]:
++    """Return the user labels a project's opaque config stamps on new sessions.
++
++    The config is client-owned JSON, so a malformed ``labels`` value or entry
++    (non-string, over the column width, or an internal key) is ignored.
++
++    :param config: The stored project config, e.g.
++        ``{"labels": {"team": "ml"}}``.
++    :returns: The usable labels, e.g. ``{"team": "ml"}``.
++    """
++    raw_labels = config.get("labels")
++    if not isinstance(raw_labels, Mapping):
++        return {}
++    return {
++        key: value
++        for key, value in raw_labels.items()
++        if isinstance(key, str)
++        and isinstance(value, str)
++        and 0 < len(key) <= LABEL_KEY_MAX_LEN
++        and len(value) <= LABEL_VALUE_MAX_LEN
++        and key != PROJECT_LABEL_KEY
++        and not key.startswith(_INTERNAL_LABEL_PREFIXES)
++    }
++
++
+ async def resolve_project_session_create(
+     *,
+     body: Any,
+@@ -68,6 +101,15 @@ async def resolve_project_session_create(
+     for field in ("agent_id", "workspace", "git"):
+         if field not in fields_set and field in config and field in body.__class__.model_fields:
+             updates[field] = config[field]
++    # Project labels sit under the request's own labels, which win on conflict,
++    # unless the client says its labels are already the final set.
++    default_labels = project_default_labels(config)
++    if (
++        default_labels
++        and "labels" in body.__class__.model_fields
++        and getattr(body, "apply_project_labels", True)
++    ):
++        updates["labels"] = {**default_labels, **(getattr(body, "labels", None) or {})}
+     resolved_data = body.model_dump()
+     resolved_data.update(updates)
+     # Re-validate project hints because config is intentionally stored as
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 359f2a83bb9d30bd664d3fc996635e63a82cab8e..4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -10593,7 +10593,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
+         )
+ 
+ 
+-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
++def _reject_server_reserved_label_seed(labels: Mapping[str, str | None] | None) -> None:
+     """
+     Reject a client-supplied label map that touches server-internal keys.
+ 
+diff --git a/omnigent/server/routes/imports.py b/omnigent/server/routes/imports.py
+index 8535ae950adb7f380358ce0aac17cd4661074f71..18bf827d9fccdb98da762e9f272236efd63f23e2 100644
+--- a/omnigent/server/routes/imports.py
++++ b/omnigent/server/routes/imports.py
+@@ -433,6 +433,8 @@ def create_imports_router(
+             )
+             await asyncio.to_thread(conversation_store.append, conversation.id, items)
+             labels = {
++                # Project default labels resolved for an import into a project.
++                **resolved_create.body.labels,
+                 **native_agent.presentation_labels,
+                 IMPORT_SOURCE_LABEL_KEY: source,
+                 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 80dcdde064171b76d61dfa012eb6d4aaa95c27b3..352ddb805781fefe599429e8c5e91b8e4470b4aa 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -2734,11 +2734,12 @@ def register_core_routes(
+                     code=ErrorCode.INVALID_INPUT,
+                 )
+             requested_codex_approval_mode = body.approval_mode
+-        labels_to_set = dict(body.labels or {})
++        labels_to_set: dict[str, str | None] = dict(body.labels or {})
+         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
+         # key; rewrite it to the caller's per-user key so one user's pin doesn't
+         # pin the session for everyone with access. Empty value (unpin) carries
+-        # through to the delete-clear loop below under the per-user key.
++        # through to the delete-clear loop below under the per-user key, as does
++        # a null.
+         if PINNED_LABEL_KEY in labels_to_set:
+             labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
+         if requested_codex_collaboration_mode is not None:
+@@ -3333,30 +3334,29 @@ def register_core_routes(
+                 _approval_result,
+             )
+             labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
+-        # Some labels are cleared by DELETE, not by upserting an empty value:
+-        # the project membership (empty = "remove from project") and the pinned
+-        # flag (empty = "unpin"). Split any empty-valued clear keys out before
+-        # the bulk upsert so other labels are unaffected. Labels are upsert-only,
+-        # so without this an empty string would linger as a stored value.
+-        # The pinned key was rewritten to the caller's per-user key above, so
+-        # clear that one (not the canonical bare key) on an empty value.
++        # A null value deletes its label. The project membership and the
++        # caller's per-user pin key also treat an empty string as delete
++        # ("remove from project" / "unpin"), so it never lingers as a value.
++        # Reserved keys were rejected above whether set or deleted.
+         for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+             if labels_to_set.get(_clear_key) == "":
+-                labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
+-                await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
+-        if labels_to_set:
+-            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
++                labels_to_set[_clear_key] = None
++        labels_to_upsert = {k: v for k, v in labels_to_set.items() if v is not None}
++        for _delete_key in (k for k, v in labels_to_set.items() if v is None):
++            await asyncio.to_thread(conversation_store.delete_label, session_id, _delete_key)
++        if labels_to_upsert:
++            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_upsert)
+         # Only when the switch was forwarded: a silent PATCH writes no label,
+         # and an unconfirmed mode must not reach the picker.
+-        if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:
++        if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_upsert:
+             _publish_permission_mode(
+                 session_id,
+-                labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
++                labels_to_upsert[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
+             )
+-        if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
++        if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_upsert:
+             _publish_codex_approval_mode(
+                 session_id,
+-                labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
++                labels_to_upsert[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
+             )
+         # Archiving means "get this out of my way", which contradicts a pin
+         # ("keep it at the top"), so drop the archiver's own pin — otherwise the
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index fac60638a3ceb5569d13b71a5804c022f36ea98d..b804a65446249ff16aa0a023a81a849abf07913f 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -1660,6 +1660,9 @@ class _SessionCreateRequestBase(BaseModel):
+         real message after the create returns. ``None`` everywhere else,
+         including the bundle-agent auto path, which routes on the first
+         message event instead.
++    :param apply_project_labels: Whether a ``project_id`` create adds the
++        project's default labels under ``labels``. ``False`` when ``labels``
++        is already the final set, e.g. a default removed for this session.
+     """
+ 
+     inference_configuration_revision: str | None = None
+@@ -1673,6 +1676,7 @@ class _SessionCreateRequestBase(BaseModel):
+     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+     labels: dict[str, str] = Field(default_factory=dict)
++    apply_project_labels: bool = True
+     parent_session_id: str | None = None
+     sub_agent_name: str | None = None
+     host_type: Literal["external", "managed"] = "external"
+@@ -1907,6 +1911,8 @@ class SessionCreateMetadata(BaseModel):
+         provision on ``host_type: "managed"`` (one of the server's
+         ``sandbox_providers``); ``None`` takes the server's first. Only
+         valid with ``host_type: "managed"``.
++    :param apply_project_labels: Same as on the JSON create: ``False`` skips
++        the project's default labels because ``labels`` is the final set.
+     """
+ 
+     inference_configuration_revision: str | None = None
+@@ -1916,6 +1922,7 @@ class SessionCreateMetadata(BaseModel):
+     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+     project_id: str | None = None
+     labels: dict[str, str] = Field(default_factory=dict)
++    apply_project_labels: bool = True
+     reasoning_effort: str | None = None
+     host_id: str | None = None
+     workspace: str | None = None
+@@ -2484,7 +2491,9 @@ class UpdateSessionRequest(BaseModel):
+     :param title: New title, e.g. ``"debugging auth flow"``.
+         ``None`` leaves unchanged.
+     :param labels: Guardrails labels to upsert. Merges with existing
+-        labels; keys not present are left untouched.
++        labels; keys not present are left untouched. A ``null`` value
++        deletes that label. Server-internal keys stay rejected whether
++        set or deleted.
+     :param reasoning_effort: Per-session reasoning-effort hint.
+         Accepted metadata values are ``"none"``, ``"minimal"``,
+         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
+@@ -2586,7 +2595,7 @@ class UpdateSessionRequest(BaseModel):
+ 
+     runner_id: str | None = None
+     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+-    labels: dict[str, str] | None = None
++    labels: dict[str, str | None] | None = None
+     reasoning_effort: str | None = None
+     model_override: str | None = None
+     collaboration_mode: str | None = None
+diff --git a/omnigent/util/cost_plan.py b/omnigent/util/cost_plan.py
+index 20aaadf64e88f0250355cf57f8bec965caeccc54..9482e5654c1c3bc31d2eaa303a1620484387c999 100644
+--- a/omnigent/util/cost_plan.py
++++ b/omnigent/util/cost_plan.py
+@@ -16,7 +16,7 @@ from collections.abc import Mapping
+ COST_CONTROL_LABEL_NAMESPACE = "cost_control."
+ 
+ 
+-def reserved_cost_control_keys(labels: Mapping[str, str]) -> tuple[str, ...]:
++def reserved_cost_control_keys(labels: Mapping[str, str | None]) -> tuple[str, ...]:
+     """
+     Return the policy-owned ``cost_control.*`` keys present in *labels*.
+ 
+diff --git a/openapi.json b/openapi.json
+index 759ad12874e87fbce29d92518a11cad5709d9274..35f98fe8fe4417ca7654d5b53080599c4665c7ec 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -10005,7 +10005,14 @@
+             "anyOf": [
+               {
+                 "additionalProperties": {
+-                  "type": "string"
++                  "anyOf": [
++                    {
++                      "type": "string"
++                    },
++                    {
++                      "type": "null"
++                    }
++                  ]
+                 },
+                 "type": "object"
+               },
+@@ -10013,7 +10020,7 @@
+                 "type": "null"
+               }
+             ],
+-            "description": "Guardrails labels to upsert. Merges with existing labels; keys not present are left untouched.",
++            "description": "Guardrails labels to upsert. Merges with existing labels; keys not present are left untouched. A `null` value deletes that label. Server-internal keys stay rejected whether set or deleted.",
+             "title": "Labels"
+           },
+           "model_override": {
+diff --git a/tests/server/routes/test_session_create_project_consistency.py b/tests/server/routes/test_session_create_project_consistency.py
+index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd900078431d4f 100644
+--- a/tests/server/routes/test_session_create_project_consistency.py
++++ b/tests/server/routes/test_session_create_project_consistency.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from collections.abc import AsyncIterator
+ from pathlib import Path
+ 
+@@ -126,6 +127,85 @@ async def test_explicit_values_are_not_overridden(
+     assert response.json()["workspace"] == "/work/project/subdir"
+ 
+ 
++async def test_project_labels_fill_under_request_labels(
++    project_create_client: httpx.AsyncClient,
++) -> None:
++    """Project default labels land on the new session, the request's own
++    labels win on conflict, and internal or malformed entries are skipped."""
++    project_id = await _project(
++        project_create_client,
++        {
++            "agent_id": CUSTOM_AGENT_ID,
++            "labels": {
++                "team": "ml",
++                "env": "dev",
++                "omnigent.archived_at": "1",
++                "omni_project": "legacy",
++                "cost_control.plan": "{}",
++                "count": 3,
++                "k" * 129: "too long",
++            },
++        },
++    )
++    response = await project_create_client.post(
++        "/v1/sessions",
++        json={"project_id": project_id, "labels": {"env": "prod"}},
++        headers=_headers(),
++    )
++    assert response.status_code == 201, response.text
++    labels = response.json()["labels"]
++    assert labels["team"] == "ml"
++    assert labels["env"] == "prod"
++    for skipped in ("omnigent.archived_at", "omni_project", "cost_control.plan", "count"):
++        assert skipped not in labels
++    assert "k" * 129 not in labels
++
++
++async def test_final_request_labels_skip_project_labels(
++    project_create_client: httpx.AsyncClient,
++) -> None:
++    """A create whose labels are already the final set keeps a default removed
++    for this session off it, and still applies the project's other defaults."""
++    project_id = await _project(
++        project_create_client,
++        {"agent_id": CUSTOM_AGENT_ID, "labels": {"team": "ml", "env": "dev"}},
++    )
++    response = await project_create_client.post(
++        "/v1/sessions",
++        json={
++            "project_id": project_id,
++            "labels": {"env": "dev", "owner": "me"},
++            "apply_project_labels": False,
++        },
++        headers=_headers(),
++    )
++    assert response.status_code == 201, response.text
++    body = response.json()
++    assert body["agent_id"] == CUSTOM_AGENT_ID
++    assert body["project_id"] == project_id
++    assert body["labels"]["env"] == "dev"
++    assert body["labels"]["owner"] == "me"
++    assert "team" not in body["labels"]
++
++
++@pytest.mark.parametrize("malformed_labels", ["team=ml", ["team"], None])
++async def test_malformed_project_labels_are_ignored(
++    project_create_client: httpx.AsyncClient,
++    malformed_labels: object,
++) -> None:
++    project_id = await _project(
++        project_create_client,
++        {"agent_id": CUSTOM_AGENT_ID, "labels": malformed_labels},
++    )
++    response = await project_create_client.post(
++        "/v1/sessions",
++        json={"project_id": project_id, "labels": {"env": "prod"}},
++        headers=_headers(),
++    )
++    assert response.status_code == 201, response.text
++    assert response.json()["labels"]["env"] == "prod"
++
++
+ async def test_explicit_null_is_not_defaulted(
+     project_create_client: httpx.AsyncClient,
+ ) -> None:
+@@ -442,7 +522,9 @@ async def test_git_default_fill_with_differing_workspace(db_uri: str) -> None:
+ async def test_multipart_create_defaults_workspace_and_files_atomically(
+     project_create_client: httpx.AsyncClient,
+ ) -> None:
+-    project_id = await _project(project_create_client, {"workspace": "/work/upload"})
++    project_id = await _project(
++        project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
++    )
+     response = await project_create_client.post(
+         "/v1/sessions",
+         data={"metadata": f'{{"project_id":"{project_id}"}}'},
+@@ -462,6 +544,34 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
+     assert session.status_code == 200, session.text
+     assert session.json()["workspace"] == "/work/upload"
+     assert session.json()["project_id"] == project_id
++    assert session.json()["labels"]["team"] == "ml"
++
++
++async def test_multipart_final_labels_skip_project_labels(
++    project_create_client: httpx.AsyncClient,
++) -> None:
++    project_id = await _project(
++        project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
++    )
++    metadata = {"project_id": project_id, "labels": {"env": "dev"}, "apply_project_labels": False}
++    response = await project_create_client.post(
++        "/v1/sessions",
++        data={"metadata": json.dumps(metadata)},
++        files={
++            "bundle": (
++                "agent.tar.gz",
++                build_agent_bundle(name="project-upload-final-labels"),
++                "application/gzip",
++            )
++        },
++        headers=_headers(),
++    )
++    assert response.status_code == 201, response.text
++    session = await project_create_client.get(
++        f"/v1/sessions/{response.json()['session_id']}", headers=_headers()
++    )
++    assert session.json()["labels"]["env"] == "dev"
++    assert "team" not in session.json()["labels"]
+ 
+ 
+ async def test_multipart_malformed_project_config_is_structured_400(
+@@ -536,7 +646,9 @@ async def test_import_with_project_defaults_workspace_and_files_session(
+ ) -> None:
+     """An import naming a project consumes the resolver's decisions for real."""
+     _seed_claude_import_agent(db_uri)
+-    project_id = await _project(project_create_client, {"workspace": "/work/import"})
++    project_id = await _project(
++        project_create_client, {"workspace": "/work/import", "labels": {"team": "ml"}}
++    )
+     response = await project_create_client.post(
+         "/v1/imports",
+         json=_import_payload("project-import-1", project_id=project_id),
+@@ -549,6 +661,7 @@ async def test_import_with_project_defaults_workspace_and_files_session(
+     assert session.status_code == 200, session.text
+     assert session.json()["workspace"] == "/work/import"
+     assert session.json()["project_id"] == project_id
++    assert session.json()["labels"]["team"] == "ml"
+ 
+ 
+ async def test_import_with_unowned_or_unknown_project_is_404(
+diff --git a/tests/server/routes/test_sessions_cost_labels.py b/tests/server/routes/test_sessions_cost_labels.py
+index 5d0f7e4efd1edc33406ebf250458de874f78d2a4..a4918748fcd0d7ae95ca6800c26d0c3ac5126771 100644
+--- a/tests/server/routes/test_sessions_cost_labels.py
++++ b/tests/server/routes/test_sessions_cost_labels.py
+@@ -286,25 +286,48 @@ def test_wrong_runner_token_is_rejected(
+     assert COST_CONTROL_PLAN_LABEL not in conv.labels
+ 
+ 
++def test_editor_cannot_delete_cost_control_plan(
++    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
++) -> None:
++    """Deleting the plan label with a ``null`` value is gated like writing
++    it: erasing the verdict would spoof the telemetry just as well."""
++    conversation_store = stores[0]
++    app = _multi_user_app(stores)
++    conv_id = _seed_session(stores, editor=BOB)
++    conversation_store.set_labels(conv_id, {COST_CONTROL_PLAN_LABEL: _FORGED_PLAN})
++
++    resp = TestClient(app).patch(
++        f"/v1/sessions/{conv_id}",
++        json={"labels": {COST_CONTROL_PLAN_LABEL: None}},
++        headers={"X-Forwarded-Email": BOB},
++    )
++    assert resp.status_code == 403
++    conv = conversation_store.get_conversation(conv_id)
++    assert conv is not None
++    assert conv.labels[COST_CONTROL_PLAN_LABEL] == _FORGED_PLAN
++
++
+ def test_editor_can_still_patch_ordinary_labels(
+     stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+ ) -> None:
+-    """The gate is namespace-scoped: an editor's write of ordinary
+-    labels still succeeds — over-blocking would regress every existing
+-    labels client."""
++    """The gate is namespace-scoped: an editor's write or delete of
++    ordinary labels still succeeds — over-blocking would regress every
++    existing labels client."""
+     conversation_store = stores[0]
+     app = _multi_user_app(stores)
+     conv_id = _seed_session(stores, editor=BOB)
++    conversation_store.set_labels(conv_id, {"stale": "yes"})
+ 
+     resp = TestClient(app).patch(
+         f"/v1/sessions/{conv_id}",
+-        json={"labels": {"team": "ml"}},
++        json={"labels": {"team": "ml", "stale": None}},
+         headers={"X-Forwarded-Email": BOB},
+     )
+     assert resp.status_code == 200
+     conv = conversation_store.get_conversation(conv_id)
+     assert conv is not None
+     assert conv.labels["team"] == "ml"
++    assert "stale" not in conv.labels
+ 
+ 
+ # ── PATCH: the bound runner's write keeps working ────────────────────────────
+diff --git a/tests/server/routes/test_sessions_crud.py b/tests/server/routes/test_sessions_crud.py
+index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..50d0f39e2b6aa47d9b98cfbde1f817628adef589 100644
+--- a/tests/server/routes/test_sessions_crud.py
++++ b/tests/server/routes/test_sessions_crud.py
+@@ -570,19 +570,22 @@ async def test_patch_session_sets_project_label(
+     assert conv.labels.get("omni_project") == "Sprint 42"
+ 
+ 
++@pytest.mark.parametrize("clear_value", ["", None])
+ async def test_patch_session_empty_project_removes_label(
+     client: httpx.AsyncClient,
+     session_id: str,
+     db_uri: str,
++    clear_value: str | None,
+ ) -> None:
+-    """PATCH with ``labels: {project: ""}`` removes the project label rather
+-    than persisting an empty value — so the session returns to Unfiled."""
++    """PATCH with ``labels: {project: ""}`` (or ``null``) removes the project
++    label rather than persisting an empty value — so the session returns to
++    Unfiled."""
+     conv_store = SqlAlchemyConversationStore(db_uri)
+     conv_store.set_labels(session_id, {"omni_project": "Sprint 42"})
+ 
+     resp = await client.patch(
+         f"/v1/sessions/{session_id}",
+-        json={"labels": {"omni_project": ""}},
++        json={"labels": {"omni_project": clear_value}},
+         headers={"Content-Type": "application/json"},
+     )
+     assert resp.status_code == 200
+@@ -592,6 +595,67 @@ async def test_patch_session_empty_project_removes_label(
+     assert "omni_project" not in conv.labels
+ 
+ 
++# ── PATCH /v1/sessions/{id} user label deletion ──────────────────────
++
++
++async def test_patch_session_null_label_deletes_it(
++    client: httpx.AsyncClient,
++    session_id: str,
++    db_uri: str,
++) -> None:
++    """A ``null`` label value deletes that label while the rest of the same
++    PATCH still upserts, and untouched labels are kept."""
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    conv_store.set_labels(session_id, {"team": "ml", "env": "dev", "owner": "ana"})
++
++    resp = await client.patch(
++        f"/v1/sessions/{session_id}",
++        json={"labels": {"team": None, "env": "prod", "never-set": None}},
++        headers={"Content-Type": "application/json"},
++    )
++    assert resp.status_code == 200, resp.text
++    assert "team" not in resp.json()["labels"]
++
++    conv = conv_store.get_conversation(session_id)
++    assert conv is not None
++    assert "team" not in conv.labels
++    assert "never-set" not in conv.labels
++    assert conv.labels["env"] == "prod"
++    assert conv.labels["owner"] == "ana"
++
++
++@pytest.mark.parametrize(
++    "reserved_key",
++    [
++        "omnigent.archived_at",
++        "omnigent.sandbox.repo",
++        "omnigent.pinned.bob@example.com",
++        "omnigent.turn_actor",
++        "omnigent.mcp_service.github",
++    ],
++)
++async def test_patch_rejects_deleting_server_reserved_label(
++    client: httpx.AsyncClient,
++    session_id: str,
++    db_uri: str,
++    reserved_key: str,
++) -> None:
++    """Deleting a server-internal label is rejected exactly like setting it,
++    and the stored value survives."""
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    conv_store.set_labels(session_id, {reserved_key: "server-written"})
++
++    resp = await client.patch(
++        f"/v1/sessions/{session_id}",
++        json={"labels": {reserved_key: None}},
++        headers={"Content-Type": "application/json"},
++    )
++    assert resp.status_code == 400, resp.text
++    conv = conv_store.get_conversation(session_id)
++    assert conv is not None
++    assert conv.labels[reserved_key] == "server-written"
++
++
+ # ── Pinned session label (omnigent.pinned) ───────────────────────────
+ 
+ 
+diff --git a/web/src/components/AgentInfo.test.tsx b/web/src/components/AgentInfo.test.tsx
+index 70276ffd0c7d1749ab1c338f8b149186b8080126..1ac5c1b68cc76ba636450e46b80f75e723d2b6d4 100644
+--- a/web/src/components/AgentInfo.test.tsx
++++ b/web/src/components/AgentInfo.test.tsx
+@@ -58,6 +58,23 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
+   getCurrentUserId: () => viewerData.current,
+ }));
+ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
++// The session snapshot feeding the Labels section, and its PATCH mutation.
++const sessionLabelsData = vi.hoisted(() => ({
++  current: undefined as Record<string, string> | undefined,
++}));
++const { updateLabelsMutateAsync } = vi.hoisted(() => ({
++  updateLabelsMutateAsync: vi.fn((_changes: Record<string, string | null>) => Promise.resolve()),
++}));
++vi.mock("@/hooks/useSession", () => ({
++  useSession: () => ({
++    session: sessionLabelsData.current ? { labels: sessionLabelsData.current } : null,
++    isLoading: false,
++    error: null,
++  }),
++}));
++vi.mock("@/hooks/useSessionLabels", () => ({
++  useUpdateSessionLabels: () => ({ mutateAsync: updateLabelsMutateAsync, isPending: false }),
++}));
+ // The codex-only "Restart with model…" dialog mounts (closed) inside
+ // AgentInfoContent for codex sessions; stub its routing + fork deps so it
+ // renders without a Router/network in jsdom.
+@@ -104,6 +121,8 @@ afterEach(() => {
+   ownerData.current = null;
+   viewerData.current = null;
+   grantsData.current = undefined;
++  sessionLabelsData.current = undefined;
++  updateLabelsMutateAsync.mockClear();
+ });
+ 
+ function renderButton(agent: Agent | undefined) {
+@@ -949,6 +968,114 @@ describe("SessionPoliciesSection", () => {
+   });
+ });
+ 
++describe("SessionLabelsSection", () => {
++  it("lists user labels and hides internal ones", () => {
++    sessionLabelsData.current = {
++      team: "ml",
++      env: "prod",
++      "omnigent.wrapper": "claude-code-native-ui",
++      "omnigent.pinned": "1",
++      omni_project: "Sprint",
++      "cost_control.plan": "{}",
++    };
++    renderContent("conv_labels");
++    const section = screen.getByTestId("agent-info-labels");
++    const rows = within(section).getAllByTestId("agent-info-labels-editor-row");
++    expect(rows.map((row) => row.textContent)).toEqual(["env:prod", "team:ml"]);
++    expect(within(section).queryByText(/omnigent\./)).toBeNull();
++    expect(within(section).queryByText(/Sprint/)).toBeNull();
++  });
++
++  it("adds, edits and removes labels through the session PATCH", async () => {
++    sessionLabelsData.current = { team: "ml" };
++    renderContent("conv_labels");
++    const section = screen.getByTestId("agent-info-labels");
++
++    fireEvent.click(within(section).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(section).getByLabelText("New label key"), {
++      target: { value: " env " },
++    });
++    fireEvent.change(within(section).getByLabelText("New label value"), {
++      target: { value: "prod" },
++    });
++    await act(async () => {
++      fireEvent.click(within(section).getByRole("button", { name: "Add" }));
++    });
++    expect(updateLabelsMutateAsync).toHaveBeenLastCalledWith({ env: "prod" });
++    expect(within(section).queryByLabelText("New label key")).toBeNull();
++
++    fireEvent.click(within(section).getByRole("button", { name: "Edit label team" }));
++    const valueInput = within(section).getByLabelText("Value for label team");
++    fireEvent.change(valueInput, { target: { value: "infra" } });
++    await act(async () => {
++      fireEvent.keyDown(valueInput, { key: "Enter" });
++    });
++    expect(updateLabelsMutateAsync).toHaveBeenLastCalledWith({ team: "infra" });
++
++    await act(async () => {
++      fireEvent.click(within(section).getByRole("button", { name: "Remove label team" }));
++    });
++    expect(updateLabelsMutateAsync).toHaveBeenLastCalledWith({ team: null });
++  });
++
++  it("validates key and value length inline without saving", () => {
++    sessionLabelsData.current = {};
++    renderContent("conv_labels");
++    const section = screen.getByTestId("agent-info-labels");
++
++    fireEvent.click(within(section).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(section).getByLabelText("New label key"), {
++      target: { value: "k".repeat(129) },
++    });
++    fireEvent.click(within(section).getByRole("button", { name: "Add" }));
++    expect(within(section).getByRole("alert")).toHaveTextContent(
++      "Key must be 128 characters or fewer.",
++    );
++
++    fireEvent.change(within(section).getByLabelText("New label key"), {
++      target: { value: "team" },
++    });
++    fireEvent.change(within(section).getByLabelText("New label value"), {
++      target: { value: "v".repeat(257) },
++    });
++    fireEvent.click(within(section).getByRole("button", { name: "Add" }));
++    expect(within(section).getByRole("alert")).toHaveTextContent(
++      "Value must be 256 characters or fewer.",
++    );
++    expect(updateLabelsMutateAsync).not.toHaveBeenCalled();
++  });
++
++  it("keeps the input and shows the server error when the PATCH fails", async () => {
++    sessionLabelsData.current = {};
++    updateLabelsMutateAsync.mockRejectedValueOnce(new Error("label rejected"));
++    renderContent("conv_labels");
++    const section = screen.getByTestId("agent-info-labels");
++
++    fireEvent.click(within(section).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(section).getByLabelText("New label key"), {
++      target: { value: "team" },
++    });
++    await act(async () => {
++      fireEvent.click(within(section).getByRole("button", { name: "Add" }));
++    });
++    expect(within(section).getByRole("alert")).toHaveTextContent("label rejected");
++    expect(within(section).getByLabelText("New label key")).toHaveValue("team");
++  });
++
++  it("is read-only for a viewer without edit access, and hidden when empty", () => {
++    sessionLabelsData.current = { team: "ml" };
++    const { unmount } = renderContent("conv_labels", 1);
++    const section = screen.getByTestId("agent-info-labels");
++    expect(within(section).getByText("ml")).toBeInTheDocument();
++    expect(within(section).queryByRole("button")).toBeNull();
++    unmount();
++
++    sessionLabelsData.current = { "omnigent.wrapper": "claude-code-native-ui" };
++    renderContent("conv_labels", 1);
++    expect(screen.queryByTestId("agent-info-labels")).toBeNull();
++  });
++});
++
+ describe("McpServersSection", () => {
+   beforeEach(() => {
+     createMcpMutate.mockClear();
+diff --git a/web/src/components/AgentInfo.tsx b/web/src/components/AgentInfo.tsx
+index 9ad67732aa21105d3ce6b70ebead6212d78e5bb5..4724cb2c4e85b46235b400c4bd18f95818143431 100644
+--- a/web/src/components/AgentInfo.tsx
++++ b/web/src/components/AgentInfo.tsx
+@@ -35,7 +35,7 @@ import {
+   type PolicyRegistryEntry,
+ } from "@/hooks/usePolicies";
+ import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
+-import { isOwnerLevel, isSessionSharedWithOthers } from "@/lib/permissionsApi";
++import { isEditorLevel, isOwnerLevel, isSessionSharedWithOthers } from "@/lib/permissionsApi";
+ import { getCurrentUserId } from "@/lib/identity";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+@@ -59,6 +59,10 @@ import { copyText } from "@/lib/clipboard";
+ import { useChatStore } from "@/store/chatStore";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
++import { useSession } from "@/hooks/useSession";
++import { useUpdateSessionLabels } from "@/hooks/useSessionLabels";
++import { LabelEditor } from "@/components/LabelEditor";
++import { userLabelEntries } from "@/lib/sessionLabels";
+ 
+ const MCP_SERVERS_UPDATED_TOAST = (
+   <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>
+@@ -1203,6 +1207,35 @@ function McpServersSection({
+   );
+ }
+ 
++// ---------------------------------------------------------------------------
++// Session labels section
++// ---------------------------------------------------------------------------
++
++/**
++ * The session's user labels, editable by anyone with edit access. Hidden for
++ * a read-only viewer when there are none to show.
++ */
++function SessionLabelsSection({ sessionId, editable }: { sessionId: string; editable: boolean }) {
++  const { session } = useSession(sessionId);
++  const updateLabels = useUpdateSessionLabels(sessionId);
++  const labels = session?.labels;
++  if (!editable && userLabelEntries(labels).length === 0) return null;
++
++  return (
++    <div className="flex flex-col gap-1.5 py-3" data-testid="agent-info-labels">
++      <SectionLabel>Labels</SectionLabel>
++      <LabelEditor
++        labels={labels}
++        readOnly={!editable}
++        disabled={!session}
++        onSet={(key, value) => updateLabels.mutateAsync({ [key]: value })}
++        onRemove={(key) => updateLabels.mutateAsync({ [key]: null })}
++        testIdPrefix="agent-info-labels-editor"
++      />
++    </div>
++  );
++}
++
+ // ---------------------------------------------------------------------------
+ // Session policies section (user-editable only)
+ // ---------------------------------------------------------------------------
+@@ -1471,6 +1504,9 @@ export function AgentInfoContent({
+             )}
+           </div>
+         )}
++      {sessionId && (
++        <SessionLabelsSection sessionId={sessionId} editable={isEditorLevel(permissionLevel)} />
++      )}
+       <McpServersSection
+         sessionId={sessionId}
+         servers={servers}
+diff --git a/web/src/components/LabelEditor.tsx b/web/src/components/LabelEditor.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..2636747097485a1a26698649007e74d1be875772
+--- /dev/null
++++ b/web/src/components/LabelEditor.tsx
+@@ -0,0 +1,323 @@
++// Key/value editor for user labels ("tags"), shared by the session info
++// popover (each change PATCHes the session) and the project settings dialog
++// (changes edit a draft saved with the dialog). Internal labels are hidden.
++//
++// It renders no <form>: the project dialog already wraps it in one, so Enter
++// is handled on the inputs instead of by implicit form submission.
++
++import { useImperativeHandle, useState, type KeyboardEvent, type Ref } from "react";
++import { CheckIcon, PencilIcon, PlusIcon, XIcon } from "lucide-react";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { labelValidationError, userLabelEntries } from "@/lib/sessionLabels";
++
++/** What {@link LabelEditorHandle.takePendingLabel} found in the add row. */
++export type PendingLabel =
++  { status: "none" } | { status: "valid"; key: string; value: string } | { status: "invalid" };
++
++/** Lets a parent that saves in bulk collect a label typed but not yet added. */
++export interface LabelEditorHandle {
++  /**
++   * Take the add row's label: a valid one is cleared from the row for the
++   * caller to save, and an invalid one shows its inline message.
++   */
++  takePendingLabel: () => PendingLabel;
++}
++
++interface LabelEditorProps {
++  /** Every label on the target; internal keys are filtered out for display. */
++  labels: Record<string, string> | null | undefined;
++  /** Show labels without add / edit / remove controls. */
++  readOnly?: boolean;
++  /** Disable the controls, e.g. while a parent is loading or saving. */
++  disabled?: boolean;
++  /** Set one label. A rejected promise keeps the input and shows its message. */
++  onSet: (key: string, value: string) => Promise<unknown> | void;
++  /** Remove one label. A rejected promise shows its message. */
++  onRemove: (key: string) => Promise<unknown> | void;
++  /** Text shown when there are no user labels. */
++  emptyText?: string;
++  /** Prefix for the `data-testid`s inside the editor. */
++  testIdPrefix?: string;
++  /** Handle for collecting the add row's pending label. */
++  handleRef?: Ref<LabelEditorHandle>;
++  /** Short note shown after a label's value, e.g. where it came from. */
++  rowNote?: (key: string, value: string) => string | null;
++}
++
++function errorMessage(err: unknown): string {
++  return err instanceof Error ? err.message : String(err);
++}
++
++/** Run `handler` on Enter without submitting an enclosing form. */
++function onEnter(handler: () => void) {
++  return (event: KeyboardEvent<HTMLInputElement>) => {
++    if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
++    event.preventDefault();
++    handler();
++  };
++}
++
++function LabelRowNote({ note }: { note: string | null | undefined }) {
++  if (!note) return null;
++  return <span className="shrink-0 font-sans text-xs text-muted-foreground">{note}</span>;
++}
++
++export function LabelEditor({
++  labels,
++  readOnly = false,
++  disabled = false,
++  onSet,
++  onRemove,
++  emptyText = "No labels",
++  testIdPrefix = "label-editor",
++  handleRef,
++  rowNote,
++}: LabelEditorProps) {
++  const entries = userLabelEntries(labels);
++  const [editingKey, setEditingKey] = useState<string | null>(null);
++  const [editValue, setEditValue] = useState("");
++  const [adding, setAdding] = useState(false);
++  const [newKey, setNewKey] = useState("");
++  const [newValue, setNewValue] = useState("");
++  const [error, setError] = useState<string | null>(null);
++  const [pending, setPending] = useState(false);
++  const controlsDisabled = disabled || pending;
++
++  async function run(action: () => Promise<unknown> | void, onDone: () => void) {
++    setPending(true);
++    setError(null);
++    try {
++      await action();
++      onDone();
++    } catch (err) {
++      setError(errorMessage(err));
++    } finally {
++      setPending(false);
++    }
++  }
++
++  function startEdit(key: string, value: string) {
++    setAdding(false);
++    setError(null);
++    setEditingKey(key);
++    setEditValue(value);
++  }
++
++  function saveEdit() {
++    if (editingKey === null) return;
++    const value = editValue.trim();
++    const invalid = labelValidationError(editingKey, value);
++    if (invalid) {
++      setError(invalid);
++      return;
++    }
++    void run(
++      () => onSet(editingKey, value),
++      () => setEditingKey(null),
++    );
++  }
++
++  function resetAdd() {
++    setAdding(false);
++    setNewKey("");
++    setNewValue("");
++  }
++
++  /** Validate the add row, showing its message when invalid. */
++  function validateNew(): { key: string; value: string } | null {
++    const key = newKey.trim();
++    const value = newValue.trim();
++    const invalid =
++      labelValidationError(key, value) ??
++      (entries.some(([existing]) => existing === key)
++        ? `"${key}" already exists. Edit it instead.`
++        : null);
++    if (invalid) {
++      setError(invalid);
++      return null;
++    }
++    return { key, value };
++  }
++
++  function saveNew() {
++    const label = validateNew();
++    if (label) void run(() => onSet(label.key, label.value), resetAdd);
++  }
++
++  useImperativeHandle(handleRef, () => ({
++    takePendingLabel: () => {
++      if (!adding || (!newKey.trim() && !newValue.trim())) return { status: "none" };
++      const label = validateNew();
++      if (!label) return { status: "invalid" };
++      setError(null);
++      resetAdd();
++      return { status: "valid", ...label };
++    },
++  }));
++
++  return (
++    <div className="flex flex-col gap-1.5" data-testid={testIdPrefix}>
++      {entries.length > 0 ? (
++        <ul className="flex flex-col gap-1">
++          {entries.map(([key, value]) =>
++            editingKey === key ? (
++              <li key={key} className="flex min-w-0 items-center gap-1">
++                <span className="max-w-[40%] shrink-0 truncate font-mono text-sm text-muted-foreground">
++                  {key}
++                </span>
++                <Input
++                  autoFocus
++                  value={editValue}
++                  onChange={(e) => setEditValue(e.target.value)}
++                  onKeyDown={onEnter(saveEdit)}
++                  aria-label={`Value for label ${key}`}
++                  className="h-7 font-mono text-sm"
++                  disabled={controlsDisabled}
++                />
++                <Button
++                  type="button"
++                  variant="ghost"
++                  size="icon-xs"
++                  aria-label={`Save label ${key}`}
++                  onClick={saveEdit}
++                  disabled={controlsDisabled}
++                >
++                  <CheckIcon className="size-3" />
++                </Button>
++                <Button
++                  type="button"
++                  variant="ghost"
++                  size="icon-xs"
++                  aria-label="Cancel editing"
++                  onClick={() => {
++                    setEditingKey(null);
++                    setError(null);
++                  }}
++                  disabled={pending}
++                >
++                  <XIcon className="size-3" />
++                </Button>
++              </li>
++            ) : (
++              <li
++                key={key}
++                className="flex min-w-0 items-center gap-1 font-mono text-sm"
++                data-testid={`${testIdPrefix}-row`}
++              >
++                <span className="max-w-[40%] shrink-0 truncate text-muted-foreground" title={key}>
++                  {key}:
++                </span>
++                <span className="min-w-0 flex-1 truncate" title={value}>
++                  {value}
++                </span>
++                <LabelRowNote note={rowNote?.(key, value)} />
++                {!readOnly && (
++                  <>
++                    <Button
++                      type="button"
++                      variant="ghost"
++                      size="icon-xs"
++                      aria-label={`Edit label ${key}`}
++                      onClick={() => startEdit(key, value)}
++                      disabled={controlsDisabled}
++                    >
++                      <PencilIcon className="size-3" />
++                    </Button>
++                    <Button
++                      type="button"
++                      variant="ghost"
++                      size="icon-xs"
++                      aria-label={`Remove label ${key}`}
++                      onClick={() =>
++                        void run(
++                          () => onRemove(key),
++                          () => {},
++                        )
++                      }
++                      disabled={controlsDisabled}
++                    >
++                      <XIcon className="size-3 text-destructive" />
++                    </Button>
++                  </>
++                )}
++              </li>
++            ),
++          )}
++        </ul>
++      ) : (
++        <p className="text-sm text-muted-foreground">{emptyText}</p>
++      )}
++      {!readOnly &&
++        (adding ? (
++          <div className="flex flex-col gap-1">
++            <div className="flex min-w-0 items-center gap-1">
++              <Input
++                autoFocus
++                value={newKey}
++                onChange={(e) => setNewKey(e.target.value)}
++                onKeyDown={onEnter(saveNew)}
++                placeholder="key"
++                aria-label="New label key"
++                className="h-7 font-mono text-sm"
++                disabled={controlsDisabled}
++              />
++              <Input
++                value={newValue}
++                onChange={(e) => setNewValue(e.target.value)}
++                onKeyDown={onEnter(saveNew)}
++                placeholder="value"
++                aria-label="New label value"
++                className="h-7 font-mono text-sm"
++                disabled={controlsDisabled}
++              />
++            </div>
++            <div className="flex justify-end gap-1">
++              <Button
++                type="button"
++                variant="ghost"
++                size="xs"
++                onClick={() => {
++                  resetAdd();
++                  setError(null);
++                }}
++                disabled={pending}
++              >
++                Cancel
++              </Button>
++              <Button
++                type="button"
++                size="xs"
++                onClick={saveNew}
++                loading={pending}
++                disabled={controlsDisabled}
++              >
++                Add
++              </Button>
++            </div>
++          </div>
++        ) : (
++          <Button
++            type="button"
++            variant="ghost"
++            size="xs"
++            className="self-start text-muted-foreground"
++            onClick={() => {
++              setEditingKey(null);
++              setError(null);
++              setAdding(true);
++            }}
++            disabled={controlsDisabled}
++          >
++            <PlusIcon className="size-3" />
++            Add label
++          </Button>
++        ))}
++      {error && (
++        <p role="alert" className="text-sm text-destructive">
++          {error}
++        </p>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/components/composer/ComposerAddMenu.tsx b/web/src/components/composer/ComposerAddMenu.tsx
+index 785d7c49688664211f4106c230977efea5b780ab..80da9939b05456a0277a06987b11cd617123bc8c 100644
+--- a/web/src/components/composer/ComposerAddMenu.tsx
++++ b/web/src/components/composer/ComposerAddMenu.tsx
+@@ -5,6 +5,7 @@ import {
+   MessagesSquareIcon,
+   PaperclipIcon,
+   PlusIcon,
++  TagIcon,
+   TargetIcon,
+ } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+@@ -35,6 +36,8 @@ export function ComposerAddMenu({
+   onSideChat,
+   projects = EMPTY_PROJECTS,
+   onProjectSelect,
++  onLabels,
++  labelCount = 0,
+ }: {
+   disabled: boolean;
+   onAttach: () => void;
+@@ -55,10 +58,15 @@ export function ComposerAddMenu({
+   onSideChat?: () => void;
+   projects?: readonly { name: string }[];
+   onProjectSelect?: (name: string) => void;
++  /** Edit the labels a new session starts with. */
++  onLabels?: () => void;
++  labelCount?: number;
+ }) {
+   const [open, setOpen] = useState(false);
+   const [showProjects, setShowProjects] = useState(false);
+   const pendingGoalRef = useRef(false);
++  // Opened once the menu has closed, so the menu's focus return can't close it.
++  const pendingLabelsRef = useRef(false);
+   const triggerRef = useRef<HTMLButtonElement>(null);
+   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
+   const measure = useCallback(() => {
+@@ -121,6 +129,10 @@ export function ComposerAddMenu({
+             pendingGoalRef.current = false;
+             requestAnimationFrame(() => onGoal?.());
+           }
++          if (pendingLabelsRef.current) {
++            pendingLabelsRef.current = false;
++            requestAnimationFrame(() => onLabels?.());
++          }
+         }}
+         side="top"
+         align="start"
+@@ -158,7 +170,7 @@ export function ComposerAddMenu({
+                 <span>Files and images</span>
+               </DropdownMenuItem>
+             </div>
+-            {(showGoal || showPlan || onProjectSelect || onSideChat) && (
++            {(showGoal || showPlan || onProjectSelect || onSideChat || onLabels) && (
+               <div className="flex flex-col gap-0.5">
+                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
+                 <div className="flex flex-col gap-px">
+@@ -210,6 +222,24 @@ export function ComposerAddMenu({
+                       </span>
+                     </DropdownMenuItem>
+                   )}
++                  {onLabels && (
++                    <DropdownMenuItem
++                      data-testid={`${testIdPrefix}-labels-action`}
++                      onSelect={() => {
++                        pendingLabelsRef.current = true;
++                      }}
++                    >
++                      <span className="flex size-4 shrink-0 items-center justify-center">
++                        <TagIcon className="size-3.5" />
++                      </span>
++                      <span className="shrink-0">Labels</span>
++                      <span className="truncate text-xs leading-4 text-muted-foreground">
++                        {labelCount === 0
++                          ? "Tag this session"
++                          : `${labelCount} label${labelCount === 1 ? "" : "s"}`}
++                      </span>
++                    </DropdownMenuItem>
++                  )}
+                   {onProjectSelect && (
+                     <DropdownMenuItem
+                       onSelect={(event) => {
+diff --git a/web/src/components/composer/NewSessionLabels.tsx b/web/src/components/composer/NewSessionLabels.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..83c4352ade094e4a811b5510cf7331cebd9c5477
+--- /dev/null
++++ b/web/src/components/composer/NewSessionLabels.tsx
+@@ -0,0 +1,116 @@
++// Labels for a session not created yet: chips in the new-session composer and
++// the editor the composer's "+" menu opens. Project defaults come pre-filled.
++
++import { useRef } from "react";
++import { TagIcon, XIcon } from "lucide-react";
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { ComposerChipRow } from "@/components/composer/ChatComposer";
++import { LabelEditor, type LabelEditorHandle } from "@/components/LabelEditor";
++import { userLabelEntries } from "@/lib/sessionLabels";
++
++/** One chip per label the new session will start with; a chip opens the editor. */
++export function NewSessionLabelChips({
++  labels,
++  onEdit,
++  onRemove,
++}: {
++  labels: Record<string, string>;
++  onEdit: () => void;
++  onRemove: (key: string) => void;
++}) {
++  const entries = userLabelEntries(labels);
++  if (entries.length === 0) return null;
++  return (
++    <ComposerChipRow className="gap-1.5" data-testid="new-session-label-chips">
++      {entries.map(([key, value]) => (
++        <span
++          key={key}
++          className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
++        >
++          <button
++            type="button"
++            onClick={onEdit}
++            className="flex min-w-0 items-center gap-1 hover:text-foreground"
++            aria-label={`Edit labels (${key}: ${value})`}
++          >
++            <TagIcon className="size-3 shrink-0" />
++            <span className="max-w-[200px] truncate font-mono" title={`${key}: ${value}`}>
++              {key}: {value}
++            </span>
++          </button>
++          <button
++            type="button"
++            onClick={() => onRemove(key)}
++            className="ml-0.5 rounded-full hover:text-foreground"
++            aria-label={`Remove label ${key}`}
++          >
++            <XIcon className="size-3" />
++          </button>
++        </span>
++      ))}
++    </ComposerChipRow>
++  );
++}
++
++/** Edit the new session's labels; a valid label left in the add row is kept on close. */
++export function NewSessionLabelsDialog({
++  open,
++  onOpenChange,
++  labels,
++  projectDefaults,
++  projectName,
++  onSet,
++  onRemove,
++}: {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++  labels: Record<string, string>;
++  projectDefaults: Record<string, string>;
++  projectName: string;
++  onSet: (key: string, value: string) => void;
++  onRemove: (key: string) => void;
++}) {
++  const editorRef = useRef<LabelEditorHandle>(null);
++  const close = () => {
++    const pending = editorRef.current?.takePendingLabel() ?? { status: "none" };
++    if (pending.status === "invalid") return;
++    if (pending.status === "valid") onSet(pending.key, pending.value);
++    onOpenChange(false);
++  };
++  return (
++    <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(true) : close())}>
++      <DialogContent className="sm:max-w-md" data-testid="new-session-labels-dialog">
++        <DialogHeader>
++          <DialogTitle>Labels</DialogTitle>
++          <DialogDescription>
++            {projectName
++              ? `Added to the new session. ${projectName}'s default labels are filled in; removing one leaves it off this session only.`
++              : "Added to the new session."}
++          </DialogDescription>
++        </DialogHeader>
++        <LabelEditor
++          labels={labels}
++          onSet={onSet}
++          onRemove={onRemove}
++          emptyText="No labels"
++          testIdPrefix="new-session-labels-editor"
++          handleRef={editorRef}
++          rowNote={(key, value) => (projectDefaults[key] === value ? "from project" : null)}
++        />
++        <DialogFooter className="border-t-0 bg-transparent">
++          <Button type="button" onClick={close} data-testid="new-session-labels-done">
++            Done
++          </Button>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/web/src/hooks/useSessionLabels.ts b/web/src/hooks/useSessionLabels.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba3e84ac2150b3f620cd527cccb7ff8f94ff39e2
+--- /dev/null
++++ b/web/src/hooks/useSessionLabels.ts
+@@ -0,0 +1,51 @@
++import { useEffect, useMemo, useState } from "react";
++import { useMutation, useQueryClient } from "@tanstack/react-query";
++import { newSessionLabels } from "@/lib/sessionLabels";
++import { overlayLabelsIntoCaches } from "@/lib/sessionListCache";
++import { updateSession } from "@/lib/sessionsApi";
++
++/**
++ * Set or delete a session's user labels via `PATCH /v1/sessions/{id}`. A
++ * `null` value deletes that label. The server-confirmed label map is then
++ * painted onto every cache that renders the session.
++ *
++ * @param sessionId - The session to edit, e.g. `"conv_abc123"`.
++ */
++export function useUpdateSessionLabels(sessionId: string | null | undefined) {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (changes: Record<string, string | null>) => {
++      if (!sessionId) throw new Error("No session selected");
++      return updateSession(sessionId, { labels: changes });
++    },
++    onSuccess: (updated) => overlayLabelsIntoCaches(queryClient, updated.id, updated.labels ?? {}),
++  });
++}
++
++/**
++ * Labels for a session not created yet: the project's defaults plus this
++ * session's edits. Removing a default only leaves it off this session.
++ *
++ * @param projectDefaults - The selected project's default labels, `{}` without one.
++ * @param projectName - The selected project; switching it forgets removed defaults.
++ */
++export function useNewSessionLabels(projectDefaults: Record<string, string>, projectName: string) {
++  const [edits, setEdits] = useState<Record<string, string | null>>({});
++  useEffect(() => {
++    setEdits((prev) => Object.fromEntries(Object.entries(prev).filter(([, v]) => v !== null)));
++  }, [projectName]);
++  const resolved = useMemo(
++    () => newSessionLabels(projectDefaults, edits),
++    [projectDefaults, edits],
++  );
++  return {
++    ...resolved,
++    setLabel: (key: string, value: string) => setEdits((prev) => ({ ...prev, [key]: value })),
++    removeLabel: (key: string) =>
++      setEdits((prev) => {
++        const rest = Object.fromEntries(Object.entries(prev).filter(([k]) => k !== key));
++        return key in projectDefaults ? { ...rest, [key]: null } : rest;
++      }),
++    reset: () => setEdits({}),
++  };
++}
+diff --git a/web/src/lib/projectsApi.ts b/web/src/lib/projectsApi.ts
+index d0653595336fdec6386f6b6e6de16ded01eca0ee..5a21d4350a75ba3d617ed512fd1aaba8ceddddb4 100644
+--- a/web/src/lib/projectsApi.ts
++++ b/web/src/lib/projectsApi.ts
+@@ -17,7 +17,8 @@ import { apiErrorFromResponse } from "./sessionsApi";
+  * Default session settings a project stores, pre-filled into the new-chat
+  * composer. All fields optional — an unset key means "no default for this
+  * slot". The vocabulary is client-owned; the server persists the object whole
+- * and never acts on it, so adding a key here needs no backend change.
++ * and reads only the session-create defaults (`agent_id`, `workspace`, `git`,
++ * `labels`) from it, so adding another key here needs no backend change.
+  */
+ export interface ProjectConfig {
+   /** Default host id, or the sandbox sentinel. */
+@@ -57,6 +58,12 @@ export interface ProjectConfig {
+    * harness on it, the composer falls back to the host default and says so.
+    */
+   provider?: string;
++  /**
++   * Labels stamped on every session created in the project, under any labels
++   * the create request sets itself. Applied server-side at creation only, so
++   * moving an existing session into the project doesn't add them.
++   */
++  labels?: Record<string, string>;
+ }
+ 
+ /** A first-class project. Mirrors the `ProjectObject` response shape. */
+diff --git a/web/src/lib/sessionLabels.test.ts b/web/src/lib/sessionLabels.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6315a1216077ad90d89d6830bb26dd0d9a8578d1
+--- /dev/null
++++ b/web/src/lib/sessionLabels.test.ts
+@@ -0,0 +1,111 @@
++import { describe, expect, it } from "vitest";
++import {
++  LABEL_KEY_MAX_LENGTH,
++  LABEL_VALUE_MAX_LENGTH,
++  isInternalLabelKey,
++  labelRecordFromUnknown,
++  labelValidationError,
++  labelsEqual,
++  newSessionLabels,
++  projectDefaultLabels,
++  userLabelEntries,
++} from "./sessionLabels";
++
++describe("isInternalLabelKey", () => {
++  it.each(["omnigent.pinned", "omnigent.wrapper", "cost_control.plan", "omni_project"])(
++    "treats %s as internal",
++    (key) => expect(isInternalLabelKey(key)).toBe(true),
++  );
++
++  it.each(["team", "omnigent", "omni_project_name", "cost-center"])(
++    "treats %s as a user label",
++    (key) => expect(isInternalLabelKey(key)).toBe(false),
++  );
++});
++
++describe("userLabelEntries", () => {
++  it("drops internal keys and sorts by key", () => {
++    expect(
++      userLabelEntries({
++        team: "ml",
++        "omnigent.pinned": "1",
++        env: "prod",
++        omni_project: "Sprint",
++        "cost_control.plan": "{}",
++      }),
++    ).toEqual([
++      ["env", "prod"],
++      ["team", "ml"],
++    ]);
++  });
++
++  it("returns nothing for a missing map", () => {
++    expect(userLabelEntries(undefined)).toEqual([]);
++  });
++});
++
++describe("labelValidationError", () => {
++  it("accepts a key at the column width, a value at its width, and an empty value", () => {
++    expect(
++      labelValidationError("k".repeat(LABEL_KEY_MAX_LENGTH), "v".repeat(LABEL_VALUE_MAX_LENGTH)),
++    ).toBeNull();
++    expect(labelValidationError("tag", "")).toBeNull();
++  });
++
++  it.each([
++    ["", "x", "Key is required."],
++    ["k".repeat(LABEL_KEY_MAX_LENGTH + 1), "x", "Key must be 128 characters or fewer."],
++    ["team", "v".repeat(LABEL_VALUE_MAX_LENGTH + 1), "Value must be 256 characters or fewer."],
++    ["omnigent.pinned", "1", '"omnigent.pinned" is reserved for Omnigent.'],
++  ])("rejects key %j", (key, value, message) => {
++    expect(labelValidationError(key, value)).toBe(message);
++  });
++});
++
++describe("labelRecordFromUnknown", () => {
++  it("keeps string values and ignores malformed input", () => {
++    expect(labelRecordFromUnknown({ team: "ml", count: 3, nested: { a: "b" } })).toEqual({
++      team: "ml",
++    });
++    expect(labelRecordFromUnknown("team=ml")).toEqual({});
++    expect(labelRecordFromUnknown(["team"])).toEqual({});
++    expect(labelRecordFromUnknown(null)).toEqual({});
++  });
++});
++
++describe("projectDefaultLabels", () => {
++  it("keeps the labels the server would stamp and drops the rest", () => {
++    expect(
++      projectDefaultLabels({
++        labels: { team: "ml", "omnigent.pinned": "1", omni_project: "x", count: 3 },
++      }),
++    ).toEqual({ team: "ml" });
++    expect(projectDefaultLabels(undefined)).toEqual({});
++  });
++});
++
++describe("newSessionLabels", () => {
++  it("layers this session's edits over the project defaults", () => {
++    expect(newSessionLabels({ team: "ml" }, { env: "dev", team: "infra" })).toEqual({
++      labels: { team: "infra", env: "dev" },
++      applyProjectLabels: true,
++    });
++  });
++
++  it("turns the server merge off once a project default is removed", () => {
++    expect(newSessionLabels({ team: "ml", env: "dev" }, { team: null })).toEqual({
++      labels: { env: "dev" },
++      applyProjectLabels: false,
++    });
++    // A removal for a key the current project doesn't default is moot.
++    expect(newSessionLabels({}, { team: null }).applyProjectLabels).toBe(true);
++  });
++});
++
++describe("labelsEqual", () => {
++  it("compares entries regardless of order", () => {
++    expect(labelsEqual({ a: "1", b: "2" }, { b: "2", a: "1" })).toBe(true);
++    expect(labelsEqual({ a: "1" }, { a: "2" })).toBe(false);
++    expect(labelsEqual({ a: "1" }, { a: "1", b: "2" })).toBe(false);
++  });
++});
+diff --git a/web/src/lib/sessionLabels.ts b/web/src/lib/sessionLabels.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..27ddff8e09be661e0e38f06a3a95bae337829eaf
+--- /dev/null
++++ b/web/src/lib/sessionLabels.ts
+@@ -0,0 +1,92 @@
++// User-facing session labels ("tags"): which `conversation_labels` keys a
++// person may see and edit, and the limits the server's label columns impose.
++
++import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
++
++/** Width of the `conversation_labels.key` column. */
++export const LABEL_KEY_MAX_LENGTH = 128;
++/** Width of the `conversation_labels.value` column. */
++export const LABEL_VALUE_MAX_LENGTH = 256;
++
++/** Namespaces Omnigent writes for its own bookkeeping (pins, wrappers, cost). */
++const INTERNAL_LABEL_PREFIXES = ["omnigent.", "cost_control."] as const;
++
++/** Whether a label key is framework-owned rather than a user label. */
++export function isInternalLabelKey(key: string): boolean {
++  return (
++    key === PROJECT_LABEL_KEY || INTERNAL_LABEL_PREFIXES.some((prefix) => key.startsWith(prefix))
++  );
++}
++
++/** The user labels in `labels`, internal keys dropped, sorted by key. */
++export function userLabelEntries(
++  labels: Record<string, string> | null | undefined,
++): [key: string, value: string][] {
++  return Object.entries(labels ?? {})
++    .filter(([key]) => !isInternalLabelKey(key))
++    .sort(([a], [b]) => a.localeCompare(b));
++}
++
++/**
++ * Validate a label about to be saved, returning a message for the user or
++ * `null` when it can be saved. The key is expected trimmed.
++ */
++export function labelValidationError(key: string, value: string): string | null {
++  if (!key) return "Key is required.";
++  if (key.length > LABEL_KEY_MAX_LENGTH) {
++    return `Key must be ${LABEL_KEY_MAX_LENGTH} characters or fewer.`;
++  }
++  if (isInternalLabelKey(key)) return `"${key}" is reserved for Omnigent.`;
++  if (value.length > LABEL_VALUE_MAX_LENGTH) {
++    return `Value must be ${LABEL_VALUE_MAX_LENGTH} characters or fewer.`;
++  }
++  return null;
++}
++
++/**
++ * Read a label map from untyped JSON (e.g. a project's stored config), keeping
++ * only string values so a malformed entry can't reach the editor.
++ */
++export function labelRecordFromUnknown(raw: unknown): Record<string, string> {
++  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
++  return Object.fromEntries(
++    Object.entries(raw).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
++  );
++}
++
++/**
++ * The labels a project's stored config stamps on new sessions, dropping any
++ * entry the server would skip (internal, too long, or not a string).
++ */
++export function projectDefaultLabels(config: { labels?: unknown } | null | undefined) {
++  return Object.fromEntries(
++    Object.entries(labelRecordFromUnknown(config?.labels)).filter(
++      ([key, value]) => labelValidationError(key, value) === null,
++    ),
++  );
++}
++
++/**
++ * A new session's labels: the project's defaults with this session's edits on
++ * top, where a `null` edit leaves that default off this session.
++ * `applyProjectLabels` is false once a default was removed, so the server
++ * takes `labels` as the final set instead of adding the defaults back.
++ */
++export function newSessionLabels(
++  projectDefaults: Record<string, string>,
++  edits: Record<string, string | null>,
++): { labels: Record<string, string>; applyProjectLabels: boolean } {
++  const labels = Object.fromEntries(
++    Object.entries({ ...projectDefaults, ...edits }).filter(
++      (entry): entry is [string, string] => entry[1] !== null,
++    ),
++  );
++  const removedDefault = Object.keys(projectDefaults).some((key) => edits[key] === null);
++  return { labels, applyProjectLabels: !removedDefault };
++}
++
++/** Whether two label maps hold the same entries. */
++export function labelsEqual(a: Record<string, string>, b: Record<string, string>): boolean {
++  const aKeys = Object.keys(a);
++  return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
++}
+diff --git a/web/src/lib/sessionListCache.test.ts b/web/src/lib/sessionListCache.test.ts
+index cd9ae2723bb16210f30cb6c9793bfcf15d8023c2..b1bec2087a66b5fef9d808cc1e1ceb01e2b85272 100644
+--- a/web/src/lib/sessionListCache.test.ts
++++ b/web/src/lib/sessionListCache.test.ts
+@@ -10,8 +10,10 @@ import {
+   mergeItemsIntoPages,
+   nullsToUndefined,
+   overlayArchivedIntoCaches,
++  overlayLabelsIntoCaches,
+   removeIdsFromPages,
+ } from "./sessionListCache";
++import type { Session } from "@/lib/types";
+ 
+ function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
+   return {
+@@ -463,6 +465,25 @@ describe("overlayArchivedIntoCaches", () => {
+   });
+ });
+ 
++describe("overlayLabelsIntoCaches", () => {
++  it("replaces the row's labels in the lists, the folder, and the session snapshot", () => {
++    const qc = new QueryClient();
++    const before = { team: "ml", "omnigent.wrapper": "claude" };
++    const after = { env: "prod", "omnigent.wrapper": "claude" };
++    qc.setQueryData(["conversations", "", false], data([conv("a", { labels: before })]));
++    qc.setQueryData(["project-sessions", "proj"], data([conv("a", { labels: before })]));
++    qc.setQueryData(["session", "a"], { id: "a", labels: before } as unknown as Session);
++
++    overlayLabelsIntoCaches(qc, "a", after);
++
++    const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!;
++    expect(list.pages[0].data[0].labels).toEqual(after);
++    const folder = qc.getQueryData<ConversationsInfiniteData>(["project-sessions", "proj"])!;
++    expect(folder.pages[0].data[0].labels).toEqual(after);
++    expect(qc.getQueryData<Session>(["session", "a"])!.labels).toEqual(after);
++  });
++});
++
+ describe("insertNewRowsIntoPages", () => {
+   const candidate = (id: string, extra: Partial<Conversation> = {}) =>
+     new Map<string, SessionListWireItem>([[id, { id, updated_at: 100, ...extra }]]);
+diff --git a/web/src/lib/sessionListCache.ts b/web/src/lib/sessionListCache.ts
+index 522e152f44e5ec0f1f04c28488cc6bfad2ddcd28..24a76f3ddb148e457af010085e9b14cf86448066 100644
+--- a/web/src/lib/sessionListCache.ts
++++ b/web/src/lib/sessionListCache.ts
+@@ -464,6 +464,33 @@ export function collectConversationIds(datas: (ConversationsInfiniteData | undef
+  */
+ export const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+ 
++/**
++ * Merge a partial wire row into the flat `["conversations"]` lists and the
++ * per-project `["project-sessions"]` lists that hold it.
++ */
++function mergeWireIntoListCaches(queryClient: QueryClient, wire: SessionListWireItem): void {
++  const itemsById = new Map([[wire.id, wire]]);
++  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
++    queryKey: ["conversations"],
++  })) {
++    // activeId only gates `needsRefetch`, which the overlay callers ignore —
++    // they patch in place rather than refetching.
++    const { data: next } = mergeItemsIntoPages(
++      data,
++      itemsById,
++      filtersFromConversationQueryKey(key),
++      undefined,
++    );
++    if (next !== data) queryClient.setQueryData(key, next);
++  }
++  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
++    queryKey: ["project-sessions"],
++  })) {
++    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
++    if (next !== data) queryClient.setQueryData(key, next);
++  }
++}
++
+ /**
+  * Overlay a title into every cache that holds a row for one session.
+  *
+@@ -496,26 +523,7 @@ export function overlayTitleIntoCaches(
+     title,
+     ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+   };
+-  const itemsById = new Map([[id, wire]]);
+-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+-    queryKey: ["conversations"],
+-  })) {
+-    // activeId only gates `needsRefetch`, which both callers ignore —
+-    // they patch in place rather than refetching.
+-    const { data: next } = mergeItemsIntoPages(
+-      data,
+-      itemsById,
+-      filtersFromConversationQueryKey(key),
+-      undefined,
+-    );
+-    if (next !== data) queryClient.setQueryData(key, next);
+-  }
+-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+-    queryKey: ["project-sessions"],
+-  })) {
+-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+-    if (next !== data) queryClient.setQueryData(key, next);
+-  }
++  mergeWireIntoListCaches(queryClient, wire);
+   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+     old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
+   );
+@@ -546,25 +554,29 @@ export function overlayArchivedIntoCaches(
+   id: string,
+   archived: boolean,
+ ): void {
+-  const itemsById = new Map<string, SessionListWireItem>([[id, { id, archived }]]);
+-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+-    queryKey: ["conversations"],
+-  })) {
+-    const { data: next } = mergeItemsIntoPages(
+-      data,
+-      itemsById,
+-      filtersFromConversationQueryKey(key),
+-      undefined,
+-    );
+-    if (next !== data) queryClient.setQueryData(key, next);
+-  }
+-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+-    queryKey: ["project-sessions"],
+-  })) {
+-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+-    if (next !== data) queryClient.setQueryData(key, next);
+-  }
++  mergeWireIntoListCaches(queryClient, { id, archived });
+   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+     old ? { ...old, archived } : old,
+   );
+ }
++
++/**
++ * Overlay a session's server-confirmed label map onto every cache that holds
++ * its row, after a label edit in the session info popover. Mirrors
++ * {@link overlayTitleIntoCaches}.
++ *
++ * @param queryClient - The app QueryClient.
++ * @param id - Conversation id whose labels changed.
++ * @param labels - The full label map from the PATCH response.
++ */
++export function overlayLabelsIntoCaches(
++  queryClient: QueryClient,
++  id: string,
++  labels: Record<string, string>,
++): void {
++  mergeWireIntoListCaches(queryClient, { id, labels });
++  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
++    old ? { ...old, labels } : old,
++  );
++  queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
++}
+diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
+index bad2fdb0f521dc9ebd13b1522ccb1e2b2b764efb..fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95 100644
+--- a/web/src/lib/sessionsApi.ts
++++ b/web/src/lib/sessionsApi.ts
+@@ -745,6 +745,7 @@ export async function createBundledSession(
+     workspace?: string;
+     project_id?: string;
+     labels?: Record<string, string>;
++    apply_project_labels?: boolean;
+     terminal_launch_args?: string[];
+     git?: { branch_name: string; base_branch?: string };
+     mcp_registry_services?: string[];
+@@ -1057,10 +1058,11 @@ export async function updateSession(
+     shareWorkspaceFiles?: boolean;
+     runnerId?: string;
+     silent?: boolean;
+-    labels?: Record<string, string>;
++    /** Labels to upsert; a `null` value deletes that label. */
++    labels?: Record<string, string | null>;
+   },
+ ): Promise<Session> {
+-  const body: Record<string, string | boolean | null | Record<string, string>> = {};
++  const body: Record<string, string | boolean | null | Record<string, string | null>> = {};
+   if ("reasoningEffort" in updates) {
+     body.reasoning_effort = updates.reasoningEffort ?? "default";
+   }
+@@ -1089,8 +1091,8 @@ export async function updateSession(
+     body.runner_id = updates.runnerId;
+   }
+   if (updates.labels !== undefined) {
+-    // Merge-upsert on the server; an empty-string value clears a label
+-    // (e.g. the pinned flag on unpin — see PATCH /v1/sessions handler).
++    // Merge-upsert on the server; `null` deletes a label, and an empty string
++    // also clears the project / pinned flags (see PATCH /v1/sessions handler).
+     body.labels = updates.labels;
+   }
+   if (updates.silent) {
+diff --git a/web/src/shell/NewChatDialog.projectCreate.test.tsx b/web/src/shell/NewChatDialog.projectCreate.test.tsx
+index b580b49ce8efeb18525b797bb019f157c31fcbb1..4f21243da6f334c6f4d263dc89eba5ec27f874bb 100644
+--- a/web/src/shell/NewChatDialog.projectCreate.test.tsx
++++ b/web/src/shell/NewChatDialog.projectCreate.test.tsx
+@@ -36,7 +36,7 @@ import type * as ToastModule from "@/components/ui/toast";
+ import type * as SessionsApiModule from "@/lib/sessionsApi";
+ 
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import type { ReactNode } from "react";
+ 
+ import { authenticatedFetch } from "@/lib/identity";
+@@ -523,6 +523,47 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
+     expect("agent_id" in body).toBe(false);
+   });
+ 
++  it("pre-fills the project's default labels and leaves the server merge on", async () => {
++    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
++    renderLanding();
++    await waitFor(() =>
++      expect(screen.getByTestId("new-session-label-chips")).toHaveTextContent("team: ml"),
++    );
++
++    const body = await submitAndReadBody();
++    expect(body.project_id).toBe("proj_alpha");
++    expect((body.labels as Record<string, string>).team).toBe("ml");
++    expect("apply_project_labels" in body).toBe(false);
++  });
++
++  it("sends the final labels without a removed project default", async () => {
++    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml", env: "dev" } });
++    renderLanding();
++    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
++    fireEvent.click(screen.getByRole("button", { name: "Edit labels (env: dev)" }));
++    const dialog = await screen.findByTestId("new-session-labels-dialog");
++    expect(dialog).toHaveTextContent("from project");
++    fireEvent.click(within(dialog).getByRole("button", { name: "Remove label team" }));
++    await waitFor(() => expect(dialog).not.toHaveTextContent("team:"));
++    fireEvent.click(within(dialog).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(dialog).getByLabelText("New label key"), {
++      target: { value: "owner" },
++    });
++    fireEvent.change(within(dialog).getByLabelText("New label value"), {
++      target: { value: "me" },
++    });
++    // Done keeps a valid label still in the add row.
++    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
++    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
++
++    const body = await submitAndReadBody();
++    const labels = body.labels as Record<string, string>;
++    expect(labels.env).toBe("dev");
++    expect(labels.owner).toBe("me");
++    expect(labels.team).toBeUndefined();
++    expect(body.apply_project_labels).toBe(false);
++  });
++
+   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
+     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+     vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
+diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
+index 5a4853f2d2a8fe97a35ff088d5e2dc17e6505f52..eeeea8e11175b84673d1a54f58a7e67d6eb10ecf 100644
+--- a/web/src/shell/NewChatDialog.test.tsx
++++ b/web/src/shell/NewChatDialog.test.tsx
+@@ -158,6 +158,25 @@ describe("ComposerAddMenu", () => {
+     expect(onProjectSelect).toHaveBeenCalledWith("docs");
+   });
+ 
++  it("opens the labels editor once the menu has closed and shows the label count", async () => {
++    const onLabels = vi.fn();
++    render(
++      <ComposerAddMenu
++        disabled={false}
++        onAttach={vi.fn()}
++        planActive={false}
++        onLabels={onLabels}
++        labelCount={2}
++      />,
++    );
++    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
++    const item = screen.getByRole("menuitem", { name: /Labels/ });
++    expect(item).toHaveTextContent("2 labels");
++    fireEvent.click(item);
++    await waitFor(() => expect(onLabels).toHaveBeenCalledOnce());
++    expect(screen.queryByRole("menu", { name: "Add" })).not.toBeInTheDocument();
++  });
++
+   it("enables plan mode through the existing harness handler", () => {
+     const onPlan = vi.fn();
+     render(
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1b2199d25 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -54,6 +54,12 @@ import {
+   ComposerSendButton,
+ } from "@/components/composer/ChatComposer";
+ import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
++import {
++  NewSessionLabelChips,
++  NewSessionLabelsDialog,
++} from "@/components/composer/NewSessionLabels";
++import { useNewSessionLabels } from "@/hooks/useSessionLabels";
++import { projectDefaultLabels } from "@/lib/sessionLabels";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import {
+   MonitorCloudIcon,
+@@ -2624,6 +2630,13 @@ export function NewChatLandingScreen() {
+   // Pre-filled from the `?project=` param so the sidebar's per-project
+   // "new session" pencil lands here with the project already selected.
+   const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
++  // Labels the session starts with, pre-filled with the project's defaults.
++  const projectLabelDefaults = useMemo(
++    () => projectDefaultLabels(storedProjectConfig),
++    [storedProjectConfig],
++  );
++  const sessionLabels = useNewSessionLabels(projectLabelDefaults, selectedProject);
++  const [labelsDialogOpen, setLabelsDialogOpen] = useState(false);
+   // The landing screen stays mounted while the `?project=` param changes (e.g.
+   // clicking a different project's pencil), so the lazy initializer above won't
+   // re-run — sync the selection to the param whenever it changes.
+@@ -5773,7 +5786,10 @@ export function NewChatLandingScreen() {
+       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
+         // Custom agents upload their bundle with the session, then launch on the host below.
+         const bundle = await buildAgentBundle(pendingAgent);
+-        const metadata: Record<string, unknown> = { labels: createLabels };
++        const metadata: Record<string, unknown> = {
++          labels: { ...sessionLabels.labels, ...createLabels },
++        };
++        if (!sessionLabels.applyProjectLabels) metadata.apply_project_labels = false;
+         if (mcpServicesForLaunch.length) {
+           metadata.mcp_registry_services = mcpServicesForLaunch;
+         }
+@@ -5905,9 +5921,12 @@ export function NewChatLandingScreen() {
+           // model would all describe a CLI the router may not pick. The
+           // server stamps the routed wrapper's labels once it has rebound.
+           labels: {
++            ...sessionLabels.labels,
+             ...(smartRoutingHarnessSelected ? {} : createLabels),
+             [CLIENT_CREATE_TOKEN_LABEL]: createToken,
+           },
++          // The labels above already leave out a project default removed here.
++          ...(sessionLabels.applyProjectLabels ? {} : { apply_project_labels: false }),
+           // Permission / approval / cursor mode → CLI flag pair, persisted as
+           // terminal_launch_args. Omitted for the default and non-native agents.
+           terminal_launch_args: smartRoutingHarnessSelected
+@@ -6918,6 +6937,11 @@ export function NewChatLandingScreen() {
+                 delivered as an "[Attached: <path>]" marker prepended to the
+                 first message at create time. */}
+                     <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
++                    <NewSessionLabelChips
++                      labels={sessionLabels.labels}
++                      onEdit={() => setLabelsDialogOpen(true)}
++                      onRemove={sessionLabels.removeLabel}
++                    />
+                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
+                     <ComposerAttachments files={files} onRemove={removeFile} />
+                     {/* Rejected-attachment feedback: unsupported type or too large */}
+@@ -6952,6 +6976,8 @@ export function NewChatLandingScreen() {
+                           (supportsPermissionMode && permissionMode === "plan") ||
+                           (supportsCursorMode && cursorExecMode === "plan")
+                         }
++                        onLabels={() => setLabelsDialogOpen(true)}
++                        labelCount={Object.keys(sessionLabels.labels).length}
+                         projects={projectList ?? []}
+                         onProjectSelect={(name) => {
+                           const params = new URLSearchParams(searchParams);
+@@ -7673,6 +7699,15 @@ export function NewChatLandingScreen() {
+             : undefined
+         }
+       />
++      <NewSessionLabelsDialog
++        open={labelsDialogOpen}
++        onOpenChange={setLabelsDialogOpen}
++        labels={sessionLabels.labels}
++        projectDefaults={projectLabelDefaults}
++        projectName={selectedProject}
++        onSet={sessionLabels.setLabel}
++        onRemove={sessionLabels.removeLabel}
++      />
+     </div>
+   );
+ }
+diff --git a/web/src/shell/ProjectSettingsDialog.test.tsx b/web/src/shell/ProjectSettingsDialog.test.tsx
+index 0579f5df75942b7ef6b2f9cc71aed9e516544ef6..7efff875cd4eb03ada48b2db8610c3d0e9b883a1 100644
+--- a/web/src/shell/ProjectSettingsDialog.test.tsx
++++ b/web/src/shell/ProjectSettingsDialog.test.tsx
+@@ -1,4 +1,4 @@
+-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ 
+@@ -62,14 +62,14 @@ const getProjectMock = vi.mocked(getProject);
+ const updateMock = vi.mocked(updateProjectConfig);
+ const createMock = vi.mocked(createProject);
+ 
+-function renderDialog(projectId: string | null = "p_1") {
++function renderDialog(projectId: string | null = "p_1", onOpenChange = vi.fn()) {
+   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   return render(
+     <QueryClientProvider client={client}>
+       <TooltipProvider>
+         <ProjectSettingsDialog
+           open
+-          onOpenChange={vi.fn()}
++          onOpenChange={onOpenChange}
+           projectId={projectId}
+           projectName="Work"
+         />
+@@ -212,6 +212,162 @@ describe("ProjectSettingsDialog", () => {
+     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+   });
+ 
++  it("edits default labels and saves them with the config", async () => {
++    getProjectMock.mockResolvedValue({
++      id: "p_1",
++      name: "Work",
++      // A malformed stored entry is dropped rather than shown or re-saved.
++      config: {
++        labels: { team: "ml", stale: "yes", count: 3 } as unknown as Record<string, string>,
++      },
++    });
++    renderDialog();
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
++    expect(screen.getByTestId("project-settings-labels")).toHaveTextContent(
++      "Moving an existing session here doesn't add them.",
++    );
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Remove label stale" }));
++    await waitFor(() => expect(within(editor).queryByText("yes")).toBeNull());
++    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(editor).getByLabelText("New label key"), {
++      target: { value: "env" },
++    });
++    const valueInput = within(editor).getByLabelText("New label value");
++    fireEvent.change(valueInput, { target: { value: "prod" } });
++    // Enter adds the label without submitting the dialog's form.
++    fireEvent.keyDown(valueInput, { key: "Enter" });
++    await waitFor(() => expect(within(editor).getByText("prod")).toBeInTheDocument());
++    expect(updateMock).not.toHaveBeenCalled();
++
++    fireEvent.click(screen.getByTestId("project-settings-save"));
++    await waitFor(() =>
++      expect(updateMock).toHaveBeenCalledWith("p_1", { labels: { team: "ml", env: "prod" } }),
++    );
++  });
++
++  it("clears the labels key when every default label is removed", async () => {
++    getProjectMock.mockResolvedValue({
++      id: "p_1",
++      name: "Work",
++      config: { labels: { team: "ml" } },
++    });
++    renderDialog();
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Remove label team" }));
++    await waitFor(() => expect(within(editor).getByText("No default labels")).toBeInTheDocument());
++    fireEvent.click(screen.getByTestId("project-settings-save"));
++    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
++  });
++
++  it("warns once before a close discards unsaved label changes", async () => {
++    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
++    const onOpenChange = vi.fn();
++    renderDialog("p_1", onOpenChange);
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
++    expect(screen.queryByTestId("project-settings-labels-unsaved")).toBeNull();
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(editor).getByLabelText("New label key"), {
++      target: { value: "team" },
++    });
++    fireEvent.click(within(editor).getByRole("button", { name: "Add" }));
++    expect(await screen.findByTestId("project-settings-labels-unsaved")).toHaveTextContent(
++      "Unsaved",
++    );
++
++    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
++    expect(onOpenChange).not.toHaveBeenCalled();
++    expect(screen.getByTestId("project-settings-labels-unsaved")).toHaveAttribute("role", "alert");
++
++    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++    expect(updateMock).not.toHaveBeenCalled();
++  });
++
++  it("saves a valid label left in the add row when Save is clicked", async () => {
++    getProjectMock.mockResolvedValue({
++      id: "p_1",
++      name: "Work",
++      config: { labels: { team: "ml" } },
++    });
++    renderDialog();
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(editor).getByLabelText("New label key"), {
++      target: { value: "env" },
++    });
++    fireEvent.change(within(editor).getByLabelText("New label value"), {
++      target: { value: "prod" },
++    });
++    fireEvent.click(screen.getByTestId("project-settings-save"));
++
++    await waitFor(() =>
++      expect(updateMock).toHaveBeenCalledWith("p_1", { labels: { team: "ml", env: "prod" } }),
++    );
++  });
++
++  it.each([
++    ["a duplicate key", "team", '"team" already exists. Edit it instead.'],
++    ["a key over the column width", "k".repeat(129), "Key must be 128 characters or fewer."],
++  ])("blocks Save when the add row holds %s", async (_case, key, message) => {
++    getProjectMock.mockResolvedValue({
++      id: "p_1",
++      name: "Work",
++      config: { labels: { team: "ml" } },
++    });
++    renderDialog();
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(editor).getByLabelText("New label key"), { target: { value: key } });
++    fireEvent.click(screen.getByTestId("project-settings-save"));
++
++    expect(await within(editor).findByRole("alert")).toHaveTextContent(message);
++    expect(within(editor).getByLabelText("New label key")).toHaveValue(key);
++    expect(updateMock).not.toHaveBeenCalled();
++  });
++
++  it("scrolls the fields and keeps Save outside the scroll region on short windows", async () => {
++    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
++    renderDialog();
++    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
++
++    const body = screen.getByTestId("project-settings-body");
++    expect(body).toHaveClass("min-h-0", "overflow-y-auto", "px-1", "-mx-1");
++    expect(body).toContainElement(screen.getByTestId("project-settings-labels"));
++    expect(body).not.toContainElement(screen.getByTestId("project-settings-save"));
++    const content = body.closest('[data-slot="dialog-content"]');
++    expect(content).toHaveClass("max-h-[85dvh]", "grid-rows-[auto_1fr_auto]");
++  });
++
++  it("rejects a reserved default label key inline", async () => {
++    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
++    renderDialog();
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() =>
++      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
++        false,
++      ),
++    );
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(editor).getByLabelText("New label key"), {
++      target: { value: "omnigent.pinned" },
++    });
++    fireEvent.click(within(editor).getByRole("button", { name: "Add" }));
++    expect(within(editor).getByRole("alert")).toHaveTextContent(
++      '"omnigent.pinned" is reserved for Omnigent.',
++    );
++  });
++
+   it("hides the sandbox option when managed sandboxes are disabled", async () => {
+     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+     renderDialog();
+diff --git a/web/src/shell/ProjectSettingsDialog.tsx b/web/src/shell/ProjectSettingsDialog.tsx
+index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1af8b51ca6 100644
+--- a/web/src/shell/ProjectSettingsDialog.tsx
++++ b/web/src/shell/ProjectSettingsDialog.tsx
+@@ -12,12 +12,14 @@
+ // harness stay per-agent run config, out of scope here. The host and agent
+ // pickers reuse the composer's components; the working directory reuses its
+ // filesystem browser (inline, so it scrolls inside the modal).
++// Default labels are stamped on new sessions server-side at creation.
+ // Fields are optional: an unset one stores no default (an absent key), and an
+ // all-default dialog stores an empty config.
+ 
+ import { ChevronDownIcon } from "lucide-react";
+ import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+ import { Button } from "@/components/ui/button";
++import { LabelEditor, type LabelEditorHandle } from "@/components/LabelEditor";
+ import {
+   Dialog,
+   DialogContent,
+@@ -51,6 +53,7 @@ import {
+ } from "@/lib/nativeCodingAgents";
+ import type { ProjectConfig } from "@/lib/projectsApi";
+ import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
++import { labelRecordFromUnknown, labelsEqual } from "@/lib/sessionLabels";
+ import { AgentHarnessPicker } from "./NewChatDialog";
+ import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+ 
+@@ -144,6 +147,20 @@ export function ProjectSettingsDialog({
+   const [model, setModel] = useState<string>(NONE);
+   // Default account (provider name); NONE runs on the host's default.
+   const [provider, setProvider] = useState<string>(NONE);
++  // Labels stamped on sessions created in the project; empty stores no key.
++  const [labels, setLabels] = useState<Record<string, string>>({});
++  const labelEditorRef = useRef<LabelEditorHandle>(null);
++  // "Add" in the editor only changes the draft, so closing with unsaved label
++  // changes is caught once and warned about; Cancel or a second close discards.
++  const labelsDirty = !labelsEqual(labels, labelRecordFromUnknown(stored?.labels));
++  const [discardWarned, setDiscardWarned] = useState(false);
++  const onDialogOpenChange = (next: boolean) => {
++    if (!next && labelsDirty && !discardWarned) {
++      setDiscardWarned(true);
++      return;
++    }
++    onOpenChange(next);
++  };
+   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+ 
+   // The agent picker and the host Select portal their dropdowns OUTSIDE
+@@ -195,6 +212,8 @@ export function ProjectSettingsDialog({
+     setAgentId(c.agent_id ?? null);
+     setModel(c.model ?? NONE);
+     setProvider(c.provider ?? NONE);
++    setLabels(labelRecordFromUnknown(c.labels));
++    setDiscardWarned(false);
+     setWorkspaceOpen(false);
+   }, [open, stored, loadFailed]);
+ 
+@@ -203,6 +222,15 @@ export function ProjectSettingsDialog({
+     // Guard against submitting a blank draft seeded from a failed load, which
+     // the server would read as "clear the stored defaults".
+     if (loadFailed) return;
++    // A label typed into the add row but not yet added is saved too; an
++    // invalid one blocks Save and shows its inline message.
++    const pendingLabel = labelEditorRef.current?.takePendingLabel() ?? { status: "none" };
++    if (pendingLabel.status === "invalid") return;
++    const labelsToSave =
++      pendingLabel.status === "valid"
++        ? { ...labels, [pendingLabel.key]: pendingLabel.value }
++        : labels;
++    if (labelsToSave !== labels) setLabels(labelsToSave);
+     // Preserve config keys owned by other dialogs, then replace only the fields
+     // this form edits.
+     const config: ProjectConfig = { ...(stored ?? {}) };
+@@ -240,6 +268,8 @@ export function ProjectSettingsDialog({
+     // A sandbox brings its own credentials, so a host account can't apply.
+     if (provider !== NONE && hostId !== SANDBOX_HOST_CHOICE) config.provider = provider;
+     else delete config.provider;
++    if (Object.keys(labelsToSave).length > 0) config.labels = labelsToSave;
++    else delete config.labels;
+ 
+     updateConfig.mutate(
+       { id: projectId, name: projectName, config },
+@@ -333,10 +363,12 @@ export function ProjectSettingsDialog({
+   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
+ 
+   return (
+-    <Dialog open={open} onOpenChange={onOpenChange}>
++    <Dialog open={open} onOpenChange={onDialogOpenChange}>
+       <DialogContent
+         onClick={(e) => e.stopPropagation()}
+-        className="sm:max-w-lg"
++        // Capped to the viewport: the body scrolls while the header and the
++        // Save/Cancel footer stay visible on short windows.
++        className="sm:max-w-lg max-h-[85dvh] grid-rows-[auto_1fr_auto]"
+         // Keep a nested dropdown's dismiss (pick an option, or click the modal
+         // body while it's open) from closing the whole Dialog. See
+         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
+@@ -350,259 +382,300 @@ export function ProjectSettingsDialog({
+             a starting point you can change per session; leave a field blank for no default.
+           </DialogDescription>
+         </DialogHeader>
+-        <form onSubmit={onSubmit} className="flex flex-col gap-4">
+-          <Field label="Host" hint="Where new sessions run by default">
+-            <Select
+-              value={hostId}
+-              onValueChange={setHostId}
+-              onOpenChange={onDropdownOpenChange}
+-              disabled={isLoading}
+-            >
+-              <SelectTrigger className="w-full" data-testid="project-settings-host">
+-                <SelectValue placeholder="No default" />
+-              </SelectTrigger>
+-              <SelectContent>
+-                <SelectItem value={NONE}>No default</SelectItem>
+-                {managedSandboxesEnabled && (
+-                  <SelectItem value={SANDBOX_HOST_CHOICE}>
+-                    {sandboxOptionLabel(sandboxProvider)}
+-                  </SelectItem>
+-                )}
+-                {onlineHosts.map((h) => (
+-                  <SelectItem key={h.host_id} value={h.host_id}>
+-                    {h.name}
+-                  </SelectItem>
+-                ))}
+-                {storedHostMissing && (
+-                  <SelectItem value={hostId}>
+-                    {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
+-                  </SelectItem>
+-                )}
+-              </SelectContent>
+-            </Select>
+-          </Field>
+-
+-          <Field
+-            label="Working directory"
+-            hint={
+-              hostId === NONE
+-                ? "Pick a host first"
+-                : browsableHostId
+-                  ? "Browse the host or type a path"
+-                  : "Absolute path on the host"
+-            }
+-            htmlFor="project-settings-workspace"
++        <form onSubmit={onSubmit} className="contents">
++          <div
++            className="-mx-1 flex min-h-0 flex-col gap-4 overflow-y-auto px-1"
++            data-testid="project-settings-body"
+           >
+-            {hostId === NONE ? (
+-              // Mirror the new-session composer: the working directory can only
+-              // be chosen once a host is selected (the file browser lists
+-              // against a concrete host, and a path is host-relative anyway).
+-              <p
+-                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
+-                data-testid="project-settings-workspace"
+-              >
+-                Pick a host first
+-              </p>
+-            ) : browsableHostId ? (
+-              // Browsing uses the shared full-screen picker; navigation is
+-              // provisional until the user confirms a folder.
+-              <div
+-                className="relative flex flex-col gap-1.5"
+-                data-testid="project-settings-workspace"
++            <Field label="Host" hint="Where new sessions run by default">
++              <Select
++                value={hostId}
++                onValueChange={setHostId}
++                onOpenChange={onDropdownOpenChange}
++                disabled={isLoading}
+               >
+-                <button
+-                  type="button"
+-                  onClick={() => setWorkspaceOpen(true)}
+-                  aria-expanded={workspaceOpen}
+-                  disabled={isLoading}
+-                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
++                <SelectTrigger className="w-full" data-testid="project-settings-host">
++                  <SelectValue placeholder="No default" />
++                </SelectTrigger>
++                <SelectContent>
++                  <SelectItem value={NONE}>No default</SelectItem>
++                  {managedSandboxesEnabled && (
++                    <SelectItem value={SANDBOX_HOST_CHOICE}>
++                      {sandboxOptionLabel(sandboxProvider)}
++                    </SelectItem>
++                  )}
++                  {onlineHosts.map((h) => (
++                    <SelectItem key={h.host_id} value={h.host_id}>
++                      {h.name}
++                    </SelectItem>
++                  ))}
++                  {storedHostMissing && (
++                    <SelectItem value={hostId}>
++                      {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
++                    </SelectItem>
++                  )}
++                </SelectContent>
++              </Select>
++            </Field>
++
++            <Field
++              label="Working directory"
++              hint={
++                hostId === NONE
++                  ? "Pick a host first"
++                  : browsableHostId
++                    ? "Browse the host or type a path"
++                    : "Absolute path on the host"
++              }
++              htmlFor="project-settings-workspace"
++            >
++              {hostId === NONE ? (
++                // Mirror the new-session composer: the working directory can only
++                // be chosen once a host is selected (the file browser lists
++                // against a concrete host, and a path is host-relative anyway).
++                <p
++                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
++                  data-testid="project-settings-workspace"
+                 >
+-                  <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
+-                    {workspace || "Browse…"}
+-                  </span>
+-                  <ChevronDownIcon
+-                    className={`size-4 shrink-0 opacity-50 transition-transform ${
+-                      workspaceOpen ? "rotate-180" : ""
+-                    }`}
++                  Pick a host first
++                </p>
++              ) : browsableHostId ? (
++                // Browsing uses the shared full-screen picker; navigation is
++                // provisional until the user confirms a folder.
++                <div
++                  className="relative flex flex-col gap-1.5"
++                  data-testid="project-settings-workspace"
++                >
++                  <button
++                    type="button"
++                    onClick={() => setWorkspaceOpen(true)}
++                    aria-expanded={workspaceOpen}
++                    disabled={isLoading}
++                    className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
++                  >
++                    <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
++                      {workspace || "Browse…"}
++                    </span>
++                    <ChevronDownIcon
++                      className={`size-4 shrink-0 opacity-50 transition-transform ${
++                        workspaceOpen ? "rotate-180" : ""
++                      }`}
++                    />
++                  </button>
++                  <WorkspacePickerDialog
++                    open={workspaceOpen}
++                    onOpenChange={setWorkspaceOpen}
++                    hostId={browsableHostId}
++                    initialPath={workspace}
++                    onConfirm={setWorkspace}
+                   />
+-                </button>
+-                <WorkspacePickerDialog
+-                  open={workspaceOpen}
+-                  onOpenChange={setWorkspaceOpen}
+-                  hostId={browsableHostId}
+-                  initialPath={workspace}
+-                  onConfirm={setWorkspace}
++                </div>
++              ) : (
++                // A host is picked but not browsable (sandbox / offline stored
++                // host) — fall back to typing an absolute path.
++                <input
++                  id="project-settings-workspace"
++                  data-testid="project-settings-workspace"
++                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
++                  placeholder="/path/to/repo"
++                  value={workspace}
++                  onChange={(e) => setWorkspace(e.target.value)}
++                  disabled={isLoading}
+                 />
+-              </div>
+-            ) : (
+-              // A host is picked but not browsable (sandbox / offline stored
+-              // host) — fall back to typing an absolute path.
+-              <input
+-                id="project-settings-workspace"
+-                data-testid="project-settings-workspace"
+-                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+-                placeholder="/path/to/repo"
+-                value={workspace}
+-                onChange={(e) => setWorkspace(e.target.value)}
+-                disabled={isLoading}
+-              />
+-            )}
+-          </Field>
+-
+-          <Field
+-            label="Random worktree"
+-            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
+-          >
+-            <div className="flex sm:justify-end">
+-              <Switch
+-                data-testid="project-settings-worktree"
+-                checked={useWorktree}
+-                onCheckedChange={setUseWorktree}
+-                disabled={isLoading}
+-              />
+-            </div>
+-          </Field>
++              )}
++            </Field>
+ 
+-          {useWorktree && (
+             <Field
+-              label="Base branch"
+-              hint="Branch new worktrees fork from; blank uses the current branch"
+-              htmlFor="project-settings-base-branch"
++              label="Random worktree"
++              hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
+             >
+-              <input
+-                id="project-settings-base-branch"
+-                data-testid="project-settings-base-branch"
+-                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+-                placeholder="e.g. main"
+-                value={baseBranch}
+-                onChange={(e) => setBaseBranch(e.target.value)}
+-                disabled={isLoading}
+-              />
++              <div className="flex sm:justify-end">
++                <Switch
++                  data-testid="project-settings-worktree"
++                  checked={useWorktree}
++                  onCheckedChange={setUseWorktree}
++                  disabled={isLoading}
++                />
++              </div>
+             </Field>
+-          )}
+ 
+-          <Field label="Agent" hint="Default agent / harness for new sessions">
+-            <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
+-              <AgentHarnessPicker
+-                agentEntries={agentEntries}
+-                harnessEntries={harnessEntries}
+-                effectiveAgentId={agentId}
+-                agentLabel={agentLabel}
+-                hasAgents={agentList.length > 0}
+-                host={warningHost}
+-                onSelectAgent={(a) => {
+-                  // A model default belongs to the picked harness's vocab —
+-                  // don't carry an alias onto a different agent.
+-                  if (a.id !== agentId) setModel(NONE);
+-                  setAgentId(a.id);
+-                }}
+-                pendingAgent={null}
+-                pendingAgentId="__unused_pending_agent__"
+-                onSelectPending={() => {}}
+-                // No interactive create flow here, so hide the "Create custom
+-                // agent" action and leave the handler inert.
+-                onCreateCustomAgent={() => {}}
+-                allowCreateCustomAgent={false}
+-                sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
+-                // Modal so the menu establishes its own scroll context and can
+-                // scroll inside the Dialog's scroll-lock (a non-modal dropdown
+-                // portals outside that lock and can't scroll). The dismiss
+-                // guard on DialogContent keeps this modal dropdown's own close
+-                // from bubbling up and closing the settings dialog.
+-                dropdownModal
+-                onOpenChange={onDropdownOpenChange}
+-                // Bound the menu height so it scrolls inside the modal instead
+-                // of running off the bottom; fixed width matches the composer.
+-                contentClassName="max-h-80 w-80"
+-                contentAlign="end"
+-                // Fill the field column and match the sibling <Select> triggers
+-                // (full width, bordered, h-8) so the control right-aligns with
+-                // the host / effort dropdowns instead of floating mid-row.
+-                triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
+-                triggerLabelClassName="max-w-none text-ui"
+-              />
+-              {agentId && (
+-                <Button
+-                  type="button"
+-                  variant="ghost"
+-                  size="sm"
+-                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
+-                  onClick={() => {
+-                    setAgentId(null);
+-                    setModel(NONE);
++            {useWorktree && (
++              <Field
++                label="Base branch"
++                hint="Branch new worktrees fork from; blank uses the current branch"
++                htmlFor="project-settings-base-branch"
++              >
++                <input
++                  id="project-settings-base-branch"
++                  data-testid="project-settings-base-branch"
++                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
++                  placeholder="e.g. main"
++                  value={baseBranch}
++                  onChange={(e) => setBaseBranch(e.target.value)}
++                  disabled={isLoading}
++                />
++              </Field>
++            )}
++
++            <Field label="Agent" hint="Default agent / harness for new sessions">
++              <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
++                <AgentHarnessPicker
++                  agentEntries={agentEntries}
++                  harnessEntries={harnessEntries}
++                  effectiveAgentId={agentId}
++                  agentLabel={agentLabel}
++                  hasAgents={agentList.length > 0}
++                  host={warningHost}
++                  onSelectAgent={(a) => {
++                    // A model default belongs to the picked harness's vocab —
++                    // don't carry an alias onto a different agent.
++                    if (a.id !== agentId) setModel(NONE);
++                    setAgentId(a.id);
+                   }}
++                  pendingAgent={null}
++                  pendingAgentId="__unused_pending_agent__"
++                  onSelectPending={() => {}}
++                  // No interactive create flow here, so hide the "Create custom
++                  // agent" action and leave the handler inert.
++                  onCreateCustomAgent={() => {}}
++                  allowCreateCustomAgent={false}
++                  sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
++                  // Modal so the menu establishes its own scroll context and can
++                  // scroll inside the Dialog's scroll-lock (a non-modal dropdown
++                  // portals outside that lock and can't scroll). The dismiss
++                  // guard on DialogContent keeps this modal dropdown's own close
++                  // from bubbling up and closing the settings dialog.
++                  dropdownModal
++                  onOpenChange={onDropdownOpenChange}
++                  // Bound the menu height so it scrolls inside the modal instead
++                  // of running off the bottom; fixed width matches the composer.
++                  contentClassName="max-h-80 w-80"
++                  contentAlign="end"
++                  // Fill the field column and match the sibling <Select> triggers
++                  // (full width, bordered, h-8) so the control right-aligns with
++                  // the host / effort dropdowns instead of floating mid-row.
++                  triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
++                  triggerLabelClassName="max-w-none text-ui"
++                />
++                {agentId && (
++                  <Button
++                    type="button"
++                    variant="ghost"
++                    size="sm"
++                    className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
++                    onClick={() => {
++                      setAgentId(null);
++                      setModel(NONE);
++                    }}
++                  >
++                    Clear
++                  </Button>
++                )}
++              </div>
++            </Field>
++
++            {supportsModelDefault && (
++              <Field
++                label="Model"
++                hint={
++                  modelPickerEmpty
++                    ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
++                    : "Default model for new sessions with this agent"
++                }
++              >
++                <Select
++                  value={model}
++                  onValueChange={setModel}
++                  onOpenChange={onDropdownOpenChange}
++                  disabled={isLoading || modelPickerEmpty}
+                 >
+-                  Clear
+-                </Button>
+-              )}
+-            </div>
+-          </Field>
++                  <SelectTrigger className="w-full" data-testid="project-settings-model">
++                    <SelectValue placeholder="No default" />
++                  </SelectTrigger>
++                  <SelectContent>
++                    <SelectItem value={NONE}>No default</SelectItem>
++                    {modelOptions.map((m) => (
++                      <SelectItem key={m.id} value={m.id}>
++                        {m.label}
++                      </SelectItem>
++                    ))}
++                    {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
++                  </SelectContent>
++                </Select>
++              </Field>
++            )}
+ 
+-          {supportsModelDefault && (
+-            <Field
+-              label="Model"
+-              hint={
+-                modelPickerEmpty
+-                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
+-                  : "Default model for new sessions with this agent"
+-              }
+-            >
++            <Field label="Account" hint={accountHint}>
+               <Select
+-                value={model}
+-                onValueChange={setModel}
++                value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
++                onValueChange={(v) => setProvider(v || NONE)}
+                 onOpenChange={onDropdownOpenChange}
+-                disabled={isLoading || modelPickerEmpty}
++                disabled={
++                  isLoading ||
++                  hostId === SANDBOX_HOST_CHOICE ||
++                  (accountOptions.length === 0 && provider === NONE)
++                }
+               >
+-                <SelectTrigger className="w-full" data-testid="project-settings-model">
++                <SelectTrigger className="w-full" data-testid="project-settings-account">
+                   <SelectValue placeholder="No default" />
+                 </SelectTrigger>
+                 <SelectContent>
+                   <SelectItem value={NONE}>No default</SelectItem>
+-                  {modelOptions.map((m) => (
+-                    <SelectItem key={m.id} value={m.id}>
+-                      {m.label}
++                  {accountOptions.map((p) => (
++                    <SelectItem
++                      key={p.name}
++                      value={p.name}
++                      disabled={!p.ready}
++                      data-testid={`project-settings-account-${p.name}`}
++                    >
++                      {p.name}
++                      {p.default ? " (host default)" : ""}
++                      {p.ready ? "" : " · not signed in"}
+                     </SelectItem>
+                   ))}
+-                  {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
++                  {unlistedProviders.map((name) => (
++                    <SelectItem key={name} value={name}>{`${name} (not listed here)`}</SelectItem>
++                  ))}
+                 </SelectContent>
+               </Select>
+             </Field>
+-          )}
+ 
+-          <Field label="Account" hint={accountHint}>
+-            <Select
+-              value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
+-              onValueChange={(v) => setProvider(v || NONE)}
+-              onOpenChange={onDropdownOpenChange}
+-              disabled={
+-                isLoading ||
+-                hostId === SANDBOX_HOST_CHOICE ||
+-                (accountOptions.length === 0 && provider === NONE)
+-              }
+-            >
+-              <SelectTrigger className="w-full" data-testid="project-settings-account">
+-                <SelectValue placeholder="No default" />
+-              </SelectTrigger>
+-              <SelectContent>
+-                <SelectItem value={NONE}>No default</SelectItem>
+-                {accountOptions.map((p) => (
+-                  <SelectItem
+-                    key={p.name}
+-                    value={p.name}
+-                    disabled={!p.ready}
+-                    data-testid={`project-settings-account-${p.name}`}
+-                  >
+-                    {p.name}
+-                    {p.default ? " (host default)" : ""}
+-                    {p.ready ? "" : " · not signed in"}
+-                  </SelectItem>
+-                ))}
+-                {unlistedProviders.map((name) => (
+-                  <SelectItem key={name} value={name}>{`${name} (not listed here)`}</SelectItem>
+-                ))}
+-              </SelectContent>
+-            </Select>
+-          </Field>
++            <div className="flex flex-col gap-1.5" data-testid="project-settings-labels">
++              <div className="flex flex-col">
++                <span className="font-medium text-ui">Default labels</span>
++                <span className="text-muted-foreground text-sm">
++                  Added to sessions created in this project; a label set at creation wins. Moving an
++                  existing session here doesn't add them.
++                </span>
++              </div>
++              <LabelEditor
++                labels={labels}
++                disabled={isLoading || loadFailed}
++                onSet={(key, value) => setLabels((prev) => ({ ...prev, [key]: value }))}
++                onRemove={(key) =>
++                  setLabels((prev) =>
++                    Object.fromEntries(Object.entries(prev).filter(([k]) => k !== key)),
++                  )
++                }
++                emptyText="No default labels"
++                testIdPrefix="project-settings-labels-editor"
++                handleRef={labelEditorRef}
++              />
++              {labelsDirty && (
++                <p
++                  className={
++                    discardWarned ? "text-destructive text-sm" : "text-muted-foreground text-sm"
++                  }
++                  role={discardWarned ? "alert" : undefined}
++                  data-testid="project-settings-labels-unsaved"
++                >
++                  {discardWarned
++                    ? "Your label changes aren't saved. Save to keep them, or close again to discard them."
++                    : "Unsaved. Save to apply these labels to new sessions."}
++                </p>
++              )}
++            </div>
++          </div>
+ 
+           {loadFailed && (
+             <p

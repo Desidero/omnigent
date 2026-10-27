@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mhavant <matthew.hoelting@avant.com>
+Date: Thu, 22 Oct 2026 08:52:48 -0500
+Subject: [PATCH] fix(claude-native): read a teammate's message as the start of
+ a lead turn
+
+Claude starts a lead turn for a teammate's message without firing
+UserPromptSubmit, and the OSC report and status file may not change, so
+after a Stop that left teammates running, that turn read idle for its
+whole length and follow-ups went straight into the busy pane.
+
+The transcript reader now reports when a teammate message reached the
+main thread, and the forwarder records that time as the session's latest
+prompt, which the status pollers already treat as a turn start.
+
+Not upstream yet: proposed alongside upstream PR #10849.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: mhavant <matthew.hoelting@avant.com>
+Docs: none (fix: a teammate-started lead turn reads as working; no setting)
+---
+ omnigent/harnesses/claude_native/bridge.py    | 69 ++++++++++++++++++-
+ omnigent/harnesses/claude_native/forwarder.py |  4 ++
+ .../claude_native/forwarder/test_status.py    | 43 ++++++++++++
+ .../test_claude_native_bridge.py              | 42 +++++++++++
+ 4 files changed, 157 insertions(+), 1 deletion(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index ef48e7d6d58eaf4c2df25df2b3053da4f0221e09..7d523696b78f6af1e92113ca769b21b8fdca1026 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -943,6 +943,9 @@ class TranscriptReadResult:
+     :param record_items: Parsed items grouped by their complete source JSONL
+         record, with the byte offset immediately after each record. Native
+         child-transcript batching uses these boundaries for partial checkpoints.
++    :param latest_peer_delivery_at: When the latest teammate message reached
++        this session, in epoch seconds, or ``None`` when the scanned records
++        held none.
+     """
+ 
+     line_cursor: int
+@@ -953,6 +956,7 @@ class TranscriptReadResult:
+     latest_model: str | None = None
+     latest_custom_title: str | None = None
+     record_items: tuple[TranscriptRecordItems, ...] = ()
++    latest_peer_delivery_at: float | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -3092,7 +3096,8 @@ def read_prompt_submitted_at(bridge_dir: Path) -> float | None:
+ 
+     Set by :func:`record_hook_event` from the session's own
+     ``UserPromptSubmit`` hook, whether the prompt was typed in the pane,
+-    delivered by Omnigent, or a background agent's completion notice.
++    delivered by Omnigent, or a background agent's completion notice, and by
++    :func:`record_peer_delivery` for a teammate message, which fires no hook.
+ 
+     :param bridge_dir: Bridge directory path.
+     :returns: The hook's recorded time in epoch seconds, e.g.
+@@ -3105,6 +3110,32 @@ def read_prompt_submitted_at(bridge_dir: Path) -> float | None:
+     return float(raw)
+ 
+ 
++def record_peer_delivery(bridge_dir: Path, delivered_at: float) -> None:
++    """
++    Record a teammate message as the session's latest prompt.
++
++    Claude starts a turn for a teammate message without a ``UserPromptSubmit``
++    hook, so the transcript reader reports it instead.
++
++    :param bridge_dir: Bridge directory path.
++    :param delivered_at: The delivery record's time in epoch seconds, e.g.
++        ``1792430876.27``.
++    """
++    with _bridge_metadata_write_lock(bridge_dir):
++        state = _read_json_file(bridge_dir / _STATE_FILE)
++        if not isinstance(state, dict):
++            state = {}
++        current = state.get("prompt_submitted_at")
++        if (
++            isinstance(current, (int, float))
++            and not isinstance(current, bool)
++            and current >= delivered_at
++        ):
++            return
++        state["prompt_submitted_at"] = delivered_at
++        _write_json_file(bridge_dir / _STATE_FILE, state)
++
++
+ def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
+     """
+     Return Claude session ids already observed by this bridge.
+@@ -3529,6 +3560,7 @@ def read_transcript_items_from_offset(
+     latest_usage: dict[str, int] | None = None
+     latest_model: str | None = None
+     latest_custom_title: str | None = None
++    latest_peer_delivery_at: float | None = None
+     record_items: list[TranscriptRecordItems] = []
+     for record in read_result.records:
+         parsed: list[ClaudeTranscriptItem] = []
+@@ -3576,6 +3608,9 @@ def read_transcript_items_from_offset(
+         custom_title = _custom_title_from_transcript_entry(entry)
+         if custom_title is not None:
+             latest_custom_title = custom_title
++        delivered_at = _peer_delivery_time(entry)
++        if delivered_at is not None:
++            latest_peer_delivery_at = max(delivered_at, latest_peer_delivery_at or 0.0)
+         record_items.append(
+             TranscriptRecordItems(
+                 next_byte_offset=record.next_byte_offset,
+@@ -3600,9 +3635,41 @@ def read_transcript_items_from_offset(
+         latest_model=latest_model,
+         latest_custom_title=latest_custom_title,
+         record_items=tuple(record_items),
++        latest_peer_delivery_at=latest_peer_delivery_at,
+     )
+ 
+ 
++def _peer_delivery_time(entry: _JsonObject) -> float | None:
++    """
++    Return when a teammate message was delivered to this session's main thread.
++
++    :param entry: One parsed transcript record.
++    :returns: The record's time in epoch seconds, or ``None`` when it is not
++        a teammate delivery.
++    """
++    if entry.get("type") != "user" or entry.get("isSidechain") is True:
++        return None
++    message = entry.get("message")
++    content = message.get("content") if isinstance(message, dict) else None
++    if isinstance(content, str):
++        texts = [content]
++    elif isinstance(content, list):
++        texts = [
++            block["text"]
++            for block in content
++            if isinstance(block, dict) and isinstance(block.get("text"), str)
++        ]
++    else:
++        return None
++    origin = entry.get("origin")
++    is_peer_origin = isinstance(origin, dict) and origin.get("kind") == "peer"
++    if not any(
++        is_peer_origin or _is_unattributed_peer_delivery(text, entry=entry) for text in texts
++    ):
++        return None
++    return _transcript_timestamp(entry.get("timestamp"))
++
++
+ # Per-model pricing memo for transcript cost computation. Each successful
+ # lookup is paired with the provider-config digest that produced it, so a
+ # config change replaces stale pricing. ``None`` is never cached, allowing a
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 6dc7f5842b010e3bf2848900be82d32f1f0c7e73..2a389769741ba60e7445999339f529fe382852da 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -48,6 +48,7 @@ from omnigent.harnesses.claude_native.bridge import (
+     read_transcript_items_from_offset,
+     read_transcript_items_since_with_position,
+     read_transcript_path,
++    record_peer_delivery,
+     transcript_has_forked_from_marker,
+     transcript_has_recent_local_command,
+     url_component,
+@@ -5219,6 +5220,9 @@ async def _forward_available_items(
+     result = await asyncio.to_thread(
+         _read_transcript_items_for_state, state, agent_name, dedupe.settled_response_id
+     )
++    if result.latest_peer_delivery_at is not None:
++        # A teammate message starts a turn without a prompt hook.
++        await asyncio.to_thread(record_peer_delivery, bridge_dir, result.latest_peer_delivery_at)
+     items = result.items
+     if not items:
+         if result.line_cursor == state.line_cursor and result.byte_offset == (
+diff --git a/tests/harnesses/claude_native/forwarder/test_status.py b/tests/harnesses/claude_native/forwarder/test_status.py
+index 7cd4b69026e8fc0a004affee32ca43cb29510858..d0eded47bdfd00ab404322e09003200be18b1515 100644
+--- a/tests/harnesses/claude_native/forwarder/test_status.py
++++ b/tests/harnesses/claude_native/forwarder/test_status.py
+@@ -15,6 +15,7 @@ import pytest
+ import omnigent.harnesses.claude_native.forwarder as forwarder
+ from omnigent.harnesses.claude_native.bridge import (
+     ClaudeHookRecord,
++    read_prompt_submitted_at,
+     record_hook_event,
+ )
+ from tests.harnesses.claude_native.forwarder._support import (
+@@ -816,6 +817,48 @@ async def test_short_turn_poll_posts_items_without_a_status_edge(tmp_path: Path)
+     assert not [body for body in posted if body["type"] == "external_session_status"]
+ 
+ 
++@pytest.mark.asyncio
++async def test_forwarder_records_a_teammate_delivery_as_a_prompt(tmp_path: Path) -> None:
++    """A teammate message starts a lead turn without a prompt hook; the forwarder records it."""
++    bridge_dir = tmp_path / "bridge"
++    transcript_path = tmp_path / "session.jsonl"
++    transcript_path.write_text(
++        json.dumps(
++            {
++                "type": "user",
++                "uuid": "delivery",
++                "timestamp": "2026-10-22T03:27:32.638Z",
++                "message": {
++                    "role": "user",
++                    "content": "Another Claude session sent a message:\n"
++                    '<teammate-message teammate_id="sleeper">slept</teammate-message>',
++                },
++            }
++        )
++        + "\n",
++        encoding="utf-8",
++    )
++    state = forwarder.TranscriptForwardState(
++        transcript_path=transcript_path,
++        line_cursor=0,
++        byte_offset=0,
++        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
++    )
++    transport = httpx.MockTransport(lambda _request: httpx.Response(202, json={}))
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        await forwarder._forward_available_items(
++            client=client,
++            session_id="conv_abc",
++            bridge_dir=bridge_dir,
++            agent_name="claude-native-ui",
++            state=state,
++            retry_tracker=forwarder._PostRetryTracker(),
++            dedupe=forwarder._ForwardDedupeState(),
++        )
++
++    assert read_prompt_submitted_at(bridge_dir) == 1792639652.638
++
++
+ @pytest.mark.asyncio
+ async def test_forwarder_does_not_leave_running_open_for_slash_command_only_turn(
+     tmp_path: Path,
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 765972ee115daf76e9a25b72b8d65ce99ac2bc00..7b6360b1d439ffd5185f6f0a2fe55697e0f62df1 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -69,6 +69,7 @@ from omnigent.harnesses.claude_native.bridge import (
+     read_transcript_items_since,
+     read_transcript_path,
+     record_hook_event,
++    record_peer_delivery,
+     start_tool_relay,
+     stop_hook_seen_since,
+     write_tmux_target,
+@@ -822,6 +823,20 @@ def test_record_hook_event_keeps_the_pinned_session_prompt_time(tmp_path: Path)
+     assert read_prompt_submitted_at(bridge_dir) == hooks[-1].recorded_at
+ 
+ 
++def test_record_peer_delivery_only_moves_the_prompt_time_forward(tmp_path: Path) -> None:
++    """A teammate delivery counts as a prompt, but never rewinds a later one."""
++    bridge_dir = tmp_path / "bridge"
++    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "parent"})
++    prompt_at = read_prompt_submitted_at(bridge_dir)
++    assert prompt_at is not None
++
++    record_peer_delivery(bridge_dir, prompt_at - 10)
++    assert read_prompt_submitted_at(bridge_dir) == prompt_at
++    record_peer_delivery(bridge_dir, prompt_at + 10)
++    assert read_prompt_submitted_at(bridge_dir) == prompt_at + 10
++    assert read_claude_session_id(bridge_dir) == "parent"
++
++
+ @pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])
+ def test_bridge_writers_preserve_concurrent_identity_and_model_updates(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, updated_file: str
+@@ -1476,6 +1491,33 @@ def test_claude_framed_delivery_without_origin_is_internal(
+         assert "is_meta" not in item.data
+ 
+ 
++@pytest.mark.parametrize(
++    "metadata,delivered",
++    [
++        ({}, True),
++        ({"origin": {"kind": "peer"}}, True),
++        ({"origin": {"kind": "human"}}, False),
++        ({"isSidechain": True}, False),
++    ],
++)
++def test_transcript_read_reports_teammate_delivery_time(
++    tmp_path: Path, metadata: dict[str, Any], delivered: bool
++) -> None:
++    """Only a teammate message on the main thread reports a delivery time."""
++    entry = {
++        "type": "user",
++        "timestamp": "2026-10-22T03:27:32.638Z",
++        "message": {"role": "user", "content": _FRAMED_TEAMMATE_DELIVERY},
++        **metadata,
++    }
++    transcript = tmp_path / "session.jsonl"
++    transcript.write_text(_transcript_line(entry), encoding="utf-8")
++
++    result = read_transcript_items_from_offset(transcript, 0, start_line=0, agent_name="Claude")
++
++    assert result.latest_peer_delivery_at == (1792639652.638 if delivered else None)
++
++
+ def test_queued_framed_delivery_from_a_human_stays_visible(tmp_path: Path) -> None:
+     _, _, items = _read_native_user(
+         tmp_path, _FRAMED_TEAMMATE_DELIVERY, queued="prompt", origin={"kind": "human"}

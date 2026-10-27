@@ -1,0 +1,792 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lazar Gopcevic <lazgop@gmail.com>
+Date: Fri, 11 Sep 2026 12:29:46 +0200
+Subject: [PATCH] fix(claude-native): follow CLAUDE_CONFIG_DIR instead of
+ ~/.claude
+
+Carried on custom until upstream PR #9617 (CLAUDE_CONFIG_DIR) merges; the
+account work below needs it.
+
+Claude Code takes its profile from CLAUDE_CONFIG_DIR. The runner env
+forwards it and trust seeding follows it, but the rest of what Omnigent
+reads and writes on Claude's behalf was still pinned to ~/.claude: the
+user settings behind the status line and effort level, the transcript
+lookup used when a session moves, the claude-sdk sandbox's writable
+roots and files, and the install ledger's check for the omnigent MCP
+entry. Under a selected profile each of these looked at the wrong one.
+
+Resolve all of them through claude_paths, trust seeding included, so a
+single rule decides where Claude's files live. Keep tests that pin the
+CLAUDE_CONFIG_DIR passthrough through both env strips, since the
+claude-native pane depends on it too.
+
+Tests now clear CLAUDE_CONFIG_DIR by default, so a developer's own
+profile cannot slip past the tmp-HOME isolation the suite relies on.
+
+Signed-off-by: Lazar Gopcevic <lazgop@gmail.com>
+(cherry picked from commit 3b60158eab69a9d4f08a4e3b45a030985394de19)
+Signed-off-by: omni-resolve-agent[bot] <omni-resolve-agent[bot]@users.noreply.github.com>
+Docs: none (fix: Omnigent follows Claude Code's own CLAUDE_CONFIG_DIR, as the CLI does; no new setting)
+---
+ omnigent/harnesses/claude_native/bridge.py    | 15 ++--
+ omnigent/harnesses/claude_native/main.py      | 20 +++--
+ omnigent/inner/claude_sdk_executor.py         | 15 ++--
+ omnigent/install_ledger.py                    |  3 +-
+ tests/cli/test_host_daemon_env.py             | 43 +++++++++++
+ tests/conftest.py                             | 13 ++++
+ .../claude_native/test_claude_native.py       | 77 +++++++++++++------
+ .../test_claude_native_bridge.py              | 46 +++++++++--
+ tests/inner/test_claude_sdk_executor.py       | 39 ++++++++++
+ ...pp_sessions_native_terminals_autocreate.py |  2 +-
+ tests/test_install_ledger.py                  | 25 ++++++
+ tests/test_routing_model_switch_guards.py     | 10 ++-
+ 12 files changed, 251 insertions(+), 57 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 7b7744faab4167a337c7934e535be807e2ffa3a5..3169062b3269b64cc1ba45cd465bbf846f9cf74d 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -69,6 +69,7 @@ from filelock import FileLock
+ from filelock import Timeout as FileLockTimeout
+ 
+ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
++from omnigent.claude_paths import claude_config_dir
+ from omnigent.harnesses.claude_native import delivery_diagnostics
+ from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
+ from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+@@ -228,7 +229,6 @@ _TOOL_RELAY_ENV_FILE = "tool_relay.env"
+ _TMUX_FILE = "tmux.json"
+ _PERMISSION_HOOK_FILE = "permission_hook.json"
+ _CONTEXT_FILE = "context.json"
+-_USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+ _MCP_SERVER_NAME = "omnigent"
+ _MCP_PROTOCOL_VERSION = "2024-11-05"
+ # Tools-changed: harness POSTs to the bridge MCP server's localhost
+@@ -8466,6 +8466,11 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
+     return model if isinstance(model, str) and model else None
+ 
+ 
++def _user_claude_settings_path() -> Path:
++    """Return the user's Claude Code ``settings.json`` for the active profile."""
++    return claude_config_dir() / "settings.json"
++
++
+ def read_user_status_line_command() -> str | None:
+     """
+     Return the user's globally-configured statusLine shell command, if any.
+@@ -8476,11 +8481,11 @@ def read_user_status_line_command() -> str | None:
+     to whatever they had configured globally.
+ 
+     :returns: The command string from
+-        ``~/.claude/settings.json``'s ``statusLine.command``, or
++        the user's ``settings.json``'s ``statusLine.command``, or
+         ``None`` when no global statusLine is configured / readable.
+     """
+     try:
+-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
++        raw = _user_claude_settings_path().read_text(encoding="utf-8")
+     except OSError:
+         return None
+     try:
+@@ -8502,14 +8507,14 @@ def read_user_effort_level() -> str | None:
+     """
+     Return the user's configured Claude Code effort level, if any.
+ 
+-    Read client-side from ``effortLevel`` in ``~/.claude/settings.json`` —
++    Read client-side from ``effortLevel`` in the user's ``settings.json`` —
+     the level the wrapped ``claude`` actually runs at (we pass no ``--effort``).
+ 
+     :returns: A recognized effort, e.g. ``"medium"``; ``None`` when unset,
+         unreadable, or not a valid Claude effort (fail-soft, never blocks launch).
+     """
+     try:
+-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
++        raw = _user_claude_settings_path().read_text(encoding="utf-8")
+     except OSError:
+         return None
+     try:
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index c1bea6e0f1bac5845c494aeb2fdf7ace1b345f47..67bfc2e974b464dc943a87b6f4b91e8a7678cbd8 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -23,6 +23,7 @@ import subprocess
+ import sys
+ import uuid
+ 
++from omnigent.claude_paths import claude_config_dir
+ from omnigent.llms.adapters._content import redact_binary_payloads
+ from omnigent.runtime.tool_result_replay import (
+     blocks_from_parsed_list,
+@@ -280,7 +281,6 @@ _SESSION_LABELS = {
+     "omnigent.ui": "terminal",
+     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
+ }
+-_CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+ # Test override for the managed-settings chain. ``None`` means "use the ambient
+ # detector's chain" — the single canonical definition (``ambient`` owns both the
+ # path list and the parser). Binding a *copy* here would create a second source
+@@ -2433,7 +2433,7 @@ def _redirect_claude_transcript_to_current_project(
+     if source is None:
+         raise click.ClickException(
+             f"Claude transcript {external_session_id!r} was not found under "
+-            f"{_CLAUDE_PROJECTS_DIR}."
++            f"{_claude_projects_dir()}."
+         )
+     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+     tmp = target.with_suffix(".jsonl.tmp")
+@@ -2676,6 +2676,11 @@ def _clone_claude_transcript(
+     return target
+ 
+ 
++def _claude_projects_dir() -> Path:
++    """Return the directory Claude Code writes session transcripts under."""
++    return claude_config_dir() / "projects"
++
++
+ def _find_claude_transcript(
+     external_session_id: str, *, exclude: Path | None = None
+ ) -> Path | None:
+@@ -2690,12 +2695,13 @@ def _find_claude_transcript(
+     """
+     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
+         return None
+-    if not _CLAUDE_PROJECTS_DIR.is_dir():
++    projects_dir = _claude_projects_dir()
++    if not projects_dir.is_dir():
+         return None
+     matches: list[Path] = []
+     filename = f"{external_session_id}.jsonl"
+     excluded = exclude.resolve() if exclude is not None else None
+-    for project_dir in _CLAUDE_PROJECTS_DIR.iterdir():
++    for project_dir in projects_dir.iterdir():
+         if not project_dir.is_dir():
+             continue
+         candidate = project_dir / filename
+@@ -2711,14 +2717,14 @@ def _claude_project_dir_for_cwd(cwd: Path) -> Path:
+     """
+     Return Claude's project transcript directory for *cwd*.
+ 
+-    Claude Code stores transcripts under
+-    ``~/.claude/projects/<sanitized-cwd>/``. The observed sanitizer
++    Claude Code stores transcripts under ``projects/<sanitized-cwd>/`` in
++    its config dir. The observed sanitizer
+     replaces non-alphanumeric path characters with ``-``.
+ 
+     :param cwd: Absolute cwd, e.g. ``Path("/home/me/repo")``.
+     :returns: Claude project transcript directory.
+     """
+-    return _CLAUDE_PROJECTS_DIR / _sanitize_claude_project_name(str(cwd))
++    return _claude_projects_dir() / _sanitize_claude_project_name(str(cwd))
+ 
+ 
+ def _sanitize_claude_project_name(path: str) -> str:
+diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
+index 488ff96a3dc536fa7d62afb003b38a9cd19ad14b..5524d009954e96fdf8fdd010ed363c44bfc34812 100644
+--- a/omnigent/inner/claude_sdk_executor.py
++++ b/omnigent/inner/claude_sdk_executor.py
+@@ -43,6 +43,7 @@ from types import ModuleType
+ from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+ 
+ from omnigent._platform import resolve_cli_binary, stable_user_id
++from omnigent.claude_paths import claude_config_dir, claude_json_path
+ from omnigent.cli_invocation import cli_invocation
+ from omnigent.databricks_ai_gateway import (
+     CLAUDE_CODE_AGENT,
+@@ -1390,11 +1391,12 @@ def _parse_optional_int(value: str | None) -> int | None:
+ def _claude_internal_write_roots() -> list[pathlib.Path]:
+     """Writable roots the Claude CLI needs for its own local session state."""
+ 
++    claude_dir = claude_config_dir()
+     roots = [
+-        pathlib.Path.home() / ".claude" / "backups",
+-        pathlib.Path.home() / ".claude" / "plugins",
+-        pathlib.Path.home() / ".claude" / "session-env",
+-        pathlib.Path.home() / ".claude" / "sessions",
++        claude_dir / "backups",
++        claude_dir / "plugins",
++        claude_dir / "session-env",
++        claude_dir / "sessions",
+         pathlib.Path.home() / ".npm" / "_logs",
+         pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
+     ]
+@@ -1407,10 +1409,7 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
+     """Exact files the Claude CLI updates outside its writable roots."""
+ 
+     # .credentials.json holds the Claude CLI's OAuth token on Linux.
+-    candidates = [
+-        pathlib.Path.home() / ".claude.json",
+-        pathlib.Path.home() / ".claude" / ".credentials.json",
+-    ]
++    candidates = [claude_json_path(), claude_config_dir() / ".credentials.json"]
+     return [path for path in candidates if path.exists()]
+ 
+ 
+diff --git a/omnigent/install_ledger.py b/omnigent/install_ledger.py
+index 838969b9bc734a3765dcbe716b829ead0a6d27a1..3b4d28c5ffdb8ad8b8635211adf47c1650478ee2 100644
+--- a/omnigent/install_ledger.py
++++ b/omnigent/install_ledger.py
+@@ -14,6 +14,7 @@ from datetime import UTC, datetime
+ from pathlib import Path
+ from typing import NotRequired, TypedDict, cast
+ 
++from omnigent.claude_paths import claude_json_path
+ from omnigent.util.json_types import JsonObject as _JsonObject
+ 
+ SCHEMA_VERSION = 1
+@@ -462,7 +463,7 @@ def observed_external_configs(*, deep: bool) -> list[ExternalConfigEntry]:
+     candidates = [
+         (cwd / ".cursor" / "mcp.json", "mcpServers.omnigent", "json"),
+         (cwd / ".kiro" / "settings" / "mcp.json", "mcpServers.omnigent", "json"),
+-        (Path.home() / ".claude.json", "mcpServers.omnigent", "json"),
++        (claude_json_path(), "mcpServers.omnigent", "json"),
+         (Path.home() / ".codex" / "config.toml", "mcp_servers.omnigent", "toml"),
+     ]
+     entries: list[ExternalConfigEntry] = []
+diff --git a/tests/cli/test_host_daemon_env.py b/tests/cli/test_host_daemon_env.py
+index 88874c1c468752c808625f85e56ed1e46f84a411..845ba41c2967d35a01b1b47d21885b9a5fec85b4 100644
+--- a/tests/cli/test_host_daemon_env.py
++++ b/tests/cli/test_host_daemon_env.py
+@@ -593,3 +593,46 @@ def test_remote_daemon_and_runners_are_pinned_to_the_selected_workspace(
+         parent_pid=12345,
+     )
+     assert runner_env[PINNED_DATABRICKS_ORG_ENV_VAR] == f"{server}?o=111"
++
++
++@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
++def test_host_daemon_env_preserves_claude_config_dir(
++    monkeypatch: pytest.MonkeyPatch,
++    server_url: str | None,
++) -> None:
++    """Claude's profile selector survives the CLI→daemon strip in both modes.
++
++    Without it the detached daemon's claude-native panes run on the default
++    ``~/.claude`` profile instead of the one the user selected.
++    """
++    # Given
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/profiles/work")
++
++    # When
++    env = _build_host_daemon_env(server_url=server_url)
++
++    # Then
++    assert env.get("CLAUDE_CONFIG_DIR") == "/profiles/work"
++
++
++def test_runner_env_preserves_claude_config_dir() -> None:
++    """Claude's profile selector survives the daemon→runner strip.
++
++    The runner env is what the claude-native pane inherits, so a drop here puts
++    the session on the default profile.
++    """
++    # Given
++    base_env = {"PATH": "/usr/bin", "CLAUDE_CONFIG_DIR": "/profiles/work"}
++
++    # When
++    env = _build_runner_env(
++        base_env,
++        server_url=_REMOTE_SERVER_URL,
++        runner_id="runner_claude_profile",
++        binding_token="binding-claude-profile",
++        workspace="/tmp/workspace",
++        parent_pid=12345,
++    )
++
++    # Then
++    assert env.get("CLAUDE_CONFIG_DIR") == "/profiles/work"
+diff --git a/tests/conftest.py b/tests/conftest.py
+index d8214be65eda920aedb7ed66ceba219f6c923f4e..7845648155a928a214cc50c32a5a9b3a6c26d9fb 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -381,6 +381,19 @@ def _isolate_claude_native_state(
+     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(state_dir))
+ 
+ 
++@pytest.fixture(autouse=True)
++def _isolate_claude_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Keep a developer's ``CLAUDE_CONFIG_DIR`` out of tests.
++
++    Omnigent resolves Claude's home from it, which would bypass the tmp ``$HOME``
++    tests use to redirect ``~/.claude``. Tests that need a profile set it themselves.
++
++    :param monkeypatch: Pytest monkeypatch fixture; restores the env at teardown.
++    :returns: None.
++    """
++    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
++
++
+ @pytest.fixture(autouse=True)
+ def _isolate_codex_native_state(
+     tmp_path_factory: pytest.TempPathFactory,
+diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
+index 6b8558d19eb484f3562e248d3ffbff84645510c7..21d831dc5afe5428eb5dbfa6c42b283cc6cdc79f 100644
+--- a/tests/harnesses/claude_native/test_claude_native.py
++++ b/tests/harnesses/claude_native/test_claude_native.py
+@@ -3035,7 +3035,7 @@ async def test_ensure_local_claude_resume_transcript_uses_workspace_dir(
+     nothing.
+     """
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     workspace = Path("/work/some-repo")
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+@@ -3091,7 +3091,7 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
+     leave an empty ``<sid>.jsonl`` behind for a later launch to trip over.
+     """
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     workspace = Path("/work/some-repo")
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+@@ -3304,7 +3304,7 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
+     session.
+     """
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     workspace = Path("/work/some-repo")
+     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+     target_dir.mkdir(parents=True)
+@@ -3348,7 +3348,7 @@ async def test_resume_transcript_ignores_corrupt_local_file(
+     failure.
+     """
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     workspace = Path("/work/some-repo")
+     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+     target_dir.mkdir(parents=True)
+@@ -3382,7 +3382,7 @@ async def test_resume_transcript_ignores_binary_local_file(
+     ``UnicodeDecodeError`` out of the fallback path.
+     """
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     workspace = Path("/work/some-repo")
+     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+     target_dir.mkdir(parents=True)
+@@ -3417,7 +3417,7 @@ async def test_resume_transcript_ignores_local_file_on_4xx(
+     local transcript exists.
+     """
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     workspace = Path("/work/some-repo")
+     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+     target_dir.mkdir(parents=True)
+@@ -3445,7 +3445,7 @@ async def test_resume_transcript_raises_when_history_unfetchable_and_no_local_fi
+ ) -> None:
+     """No server history and no local transcript → the failure surfaces."""
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+         del request
+@@ -3532,7 +3532,7 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
+     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+ 
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     bridge_dir = tmp_path / "bridge"
+     monkeypatch.setattr(
+         claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+@@ -3606,7 +3606,7 @@ async def test_resume_restores_attachments_using_the_launch_bridge(
+     from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+ 
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     legacy_bridge = tmp_path / "legacy-bridge"
+     bridge_dir = legacy_bridge if resume_path == "legacy" else tmp_path / "live-bridge"
+     monkeypatch.setattr(
+@@ -3741,7 +3741,7 @@ async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachme
+     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+ 
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     bridge_dir = tmp_path / "bridge"
+     monkeypatch.setattr(
+         claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+@@ -3786,7 +3786,7 @@ async def test_ensure_local_claude_resume_transcript_survives_malformed_file_met
+     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+ 
+     projects = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     bridge_dir = tmp_path / "bridge"
+     monkeypatch.setattr(
+         claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+@@ -5620,7 +5620,7 @@ async def test_resolve_cold_resume_args_injects_external_session_id(
+     :param tmp_path: Temporary directory used to isolate Claude
+         project state from the developer's real ``~/.claude`` tree.
+     """
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: tmp_path / "projects")
+     client = await _httpx_client_with_canned_response(
+         _conversation_response_body(
+             labels={"omnigent.wrapper": "claude-code-native-ui"},
+@@ -5653,7 +5653,7 @@ async def test_resolve_cold_resume_args_declines_resume_when_no_history(
+     :param monkeypatch: Pytest monkeypatch fixture.
+     :param tmp_path: Temporary directory isolating Claude project state.
+     """
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: tmp_path / "projects")
+     client = await _httpx_client_with_canned_response(
+         _conversation_response_body(
+             labels={"omnigent.wrapper": "claude-code-native-ui"},
+@@ -5756,7 +5756,7 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
+         raise AssertionError(f"unexpected request {request.method} {request.url}")
+ 
+     monkeypatch.chdir(workspace)
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     transport = httpx.MockTransport(handler)
+     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+         args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+@@ -5880,7 +5880,7 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
+         raise AssertionError(f"unexpected request {request.method} {request.url}")
+ 
+     monkeypatch.chdir(workspace)
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     transport = httpx.MockTransport(handler)
+     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+         args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+@@ -5952,7 +5952,7 @@ async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_im
+         del request
+         return httpx.Response(200, json=_items_response_body([image_item]))
+ 
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
+     transport = httpx.MockTransport(handler)
+     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+         written = await claude_native._ensure_local_claude_resume_transcript(
+@@ -7324,7 +7324,7 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
+         "",
+     ]
+     source.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+     monkeypatch.setattr(
+         claude_native,
+         "_fetch_external_session_id_for_redirect",
+@@ -7404,7 +7404,7 @@ def test_align_working_directory_redirect_replaces_stale_target(
+     target_dir.mkdir(parents=True)
+     target = target_dir / f"{external_session_id}.jsonl"
+     target.write_text('{"cwd":"do-not-overwrite"}\n', encoding="utf-8")
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+     monkeypatch.setattr(
+         claude_native,
+         "_fetch_external_session_id_for_redirect",
+@@ -7479,7 +7479,7 @@ def test_align_working_directory_redirect_works_when_recorded_path_missing(
+         )
+         return "move"
+ 
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+     monkeypatch.setattr(
+         claude_native,
+         "_fetch_external_session_id_for_redirect",
+@@ -7577,7 +7577,7 @@ def test_clone_claude_transcript_rewrites_session_and_cwd_into_clone_project_dir
+         "",
+     ]
+     source_path.write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+ 
+     result = claude_native._clone_claude_transcript(
+         source_external_session_id=source_uuid,
+@@ -7639,7 +7639,7 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
+     projects_dir.mkdir(parents=True)
+     clone_workspace = tmp_path / "clone"
+     clone_workspace.mkdir()
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+ 
+     result = claude_native._clone_claude_transcript(
+         source_external_session_id="00000000-0000-0000-0000-000000000000",
+@@ -7748,7 +7748,7 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
+     source_text = source_path.read_text(encoding="utf-8")
+     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
+     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+ 
+     result = claude_native._clone_claude_transcript(
+         source_external_session_id=source_uuid,
+@@ -7844,7 +7844,7 @@ def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
+         "toolUseResult": json.dumps(fake_text),
+     }
+     source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+ 
+     result = claude_native._clone_claude_transcript(
+         source_external_session_id=source_uuid,
+@@ -8205,7 +8205,7 @@ def test_clone_and_cwd_copy_paths_both_collapse_a_dropped_payload(
+     source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+     source_text = source_path.read_text(encoding="utf-8")
+     assert source_text.count(payload) == 2, "pre-repair wedged state"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+ 
+     cloned = claude_native._clone_claude_transcript(
+         source_external_session_id=source_uuid,
+@@ -8251,7 +8251,7 @@ def test_clone_claude_transcript_repairs_progressive_jpeg_duplication(
+     b64 = _TINY_PROGRESSIVE_JPEG_BASE64
+     source_path.write_text(json.dumps(_stale_duplicated_jpeg_record(b64)) + "\n", encoding="utf-8")
+     assert source_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
++    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
+ 
+     result = claude_native._clone_claude_transcript(
+         source_external_session_id=source_uuid,
+@@ -12086,3 +12086,30 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
+     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+ 
+     assert claude_native.resolve_native_claude_config(spec=spec, refresh_models=False) is None
++
++
++def test_find_claude_transcript_searches_the_configured_claude_home(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Transcripts are found in ``$CLAUDE_CONFIG_DIR/projects``, where Claude writes them."""
++    monkeypatch.setenv("HOME", str(tmp_path / "home"))
++    profile = tmp_path / "work-profile"
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++    session_id = "02857840-6362-408f-b41f-309e396ed7c6"
++    transcript = profile / "projects" / "-work-repo" / f"{session_id}.jsonl"
++    transcript.parent.mkdir(parents=True)
++    transcript.write_text("{}\n", encoding="utf-8")
++
++    assert claude_native._find_claude_transcript(session_id) == transcript
++
++
++def test_claude_project_dir_for_cwd_uses_the_configured_claude_home(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A moved transcript lands where the configured profile's Claude will look for it."""
++    profile = tmp_path / "work-profile"
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++
++    assert claude_native._claude_project_dir_for_cwd(Path("/work/repo")) == (
++        profile / "projects" / "-work-repo"
++    )
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 7bc1fd21351634a52aa0baf69778f225194cac74..8c4632bcc988fcd81ef11be08651ab22125e4162 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -8059,7 +8059,7 @@ def test_read_user_status_line_command_returns_string(
+         json.dumps({"statusLine": {"type": "command", "command": "bun run hud"}}),
+         encoding="utf-8",
+     )
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
++    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
+ 
+     assert claude_native_bridge.read_user_status_line_command() == "bun run hud"
+ 
+@@ -8070,7 +8070,7 @@ def test_read_user_status_line_command_returns_none_when_unset(
+     """No global statusLine → chain is omitted; wrapper prints nothing extra."""
+     settings = tmp_path / "settings.json"
+     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
++    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
+     assert claude_native_bridge.read_user_status_line_command() is None
+ 
+ 
+@@ -8081,7 +8081,7 @@ def test_read_user_effort_level_returns_configured_level(
+     """A recognized ``effortLevel`` is returned, to stamp on the session row."""
+     settings = tmp_path / "settings.json"
+     settings.write_text(json.dumps({"effortLevel": effort}), encoding="utf-8")
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
++    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
+     assert claude_native_bridge.read_user_effort_level() == effort
+ 
+ 
+@@ -8091,7 +8091,7 @@ def test_read_user_effort_level_returns_none_when_unset(
+     """No ``effortLevel`` → None, so creation omits reasoning_effort entirely."""
+     settings = tmp_path / "settings.json"
+     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
++    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
+     assert claude_native_bridge.read_user_effort_level() is None
+ 
+ 
+@@ -8101,7 +8101,7 @@ def test_read_user_effort_level_rejects_unrecognized_value(
+     """An unrecognized value is treated as unset (fail-soft, so launch never 400s)."""
+     settings = tmp_path / "settings.json"
+     settings.write_text(json.dumps({"effortLevel": "ultra"}), encoding="utf-8")
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
++    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
+     assert claude_native_bridge.read_user_effort_level() is None
+ 
+ 
+@@ -8110,7 +8110,7 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
+ ) -> None:
+     """Missing settings.json → None; absence of config must not raise."""
+     missing = tmp_path / "does-not-exist" / "settings.json"
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", missing)
++    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: missing)
+     assert claude_native_bridge.read_user_effort_level() is None
+ 
+ 
+@@ -14478,3 +14478,37 @@ def test_hold_approval_wait_marker_refreshes_until_released(
+     settled = len(touches)
+     time.sleep(0.1)
+     assert len(touches) == settled, "the refresher must stop when the block exits"
++
++
++def test_ensure_trusted_writes_into_the_configured_claude_home(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Trust lands in the ``.claude.json`` the configured profile's Claude reads."""
++    home_config = _redirect_home(monkeypatch, tmp_path / "home")
++    profile = tmp_path / "work-profile"
++    profile.mkdir()
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++    workspace = tmp_path / "repo"
++    workspace.mkdir()
++
++    ensure_claude_workspace_trusted(workspace)
++
++    assert not home_config.exists()
++    data = json.loads((profile / ".claude.json").read_text(encoding="utf-8"))
++    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
++
++
++def test_read_user_status_line_command_reads_the_configured_claude_home(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """User settings come from ``$CLAUDE_CONFIG_DIR/settings.json`` when it is set."""
++    monkeypatch.setenv("HOME", str(tmp_path / "home"))
++    profile = tmp_path / "work-profile"
++    profile.mkdir()
++    (profile / "settings.json").write_text(
++        json.dumps({"statusLine": {"type": "command", "command": "work-profile-hud"}}),
++        encoding="utf-8",
++    )
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++
++    assert claude_native_bridge.read_user_status_line_command() == "work-profile-hud"
+diff --git a/tests/inner/test_claude_sdk_executor.py b/tests/inner/test_claude_sdk_executor.py
+index 1da1c0587bbbbe1694f89902972174a10fc279d1..2c3d7c8407b7dc92fb4212a25b20a006bd9a9814 100644
+--- a/tests/inner/test_claude_sdk_executor.py
++++ b/tests/inner/test_claude_sdk_executor.py
+@@ -6146,3 +6146,42 @@ async def test_effort_changes_rebuild_client_with_history(initial_effort, compac
+ 
+     assert len(fake_sdk.created_clients) == 3
+     assert [call.args[0] for call in close.await_args_list] == fake_sdk.created_clients[:2]
++
++
++def test_claude_internal_write_roots_follow_the_configured_claude_home(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The sandbox opens the configured profile's state dirs, not ``~/.claude``."""
++    from omnigent.inner.claude_sdk_executor import _claude_internal_write_roots
++
++    home = tmp_path / "home"
++    monkeypatch.setenv("HOME", str(home))
++    profile = tmp_path / "work-profile"
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++
++    roots = _claude_internal_write_roots()
++
++    assert profile / "sessions" in roots
++    assert home / ".claude" / "sessions" not in roots
++
++
++def test_claude_internal_write_files_follow_the_configured_claude_home(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Only the configured profile's config and credentials become writable."""
++    from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
++
++    home = tmp_path / "home"
++    home.mkdir()
++    (home / ".claude.json").write_text("{}\n", encoding="utf-8")
++    monkeypatch.setenv("HOME", str(home))
++    profile = tmp_path / "work-profile"
++    profile.mkdir()
++    (profile / ".claude.json").write_text("{}\n", encoding="utf-8")
++    (profile / ".credentials.json").write_text("{}\n", encoding="utf-8")
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++
++    assert _claude_internal_write_files() == [
++        profile / ".claude.json",
++        profile / ".credentials.json",
++    ]
+diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+index 1f504f8c9aafa1f44e3765bc3f119a74eaf49f40..73aab7fcd6f99e73fe179751e01c96f44935bc60 100644
+--- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
++++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+@@ -3112,7 +3112,7 @@ async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
+     monkeypatch.setattr(
+         claude_native_bridge, "ensure_claude_workspace_trusted", lambda *a, **k: None
+     )
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
+     monkeypatch.setattr("omnigent.config.load_effective_config", lambda **_: {})
+     forwarder = AsyncMock()
+diff --git a/tests/test_install_ledger.py b/tests/test_install_ledger.py
+index dd73fd40473f2a645f4f34440db542e12b796bc3..7c828444b00ff8ec4a7ca8d0482d21ca85606b59 100644
+--- a/tests/test_install_ledger.py
++++ b/tests/test_install_ledger.py
+@@ -240,3 +240,28 @@ def test_record_and_remove_launch_agent_preserves_other_entries(
+     removed = install_ledger.load_ledger(install_ledger.ledger_path())
+     assert removed is not None
+     assert removed.entries.launch_agents == [unrelated]
++
++
++def test_deep_backfill_observes_claude_config_in_the_configured_claude_home(
++    tmp_path: Path, monkeypatch
++) -> None:
++    home = tmp_path / "home"
++    state = home / ".omnigent"
++    profile = tmp_path / "work-profile"
++    workspace = tmp_path / "workspace"
++    state.mkdir(parents=True)
++    profile.mkdir()
++    workspace.mkdir()
++    (state / "installation_id").write_text("install-123\n")
++    claude_config = profile / ".claude.json"
++    claude_config.write_text('{"mcpServers": {"omnigent": {"command": "python"}}}\n')
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
++    monkeypatch.chdir(workspace)
++
++    ledger = install_ledger.backfill_install_ledger(deep=True, apply=False)
++
++    assert ledger is not None
++    observed = [entry.path for entry in ledger.entries.injected_external_config]
++    assert observed == [str(claude_config)]
+diff --git a/tests/test_routing_model_switch_guards.py b/tests/test_routing_model_switch_guards.py
+index 442a038f7f31ab723a6139fbe9a0900ecd6e1b6d..edcd8d929130d0471137f129df2c9a7d8d78bd8e 100644
+--- a/tests/test_routing_model_switch_guards.py
++++ b/tests/test_routing_model_switch_guards.py
+@@ -58,13 +58,15 @@ def test_the_users_claude_settings_file_is_only_ever_read() -> None:
+         if not isinstance(node, ast.Attribute):
+             continue
+         if not (
+-            isinstance(node.value, ast.Name) and node.value.id == "_USER_CLAUDE_SETTINGS_PATH"
++            isinstance(node.value, ast.Call)
++            and isinstance(node.value.func, ast.Name)
++            and node.value.func.id == "_user_claude_settings_path"
+         ):
+             continue
+         reads.append(node.attr)
+-    # The definition itself is an assignment, not an attribute access, so every
+-    # hit here is a use.
+-    assert reads, "the guard found no usages at all — has the constant been renamed?"
++    # The accessor's own definition is not an attribute access, so every hit here
++    # is a use.
++    assert reads, "the guard found no usages at all — has the accessor been renamed?"
+     assert set(reads) <= {"read_text", "read_bytes", "exists", "is_file"}, (
+         f"non-read access to the user's settings file: {sorted(set(reads))}"
+     )

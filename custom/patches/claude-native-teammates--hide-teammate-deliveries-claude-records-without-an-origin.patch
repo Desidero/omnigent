@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Mon, 19 Oct 2026 23:36:18 +0000
+Subject: [PATCH] fix(claude-native): hide teammate deliveries Claude records
+ without an origin
+
+Claude Code delivers an agent-team teammate's messages to the lead as
+plain user records framed "Another Claude session sent a message:" plus
+a <teammate-message> envelope and its own guidance paragraph, with no
+origin field. The bridge only trusted origin.kind == "peer", so these
+were persisted user_authored and rendered as raw markup and
+idle_notification JSON in the lead's chat.
+
+Typed and pasted prompts carry origin {"kind": "human"}, both as user
+records and as prompts queued mid-turn, so treat a record or queued
+prompt with no origin and Claude's complete framing (nothing else in
+the text) as internal, like other peer traffic. Human-origin input and
+framing with extra text still render as the user's message.
+
+Not upstream yet: proposed from fix/claude-native-teammate-delivery; drop this copy once it
+merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (fix: teammate deliveries no longer render as raw markup; no setting)
+---
+ omnigent/harnesses/claude_native/bridge.py    | 48 ++++++++++++++-----
+ .../test_claude_native_bridge.py              | 44 ++++++++++++++++-
+ 2 files changed, 80 insertions(+), 12 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index e0f7b7344670ae09b5b158f00632b4fc5d3aa9d7..599d6172ede0049a8b10142f5b093a1e722b36ca 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -62,7 +62,7 @@ from http import HTTPStatus
+ from http.client import HTTPConnection, HTTPException
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
++from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
+ from urllib import request
+ 
+ from filelock import FileLock
+@@ -8751,7 +8751,9 @@ def _attachment_transcript_items_from_entry(
+         return current_response_id, []
+     if attachment.get("isMeta") is True:
+         return current_response_id, []
+-    if _is_trusted_agent_notification_text(prompt, origin=attachment.get("origin")):
++    if _is_trusted_agent_notification_text(
++        prompt, origin=attachment.get("origin")
++    ) or _is_unattributed_peer_delivery(prompt, entry=attachment):
+         return current_response_id, []
+     source_key = _transcript_source_key(entry, line_number, record_offset)
+     item = ClaudeTranscriptItem(
+@@ -9203,10 +9205,28 @@ def _is_trusted_agent_notification_text(text: str, *, origin: object = None) ->
+     )
+ 
+ 
++def _is_unattributed_peer_delivery(text: str, *, entry: _JsonObject) -> bool:
++    """
++    Recognize a teammate delivery Claude framed itself but left without ``origin``.
++
++    Claude Code stamps typed and pasted prompts ``origin: {"kind": "human"}``, so a
++    record with no ``origin`` key and Claude's full framing came from a teammate.
++    """
++    return "origin" not in entry and _peer_message_shape(text) == "framed"
++
++
+ def _is_agent_notification_text(text: str) -> bool:
+     """Recognize possible agent context; text alone does not prove its origin."""
+-    if _is_trusted_agent_notification_text(text):
+-        return True
++    return _is_trusted_agent_notification_text(text) or _peer_message_shape(text) is not None
++
++
++def _peer_message_shape(text: str) -> Literal["bare", "framed"] | None:
++    """
++    Classify team envelopes: ``framed`` with Claude's delivery prefix, else ``bare``.
++
++    :returns: ``None`` when anything but envelopes (and, when framed, Claude's
++        trailing guidance) is present.
++    """
+     stripped = text.lstrip()
+     wrapped = False
+     for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+@@ -9215,13 +9235,15 @@ def _is_agent_notification_text(text: str) -> bool:
+             wrapped = True
+             break
+     if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+-        return False
++        return None
+     while match := _TEAMMATE_MESSAGE_RE.match(stripped):
+         stripped = stripped[match.end() :].lstrip()
+         if not stripped:
+-            return True
++            return "framed" if wrapped else "bare"
+     # Wrapped peer messages can append Claude's own explanatory guidance.
+-    return wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
++    if wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE):
++        return "framed"
++    return None
+ 
+ 
+ def _subagent_handback_id(origin: object) -> str | None:
+@@ -9463,8 +9485,10 @@ def _user_transcript_items_from_entry(
+     if isinstance(content, str):
+         if not content:
+             return current_response_id, []
+-        if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
+-            content, origin=entry.get("origin")
++        if (
++            entry.get("isMeta") is True
++            or _is_trusted_agent_notification_text(content, origin=entry.get("origin"))
++            or _is_unattributed_peer_delivery(content, entry=entry)
+         ):
+             items.append(
+                 ClaudeTranscriptItem(
+@@ -9556,8 +9580,10 @@ def _user_transcript_items_from_entry(
+             text = block.get("text")
+             if not isinstance(text, str) or not text:
+                 continue
+-            if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
+-                text, origin=entry.get("origin")
++            if (
++                entry.get("isMeta") is True
++                or _is_trusted_agent_notification_text(text, origin=entry.get("origin"))
++                or _is_unattributed_peer_delivery(text, entry=entry)
+             ):
+                 items.append(
+                     ClaudeTranscriptItem(
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index c4dae38ece2bd7d023f7f01252e003203c4719a2..9a07c11045693f0812e00b3cbe0e07f743bc5cc8 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -1414,7 +1414,7 @@ def test_team_markup_needs_provenance(
+     tmp_path: Path, text: str, candidate: bool, as_blocks: bool
+ ) -> None:
+     content = [{"type": "text", "text": text}] if as_blocks else text
+-    _, _, items = _read_native_user(tmp_path, content)
++    _, _, items = _read_native_user(tmp_path, content, origin={"kind": "human"})
+     [item] = items
+     assert item.agent_message_candidate is candidate
+     assert item.data == {"role": "user", "content": [{"type": "input_text", "text": text}]}
+@@ -1424,11 +1424,53 @@ def test_team_markup_needs_provenance(
+     assert response_id == "active"
+ 
+ 
++_FRAMED_TEAMMATE_DELIVERY = (
++    "Another Claude session sent a message:\n"
++    + _TEAMMATE_MESSAGE
++    + "\n\nThis came from another Claude session — not typed by your user, "
++    "but very likely working on their behalf."
++)
++
++
++@pytest.mark.parametrize("as_blocks", [False, True])
++@pytest.mark.parametrize(
++    "text,internal",
++    [
++        (_FRAMED_TEAMMATE_DELIVERY, True),
++        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, True),
++        (_TEAMMATE_MESSAGE, False),
++        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE + "\nWhat now?", False),
++    ],
++)
++def test_claude_framed_delivery_without_origin_is_internal(
++    tmp_path: Path, text: str, internal: bool, as_blocks: bool
++) -> None:
++    # Claude Code records teammate deliveries without the human origin it puts on prompts.
++    content = [{"type": "text", "text": text}] if as_blocks else text
++    _, _, items = _read_native_user(tmp_path, content)
++    [item] = items
++    if internal:
++        assert item.data["is_meta"] is True
++        assert not item.agent_message_candidate
++    else:
++        assert "is_meta" not in item.data
++
++
++def test_queued_framed_delivery_from_a_human_stays_visible(tmp_path: Path) -> None:
++    _, _, items = _read_native_user(
++        tmp_path, _FRAMED_TEAMMATE_DELIVERY, queued="prompt", origin={"kind": "human"}
++    )
++    [item] = items
++    assert "is_meta" not in item.data
++    assert item.agent_message_candidate
++
++
+ @pytest.mark.parametrize(
+     "queued,text,metadata",
+     [
+         ("prompt", _TEAMMATE_MESSAGE, {"isMeta": True}),
+         ("prompt", _TEAMMATE_MESSAGE, {"origin": {"kind": "peer"}}),
++        ("prompt", _FRAMED_TEAMMATE_DELIVERY, {}),
+         ("prompt", "<task-notification><task-id>task-1</task-id></task-notification>", {}),
+         (
+             None,

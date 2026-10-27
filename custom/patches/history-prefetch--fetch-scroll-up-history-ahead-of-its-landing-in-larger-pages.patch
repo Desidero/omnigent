@@ -1,0 +1,846 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Sat, 24 Oct 2026 02:30:40 +0000
+Subject: [PATCH] perf(web): fetch scroll-up history ahead of its landing, in
+ larger pages
+
+Scrolling up through a long transcript stuttered, worst on a phone: every
+20 items cost a round trip that only started once the pane was still, then
+a prepend hitch, so a reader paging back through a few hundred items hit
+the top and waited sixteen times over.
+
+The history loader now fetches the next older page as soon as a seeking
+gesture brings the pane within the load threshold, ahead of the landing
+decision that may wait for a fling to settle; `loadMoreHistory` then lands
+the prefetched page from memory. One page per cursor is ever in flight, a
+failed prefetch is forgotten so the reader's own request retries it, and
+the page is dropped with its conversation.
+
+Scroll-up pages grow from 20 items to 100, or 60 on a mobile-width
+viewport (the shell's `useIsMobileViewport` breakpoint); only the rows in
+view mount, so a page costs one request plus one prepend whatever its
+size. The per-gesture chaining budget is kept as 600 items rather than 30
+pages, so a folded tool-heavy turn still cannot page the whole transcript
+in with the reader's hands off. The reconnect backfill keeps its 20-item
+page.
+
+On a 420-item session at a phone viewport with a 100 ms RTT and a 4x CPU
+slowdown: 16 page fetches become 6, time stalled at the top waiting for a
+page drops from 2.5 s to 0.5 s, and long tasks during the scroll fall from
+6.0 s to 2.5 s. Desktop goes from 16 fetches to 4.
+
+Not upstream yet: proposed from fix/history-prefetch; drop this copy once it merges.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit efa0347afede58d67739c9b34c22a5d9b2542476)
+Docs: none (performance: older history loads ahead of the scroll, in larger pages; no setting)
+---
+ web/src/components/chat/chatBubbleParts.tsx |  52 ++++--
+ web/src/hooks/useIsMobileViewport.test.ts   |  34 ++++
+ web/src/hooks/useIsMobileViewport.ts        |   8 +-
+ web/src/lib/sessionsApi.test.ts             |  10 ++
+ web/src/lib/sessionsApi.ts                  |  28 +++-
+ web/src/pages/ChatPage.historyLoad.test.tsx |  94 ++++++++++-
+ web/src/store/chatStore.test.ts             | 175 ++++++++++++++++++--
+ web/src/store/chatStore.ts                  |  53 +++++-
+ 8 files changed, 404 insertions(+), 50 deletions(-)
+ create mode 100644 web/src/hooks/useIsMobileViewport.test.ts
+
+diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
+index f6a6e8ccfbf7df65417ed574a2ca31f0f443efbf..7b225f0ffe7a32f6b502d87e7feaabd0d8c6c335 100644
+--- a/web/src/components/chat/chatBubbleParts.tsx
++++ b/web/src/components/chat/chatBubbleParts.tsx
+@@ -67,7 +67,12 @@ import {
+ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+ import { getCurrentAuthorId } from "@/lib/identity";
+ import { QueryClientContext } from "@tanstack/react-query";
+-import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
++import {
++  ApiError,
++  continueFailedTurn,
++  retrySession,
++  scrollUpHistoryPageSize,
++} from "@/lib/sessionsApi";
+ import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+ import { conversationRegistry } from "@/store/conversationRegistry";
+ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+@@ -94,7 +99,7 @@ import { scanItemLabelSource } from "@/lib/itemComments";
+ import { copyText } from "@/lib/clipboard";
+ import { copyMarkdown } from "@/lib/copyMarkdown";
+ import { showToast } from "@/components/ui/toast";
+-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import { isMobileViewport, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import type { SessionStatus } from "@/lib/types";
+ import {
+   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
+@@ -1382,12 +1387,17 @@ const TOUCH_DRAG_SLOP_PX = 8;
+ const WHEEL_GESTURE_QUIET_MS = 300;
+ 
+ /**
+- * Pages one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
+- * may chain beyond its first while every page folds into a turn already on
+- * screen. One enormous turn would otherwise let a single gesture page in the
+- * whole transcript with the reader's hands off.
++ * Items one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
++ * may chain beyond its first page while every page folds into a turn already
++ * on screen. One enormous turn would otherwise let a single gesture page in
++ * the whole transcript with the reader's hands off.
+  */
+-const SEEK_PAGES_PER_GESTURE = 30;
++export const SEEK_ITEMS_PER_GESTURE = 600;
++
++/** The item budget as pages of the size the viewport fetches. */
++function seekPagesPerGesture(): number {
++  return Math.ceil(SEEK_ITEMS_PER_GESTURE / scrollUpHistoryPageSize(isMobileViewport()));
++}
+ 
+ /**
+  * Quiet time after the last scroll event before a touch-armed page may land.
+@@ -1464,11 +1474,16 @@ export function HistoryAutoLoader({
+   // entirely inside it and show the reader nothing; the gesture keeps paging
+   // until a page adds a row, then waits for the next gesture.
+   const seekBaseRowsRef = useRef<number | null>(null);
+-  const seekPagesLeftRef = useRef(SEEK_PAGES_PER_GESTURE);
++  const seekPagesLeftRef = useRef(seekPagesPerGesture());
+   // Whether the current gesture has fetched yet: its first page is free, every
+   // later one — chained or from a further tick of the same gesture — spends
+   // the budget, even after a page that added a row ended the seek.
+   const gestureFetchedRef = useRef(false);
++  // Whether the gesture in hand is still asking for older history. While it
++  // is, the next page is fetched as soon as the pane comes within the load
++  // threshold, so the landing — which may wait for the pane to settle, or for
++  // the reader's next tick — comes from memory rather than the network.
++  const prefetchArmedRef = useRef(false);
+ 
+   // Position across a prepend is held by the transcript (VirtualBubbleList), not
+   // by this component. Writing scrollTop here instead used to interrupt the
+@@ -1479,6 +1494,7 @@ export function HistoryAutoLoader({
+     const noteUpwardGesture = (seekPages: number, viaTouch = false) => {
+       touchArmedRef.current = viaTouch;
+       scrolledUpRef.current = true;
++      prefetchArmedRef.current = true;
+       // A fresh gesture seeks from what is on screen now, with a fresh budget.
+       seekBaseRowsRef.current = null;
+       seekPagesLeftRef.current = seekPages;
+@@ -1489,6 +1505,7 @@ export function HistoryAutoLoader({
+     // lands, but nothing chains after it.
+     const noteDownwardGesture = () => {
+       scrolledUpRef.current = false;
++      prefetchArmedRef.current = false;
+       seekBaseRowsRef.current = null;
+     };
+     // Scroll movement alone is never intent: the virtualizer, the bottom lock,
+@@ -1507,10 +1524,11 @@ export function HistoryAutoLoader({
+       const newGesture = now - lastUpwardTickAtRef.current > WHEEL_GESTURE_QUIET_MS;
+       lastUpwardTickAtRef.current = now;
+       if (newGesture) {
+-        noteUpwardGesture(SEEK_PAGES_PER_GESTURE);
++        noteUpwardGesture(seekPagesPerGesture());
+         return;
+       }
+       scrolledUpRef.current = true;
++      prefetchArmedRef.current = true;
+       setScrollRevision((revision) => revision + 1);
+     };
+     // The transcript draws its own scrollbar; a thumb drag reports its direction
+@@ -1549,7 +1567,7 @@ export function HistoryAutoLoader({
+       if (current > last) touchLastYRef.current = current;
+       if (current <= start + TOUCH_DRAG_SLOP_PX || touchGestureSpentRef.current) return;
+       touchGestureSpentRef.current = true;
+-      noteUpwardGesture(SEEK_PAGES_PER_GESTURE, true);
++      noteUpwardGesture(seekPagesPerGesture(), true);
+     };
+     const inTranscript = (target: EventTarget | null) =>
+       target instanceof Node &&
+@@ -1620,22 +1638,22 @@ export function HistoryAutoLoader({
+       generationRef.current = historyGeneration;
+       // A new window is a new open: require a fresh gesture, with a fresh budget.
+       scrolledUpRef.current = false;
++      prefetchArmedRef.current = false;
+       seekBaseRowsRef.current = null;
+-      seekPagesLeftRef.current = SEEK_PAGES_PER_GESTURE;
++      seekPagesLeftRef.current = seekPagesPerGesture();
+       gestureFetchedRef.current = false;
+       lastUpwardTickAtRef.current = Number.NEGATIVE_INFINITY;
+     }
+ 
+     const state = useChatStore.getState();
+-    if (
+-      !state.oldestItemId ||
+-      !state.hasMoreHistory ||
+-      state.loadingMoreHistory ||
+-      !(itemsChanged || scrollPositionChanged)
+-    ) {
++    if (!state.oldestItemId || !state.hasMoreHistory || !(itemsChanged || scrollPositionChanged)) {
+       return;
+     }
+     if (el.scrollTop >= historyLoadThreshold(el)) return;
++    // The gesture is still seeking and the pane is within the threshold: get
++    // the next page on the wire now, ahead of the landing decided below.
++    if (prefetchArmedRef.current) state.prefetchMoreHistory();
++    if (state.loadingMoreHistory) return;
+     // A finger-armed request waits while the pane is still moving, so the page
+     // cannot land mid-fling. A pane that has been still for the settle window
+     // fetches at once — a slow drag that stopped at the top has no momentum to
+diff --git a/web/src/hooks/useIsMobileViewport.test.ts b/web/src/hooks/useIsMobileViewport.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2db21b8c653ca9cc39d9d4b07350b353faf77e8b
+--- /dev/null
++++ b/web/src/hooks/useIsMobileViewport.test.ts
+@@ -0,0 +1,34 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { isMobileViewport } from "./useIsMobileViewport";
++
++function matchMediaStub(matches: (query: string) => boolean) {
++  return (query: string) => ({
++    matches: matches(query),
++    addEventListener() {},
++    removeEventListener() {},
++  });
++}
++
++describe("isMobileViewport", () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it("is false where no media query can be asked", () => {
++    vi.stubGlobal("matchMedia", undefined);
++    expect(isMobileViewport()).toBe(false);
++  });
++
++  it("answers the shell's max-md breakpoint", () => {
++    vi.stubGlobal(
++      "matchMedia",
++      matchMediaStub((query) => query === "(max-width: 767.98px)"),
++    );
++    expect(isMobileViewport()).toBe(true);
++    vi.stubGlobal(
++      "matchMedia",
++      matchMediaStub(() => false),
++    );
++    expect(isMobileViewport()).toBe(false);
++  });
++});
+diff --git a/web/src/hooks/useIsMobileViewport.ts b/web/src/hooks/useIsMobileViewport.ts
+index 70dcbd3166b2f87223b69d21f15a2e306d11ec39..2628ef024c23e1b8db3a07b7e1f1bfcceed69395 100644
+--- a/web/src/hooks/useIsMobileViewport.ts
++++ b/web/src/hooks/useIsMobileViewport.ts
+@@ -19,7 +19,11 @@ function subscribe(callback: () => void): () => void {
+   return () => mql.removeEventListener("change", callback);
+ }
+ 
+-function getSnapshot(): boolean {
++/**
++ * One-off read of {@link useIsMobileViewport}'s answer, for code outside React
++ * (store actions) that sizes work to the viewport. `false` without a window.
++ */
++export function isMobileViewport(): boolean {
+   if (typeof window === "undefined" || !window.matchMedia) return false;
+   return window.matchMedia(MOBILE_QUERY).matches;
+ }
+@@ -31,5 +35,5 @@ function getSnapshot(): boolean {
+  * (returns `false` on the server, matching `initialSidebarOpen`).
+  */
+ export function useIsMobileViewport(): boolean {
+-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
++  return useSyncExternalStore(subscribe, isMobileViewport, () => false);
+ }
+diff --git a/web/src/lib/sessionsApi.test.ts b/web/src/lib/sessionsApi.test.ts
+index cbfba2c7aebb7872c64f746800fe7c3ae6767777..4a274811bb1b7ee9bb7c92ddb4504fb3125fcc9c 100644
+--- a/web/src/lib/sessionsApi.test.ts
++++ b/web/src/lib/sessionsApi.test.ts
+@@ -26,6 +26,9 @@ import {
+   openSessionStream,
+   postEvent,
+   continueFailedTurn,
++  MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE,
++  SCROLL_UP_HISTORY_PAGE_SIZE,
++  scrollUpHistoryPageSize,
+   SESSION_HISTORY_PAGE_SIZE,
+   stopSession,
+   updateSession,
+@@ -1495,6 +1498,13 @@ describe("fetchSessionItemsPage", () => {
+     );
+   });
+ 
++  it("sizes scroll-up pages larger than the reconnect page, and smaller on a phone", () => {
++    expect(scrollUpHistoryPageSize(false)).toBe(SCROLL_UP_HISTORY_PAGE_SIZE);
++    expect(scrollUpHistoryPageSize(true)).toBe(MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE);
++    expect(MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE).toBeLessThan(SCROLL_UP_HISTORY_PAGE_SIZE);
++    expect(SCROLL_UP_HISTORY_PAGE_SIZE).toBeGreaterThan(SESSION_HISTORY_PAGE_SIZE);
++  });
++
+   it("pages backwards via an `after` cursor in descending order when olderThan is set", async () => {
+     fetchMock.mockResolvedValueOnce(
+       mockJsonResponse({
+diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
+index 5c1076d2c376dcbe9f65b831e0139d42eb7b0e16..07d2d4a870335f934a52b735290e758ef5e8b39a 100644
+--- a/web/src/lib/sessionsApi.ts
++++ b/web/src/lib/sessionsApi.ts
+@@ -284,16 +284,30 @@ interface SessionItemsResponseWire {
+ }
+ 
+ /**
+- * Initial (and per-scroll-up-page) item count for conversation history
+- * hydration. Bounds how many items the chat surface fetches, parses,
+- * and renders when a conversation is opened. The synchronous first-paint
+- * render scales ~linearly with this count (parse/walk are negligible;
+- * mounting the markdown/Streamdown tree per bubble is the cost), so a
+- * smaller window keeps thread-switch render cheap. `loadMoreHistory`
+- * pages older items on scroll-up.
++ * Default item count for a `fetchSessionItemsPage` call: the newest-items
++ * page a reconnect backfills from. Bounds how many items a reconnect fetches,
++ * parses and renders before paging back to the pre-gap window.
+  */
+ export const SESSION_HISTORY_PAGE_SIZE = 20;
+ 
++/**
++ * Items per scroll-up history page (`loadMoreHistory`). Only the rows in view
++ * mount, so a page costs one request plus a store prepend whatever its size;
++ * a small page meant a round trip and a prepend hitch every screen or two of
++ * reading, which read as a stutter on the way up. A page is a few dozen KB.
++ */
++export const SCROLL_UP_HISTORY_PAGE_SIZE = 100;
++/**
++ * Scroll-up page on a mobile-width viewport: a phone reads a page in more
++ * screens, on a slower CPU and link, so a smaller page lands sooner.
++ */
++export const MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE = 60;
++
++/** Scroll-up page size for the viewport in use. */
++export function scrollUpHistoryPageSize(mobileViewport: boolean): number {
++  return mobileViewport ? MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE : SCROLL_UP_HISTORY_PAGE_SIZE;
++}
++
+ /**
+  * Convert the snake-case `usage_by_model` wire map into the camelCase
+  * `Record<string, ModelUsage>` the store/UI use, or `null` when absent.
+diff --git a/web/src/pages/ChatPage.historyLoad.test.tsx b/web/src/pages/ChatPage.historyLoad.test.tsx
+index f240317c22fc3649c2ad5f368506e8d13f4453b3..5f2efc27cd4570d518180727f69db35735e8cc84 100644
+--- a/web/src/pages/ChatPage.historyLoad.test.tsx
++++ b/web/src/pages/ChatPage.historyLoad.test.tsx
+@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
+ import { Profiler, useEffect, useState } from "react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { UserMessageBlock } from "@/lib/blocks";
++import { SEEK_ITEMS_PER_GESTURE } from "@/components/chat/chatBubbleParts";
++import { SCROLL_UP_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+ import { TRANSCRIPT_SCROLLBAR_DRAG_EVENT } from "@/pages/TranscriptScrollbar";
+ import { useChatStore } from "@/store/chatStore";
+ import {
+@@ -25,6 +27,7 @@ vi.mock("use-stick-to-bottom", () => ({
+ }));
+ 
+ const originalLoadMoreHistory = useChatStore.getState().loadMoreHistory;
++const originalPrefetchMoreHistory = useChatStore.getState().prefetchMoreHistory;
+ 
+ function userBlock(id: string, text = id): UserMessageBlock {
+   return {
+@@ -266,12 +269,17 @@ describe("HistoryAutoLoader", () => {
+       loadingMoreHistory: false,
+       oldestItemId: "item_2",
+       historyGeneration: 0,
++      // A seeking gesture also prefetches; keep that off the network here.
++      prefetchMoreHistory: vi.fn(),
+     });
+   });
+ 
+   afterEach(() => {
+     cleanup();
+-    useChatStore.setState({ loadMoreHistory: originalLoadMoreHistory });
++    useChatStore.setState({
++      loadMoreHistory: originalLoadMoreHistory,
++      prefetchMoreHistory: originalPrefetchMoreHistory,
++    });
+     vi.unstubAllGlobals();
+     vi.useRealTimers();
+   });
+@@ -888,14 +896,88 @@ describe("HistoryAutoLoader", () => {
+       stalled = loadMoreHistory.mock.calls.length === before;
+     }
+     expect(stalled).toBe(true);
+-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
+-    expect(loadMoreHistory.mock.calls.length).toBeGreaterThan(10);
++    // The gesture's first page is free; the item budget bounds the chained ones.
++    const chainedPages = Math.ceil(SEEK_ITEMS_PER_GESTURE / SCROLL_UP_HISTORY_PAGE_SIZE);
++    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 1);
+ 
+     // The next flick, after a quiet gap, is a new gesture and continues from there.
+     now += 1000;
+     fireEvent.wheel(scrollRoot, { deltaY: -120 });
+     nowSpy.mockRestore();
+-    expect(loadMoreHistory.mock.calls.length).toBe(32);
++    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 2);
++  });
++
++  it("prefetches the page a finger-armed request is waiting to land", () => {
++    // The landing waits for the pane to settle (see the hold tests); the page
++    // itself need not — by the time the pane is still it is in memory.
++    let now = 1000;
++    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
++    const loadMoreHistory = vi.fn(async () => {
++      useChatStore.setState({ loadingMoreHistory: true });
++    });
++    const prefetchMoreHistory = vi.fn();
++    useChatStore.setState({
++      hasMoreHistory: true,
++      oldestItemId: "item_50",
++      loadMoreHistory,
++      prefetchMoreHistory,
++    });
++    const scrollRoot = document.createElement("div");
++    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
++    stickContext.scrollRef.current = scrollRoot;
++
++    render(<HistoryAutoLoader rowCount={1} />);
++    // The open alone asks for nothing.
++    expect(prefetchMoreHistory).not.toHaveBeenCalled();
++
++    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
++    fireEvent.scroll(scrollRoot);
++    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
++    // Still moving: the landing is held, but the page is already on the wire.
++    expect(prefetchMoreHistory).toHaveBeenCalled();
++    expect(loadMoreHistory).not.toHaveBeenCalled();
++
++    now += 200;
++    act(() => {
++      vi.advanceTimersByTime(200);
++    });
++    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
++
++    // The page lands with the pane still near the top: the one after it is
++    // fetched ahead of the gesture's next page.
++    prefetchMoreHistory.mockClear();
++    act(() => {
++      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_40" });
++    });
++    expect(prefetchMoreHistory).toHaveBeenCalled();
++    nowSpy.mockRestore();
++  });
++
++  it("prefetches only for a gesture that asked for older history", () => {
++    const loadMoreHistory = vi.fn(async () => {});
++    const prefetchMoreHistory = vi.fn();
++    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory, prefetchMoreHistory });
++    const scrollRoot = document.createElement("div");
++    const metrics = { scrollTop: 300, scrollHeight: 4000, clientHeight: 800 };
++    setScrollMetrics(scrollRoot, metrics);
++    stickContext.scrollRef.current = scrollRoot;
++
++    render(<HistoryAutoLoader rowCount={1} />);
++    // The pane moving near the top on its own is not a request.
++    fireEvent.scroll(scrollRoot);
++    expect(prefetchMoreHistory).not.toHaveBeenCalled();
++
++    // A wheel-up inside the threshold asks: the page is fetched and landed.
++    fireEvent.wheel(scrollRoot, { deltaY: -120 });
++    expect(prefetchMoreHistory).toHaveBeenCalledTimes(1);
++    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
++
++    // Wheeling back down withdraws: later movement near the top prefetches nothing.
++    prefetchMoreHistory.mockClear();
++    fireEvent.wheel(scrollRoot, { deltaY: 120 });
++    metrics.scrollTop = 200;
++    fireEvent.scroll(scrollRoot);
++    expect(prefetchMoreHistory).not.toHaveBeenCalled();
+   });
+ 
+   it("ignores a wheel-down, which is not a request for older history", () => {
+@@ -1144,8 +1226,8 @@ describe("HistoryAutoLoader", () => {
+       stalled = loadMoreHistory.mock.calls.length === before;
+     }
+     expect(stalled).toBe(true);
+-    expect(loadMoreHistory.mock.calls.length).toBeGreaterThan(10);
+-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
++    const chainedPages = Math.ceil(SEEK_ITEMS_PER_GESTURE / SCROLL_UP_HISTORY_PAGE_SIZE);
++    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 1);
+   });
+ 
+   it("resumes seeking on the reader's next gesture", () => {
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 4936be97a01b9b7d6071b702c5cda771ec1245e7..e595c448b091cb9aefda6f572c62662c64cefefb 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -33,7 +33,13 @@ import type {
+ import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
+ import { itemsToBlocks } from "@/lib/itemsToBlocks";
+ import { buildBubbles } from "@/lib/renderItems";
+-import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
++import {
++  getSessionSlim,
++  INITIAL_WINDOW_ITEMS,
++  MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE,
++  SCROLL_UP_HISTORY_PAGE_SIZE,
++  SESSION_HISTORY_PAGE_SIZE,
++} from "@/lib/sessionsApi";
+ import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
+ import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+ import { clearUnsentSends, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
+@@ -1947,7 +1953,7 @@ describe("chatStore — switchTo", () => {
+ 
+   it("hydrates only the initial window and flags that older history remains", async () => {
+     // Longer than the initial window so the loaded window is a strict subset.
+-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE + 5;
+     const fullItems = Array.from({ length: total }, (_, idx) =>
+       userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
+     );
+@@ -1982,7 +1988,7 @@ describe("chatStore — switchTo", () => {
+   it.each([false, true])(
+     "loadMoreHistory prepends the correct page (scoped pane: %s)",
+     async (scoped) => {
+-      const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
++      const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE + 5;
+       const fullItems = Array.from({ length: total }, (_, idx) =>
+         userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
+       );
+@@ -2001,14 +2007,14 @@ describe("chatStore — switchTo", () => {
+       // Window + one older page. A wrong older-page cursor — e.g. the pre-fix
+       // bug that fetched the convo head — would yield the wrong count or
+       // duplicate blocks.
+-      expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE);
++      expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE);
+       // The older page sits before the original, oldest item first. Its first
+       // block is index `total - WINDOW - PAGE` (= 5): proves the prepend order
+       // and the descending+after cursor math are correct.
+       expect(state.blocks[0]).toMatchObject({
+         type: "user_message",
+         ctx: {
+-          itemId: `msg_resp_${(total - INITIAL_WINDOW_ITEMS - SESSION_HISTORY_PAGE_SIZE)
++          itemId: `msg_resp_${(total - INITIAL_WINDOW_ITEMS - SCROLL_UP_HISTORY_PAGE_SIZE)
+             .toString()
+             .padStart(4, "0")}_user`,
+         },
+@@ -2024,7 +2030,7 @@ describe("chatStore — switchTo", () => {
+     // relative to a window that no longer existed. The conversation now keeps its
+     // window across navigation, so the page is still valid when it lands and must
+     // be applied rather than discarded.
+-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
+     const itemsA = Array.from({ length: total }, (_, idx) =>
+       userMessage(`a_${idx.toString().padStart(4, "0")}`, `a ${idx}`),
+     );
+@@ -2056,7 +2062,7 @@ describe("chatStore — switchTo", () => {
+     const state = useChatStore.getState();
+     // Prepended onto the window it was fetched against, which is still current.
+     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
+-      ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
++      ...itemsA.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
+       ...windowIds,
+     ]);
+     expect(state.oldestItemId).toBe(itemsA[0]!.id);
+@@ -2065,7 +2071,7 @@ describe("chatStore — switchTo", () => {
+   });
+ 
+   it("loadMoreHistory dedupes a page overlapping blocks kept across a rebind", async () => {
+-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE * 2;
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE * 2;
+     const items = Array.from({ length: total }, (_, idx) =>
+       userMessage(`r_${idx.toString().padStart(4, "0")}`, `r ${idx}`),
+     );
+@@ -2074,7 +2080,7 @@ describe("chatStore — switchTo", () => {
+     await useChatStore.getState().switchTo("conv_re");
+     await useChatStore.getState().loadMoreHistory();
+     expect(useChatStore.getState().blocks).toHaveLength(
+-      INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE,
++      INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE,
+     );
+ 
+     // The stream died (idle disconnect): the send-triggered rebind
+@@ -2088,7 +2094,7 @@ describe("chatStore — switchTo", () => {
+     // kept across the rebind — without itemId dedupe each would render twice.
+     await useChatStore.getState().loadMoreHistory();
+     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+-      items.slice(SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
++      items.slice(SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
+     );
+ 
+     // The cursor advanced through the overlap, so the oldest page loads next.
+@@ -2099,7 +2105,7 @@ describe("chatStore — switchTo", () => {
+   });
+ 
+   it("clears loadingMoreHistory when a rebind hydration voids the in-flight page", async () => {
+-    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
+     const items = Array.from({ length: total }, (_, idx) =>
+       userMessage(`lh_${idx.toString().padStart(4, "0")}`, `lh ${idx}`),
+     );
+@@ -2138,9 +2144,148 @@ describe("chatStore — switchTo", () => {
+     // Scroll-up still works: the older page actually fetches and prepends.
+     await useChatStore.getState().loadMoreHistory();
+     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
++      ...items.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
++      ...windowIds,
++    ]);
++  });
++
++  it("lands a prefetched page from memory and never fetches the same cursor twice", async () => {
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE + 5;
++    const items = Array.from({ length: total }, (_, idx) =>
++      userMessage(`pf_${idx.toString().padStart(4, "0")}`, `pf ${idx}`),
++    );
++    seedSession("conv_pf", items);
++    await useChatStore.getState().switchTo("conv_pf");
++    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
++    const olderPageRequests = () =>
++      fetchMock.mock.calls.filter(([u]) =>
++        /\/v1\/sessions\/conv_pf\/items\?.*after=/.test(String(u)),
++      );
++
++    // The loader asks on every re-evaluation; one page per cursor goes on the wire.
++    useChatStore.getState().prefetchMoreHistory();
++    useChatStore.getState().prefetchMoreHistory();
++    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(1));
++    // A prefetch is not a prepend: nothing lands and no loading row shows.
++    expect(useChatStore.getState().blocks).toHaveLength(INITIAL_WINDOW_ITEMS);
++    expect(useChatStore.getState().loadingMoreHistory).toBe(false);
++
++    await useChatStore.getState().loadMoreHistory();
++    expect(olderPageRequests()).toHaveLength(1);
++    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
++      ...items.slice(5, 5 + SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
++      ...windowIds,
++    ]);
++    expect(useChatStore.getState().hasMoreHistory).toBe(true);
++
++    // The cursor moved on, so the next prefetch is a new page.
++    useChatStore.getState().prefetchMoreHistory();
++    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(2));
++  });
++
++  it("refetches an older page whose prefetch failed when the reader asks for it", async () => {
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
++    const items = Array.from({ length: total }, (_, idx) =>
++      userMessage(`pff_${idx.toString().padStart(4, "0")}`, `pff ${idx}`),
++    );
++    seedSession("conv_pff", items);
++    await useChatStore.getState().switchTo("conv_pff");
++    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
++
++    let failed = false;
++    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === "string" ? input : input.toString();
++      if (/\/v1\/sessions\/conv_pff\/items\?.*after=/.test(url) && !failed) {
++        failed = true;
++        return Promise.reject(new TypeError("network down"));
++      }
++      return defaultFetchHandler(input, init);
++    });
++
++    useChatStore.getState().prefetchMoreHistory();
++    await vi.waitFor(() => expect(failed).toBe(true));
++    // The rejection settles within the task it arrives in; let that task end.
++    await new Promise<void>((resolve) => {
++      setTimeout(resolve, 0);
++    });
++    // A failed prefetch is silent: scroll-up stays armed rather than disabled.
++    expect(useChatStore.getState().hasMoreHistory).toBe(true);
++
++    await useChatStore.getState().loadMoreHistory();
++    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
++      ...items.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
+       ...windowIds,
+     ]);
++    expect(useChatStore.getState().hasMoreHistory).toBe(false);
++  });
++
++  it("does not prefetch while a page is in flight or once history is exhausted", async () => {
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE;
++    const items = Array.from({ length: total }, (_, idx) =>
++      userMessage(`pfx_${idx.toString().padStart(4, "0")}`, `pfx ${idx}`),
++    );
++    seedSession("conv_pfx", items);
++    await useChatStore.getState().switchTo("conv_pfx");
++    const olderPageRequests = () =>
++      fetchMock.mock.calls.filter(([u]) =>
++        /\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(String(u)),
++      );
++
++    let releasePage: (() => void) | null = null;
++    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === "string" ? input : input.toString();
++      if (/\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(url) && releasePage === null) {
++        return new Promise<Response>((resolve) => {
++          releasePage = () => resolve(defaultFetchHandler(input, init));
++        });
++      }
++      return defaultFetchHandler(input, init);
++    });
++
++    const page = useChatStore.getState().loadMoreHistory();
++    await vi.waitFor(() => expect(releasePage).not.toBeNull());
++    // The page in flight is the one a prefetch would fetch.
++    useChatStore.getState().prefetchMoreHistory();
++    await Promise.resolve();
++    expect(olderPageRequests()).toHaveLength(1);
++
++    releasePage!();
++    await page;
++    expect(useChatStore.getState().hasMoreHistory).toBe(false);
++    useChatStore.getState().prefetchMoreHistory();
++    await Promise.resolve();
++    expect(olderPageRequests()).toHaveLength(1);
++  });
++
++  it("sizes a scroll-up page to the viewport", async () => {
++    const total = INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE * 2;
++    const items = Array.from({ length: total }, (_, idx) =>
++      userMessage(`pfm_${idx.toString().padStart(4, "0")}`, `pfm ${idx}`),
++    );
++    seedSession("conv_pfm", items);
++    await useChatStore.getState().switchTo("conv_pfm");
++    const lastOlderPageUrl = () =>
++      String(
++        fetchMock.mock.calls
++          .filter(([u]) => /\/v1\/sessions\/conv_pfm\/items\?.*after=/.test(String(u)))
++          .at(-1)![0],
++      );
++
++    await useChatStore.getState().loadMoreHistory();
++    expect(lastOlderPageUrl()).toContain(`limit=${SCROLL_UP_HISTORY_PAGE_SIZE}&`);
++
++    // A mobile-width viewport pages in smaller steps.
++    vi.stubGlobal("matchMedia", (query: string) => ({
++      matches: query === "(max-width: 767.98px)",
++      addEventListener() {},
++      removeEventListener() {},
++    }));
++    try {
++      await useChatStore.getState().loadMoreHistory();
++      expect(lastOlderPageUrl()).toContain(`limit=${MOBILE_SCROLL_UP_HISTORY_PAGE_SIZE}&`);
++    } finally {
++      vi.unstubAllGlobals();
++    }
+   });
+ 
+   it("keeps each conversation's own effort across a warm A→B→A switch", async () => {
+@@ -2320,7 +2465,7 @@ describe("chatStore — switchTo", () => {
+     // future scroll-up: dead history until a page refresh.
+     // One full window plus one page, so there is genuinely more to scroll to.
+     const items: ConversationItem[] = Array.from(
+-      { length: INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE },
++      { length: INITIAL_WINDOW_ITEMS + SCROLL_UP_HISTORY_PAGE_SIZE },
+       (_, idx) => userMessage(`bh_${idx.toString().padStart(4, "0")}`, `bh ${idx}`),
+     );
+     seedSession("conv_scroll", items);
+@@ -2352,7 +2497,7 @@ describe("chatStore — switchTo", () => {
+     expect(scrolled.loadingMoreHistory).toBe(false);
+     // ...and the page landed on the conversation it belongs to, in order.
+     expect(scrolled.blocks.map((b) => b.ctx.itemId)).toEqual([
+-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
++      ...items.slice(0, SCROLL_UP_HISTORY_PAGE_SIZE).map((item) => item.id),
+       ...windowIds,
+     ]);
+     // The visible conversation gained nothing.
+@@ -14853,7 +14998,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
+     // Scroll-up still pages from the window's top, one page at a time.
+     await useChatStore.getState().loadMoreHistory();
+     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+-      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
++      [...preGap.slice(-SCROLL_UP_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
+     );
+ 
+     const last = sinks[1]!;
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index da6d6f84eba759679661033c63305c50462b2454..f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -80,6 +80,7 @@ import {
+   openSessionStream,
+   postEvent,
+   type ProviderSwitchApplied,
++  scrollUpHistoryPageSize,
+   type SessionItemsPage,
+   switchSessionProvider,
+   updateSession,
+@@ -106,6 +107,7 @@ import {
+ } from "@/lib/sse";
+ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
+ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
++import { isMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
+ import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+ import {
+@@ -1390,6 +1392,13 @@ export interface ChatActions {
+    * or there is no active conversation / oldest-item cursor yet.
+    */
+   loadMoreHistory: (sessionId?: string) => Promise<void>;
++  /**
++   * Start fetching the next older page without prepending it, so the
++   * `loadMoreHistory` that follows lands it from memory. One page per
++   * conversation, keyed by the cursor it was fetched for; a repeat call for
++   * the same cursor, or while a page is in flight, is a no-op.
++   */
++  prefetchMoreHistory: (sessionId?: string) => void;
+   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
+   flashUserMessage: (itemId: string) => void;
+   /** Queue an "@"-mention chip into the active composer from outside it. */
+@@ -1444,6 +1453,21 @@ let queryClient: QueryClient | null = null;
+ const streamEventRevisions = new Map<string, number>();
+ conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+ 
++// The older page `prefetchMoreHistory` has in flight or ready per conversation,
++// consumed by the `loadMoreHistory` that asks for the same cursor.
++const prefetchedHistoryPages = new Map<
++  string,
++  { cursor: string; page: Promise<SessionItemsPage> }
++>();
++conversationRegistry.subscribeDisposed((id) => prefetchedHistoryPages.delete(id));
++
++function fetchOlderHistoryPage(conversationId: string, cursor: string): Promise<SessionItemsPage> {
++  return fetchSessionItemsPage(conversationId, {
++    olderThan: cursor,
++    limit: scrollUpHistoryPageSize(isMobileViewport()),
++  });
++}
++
+ // Reconnects share a binding; only one usage request may hydrate it at a time.
+ const sessionUsageHydrations = new WeakSet<AbortController>();
+ const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
+@@ -3725,9 +3749,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+       (setterForState(conversationId)?.historyGeneration ?? historyGeneration) !==
+         historyGeneration;
+     try {
+-      const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
+-        olderThan: oldestItemId,
+-      });
++      const prefetched = prefetchedHistoryPages.get(conversationId);
++      prefetchedHistoryPages.delete(conversationId);
++      const { items, hasMore } = await (prefetched?.cursor === oldestItemId
++        ? prefetched.page
++        : fetchOlderHistoryPage(conversationId, oldestItemId));
+       if (stale()) return;
+       const newBlocks = itemsToBlocks(items);
+       pageSet((state) => {
+@@ -3756,6 +3782,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
+     }
+   },
++
++  prefetchMoreHistory: (sessionId) => {
++    const conversationId = sessionId ?? get().conversationId;
++    const conversation = sessionId ? conversationRegistry.peek(sessionId)?.getState() : get();
++    if (!conversation || !conversationId) return;
++    const { oldestItemId, loadingMoreHistory, hasMoreHistory } = conversation;
++    if (!oldestItemId || loadingMoreHistory || !hasMoreHistory) return;
++    if (prefetchedHistoryPages.get(conversationId)?.cursor === oldestItemId) return;
++    const entry = {
++      cursor: oldestItemId,
++      page: fetchOlderHistoryPage(conversationId, oldestItemId),
++    };
++    prefetchedHistoryPages.set(conversationId, entry);
++    // A failed prefetch is forgotten: the reader's own request refetches and
++    // reports the failure the usual way.
++    entry.page.catch(() => {
++      if (prefetchedHistoryPages.get(conversationId) === entry) {
++        prefetchedHistoryPages.delete(conversationId);
++      }
++    });
++  },
+ }));
+ 
+ // ── Store-action setter ──────────────────────────────────

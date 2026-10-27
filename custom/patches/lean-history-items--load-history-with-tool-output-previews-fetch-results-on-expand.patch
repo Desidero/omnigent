@@ -1,0 +1,1027 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Sat, 24 Oct 2026 02:27:07 +0000
+Subject: [PATCH] feat(web): load history with tool-output previews, fetch
+ results on expand
+
+Hydrate the transcript (initial window, scroll-up pages, reconnect
+backfill) with `tool_output=preview`, so a history page carries the
+head of each long tool result instead of the whole thing. Tool rows
+render collapsed; when the reader expands one whose output is a preview
+the card asks the store for the full item, which fetches it once via
+`GET /v1/sessions/{id}/items/{item_id}` and swaps it into the result
+block. The card shows the preview with a loading note meanwhile and a
+retry on failure. Results that are rendered as cards from their text
+(AskUserQuestion, ExitPlanMode, sys_advise_models) are inflated when the
+page is fetched, so those cards never see a cut-off result. Live-streamed
+output in the current turn is untouched.
+
+Opening the benchmark session now moves 7 KB on the wire for the
+100-item initial window instead of 225 KB, and an expanded result loads
+in ~25 ms.
+
+Not upstream yet: proposed from feat/lean-history-items; drop this copy once it merges.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit ef52e265d3cfa53f62ef01dda1f75a11608589b7)
+Docs: none (performance: history pages carry tool-output previews and expanding a tool row loads the rest; no setting)
+---
+ web/src/components/blocks/BlockRenderer.tsx |   2 +
+ web/src/components/blocks/ToolCard.test.ts  |  68 +++++++++++-
+ web/src/components/blocks/ToolCard.tsx      |  85 +++++++++++++-
+ web/src/lib/blocks.ts                       |   2 +
+ web/src/lib/conversationItems.ts            |   5 +
+ web/src/lib/itemsToBlocks.test.ts           |  40 +++++++
+ web/src/lib/itemsToBlocks.ts                |  21 +++-
+ web/src/lib/renderItems.test.ts             |  42 ++++++-
+ web/src/lib/renderItems.ts                  |  19 +++-
+ web/src/lib/sessionsApi.test.ts             | 116 ++++++++++++++++++++
+ web/src/lib/sessionsApi.ts                  |  85 +++++++++++++-
+ web/src/store/chatStore.test.ts             |  82 ++++++++++++++
+ web/src/store/chatStore.ts                  |  75 ++++++++++++-
+ 13 files changed, 628 insertions(+), 14 deletions(-)
+
+diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
+index efe793260a1b39e028216e9fa4b044b77aa4336c..a481d5faa3d781c064f44f1b9216c28f40f18f8b 100644
+--- a/web/src/components/blocks/BlockRenderer.tsx
++++ b/web/src/components/blocks/BlockRenderer.tsx
+@@ -798,6 +798,8 @@ function renderItem(
+           state={item.state}
+           startedAt={item.startedAt}
+           duration={item.duration}
++          resultItemId={item.resultItemId}
++          truncatedOutputLength={item.truncatedOutputLength}
+         />
+       );
+     case "native_tool":
+diff --git a/web/src/components/blocks/ToolCard.test.ts b/web/src/components/blocks/ToolCard.test.ts
+index 507d5cdcb9916c66b43c0bd2f6a3ca3301c4da54..fa56de80a9f112ad8617c4866c6f16961194da44 100644
+--- a/web/src/components/blocks/ToolCard.test.ts
++++ b/web/src/components/blocks/ToolCard.test.ts
+@@ -4,9 +4,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ import { FileViewerContext } from "@/shell/FileViewerContext";
+ import type { RenderItem } from "@/lib/renderItems";
++import { useChatStore } from "@/store/chatStore";
+ import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
+ 
+-afterEach(cleanup);
++const realLoadToolOutput = useChatStore.getState().loadToolOutput;
++
++afterEach(() => {
++  cleanup();
++  useChatStore.setState({ loadToolOutput: realLoadToolOutput });
++});
+ 
+ // Render helper: ToolCard reads a Tooltip (trigger title) so it needs the
+ // TooltipProvider; createElement keeps this in a .ts file without JSX.
+@@ -123,6 +129,66 @@ describe("ToolCard rendering", () => {
+     expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+   });
+ 
++  it("fetches the full output once when a lean-page preview row is expanded", async () => {
++    // WHY: history pages carry only the head of a long result; the row must
++    // ask the store for the rest when (and only when) the reader opens it.
++    const loadToolOutput = vi.fn(() => Promise.resolve());
++    useChatStore.setState({ loadToolOutput });
++    const { container } = renderCard({
++      name: "Read",
++      arguments: { file_path: "/big.txt" },
++      output: "head",
++      state: "output-available",
++      resultItemId: "fco_1",
++      truncatedOutputLength: 12345,
++    });
++    expect(loadToolOutput).not.toHaveBeenCalled();
++    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
++    expect(loadToolOutput).toHaveBeenCalledWith("fco_1", undefined);
++    expect(screen.getByRole("status")).toHaveTextContent(
++      "Showing the first 4 of 12,345 characters; loading the full output",
++    );
++    // The preview itself is on screen while the rest loads.
++    expect(screen.getByText("head")).toBeInTheDocument();
++    await waitFor(() => expect(loadToolOutput).toHaveBeenCalledTimes(1));
++  });
++
++  it("offers a retry when the full output fails to load", async () => {
++    const loadToolOutput = vi
++      .fn<() => Promise<void>>()
++      .mockRejectedValueOnce(new Error("offline"))
++      .mockResolvedValue(undefined);
++    useChatStore.setState({ loadToolOutput });
++    const { container } = renderCard({
++      name: "Read",
++      arguments: {},
++      output: "head",
++      state: "output-available",
++      resultItemId: "fco_1",
++      truncatedOutputLength: 500,
++    });
++    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
++    const retry = await screen.findByRole("button", { name: "Retry" });
++    expect(screen.getByRole("status")).toHaveTextContent("The full output failed to load.");
++    fireEvent.click(retry);
++    expect(loadToolOutput).toHaveBeenCalledTimes(2);
++  });
++
++  it("renders a complete result without any loading notice", () => {
++    const loadToolOutput = vi.fn(() => Promise.resolve());
++    useChatStore.setState({ loadToolOutput });
++    const { container } = renderCard({
++      name: "Read",
++      arguments: {},
++      output: "the whole output",
++      state: "output-available",
++      resultItemId: "fco_1",
++    });
++    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
++    expect(loadToolOutput).not.toHaveBeenCalled();
++    expect(screen.queryByRole("status")).toBeNull();
++  });
++
+   it("renders a pending output placeholder while input-available with no output", () => {
+     // WHY: a running tool (input-available, output null) shows the
+     // waiting-for-output indicator, not an empty/error panel.
+diff --git a/web/src/components/blocks/ToolCard.tsx b/web/src/components/blocks/ToolCard.tsx
+index 70dbe93fd043102fecb8a1b7acd2f5eee630c2c0..8b617668a77c99943a1f80bc75126c719318d4b1 100644
+--- a/web/src/components/blocks/ToolCard.tsx
++++ b/web/src/components/blocks/ToolCard.tsx
+@@ -27,6 +27,7 @@ import {
+   CodeBlockHeader,
+   CodeBlockTitle,
+ } from "@/components/ai-elements/code-block";
++import { useScopedConversationId } from "@/components/chat/conversationScope";
+ import { Button } from "@/components/ui/button";
+ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+@@ -45,6 +46,7 @@ import {
+ } from "@/lib/toolTitle";
+ import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
+ import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
++import { useChatStore } from "@/store/chatStore";
+ 
+ const OUTPUT_PREVIEW_LINE_LIMIT = 80;
+ const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
+@@ -168,8 +170,17 @@ interface ToolCardProps {
+   startedAt?: number | null;
+   /** Completed runtime in seconds. Undefined when historical data lacks timing. */
+   duration?: number;
++  /** Persisted result item backing `output`, when there is one. */
++  resultItemId?: string;
++  /**
++   * Stored output length when `output` is only the preview a lean history
++   * page returned. Expanding the row fetches the result in full.
++   */
++  truncatedOutputLength?: number;
+ }
+ 
++type OutputLoadState = "idle" | "loading" | "failed";
++
+ export function ToolCard({
+   name,
+   nativeToolType,
+@@ -179,6 +190,8 @@ export function ToolCard({
+   state,
+   startedAt,
+   duration,
++  resultItemId,
++  truncatedOutputLength,
+ }: ToolCardProps) {
+   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
+   const shellCall = useMemo(() => shellToolCall(name, args), [name, args]);
+@@ -199,8 +212,26 @@ export function ToolCard({
+       : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
+   const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
+ 
++  // A lean history page carries only the head of a long result; the rest is
++  // fetched once the reader opens the row, and the store swaps it in.
++  const isOutputPreview = truncatedOutputLength !== undefined && resultItemId !== undefined;
++  const conversationId = useScopedConversationId();
++  const loadToolOutput = useChatStore((s) => s.loadToolOutput);
++  const [outputLoad, setOutputLoad] = useState<OutputLoadState>("idle");
++  const loadFullOutput = useCallback(() => {
++    if (resultItemId === undefined) return;
++    setOutputLoad("loading");
++    loadToolOutput(resultItemId, conversationId ?? undefined).then(
++      () => setOutputLoad("idle"),
++      () => setOutputLoad("failed"),
++    );
++  }, [conversationId, loadToolOutput, resultItemId]);
++  const onOpenChange = (open: boolean) => {
++    if (open && isOutputPreview && outputLoad === "idle") loadFullOutput();
++  };
++
+   return (
+-    <Collapsible defaultOpen={false} className="group not-prose w-full">
++    <Collapsible defaultOpen={false} onOpenChange={onOpenChange} className="group not-prose w-full">
+       <ToolTriggerRow
+         title={title}
+         name={name}
+@@ -238,11 +269,61 @@ export function ToolCard({
+           (state === "output-error" || state === "cancelled" || state === "no-output") && (
+             <EmptyOutputState state={state} />
+           )}
++        {isOutputPreview && output !== null && (
++          <OutputPreviewNotice
++            shownChars={output.length}
++            totalChars={truncatedOutputLength}
++            loadState={outputLoad}
++            onRetry={loadFullOutput}
++          />
++        )}
+       </CollapsibleContent>
+     </Collapsible>
+   );
+ }
+ 
++/** Footer under a lean page's output head while the full result loads. */
++function OutputPreviewNotice({
++  shownChars,
++  totalChars,
++  loadState,
++  onRetry,
++}: {
++  shownChars: number;
++  totalChars: number;
++  loadState: OutputLoadState;
++  onRetry: () => void;
++}) {
++  const shown = `Showing the first ${shownChars.toLocaleString()} of ${totalChars.toLocaleString()} characters`;
++  return (
++    <div
++      role="status"
++      className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-sm sm:flex-row sm:items-center sm:justify-between"
++    >
++      {loadState === "failed" ? (
++        <>
++          <span className="min-w-0">{shown}. The full output failed to load.</span>
++          <Button
++            className="w-fit"
++            onClick={onRetry}
++            size="xs"
++            type="button"
++            variant="outline"
++            componentId="diagnostics.tool.retry_full_output"
++          >
++            Retry
++          </Button>
++        </>
++      ) : (
++        <span className="flex min-w-0 items-center gap-2">
++          <Loader2Icon className="size-3.5 shrink-0 animate-spin" />
++          {shown}; loading the full output…
++        </span>
++      )}
++    </div>
++  );
++}
++
+ /**
+  * Render the folded (older) part of a contiguous tool run as one muted
+  * summary line ("Read 2 files"). Clicking expands to show each tool as
+@@ -276,6 +357,8 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
+                 state={item.state}
+                 startedAt={item.startedAt}
+                 duration={item.duration}
++                resultItemId={item.resultItemId}
++                truncatedOutputLength={item.truncatedOutputLength}
+               />
+             );
+           }
+diff --git a/web/src/lib/blocks.ts b/web/src/lib/blocks.ts
+index c771be8f2bf0a37741a12a40a9e16c4df4f50b46..363b3dc18afa94b20f21e0f287cf9b97c363f0e6 100644
+--- a/web/src/lib/blocks.ts
++++ b/web/src/lib/blocks.ts
+@@ -266,6 +266,8 @@ export interface ToolResultBlock {
+   callId: string;
+   agentName: string;
+   output: string;
++  /** Stored output length when `output` is only the preview a lean history page returned. */
++  truncatedOutputLength?: number;
+ }
+ 
+ /** A provider-native tool output (web_search, mcp, etc.). */
+diff --git a/web/src/lib/conversationItems.ts b/web/src/lib/conversationItems.ts
+index 9ba1103e97b50bfae5879d408d4bdcac1cbe4681..0efa7b679860cea50670018be1b873672c9fb64f 100644
+--- a/web/src/lib/conversationItems.ts
++++ b/web/src/lib/conversationItems.ts
+@@ -54,7 +54,12 @@ export interface FunctionCallItem extends BaseItem {
+ export interface FunctionCallOutputItem extends BaseItem {
+   type: "function_call_output";
+   call_id: string;
++  /** The tool's result, or only its head when `output_truncated` is set. */
+   output: string;
++  /** Set on `tool_output=preview` pages whose `output` is a prefix of the stored result. */
++  output_truncated?: boolean;
++  /** Character count of the stored result; sent with `output_truncated`. */
++  output_length?: number;
+ }
+ 
+ /**
+diff --git a/web/src/lib/itemsToBlocks.test.ts b/web/src/lib/itemsToBlocks.test.ts
+index 167bab501281cd92e0bd9e83016db5ef89636d64..c6789f244edbef9f1f9b8740b53b74a067954ddd 100644
+--- a/web/src/lib/itemsToBlocks.test.ts
++++ b/web/src/lib/itemsToBlocks.test.ts
+@@ -545,6 +545,26 @@ describe("itemsToBlocks — tool calls", () => {
+     expect(result.output).toBe("12:00:00 UTC");
+   });
+ 
++  it("carries a lean page's stored output length onto the result block", () => {
++    const items: ConversationItem[] = [
++      functionCall("resp_1", "c1", "Read", { file_path: "/a" }),
++      {
++        ...functionCallOutput("resp_1", "c1", "head of the file"),
++        output_truncated: true,
++        output_length: 9000,
++      },
++      functionCall("resp_1", "c2", "Read", { file_path: "/b" }),
++      functionCallOutput("resp_1", "c2", "whole file"),
++    ];
++    const results = itemsToBlocks(items).filter(
++      (b): b is ToolResultBlock => b.type === "tool_result",
++    );
++    expect(results[0]).toMatchObject({ output: "head of the file", truncatedOutputLength: 9000 });
++    // A complete result carries no marker at all, so nothing downstream
++    // mistakes it for a preview.
++    expect(results[1]).not.toHaveProperty("truncatedOutputLength");
++  });
++
+   it("multiple tool calls in one response_id stay flat (no bubble boundary)", () => {
+     const items: ConversationItem[] = [
+       userMessage("resp_1", "Read three files"),
+@@ -655,6 +675,26 @@ describe("itemsToBlocks — answered question and plan cards", () => {
+     });
+   });
+ 
++  it("leaves a question whose answer is only a lean-page preview as a plain tool row", () => {
++    // A cut-off result could name the wrong choice; the row stays until the
++    // full output is fetched, rather than a card built from a prefix.
++    const answered = functionCallOutput(
++      "resp_1",
++      "c1",
++      'Your questions have been answered: "Which library should we use?"="date-fns", ',
++    );
++    const items: ConversationItem[] = [
++      userMessage("resp_1", "Pick for me"),
++      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1"),
++      { ...answered, output_truncated: true, output_length: 180 },
++    ];
++    expect(itemsToBlocks(items).map((b) => b.type)).toEqual([
++      "user_message",
++      "tool_group",
++      "tool_result",
++    ]);
++  });
++
+   it("leaves an unanswered question as a plain tool row", () => {
+     // No output yet (still parked, or the pair split across history pages):
+     // the live snapshot owns the pending card, and a rebuilt one would have
+diff --git a/web/src/lib/itemsToBlocks.ts b/web/src/lib/itemsToBlocks.ts
+index d1afe524a51695a7955e82ba4b1288046db97c94..1f11ad5da19bc74595d969478b61d6994c462060 100644
+--- a/web/src/lib/itemsToBlocks.ts
++++ b/web/src/lib/itemsToBlocks.ts
+@@ -74,6 +74,18 @@ import { readSubagentActivity } from "./subagentActivity";
+ const ASK_USER_QUESTION_TOOL = "AskUserQuestion";
+ const EXIT_PLAN_MODE_TOOL = "ExitPlanMode";
+ 
++/**
++ * Tools whose transcript card is built from the result text itself (the
++ * answered question / plan card, the routing plan card) rather than shown
++ * on demand. A lean history page must carry their output in full.
++ */
++export const TOOLS_RENDERED_FROM_OUTPUT: ReadonlySet<string> = new Set([
++  ASK_USER_QUESTION_TOOL,
++  EXIT_PLAN_MODE_TOOL,
++  "sys_advise_models",
++  "mcp__omnigent__sys_advise_models",
++]);
++
+ // Claude Code's ExitPlanMode result opens with this when the user
+ // approved; a rejection returns the feedback they typed instead.
+ const PLAN_APPROVED_PREFIX = "User has approved your plan";
+@@ -139,7 +151,11 @@ function agentNamesByResponseId(items: ConversationItem[]): Map<string, string |
+ function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
+   const outputs = new Map<string, string>();
+   for (const item of items) {
+-    if (isFunctionCallOutputItem(item)) outputs.set(item.call_id, item.output);
++    // A preview is not an answer: a card built from a cut-off result would
++    // misreport what the user chose, so leave the plain tool row instead.
++    if (isFunctionCallOutputItem(item) && !item.output_truncated) {
++      outputs.set(item.call_id, item.output);
++    }
+   }
+   return outputs;
+ }
+@@ -401,6 +417,9 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
+     callId: item.call_id,
+     agentName: ctx.agent ?? "",
+     output: item.output,
++    ...(item.output_truncated && item.output_length !== undefined
++      ? { truncatedOutputLength: item.output_length }
++      : {}),
+   };
+ }
+ 
+diff --git a/web/src/lib/renderItems.test.ts b/web/src/lib/renderItems.test.ts
+index 9e93843c250240fe7848fd0449f18dac876b52e3..0a129b759b7918a226bfb2327d799faed96e3605 100644
+--- a/web/src/lib/renderItems.test.ts
++++ b/web/src/lib/renderItems.test.ts
+@@ -6,7 +6,13 @@
+ // `blockStream.test.ts`.
+ 
+ import { describe, expect, it } from "vitest";
+-import type { AnyBlock, BlockContext, MessageContentBlock, ToolExecution } from "./blocks";
++import type {
++  AnyBlock,
++  BlockContext,
++  MessageContentBlock,
++  ToolExecution,
++  ToolResultBlock,
++} from "./blocks";
+ import { BlockStream } from "./blockStream";
+ import type { ConversationItem } from "./conversationItems";
+ import type { StreamEvent } from "./events";
+@@ -1404,6 +1410,40 @@ describe("buildBubbles — tool joining", () => {
+     expect(t.duration).toBe(2.25);
+   });
+ 
++  it("tool item names its result item and the stored length of a lean-page preview", () => {
++    const toolItemFor = (result: Partial<ToolResultBlock>) => {
++      const blocks: AnyBlock[] = [
++        {
++          type: "tool_group",
++          ctx: ctx({ itemId: "fc_1", timestamp: 10 }),
++          executions: [mkExec("Read", "c1")],
++          iteration: 0,
++        },
++        {
++          type: "tool_result",
++          ctx: ctx({ itemId: "fco_1", timestamp: 12 }),
++          name: "Read",
++          callId: "c1",
++          agentName: "test",
++          output: "head",
++          ...result,
++        },
++      ];
++      const bubbles = buildBubbles(blocks, null);
++      return (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items[0] as Extract<
++        RenderItem,
++        { kind: "tool" }
++      >;
++    };
++    const preview = toolItemFor({ truncatedOutputLength: 4096 });
++    expect(preview.resultItemId).toBe("fco_1");
++    expect(preview.truncatedOutputLength).toBe(4096);
++    // A full result: the id is still known (nothing to fetch), no length.
++    const full = toolItemFor({});
++    expect(full.resultItemId).toBe("fco_1");
++    expect(full).not.toHaveProperty("truncatedOutputLength");
++  });
++
+   it("tool_group without matching result, lifecycle streaming → state input-available", () => {
+     const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+     const blocks: AnyBlock[] = [
+diff --git a/web/src/lib/renderItems.ts b/web/src/lib/renderItems.ts
+index 7e3b2c61c31d09eba6b22a0f94484ee1bfdf0763..3c0a3d8aef4f507d208557ea19b3dfa8f1127cb7 100644
+--- a/web/src/lib/renderItems.ts
++++ b/web/src/lib/renderItems.ts
+@@ -90,6 +90,10 @@ export type RenderItem =
+       state: ToolState;
+       startedAt: number | null;
+       duration: number | undefined;
++      /** Id of the persisted result item, when the output came from one. */
++      resultItemId?: string;
++      /** Stored output length when `output` is only a lean history page's preview. */
++      truncatedOutputLength?: number;
+     }
+   | {
+       kind: "native_tool";
+@@ -1819,7 +1823,20 @@ function toolItem(
+     state = "no-output";
+   }
+ 
+-  return { kind: "tool", itemId, execution, output, state, startedAt, duration };
++  return {
++    kind: "tool",
++    itemId,
++    execution,
++    output,
++    state,
++    startedAt,
++    duration,
++    // Primitives only, so an unchanged tool stays shallow-equal across rebuilds.
++    ...(result?.ctx.itemId ? { resultItemId: result.ctx.itemId } : {}),
++    ...(result?.truncatedOutputLength !== undefined
++      ? { truncatedOutputLength: result.truncatedOutputLength }
++      : {}),
++  };
+ }
+ 
+ /** Same keys, each value strictly equal. */
+diff --git a/web/src/lib/sessionsApi.test.ts b/web/src/lib/sessionsApi.test.ts
+index 4a274811bb1b7ee9bb7c92ddb4504fb3125fcc9c..300d2a2b8c7ea476050bd34b1266767e7df3d315 100644
+--- a/web/src/lib/sessionsApi.test.ts
++++ b/web/src/lib/sessionsApi.test.ts
+@@ -15,6 +15,7 @@ import {
+   createSession,
+   createSideChat,
+   exportSessionTranscript,
++  fetchSessionItem,
+   fetchSessionItemsPage,
+   forkSession,
+   getSession,
+@@ -1529,6 +1530,121 @@ describe("fetchSessionItemsPage", () => {
+   });
+ });
+ 
++describe("fetchSessionItemsPage with lean tool output", () => {
++  const page = (data: Record<string, unknown>[]) =>
++    mockJsonResponse({
++      object: "list",
++      data,
++      first_id: data[0]?.id ?? null,
++      last_id: data.at(-1)?.id ?? null,
++      has_more: false,
++    });
++  const answer =
++    'Your questions have been answered: "Which library should we use?"="date-fns". ' +
++    "You can now continue with these answers in mind.";
++  // Newest first, as the server sends a desc page.
++  const leanPage = [
++    {
++      id: "fco_read",
++      response_id: "resp_1",
++      type: "function_call_output",
++      status: "completed",
++      call_id: "c_read",
++      output: "head of the file",
++      output_truncated: true,
++      output_length: 9000,
++    },
++    {
++      id: "fc_read",
++      response_id: "resp_1",
++      type: "function_call",
++      status: "completed",
++      name: "Read",
++      arguments: "{}",
++      call_id: "c_read",
++    },
++    {
++      id: "fco_ask",
++      response_id: "resp_1",
++      type: "function_call_output",
++      status: "completed",
++      call_id: "c_ask",
++      output: answer.slice(0, 40),
++      output_truncated: true,
++      output_length: answer.length,
++    },
++    {
++      id: "fc_ask",
++      response_id: "resp_1",
++      type: "function_call",
++      status: "completed",
++      name: "AskUserQuestion",
++      arguments: "{}",
++      call_id: "c_ask",
++    },
++  ];
++
++  it("asks for previews and inflates only the results that render as cards", async () => {
++    fetchMock.mockResolvedValueOnce(page(leanPage));
++    fetchMock.mockResolvedValueOnce(
++      mockJsonResponse({ ...leanPage[2], output: answer, output_truncated: undefined }),
++    );
++
++    const result = await fetchSessionItemsPage("conv_a", { toolOutput: "preview" });
++
++    expect(String(fetchMock.mock.calls[0]![0])).toBe(
++      `/v1/sessions/conv_a/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc&tool_output=preview`,
++    );
++    // The answered-question card is built from the result text, so that one
++    // item is read in full; the file read stays a preview until expanded.
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(String(fetchMock.mock.calls[1]![0])).toBe("/v1/sessions/conv_a/items/fco_ask");
++    expect(result.items.map((item) => item.id)).toEqual([
++      "fc_ask",
++      "fco_ask",
++      "fc_read",
++      "fco_read",
++    ]);
++    expect(result.items[1]).toMatchObject({ output: answer });
++    expect(result.items[1]).not.toHaveProperty("output_truncated", true);
++    expect(result.items[3]).toMatchObject({ output: "head of the file", output_truncated: true });
++  });
++
++  it("keeps the preview when a card result fails to load, instead of failing the page", async () => {
++    fetchMock.mockResolvedValueOnce(page(leanPage));
++    fetchMock.mockResolvedValueOnce(
++      mockJsonResponse({ error: { message: "gone" } }, { ok: false, status: 404 }),
++    );
++
++    const result = await fetchSessionItemsPage("conv_a", { toolOutput: "preview" });
++
++    expect(result.items[1]).toMatchObject({ id: "fco_ask", output_truncated: true });
++  });
++
++  it("sends no tool_output parameter by default, so other readers keep full items", async () => {
++    fetchMock.mockResolvedValueOnce(page([]));
++    await fetchSessionItemsPage("conv_a");
++    expect(String(fetchMock.mock.calls[0]![0])).not.toContain("tool_output");
++  });
++});
++
++describe("fetchSessionItem", () => {
++  it("GETs the item route and returns the flat item", async () => {
++    const item = {
++      id: "fco_1",
++      response_id: "resp_1",
++      type: "function_call_output",
++      status: "completed",
++      call_id: "c1",
++      output: "the whole output",
++    };
++    fetchMock.mockResolvedValueOnce(mockJsonResponse(item));
++
++    expect(await fetchSessionItem("conv a", "fco/1")).toEqual(item);
++    expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/sessions/conv%20a/items/fco%2F1");
++  });
++});
++
+ describe("postEvent", () => {
+   it("POSTs the event body verbatim and returns {queued, itemId}", async () => {
+     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_123" }));
+diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
+index 07d2d4a870335f934a52b735290e758ef5e8b39a..80e88bd57f95024b13f461bfff2566f1d7ec9054 100644
+--- a/web/src/lib/sessionsApi.ts
++++ b/web/src/lib/sessionsApi.ts
+@@ -10,7 +10,12 @@
+ // helpers below convert at the boundary so callers never see raw
+ // wire fields.
+ 
+-import type { ConversationItem } from "./conversationItems";
++import {
++  type ConversationItem,
++  isFunctionCallItem,
++  isFunctionCallOutputItem,
++} from "./conversationItems";
++import { TOOLS_RENDERED_FROM_OUTPUT } from "./itemsToBlocks";
+ import type { MessageContentBlock } from "./blocks";
+ import type { McpServerStartup } from "./events";
+ import { authenticatedFetch } from "./identity";
+@@ -1333,18 +1338,92 @@ export async function fetchSessionItemsPage(
+     olderThan,
+     limit = SESSION_HISTORY_PAGE_SIZE,
+     signal,
+-  }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
++    toolOutput = "full",
++  }: {
++    olderThan?: string;
++    limit?: number;
++    signal?: AbortSignal;
++    /**
++     * `"preview"` asks for lean items: tool outputs longer than the server's
++     * preview come back cut to its head with `output_truncated` and
++     * `output_length` set, and are fetched in full on demand
++     * (`fetchSessionItem`). Tool output is most of a transcript page's bytes.
++     * Tools whose card is built from the result are inflated here, so callers
++     * see complete items for them.
++     */
++    toolOutput?: "full" | "preview";
++  } = {},
+ ): Promise<SessionItemsPage> {
+   const params = new URLSearchParams({ limit: String(limit), order: "desc" });
+   // "Older than the cursor" within a descending scan = items after it.
+   if (olderThan) params.set("after", olderThan);
++  if (toolOutput === "preview") params.set("tool_output", "preview");
+   const res = await authenticatedFetch(
+     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+     { signal },
+   );
+   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
+   // Server returns newest-first; reverse to chronological for rendering.
+-  return { items: [...page.data].reverse(), hasMore: page.has_more };
++  const items = [...page.data].reverse();
++  return {
++    items:
++      toolOutput === "preview"
++        ? await inflateOutputsRenderedAsCards(sessionId, items, signal)
++        : items,
++    hasMore: page.has_more,
++  };
++}
++
++/**
++ * Fetch one committed item in full via `GET /v1/sessions/{id}/items/{item_id}`.
++ *
++ * The counterpart of a `toolOutput: "preview"` page: the same flat item
++ * shape, with the tool output as stored.
++ */
++export async function fetchSessionItem(
++  sessionId: string,
++  itemId: string,
++  signal?: AbortSignal,
++): Promise<ConversationItem> {
++  const res = await authenticatedFetch(
++    `/v1/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(itemId)}`,
++    { signal },
++  );
++  return readJsonOrThrow<ConversationItem>(res);
++}
++
++/**
++ * Replace the truncated results of tools in `TOOLS_RENDERED_FROM_OUTPUT`
++ * with the full items, fetched in parallel. A result whose fetch fails
++ * keeps its preview; the card falls back to the plain tool row rather than
++ * failing the whole page.
++ */
++async function inflateOutputsRenderedAsCards(
++  sessionId: string,
++  items: ConversationItem[],
++  signal?: AbortSignal,
++): Promise<ConversationItem[]> {
++  const cardCallIds = new Set<string>();
++  for (const item of items) {
++    if (isFunctionCallItem(item) && TOOLS_RENDERED_FROM_OUTPUT.has(item.name)) {
++      cardCallIds.add(item.call_id);
++    }
++  }
++  const truncated = items.filter(
++    (item) =>
++      isFunctionCallOutputItem(item) &&
++      item.output_truncated === true &&
++      cardCallIds.has(item.call_id),
++  );
++  if (truncated.length === 0) return items;
++  const settled = await Promise.allSettled(
++    truncated.map((item) => fetchSessionItem(sessionId, item.id, signal)),
++  );
++  const fullById = new Map<string, ConversationItem>();
++  for (const result of settled) {
++    if (result.status === "fulfilled") fullById.set(result.value.id, result.value);
++  }
++  return items.map((item) => fullById.get(item.id) ?? item);
+ }
+ 
+ /**
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index e595c448b091cb9aefda6f572c62662c64cefefb..08d69e15d301f95fb648a51fbd001fbce23d3dec 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -275,6 +275,8 @@ let client: QueryClient;
+ const fetchMock = vi.fn();
+ let sessionSnapshots: Map<string, ConversationItem[]>;
+ let sessionItems: Map<string, ConversationItem[]>;
++// Full items the per-item route serves, keyed by `${sessionId}/${itemId}`.
++let sessionFullItems: Map<string, ConversationItem>;
+ let sessionPendingElicitations: Map<string, Record<string, unknown>[]>;
+ let sessionPendingInputs: Map<
+   string,
+@@ -301,6 +303,14 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
+   // the matched session id below.
+   const path = url.split("?")[0]!;
+   if (url.match(/\/v1\/sessions\/[^/]+\/stream$/)) return streamResponse();
++  // GET /v1/sessions/{id}/items/{item_id} → one full item from the seeded set.
++  const itemMatch = url.match(/^\/v1\/sessions\/([^/]+)\/items\/([^/?]+)$/);
++  if (itemMatch) {
++    const full = sessionFullItems.get(`${itemMatch[1]}/${itemMatch[2]}`);
++    return full === undefined
++      ? mockResponse({ error: { message: "Item not found" } }, { ok: false, status: 404 })
++      : mockResponse(full);
++  }
+   const itemsMatch = url.match(/^\/v1\/sessions\/([^/]+)\/items(?:\?.*)?$/);
+   if (itemsMatch) {
+     const sessionId = itemsMatch[1]!;
+@@ -524,6 +534,7 @@ beforeEach(() => {
+   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   sessionSnapshots = new Map();
+   sessionItems = new Map();
++  sessionFullItems = new Map();
+   sessionPendingElicitations = new Map();
+   sessionPendingInputs = new Map();
+   sessionCostControlOverrides = new Map();
+@@ -1985,6 +1996,77 @@ describe("chatStore — switchTo", () => {
+     expect(String(itemFetches[0]![0])).toContain("order=desc");
+   });
+ 
++  it("hydrates history with tool-output previews and loads a result in full on demand", async () => {
++    const fullOutput = "line\n".repeat(2000);
++    const call: ConversationItem = {
++      id: "fc_1",
++      response_id: "resp_1",
++      type: "function_call",
++      status: "completed",
++      name: "Read",
++      arguments: JSON.stringify({ file_path: "/big.txt" }),
++      call_id: "c1",
++    };
++    const fullResult: ConversationItem = {
++      id: "fco_1",
++      response_id: "resp_1",
++      type: "function_call_output",
++      status: "completed",
++      call_id: "c1",
++      output: fullOutput,
++    };
++    const preview: ConversationItem = {
++      ...fullResult,
++      output: fullOutput.slice(0, 400),
++      output_truncated: true,
++      output_length: fullOutput.length,
++    };
++    seedSessionSnapshot("conv_lean", [userMessage("resp_1", "read it"), call, preview]);
++    seedSessionItems("conv_lean", [userMessage("resp_1", "read it"), call, preview]);
++    sessionFullItems.set("conv_lean/fco_1", fullResult);
++
++    await useChatStore.getState().switchTo("conv_lean");
++
++    // The open asked for lean items: tool rows render collapsed, so the
++    // bytes of every result would be paid for nothing.
++    const historyFetches = fetchMock.mock.calls
++      .map(([u]) => String(u))
++      .filter((u) => u.startsWith("/v1/sessions/conv_lean/items?"));
++    expect(historyFetches).toHaveLength(1);
++    expect(historyFetches[0]).toContain("tool_output=preview");
++    const resultBlock = () =>
++      useChatStore
++        .getState()
++        .blocks.find((b) => b.type === "tool_result" && b.ctx.itemId === "fco_1");
++    expect(resultBlock()).toMatchObject({
++      output: fullOutput.slice(0, 400),
++      truncatedOutputLength: fullOutput.length,
++    });
++
++    // Two cards expanding the same result share one request.
++    await Promise.all([
++      useChatStore.getState().loadToolOutput("fco_1"),
++      useChatStore.getState().loadToolOutput("fco_1"),
++    ]);
++    const itemFetches = () =>
++      fetchMock.mock.calls.filter(([u]) => String(u) === "/v1/sessions/conv_lean/items/fco_1");
++    expect(itemFetches()).toHaveLength(1);
++    expect(resultBlock()).toMatchObject({ output: fullOutput });
++    expect(resultBlock()).not.toHaveProperty("truncatedOutputLength");
++    // Loaded once is loaded: a later expand costs nothing.
++    await useChatStore.getState().loadToolOutput("fco_1");
++    expect(itemFetches()).toHaveLength(1);
++    // Scroll-up pages ask for previews too.
++    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "fco_1" });
++    await useChatStore.getState().loadMoreHistory();
++    expect(
++      fetchMock.mock.calls
++        .map(([u]) => String(u))
++        .filter((u) => u.includes("/items?") && u.includes("after=fco_1"))
++        .every((u) => u.includes("tool_output=preview")),
++    ).toBe(true);
++  });
++
+   it.each([false, true])(
+     "loadMoreHistory prepends the correct page (scoped pane: %s)",
+     async (scoped) => {
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090f38fc2c8 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -62,7 +62,12 @@ import {
+ } from "@/lib/blocks";
+ import { BlockStream } from "@/lib/blockStream";
+ import { itemsToBlocks } from "@/lib/itemsToBlocks";
+-import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
++import {
++  isFunctionCallOutputItem,
++  isMessageItem,
++  type ConversationItem,
++  type MessageItem,
++} from "@/lib/conversationItems";
+ import { buildBubbles } from "@/lib/renderItems";
+ import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+ import { emitUiOpenFile } from "@/lib/uiFileRequests";
+@@ -73,6 +78,7 @@ import {
+   createSession,
+   getSessionSlim,
+   getSessionUsage,
++  fetchSessionItem,
+   fetchSessionItemsPage,
+   HOST_OFFLINE_CODE,
+   INITIAL_WINDOW_ITEMS,
+@@ -1399,6 +1405,13 @@ export interface ChatActions {
+    * the same cursor, or while a page is in flight, is a no-op.
+    */
+   prefetchMoreHistory: (sessionId?: string) => void;
++  /**
++   * Fetch a lean history page's tool result in full and swap it into
++   * `blocks`. `itemId` is the result item (`resultItemId` on the tool's
++   * render item). Concurrent calls for one item share a single request;
++   * a result already loaded is a no-op.
++   */
++  loadToolOutput: (itemId: string, sessionId?: string) => Promise<void>;
+   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
+   flashUserMessage: (itemId: string) => void;
+   /** Queue an "@"-mention chip into the active composer from outside it. */
+@@ -1462,7 +1475,7 @@ const prefetchedHistoryPages = new Map<
+ conversationRegistry.subscribeDisposed((id) => prefetchedHistoryPages.delete(id));
+ 
+ function fetchOlderHistoryPage(conversationId: string, cursor: string): Promise<SessionItemsPage> {
+-  return fetchSessionItemsPage(conversationId, {
++  return fetchHistoryPage(conversationId, {
+     olderThan: cursor,
+     limit: scrollUpHistoryPageSize(isMobileViewport()),
+   });
+@@ -3803,8 +3816,58 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+       }
+     });
+   },
++
++  loadToolOutput: async (itemId, sessionId) => {
++    const conversationId = sessionId ?? get().conversationId;
++    if (!conversationId) return;
++    const current = setterForState(conversationId);
++    const block = current?.blocks.find((b) => b.type === "tool_result" && b.ctx.itemId === itemId);
++    if (
++      block === undefined ||
++      block.type !== "tool_result" ||
++      !("truncatedOutputLength" in block)
++    ) {
++      return;
++    }
++    const key = `${conversationId}:${itemId}`;
++    const inFlight = toolOutputLoads.get(key);
++    if (inFlight) return inFlight;
++    const load = (async () => {
++      const item = await fetchSessionItem(conversationId, itemId);
++      if (!isFunctionCallOutputItem(item)) return;
++      // Pinned like `loadMoreHistory`: the result belongs to this conversation
++      // even if the reader has switched away before it lands.
++      setterFor(conversationId)((s) => ({
++        blocks: s.blocks.map((b) => {
++          if (b.type !== "tool_result" || b.ctx.itemId !== itemId) return b;
++          const { truncatedOutputLength: _preview, ...full } = b;
++          return { ...full, output: item.output };
++        }),
++      }));
++    })().finally(() => {
++      toolOutputLoads.delete(key);
++    });
++    toolOutputLoads.set(key, load);
++    return load;
++  },
+ }));
+ 
++// Full tool outputs in flight, keyed by `${conversationId}:${itemId}`, so a
++// row expanded twice (or two cards for one result) share one request.
++const toolOutputLoads = new Map<string, Promise<void>>();
++
++/**
++ * Transcript hydration asks for lean tool output: tool rows render collapsed,
++ * so a result is fetched in full only when the reader expands it
++ * (`loadToolOutput`). Tool output is most of a history page's bytes.
++ */
++function fetchHistoryPage(
++  sessionId: string,
++  options: { olderThan?: string; limit?: number } = {},
++): Promise<SessionItemsPage> {
++  return fetchSessionItemsPage(sessionId, { ...options, toolOutput: "preview" });
++}
++
+ // ── Store-action setter ──────────────────────────────────
+ //
+ // The store's own actions (`send`, `stop`, the picker setters, `loadMoreHistory`)
+@@ -4817,7 +4880,7 @@ async function bindStream(
+         staleTime: 0,
+         retry: false,
+       }),
+-      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
++      fetchHistoryPage(id, { limit: INITIAL_WINDOW_ITEMS }),
+     ]);
+     if (isConversationDisposed(id)) return;
+     const items = page.items;
+@@ -5627,7 +5690,7 @@ async function rehydrateWindowOnReconnect(
+   const generation = get().historyGeneration;
+   let fresh: SessionItemsPage;
+   try {
+-    fresh = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS });
++    fresh = await fetchHistoryPage(id, { limit: INITIAL_WINDOW_ITEMS });
+   } catch {
+     return;
+   }
+@@ -5745,7 +5808,7 @@ async function reconcileOnReconnect(
+         staleTime: 0,
+         retry: false,
+       }),
+-      fetchSessionItemsPage(id),
++      fetchHistoryPage(id),
+     ]);
+   } catch {
+     return;
+@@ -5767,7 +5830,7 @@ async function reconcileOnReconnect(
+     if (!cursor) break;
+     let older: SessionItemsPage;
+     try {
+-      older = await fetchSessionItemsPage(id, { olderThan: cursor });
++      older = await fetchHistoryPage(id, { olderThan: cursor });
+     } catch (error) {
+       // A cursor whose item was deleted can never be paged past. Stop the
+       // backfill with the gap still uncovered so the full rehydrate below

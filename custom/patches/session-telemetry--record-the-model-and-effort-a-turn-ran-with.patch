@@ -1,0 +1,546 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 23 Oct 2026 02:19:23 +0000
+Subject: [PATCH] feat(telemetry): record the model and effort a turn ran with
+
+The agent span only carried what a turn asked for. With no model pinned,
+gen_ai.request.model and llm.model_name fell back to the agent name, and
+no effort was recorded at all, so a session on the defaults never said
+which model or effort ran.
+
+gen_ai.request.model is now set only when the turn requested a model.
+The agent name stays in gen_ai.agent.name, and llm.model_name and
+gen_ai.provider.name are unchanged for MLflow and OpenInference views.
+The agent span also gets:
+
+- gen_ai.response.model with omnigent.model.source: observed from the
+  turn's usage model (SDK harnesses), or requested when only the turn's
+  override is known. An observed value replaces the requested one at
+  turn end.
+- omnigent.reasoning_effort.requested (as given), and
+  omnigent.reasoning_effort with .source, only when the level is known:
+  requested, or observed when the harness reports what it applied.
+  Codex now reports its thread default on TurnComplete; harnesses that
+  report nothing (Claude Code, Claude Agent SDK, pi, OpenAI Agents) leave
+  a default effort unset.
+
+Nothing changes when telemetry is off.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ designs/OBSERVABILITY.md                      |  31 +++++
+ docs/databricks.md                            |  10 ++
+ omnigent/inner/codex_executor.py              |  12 +-
+ omnigent/inner/executor.py                    |   5 +
+ omnigent/inner/tracing.py                     | 112 +++++++++++++++++-
+ .../runtime/harnesses/_executor_adapter.py    |  12 ++
+ tests/inner/test_codex_executor.py            |  12 +-
+ tests/inner/test_tracing_genai_semconv.py     |  15 +++
+ .../harnesses/test_executor_adapter_skill.py  | 106 ++++++++++++++++-
+ 9 files changed, 304 insertions(+), 11 deletions(-)
+
+diff --git a/designs/OBSERVABILITY.md b/designs/OBSERVABILITY.md
+index d522f48457bb30dee0131b3596991fe31ecef93b..5e12808411bb42058ffa6c294a6f12c7642cf3f6 100644
+--- a/designs/OBSERVABILITY.md
++++ b/designs/OBSERVABILITY.md
+@@ -548,3 +548,34 @@ bare or MCP-prefixed `load_skill` tool call, plus claude-sdk's native `Skill`:
+ 
+ </content>
+ </invoke>
++
++## 14. Model and effort attributes
++
++The per-turn agent span (`gen_ai.operation.name = invoke_agent`) records both
++what a turn asked for and what it ran with, so a turn left on the default
++model or effort still reports what ran whenever the harness says.
++
++| Attribute | Value |
++|---|---|
++| `gen_ai.request.model` | What the turn asked for: the model override. Unset when the turn asked for none; `gen_ai.agent.name` names the agent. `llm.model_name` keeps its OpenInference value (the override, else the agent name). |
++| `gen_ai.response.model` | The model that ran, whenever it is known. |
++| `omnigent.model.source` | Where `gen_ai.response.model` came from: `observed` (the harness or provider reported it) or `requested` (only the turn's override is known). |
++| `omnigent.reasoning_effort.requested` | The effort the turn asked for, as given, e.g. `high`. Omitted when none was asked for. |
++| `omnigent.reasoning_effort` | The effort that applied, as a level from the shared effort ladder (`low` … `max`). Omitted when unknown; never guessed. |
++| `omnigent.reasoning_effort.source` | Same values as `omnigent.model.source`. |
++
++A value observed at turn end replaces the one stamped at turn start.
++
++Where the values come from:
++
++| Harness / path | `gen_ai.response.model` | `omnigent.reasoning_effort` |
++|---|---|---|
++| SDK harnesses that report a model in turn usage (claude-sdk, codex, pi, openai-agents, copilot, cursor, kimi, ACP, antigravity) | `observed` at turn end; before that, or if the turn fails, the override (`requested`), else unset | `requested` when asked for; codex reports the thread's own default as `observed`; otherwise unset |
++| SDK harnesses without turn usage (databricks, goose, hermes, qwen) | The override (`requested`), else unset | `requested`, else unset |
++| Native terminal harnesses (claude-native, codex-native, cursor-native, kimi-native, kiro-native, opencode-native, antigravity-native) | The override (`requested`), else unset | `requested` (codex-native's effort is mirrored back from Codex); unset when left at the terminal's own default |
++| Turns typed directly in a native terminal | No agent span | No agent span |
++
++An effort left at the harness's own default is unset for Claude Code, the
++Claude Agent SDK, pi and OpenAI Agents: none of them reports the level it
++picked. Omnigent emits no per-LLM-call spans of its own, so these attributes
++live only on the agent span.
+diff --git a/docs/databricks.md b/docs/databricks.md
+index 914e0091241846ed568a60a8739a3bd988a87d26..923b433979014d08d37c100e9e378147b7d5b1ff 100644
+--- a/docs/databricks.md
++++ b/docs/databricks.md
+@@ -571,6 +571,16 @@ For a single agent turn that calls one tool and one LLM:
+ The trace ID is the hex suffix of the response ID, so you can search
+ for a specific request in MLflow by stripping the `resp_` prefix.
+ 
++#### Which model and effort a turn ran with
++
++`gen_ai.request.model` is what the turn asked for. A turn on the default
++model or effort also records what actually ran, on its agent span:
++`gen_ai.response.model`, `omnigent.model.source`,
++`omnigent.reasoning_effort.requested`, `omnigent.reasoning_effort` and
++`omnigent.reasoning_effort.source`. See
++[Model and effort attributes](../designs/OBSERVABILITY.md#14-model-and-effort-attributes)
++for their meaning and which harnesses report them.
++
+ ### Verified end-to-end
+ 
+ Emitted a synthetic trace from a local Python script (using the same
+diff --git a/omnigent/inner/codex_executor.py b/omnigent/inner/codex_executor.py
+index 4100531e22f8e3fba17c9788630f7ee5e5d6d119..0f25037bd70d96910df61a971b3cf9268d0a6637 100644
+--- a/omnigent/inner/codex_executor.py
++++ b/omnigent/inner/codex_executor.py
+@@ -3763,6 +3763,8 @@ class _CodexAppServerSession:
+         )
+         if effort_via_turn_start:
+             self._applied_effort = reasoning_effort
++        # With no effort asked for, the thread runs at the default Codex reported for it.
++        turn_effort = effort or self._default_effort
+         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
+         if not isinstance(raw_active_turn_id, str) or not raw_active_turn_id:
+             yield ExecutorError(message="Codex App Server did not return a turn id")
+@@ -4080,7 +4082,11 @@ class _CodexAppServerSession:
+                             )
+                             turn_usage = self._consume_turn_usage()
+                             _notify_usage_from_dict(model=model, usage=turn_usage)
+-                            yield TurnComplete(response=final_response, usage=turn_usage)
++                            yield TurnComplete(
++                                response=final_response,
++                                usage=turn_usage,
++                                reasoning_effort=turn_effort,
++                            )
+                             return
+                         continue
+                     if item_type == "dynamicToolCall":
+@@ -4141,7 +4147,9 @@ class _CodexAppServerSession:
+                         )
+                     turn_usage = self._consume_turn_usage()
+                     _notify_usage_from_dict(model=model, usage=turn_usage)
+-                    yield TurnComplete(response=final_response, usage=turn_usage)
++                    yield TurnComplete(
++                        response=final_response, usage=turn_usage, reasoning_effort=turn_effort
++                    )
+                     return
+ 
+                 if method == "turn/failed":
+diff --git a/omnigent/inner/executor.py b/omnigent/inner/executor.py
+index 079c1444ff39a03523937dace1e06643e2436517..7406f07f6aea606276d0411199aa73818ed0f480 100644
+--- a/omnigent/inner/executor.py
++++ b/omnigent/inner/executor.py
+@@ -187,12 +187,17 @@ class TurnComplete(ExecutorEvent):
+         ``"cache_read_input_tokens"``, ``"cache_creation_input_tokens"``.
+         e.g. ``{"input_tokens": 1523, "output_tokens": 847,
+         "total_tokens": 2370}``.
++    :param reasoning_effort: The reasoning effort the harness reports it
++        applied to this turn, including its own default when none was
++        requested, e.g. ``"medium"``. ``None`` when the harness does not
++        report one.
+     """
+ 
+     response: str | None = None
+     modified_by_policy: bool = False
+     continue_turn: bool = False
+     usage: ExecutorUsage | None = None
++    reasoning_effort: str | None = None
+ 
+ 
+ class ToolCallStatus(str, enum.Enum):
+diff --git a/omnigent/inner/tracing.py b/omnigent/inner/tracing.py
+index f8ef01bd1cc2be645aa123fa58938cd0e3463962..8ea143fe7f0a9029fc9a28817c5bfe9dd097a1cf 100644
+--- a/omnigent/inner/tracing.py
++++ b/omnigent/inner/tracing.py
+@@ -40,6 +40,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++from collections.abc import Mapping
+ from typing import TYPE_CHECKING, Any, TypeAlias
+ 
+ if TYPE_CHECKING:
+@@ -72,6 +73,7 @@ _GEN_AI_OP_NAME = "gen_ai.operation.name"
+ _GEN_AI_AGENT_NAME = "gen_ai.agent.name"
+ _GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
+ _GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
++_GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
+ _GEN_AI_TOOL_NAME = "gen_ai.tool.name"
+ _TOOL_NAME = "tool.name"
+ 
+@@ -83,6 +85,19 @@ _ERROR_MESSAGE = "error.message"
+ # stamped regardless of content capture.
+ _SKILL_NAME = "omnigent.skill.name"
+ 
++# What an agent turn actually ran with. gen_ai.response.model is the model; each
++# source says where a value came from: the harness reported it (observed) or
++# only the request is known (requested).
++TURN_MODEL_SOURCE = "omnigent.model.source"
++TURN_REASONING_EFFORT_REQUESTED = "omnigent.reasoning_effort.requested"
++TURN_REASONING_EFFORT = "omnigent.reasoning_effort"
++TURN_REASONING_EFFORT_SOURCE = "omnigent.reasoning_effort.source"
++SOURCE_OBSERVED = "observed"
++SOURCE_REQUESTED = "requested"
++
++# start_agent_span's default: the requested model is the recorded model.
++_SAME_AS_MODEL = object()
++
+ # ---------------------------------------------------------------------------
+ # Global enable/disable
+ # ---------------------------------------------------------------------------
+@@ -153,8 +168,19 @@ class TracingContext:
+         agent_name: str,
+         user_message: str,
+         model: str | None = None,
++        *,
++        request_model: str | object | None = _SAME_AS_MODEL,
+     ) -> Span:
+-        """Begin the root AGENT span for a turn."""
++        """
++        Begin the root AGENT span for a turn.
++
++        :param agent_name: The agent's name, e.g. ``"coder"``.
++        :param user_message: The turn's user message, recorded with content capture.
++        :param model: Recorded as ``llm.model_name`` (and its provider prefix as
++            ``gen_ai.provider.name``).
++        :param request_model: The model the turn asked for, as
++            ``gen_ai.request.model``; ``None`` records none. Defaults to *model*.
++        """
+         from opentelemetry import trace
+ 
+         parent = self._current_span
+@@ -174,11 +200,12 @@ class TracingContext:
+             attrs["session.id"] = self.session_id
+         if model:
+             attrs[_LLM_MODEL_NAME] = model
+-            provider, model_name = parse_provider_name(model)
++            provider, _ = parse_provider_name(model)
+             if provider:
+                 attrs[_GEN_AI_PROVIDER_NAME] = provider
+-            if model_name:
+-                attrs[_GEN_AI_REQUEST_MODEL] = model_name
++        requested = model if request_model is _SAME_AS_MODEL else request_model
++        if isinstance(requested, str) and (model_name := parse_provider_name(requested)[1]):
++            attrs[_GEN_AI_REQUEST_MODEL] = model_name
+         if parent_ended and parent is not None:
+             ctx = parent.get_span_context()
+             if ctx is not None:
+@@ -312,6 +339,83 @@ class TracingContext:
+         if span is self._current_span:
+             self._current_span = parent_span
+ 
++    def set_turn_model(self, span: Span | None, model: str | None, source: str) -> None:
++        """
++        Stamp the model a turn ran with as ``gen_ai.response.model``.
++
++        :param span: The turn's AGENT span.
++        :param model: Model id, e.g. ``"claude-opus-4-8[1m]"``; ignored when empty.
++        :param source: One of :data:`SOURCE_OBSERVED`, :data:`SOURCE_REQUESTED`.
++        """
++        if span is None or not model:
++            return
++        span.set_attribute(_GEN_AI_RESPONSE_MODEL, model)
++        span.set_attribute(TURN_MODEL_SOURCE, source)
++
++    def set_turn_reasoning_effort(
++        self, span: Span | None, effort: str | None, source: str
++    ) -> None:
++        """
++        Stamp the reasoning effort a turn ran at, when it is a known level.
++
++        :param span: The turn's AGENT span.
++        :param effort: Effort level, e.g. ``"high"``. Anything outside the
++            shared effort ladder (empty, or a clear alias such as ``"default"``)
++            names no level and is not stamped.
++        :param source: Where the value came from, as for :meth:`set_turn_model`.
++        """
++        from omnigent.util.reasoning_effort import EFFORT_VALUES
++
++        level = effort.strip().lower() if isinstance(effort, str) else ""
++        if span is None or level not in EFFORT_VALUES:
++            return
++        span.set_attribute(TURN_REASONING_EFFORT, level)
++        span.set_attribute(TURN_REASONING_EFFORT_SOURCE, source)
++
++    def set_requested_turn_settings(
++        self,
++        span: Span | None,
++        *,
++        requested_model: str | None,
++        requested_effort: str | None,
++    ) -> None:
++        """
++        Stamp the model and effort a turn asked for as it starts.
++
++        An observed value at turn end replaces either.
++
++        :param span: The turn's AGENT span.
++        :param requested_model: The turn's model override, or ``None``.
++        :param requested_effort: The effort the turn asked for, as given, or ``None``.
++        """
++        if requested_model:
++            # Spelled like gen_ai.request.model, without a provider prefix.
++            self.set_turn_model(span, parse_provider_name(requested_model)[1], SOURCE_REQUESTED)
++        if span is not None and requested_effort:
++            span.set_attribute(TURN_REASONING_EFFORT_REQUESTED, requested_effort)
++        self.set_turn_reasoning_effort(span, requested_effort, SOURCE_REQUESTED)
++
++    def set_observed_turn_settings(
++        self,
++        span: Span | None,
++        *,
++        usage: Mapping[str, Any] | None,
++        reasoning_effort: str | None,
++    ) -> None:
++        """
++        Stamp what the harness reported running at turn end, over the request.
++
++        :param span: The turn's AGENT span.
++        :param usage: The turn's provider usage; its ``"model"`` key is the
++            model that served the turn, e.g. ``{"model": "gpt-5.5", ...}``.
++        :param reasoning_effort: The effort the harness applied, e.g. its own
++            default when the turn asked for none.
++        """
++        model = usage.get("model") if usage is not None else None
++        if isinstance(model, str):
++            self.set_turn_model(span, model, SOURCE_OBSERVED)
++        self.set_turn_reasoning_effort(span, reasoning_effort, SOURCE_OBSERVED)
++
+     def set_skill_name(self, span: Span | None, skill_name: str) -> None:
+         """Stamp ``omnigent.skill.name`` on a Skill / load_skill tool span."""
+         if span is not None and skill_name:
+diff --git a/omnigent/runtime/harnesses/_executor_adapter.py b/omnigent/runtime/harnesses/_executor_adapter.py
+index 12aaf8ead3fc4f11c80949a695865fb09fc69a46..d4928f2a336a9fd4f990ce19b4972bef4364edbd 100644
+--- a/omnigent/runtime/harnesses/_executor_adapter.py
++++ b/omnigent/runtime/harnesses/_executor_adapter.py
+@@ -352,6 +352,13 @@ class ExecutorAdapter(HarnessApp):
+                         agent_name=request.model or "unknown",
+                         user_message=user_message,
+                         model=request.model_override or request.model,
++                        # ``request.model`` is the agent name, never a requested model.
++                        request_model=request.model_override,
++                    )
++                    tctx.set_requested_turn_settings(
++                        agent_span,
++                        requested_model=request.model_override,
++                        requested_effort=extra.get("reasoning_effort"),
+                     )
+ 
+                 response_text: str | None = None
+@@ -427,6 +434,11 @@ class ExecutorAdapter(HarnessApp):
+                                 from omnigent.runtime.telemetry import record_llm_usage
+ 
+                                 record_llm_usage(agent_span, event.usage)
++                            tctx.set_observed_turn_settings(
++                                agent_span,
++                                usage=event.usage,
++                                reasoning_effort=event.reasoning_effort,
++                            )
+                     # --- End tracing ---
+                     self._translate_event(event, ctx)
+                     if isinstance(event, TurnComplete):
+diff --git a/tests/inner/test_codex_executor.py b/tests/inner/test_codex_executor.py
+index d43203e982f53f7c1ab7fb75962e484a954d2952..c0cf47183a6c1828f08d84be75526ba485440005 100644
+--- a/tests/inner/test_codex_executor.py
++++ b/tests/inner/test_codex_executor.py
+@@ -958,9 +958,10 @@ class TestCodexExecutor(unittest.TestCase):
+ 
+         session._request = AsyncMock(side_effect=request)
+         messages = []
++        reported_efforts = []
+         for index, effort in enumerate((None, "high", "high", None, None, "medium", None), 1):
+             messages.append({"role": "user", "content": f"message-{index}"})
+-            async for _ in session.run_turn(
++            async for event in session.run_turn(
+                 messages=messages,
+                 tools=[
+                     {
+@@ -975,7 +976,8 @@ class TestCodexExecutor(unittest.TestCase):
+                 sandbox="workspace-write",
+                 reasoning_effort=effort,
+             ):
+-                pass
++                if isinstance(event, TurnComplete):
++                    reported_efforts.append(event.reasoning_effort)
+             messages.append({"role": "assistant", "content": "remembered"})
+             self.assertEqual(server_effort, effort or default_effort, f"turn {index}: {effort=}")
+ 
+@@ -991,6 +993,12 @@ class TestCodexExecutor(unittest.TestCase):
+                 default_effort,
+             ],
+         )
++        # Each turn reports the effort it ran at; the model default is unknown
++        # until Codex names it, so a first Default turn reports none.
++        self.assertEqual(
++            reported_efforts,
++            [configured_default, *applied_efforts[1:]],
++        )
+         methods = [call.args[0] for call in session._request.await_args_list]
+         self.assertEqual(methods.count("thread/start"), 1)
+         self.assertEqual(methods.count("thread/settings/update"), 4)
+diff --git a/tests/inner/test_tracing_genai_semconv.py b/tests/inner/test_tracing_genai_semconv.py
+index cf796abdb8de5d7e223c74782b94785d140b5ccf..2d1c0351b98432076f5b4a94c04cc23fe46d82c1 100644
+--- a/tests/inner/test_tracing_genai_semconv.py
++++ b/tests/inner/test_tracing_genai_semconv.py
+@@ -111,6 +111,21 @@ def test_agent_span_provider_only_omits_request_model(
+     assert attrs["gen_ai.request.model"] == "gpt-5.1"
+ 
+ 
++def test_agent_span_records_no_request_model_when_none_was_asked_for(
++    exporter: InMemorySpanExporter,
++):
++    """The agent name may name the model for MLflow but is not a requested model."""
++    ctx = TracingContext()
++    span = ctx.start_agent_span(
++        agent_name="my-agent", user_message="hi", model="my-agent", request_model=None
++    )
++    ctx.end_agent_span(span, response="ok")
++
++    attrs = dict(_spans_by_name(exporter, "agent:")[0].attributes or {})
++    assert attrs["llm.model_name"] == "my-agent"
++    assert "gen_ai.request.model" not in attrs
++
++
+ # ---
+ # TOOL span gen_ai semconv attributes
+ # ---
+diff --git a/tests/runtime/harnesses/test_executor_adapter_skill.py b/tests/runtime/harnesses/test_executor_adapter_skill.py
+index 8fdd794d56f8cbefb60ac555e5c9a0391f863895..e72b095eb053e57e93385ea6ee90d9dfc9fe7b0b 100644
+--- a/tests/runtime/harnesses/test_executor_adapter_skill.py
++++ b/tests/runtime/harnesses/test_executor_adapter_skill.py
+@@ -154,8 +154,8 @@ def _tool(name: str, args: dict[str, object], call_id: str) -> list[ExecutorEven
+     ]
+ 
+ 
+-async def _run(events: list[ExecutorEvent]) -> None:
+-    """Run one adapter turn over *events*."""
++async def _run(events: list[ExecutorEvent], **request_fields: object) -> None:
++    """Run one adapter turn over *events*; *request_fields* extend the request."""
+     executor = MockExecutor()
+     executor.enqueue_events(events)
+     adapter = ExecutorAdapter(executor_factory=lambda: executor)
+@@ -165,7 +165,8 @@ async def _run(events: list[ExecutorEvent]) -> None:
+         cancelled=asyncio.Event(),
+     )
+     try:
+-        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hi"), ctx)
++        request = CreateResponseRequest(model="test-agent", input="hi", **request_fields)
++        await adapter.run_turn(request, ctx)
+     finally:
+         await adapter.on_shutdown()
+ 
+@@ -302,3 +303,102 @@ async def test_malformed_skill_call_exports_no_argument_content(
+         for value in (span.attributes or {}).values():
+             assert "private task details" not in str(value)
+     assert telemetry._active_skill_var.get() is None
++
++
++_UNSET = None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("request_fields", "terminal", "expected"),
++    [
++        pytest.param(
++            {},
++            TurnComplete(response="", usage={"model": "gpt-5.5-2026-09", "input_tokens": 3}),
++            {
++                "gen_ai.request.model": _UNSET,
++                "llm.model_name": "test-agent",
++                "gen_ai.response.model": "gpt-5.5-2026-09",
++                "omnigent.model.source": "observed",
++                "omnigent.reasoning_effort.requested": _UNSET,
++                "omnigent.reasoning_effort": _UNSET,
++            },
++            id="default-model-observed",
++        ),
++        pytest.param(
++            {},
++            TurnComplete(response=""),
++            {
++                "gen_ai.request.model": _UNSET,
++                "gen_ai.response.model": _UNSET,
++                "omnigent.model.source": _UNSET,
++            },
++            id="model-unknowable",
++        ),
++        pytest.param(
++            {"model_override": "openai/gpt-5.4-mini", "reasoning": {"effort": "High"}},
++            TurnComplete(response=""),
++            {
++                "gen_ai.request.model": "gpt-5.4-mini",
++                "gen_ai.response.model": "gpt-5.4-mini",
++                "omnigent.model.source": "requested",
++                "omnigent.reasoning_effort.requested": "High",
++                "omnigent.reasoning_effort": "high",
++                "omnigent.reasoning_effort.source": "requested",
++            },
++            id="requested",
++        ),
++        pytest.param(
++            {"model_override": "openai/gpt-5.4-mini", "reasoning": {"effort": "High"}},
++            TurnComplete(
++                response="", usage={"model": "gpt-5.5-2026-09"}, reasoning_effort="medium"
++            ),
++            {
++                "gen_ai.request.model": "gpt-5.4-mini",
++                "gen_ai.response.model": "gpt-5.5-2026-09",
++                "omnigent.model.source": "observed",
++                "omnigent.reasoning_effort.requested": "High",
++                "omnigent.reasoning_effort": "medium",
++                "omnigent.reasoning_effort.source": "observed",
++            },
++            id="observed-replaces-requested",
++        ),
++        pytest.param(
++            {"reasoning": {"effort": "default"}},
++            TurnComplete(response="", reasoning_effort="medium"),
++            {
++                "omnigent.reasoning_effort.requested": "default",
++                "omnigent.reasoning_effort": "medium",
++                "omnigent.reasoning_effort.source": "observed",
++            },
++            id="default-effort-observed",
++        ),
++        pytest.param(
++            {"reasoning": {"effort": "default"}},
++            TurnComplete(response=""),
++            {
++                "omnigent.reasoning_effort.requested": "default",
++                "omnigent.reasoning_effort": _UNSET,
++            },
++            id="default-effort-unreported",
++        ),
++    ],
++)
++async def test_agent_span_records_the_model_and_effort_the_turn_ran_with(
++    exporter: InMemorySpanExporter,
++    monkeypatch: pytest.MonkeyPatch,
++    request_fields: dict[str, object],
++    terminal: TurnComplete,
++    expected: dict[str, str | None],
++) -> None:
++    """A default model or effort is recorded as what ran, or left unset when unknown.
++
++    The agent name stays ``llm.model_name`` but is never a requested model.
++    """
++    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
++
++    await _run([terminal], **request_fields)
++
++    (agent,) = [s for s in exporter.get_finished_spans() if s.name == "agent:test-agent"]
++    attributes = dict(agent.attributes or {})
++    assert {key: attributes.get(key) for key in expected} == expected

@@ -1,0 +1,917 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 23 Oct 2026 14:16:08 +0000
+Subject: [PATCH] feat(telemetry): stamp session metadata on harness turn spans
+
+Exported spans carry session.id but nothing about the session, so a
+downstream job that classifies conversations has to look each session up
+in the Omnigent database.
+
+When OMNIGENT_TELEMETRY_ENABLED is on, the runner resolves session-level
+attributes for every turn and forwards them on the turn body as
+telemetry_attributes. The executor adapter binds them for the turn, and a
+span processor stamps them on every span the harness emits.
+
+- Read from the server each turn, so renames, label edits and project
+  moves reach later spans: omnigent.session.title,
+  omnigent.session.labels.<key> (internal omnigent.* labels skipped),
+  omnigent.project.id and .name (the name is cached per project id),
+  omnigent.agent.name, and omnigent.git.branch (the workspace's
+  checked-out branch when the session records none).
+- Resolved once per session on the runner: omnigent.workspace,
+  omnigent.git.remote (credentials stripped), omnigent.host.name.
+
+Every lookup is best-effort and bounded: the server reads share a short
+budget, and a failure or timeout leaves the turn with the machine-local
+attributes only; a turn is never delayed or failed by telemetry. The
+session title is often generated from the first message, so it is
+stamped only when OMNIGENT_OTEL_CAPTURE_CONTENT is on. Labels, project
+and workspace are exported as metadata and documented as such.
+
+No change when telemetry is disabled. There is no user attribute here.
+
+Related: #10794
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ designs/OBSERVABILITY.md                      |  40 +++-
+ omnigent/runner/app.py                        |  31 +++
+ omnigent/runner/session_telemetry.py          | 200 ++++++++++++++++++
+ .../runtime/harnesses/_executor_adapter.py    |   2 +
+ omnigent/runtime/telemetry.py                 |  65 +++++-
+ omnigent/server/schemas.py                    |   3 +
+ ...t_app_sessions_native_workflow_messages.py |  61 ++++++
+ tests/runner/test_session_telemetry.py        | 185 ++++++++++++++++
+ .../harnesses/test_executor_adapter_skill.py  |  30 ++-
+ tests/runtime/test_telemetry.py               |  38 ++++
+ 10 files changed, 639 insertions(+), 16 deletions(-)
+ create mode 100644 omnigent/runner/session_telemetry.py
+ create mode 100644 tests/runner/test_session_telemetry.py
+
+diff --git a/designs/OBSERVABILITY.md b/designs/OBSERVABILITY.md
+index 5e12808411bb42058ffa6c294a6f12c7642cf3f6..d3a5fb468ba22fe0a0e03f8584affb699e22f089 100644
+--- a/designs/OBSERVABILITY.md
++++ b/designs/OBSERVABILITY.md
+@@ -293,7 +293,7 @@ All standard OpenTelemetry env vars; nothing backend-specific in code.
+ | `OTEL_SERVICE_NAME` | per component | Service identity in Jaeger |
+ | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` (dev) | Always sample locally; ratio-based in prod |
+ | `OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION` | `true` | Server/runner HTTP spans + extract |
+-| `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans; **off in prod** (PII) |
++| `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans, and the session title (§15); **off in prod** (PII) |
+ | `OMNIGENT_OTEL_CAPTURE_USER` | off | Stamp the acting user as `enduser.id` on every span (PII; usually an email). `omnigent.runner.id` and the `omnigent.host.id` resource attribute need no opt-in. |
+ 
+ Telemetry is **opt-in**: nothing is instrumented and no spans are created unless
+@@ -481,7 +481,7 @@ low-cardinality labels — never content, never ids like `session.id`.
+ | Need | Seam | Reference |
+ |---|---|---|
+ | Structured, per-turn, tree-nested span (agent/tool/skill-like) | New `start_X_span`/`end_X_span` on `TracingContext` + an `elif isinstance(event, …)` branch in the executor-adapter event loop | `omnigent/inner/tracing.py`, `omnigent/runtime/harnesses/_executor_adapter.py` |
+-| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `omnigent.skill.active`, `enduser.id`, `omnigent.runner.id`) |
++| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), or `make_span_attributes_processor(get_mapping)` for a whole mapping, registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `omnigent.skill.active`, `enduser.id`, `omnigent.runner.id`, `session_attributes_scope`) |
+ | Aggregatable counts / latency (dashboards, alerting) | A metric module copied from `omnigent/db/metrics.py`, with module-level `record_*` wrapped in `@telemetry_guarded` | `omnigent/runtime/skill_metrics.py`, `omnigent/db/metrics.py` |
+ | Ad-hoc span around a code block | `telemetry.span()` (+ `record_message_payload` for a gated body) | `telemetry.py`, `omnigent/runtime/policies/engine.py` |
+ 
+@@ -515,10 +515,10 @@ The skill name is read only from the tool's name field (`skill` / `command` for
+ malformed call can't leak argument text past content capture.
+ 
+ Ambient attributes (`session.id`, `omnigent.skill.active`, `enduser.id`,
+-`omnigent.runner.id`) come from span processors that `_init_otel_traces` registers
+-on the provider it creates. If the process uses an externally installed
+-`TracerProvider` instead, `omnigent.skill.name` is still stamped on the skill tool
+-span but the ambient attributes are not.
++`omnigent.runner.id`, the session attributes of §15) come from span processors
++that `_init_otel_traces` registers on the provider it creates. If the process
++uses an externally installed `TracerProvider` instead, `omnigent.skill.name` is
++still stamped on the skill tool span but the ambient attributes are not.
+ 
+ **Harness coverage & known gaps.** Detection fires only on a `ToolCallRequest`
+ whose name (after `_strip_mcp_tool_prefix`) is in `_SKILL_TOOL_NAMES`
+@@ -579,3 +579,31 @@ An effort left at the harness's own default is unset for Claude Code, the
+ Claude Agent SDK, pi and OpenAI Agents: none of them reports the level it
+ picked. Omnigent emits no per-LLM-call spans of its own, so these attributes
+ live only on the agent span.
++
++## 15. Session attributes
++
++With `OMNIGENT_TELEMETRY_ENABLED` on, the runner resolves session-level
++metadata for every turn it forwards and sends it on the turn body as
++`telemetry_attributes` (`omnigent/runner/session_telemetry.py`). The executor
++adapter binds it with `session_attributes_scope`, and a span processor stamps
++every key on every span the harness emits for the turn, so a downstream job can
++classify spans without joining the Omnigent database.
++
++| Attribute | Source | Gate |
++|---|---|---|
++| `omnigent.session.title` | The session title, re-read each turn | `OMNIGENT_OTEL_CAPTURE_CONTENT`: titles are usually generated from the first message |
++| `omnigent.session.labels.<key>` | Each session label, re-read each turn; internal `omnigent.*` labels are skipped | None: labels are the classification keys this exists for. Keys become attribute names and values are exported as free text, as-is |
++| `omnigent.project.id`, `omnigent.project.name` | The session's project; the name is looked up once per project id for the runner's lifetime | None (metadata) |
++| `omnigent.agent.name` | The session's agent, re-read each turn | None (metadata) |
++| `omnigent.git.branch` | The branch the session records, else the branch checked out in its workspace | None (metadata) |
++| `omnigent.workspace` | The session's runtime working folder, resolved once per session | None (metadata; the path can embed a user name) |
++| `omnigent.git.remote` | The workspace's `origin` URL with any credentials or SSH user stripped, resolved once per session | None (metadata) |
++| `omnigent.host.name` | The runner machine's host name, resolved once per session | None (metadata) |
++
++The gate is evaluated in the runner when the attributes are resolved; the
++harness stamps whatever the runner sent. Every lookup is best-effort and
++bounded: a server read that fails or does not finish within a few seconds
++leaves the turn with the machine-local attributes only, and the turn itself is
++never delayed or failed by telemetry. Nothing is resolved or sent when
++telemetry is off. No user attribute is stamped here: the acting user belongs
++to the semconv `enduser.id`, proposed separately.
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index c545671dbb050dafdc5ab37dfc61799105d8ccee..fad917ef1a32943ab4c1470fac7c112929685a01 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -1299,6 +1299,9 @@ def create_runner_app(
+     _session_agent_revisions: dict[str, str] = {}
+     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
+     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
++    # session_id → machine-local span attributes (workspace, git remote, host)
++    _session_telemetry_local_attributes: dict[str, dict[str, str]] = {}
++    _session_telemetry_project_names: dict[str, str] = {}  # project_id → name
+     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
+     _session_init_tasks: dict[
+         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
+@@ -2145,6 +2148,31 @@ def create_runner_app(
+             return Path(workspace.strip()).expanduser().resolve()
+         return runner_workspace.resolve() if runner_workspace is not None else None
+ 
++    async def _session_span_attributes(session_id: str) -> dict[str, str]:
++        """Session-level span attributes for a turn; empty when telemetry is off."""
++        from omnigent.runtime.telemetry import telemetry_enabled
++
++        if not telemetry_enabled():
++            return {}
++        from omnigent.runner.session_telemetry import (
++            local_session_attributes,
++            resolve_session_attributes,
++        )
++
++        cwd = await _session_runtime_cwd(session_id)
++        workspace = str(cwd) if cwd is not None else None
++        local = _session_telemetry_local_attributes.get(session_id)
++        if local is None:
++            local = await asyncio.to_thread(local_session_attributes, workspace)
++            _session_telemetry_local_attributes[session_id] = local
++        return await resolve_session_attributes(
++            server_client,
++            session_id,
++            workspace=workspace,
++            local=local,
++            project_names=_session_telemetry_project_names,
++        )
++
+     async def _load_legacy_session_init_context() -> _SessionInitContext:
+         await _get_server_version(server_client)
+         return _SessionInitContext(envelope=None)
+@@ -3512,6 +3540,7 @@ def create_runner_app(
+         _session_workspace_cache.pop(session_id, None)
+         _session_snapshot_cache.pop(session_id, None)
+         _session_snapshot_locks.pop(session_id, None)
++        _session_telemetry_local_attributes.pop(session_id, None)
+         _session_init_envelopes.pop(session_id, None)
+         _session_reasoning_effort.pop(session_id, None)
+         _session_chat_features.pop(session_id, None)
+@@ -5170,6 +5199,8 @@ def create_runner_app(
+             "role": "user",
+             "model": msg_body.get("model", ""),
+         }
++        if _span_attributes := await _session_span_attributes(conv):
++            harness_body["telemetry_attributes"] = _span_attributes
+         # The routed model rides in-band on the forwarded message. This body is
+         # built field by field (not copied), so it must be threaded explicitly:
+         # the harness forwards it onto CreateResponseRequest.model_override and
+diff --git a/omnigent/runner/session_telemetry.py b/omnigent/runner/session_telemetry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d37407d32bb090281df31cae76fc82fddb4b4759
+--- /dev/null
++++ b/omnigent/runner/session_telemetry.py
+@@ -0,0 +1,200 @@
++"""Session-level span attributes the runner hands each harness turn."""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import socket
++from collections.abc import Mapping, MutableMapping
++from typing import Any
++
++import httpx
++
++from omnigent.diagnostics import redact_url
++from omnigent.runner.github_resource import _git
++from omnigent.runner.native import _SESSION_METADATA_PARAMS
++from omnigent.runtime.telemetry import should_capture_content
++
++_logger = logging.getLogger(__name__)
++
++# Metadata reads must never hold a turn: each server GET is capped, and the
++# whole resolution shares one budget before the turn goes on without it.
++_SERVER_TIMEOUT_S = 5.0
++_RESOLVE_TIMEOUT_S = 5.0
++
++LABEL_ATTRIBUTE_PREFIX = "omnigent.session.labels."
++
++
++def session_metadata_attributes(
++    session: Mapping[str, Any],
++    *,
++    project_name: str | None = None,
++    git_branch: str | None = None,
++) -> dict[str, str]:
++    """
++    Project a ``GET /v1/sessions/{id}`` body onto ``omnigent.*`` span attributes.
++
++    Missing or empty values are omitted, as are internal ``omnigent.*`` labels.
++    The title is often generated from the first message, so it is included
++    only when ``OMNIGENT_OTEL_CAPTURE_CONTENT`` is on.
++
++    :param session: Session response body, e.g. ``{"title": "Fix login",
++        "labels": {"team": "web"}, "project_id": "proj_1"}``.
++    :param project_name: Name of the session's project, if resolved.
++    :param git_branch: Branch to report when the session records none.
++    :returns: Attribute names mapped to values, e.g.
++        ``{"omnigent.session.title": "Fix login"}``.
++    """
++    candidates: dict[str, object] = {
++        "omnigent.session.title": session.get("title") if should_capture_content() else None,
++        "omnigent.project.id": session.get("project_id"),
++        "omnigent.project.name": project_name,
++        "omnigent.git.branch": session.get("git_branch") or git_branch,
++        "omnigent.agent.name": session.get("agent_name"),
++    }
++    labels = session.get("labels")
++    if isinstance(labels, Mapping):
++        candidates.update(
++            {
++                f"{LABEL_ATTRIBUTE_PREFIX}{key}": value
++                for key, value in labels.items()
++                if not str(key).startswith("omnigent.")
++            }
++        )
++    return _string_attributes(candidates)
++
++
++def local_session_attributes(workspace: str | None) -> dict[str, str]:
++    """
++    Resolve the attributes that depend only on this machine; never raises.
++
++    The host name is the machine's own: the runner has no view of the host's
++    configured identity name.
++
++    :param workspace: The session's working folder, or ``None``.
++    :returns: Workspace, git remote and host attributes that resolved.
++    """
++    try:
++        host_name: str | None = socket.gethostname()
++    except OSError:
++        host_name = None
++    return _string_attributes(
++        {
++            "omnigent.workspace": workspace,
++            "omnigent.git.remote": git_remote_url(workspace) if workspace else None,
++            "omnigent.host.name": host_name,
++        }
++    )
++
++
++def _string_attributes(candidates: Mapping[str, object]) -> dict[str, str]:
++    """Drop missing or empty values and stringify the rest."""
++    return {key: str(value) for key, value in candidates.items() if value not in (None, "")}
++
++
++def _git_output(argv: list[str], workspace: str) -> str | None:
++    """Return stripped stdout of ``git <argv>`` in *workspace*, or ``None`` on any failure."""
++    returncode, stdout, _ = _git(argv, cwd=workspace)
++    output = stdout.strip()
++    return output if returncode == 0 and output else None
++
++
++def git_remote_url(workspace: str) -> str | None:
++    """
++    Return the ``origin`` URL of the git repo containing *workspace*, or ``None``.
++
++    Credentials embedded in the URL are dropped, so ``https://user:token@host/acme/app.git``
++    and ``git@host:acme/app.git`` are reported as ``https://host/acme/app.git``
++    and ``host:acme/app.git``.
++
++    :param workspace: Directory inside the repository.
++    :returns: The remote URL, e.g. ``"https://github.com/acme/app.git"``.
++    """
++    return redact_url(_git_output(["remote", "get-url", "origin"], workspace))
++
++
++def git_branch(workspace: str) -> str | None:
++    """
++    Return the branch checked out in *workspace*, or ``None`` (including detached HEAD).
++
++    :param workspace: Directory inside the repository.
++    :returns: The branch name, e.g. ``"main"``.
++    """
++    branch = _git_output(["rev-parse", "--abbrev-ref", "HEAD"], workspace)
++    return branch if branch != "HEAD" else None
++
++
++async def _get_json(server_client: httpx.AsyncClient, path: str, **kwargs: Any) -> dict[str, Any]:
++    """GET *path* and return its JSON object body, or ``{}`` on any failure."""
++    try:
++        response = await server_client.get(path, timeout=_SERVER_TIMEOUT_S, **kwargs)
++        if response.status_code == 200:
++            body = response.json()
++            if isinstance(body, dict):
++                return body
++    except Exception:
++        _logger.debug("session telemetry lookup %s failed", path, exc_info=True)
++    return {}
++
++
++async def resolve_session_attributes(
++    server_client: httpx.AsyncClient,
++    session_id: str,
++    *,
++    workspace: str | None,
++    local: Mapping[str, str],
++    project_names: MutableMapping[str, str] | None = None,
++) -> dict[str, str]:
++    """
++    Resolve the current span attributes for *session_id*; never raises.
++
++    Server-owned metadata is read on every call so renames, label edits and
++    project moves made mid-session reach later turns. When the reads do not
++    finish within the budget, the turn goes on with *local* alone.
++
++    :param server_client: Runner-to-server client.
++    :param session_id: Session id, e.g. ``"conv_abc123"``.
++    :param workspace: The session's runtime working folder, or ``None``.
++    :param local: The session's cached :func:`local_session_attributes`.
++    :param project_names: Project names by project id, filled on first use so
++        a project is looked up once per runner process.
++    :returns: Attribute names mapped to values.
++    """
++    try:
++        metadata = await asyncio.wait_for(
++            _server_session_attributes(
++                server_client, session_id, workspace=workspace, project_names=project_names
++            ),
++            timeout=_RESOLVE_TIMEOUT_S,
++        )
++        return {**local, **metadata}
++    except TimeoutError:
++        _logger.debug("session telemetry attributes for %s timed out; skipped", session_id)
++    except Exception:
++        _logger.debug("session telemetry attributes failed for %s", session_id, exc_info=True)
++    return dict(local)
++
++
++async def _server_session_attributes(
++    server_client: httpx.AsyncClient,
++    session_id: str,
++    *,
++    workspace: str | None,
++    project_names: MutableMapping[str, str] | None,
++) -> dict[str, str]:
++    """Read the session from the server and project it onto span attributes."""
++    session = await _get_json(
++        server_client, f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
++    )
++    project_name = None
++    if project_id := session.get("project_id"):
++        cache = project_names if project_names is not None else {}
++        project_name = cache.get(project_id)
++        if project_name is None:
++            project = await _get_json(server_client, f"/v1/projects/{project_id}")
++            if isinstance(name := project.get("name"), str) and name:
++                project_name = cache[project_id] = name
++    branch = None
++    if not session.get("git_branch") and workspace:
++        branch = await asyncio.to_thread(git_branch, workspace)
++    return session_metadata_attributes(session, project_name=project_name, git_branch=branch)
+diff --git a/omnigent/runtime/harnesses/_executor_adapter.py b/omnigent/runtime/harnesses/_executor_adapter.py
+index d4928f2a336a9fd4f990ce19b4972bef4364edbd..cbdcc4523dea8e83abf53f9c637a6850291d32b1 100644
+--- a/omnigent/runtime/harnesses/_executor_adapter.py
++++ b/omnigent/runtime/harnesses/_executor_adapter.py
+@@ -303,6 +303,7 @@ class ExecutorAdapter(HarnessApp):
+         from omnigent.runtime.telemetry import (
+             current_session_id,
+             reset_active_skill,
++            session_attributes_scope,
+             session_scope,
+             set_active_skill,
+         )
+@@ -340,6 +341,7 @@ class ExecutorAdapter(HarnessApp):
+                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
+             with (
+                 session_scope(turn_session_id),
++                session_attributes_scope(request.telemetry_attributes),
+                 phase_scope(ErrorPhase.TURN),
+                 trace_cm,
+                 input_delivery_scope(input_identity, response_id=ctx.response_id),
+diff --git a/omnigent/runtime/telemetry.py b/omnigent/runtime/telemetry.py
+index cc5334086c72c1c9e69905332eddade8a9024381..5b4b189b179695a2c0e1162b4ae952970d47b09a 100644
+--- a/omnigent/runtime/telemetry.py
++++ b/omnigent/runtime/telemetry.py
+@@ -70,6 +70,12 @@ _session_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+     "omnigent_session_id", default=None
+ )
+ 
++# Session-level metadata (title, labels, project, workspace, ...) bound for the
++# current turn; every key/value is stamped on every span started in the context.
++_session_attributes_var: contextvars.ContextVar[Mapping[str, str] | None] = contextvars.ContextVar(
++    "omnigent_session_attributes", default=None
++)
++
+ # Skill active in the current turn; stamped on every span as `omnigent.skill.active`.
+ _active_skill_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+     "omnigent_active_skill", default=None
+@@ -355,6 +361,27 @@ def session_scope(session_id: str | None) -> Iterator[None]:
+         _session_id_var.reset(token)
+ 
+ 
++@contextmanager
++def session_attributes_scope(attributes: Mapping[str, str] | None) -> Iterator[None]:
++    """
++    Bind session-level span attributes for the current execution context.
++
++    Every span started while this scope is active carries each key/value,
++    e.g. ``{"omnigent.session.title": "Fix login"}``. No-op for an empty
++    mapping or when telemetry is off.
++
++    :param attributes: Span attribute names mapped to string values.
++    """
++    if not attributes or not telemetry_enabled():
++        yield
++        return
++    token = _session_attributes_var.set(dict(attributes))
++    try:
++        yield
++    finally:
++        _session_attributes_var.reset(token)
++
++
+ def set_active_skill(skill_name: str) -> contextvars.Token[str | None]:
+     """
+     Bind *skill_name* as the active skill; spans started until reset carry
+@@ -371,13 +398,12 @@ def reset_active_skill(token: contextvars.Token[str | None]) -> None:
+     _active_skill_var.reset(token)
+ 
+ 
+-def make_span_attribute_processor(attribute_key: str, get_value: Callable[[], str | None]) -> Any:
++def make_span_attributes_processor(get_attributes: Callable[[], Mapping[str, str] | None]) -> Any:
+     """
+-    Build a span processor that stamps *attribute_key* with ``get_value()`` on
+-    every recording span (skipped when the value is empty).
++    Build a span processor that stamps every key/value of ``get_attributes()``
++    on each recording span (skipped when the mapping is empty).
+ 
+-    :param attribute_key: Span attribute to set, e.g. ``"omnigent.skill.active"``.
+-    :param get_value: Called at span start, e.g. ``some_context_var.get``.
++    :param get_attributes: Called at span start, e.g. ``some_context_var.get``.
+     :returns: A ``SpanProcessor`` instance.
+     """
+     from opentelemetry.sdk.trace import SpanProcessor
+@@ -385,15 +411,32 @@ def make_span_attribute_processor(attribute_key: str, get_value: Callable[[], st
+     class _AttributeSpanProcessor(SpanProcessor):
+         def on_start(self, span: Any, parent_context: Any = None) -> None:
+             try:
+-                value = get_value()
+-                if value and span.is_recording():
+-                    span.set_attribute(attribute_key, value)
++                attributes = get_attributes()
++                if attributes and span.is_recording():
++                    span.set_attributes(attributes)
+             except Exception:  # pragma: no cover - telemetry must never break spans
+                 pass
+ 
+     return _AttributeSpanProcessor()
+ 
+ 
++def make_span_attribute_processor(attribute_key: str, get_value: Callable[[], str | None]) -> Any:
++    """
++    Build a span processor that stamps *attribute_key* with ``get_value()`` on
++    every recording span (skipped when the value is empty).
++
++    :param attribute_key: Span attribute to set, e.g. ``"omnigent.skill.active"``.
++    :param get_value: Called at span start, e.g. ``some_context_var.get``.
++    :returns: A ``SpanProcessor`` instance.
++    """
++
++    def get_attributes() -> Mapping[str, str] | None:
++        value = get_value()
++        return {attribute_key: value} if value else None
++
++    return make_span_attributes_processor(get_attributes)
++
++
+ def _make_session_id_processor() -> Any:
+     """Span processor stamping ``session.id`` from :data:`_session_id_var`."""
+     return make_span_attribute_processor("session.id", _session_id_var.get)
+@@ -421,6 +464,11 @@ def _make_runner_id_processor() -> Any:
+     return make_span_attribute_processor("omnigent.runner.id", current_runner_id)
+ 
+ 
++def _make_session_attributes_processor() -> Any:
++    """Span processor stamping the attributes bound by :func:`session_attributes_scope`."""
++    return make_span_attributes_processor(_session_attributes_var.get)
++
++
+ def _make_active_skill_processor() -> Any:
+     """Span processor stamping ``omnigent.skill.active`` from :data:`_active_skill_var`."""
+     return make_span_attribute_processor("omnigent.skill.active", _active_skill_var.get)
+@@ -1146,6 +1194,7 @@ def _init_otel_traces(endpoint: str) -> None:
+             # Enrich every span with session.id from the active context (set via
+             # session_scope at the request hook / executor turn / forwarder).
+             provider.add_span_processor(_make_session_id_processor())
++            provider.add_span_processor(_make_session_attributes_processor())
+             # Tag every span with the skill active in the turn, if any.
+             provider.add_span_processor(_make_active_skill_processor())
+             # Attribute every span to its runner, and to the acting user when
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 0889683eb3426ac386dd328e103c4b916c5daf93..422e2fc1fcdadc8f85028a3cc380cfc56309b90a 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -1154,6 +1154,9 @@ class CreateResponseRequest(BaseModel):
+     model_override: str | None = None
+     # Compaction strategy objects, e.g. [{"type": "compaction", ...}]
+     context_management: list[dict[str, Any]] | None = None
++    # Session-level span attributes the runner resolves when telemetry is on,
++    # e.g. {"omnigent.session.title": "Fix login"}; stamped on the turn's spans.
++    telemetry_attributes: dict[str, str] | None = None
+     # Ignored fields — agent controls these; silently dropped.
+     # Typed loosely because we only need to accept and discard them.
+     temperature: float | None = None
+diff --git a/tests/runner/test_app_sessions_native_workflow_messages.py b/tests/runner/test_app_sessions_native_workflow_messages.py
+index 95969719de1f4780bf91bd1334ec35f73e9324dc..de49753cae57c49da8c9168e920a43c548595ef8 100644
+--- a/tests/runner/test_app_sessions_native_workflow_messages.py
++++ b/tests/runner/test_app_sessions_native_workflow_messages.py
+@@ -986,6 +986,67 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
+     )
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("enabled", [True, False])
++async def test_session_span_attributes_reach_the_harness_only_with_telemetry(
++    monkeypatch: pytest.MonkeyPatch, enabled: bool
++) -> None:
++    """With telemetry on, the runner resolves session span attributes onto the turn body."""
++    from omnigent.runner import session_telemetry
++
++    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true" if enabled else "false")
++    resolved: list[str] = []
++
++    async def fake_resolve(
++        _client: object,
++        session_id: str,
++        *,
++        workspace: str | None,
++        local: dict,
++        project_names: dict,
++    ) -> dict:
++        resolved.append(session_id)
++        return {**local, "omnigent.session.title": "Fix login"}
++
++    monkeypatch.setattr(
++        session_telemetry, "local_session_attributes", lambda _: {"omnigent.host.name": "dev"}
++    )
++    monkeypatch.setattr(session_telemetry, "resolve_session_attributes", fake_resolve)
++    hc = _ScriptedHarnessClient(
++        [
++            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
++            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
++        ]
++    )
++    app = create_runner_app(
++        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
++        server_client=NullServerClient(),  # type: ignore[arg-type]
++    )
++
++    async with _runner_client(app) as client:
++        resp = await client.post(
++            "/v1/sessions/0b5f3c1e9d2a4b7c8e6f1a2b3c4d5e6f/events",
++            json={
++                "type": "message",
++                "role": "user",
++                "model": "test-agent",
++                "content": [{"type": "input_text", "text": "hi"}],
++            },
++        )
++        assert resp.status_code == 202
++        for _ in range(200):
++            if hc.posted_bodies:
++                break
++            await asyncio.sleep(0.01)
++
++    assert hc.posted_bodies, "harness never received a turn"
++    expected = (
++        {"omnigent.host.name": "dev", "omnigent.session.title": "Fix login"} if enabled else None
++    )
++    assert hc.posted_bodies[0].get("telemetry_attributes") == expected
++    assert resolved == (["0b5f3c1e9d2a4b7c8e6f1a2b3c4d5e6f"] if enabled else [])
++
++
+ @pytest.mark.asyncio
+ async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
+     """The turn's reasoning effort rides the forwarded message to the harness.
+diff --git a/tests/runner/test_session_telemetry.py b/tests/runner/test_session_telemetry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..191553971e095d0547ee6a216b49aca379c0e007
+--- /dev/null
++++ b/tests/runner/test_session_telemetry.py
+@@ -0,0 +1,185 @@
++"""Session-level span attributes resolved by the runner."""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import shutil
++import subprocess
++from collections.abc import Awaitable, Callable
++from pathlib import Path
++
++import httpx
++import pytest
++
++from omnigent.runner import session_telemetry
++
++
++@pytest.fixture(autouse=True)
++def _capture_content(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
++
++
++def test_session_metadata_attributes_omit_missing_values_and_internal_labels() -> None:
++    session = {
++        "title": "Fix login",
++        "labels": {"team": "web", "priority": 2, "omnigent.ui": "web"},
++        "project_id": "proj_1",
++        "git_branch": "",
++        "agent_name": None,
++    }
++
++    attributes = session_telemetry.session_metadata_attributes(
++        session, project_name="Web", git_branch="feature/login"
++    )
++
++    assert attributes == {
++        "omnigent.session.title": "Fix login",
++        "omnigent.session.labels.team": "web",
++        "omnigent.session.labels.priority": "2",
++        "omnigent.project.id": "proj_1",
++        "omnigent.project.name": "Web",
++        "omnigent.git.branch": "feature/login",
++    }
++
++
++def test_session_title_needs_content_capture(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
++
++    attributes = session_telemetry.session_metadata_attributes(
++        {"title": "Fix login for alice@example.com", "labels": {"team": "web"}}
++    )
++
++    assert attributes == {"omnigent.session.labels.team": "web"}
++
++
++def test_local_session_attributes_omit_the_user(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("OMNIGENT_USER_ID", "alice@example.com")
++    monkeypatch.setattr(session_telemetry, "git_remote_url", lambda _: "https://git/acme/app")
++
++    attributes = session_telemetry.local_session_attributes("/repo")
++
++    assert attributes.pop("omnigent.host.name")
++    assert attributes == {
++        "omnigent.workspace": "/repo",
++        "omnigent.git.remote": "https://git/acme/app",
++    }
++
++
++@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
++def test_git_lookups_read_the_repo_and_tolerate_failures(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    # Ignore the developer's url.<base>.insteadOf rewrites.
++    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
++    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
++    repo = tmp_path / "repo"
++    (repo / "pkg").mkdir(parents=True)
++
++    def git(*args: str) -> None:
++        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
++
++    git("init", "-q", "-b", "main")
++    git("remote", "add", "origin", "git@github.com:acme/app.git")
++    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
++    workspace = str(repo / "pkg")
++
++    # The SSH user and any https credentials are dropped from the remote.
++    assert session_telemetry.git_remote_url(workspace) == "github.com:acme/app.git"
++    git("remote", "set-url", "origin", "https://alice:ghp_secret@github.com/acme/app.git")
++    assert session_telemetry.git_remote_url(workspace) == "https://github.com/acme/app.git"
++    assert session_telemetry.git_branch(workspace) == "main"
++    git("checkout", "-q", "--detach")
++    assert session_telemetry.git_branch(workspace) is None
++    missing = str(tmp_path / "missing")
++    assert session_telemetry.git_remote_url(missing) is None
++    assert session_telemetry.git_branch(missing) is None
++
++
++def _client(
++    handler: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]],
++) -> httpx.AsyncClient:
++    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://server")
++
++
++@pytest.mark.asyncio
++async def test_resolve_session_attributes_reads_server_metadata_each_call(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(session_telemetry, "git_branch", lambda _: "feature/login")
++    session: dict[str, object] = {"title": "Untitled", "agent_name": "coder"}
++    bodies = {"/v1/sessions/conv_1": session, "/v1/projects/proj_1": {"name": "Web"}}
++    local = {"omnigent.host.name": "dev"}
++    requested: list[str] = []
++    project_names: dict[str, str] = {}
++
++    def serve(request: httpx.Request) -> httpx.Response:
++        requested.append(request.url.path)
++        assert request.extensions["timeout"]["read"] == session_telemetry._SERVER_TIMEOUT_S
++        return httpx.Response(200, json=bodies[request.url.path])
++
++    async with _client(serve) as client:
++        first = await session_telemetry.resolve_session_attributes(
++            client, "conv_1", workspace="/repo", local=local, project_names=project_names
++        )
++        session.update(title="Fix login", labels={"team": "web"}, project_id="proj_1")
++        second = await session_telemetry.resolve_session_attributes(
++            client, "conv_1", workspace="/repo", local=local, project_names=project_names
++        )
++        third = await session_telemetry.resolve_session_attributes(
++            client, "conv_1", workspace="/repo", local=local, project_names=project_names
++        )
++
++    assert first == {
++        "omnigent.host.name": "dev",
++        "omnigent.session.title": "Untitled",
++        "omnigent.git.branch": "feature/login",
++        "omnigent.agent.name": "coder",
++    }
++    assert second == {
++        **first,
++        "omnigent.session.title": "Fix login",
++        "omnigent.session.labels.team": "web",
++        "omnigent.project.id": "proj_1",
++        "omnigent.project.name": "Web",
++    }
++    # The session is re-read every call; the project name is cached by id.
++    assert third == second
++    assert requested.count("/v1/sessions/conv_1") == 3
++    assert requested.count("/v1/projects/proj_1") == 1
++    assert project_names == {"proj_1": "Web"}
++
++
++@pytest.mark.asyncio
++async def test_resolve_session_attributes_gives_up_when_the_server_stalls(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A stalled read ends within the budget with the local attributes only."""
++    monkeypatch.setattr(session_telemetry, "_RESOLVE_TIMEOUT_S", 0.05)
++
++    async def stall(_request: httpx.Request) -> httpx.Response:
++        await asyncio.sleep(5)
++        return httpx.Response(200, json={"title": "late"})
++
++    async with _client(stall) as client:
++        attributes = await asyncio.wait_for(
++            session_telemetry.resolve_session_attributes(
++                client, "conv_1", workspace=None, local={"omnigent.host.name": "dev"}
++            ),
++            timeout=2,
++        )
++
++    assert attributes == {"omnigent.host.name": "dev"}
++
++
++@pytest.mark.asyncio
++async def test_resolve_session_attributes_survives_server_failure() -> None:
++    def fail(request: httpx.Request) -> httpx.Response:
++        raise httpx.ConnectError("server down", request=request)
++
++    async with _client(fail) as client:
++        attributes = await session_telemetry.resolve_session_attributes(
++            client, "conv_1", workspace=None, local={"omnigent.host.name": "dev"}
++        )
++
++    assert attributes == {"omnigent.host.name": "dev"}
+diff --git a/tests/runtime/harnesses/test_executor_adapter_skill.py b/tests/runtime/harnesses/test_executor_adapter_skill.py
+index e72b095eb053e57e93385ea6ee90d9dfc9fe7b0b..9da25e062fc00a16242845442cbe498f25fa19c3 100644
+--- a/tests/runtime/harnesses/test_executor_adapter_skill.py
++++ b/tests/runtime/harnesses/test_executor_adapter_skill.py
+@@ -131,6 +131,7 @@ def exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+     in_mem = InMemorySpanExporter()
+     provider = TracerProvider()
+     provider.add_span_processor(telemetry._make_active_skill_processor())
++    provider.add_span_processor(telemetry._make_session_attributes_processor())
+     provider.add_span_processor(SimpleSpanProcessor(in_mem))
+     otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+     otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+@@ -154,7 +155,11 @@ def _tool(name: str, args: dict[str, object], call_id: str) -> list[ExecutorEven
+     ]
+ 
+ 
+-async def _run(events: list[ExecutorEvent], **request_fields: object) -> None:
++async def _run(
++    events: list[ExecutorEvent],
++    telemetry_attributes: dict[str, str] | None = None,
++    **request_fields: object,
++) -> None:
+     """Run one adapter turn over *events*; *request_fields* extend the request."""
+     executor = MockExecutor()
+     executor.enqueue_events(events)
+@@ -165,7 +170,12 @@ async def _run(events: list[ExecutorEvent], **request_fields: object) -> None:
+         cancelled=asyncio.Event(),
+     )
+     try:
+-        request = CreateResponseRequest(model="test-agent", input="hi", **request_fields)
++        request = CreateResponseRequest(
++            model="test-agent",
++            input="hi",
++            telemetry_attributes=telemetry_attributes,
++            **request_fields,
++        )
+         await adapter.run_turn(request, ctx)
+     finally:
+         await adapter.on_shutdown()
+@@ -305,6 +315,22 @@ async def test_malformed_skill_call_exports_no_argument_content(
+     assert telemetry._active_skill_var.get() is None
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_attributes_stamp_every_turn_span(
++    exporter: InMemorySpanExporter, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The request's session attributes land on the agent span and its tool spans."""
++    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
++    attributes = {"omnigent.session.title": "Fix login", "omnigent.session.labels.team": "web"}
++
++    await _run([*_tool("Bash", {"command": "ls"}, "c1"), TurnComplete(response="")], attributes)
++
++    spans = {s.name: s for s in exporter.get_finished_spans()}
++    for name in ("agent:test-agent", "tool:Bash"):
++        assert {key: (spans[name].attributes or {}).get(key) for key in attributes} == attributes
++    assert telemetry._session_attributes_var.get() is None
++
++
+ _UNSET = None
+ 
+ 
+diff --git a/tests/runtime/test_telemetry.py b/tests/runtime/test_telemetry.py
+index bb13ab9a58017a8c1b6152eb2cb472ff7c00cad3..5f1a6634d1ba47d18f2ce103edc1972c4fabfa4c 100644
+--- a/tests/runtime/test_telemetry.py
++++ b/tests/runtime/test_telemetry.py
+@@ -1120,6 +1120,44 @@ def test_fastapi_server_span_carries_enduser_id_when_opted_in(
+     assert inner_span.attributes.get("enduser.id") == "alice@example.com"
+ 
+ 
++@pytest.mark.parametrize("enabled", [True, False])
++def test_session_attributes_scope_stamps_spans_only_when_enabled(
++    monkeypatch: pytest.MonkeyPatch, enabled: bool
++) -> None:
++    """Every span inside the scope carries each attribute; disabled telemetry binds nothing."""
++    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true" if enabled else "false")
++    exporter = InMemorySpanExporter()
++    provider = TracerProvider()
++    provider.add_span_processor(telemetry._make_session_attributes_processor())
++    provider.add_span_processor(SimpleSpanProcessor(exporter))
++    tracer = provider.get_tracer("test")
++    attributes = {"omnigent.session.title": "Fix login", "omnigent.project.name": "Web"}
++
++    with telemetry.session_attributes_scope(attributes):
++        with tracer.start_as_current_span("agent:demo"):
++            with tracer.start_as_current_span("tool:Bash"):
++                pass
++    with tracer.start_as_current_span("outside.scope"):
++        pass
++
++    spans = {s.name: dict(s.attributes or {}) for s in exporter.get_finished_spans()}
++    expected = attributes if enabled else {}
++    assert spans["agent:demo"] == expected
++    assert spans["tool:Bash"] == expected
++    assert spans["outside.scope"] == {}
++
++
++@pytest.mark.parametrize("attributes", [None, {}])
++def test_session_attributes_scope_binds_nothing_for_an_empty_mapping(
++    monkeypatch: pytest.MonkeyPatch, attributes: dict[str, str] | None
++) -> None:
++    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
++
++    with telemetry.session_attributes_scope(attributes):
++        assert telemetry._session_attributes_var.get() is None
++    assert telemetry._session_attributes_var.get() is None
++
++
+ def test_make_span_attribute_processor_is_generic() -> None:
+     """The factory stamps any attribute from any value getter, e.g. a context var."""
+     import contextvars

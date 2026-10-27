@@ -1,0 +1,379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mhavant <matthew.hoelting@avant.com>
+Date: Thu, 22 Oct 2026 01:10:46 -0500
+Subject: [PATCH] fix(claude-native): read a delegate holdover as idle on the
+ OSC status path
+
+Claude keeps reporting OSC 7501 "working" while a background agent
+outlives its turn, so with OSC status on (the default) the session stayed
+Working and follow-ups queued even with the status-file fix. The OSC
+poller also lacked note_turn_ended, note_turn_started and reports_busy,
+so the runner's calls from the status-file fix would raise on it.
+
+After a Stop that left a delegate running, an unchanged "working" report
+now reads idle until a turn starts again: the runner delivers one, Claude
+submits a prompt of its own, or the report changes. reports_busy still
+says working, so the idle pane reaper and idle shutdown keep the delegate
+alive.
+
+[Desidero: release the holdover only on a state change, so a message clear
+that arrives after Stop doesn't end it]
+
+Not upstream yet: extends upstream PR #10849 to the OSC status path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: mhavant <matthew.hoelting@avant.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (fix: the same idle fix on the OSC status path; no setting)
+---
+ .../harnesses/claude_native/program_status.py | 119 ++++++++++++++--
+ omnigent/runner/resource_registry.py          |   8 +-
+ .../test_claude_native_program_status.py      | 127 ++++++++++++++++++
+ 3 files changed, 243 insertions(+), 11 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/program_status.py b/omnigent/harnesses/claude_native/program_status.py
+index dfa44bd906e492e75cba968aedb885b223df89f2..142d34a9a966de3c2c0c135c5b0ca1933efe5ed0 100644
+--- a/omnigent/harnesses/claude_native/program_status.py
++++ b/omnigent/harnesses/claude_native/program_status.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import logging
+ import threading
+ from collections.abc import Callable
+ 
+@@ -12,24 +13,46 @@ from omnigent.terminals.program_status import (
+     blocked_reason,
+ )
+ 
++_logger = logging.getLogger(__name__)
++
+ 
+ class ClaudeProgramStatusPoller:
+-    """Adapt one terminal's OSC snapshot to existing session-status callbacks."""
++    """Adapt one terminal's OSC snapshot to existing session-status callbacks.
++
++    Claude keeps reporting ``working`` while a background agent or teammate
++    outlives its turn. After a ``Stop`` that left such a delegate running, the
++    ``working`` report seen when the ``Stop`` arrives reads as idle until a turn
++    starts again: the runner delivers one, Claude submits a prompt of its own,
++    or the report leaves ``working``. A message-only change does not end it,
++    since Claude may clear the turn's message after the ``Stop`` is noted.
++    """
+ 
+     def __init__(
+         self,
+         reader: ProgramStatusReader,
+         fallback: SessionStatusPoller,
+         on_status: Callable[[str, str | None], None],
++        prompt_submitted_at_getter: Callable[[], int | None] | None = None,
+     ) -> None:
+         self._reader = reader
+         self._fallback = fallback
+         self._on_status = on_status
++        self._prompt_submitted_at_getter = prompt_submitted_at_getter
+         self._last: ProgramStatus | None = None
++        self._published: str | None = None
+         self._using_osc = False
+         self._retired = False
+         self._resync_lock = threading.Lock()
+         self._resync_requested = False
++        self._turn_started_at_ms: int | None = None
++        self._turn_ended_at_ms: int | None = None
++        # Last report read, kept across resyncs; the baseline a new Stop holds.
++        self._observed: ProgramStatus | None = None
++        # The Stop a holdover belongs to, the report it holds, and whether it ended.
++        self._held_for_ms: int | None = None
++        self._held_report: ProgramStatus | None = None
++        self._released = False
++        self._holding = False
+ 
+     @property
+     def active(self) -> bool:
+@@ -44,6 +67,16 @@ class ClaudeProgramStatusPoller:
+         report = self._reader.status
+         return blocked_reason(report) if report is not None else self._fallback.blocked_on
+ 
++    @property
++    def reports_busy(self) -> bool:
++        """Whether Claude still reports work, even while a holdover publishes idle."""
++        if self._retired:
++            return False
++        report = self._reader.status
++        if report is not None:
++            return report.state == "working"
++        return self._fallback.reports_busy
++
+     def tick(self) -> None:
+         """Publish changed reports; never interpret silence as completion."""
+         if self._retired:
+@@ -54,20 +87,26 @@ class ClaudeProgramStatusPoller:
+         if requested:
+             self._last = None
+         report = self._reader.status
++        self._track_holdover(report)
++        self._observed = report
+         if report is not None:
+             self._using_osc = True
+-            if report != self._last:
+-                self._last = report
+-                # The StopFailure hook owns the failed edge and carries the API
+-                # error text; an error report here would fail the turn first, bare.
+-                if report.state != "error":
+-                    status = "running" if report.state in {"working", "blocked"} else "idle"
+-                    self._on_status(status, blocked_reason(report))
++            changed = report != self._last
++            if not changed and not self._holding:
++                return
++            self._last = report
++            status = self._osc_status(report)
++            if status is None:
++                return
++            if changed or status != self._published:
++                self._published = status
++                self._on_status(status, blocked_reason(report))
+         else:
+             if self._using_osc:
+                 self._fallback.resync()
+             self._using_osc = False
+             self._last = None
++            self._holding = False
+             self._fallback.tick()
+ 
+     def resync(self) -> None:
+@@ -76,7 +115,71 @@ class ClaudeProgramStatusPoller:
+             self._resync_requested = True
+         self._fallback.resync()
+ 
++    def note_turn_started(self, started_at_ms: int) -> None:
++        """Record that the runner delivered a turn, then re-assert the report.
++
++        :param started_at_ms: Delivery time in epoch milliseconds.
++        """
++        with self._resync_lock:
++            self._turn_started_at_ms = max(started_at_ms, self._turn_started_at_ms or 0)
++            self._resync_requested = True
++        self._fallback.note_turn_started(started_at_ms)
++
++    def note_turn_ended(self, ended_at_ms: int) -> None:
++        """Record a ``Stop`` that left a delegate running, then re-assert the report.
++
++        :param ended_at_ms: When the hook was recorded, in epoch milliseconds.
++        """
++        with self._resync_lock:
++            self._turn_ended_at_ms = max(ended_at_ms, self._turn_ended_at_ms or 0)
++            self._resync_requested = True
++        self._fallback.note_turn_ended(ended_at_ms)
++
+     def retire(self) -> None:
+         """Let terminal lifecycle handling own the outcome after process exit."""
+         self._retired = True
+         self._fallback.retire()
++
++    def _track_holdover(self, report: ProgramStatus | None) -> None:
++        """Start a holdover on a new Stop, and end it once the report leaves ``working``."""
++        with self._resync_lock:
++            ended_at_ms = self._turn_ended_at_ms
++        if ended_at_ms is not None and ended_at_ms != self._held_for_ms:
++            self._held_for_ms = ended_at_ms
++            self._held_report = self._observed if self._observed is not None else report
++            self._released = self._held_report is None or self._held_report.state != "working"
++        if report is None or self._held_report is None or report.state != self._held_report.state:
++            self._released = True
++
++    def _osc_status(self, report: ProgramStatus) -> str | None:
++        """Map a report to the runner vocabulary, reading a delegate holdover as idle.
++
++        An error report maps to nothing: the StopFailure hook owns the failed
++        edge and carries the API error text, so publishing here would fail the
++        turn first, bare.
++        """
++        self._holding = self._holds()
++        if self._holding or report.state not in {"working", "blocked", "error"}:
++            return "idle"
++        return None if report.state == "error" else "running"
++
++    def _holds(self) -> bool:
++        """Whether the held ``working`` report is the leftover of a turn that already ended."""
++        if self._held_for_ms is None or self._released:
++            return False
++        with self._resync_lock:
++            started_at_ms = self._turn_started_at_ms
++        if started_at_ms is not None and started_at_ms > self._held_for_ms:
++            return False
++        prompt_at_ms = self._prompt_submitted_at()
++        return prompt_at_ms is None or prompt_at_ms <= self._held_for_ms
++
++    def _prompt_submitted_at(self) -> int | None:
++        """Read Claude's last prompt time, treating a failed read as unknown."""
++        if self._prompt_submitted_at_getter is None:
++            return None
++        try:
++            return self._prompt_submitted_at_getter()
++        except Exception:
++            _logger.debug("claude prompt time read failed", exc_info=True)
++            return None
+diff --git a/omnigent/runner/resource_registry.py b/omnigent/runner/resource_registry.py
+index 2b3c74514f0d4762795328fe13d46395f548f26a..22c45f34c6685066180228b4118d02aff25977f7 100644
+--- a/omnigent/runner/resource_registry.py
++++ b/omnigent/runner/resource_registry.py
+@@ -688,10 +688,10 @@ class SessionResourceRegistry:
+             )
+ 
+     def claude_status_file_reports_busy(self, session_id: str) -> bool:
+-        """Whether Claude's status file says busy, including a background agent.
++        """Whether Claude still reports work, including a background agent.
+ 
+         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+-        :returns: ``True`` when the session's status-file poller last read ``busy``.
++        :returns: ``True`` when Claude's OSC report or status file says it is working.
+         """
+         with self._lock:
+             poller = self._status_pollers.get(session_id)
+@@ -1759,7 +1759,9 @@ class SessionResourceRegistry:
+         if reader is not None:
+             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
+ 
+-            return ClaudeProgramStatusPoller(reader, fallback, on_status)
++            return ClaudeProgramStatusPoller(
++                reader, fallback, on_status, prompt_submitted_at_getter=_prompt_submitted_at_ms
++            )
+         return fallback
+ 
+     async def _handle_terminal_exit(
+diff --git a/tests/harnesses/claude_native/test_claude_native_program_status.py b/tests/harnesses/claude_native/test_claude_native_program_status.py
+index 6c9412fe2dbcf46405d1c9b9021c4d384f5bd426..d996ebdaca392adfa42f5d35998d136ed7e20efb 100644
+--- a/tests/harnesses/claude_native/test_claude_native_program_status.py
++++ b/tests/harnesses/claude_native/test_claude_native_program_status.py
+@@ -98,3 +98,130 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
+     assert published == ["idle", "running", "running"]
+     poller.tick()
+     assert published == ["idle", "running", "running"]
++
++
++def _write_report(path: Path, state: str, message: str | None = None) -> None:
++    status = {"state": state, "app": "claude-code", "message": message}
++    path.write_text(json.dumps({"relay_pid": os.getpid(), "status": status}))
++
++
++def _delegate_poller(
++    tmp_path: Path, prompt_at_ms: list[int | None]
++) -> tuple[ClaudeProgramStatusPoller, Path, list[str]]:
++    """Build an OSC poller over a working report, with a settable prompt time."""
++    path = tmp_path / "program-status.json"
++    _write_report(path, "working")
++    published: list[str] = []
++
++    def on_status(status: str, _reason: str | None) -> None:
++        published.append(status)
++
++    poller = ClaudeProgramStatusPoller(
++        ProgramStatusReader(path),
++        SessionStatusPoller(
++            on_status=on_status,
++            pane_pid_getter=lambda: None,
++            session_id_getter=lambda: None,
++            config_dir=tmp_path,
++        ),
++        on_status,
++        prompt_submitted_at_getter=lambda: prompt_at_ms[0],
++    )
++    poller.tick()
++    poller.note_turn_ended(2000)
++    poller.tick()
++    return poller, path, published
++
++
++def test_working_report_after_delegate_stop_reads_idle_until_prompt(tmp_path: Path) -> None:
++    """A delegate keeps Claude's report working; the ended turn still reads idle."""
++    prompt_at_ms: list[int | None] = [1000]
++    poller, _path, published = _delegate_poller(tmp_path, prompt_at_ms)
++
++    assert published == ["running", "idle"]
++    assert poller.reports_busy is True
++    poller.tick()
++    assert published == ["running", "idle"]
++
++    # Claude starts the delegate's completion turn without changing the report.
++    prompt_at_ms[0] = 3000
++    poller.tick()
++    assert published == ["running", "idle", "running"]
++
++
++def test_runner_turn_ends_the_delegate_holdover(tmp_path: Path) -> None:
++    """A turn the runner delivers after the Stop reads running."""
++    poller, _path, published = _delegate_poller(tmp_path, [None])
++
++    poller.note_turn_started(3000)
++    poller.tick()
++    assert published == ["running", "idle", "running"]
++
++
++def test_message_change_keeps_the_delegate_holdover_until_a_prompt(tmp_path: Path) -> None:
++    """Only a new turn or a state change ends the holdover, not a new message."""
++    prompt_at_ms: list[int | None] = [1000]
++    poller, path, published = _delegate_poller(tmp_path, prompt_at_ms)
++
++    _write_report(path, "working", "Waiting on the delegate")
++    poller.tick()
++    assert published == ["running", "idle", "idle"]
++
++    prompt_at_ms[0] = 3000
++    _write_report(path, "working", "Reading the delegate's result")
++    poller.tick()
++    assert published == ["running", "idle", "idle", "running"]
++
++
++def test_other_report_ends_the_delegate_holdover(tmp_path: Path) -> None:
++    """A permission prompt in between means the held report no longer holds."""
++    poller, path, published = _delegate_poller(tmp_path, [None])
++
++    _write_report(path, "blocked")
++    poller.tick()
++    _write_report(path, "working")
++    poller.tick()
++    assert published == ["running", "idle", "running", "running"]
++
++
++def test_message_cleared_after_the_stop_is_noted_stays_held(tmp_path: Path) -> None:
++    """Claude may clear the turn's message after the Stop reaches the poller."""
++    path = tmp_path / "program-status.json"
++    _write_report(path, "working")
++    published: list[str] = []
++
++    def on_status(status: str, _reason: str | None) -> None:
++        published.append(status)
++
++    poller = ClaudeProgramStatusPoller(
++        ProgramStatusReader(path),
++        SessionStatusPoller(
++            on_status=on_status,
++            pane_pid_getter=lambda: None,
++            session_id_getter=lambda: None,
++            config_dir=tmp_path,
++        ),
++        on_status,
++        prompt_submitted_at_getter=lambda: 1000,
++    )
++    poller.note_turn_started(1000)
++    poller.tick()
++    _write_report(path, "working", "Running a long command")
++    poller.tick()
++    poller.note_turn_ended(2000)
++    _write_report(path, "working")
++    poller.tick()
++    poller.tick()
++    assert published == ["running", "running", "idle"]
++    assert poller.reports_busy is True
++
++
++def test_osc_returning_after_a_gap_does_not_resume_the_holdover(tmp_path: Path) -> None:
++    """While OSC was gone the file fallback owned status; its return reads running."""
++    poller, path, published = _delegate_poller(tmp_path, [None])
++
++    path.unlink()
++    poller.tick()
++    _write_report(path, "working")
++    poller.tick()
++    assert published == ["running", "idle", "running"]

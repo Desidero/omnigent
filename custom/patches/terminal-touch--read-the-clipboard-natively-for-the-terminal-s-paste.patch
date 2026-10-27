@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 16 Oct 2026 00:29:48 +0000
+Subject: [PATCH] feat(ios): read the clipboard natively for the terminal's
+ Paste
+
+In the iOS app, the terminal's Paste used navigator.clipboard.readText, so
+WebKit showed its own Paste bubble on every paste. The shell now exposes
+readClipboardText() on its bridge and reads UIPasteboard itself, so the
+app's Settings > Omnigent > Paste from Other Apps permission applies and
+"Allow" removes the extra tap. Shells without the method keep the web path.
+
+Local patch on top of the touch-selection patch it serves, so it is tested
+on a sideloaded build first; to be proposed upstream together with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/terminals.md                      |  3 +++
+ web/ios/Omnigent/OmnigentWebView.swift        | 21 ++++++++++++++++
+ web/ios/Omnigent/WebViewModel.swift           |  6 +++++
+ .../components/blocks/TerminalView.test.tsx   | 24 +++++++++++++++++++
+ web/src/components/blocks/TerminalView.tsx    |  7 ++++++
+ web/src/lib/nativeBridge.ts                   | 24 +++++++++++++++++++
+ 6 files changed, 85 insertions(+)
+
+diff --git a/feature-map/terminals.md b/feature-map/terminals.md
+index da8a874d5a771ad94b47e72ea84a925298e19ab2..5d52c4c2e0091f2d61b41883f4630df178954afb 100644
+--- a/feature-map/terminals.md
++++ b/feature-map/terminals.md
+@@ -192,6 +192,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
+ - A long-press in the terminal selects instead of opening the iOS text
+   callout, and never reaches the program as a click. A quick swipe still
+   scrolls; the long-press only starts after the finger rests.
++- In the iOS app, the menu's Paste reads the clipboard natively, so iOS follows
++  its Settings → Omnigent → Paste from Other Apps choice: Allow pastes without a
++  prompt. In a browser, Safari shows its own Paste bubble on every paste.
+ - Terminal output is drawn on a canvas, so page text searches do not see it.
+   Use the tests' approach (the harness's own transcript or program input)
+   instead of reading the page.
+diff --git a/web/ios/Omnigent/OmnigentWebView.swift b/web/ios/Omnigent/OmnigentWebView.swift
+index 08ecda92efd90702f1a6e7e42cdcf3e104b3fef6..1d60490395aa5f6c86ae04fc2ec4818ae0b473eb 100644
+--- a/web/ios/Omnigent/OmnigentWebView.swift
++++ b/web/ios/Omnigent/OmnigentWebView.swift
+@@ -239,6 +239,14 @@ struct OmnigentWebView: UIViewRepresentable {
+         }
+         signOutWaiters.clear();
+       });
++      const clipboardWaiters = new Set();
++      defineEmit("__omnigentNativeEmitClipboardText", (text) => {
++        const value = typeof text === "string" ? text : null;
++        for (const resolve of clipboardWaiters) {
++          try { resolve(value); } catch {}
++        }
++        clipboardWaiters.clear();
++      });
+       const insetCallbacks = new Set();
+       const keyboardViewportCallbacks = new Set();
+       let keyboardViewport = null;
+@@ -399,6 +407,14 @@ struct OmnigentWebView: UIViewRepresentable {
+             method: "openServerSetup",
+           });
+         },
++        readClipboardText() {
++          // Native answers with the pasteboard text, or null when it has none.
++          const pending = new Promise((resolve) => { clipboardWaiters.add(resolve); });
++          window.webkit.messageHandlers.omnigentNative.postMessage({
++            method: "readClipboardText",
++          });
++          return pending;
++        },
+       });
+       window.webkit.messageHandlers.omnigentNative.postMessage({
+         method: "requestKeyboardViewport",
+@@ -1321,6 +1337,11 @@ struct OmnigentWebView: UIViewRepresentable {
+         parent.requestSwitchServer(urlString)
+       case "openServerSetup":
+         parent.openServerSetup()
++      case "readClipboardText":
++        // hasStrings never prompts. Reading the text asks each time unless the
++        // user set Settings > Omnigent > Paste from Other Apps to Allow.
++        let pasteboard = UIPasteboard.general
++        parent.model.emitClipboardText(pasteboard.hasStrings ? pasteboard.string : nil)
+       case "setViewMode":
+         markWorkspaceReady()
+         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
+diff --git a/web/ios/Omnigent/WebViewModel.swift b/web/ios/Omnigent/WebViewModel.swift
+index 1506b30f175105365032dd6566da945fc7a4b0bc..29e822f6c35764b530e80c9fa7674451c453150f 100644
+--- a/web/ios/Omnigent/WebViewModel.swift
++++ b/web/ios/Omnigent/WebViewModel.swift
+@@ -134,6 +134,12 @@ final class WebViewModel: ObservableObject {
+     return String(data: data, encoding: .utf8)
+   }
+ 
++  /// Settle the page's pending `readClipboardText()` calls.
++  func emitClipboardText(_ text: String?) {
++    let argument = text.map(Self.javascriptString) ?? "null"
++    webView?.evaluateJavaScript("window.__omnigentNativeEmitClipboardText?.(\(argument));")
++  }
++
+   /// Settle the page's pending `signOutOfServer()` calls.
+   func emitSignOutResult(_ handled: Bool) {
+     webView?.evaluateJavaScript("window.__omnigentNativeEmitSignOutResult?.(\(handled));")
+diff --git a/web/src/components/blocks/TerminalView.test.tsx b/web/src/components/blocks/TerminalView.test.tsx
+index be64af841aaf2246432213e95082be8904cbd677..68b56ced8df7347bcac7ed26113e0a9646e7dccb 100644
+--- a/web/src/components/blocks/TerminalView.test.tsx
++++ b/web/src/components/blocks/TerminalView.test.tsx
+@@ -509,6 +509,30 @@ describe("touch selection menu", () => {
+     }
+   });
+ 
++  it("pastes through the iOS shell's clipboard reader when it has one", async () => {
++    // WHY: the shell reads UIPasteboard itself, so the app's Paste permission
++    // applies instead of WebKit's confirm bubble on every paste.
++    const readText = vi.fn(async () => "web text");
++    vi.stubGlobal("navigator", { ...navigator, clipboard: { readText } });
++    const readClipboardText = vi.fn(async () => "native text");
++    (window as unknown as Record<string, unknown>).omnigentNative = {
++      kind: "ios",
++      readClipboardText,
++    };
++    try {
++      const terminal = await renderSelectingView();
++      showSelection(terminal, { ...selected, start: null, end: null, hasSelection: false });
++
++      tapMenu("Paste");
++
++      await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("native text"));
++      expect(readClipboardText).toHaveBeenCalledTimes(1);
++      expect(readText).not.toHaveBeenCalled();
++    } finally {
++      vi.unstubAllGlobals();
++    }
++  });
++
+   it("selects the screen, and offers no Paste on a read-only terminal", async () => {
+     const terminal = await renderSelectingView(true);
+     showSelection(terminal);
+diff --git a/web/src/components/blocks/TerminalView.tsx b/web/src/components/blocks/TerminalView.tsx
+index ac8e9fd3acc11a93e90ba39ba3a296ba10c2217d..09a28fef64924b4e105e7d789d15e0004d8a12d0 100644
+--- a/web/src/components/blocks/TerminalView.tsx
++++ b/web/src/components/blocks/TerminalView.tsx
+@@ -30,6 +30,7 @@ import {
+   type TerminalClipboardPreference,
+ } from "@/lib/terminalClipboardPreferences";
+ import { subscribeCodeFont } from "@/lib/codeFontPreferences";
++import { canReadNativeClipboard, readNativeClipboardText } from "@/lib/nativeBridge";
+ import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
+ import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
+ import {
+@@ -557,6 +558,12 @@ export function TerminalView({
+     const session = sessionRef.current;
+     if (!session || readOnly) return;
+     session.touchSelection.clear();
++    if (canReadNativeClipboard()) {
++      void readNativeClipboardText().then((text) => {
++        if (text && sessionRef.current === session) session.paste(text);
++      });
++      return;
++    }
+     if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
+       toast.error("Pasting isn't available in this browser.");
+       return;
+diff --git a/web/src/lib/nativeBridge.ts b/web/src/lib/nativeBridge.ts
+index 93554e1465868eb6fad0eeb8c14f395de9edb45d..462fd9810a1fcad569c1737aada1a5846f73f1e8 100644
+--- a/web/src/lib/nativeBridge.ts
++++ b/web/src/lib/nativeBridge.ts
+@@ -123,6 +123,12 @@ interface NativeShellApi {
+   signOutOfServer?: () => Promise<boolean>;
+   /** Return to the shell's "connect to server" setup page. */
+   openServerSetup?: () => void;
++  /**
++   * Read the system clipboard as text, or null when it holds none. The iOS
++   * shell reads it natively, so the app's paste permission applies instead of
++   * WebKit's per-paste callout. Absent on older shells.
++   */
++  readClipboardText?: () => Promise<string | null>;
+   /**
+    * Drive the native Chat/Terminal bar's visibility (iOS). The web app owns
+    * the truth and only ever pushes it hidden now that the switcher lives in
+@@ -996,6 +1002,24 @@ export async function switchServer(url: string): Promise<void> {
+   }
+ }
+ 
++/** Whether the native shell can read the clipboard itself. */
++export function canReadNativeClipboard(): boolean {
++  return typeof nativeApi()?.readClipboardText === "function";
++}
++
++/** Clipboard text read by the native shell; null off-shell, when empty, or on failure. */
++export async function readNativeClipboardText(): Promise<string | null> {
++  const native = nativeApi();
++  if (!native?.readClipboardText) return null;
++  try {
++    const text = await native.readClipboardText();
++    return typeof text === "string" ? text : null;
++  } catch (err) {
++    console.warn("[nativeBridge] native readClipboardText failed:", err);
++    return null;
++  }
++}
++
+ /**
+  * Ask the native shell to sign this window's server out. Every window on that
+  * server returns to the setup page, and the next Connect signs in through the

@@ -1,0 +1,536 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 15 Oct 2026 05:24:44 +0000
+Subject: [PATCH] feat(web): switch a running session's account from the
+ harness menu
+
+Carried on custom while the design is discussed on upstream issue #503;
+see docs/providers.md. Drop it once upstream has an equivalent.
+
+The server can now move a running Claude session to another provider, but
+the composer had no way to ask for it, and it did not show which account a
+session runs on.
+
+The in-session harness menu gains the same Account section as the
+new-session dialog, for host-bound claude-native and claude-sdk sessions
+whose host lists more than one provider. The current account is checked.
+Accounts that are not signed in, or that keep a separate login and
+conversation store (a different switch group), are listed but disabled with
+the reason. Picking one calls POST /v1/sessions/{id}/provider and says
+whether Claude is restarting now or switches after the current turn; errors
+show the server's message.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (documented with its series in docs/providers.md)
+---
+ web/src/lib/sessionsApi.ts                 |  27 ++++
+ web/src/lib/types.ts                       |   5 +
+ web/src/pages/ChatPage.composer.test.tsx   | 138 +++++++++++++++++++++
+ web/src/pages/ChatPage.mention.test.tsx    |   1 +
+ web/src/pages/ChatPage.statusLine.test.tsx |   1 +
+ web/src/pages/ChatPage.tsx                 |  93 ++++++++++----
+ web/src/store/chatStore.test.ts            |  47 +++++++
+ web/src/store/chatStore.ts                 |  18 +++
+ 8 files changed, 307 insertions(+), 23 deletions(-)
+
+diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
+index f413fe08e9fd4a97b7ec787192cd921df817bd1a..bad2fdb0f521dc9ebd13b1522ccb1e2b2b764efb 100644
+--- a/web/src/lib/sessionsApi.ts
++++ b/web/src/lib/sessionsApi.ts
+@@ -173,6 +173,8 @@ interface SessionResponseWire {
+   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
+   harness?: string | null;
+   model_override?: string | null;
++  /** Host provider the session runs on; `null` = the host default. */
++  provider_override?: string | null;
+   inference_configured?: boolean;
+   inference_error?: string | null;
+   /** Per-session cost-control switch; `null`/absent = spec default. */
+@@ -345,6 +347,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
+     llmModel: wire.llm_model,
+     harness: wire.harness ?? null,
+     modelOverride: wire.model_override,
++    providerOverride: wire.provider_override,
+     costControlModeOverride: wire.cost_control_mode_override,
+     subagentRoutingOverride: wire.subagent_routing_override,
+     shareWorkspaceFiles: wire.share_workspace_files ?? false,
+@@ -1101,6 +1104,30 @@ export async function updateSession(
+   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+ }
+ 
++/** When a provider switch takes effect: now (runner restarts) or after the current turn. */
++export type ProviderSwitchApplied = "now" | "after_turn";
++
++/**
++ * Move a session to another of its host's providers (accounts). `null` goes
++ * back to the host default. Only providers sharing the current one's switch
++ * group are accepted; others need a new session.
++ */
++export async function switchSessionProvider(
++  sessionId: string,
++  provider: string | null,
++): Promise<{ providerOverride: string | null; applied: ProviderSwitchApplied }> {
++  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/provider`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ provider }),
++  });
++  const wire = await readJsonOrThrow<{
++    provider_override: string | null;
++    applied: ProviderSwitchApplied;
++  }>(res);
++  return { providerOverride: wire.provider_override ?? null, applied: wire.applied };
++}
++
+ interface RunnerSummaryWire {
+   runner_id: string;
+   online: boolean;
+diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
+index 23e15f09c6f072d63a852dc7a1c8c9875804d411..bb0add0ac895ad663279529239eba5d11966549c 100644
+--- a/web/src/lib/types.ts
++++ b/web/src/lib/types.ts
+@@ -378,6 +378,11 @@ export interface Session {
+    * so the surfaces stay in sync.
+    */
+   modelOverride?: string | null;
++  /**
++   * Host provider (account) the session runs on, e.g. ``"claude-max2"``;
++   * `null` runs on the host's default provider.
++   */
++  providerOverride?: string | null;
+   /**
+    * Per-session cost-control switch: `"on"` activates the spec's
+    * configured cost-control mode, `"off"` disables cost control for
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 1881b3f8862c26b68a3efca4cd2326b24b5ca04e..23b97c454ad6629b3419f661fcacab6c18bac1ce 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -10,6 +10,7 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
+ import type * as GoalApiModule from "@/lib/goalApi";
+ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
++import type { HostProvider } from "@/hooks/useHostProviders";
+ import type * as FileViewerContextModule from "@/shell/FileViewerContext";
+ 
+ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+@@ -143,6 +144,7 @@ const { composerSessionSnapshot } = vi.hoisted(() => ({
+     workspace: null as string | null,
+     labels: {} as Record<string, string>,
+     gitBranch: null as string | null,
++    providerOverride: null as string | null,
+   },
+ }));
+ vi.mock("@/hooks/useSession", async (importOriginal) => ({
+@@ -153,6 +155,12 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
+     error: null,
+   }),
+ }));
++const { hostProvidersMock } = vi.hoisted(() => ({
++  hostProvidersMock: vi.fn((_hostId: string | null, _harness: string | null) => ({
++    data: [] as HostProvider[],
++  })),
++}));
++vi.mock("@/hooks/useHostProviders", () => ({ useHostProviders: hostProvidersMock }));
+ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+   ...(await importOriginal<typeof UseHostsModule>()),
+   useHosts: () => ({ data: [] }),
+@@ -7306,3 +7314,133 @@ describe("saved sandbox inference policy", () => {
+     },
+   );
+ });
++
++describe("Composer account switch", () => {
++  const MAX1: HostProvider = {
++    name: "claude-max1",
++    kind: "subscription",
++    label: "claude CLI login (~/.claude-max1)",
++    default: true,
++    ready: true,
++    switch_group: "claude",
++  };
++  const MAX2: HostProvider = {
++    ...MAX1,
++    name: "claude-max2",
++    label: "~/.claude-max2",
++    default: false,
++  };
++  const MAX3: HostProvider = {
++    ...MAX2,
++    name: "claude-max3",
++    label: "~/.claude-max3",
++    ready: false,
++  };
++  // An older host omits switch_group, so nothing can swap onto it in place.
++  const DBX: HostProvider = {
++    name: "databricks",
++    kind: "databricks",
++    label: "Databricks profile alt",
++    default: false,
++    ready: true,
++  };
++
++  // A fresh conversation per test, so no earlier test's entry state carries over.
++  let sessionId = "";
++  let sessionCount = 0;
++  beforeEach(() => {
++    sessionId = `conv_acct_${++sessionCount}`;
++    useChatStore.setState({ conversationId: sessionId, sessionHarness: "claude-native" });
++    composerSessionSnapshot.hostId = "host_1";
++    hostProvidersMock.mockReturnValue({ data: [MAX1, MAX2, MAX3, DBX] });
++  });
++  afterEach(() => {
++    cleanup();
++    composerSessionSnapshot.hostId = null;
++    composerSessionSnapshot.providerOverride = null;
++    hostProvidersMock.mockReturnValue({ data: [] });
++    useChatStore.setState({ conversationId: null, sessionHarness: null });
++    vi.restoreAllMocks();
++  });
++
++  async function openAccounts() {
++    openSessionConfig();
++    fireEvent.click(screen.getByTestId("composer-agent-edit"));
++    return screen.findByTestId("composer-agent-accounts");
++  }
++
++  it("lists the host's accounts and blocks ones that need a separate login", async () => {
++    composerSessionSnapshot.providerOverride = "claude-max2";
++    render(<Composer {...composerProps()} />);
++    await openAccounts();
++
++    expect(hostProvidersMock).toHaveBeenLastCalledWith("host_1", "claude-native");
++    expect(screen.getByTestId("composer-agent-account-claude-max2")).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++    expect(screen.getByTestId("composer-agent-account-claude-max1")).not.toHaveAttribute(
++      "data-disabled",
++    );
++    const notSignedIn = screen.getByTestId("composer-agent-account-claude-max3");
++    expect(notSignedIn).toHaveAttribute("data-disabled");
++    expect(notSignedIn).toHaveTextContent("not signed in");
++    const separate = screen.getByTestId("composer-agent-account-databricks");
++    expect(separate).toHaveAttribute("data-disabled");
++    expect(separate).toHaveTextContent("Separate login — start a new session");
++  });
++
++  it("is hidden with a single account or outside Claude harnesses", async () => {
++    hostProvidersMock.mockReturnValue({ data: [MAX1] });
++    const view = render(<Composer {...composerProps()} />);
++    openSessionConfig();
++    fireEvent.click(screen.getByTestId("composer-agent-edit"));
++    await screen.findByTestId("composer-agent-efforts");
++    expect(screen.queryByTestId("composer-agent-accounts")).toBeNull();
++    view.unmount();
++
++    hostProvidersMock.mockClear();
++    useChatStore.setState({ sessionHarness: "codex-native" });
++    render(<Composer {...composerProps()} />);
++    expect(hostProvidersMock).toHaveBeenLastCalledWith(null, null);
++  });
++
++  it.each([
++    ["now", "Switched to claude-max2 — Claude is restarting"],
++    ["after_turn", "Switches to claude-max2 after this turn"],
++  ] as const)("POSTs the switch and reports when it applies (%s)", async (applied, notice) => {
++    const fetchSpy = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
++      new Response(JSON.stringify({ provider_override: "claude-max2", applied }), {
++        status: 200,
++        headers: { "Content-Type": "application/json" },
++      }),
++    );
++    const success = vi.spyOn(toast, "success");
++    render(<Composer {...composerProps()} />);
++    await openAccounts();
++
++    fireEvent.click(screen.getByTestId("composer-agent-account-claude-max2"));
++
++    await waitFor(() => expect(success).toHaveBeenCalledWith(notice));
++    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
++    expect(url).toBe(`/v1/sessions/${sessionId}/provider`);
++    expect(init.method).toBe("POST");
++    expect(JSON.parse(init.body as string)).toEqual({ provider: "claude-max2" });
++  });
++
++  it("shows the server's error when the switch is refused", async () => {
++    vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
++      new Response(
++        JSON.stringify({ error: { code: "conflict", message: "claude-max2 is not signed in" } }),
++        { status: 409, headers: { "Content-Type": "application/json" } },
++      ),
++    );
++    const error = vi.spyOn(toast, "error");
++    render(<Composer {...composerProps()} />);
++    await openAccounts();
++
++    fireEvent.click(screen.getByTestId("composer-agent-account-claude-max2"));
++
++    await waitFor(() => expect(error).toHaveBeenCalledWith("claude-max2 is not signed in"));
++  });
++});
+diff --git a/web/src/pages/ChatPage.mention.test.tsx b/web/src/pages/ChatPage.mention.test.tsx
+index 06f602c2b8421166a06eda0831597daf2ebf2f0e..3d0ed9f740ecc6dcea5a5b596f8ce409ef885d21 100644
+--- a/web/src/pages/ChatPage.mention.test.tsx
++++ b/web/src/pages/ChatPage.mention.test.tsx
+@@ -86,6 +86,7 @@ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+   ...(await importOriginal<typeof UseHostsModule>()),
+   useHosts: () => ({ data: [] }),
+ }));
++vi.mock("@/hooks/useHostProviders", () => ({ useHostProviders: () => ({ data: [] }) }));
+ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
+   useSessionHostOnline: () => undefined,
+diff --git a/web/src/pages/ChatPage.statusLine.test.tsx b/web/src/pages/ChatPage.statusLine.test.tsx
+index e8d44c6fcc703f06b9fb8ae40a95ed87a32abdc3..ff60f56d187665c19779d0c980b0a73398887a0c 100644
+--- a/web/src/pages/ChatPage.statusLine.test.tsx
++++ b/web/src/pages/ChatPage.statusLine.test.tsx
+@@ -99,6 +99,7 @@ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+   ...(await importOriginal<typeof UseHostsModule>()),
+   useHosts: (opts: unknown) => useHostsMock(opts),
+ }));
++vi.mock("@/hooks/useHostProviders", () => ({ useHostProviders: () => ({ data: [] }) }));
+ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
+   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 577c13c686c334b23570e5244bd965e5d08b71a5..7b95d5e7782b1c3481253fda6136f28cd50cef98 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -185,6 +185,12 @@ import {
+   computeIsWorking,
+ } from "@/components/chat/chatBubbleParts";
+ import { useSession } from "@/hooks/useSession";
++import { type HostProvider, useHostProviders } from "@/hooks/useHostProviders";
++import {
++  buildAccountSection,
++  currentProvider,
++  inPlaceSwitchBlocked,
++} from "@/components/composer/accountSection";
+ import { useOpenGithubTab } from "@/shell/FileViewerContext";
+ import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+ import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
+@@ -4810,6 +4816,9 @@ export function shouldShowPollyCodexGoalControl(
+   );
+ }
+ 
++const CLAUDE_ACCOUNT_HARNESSES = new Set(["claude-native", "claude-sdk"]);
++const EMPTY_HOST_PROVIDERS: HostProvider[] = [];
++
+ /**
+  * Whether the session surfaces any run-config the gear modal can edit. Shared
+  * render guard for the config gear and click-to-open gate for the model/effort
+@@ -4914,10 +4923,62 @@ function SessionHarnessPicker({
+     modelLabel: modelSummary,
+     costRoutingEligible,
+   });
+-  const configurable = hasSessionConfig({
+-    showModels,
+-    showEffort,
+-  });
++  const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
++    if (disabled || busyRef.current || pendingModelChange !== null) return;
++    busyRef.current = true;
++    setBusy(true);
++    setStartingSession(wakesSession);
++    try {
++      await change();
++    } catch {
++      // The store rolls back a refused change, so the pill shows what applied.
++    } finally {
++      busyRef.current = false;
++      setBusy(false);
++      setStartingSession(false);
++    }
++  };
++  const { session } = useSession(conversationId);
++  // Accounts live on the host; only Claude harnesses can swap them in place.
++  const accountHarness =
++    session?.hostId && sessionHarness && CLAUDE_ACCOUNT_HARNESSES.has(sessionHarness)
++      ? sessionHarness
++      : null;
++  const { data: hostProviders = EMPTY_HOST_PROVIDERS } = useHostProviders(
++    accountHarness ? (session?.hostId ?? null) : null,
++    accountHarness,
++  );
++  const providerOverride = session?.providerOverride ?? null;
++  const runningProvider = currentProvider(hostProviders, providerOverride);
++  const selectAccount = (name: string | null) =>
++    void apply(async () => {
++      const target = name ?? hostProviders.find((p) => p.default)?.name ?? "the default account";
++      try {
++        const applied = await useChatStore.getState().setProvider(name);
++        toast.success(
++          applied === "now"
++            ? `Switched to ${target} — Claude is restarting`
++            : `Switches to ${target} after this turn`,
++        );
++      } catch (err) {
++        toast.error(err instanceof Error ? err.message : `Couldn't switch to ${target}.`);
++      }
++    });
++  const accountSection = accountHarness
++    ? buildAccountSection({
++        providers: hostProviders,
++        value: providerOverride,
++        testIdPrefix: "composer-agent",
++        onSelect: selectAccount,
++        disabled: busy || pendingModelChange !== null,
++        blockedReason: (provider) => inPlaceSwitchBlocked(provider, runningProvider),
++      })
++    : undefined;
++  const configurable =
++    hasSessionConfig({
++      showModels,
++      showEffort,
++    }) || accountSection !== undefined;
+   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
+   const label = routingOn
+     ? SMART_ROUTING_LABEL
+@@ -4942,21 +5003,6 @@ function SessionHarnessPicker({
+     setMenuOpen(false);
+     setConfigOpen(false);
+   }, [conversationId]);
+-  const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
+-    if (disabled || busyRef.current || pendingModelChange !== null) return;
+-    busyRef.current = true;
+-    setBusy(true);
+-    setStartingSession(wakesSession);
+-    try {
+-      await change();
+-    } catch {
+-      // The store rolls back a refused change, so the pill shows what applied.
+-    } finally {
+-      busyRef.current = false;
+-      setBusy(false);
+-      setStartingSession(false);
+-    }
+-  };
+   const selectModel = (modelId: string | null) =>
+     void apply(async () => {
+       const store = useChatStore.getState();
+@@ -5098,8 +5144,8 @@ function SessionHarnessPicker({
+               }
+             : undefined
+         }
+-        extra={
+-          composerFusion !== undefined && fusionSelected && !routingOn
++        extra={[
++          ...(composerFusion !== undefined && fusionSelected && !routingOn
+             ? buildFusionSections({
+                 descriptor: composerFusion,
+                 modelUid: pickerSelectedModel ?? composerFusion.default,
+@@ -5107,8 +5153,9 @@ function SessionHarnessPicker({
+                 onChange: selectFusionModel,
+                 disabled: busy || pendingModelChange !== null,
+               })
+-            : undefined
+-        }
++            : []),
++          ...(accountSection ? [accountSection] : []),
++        ]}
+       />
+     </>
+   );
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 7f419b5b28128ee75f1e5a883a3a5afd2d1142ed..6e5b0792dd5a514d6dbfb8c454c129c86aeeaa70 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -16856,6 +16856,53 @@ describe("chatStore — setSubagentRouting", () => {
+   });
+ });
+ 
++describe("chatStore — setProvider", () => {
++  function routeProviderPost(response: Response | Promise<Response>): void {
++    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === "string" ? input : input.toString();
++      if (url === "/v1/sessions/conv_acct/provider" && init?.method === "POST") return response;
++      return defaultFetchHandler(input, init);
++    });
++  }
++
++  function providerOverride(): string | null | undefined {
++    return client.getQueryData<{ providerOverride?: string | null }>(["session", "conv_acct"])
++      ?.providerOverride;
++  }
++
++  it("POSTs the account and records it on the session snapshot", async () => {
++    seedSession("conv_acct", []);
++    await useChatStore.getState().switchTo("conv_acct");
++    routeProviderPost(mockResponse({ provider_override: "claude-max2", applied: "after_turn" }));
++
++    await expect(useChatStore.getState().setProvider("claude-max2")).resolves.toBe("after_turn");
++
++    const post = fetchMock.mock.calls.find(
++      ([u, init]) => String(u).endsWith("/provider") && (init as RequestInit)?.method === "POST",
++    ) as [string, RequestInit];
++    expect(JSON.parse(post[1].body as string)).toEqual({
++      provider: "claude-max2",
++    });
++    expect(providerOverride()).toBe("claude-max2");
++  });
++
++  it("rejects with the server's message and keeps the snapshot", async () => {
++    seedSession("conv_acct", []);
++    await useChatStore.getState().switchTo("conv_acct");
++    routeProviderPost(
++      mockResponse(
++        { error: { code: "invalid_request", message: "claude-max2 needs a new session" } },
++        { ok: false, status: 409 },
++      ),
++    );
++
++    await expect(useChatStore.getState().setProvider("claude-max2")).rejects.toThrow(
++      "claude-max2 needs a new session",
++    );
++    expect(providerOverride() ?? null).toBeNull();
++  });
++});
++
+ // Nothing pushes a routing-switch change to the client, so a control that only
+ // ever read the bind-time snapshot would keep showing a stale value (the
+ // "Default shown while 'on' is stored" mismatch). These pin the re-read.
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 19d73d393da62a281cd0f532b22f6a3cb9bf97c7..bc98c2c403242c191b862c68020b53416103c39a 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -74,7 +74,9 @@ import {
+   interrupt as interruptSession,
+   openSessionStream,
+   postEvent,
++  type ProviderSwitchApplied,
+   type SessionItemsPage,
++  switchSessionProvider,
+   updateSession,
+ } from "@/lib/sessionsApi";
+ import { isStaleCursorError } from "@/lib/staleCursor";
+@@ -1308,6 +1310,12 @@ export interface ChatActions {
+    * whose chip renders the reported model (claude-/codex-native).
+    */
+   setModel: (model: string | null, opts?: { expectConfirmation?: boolean }) => Promise<void>;
++  /**
++   * Move the active session onto another of its host's providers (``null`` =
++   * the host default) and record it on the ``["session", id]`` snapshot.
++   * Resolves with when the switch applies; rejects with the server's error.
++   */
++  setProvider: (provider: string | null) => Promise<ProviderSwitchApplied>;
+   /**
+    * Set the active session's cost-control switch — optimistic local
+    * flip, then PATCH; the server's canonical value (or a rollback on
+@@ -3505,6 +3513,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+     }
+   },
+ 
++  setProvider: async (provider) => {
++    const { conversationId } = get();
++    if (!conversationId) throw new Error("No active session to switch.");
++    const result = await switchSessionProvider(conversationId, provider);
++    queryClient?.setQueryData<Session>(["session", conversationId], (session) =>
++      session ? { ...session, providerOverride: result.providerOverride } : session,
++    );
++    return result.applied;
++  },
++
+   setCostControlMode: async (mode) => {
+     const { conversationId } = get();
+     if (!conversationId) return;

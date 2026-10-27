@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Mon, 19 Oct 2026 13:29:41 +0000
+Subject: [PATCH] feat(telemetry): attribute spans to the acting user and
+ runner
+
+On a multi-user server, exported spans only carried session.id, so
+answering "whose traffic is this?" or "which runner is slow?" needed a
+join against the Omnigent database. The user and runner were already
+bound in the debug-logging context for every request; stamp them on
+spans too.
+
+- omnigent.runner.id: the runner bound to the request, falling back to
+  OMNIGENT_RUNNER_ID in runner and harness processes.
+- enduser.id (OTel semconv): the authenticated user on the server, and
+  the process owner on host/runner/harness. Opt-in via
+  OMNIGENT_OTEL_CAPTURE_USER because the id is usually an email. The
+  server middleware also stamps the root HTTP span, which starts before
+  auth resolves the user.
+
+Refs #10794
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ designs/OBSERVABILITY.md        |   2 +
+ omnigent/debug_logging.py       |   5 ++
+ omnigent/runtime/telemetry.py   |  93 ++++++++++++++++++++++++-
+ omnigent/server/app.py          |   2 +
+ tests/runtime/test_telemetry.py | 119 +++++++++++++++++++++++++++++++-
+ 5 files changed, 219 insertions(+), 2 deletions(-)
+
+diff --git a/designs/OBSERVABILITY.md b/designs/OBSERVABILITY.md
+index 6907e682d38e4541e91b307b3aec863210f273ab..e840c6170027b0f32e02e8768d24465325622718 100644
+--- a/designs/OBSERVABILITY.md
++++ b/designs/OBSERVABILITY.md
+@@ -294,6 +294,8 @@ All standard OpenTelemetry env vars; nothing backend-specific in code.
+ | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` (dev) | Always sample locally; ratio-based in prod |
+ | `OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION` | `true` | Server/runner HTTP spans + extract |
+ | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans; **off in prod** (PII) |
++| `OMNIGENT_OTEL_CAPTURE_USER` | off | Stamp the acting user as `enduser.id` on every span (PII; usually an email). Spans always carry `omnigent.runner.id` when a runner is known. |
++| `OMNIGENT_OTEL_LOCAL_USER` | unset | With `OMNIGENT_OTEL_CAPTURE_USER`, report the single-user `local` identity under this name, e.g. `alice@example.com`, so solo installs stay attributable in a shared collector. |
+ 
+ Telemetry is **opt-in**: nothing is instrumented and no spans are created unless
+ `OMNIGENT_TELEMETRY_ENABLED` is truthy, so a default install is never burdened with
+diff --git a/omnigent/debug_logging.py b/omnigent/debug_logging.py
+index 33af5d7b908e4cf0c5b01566e99ae8044343e553..4e1aa682e55ae74c19e927f2f07057da9ee2e919 100644
+--- a/omnigent/debug_logging.py
++++ b/omnigent/debug_logging.py
+@@ -311,6 +311,11 @@ def set_current_request_id(request_id: str | None) -> None:
+     _request_id_var.set(request_id or None)
+ 
+ 
++def current_runner_id() -> str | None:
++    """Return the runner bound to the current request or lifecycle scope, if any."""
++    return _runner_id_var.get() or None
++
++
+ def set_current_runner_id(runner_id: str | None) -> None:
+     """Bind a known runner without looking up a session on every log record."""
+     _runner_id_var.set(runner_id or None)
+diff --git a/omnigent/runtime/telemetry.py b/omnigent/runtime/telemetry.py
+index eef1075354d88f7e1c6f50c3258f5f5dfafc0ebc..d353d0936b530963d8b02a91a4a72d297ece4ea1 100644
+--- a/omnigent/runtime/telemetry.py
++++ b/omnigent/runtime/telemetry.py
+@@ -56,6 +56,13 @@ _HEX_LEN = 32
+ SENTINEL_PARENT_SPAN_ID = 0x1000000000000001
+ 
+ _capture_content: bool = False
++_capture_user: bool = False
++# Name reported as `enduser.id` for the single-user "local" identity.
++_local_user: str | None = None
++# Runner and harness processes fall back to their own OMNIGENT_RUNNER_ID for
++# `omnigent.runner.id`; other processes only stamp a context-bound runner.
++_runner_process: bool = False
++_RUNNER_SERVICE_NAMES = frozenset({"omni-runner", "omni-harness"})
+ _initialized: bool = False
+ _metrics_initialized: bool = False
+ _logs_initialized: bool = False
+@@ -103,6 +110,36 @@ def should_capture_content() -> bool:
+     return _capture_content
+ 
+ 
++def should_capture_user() -> bool:
++    """
++    Return whether the acting user's id should be stamped on spans.
++
++    Controlled by ``OMNIGENT_OTEL_CAPTURE_USER``. Off by default because
++    the id (``enduser.id``) is usually an email address.
++
++    :returns: ``True`` when user attribution is enabled.
++    """
++    return _capture_user
++
++
++def _attributed_user(user_id: str | None) -> str | None:
++    """
++    Return the ``enduser.id`` value for *user_id*.
++
++    The single-user ``"local"`` identity is reported as
++    ``OMNIGENT_OTEL_LOCAL_USER`` when set, so solo installs that export
++    to a shared collector stay attributable.
++
++    :param user_id: Authenticated or process-owner id, e.g. ``"local"``.
++    :returns: The id to stamp, or ``None``.
++    """
++    from omnigent.server.auth import RESERVED_USER_LOCAL
++
++    if user_id == RESERVED_USER_LOCAL and _local_user:
++        return _local_user
++    return user_id
++
++
+ def telemetry_enabled() -> bool:
+     """
+     Return whether telemetry is enabled for this process.
+@@ -266,6 +303,29 @@ def set_session_id(session_id: str | None) -> None:
+         pass
+ 
+ 
++def set_request_user(user_id: str | None) -> None:
++    """
++    Stamp ``enduser.id`` on the active server span once auth resolves the user.
++
++    The FastAPI server span starts before the auth middleware runs, so the
++    user span processor's ``on_start`` misses it; child spans are covered by
++    the processor. A no-op unless ``OMNIGENT_OTEL_CAPTURE_USER`` is set.
++
++    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``.
++    """
++    if not user_id or not should_capture_user():
++        return
++    try:
++        from opentelemetry import trace as otel_trace
++
++        span = otel_trace.get_current_span()
++        attributed = _attributed_user(user_id)
++        if attributed and span is not None and span.is_recording():
++            span.set_attribute("enduser.id", attributed)
++    except Exception:  # pragma: no cover - telemetry must never break requests
++        pass
++
++
+ def current_session_id() -> str | None:
+     """
+     Return the session id bound in the current context, or ``None``.
+@@ -348,6 +408,29 @@ def _make_session_id_processor() -> Any:
+     return make_span_attribute_processor("session.id", _session_id_var.get)
+ 
+ 
++def _make_user_id_processor() -> Any:
++    """Span processor stamping ``enduser.id`` from the debug-log user binding."""
++    from omnigent.debug_logging import current_user_id
++
++    def span_user_id() -> str | None:
++        return _attributed_user(current_user_id()) if _capture_user else None
++
++    return make_span_attribute_processor("enduser.id", span_user_id)
++
++
++def _make_runner_id_processor() -> Any:
++    """Span processor stamping ``omnigent.runner.id`` from the debug-log runner binding."""
++    from omnigent.debug_logging import current_runner_id
++    from omnigent.runner.identity import RUNNER_ID_ENV_VAR
++
++    def span_runner_id() -> str | None:
++        if bound := current_runner_id():
++            return bound
++        return os.environ.get(RUNNER_ID_ENV_VAR) if _runner_process else None
++
++    return make_span_attribute_processor("omnigent.runner.id", span_runner_id)
++
++
+ def _make_active_skill_processor() -> Any:
+     """Span processor stamping ``omnigent.skill.active`` from :data:`_active_skill_var`."""
+     return make_span_attribute_processor("omnigent.skill.active", _active_skill_var.get)
+@@ -1075,6 +1158,10 @@ def _init_otel_traces(endpoint: str) -> None:
+             provider.add_span_processor(_make_session_id_processor())
+             # Tag every span with the skill active in the turn, if any.
+             provider.add_span_processor(_make_active_skill_processor())
++            # Attribute every span to its runner, and to the acting user when
++            # OMNIGENT_OTEL_CAPTURE_USER opts in.
++            provider.add_span_processor(_make_runner_id_processor())
++            provider.add_span_processor(_make_user_id_processor())
+             provider.add_span_processor(BatchSpanProcessor(_create_otlp_span_exporter()))
+             trace.set_tracer_provider(provider)
+ 
+@@ -1267,7 +1354,7 @@ def init(service_name: str | None = None) -> None:
+       ``TracerProvider`` externally get spans automatically. The
+       default OTel no-op provider discards spans silently.
+     """
+-    global _capture_content, _initialized
++    global _capture_content, _capture_user, _initialized, _local_user, _runner_process
+ 
+     if not telemetry_enabled():
+         # Master opt-in off (the default): stay fully inert — no provider, no
+@@ -1276,10 +1363,14 @@ def init(service_name: str | None = None) -> None:
+         return
+ 
+     _capture_content = _env_bool("OMNIGENT_OTEL_CAPTURE_CONTENT")
++    _capture_user = _env_bool("OMNIGENT_OTEL_CAPTURE_USER")
++    _local_user = os.environ.get("OMNIGENT_OTEL_LOCAL_USER", "").strip() or None
+ 
+     if _initialized:
+         return
+ 
++    _runner_process = service_name in _RUNNER_SERVICE_NAMES
++
+     # Per-component service identity. The trace / metrics / logs
+     # providers below all read OTEL_SERVICE_NAME when they build their
+     # Resource, so this must run before any provider is created. A
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index c64fccea70b6f9168f67d6843f988c52ea2ff27b..ee8ef071b6bd4d9fa627e6317c89d066f01ee799 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -37,6 +37,7 @@ from omnigent.debug_logging import (
+     add_audit_attrs,
+     audit_event_logger,
+     current_request_audit_attrs,
++    current_user_id,
+     debug_event,
+     debug_sink_enabled,
+     reset_request_audit_attrs,
+@@ -2344,6 +2345,7 @@ def create_app(
+             )
+         except Exception:  # noqa: BLE001 — attribution is best-effort
+             set_current_user_id(None)
++        telemetry.set_request_user(current_user_id())
+ 
+         # Resolve the operation + session id from the matched route up front so
+         # the audit ``start`` event is named and records emitted while handling a
+diff --git a/tests/runtime/test_telemetry.py b/tests/runtime/test_telemetry.py
+index 331b5420f913b6af38e7cc781998182a6873ed16..d370a25d476fac431a4869bb1aa73eb4fb300387 100644
+--- a/tests/runtime/test_telemetry.py
++++ b/tests/runtime/test_telemetry.py
+@@ -733,13 +733,24 @@ def test_init_respects_capture_content_flag(
+     monkeypatch.setattr(telemetry, "_initialized", False)
+     monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+     monkeypatch.setattr(telemetry, "_logs_initialized", False)
++    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
++    monkeypatch.setattr(telemetry, "_runner_process", False)
+     monkeypatch.setenv("OMNIGENT_OTEL_CAPTURE_CONTENT", "true")
+-    telemetry.init()
++    monkeypatch.setenv("OMNIGENT_OTEL_CAPTURE_USER", "true")
++    monkeypatch.setenv("OMNIGENT_OTEL_LOCAL_USER", " bob@example.com ")
++    telemetry.init("omni-runner")
+     assert telemetry.should_capture_content() is True
++    assert telemetry.should_capture_user() is True
++    assert telemetry._local_user == "bob@example.com"
++    assert telemetry._runner_process is True
+ 
+     monkeypatch.setenv("OMNIGENT_OTEL_CAPTURE_CONTENT", "false")
++    monkeypatch.delenv("OMNIGENT_OTEL_CAPTURE_USER")
++    monkeypatch.delenv("OMNIGENT_OTEL_LOCAL_USER")
+     telemetry.init()
+     assert telemetry.should_capture_content() is False
++    assert telemetry.should_capture_user() is False
++    assert telemetry._local_user is None
+ 
+ 
+ def test_init_disabled_by_default_is_noop(
+@@ -900,6 +911,112 @@ def test_active_skill_processor_stamps_spans_while_active() -> None:
+     assert telemetry._active_skill_var.get() is None
+ 
+ 
++def test_runner_id_processor_uses_bound_runner_then_runner_process_env(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """
++    Spans carry ``omnigent.runner.id`` from the runner bound to the request;
++    only runner/harness processes fall back to their own ``OMNIGENT_RUNNER_ID``.
++
++    :param monkeypatch: Pytest monkeypatch fixture.
++    """
++    from omnigent.debug_logging import runner_log_scope
++    from omnigent.runner.identity import RUNNER_ID_ENV_VAR
++
++    monkeypatch.setenv(RUNNER_ID_ENV_VAR, "runner-from-env")
++    exporter = InMemorySpanExporter()
++    provider = TracerProvider()
++    provider.add_span_processor(telemetry._make_runner_id_processor())
++    provider.add_span_processor(SimpleSpanProcessor(exporter))
++    tracer = provider.get_tracer("test")
++
++    monkeypatch.setattr(telemetry, "_runner_process", False)
++    with runner_log_scope(None, "runner-bound"):
++        with tracer.start_as_current_span("server.bound"):
++            pass
++    with tracer.start_as_current_span("server.unbound"):
++        pass
++    monkeypatch.setattr(telemetry, "_runner_process", True)
++    with tracer.start_as_current_span("runner.unbound"):
++        pass
++
++    spans = {s.name: s for s in exporter.get_finished_spans()}
++    assert spans["server.bound"].attributes.get("omnigent.runner.id") == "runner-bound"
++    assert "omnigent.runner.id" not in (spans["server.unbound"].attributes or {})
++    assert spans["runner.unbound"].attributes.get("omnigent.runner.id") == "runner-from-env"
++
++
++def test_user_id_processor_stamps_enduser_only_when_opted_in(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """
++    ``enduser.id`` is PII, so the processor stamps the bound user only while
++    ``OMNIGENT_OTEL_CAPTURE_USER`` is on.
++
++    :param monkeypatch: Pytest monkeypatch fixture.
++    """
++    from omnigent.debug_logging import USER_ID_ENV_VAR, current_user_id_scope
++
++    monkeypatch.delenv(USER_ID_ENV_VAR, raising=False)
++    exporter = InMemorySpanExporter()
++    provider = TracerProvider()
++    provider.add_span_processor(telemetry._make_user_id_processor())
++    provider.add_span_processor(SimpleSpanProcessor(exporter))
++    tracer = provider.get_tracer("test")
++
++    with current_user_id_scope("alice@example.com"):
++        monkeypatch.setattr(telemetry, "_capture_user", False)
++        with tracer.start_as_current_span("capture.off"):
++            pass
++        monkeypatch.setattr(telemetry, "_capture_user", True)
++        with tracer.start_as_current_span("capture.on"):
++            with tracer.start_as_current_span("capture.on.child"):
++                pass
++    with current_user_id_scope("local"):
++        monkeypatch.setattr(telemetry, "_local_user", None)
++        with tracer.start_as_current_span("local.unnamed"):
++            pass
++        monkeypatch.setattr(telemetry, "_local_user", "bob@example.com")
++        with tracer.start_as_current_span("local.named"):
++            pass
++
++    spans = {s.name: s for s in exporter.get_finished_spans()}
++    assert "enduser.id" not in (spans["capture.off"].attributes or {})
++    assert spans["capture.on"].attributes.get("enduser.id") == "alice@example.com"
++    assert spans["capture.on.child"].attributes.get("enduser.id") == "alice@example.com"
++    assert spans["local.unnamed"].attributes.get("enduser.id") == "local"
++    assert spans["local.named"].attributes.get("enduser.id") == "bob@example.com"
++
++
++def test_set_request_user_stamps_current_span_when_opted_in(
++    in_memory_exporter: InMemorySpanExporter,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """
++    ``set_request_user`` tags the already-started server span, which the
++    processor misses because auth resolves the user after the span starts.
++
++    :param in_memory_exporter: In-memory span exporter fixture.
++    :param monkeypatch: Pytest monkeypatch fixture.
++    """
++    tracer = otel_trace.get_tracer("test")
++    monkeypatch.setattr(telemetry, "_capture_user", False)
++    with tracer.start_as_current_span("GET /v1/sessions off"):
++        telemetry.set_request_user("alice@example.com")
++    monkeypatch.setattr(telemetry, "_capture_user", True)
++    with tracer.start_as_current_span("GET /v1/sessions on"):
++        telemetry.set_request_user("alice@example.com")
++        telemetry.set_request_user(None)  # no-op, must not raise or clear
++    monkeypatch.setattr(telemetry, "_local_user", "bob@example.com")
++    with tracer.start_as_current_span("GET /v1/sessions local"):
++        telemetry.set_request_user("local")
++
++    spans = {s.name: s for s in in_memory_exporter.get_finished_spans()}
++    assert "enduser.id" not in (spans["GET /v1/sessions off"].attributes or {})
++    assert spans["GET /v1/sessions on"].attributes.get("enduser.id") == "alice@example.com"
++    assert spans["GET /v1/sessions local"].attributes.get("enduser.id") == "bob@example.com"
++
++
+ def test_make_span_attribute_processor_is_generic() -> None:
+     """The factory stamps any attribute from any value getter, e.g. a context var."""
+     import contextvars

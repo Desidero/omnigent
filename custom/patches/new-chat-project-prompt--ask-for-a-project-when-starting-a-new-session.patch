@@ -1,0 +1,821 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 21 Oct 2026 04:15:25 +0000
+Subject: [PATCH] feat(web): ask for a project when starting a new session
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A project carries the settings a new session needs (host, workspace,
+agent, model, worktree), but every "new session" entry point opens a
+plain composer, so filing a session in its project and getting those
+defaults is an extra, easily forgotten step.
+
+When projects exist, the new-session hotkey, the sidebar's New session
+links (also reached from the mobile drawer), and the palette's New chat
+now open the palette on a project step: No project first, then every
+project, filtered by name as you type. Picking one opens /?project=<name>,
+the route the per-project pencil already uses. Modified clicks on the
+links still open the composer in a new tab, and Settings › General ›
+Sessions has a switch to turn the prompt off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit 1401d53cc127a9668163e508b749c5c49c43e99c)
+---
+ feature-map/composer.md                       | 10 +++
+ web/src/hooks/useNewChatProjectPrompt.ts      | 15 ++++
+ web/src/hooks/useNewSessionHotkey.test.tsx    | 10 +++
+ web/src/hooks/useNewSessionHotkey.ts          | 13 ++-
+ .../newChatProjectPromptPreferences.test.ts   | 24 ++++++
+ .../lib/newChatProjectPromptPreferences.ts    | 26 ++++++
+ web/src/pages/SettingsPage.tsx                | 40 +++++++++
+ web/src/shell/AppShell.test.tsx               | 50 ++++++++++-
+ web/src/shell/AppShell.tsx                    | 38 +++++++--
+ web/src/shell/CommandPalette.test.tsx         | 48 +++++++++++
+ web/src/shell/CommandPalette.tsx              | 82 ++++++++++++++-----
+ web/src/shell/Sidebar.test.tsx                | 26 +++++-
+ web/src/shell/Sidebar.tsx                     | 20 +++++
+ 13 files changed, 369 insertions(+), 33 deletions(-)
+ create mode 100644 web/src/hooks/useNewChatProjectPrompt.ts
+ create mode 100644 web/src/lib/newChatProjectPromptPreferences.test.ts
+ create mode 100644 web/src/lib/newChatProjectPromptPreferences.ts
+
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index 0414c8cf9e9c0365d1f82da8bb11f9763037b414..1cf3ed2b8895b43a0cd91618dd42360501cca6a3 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -113,6 +113,10 @@ and steers messages while the agent is busy.
+ - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
+   opens and focuses the new-session composer in browsers. Native shells retain
+   ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
++- `new-session-project-prompt`: when projects exist, the hotkey, the sidebar's
++  New session links, and the palette's New chat first ask for a project (or No
++  project), then open the composer with its defaults. Settings › General ›
++  Sessions turns it off. Modified clicks on the links still open a new tab.
+ - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
+   can be steered into the running turn.
+ - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
+@@ -230,6 +234,12 @@ and steers messages while the agent is busy.
+ - With the browser app focused, press ⌘+Shift+O (macOS) or
+   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
+   composer.
++- With at least one project, press the hotkey or click New session (also from
++  the mobile drawer): a "Start a new session in…" picker opens. Type part of a
++  project name and press Enter to land on `/?project=<name>` with its defaults;
++  choose No project for a plain composer. Turn off **Ask for a project when
++  starting a session** in Settings and the same actions open the composer
++  directly.
+ - Hover the model/effort pill to see the tooltip.
+ - Hover the host chip to see the selected host or sandbox and its connection.
+ - Pick a harness, then open its configuration for model, effort (Codex, Claude,
+diff --git a/web/src/hooks/useNewChatProjectPrompt.ts b/web/src/hooks/useNewChatProjectPrompt.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe3b25a9a2cfa682651404d9daac5aa4a42a8982
+--- /dev/null
++++ b/web/src/hooks/useNewChatProjectPrompt.ts
+@@ -0,0 +1,15 @@
++import { useCallback } from "react";
++
++import { useProjects } from "@/hooks/useConversations";
++import { readNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPreferences";
++
++/**
++ * Returns a check for whether starting a new session should first ask for a
++ * project: at least one project exists and the prompt isn't turned off in
++ * Settings. The preference is read at call time so a toggle applies at once.
++ */
++export function useShouldPromptForProject(): () => boolean {
++  const { data: projects = [] } = useProjects();
++  const hasProjects = projects.length > 0;
++  return useCallback(() => hasProjects && readNewChatProjectPromptEnabled(), [hasProjects]);
++}
+diff --git a/web/src/hooks/useNewSessionHotkey.test.tsx b/web/src/hooks/useNewSessionHotkey.test.tsx
+index c523107a1d8267cc63eb3a901c8d176e8654306d..02438760b7df927e82b94ed4d283b2f9672f5351 100644
+--- a/web/src/hooks/useNewSessionHotkey.test.tsx
++++ b/web/src/hooks/useNewSessionHotkey.test.tsx
+@@ -134,6 +134,16 @@ describe("useNewSessionHotkey", () => {
+     expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
+   });
+ 
++  it("hands the shortcut to onNewSession instead of navigating", () => {
++    const onNewSession = vi.fn();
++    renderHook(() => useNewSessionHotkey(true, false, onNewSession));
++
++    press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
++
++    expect(onNewSession).toHaveBeenCalledTimes(1);
++    expect(navigate).not.toHaveBeenCalled();
++  });
++
+   it("ignores auto-repeat", () => {
+     renderHook(() => useNewSessionHotkey(true, false));
+ 
+diff --git a/web/src/hooks/useNewSessionHotkey.ts b/web/src/hooks/useNewSessionHotkey.ts
+index 34c2bf38f4d8d7a62940449406a7957856b70a97..0c58d325c1bad6ec36bbed55ff1d5ae79b752f9d 100644
+--- a/web/src/hooks/useNewSessionHotkey.ts
++++ b/web/src/hooks/useNewSessionHotkey.ts
+@@ -18,8 +18,12 @@ export function isNewSessionHotkey(
+     : !e.altKey && e.shiftKey && e.key.toLowerCase() === "o";
+ }
+ 
+-/** Navigate to the same new-session route used by the command palette. */
+-export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): void {
++/** Start a new session via `onNewSession`, or open the plain composer. */
++export function useNewSessionHotkey(
++  enabled = true,
++  isMac = isMacPlatform(),
++  onNewSession?: () => void,
++): void {
+   const navigate = useNavigate();
+   const isEmbedded = useIsEmbedded();
+ 
+@@ -31,9 +35,10 @@ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): vo
+       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
+       e.preventDefault();
+       e.stopPropagation();
+-      navigate("/");
++      if (onNewSession) onNewSession();
++      else navigate("/");
+     };
+     window.addEventListener("keydown", handler);
+     return () => window.removeEventListener("keydown", handler);
+-  }, [enabled, isMac, isEmbedded, navigate]);
++  }, [enabled, isMac, isEmbedded, navigate, onNewSession]);
+ }
+diff --git a/web/src/lib/newChatProjectPromptPreferences.test.ts b/web/src/lib/newChatProjectPromptPreferences.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..420c995c3f15a9337cc0cf3227dcd53a04c267e3
+--- /dev/null
++++ b/web/src/lib/newChatProjectPromptPreferences.test.ts
+@@ -0,0 +1,24 @@
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY,
++  readNewChatProjectPromptEnabled,
++  writeNewChatProjectPromptEnabled,
++} from "./newChatProjectPromptPreferences";
++
++describe("newChatProjectPromptPreferences", () => {
++  afterEach(() => localStorage.clear());
++
++  it("defaults on when storage is unset", () => {
++    expect(readNewChatProjectPromptEnabled()).toBe(true);
++  });
++
++  it("persists an off preference and restores the default by clearing it", () => {
++    writeNewChatProjectPromptEnabled(false);
++    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("off");
++    expect(readNewChatProjectPromptEnabled()).toBe(false);
++
++    writeNewChatProjectPromptEnabled(true);
++    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBeNull();
++    expect(readNewChatProjectPromptEnabled()).toBe(true);
++  });
++});
+diff --git a/web/src/lib/newChatProjectPromptPreferences.ts b/web/src/lib/newChatProjectPromptPreferences.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..31f7346e420d2527e45b3d4bc4c6185863d5af46
+--- /dev/null
++++ b/web/src/lib/newChatProjectPromptPreferences.ts
+@@ -0,0 +1,26 @@
++// App-global preference (Settings › General): when projects exist, starting a
++// new session first asks which project it belongs to. On unless turned off.
++
++export const NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY = "omnigent:new-chat-project-prompt";
++
++export function readNewChatProjectPromptEnabled(): boolean {
++  if (typeof window === "undefined") return true;
++  try {
++    return window.localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY) !== "off";
++  } catch {
++    return true;
++  }
++}
++
++export function writeNewChatProjectPromptEnabled(enabled: boolean): void {
++  if (typeof window === "undefined") return;
++  try {
++    if (enabled) {
++      window.localStorage.removeItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY);
++    } else {
++      window.localStorage.setItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY, "off");
++    }
++  } catch {
++    // localStorage failures should not make Settings unusable.
++  }
++}
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index c5191815f5944f282d0224f4d4d83d5c6ba51118..a46d0969cb0bdd2bdf00058c8d67ada9dc78ab4b 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -224,6 +224,10 @@ import {
+   writeSubmitWithModEnter,
+ } from "@/lib/composerSendShortcutPreferences";
+ import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
++import {
++  readNewChatProjectPromptEnabled,
++  writeNewChatProjectPromptEnabled,
++} from "@/lib/newChatProjectPromptPreferences";
+ import {
+   readDeleteWorktreesOnArchive,
+   writeDeleteWorktreesOnArchive,
+@@ -1799,6 +1803,39 @@ function OpenLinksInAppControl() {
+   );
+ }
+ 
++function NewChatProjectPromptControl() {
++  const [enabled, setEnabled] = useState(readNewChatProjectPromptEnabled);
++  const labelId = useId();
++  const descriptionId = useId();
++
++  const toggle = useCallback((next: boolean) => {
++    setEnabled(next);
++    writeNewChatProjectPromptEnabled(next);
++  }, []);
++
++  return (
++    <div className="flex items-start justify-between gap-6">
++      <SettingsLabel
++        label="Ask for a project when starting a session"
++        labelId={labelId}
++        descriptionId={descriptionId}
++        className="flex-1"
++        description="When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer."
++        descriptionClassName="text-ui"
++      />
++      <Switch
++        aria-labelledby={labelId}
++        aria-describedby={descriptionId}
++        checked={enabled}
++        onCheckedChange={toggle}
++        data-testid="new-chat-project-prompt-toggle"
++        className="mt-0.5 shrink-0"
++        componentId="settings.general.new_chat_project_prompt"
++      />
++    </div>
++  );
++}
++
+ function BackgroundSessionTitlesControl() {
+   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
+   const labelId = useId();
+@@ -1916,6 +1953,9 @@ function GeneralSection() {
+         </SettingsGroup>
+         <SettingsGroup title="Sessions" testId="settings-group-sessions">
+           <BackgroundSessionTitlesControl />
++          <div className="mt-4 border-t border-border pt-4">
++            <NewChatProjectPromptControl />
++          </div>
+         </SettingsGroup>
+         <SettingsGroup title="Terminal" testId="settings-group-terminal">
+           <TerminalClipboardControl />
+diff --git a/web/src/shell/AppShell.test.tsx b/web/src/shell/AppShell.test.tsx
+index b7750e08ee468cc21139a5646ca955effec678b2..cf76294a86222a37f7d540deae29292d76e344c2 100644
+--- a/web/src/shell/AppShell.test.tsx
++++ b/web/src/shell/AppShell.test.tsx
+@@ -266,7 +266,8 @@ vi.mock("./TerminalsPanel", () => ({
+   ),
+ }));
+ 
+-import { useConversations } from "@/hooks/useConversations";
++import { useConversations, useProjects } from "@/hooks/useConversations";
++import { writeNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPreferences";
+ import { useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
+ 
+ const useConvMock = vi.mocked(useConversations);
+@@ -5701,4 +5702,51 @@ describe("new-session browser shortcut", () => {
+     expect(screen.getByText("New session route")).toBeInTheDocument();
+     setEmbedRoot(null);
+   });
++
++  describe("with projects", () => {
++    beforeEach(() => {
++      vi.mocked(useProjects).mockReturnValue({
++        data: [{ id: "p1", name: "omnigent" }],
++      } as unknown as ReturnType<typeof useProjects>);
++    });
++    afterEach(() => {
++      vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
++        typeof useProjects
++      >);
++      localStorage.clear();
++    });
++
++    function pressNewSession() {
++      mockConversations([{ id: "conv_abc", permission_level: null }]);
++      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++      render(
++        shellTree(
++          client,
++          "/c/conv_abc",
++          <>
++            <Route index element={<p>New session route</p>} />
++            <Route path="c/:conversationId" element={<p>Session route</p>} />
++          </>,
++          <AppShell />,
++        ),
++      );
++      fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
++    }
++
++    it("asks for a project before opening the composer", () => {
++      pressNewSession();
++      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
++      expect(screen.queryByText("New session route")).toBeNull();
++
++      fireEvent.click(screen.getByText("No project"));
++      expect(screen.getByText("New session route")).toBeInTheDocument();
++    });
++
++    it("opens the composer directly when the prompt is turned off", () => {
++      writeNewChatProjectPromptEnabled(false);
++      pressNewSession();
++      expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
++      expect(screen.getByText("New session route")).toBeInTheDocument();
++    });
++  });
+ });
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index 04385ea0b7ef9b5ed410b071fde8eb85be2fe1bc..071f33b1b1d9fac969764e0c8179d311d75c4634 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -14,7 +14,14 @@ import {
+ } from "react";
+ import { useQueryClient } from "@tanstack/react-query";
+ import { toast } from "sonner";
+-import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
++import {
++  Outlet,
++  useLocation,
++  useNavigate,
++  useParams,
++  useRebasePath,
++  useSearchParams,
++} from "@/lib/routing";
+ import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
+ import { isCanvasPathname } from "@/canvas/canvasNavigation";
+ import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
+@@ -25,6 +32,7 @@ import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+ import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+ import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+ import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
++import { useShouldPromptForProject } from "@/hooks/useNewChatProjectPrompt";
+ import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
+ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
+ import { useIsEmbedded } from "@/lib/embedded";
+@@ -1714,6 +1722,7 @@ function AppShellImpl() {
+   // Bound here where the palette's open-state lives.
+   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+   const [sessionSearch, setSessionSearch] = useState(false);
++  const [projectStep, setProjectStep] = useState(false);
+   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
+   // frequent re-renders (chatStore status churn during a bind). Inline
+   // callbacks would give it fresh props each time and defeat the memo.
+@@ -1730,22 +1739,38 @@ function AppShellImpl() {
+   );
+   const handleOpenSearch = useCallback(() => {
+     setSessionSearch(false);
++    setProjectStep(false);
+     setCommandPaletteOpen(true);
+   }, []);
++  // Every "new session" entry point lands here: with projects to choose from,
++  // the palette asks which one first; otherwise the plain composer opens.
++  const shouldPromptForProject = useShouldPromptForProject();
++  const navigate = useNavigate();
++  const handleNewSession = useCallback(() => {
++    if (!shouldPromptForProject()) {
++      navigate("/");
++      return;
++    }
++    setSessionSearch(false);
++    setProjectStep(true);
++    setCommandPaletteOpen(true);
++  }, [navigate, shouldPromptForProject]);
+   const isEmbedded = useIsEmbedded();
+   useCommandPaletteHotkey(
+     () => {
+       setSessionSearch(false);
+-      setCommandPaletteOpen((prev) => sessionSearch || !prev);
++      setProjectStep(false);
++      setCommandPaletteOpen((prev) => sessionSearch || projectStep || !prev);
+     },
+     true,
+     undefined,
+     () => {
+       setSessionSearch(true);
+-      setCommandPaletteOpen((prev) => !sessionSearch || !prev);
++      setProjectStep(false);
++      setCommandPaletteOpen((prev) => !sessionSearch || projectStep || !prev);
+     },
+   );
+-  useNewSessionHotkey();
++  useNewSessionHotkey(true, undefined, handleNewSession);
+   useSettingsHotkey();
+ 
+   // Mobile back button: close the open file and return to the files/changes
+@@ -2453,6 +2478,7 @@ function AppShellImpl() {
+               dragProgress={sidebarDragProgress}
+               onClose={handleSidebarClose}
+               onOpenSearch={handleOpenSearch}
++              onNewSession={handleNewSession}
+             />
+ 
+             {/* Content region (everything right of the sidebar): a relative
+@@ -2820,8 +2846,10 @@ function AppShellImpl() {
+               there even though the ⌘K hotkey is disabled (it belongs to the
+               host page). */}
+           <CommandPalette
+-            key={sessionSearch ? "sessions" : "commands"}
++            key={projectStep ? "project" : sessionSearch ? "sessions" : "commands"}
+             sessionsOnly={sessionSearch}
++            projectStep={projectStep}
++            onNewSession={handleNewSession}
+             open={commandPaletteOpen}
+             onOpenChange={setCommandPaletteOpen}
+             onToggleLeftSidebar={toggleLeftSidebar}
+diff --git a/web/src/shell/CommandPalette.test.tsx b/web/src/shell/CommandPalette.test.tsx
+index ea61ebd392c59ce32fc34767e693ca3814a4af43..e0e8ab82ce4cc44a5eb6bc62a8f33d020b7749e2 100644
+--- a/web/src/shell/CommandPalette.test.tsx
++++ b/web/src/shell/CommandPalette.test.tsx
+@@ -381,6 +381,15 @@ describe("CommandPalette — new chat in project", () => {
+     expect(navigate).toHaveBeenCalledWith("/?project=home%20lab");
+   });
+ 
++  it("routes the New chat action through onNewSession", () => {
++    const onNewSession = vi.fn();
++    const { onOpenChange } = renderPalette({ onNewSession });
++    fireEvent.click(screen.getByText("New chat"));
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++    expect(onNewSession).toHaveBeenCalledTimes(1);
++    expect(navigate).not.toHaveBeenCalled();
++  });
++
+   it("omits project rows in the sessions-only switcher", () => {
+     renderPalette({ sessionsOnly: true });
+     fireEvent.change(screen.getByTestId("command-palette-input"), {
+@@ -390,6 +399,45 @@ describe("CommandPalette — new chat in project", () => {
+   });
+ });
+ 
++describe("CommandPalette — project step", () => {
++  beforeEach(() => {
++    setSessions([conv("s1", "Cached session")]);
++    useProjects.mockReturnValue({
++      data: [
++        { id: "p1", name: "omnigent", icon: "🔥" },
++        { id: null, name: "home lab", icon: null },
++      ],
++    });
++  });
++
++  it("offers No project first, then every project, and nothing else", () => {
++    renderPalette({ projectStep: true });
++
++    expect(screen.getByPlaceholderText("Start a new session in…")).toBeTruthy();
++    const rows = screen.getAllByRole("option").map((row) => row.textContent);
++    expect(rows).toEqual(["No project", "🔥omnigent", "home lab"]);
++    expect(useConversations).toHaveBeenCalledWith("", false, { enabled: false });
++  });
++
++  it("filters projects by name as the user types", () => {
++    renderPalette({ projectStep: true });
++    fireEvent.change(screen.getByTestId("command-palette-input"), {
++      target: { value: "lab" },
++    });
++    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual(["home lab"]);
++  });
++
++  it.each([
++    ["No project", "/"],
++    ["home lab", "/?project=home%20lab"],
++  ])("opens the composer for %s", (row, path) => {
++    const { onOpenChange } = renderPalette({ projectStep: true });
++    fireEvent.click(screen.getByText(row));
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++    expect(navigate).toHaveBeenCalledWith(path);
++  });
++});
++
+ describe("CommandPalette — input", () => {
+   it("uses the sessions-first placeholder", () => {
+     renderPalette();
+diff --git a/web/src/shell/CommandPalette.tsx b/web/src/shell/CommandPalette.tsx
+index 223a90a4197b8c8bec207fee3035a9828fb5b0a7..cffb0858a02aee1875bfa7c71916f028f3edab90 100644
+--- a/web/src/shell/CommandPalette.tsx
++++ b/web/src/shell/CommandPalette.tsx
+@@ -15,6 +15,9 @@
+ //     project's stored defaults (`/?project=`). Hidden until the user types, so
+ //     a long project list doesn't push Actions out of view.
+ //
++// With `projectStep` the palette instead asks which project a new session
++// belongs to: "No project" first, then every project, filtered as you type.
++//
+ // cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
+ // sessions, and we filter the (tiny, static) action list ourselves so both
+ // groups react to the same input.
+@@ -24,6 +27,7 @@ import { defaultFilter } from "cmdk";
+ import { useEffect, useMemo, useState } from "react";
+ import {
+   CalendarClockIcon,
++  CircleSlashIcon,
+   InboxIcon,
+   type LucideIcon,
+   PanelLeftIcon,
+@@ -51,12 +55,17 @@ import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav
+ 
+ export interface CommandPaletteProps {
+   sessionsOnly?: boolean;
++  /** Ask which project a new session belongs to instead of listing commands. */
++  projectStep?: boolean;
+   open: boolean;
+   onOpenChange: (open: boolean) => void;
+   /** Flip the left (Conversations) sidebar — owned by AppShell. */
+   onToggleLeftSidebar: () => void;
+   /** Flip the right (Workspace) sidebar — owned by AppShell. */
+   onToggleRightSidebar: () => void;
++  /** Start a new session, which may reopen the palette on the project step.
++      Defaults to opening the plain composer. */
++  onNewSession?: () => void;
+ }
+ 
+ interface ActionCommand {
+@@ -106,12 +115,24 @@ const IDLE_SESSION_LIMIT = 5;
+ const SESSION_SEARCH_PAGE_BATCH = 10;
+ const SESSION_SEARCH_RESULT_LIMIT = 50;
+ 
++/** Whether every whitespace-separated word of `query` occurs in `text`. */
++function matchesEveryWord(text: string, query: string): boolean {
++  const lower = text.toLowerCase();
++  return query
++    .toLowerCase()
++    .split(/\s+/)
++    .filter(Boolean)
++    .every((word) => lower.includes(word));
++}
++
+ export function CommandPalette({
+   sessionsOnly = false,
++  projectStep = false,
+   open,
+   onOpenChange,
+   onToggleLeftSidebar,
+   onToggleRightSidebar,
++  onNewSession,
+ }: CommandPaletteProps) {
+   const navigate = useNavigate();
+   const isMobile = useIsMobileViewport();
+@@ -142,7 +163,7 @@ export function CommandPalette({
+         label: "New chat",
+         icon: SquarePenIcon,
+         keywords: ["compose", "start", "new session"],
+-        run: () => navigate("/"),
++        run: onNewSession ?? (() => navigate("/")),
+       },
+       {
+         id: "go-inbox",
+@@ -180,33 +201,34 @@ export function CommandPalette({
+         run: onToggleRightSidebar,
+       },
+     ],
+-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
++    [navigate, onNewSession, onToggleLeftSidebar, onToggleRightSidebar],
+   );
+ 
+   const filteredActions = useMemo(() => {
+     const q = query.trim().toLowerCase();
+-    if (sessionsOnly) return [];
++    if (sessionsOnly || projectStep) return [];
+     if (q === "") return actions;
+     return actions.filter(
+       (a) =>
+         a.label.toLowerCase().includes(q) || a.keywords.some((k) => k.toLowerCase().includes(q)),
+     );
+-  }, [actions, query, sessionsOnly]);
++  }, [actions, query, sessionsOnly, projectStep]);
+ 
+   const { data: projects = [] } = useProjects();
+   // Every typed word must appear in the row label, so "new omni" and "omni"
+-  // both reach "New chat in omnigent".
++  // both reach "New chat in omnigent". The project step lists every project
++  // until the user types, and matches names only.
+   const filteredProjects = useMemo(() => {
+-    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+-    if (sessionsOnly || words.length === 0) return [];
+-    return projects.filter((project) => {
+-      const label = `new chat in ${project.name}`.toLowerCase();
+-      return words.every((word) => label.includes(word));
+-    });
+-  }, [projects, query, sessionsOnly]);
++    if (projectStep) return projects.filter((project) => matchesEveryWord(project.name, query));
++    if (sessionsOnly || query.trim() === "") return [];
++    return projects.filter((project) => matchesEveryWord(`new chat in ${project.name}`, query));
++  }, [projects, query, sessionsOnly, projectStep]);
++  const showNoProject = projectStep && matchesEveryWord("no project", query);
+ 
+   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
+-    useConversations(sessionsOnly ? "" : debouncedQuery, false, { enabled: open });
++    useConversations(sessionsOnly ? "" : debouncedQuery, false, {
++      enabled: open && !projectStep,
++    });
+   const loadedPages = data?.pages.length ?? 0;
+   useEffect(() => {
+     if (
+@@ -233,6 +255,8 @@ export function CommandPalette({
+   ]);
+ 
+   const sessions = useMemo(() => {
++    // A disabled query still returns cached pages; the project step lists none.
++    if (projectStep) return [];
+     const seen = new Set<string>();
+     const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
+     for (const page of data?.pages ?? []) {
+@@ -262,14 +286,20 @@ export function CommandPalette({
+         .sort((first, second) => second.score - first.score);
+     }
+     return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
+-  }, [data, debouncedQuery, query, sessionsOnly]);
++  }, [data, debouncedQuery, query, sessionsOnly, projectStep]);
+   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
+   const loadError = isError || isFetchNextPageError;
+ 
+-  const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
+-  const placeholder = sessionsOnly
+-    ? "Search sessions by name…"
+-    : "Search sessions or run a command";
++  const paletteLabel = projectStep
++    ? "New session"
++    : sessionsOnly
++      ? "Switch session"
++      : "Command palette";
++  const placeholder = projectStep
++    ? "Start a new session in…"
++    : sessionsOnly
++      ? "Search sessions by name…"
++      : "Search sessions or run a command";
+ 
+   const runAction = (action: ActionCommand): void => {
+     close();
+@@ -278,7 +308,7 @@ export function CommandPalette({
+ 
+   const newChatInProject = (name: string): void => {
+     close();
+-    navigate(`/?project=${encodeURIComponent(name)}`);
++    navigate(name ? `/?project=${encodeURIComponent(name)}` : "/");
+   };
+ 
+   const goToSession = (id: string): void => {
+@@ -438,8 +468,14 @@ export function CommandPalette({
+                 })}
+               </CommandGroup>
+             )}
+-            {filteredProjects.length > 0 && (
+-              <CommandGroup heading="New chat in project">
++            {(filteredProjects.length > 0 || showNoProject) && (
++              <CommandGroup heading={projectStep ? "Project" : "New chat in project"}>
++                {showNoProject && (
++                  <CommandItem value="no-project" onSelect={() => newChatInProject("")}>
++                    <CircleSlashIcon />
++                    <span className="flex-1 truncate text-left">No project</span>
++                  </CommandItem>
++                )}
+                 {filteredProjects.map((project) => (
+                   <CommandItem
+                     key={project.name}
+@@ -447,7 +483,9 @@ export function CommandPalette({
+                     onSelect={() => newChatInProject(project.name)}
+                   >
+                     <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
+-                    <span className="flex-1 truncate text-left">New chat in {project.name}</span>
++                    <span className="flex-1 truncate text-left">
++                      {projectStep ? project.name : `New chat in ${project.name}`}
++                    </span>
+                   </CommandItem>
+                 ))}
+               </CommandGroup>
+diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
+index 03b949c48bec7d653225742d4861a175bb61c850..8d8176cd21dc0397f0e39013aa7af02e81fcd982 100644
+--- a/web/src/shell/Sidebar.test.tsx
++++ b/web/src/shell/Sidebar.test.tsx
+@@ -245,9 +245,17 @@ function renderSidebar(
+   extensions: ExtensionCatalogItem[] = [],
+   onClose = vi.fn(),
+   config: SidebarConfig = sidebarConfig,
++  onNewSession?: () => void,
+ ) {
+   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+-  const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
++  const sidebar = (
++    <Sidebar
++      open={open}
++      onClose={onClose}
++      onOpenSearch={onOpenSearch}
++      onNewSession={onNewSession}
++    />
++  );
+   return render(
+     <QueryClientProvider client={qc}>
+       <CapabilitiesProvider info={info ?? "loading"}>
+@@ -1894,6 +1902,22 @@ describe("Sidebar tabs", () => {
+     expect(screen.queryByText("conv_shared")).toBeNull();
+   });
+ 
++  it.each(["new-chat-button", "sessions-new-session"])(
++    "hands a plain click on %s to onNewSession but lets modified clicks open a tab",
++    (testId) => {
++      mockConversations(THREE_TYPE_CONVERSATIONS);
++      const onNewSession = vi.fn();
++      renderSidebar(true, "/", undefined, undefined, [], vi.fn(), sidebarConfig, onNewSession);
++      const link = screen.getByTestId(testId);
++
++      expect(fireEvent.click(link, { metaKey: true })).toBe(true);
++      expect(onNewSession).not.toHaveBeenCalled();
++
++      expect(fireEvent.click(link)).toBe(false);
++      expect(onNewSession).toHaveBeenCalledTimes(1);
++    },
++  );
++
+   it("drops the Shared filter option on a single-user (local) server", () => {
+     // A loopback-only server can't share sessions, so that one option is
+     // meaningless there. The rest of the menu keeps working.
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index 4722f9ff80688b53ca3b015904453f8676a992ed..8f3f27e42bfafb356bd8d24725d3c858cd150be2 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -488,6 +488,12 @@ interface SidebarProps {
+    * Optional (defaults to a no-op) so the sidebar renders standalone in tests.
+    */
+   onOpenSearch?: () => void;
++  /**
++   * Start a new session, which may ask for a project first. A plain left click
++   * on a "New session" link calls this instead of following it; modified
++   * clicks still open the composer in a new tab. Optional for standalone tests.
++   */
++  onNewSession?: () => void;
+   /**
+    * Whether the sidebar is peeking.
+    */
+@@ -696,6 +702,7 @@ function SidebarImpl({
+   onOpen,
+   dragProgress = null,
+   onOpenSearch,
++  onNewSession,
+   peek,
+ }: SidebarProps) {
+   const sidebarData = useSidebarData();
+@@ -823,6 +830,13 @@ function SidebarImpl({
+     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+     if (isMobileViewport()) onClose();
+   });
++  // Runs after onNavClick, which has already closed the mobile drawer.
++  const onNewSessionClick = useStableCallback((e: MouseEvent<HTMLAnchorElement>) => {
++    if (!onNewSession || e.defaultPrevented || e.button !== 0) return;
++    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
++    e.preventDefault();
++    onNewSession();
++  });
+ 
+   // Which top-level nav button to highlight for the current route.
+   const {
+@@ -1206,6 +1220,7 @@ function SidebarImpl({
+                   onClick={(e) => {
+                     switchTab("mine");
+                     onNavClick(e);
++                    onNewSessionClick(e);
+                   }}
+                 >
+                   <MessageCirclePlusIcon
+@@ -1370,6 +1385,7 @@ function SidebarImpl({
+                     conversationsQuery={displayQuery}
+                     scrollContainerRef={scrollContainerRef}
+                     onRowClick={onNavClick}
++                    onNewSessionClick={onNewSessionClick}
+                     searchQuery=""
+                     newSessionProjectName={newSessionProjectName}
+                     activeTab={availableTab}
+@@ -1697,6 +1713,8 @@ interface ConversationListProps {
+   // The scrollable ancestor, used as the infinite-scroll observer root.
+   scrollContainerRef: RefObject<HTMLElement | null>;
+   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
++  /** Click handler for the "New session" link (see SidebarProps.onNewSession). */
++  onNewSessionClick?: (e: MouseEvent<HTMLAnchorElement>) => void;
+   searchQuery: string;
+   /** Project selected on the new-session composer route, if any. */
+   newSessionProjectName: string | null;
+@@ -1741,6 +1759,7 @@ function ConversationList({
+   conversationsQuery,
+   scrollContainerRef,
+   onRowClick,
++  onNewSessionClick,
+   searchQuery,
+   newSessionProjectName,
+   activeTab,
+@@ -2654,6 +2673,7 @@ function ConversationList({
+                 event.stopPropagation();
+                 onActiveTabChange("mine");
+                 onRowClick(event);
++                onNewSessionClick?.(event);
+               }}
+             >
+               <MessageCirclePlusIcon className="size-3.5" />

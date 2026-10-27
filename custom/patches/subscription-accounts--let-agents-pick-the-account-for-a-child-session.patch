@@ -1,0 +1,1240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 21 Oct 2026 15:03:33 +0000
+Subject: [PATCH] feat(sessions): let agents pick the account for a child
+ session
+
+Belongs with the subscription-accounts series (carried on custom while the
+design is discussed on upstream issue #503; see docs/providers.md). Drop it
+once upstream has an equivalent.
+
+A session could choose its provider at creation, but a child an agent
+started with sys_session_create always shared its parent's runner, and so
+its accounts. A Claude session on Databricks could not start one child on a
+Claude subscription and another on a Codex subscription.
+
+sys_session_create takes an optional provider, the name of a providers:
+entry on the parent's host:
+
+- The runner checks it against the host's config before anything is
+  created: an unknown name or a subscription that is not signed in fails
+  with the configured names or the sign-in command.
+- A provider the parent's runner already uses for its CLI families keeps
+  the child co-located. Any other gets the child its own runner on the
+  parent's host and workspace, created with provider_override, so the host
+  validates and launches it like any session on that provider. The server
+  no longer inherits the parent's runner for such a child, and never moves
+  it back onto an ancestor's runner when its own is not connected yet.
+- Once the server resolves the child's harness, a provider that cannot run
+  it deletes the child and lists the providers that can. The first message
+  is posted only after that check, so no turn starts on the wrong account.
+- provider works with agent_id only; config_path refuses it.
+
+sys_list_models reports host_providers: each provider's name, kind, label,
+the CLIs it serves, the CLIs that use it by default from this runner, and
+whether it is signed in.
+
+A child in its own runner does not wake its parent when it finishes (the
+inbox is runner-local); the tool result and docs say to check it with
+sys_session_get_info. Its runner acknowledges the completion instead of
+making the forwarder retry for minutes.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit f72a7ba03eae839f9dff878bfa34669902c32daf)
+---
+ docs/providers.md                             |  29 +++
+ feature-map/native-harnesses.md               |   9 +
+ omnigent/onboarding/subscription_accounts.py  |  35 +++
+ omnigent/runner/app.py                        |   7 +-
+ omnigent/runner/child_account.py              | 130 +++++++++++
+ omnigent/runner/tool_dispatch.py              | 204 +++++++++++++++--
+ .../server/routes/_sessions/orchestration.py  |   8 +-
+ omnigent/server/schemas.py                    |   3 +-
+ omnigent/tools/builtins/list_models.py        |  41 +++-
+ omnigent/tools/builtins/spawn.py              |  22 +-
+ .../onboarding/test_subscription_accounts.py  |  61 ++++++
+ .../test_native_subagent_inbox_delivery.py    |  22 ++
+ tests/runner/test_runner_dispatch.py          | 207 +++++++++++++++++-
+ .../integration/test_session_host_launch.py   |  42 ++++
+ .../test_subagent_status_forward_recovery.py  |  33 +++
+ tests/tools/builtins/test_list_models.py      |  42 ++++
+ 16 files changed, 863 insertions(+), 32 deletions(-)
+ create mode 100644 omnigent/runner/child_account.py
+
+diff --git a/docs/providers.md b/docs/providers.md
+index aab5b61f7e379140766ee392e6d102f962c91914..168804089f68bb1b8dd344f3c49c58385ee92bcc 100644
+--- a/docs/providers.md
++++ b/docs/providers.md
+@@ -131,6 +131,35 @@ How the choice applies:
+ - Only sessions on a connected host can choose. Managed sandboxes use their
+   deployment's inference settings.
+ 
++## Child sessions an agent starts
++
++An agent with `spawn: true` can start a child session on one of its host's
++providers by passing `provider` to `sys_session_create`, for example a Claude
++session on Databricks starting one child on a Claude subscription and another
++on a Codex subscription:
++
++```json
++{"agent_id": "ag_...", "provider": "claude-max2", "message": "..."}
++```
++
++`sys_list_models` lists the choices under `host_providers`, with each
++provider's kind, the CLIs it serves (`claude` for claude-native and claude-sdk
++agents, `codex` for codex-native and codex agents), which CLIs use it by default
++and whether it is signed in. Without `provider` the child runs on the parent's
++provider when that serves the child's CLI, otherwise on the host default.
++
++The tool checks the choice before the child starts. It returns
++`provider_not_found` when the host has no such provider, `provider_not_ready`
++when the account is not signed in (with the command that signs it in),
++`provider_not_for_harness` when the provider cannot run the child's agent
++(listing the ones that can), and `provider_unavailable` when the parent is not
++on a connected host. `provider` works only with `agent_id`, not `config_path`.
++
++A child on an account other than the one its parent's runner uses gets its own
++runner on the same host and workspace. It does not wake the parent when it
++finishes, so the parent checks it with `sys_session_get_info` or
++`sys_session_get_history`.
++
+ ## Switching a running session
+ 
+ A Claude session (claude-native or claude-sdk) can move to another provider
+diff --git a/feature-map/native-harnesses.md b/feature-map/native-harnesses.md
+index 26f7bc93176db9778ed9144db134517124dcb437..c93eeda2d4cc440f5e03e11a856c4cf87296c855 100644
+--- a/feature-map/native-harnesses.md
++++ b/feature-map/native-harnesses.md
+@@ -51,6 +51,9 @@ implements them separately, so a fix for one harness does not reach the others.
+ - `subagent-discovery`: Claude children appear under the agent that spawned
+   them, including delayed spawns; an unresolved spawn does not keep an idle
+   runner re-reading unchanged conversations.
++- `child-account`: with several accounts on the host, `sys_session_create`
++  `provider` starts a Claude or Codex child on a chosen account; the child runs
++  in its own runner when its parent's runner uses another account.
+ - `disconnect`: startup waits and active operations settle when their native
+   connection ends; reconnect can receive fresh events. Distinguish a native
+   CLI disconnect, a runner going offline, and a browser stream reconnect.
+@@ -110,6 +113,12 @@ the linked session's Agents panel and check the child under its parent. Ask a
+ child to delegate again to check nested ownership; completed children remain
+ visible while the runner idles.
+ 
++**Child on another account:** with two Claude accounts (and a Codex one) under
++`providers:` (see `docs/providers.md`), ask a Claude session to call
++`sys_list_models`, then `sys_session_create` with a native agent's `agent_id`
++and each `provider`. Open each child and check its terminal runs on that
++account (`/status` in Claude, `/status` in Codex).
++
+ **Native Gemini setup:** run `omni setup` → Antigravity → Configure native agy
+ API key / gateway. If existing providers conflict, choose the Gemini default
+ before entering the harness menu. Then start a new CLI or web session.
+diff --git a/omnigent/onboarding/subscription_accounts.py b/omnigent/onboarding/subscription_accounts.py
+index c045f621c731bad34f2bd3bbc5d17281a9bcb6d4..3ea46fabff7fc0d347437ed249a48964cd231f1b 100644
+--- a/omnigent/onboarding/subscription_accounts.py
++++ b/omnigent/onboarding/subscription_accounts.py
+@@ -423,3 +423,38 @@ def provider_choices(
+             }
+         )
+     return rows
++
++
++# The CLI families an agent can pick a child session's account for, each with
++# the harness whose provider listing describes it.
++ACCOUNT_CLI_HARNESSES: dict[str, str] = {"claude": "claude-native", "codex": "codex-native"}
++
++
++def host_provider_summary(config: dict[str, object]) -> list[dict[str, object]]:
++    """List this host's providers for an agent choosing a child session's account.
++
++    :param config: The parsed ``~/.omnigent/config.yaml`` mapping.
++    :returns: One row per provider: ``name``, ``kind``, ``label``, ``clis`` (the
++        CLI families it serves, e.g. ``["claude"]``), ``default_for`` (the
++        families whose children run on it when none is chosen) and ``ready``.
++    :raises OmnigentError: If the provider config is malformed.
++    """
++    rows: dict[str, dict[str, object]] = {}
++    clis: dict[str, list[str]] = {}
++    defaults: dict[str, list[str]] = {}
++    for cli, harness in ACCOUNT_CLI_HARNESSES.items():
++        for choice in provider_choices(config, harness):
++            name = str(choice["name"])
++            if name not in rows:
++                rows[name] = {
++                    "name": name,
++                    "kind": choice["kind"],
++                    "label": choice["label"],
++                    "clis": clis.setdefault(name, []),
++                    "default_for": defaults.setdefault(name, []),
++                    "ready": choice["ready"],
++                }
++            clis[name].append(cli)
++            if choice["default"]:
++                defaults[name].append(cli)
++    return list(rows.values())
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index 994ef539cd3d777cf5fc9281bcf8f7817a3e0ea2..bcaf48379146e7700b4161926c444ea054ff1dba 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -6798,7 +6798,12 @@ def create_runner_app(
+                 if (
+                     delivery_ack.entry is not None
+                     and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
+-                    and await _parent_is_nested_subagent(delivery_ack.entry)
++                    and (
++                        # A child launched in its own runner (on another
++                        # account) never has its parent on this runner.
++                        delivery_ack.entry.child_session_id == runner_primary_session_id()
++                        or await _parent_is_nested_subagent(delivery_ack.entry)
++                    )
+                 ):
+                     # Acknowledge instead of asking the forwarder to poll. The
+                     # entry stays terminal and undelivered; it is handed over
+diff --git a/omnigent/runner/child_account.py b/omnigent/runner/child_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..86467dd72475ebbf165fc3a13611aa6fb81c3172
+--- /dev/null
++++ b/omnigent/runner/child_account.py
+@@ -0,0 +1,130 @@
++"""The account (provider) a ``sys_session_create`` child runs on.
++
++A runner's provider lives in its environment, so a child co-located on its
++parent's runner shares the parent's accounts. A child on another account gets
++its own runner on the same host, launched with that provider like any session
++created with ``provider_override``. These checks read this host's
++``providers:`` config, the same one the host resolves the child's launch from.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from omnigent.errors import OmnigentError
++from omnigent.onboarding.provider_config import (
++    ANTHROPIC_FAMILY,
++    OPENAI_FAMILY,
++    get_default_provider,
++    load_config,
++    load_providers,
++    provider_families,
++)
++from omnigent.onboarding.subscription_accounts import (
++    provider_choices,
++    require_subscription_login,
++)
++from omnigent.util.json_types import JsonObject
++
++# Where an agent finds the valid names.
++_DISCOVERY_HINT = "sys_list_models lists this host's providers under 'host_providers'."
++
++
++class ChildAccountError(Exception):
++    """A provider the child cannot run on, as a tool error.
++
++    :param code: Machine-readable reason, e.g. ``"provider_not_found"``.
++    :param message: What is wrong and how to fix it.
++    """
++
++    def __init__(self, code: str, message: str) -> None:
++        super().__init__(message)
++        self.code = code
++        self.message = message
++
++    def as_tool_error(self, provider: str) -> JsonObject:
++        """Return the JSON object the tool reports."""
++        return {"error": self.code, "provider": provider, "message": self.message}
++
++
++@dataclass(frozen=True)
++class ChildAccount:
++    """Where a child on *provider* runs.
++
++    :param provider: The ``providers:`` entry name, e.g. ``"claude-alt"``.
++    :param own_runner: Whether the child needs its own runner because the
++        parent's runner runs another account for the provider's families.
++    """
++
++    provider: str
++    own_runner: bool
++
++
++def choose_child_account(provider: str) -> ChildAccount:
++    """Check *provider* on this host and decide whether the child needs its own runner.
++
++    :param provider: The requested ``providers:`` entry name.
++    :returns: The child's placement.
++    :raises ChildAccountError: ``provider_not_found`` when it is not configured
++        here, ``provider_not_ready`` when its subscription is not signed in.
++    """
++    try:
++        config = load_config()
++        providers = load_providers(config)
++    except OmnigentError as exc:
++        raise ChildAccountError("provider_config_invalid", exc.message) from exc
++    entry = providers.get(provider)
++    if entry is None:
++        configured = ", ".join(sorted(providers)) or "none"
++        raise ChildAccountError(
++            "provider_not_found",
++            f"Provider {provider!r} is not configured on this host "
++            f"(configured: {configured}). {_DISCOVERY_HINT}",
++        )
++    try:
++        require_subscription_login(entry)
++    except OmnigentError as exc:
++        raise ChildAccountError("provider_not_ready", exc.message) from exc
++    families = provider_families(entry) & {ANTHROPIC_FAMILY, OPENAI_FAMILY}
++    try:
++        shared = bool(families) and all(
++            (current := get_default_provider(config, family)) is not None
++            and current.name == provider
++            for family in families
++        )
++    except OmnigentError:
++        shared = False
++    return ChildAccount(provider=provider, own_runner=not shared)
++
++
++def require_child_harness(provider: str, harness: str | None, agent_name: str | None) -> None:
++    """Fail unless *provider* can run the child's harness on this host.
++
++    :param provider: The requested ``providers:`` entry name.
++    :param harness: The child's canonical harness, e.g. ``"codex-native"``.
++    :param agent_name: The child's agent, for the message.
++    :raises ChildAccountError: ``provider_not_for_harness`` listing the
++        providers that can run it.
++    """
++    try:
++        choices = provider_choices(load_config(), harness) if harness else []
++    except OmnigentError as exc:
++        raise ChildAccountError("provider_config_invalid", exc.message) from exc
++    if any(choice["name"] == provider for choice in choices):
++        return
++    agent = f"agent {agent_name!r}" if agent_name else "the agent"
++    if not choices:
++        raise ChildAccountError(
++            "provider_not_for_harness",
++            f"The child ({agent}) runs the {harness!r} harness, which has no account "
++            "to choose. Omit 'provider' for it.",
++        )
++    valid = ", ".join(
++        f"{choice['name']} (default)" if choice["default"] else str(choice["name"])
++        for choice in choices
++    )
++    raise ChildAccountError(
++        "provider_not_for_harness",
++        f"Provider {provider!r} cannot run {agent} (harness {harness!r}). "
++        f"Providers for {harness!r} on this host: {valid}.",
++    )
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index 1635bdb6a7212cbb9e78049e516d8bf1e23b04f1..a3dcfedc277019104ed92e1b2313db277f220ceb 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -2423,13 +2423,14 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
+     :param agent_spec: The calling session's agent spec; its
+         ``sub_agents`` define the worker rows.
+     :returns: JSON mapping of worker name (plus ``"self"``) to its
+-        ``{source, verified, models, note}`` row, or an error string.
++        ``{source, verified, models, note}`` row, plus this host's
++        ``host_providers``, or an error string.
+     """
+     if agent_spec is None:
+         return "Error: sys_list_models requires an agent spec"
+-    from omnigent.models.model_catalog import catalog_for_spec
++    from omnigent.tools.builtins.list_models import list_models_payload
+ 
+-    catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
++    catalog = await asyncio.to_thread(list_models_payload, agent_spec)
+     return json.dumps(catalog)
+ 
+ 
+@@ -3501,7 +3502,21 @@ async def _execute_session_create(
+                 )
+             }
+         )
++    provider = args.get("provider")
++    if provider is not None and (not isinstance(provider, str) or not provider):
++        return json.dumps(
++            {"error": "sys_session_create 'provider' must be a non-empty provider name"}
++        )
+     if has_config_path:
++        if provider is not None:
++            return json.dumps(
++                {
++                    "error": (
++                        "sys_session_create 'provider' is supported only with "
++                        "'agent_id'; the 'config_path' create cannot carry it."
++                    )
++                }
++            )
+         # The multipart create carries only the config bundle, so an effort
+         # passed here would never reach the child. Refuse instead of dropping it.
+         if args.get("reasoning_effort") is not None:
+@@ -3523,6 +3538,15 @@ async def _execute_session_create(
+             agent_spec=agent_spec,
+             runner_workspace=runner_workspace,
+         )
++    if provider is not None:
++        return await _session_create_on_provider(
++            str(agent_id),
++            provider,
++            args,
++            server_client=server_client,
++            conversation_id=conversation_id,
++            publish_event=publish_event,
++        )
+     body = _build_session_create_body(
+         str(agent_id),
+         conversation_id,
+@@ -3555,6 +3579,123 @@ async def _execute_session_create(
+     )
+ 
+ 
++async def _session_create_on_provider(
++    agent_id: str,
++    provider: str,
++    args: _JsonObject,
++    *,
++    server_client: httpx.AsyncClient,
++    conversation_id: str,
++    publish_event: Callable[[str, _JsonObject], None] | None,
++) -> str:
++    """
++    ``sys_session_create`` with ``provider``: start the child on that account.
++
++    A child whose account differs from the one this runner uses gets its own
++    runner on this runner's host and workspace, created with
++    ``provider_override``. The first message is posted only after the child's
++    harness is known to run on the provider, so no turn starts on another
++    account.
++
++    :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
++    :param provider: The ``providers:`` entry name, e.g. ``"claude-alt"``.
++    :param args: Parsed tool arguments.
++    :param server_client: HTTP client pointed at the Omnigent server.
++    :param conversation_id: The caller's session id — the forced parent.
++    :param publish_event: SSE publish callback for ``session.created``.
++    :returns: JSON handle on success; a JSON error object otherwise.
++    """
++    from omnigent.runner.child_account import (
++        ChildAccountError,
++        choose_child_account,
++        require_child_harness,
++    )
++
++    try:
++        account = await asyncio.to_thread(choose_child_account, provider)
++    except ChildAccountError as exc:
++        return json.dumps(exc.as_tool_error(provider))
++    body = _build_session_create_body(
++        agent_id,
++        conversation_id,
++        args.get("title"),
++        None,
++        model=args.get("model"),
++        reasoning_effort=args.get("reasoning_effort"),
++    )
++    if account.own_runner:
++        try:
++            host = await _host_bound_snapshot(server_client, conversation_id)
++        except (httpx.HTTPError, ValueError):
++            host = None
++        host_id = _optional_string(host.get("host_id")) if host else None
++        workspace = _optional_string(host.get("workspace")) if host else None
++        if not host_id or not workspace:
++            unavailable = ChildAccountError(
++                "provider_unavailable",
++                "Only a session running on a connected host can start a child on "
++                "another account. Omit 'provider' to use this session's account.",
++            )
++            return json.dumps(unavailable.as_tool_error(provider))
++        body.update(host_id=host_id, workspace=workspace, provider_override=provider)
++    try:
++        # A child with its own runner waits for the host to launch it.
++        resp = await server_client.post("/v1/sessions", json=body, timeout=90.0)
++    except Exception as exc:  # noqa: BLE001
++        return json.dumps({"error": f"sys_session_create failed: {exc}"})
++    if resp.status_code == 404:
++        return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
++    if resp.status_code in (401, 403):
++        return json.dumps({"error": "access_denied", "agent_id": agent_id})
++    if resp.status_code >= 400:
++        return json.dumps(
++            {
++                "error": f"sys_session_create returned {resp.status_code}",
++                "provider": provider,
++                "message": _omnigent_error_message(resp) or resp.text[:500],
++            }
++        )
++    data = resp.json()
++    child_id = data.get("id")
++    if not isinstance(child_id, str) or not child_id:
++        return json.dumps({"error": "server did not return a child session id"})
++    try:
++        await asyncio.to_thread(
++            require_child_harness,
++            provider,
++            _optional_string(data.get("harness")),
++            _optional_string(data.get("agent_name")),
++        )
++    except ChildAccountError as exc:
++        error = exc.as_tool_error(provider)
++        warning = await _teardown_failed_child(server_client, child_id, created_child=True)
++        if warning:
++            error["warning"] = warning
++        return json.dumps(error)
++    message = args.get("message")
++    if isinstance(message, str) and message:
++        message_error = await _post_child_first_message(child_id, message, server_client)
++        if message_error is not None:
++            return message_error
++    handle = json.loads(
++        _finalize_created_session(
++            data,
++            conversation_id=conversation_id,
++            agent_id=agent_id,
++            title=args.get("title"),
++            publish_event=publish_event,
++        )
++    )
++    handle["provider"] = provider
++    if account.own_runner:
++        handle["note"] = (
++            "The child runs in its own runner on this host, so it does not wake you "
++            "when it finishes: check it with sys_session_get_info or "
++            "sys_session_get_history."
++        )
++    return json.dumps(handle)
++
++
+ def _bundle_local_agent_source(source: Path) -> bytes:
+     """
+     Build gzipped agent-bundle bytes from a local source path.
+@@ -5689,32 +5830,51 @@ async def _agent_list_host_readiness(
+     try:
+         async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
+             host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
++            if not host_id:
++                snapshot = await _host_bound_snapshot(server_client, conversation_id)
++                host_id = _optional_string(snapshot.get("host_id")) if snapshot else None
+             if host_id:
+                 return await _host_harnesses_or_none(host_id, server_client)
+-            seen: set[str] = set()
+-            while conversation_id and conversation_id not in seen:
+-                if len(seen) >= _AGENT_READINESS_MAX_DEPTH:
+-                    return None
+-                seen.add(conversation_id)
+-                response = await server_client.get(
+-                    f"{_session_url(conversation_id)}",
+-                    params={"include_items": "false", "include_liveness": "false"},
+-                    timeout=_AGENT_READINESS_TIMEOUT_S,
+-                )
+-                if response.status_code != 200:
+-                    return None
+-                snapshot = _string_object_dict(response.json())
+-                if snapshot is None:
+-                    return None
+-                host_id = _optional_string(snapshot.get("host_id"))
+-                if host_id:
+-                    return await _host_harnesses_or_none(host_id, server_client)
+-                conversation_id = _optional_string(snapshot.get("parent_session_id"))
+     except (TimeoutError, httpx.HTTPError, ValueError):
+         return None
+     return None
+ 
+ 
++async def _host_bound_snapshot(
++    server_client: httpx.AsyncClient,
++    conversation_id: str | None,
++) -> _JsonObject | None:
++    """
++    Return the nearest host-bound session from *conversation_id* up its parents.
++
++    Children share that session's runner, so it names the host and workspace
++    this runner was launched with. ``None`` when no session in a bounded walk
++    is host-bound or a read fails.
++
++    :raises httpx.HTTPError: When a session read fails in transport.
++    :raises ValueError: When a session read returns invalid JSON.
++    """
++    seen: set[str] = set()
++    while conversation_id and conversation_id not in seen:
++        if len(seen) >= _AGENT_READINESS_MAX_DEPTH:
++            return None
++        seen.add(conversation_id)
++        response = await server_client.get(
++            f"{_session_url(conversation_id)}",
++            params={"include_items": "false", "include_liveness": "false"},
++            timeout=_AGENT_READINESS_TIMEOUT_S,
++        )
++        if response.status_code != 200:
++            return None
++        snapshot = _string_object_dict(response.json())
++        if snapshot is None:
++            return None
++        if _optional_string(snapshot.get("host_id")):
++            return snapshot
++        conversation_id = _optional_string(snapshot.get("parent_session_id"))
++    return None
++
++
+ async def _agent_list_via_rest(
+     server_client: httpx.AsyncClient,
+     *,
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 0b097cd642771bf2030bba891b220f0d5caa927b..49dbef34ad586c38f97af3b5f115f4703e573932 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -3740,6 +3740,10 @@ async def _heal_subagent_runner_binding_via_parent(
+     # live runner.  A single hop covers the common case; two hops cover nested
+     # sub-agents where the immediate parent's runner is also stale but the root
+     # is still healthy.
++    if child_conv.host_id is not None and child_conv.provider_override is not None:
++        # A child on its own provider runs in its own runner, launched with that
++        # provider; its host relaunches it rather than an ancestor adopting it.
++        return None
+     candidate_ids: list[str] = []
+     if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
+         candidate_ids.append(child_conv.parent_conversation_id)
+@@ -11576,7 +11580,9 @@ async def _create_session_from_existing_agent(
+     # Inherit runner affinity from the parent session so the child
+     # is assigned to the same runner (sub-agent co-location).
+     inherited_runner_id: str | None = None
+-    if body.parent_session_id is not None:
++    # A child that chooses a provider (validated above to be host-bound) gets
++    # a runner launched with it; the parent's runner carries the parent's accounts.
++    if body.parent_session_id is not None and body.provider_override is None:
+         parent_conv = _parent_for_routing
+         if parent_conv is not None:
+             inherited_runner_id = parent_conv.runner_id
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 504d8555089429b1480bd3844b5b906e3af04ad2..fac60638a3ceb5569d13b71a5804c022f36ea98d 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -1649,7 +1649,8 @@ class _SessionCreateRequestBase(BaseModel):
+         for the session's harness family when launching the runner, and a
+         missing login fails the launch. ``None`` uses the family default.
+         Create-time only; host-bound sessions only. Sub-agents inherit it
+-        when they run in the same family.
++        when they run in the same family. A child created with it (and its
++        parent's ``host_id``) gets its own runner instead of its parent's.
+     :param smart_routing_message: The user's first-message text, used to
+         route the harness at create time. Only read on the top-level
+         Smart Routing path (``harness_override: "auto"`` on a native
+diff --git a/omnigent/tools/builtins/list_models.py b/omnigent/tools/builtins/list_models.py
+index 70d9853effe87068e922795042364f0c4200b75f..3061be29e76539d1ca1dd949c8e2de4d163ac248 100644
+--- a/omnigent/tools/builtins/list_models.py
++++ b/omnigent/tools/builtins/list_models.py
+@@ -11,6 +11,7 @@ and the in-process path runs the same enumerator via :meth:`invoke`.
+ from __future__ import annotations
+ 
+ import json
++import logging
+ 
+ # Any: tool schemas are heterogeneous dicts.
+ from typing import Any
+@@ -18,6 +19,33 @@ from typing import Any
+ from omnigent.spec.types import AgentSpec
+ from omnigent.tools.base import Tool, ToolContext
+ 
++_logger = logging.getLogger(__name__)
++
++# A worker with this name keeps its row.
++HOST_PROVIDERS_KEY = "host_providers"
++
++
++def list_models_payload(spec: AgentSpec) -> dict[str, Any]:
++    """
++    Build the ``sys_list_models`` result: worker rows plus this host's providers.
++
++    :param spec: The calling agent's spec.
++    :returns: :func:`~omnigent.models.model_catalog.catalog_for_spec` rows,
++        plus :data:`HOST_PROVIDERS_KEY` listing the accounts
++        ``sys_session_create`` can start a child on (omitted when the
++        provider config cannot be read).
++    """
++    from omnigent.models.model_catalog import catalog_for_spec
++    from omnigent.onboarding.provider_config import load_config
++    from omnigent.onboarding.subscription_accounts import host_provider_summary
++
++    payload: dict[str, Any] = dict(catalog_for_spec(spec))
++    try:
++        payload.setdefault(HOST_PROVIDERS_KEY, host_provider_summary(load_config()))
++    except Exception:
++        _logger.debug("host provider listing failed", exc_info=True)
++    return payload
++
+ 
+ class SysListModelsTool(Tool):
+     """
+@@ -61,7 +89,12 @@ class SysListModelsTool(Tool):
+             "(source 'none' means dispatches to that worker cannot run "
+             "in this deployment). Each entry reports {source, verified, "
+             "models: [{id, family, context_window?}], note}; pick "
+-            "'args.model' values verbatim from the target worker's list."
++            "'args.model' values verbatim from the target worker's list. "
++            "'host_providers' lists the accounts this host can run a "
++            "sys_session_create child on: {name, kind, label, clis "
++            "(claude: claude-native/claude-sdk agents; codex: "
++            "codex-native/codex agents), default_for, ready}; pass a name "
++            "as sys_session_create 'provider'."
+         )
+ 
+     def get_schema(self) -> dict[str, Any]:
+@@ -92,9 +125,7 @@ class SysListModelsTool(Tool):
+         :param arguments: Ignored — the tool takes no parameters.
+         :param ctx: Tool execution context (unused).
+         :returns: JSON mapping of worker name (plus ``"self"``) to its
+-            ``{source, verified, models, note}`` row.
++            ``{source, verified, models, note}`` row, plus ``host_providers``.
+         """
+         del arguments, ctx
+-        from omnigent.models.model_catalog import catalog_for_spec
+-
+-        return json.dumps(catalog_for_spec(self._spec))
++        return json.dumps(list_models_payload(self._spec))
+diff --git a/omnigent/tools/builtins/spawn.py b/omnigent/tools/builtins/spawn.py
+index df9848f72033dbc590a39d6b98c446d3af3743be..2548311b9c2b12d9ce7fbca758fdeae934eeeca5 100644
+--- a/omnigent/tools/builtins/spawn.py
++++ b/omnigent/tools/builtins/spawn.py
+@@ -888,7 +888,9 @@ class SysSessionCreateTool(Tool):
+       a fresh session-scoped agent.
+ 
+     An optional ``message`` is queued as the child's first user turn;
+-    an optional ``title`` labels the session.
++    an optional ``title`` labels the session. An optional ``provider``
++    runs the child on another account of this host (see
++    ``docs/providers.md``).
+ 
+     Returns a handle ``{conversation_id, agent_id, title, status}``. The
+     session runs asynchronously — use ``sys_session_get_history`` /
+@@ -1021,6 +1023,24 @@ class SysSessionCreateTool(Tool):
+                                 "default."
+                             ),
+                         },
++                        "provider": {
++                            "type": "string",
++                            "description": (
++                                "Optional account for the child: the name "
++                                "of a providers: entry on this host, e.g. "
++                                "'claude-alt' (a Claude subscription) or "
++                                "'chatgpt' (a Codex subscription). Omit to "
++                                "use your own provider when it serves the "
++                                "child's CLI, else the host default. "
++                                "sys_list_models lists the names under "
++                                "'host_providers'; the provider must serve "
++                                "the child agent's CLI. Only valid with "
++                                "'agent_id'. A child on an account other "
++                                "than yours runs in its own runner and "
++                                "does not wake you when it finishes; check "
++                                "it with sys_session_get_info."
++                            ),
++                        },
+                     },
+                     # Only the always-optional fields are listed in
+                     # ``required`` (none): the agent_id-vs-config_path
+diff --git a/tests/onboarding/test_subscription_accounts.py b/tests/onboarding/test_subscription_accounts.py
+index 539225e50fc92cbe78b0c0302c54425fa00e3eb8..2df4555e74eac285cca29f1dc79d6a85d4abff8d 100644
+--- a/tests/onboarding/test_subscription_accounts.py
++++ b/tests/onboarding/test_subscription_accounts.py
+@@ -23,6 +23,7 @@ from omnigent.onboarding.subscription_accounts import (
+     apply_default_account_env,
+     claude_account_env,
+     default_accounts_env,
++    host_provider_summary,
+     provider_choices,
+     require_session_account_dir,
+     require_subscription_dir_active,
+@@ -463,6 +464,66 @@ def test_provider_choices_list_family_providers_without_secrets(tmp_path: Path)
+     assert provider_choices(_session_config(tmp_path), "cursor") == []
+ 
+ 
++def test_host_provider_summary_names_each_providers_clis_and_defaults(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    _write_claude_login(tmp_path / "m1")
++    config = _session_config(tmp_path)
++
++    rows = {row.pop("name"): row for row in host_provider_summary(config)}
++
++    assert rows["max1"] == {
++        "kind": "subscription",
++        "label": "claude login (own directory)",
++        "clis": ["claude"],
++        "default_for": ["claude"],
++        "ready": True,
++    }
++    assert rows["max2"]["ready"] is False
++    assert rows["codex_b"]["clis"] == rows["codex_b"]["default_for"] == ["codex"]
++    assert rows["dbx"]["clis"] == ["claude", "codex"]
++    assert rows["openrouter"]["clis"] == ["claude"]
++    assert str(tmp_path) not in json.dumps(rows)
++
++    # Inside a runner on Databricks, children of either CLI default to it.
++    monkeypatch.setenv(SESSION_PROVIDER_ENV, "dbx")
++    dbx = next(row for row in host_provider_summary(config) if row["name"] == "dbx")
++    assert dbx["default_for"] == ["claude", "codex"]
++
++
++@pytest.mark.parametrize(
++    "session_provider,provider,own_runner",
++    [
++        (None, "max1", False),
++        (None, "max2", True),
++        (None, "codex_b", False),
++        # Databricks serves both families, so the runner must use it for both.
++        (None, "dbx", True),
++        ("dbx", "dbx", False),
++        ("dbx", "max1", True),
++        ("dbx", "codex_b", True),
++    ],
++)
++def test_child_account_shares_the_runner_only_on_the_runners_account(
++    config_home: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    session_provider: str | None,
++    provider: str,
++    own_runner: bool,
++) -> None:
++    from omnigent.runner.child_account import choose_child_account
++
++    _write_config(config_home, _session_config(tmp_path))
++    for login in ("m1", "m2"):
++        _write_claude_login(tmp_path / login)
++    _write_codex_login(tmp_path / "cb")
++    if session_provider is not None:
++        monkeypatch.setenv(SESSION_PROVIDER_ENV, session_provider)
++
++    assert choose_child_account(provider).own_runner is own_runner
++
++
+ def test_host_launch_env_uses_defaults_or_the_session_choice(
+     config_home: Path, tmp_path: Path
+ ) -> None:
+diff --git a/tests/runner/test_native_subagent_inbox_delivery.py b/tests/runner/test_native_subagent_inbox_delivery.py
+index 58563b6d873f19223a6231f4b49909922623fd7d..4db0eb352efa608afc66383a3a95765682cac6a6 100644
+--- a/tests/runner/test_native_subagent_inbox_delivery.py
++++ b/tests/runner/test_native_subagent_inbox_delivery.py
+@@ -549,6 +549,28 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
+     assert entry.delivered is False
+ 
+ 
++@pytest.mark.asyncio
++async def test_child_in_its_own_runner_is_acked_without_parent_inbox(
++    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A child launched in its own runner (on another account) is ACKed, not retried.
++
++    Its parent runs on another runner, so its inbox never appears here and a
++    503 would only make the forwarder retry until it gives up.
++    """
++    from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
++
++    monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, CHILD_SESSION_ID)
++    http, items = await _post_native_idle(
++        child_body=_child_snapshot(sub_agent_name=None, parent_session_id=PARENT_SESSION_ID),
++        seed_parent_inbox=False,
++        register_work=False,
++    )
++
++    assert http == 204
++    assert items == []
++
++
+ @pytest.mark.asyncio
+ async def test_retained_result_is_delivered_when_parent_inbox_is_created(
+     _clean_subagent_registry: None,
+diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
+index 110194521293d07ab6d66066d5636ba72fb8c773..0054b62e906dfb85135c22488cb06fd10ef532e9 100644
+--- a/tests/runner/test_runner_dispatch.py
++++ b/tests/runner/test_runner_dispatch.py
+@@ -4868,7 +4868,14 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
+         conversation_id="conv_list_models",
+     )
+     payload = json.loads(output)
+-    assert set(payload) == {"worker", "self"}
++    assert set(payload) == {"worker", "self", "host_providers"}
++    # The accounts sys_session_create can start a child on.
++    [account] = payload["host_providers"]
++    assert (account["name"], account["clis"], account["default_for"]) == (
++        "claude",
++        ["claude"],
++        ["claude"],
++    )
+     worker = payload["worker"]
+     assert worker["source"] == "static"
+     assert worker["verified"] is False
+@@ -8292,6 +8299,9 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
+     assert captured["agent_id"] == "ag_x"
+     assert captured["title"] == "auth"
+     assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
++    # Without 'provider' the child stays on the caller's runner and accounts.
++    assert "provider_override" not in captured
++    assert "host_id" not in captured
+     handle = json.loads(output)
+     assert handle["conversation_id"] == "conv_child"
+     assert handle["agent_id"] == "ag_x"
+@@ -8518,6 +8528,201 @@ async def test_sys_session_create_config_not_found(tmp_path: Path) -> None:
+     assert info["config_path"] == "nope.yaml"
+ 
+ 
++def _child_account_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
++    """Configure this host with two Claude accounts, a Codex one and Databricks.
++
++    ``max1`` (the default Claude login) and ``max2`` (its own login directory)
++    are signed in; ``max1`` and ``codex_b`` are the defaults the runner uses.
++    """
++    import yaml
++
++    from omnigent.onboarding.provider_config import SESSION_PROVIDER_ENV
++
++    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
++    for var in (SESSION_PROVIDER_ENV, "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HOME", str(tmp_path / "home"))
++    providers: dict[str, object] = {
++        "max1": {"kind": "subscription", "cli": "claude", "default": True},
++        "max2": {"kind": "subscription", "cli": "claude", "config_dir": str(tmp_path / "m2")},
++        "codex_b": {"kind": "subscription", "cli": "codex", "default": True},
++        "dbx": {"kind": "databricks", "profile": "alt"},
++    }
++    (config_home / "config.yaml").write_text(yaml.safe_dump({"providers": providers}))
++    for login_dir in (tmp_path / "home" / ".claude", tmp_path / "m2"):
++        login_dir.mkdir(parents=True)
++        (login_dir / ".credentials.json").write_text(
++            json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}})
++        )
++
++
++async def _create_child_on_provider(
++    arguments: dict[str, Any], *, child_harness: str = "claude-native", parent_host: bool = True
++) -> tuple[dict[str, Any], list[tuple[str, str, dict[str, Any] | None]]]:
++    """Run ``sys_session_create`` against a fake server; return (result, requests)."""
++    from omnigent.runner.tool_dispatch import execute_tool
++
++    requests: list[tuple[str, str, dict[str, Any] | None]] = []
++
++    async def _server_handler(request: httpx.Request) -> httpx.Response:
++        body = json.loads(request.content) if request.content else None
++        requests.append((request.method, request.url.path, body))
++        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
++            host = {"host_id": "host_1", "workspace": "/repo"} if parent_host else {}
++            return httpx.Response(200, json={"id": "conv_caller", **host})
++        if request.method == "POST" and request.url.path == "/v1/sessions":
++            return httpx.Response(
++                201,
++                json={
++                    "id": "conv_child",
++                    "agent_id": "ag_x",
++                    "agent_name": "claude-native-ui",
++                    "harness": child_harness,
++                    "status": "idle",
++                },
++            )
++        if request.url.path.startswith("/v1/sessions/conv_child"):
++            return httpx.Response(204 if request.method == "DELETE" else 200, json={})
++        return httpx.Response(404, json={"error": str(request.url)})
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(_server_handler),
++        base_url="http://server",
++    ) as server_client:
++        output = await execute_tool(
++            tool_name="sys_session_create",
++            arguments=json.dumps(arguments),
++            server_client=server_client,
++            conversation_id="conv_caller",
++        )
++    return json.loads(output), requests
++
++
++@pytest.mark.asyncio
++async def test_sys_session_create_on_another_account_gets_its_own_runner(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """
++    A provider other than the runner's account creates the child on the
++    parent's host and workspace with ``provider_override`` (so the host launches
++    it a runner on that account), and only then posts the first message.
++    """
++    _child_account_host(monkeypatch, tmp_path)
++
++    result, requests = await _create_child_on_provider(
++        {"agent_id": "ag_x", "provider": "max2", "message": "start"}
++    )
++
++    creates = [body for method, path, body in requests if path == "/v1/sessions"]
++    assert creates == [
++        {
++            "agent_id": "ag_x",
++            "parent_session_id": "conv_caller",
++            "host_id": "host_1",
++            "workspace": "/repo",
++            "provider_override": "max2",
++        }
++    ]
++    assert requests[-1][:2] == ("POST", "/v1/sessions/conv_child/events")
++    assert result["conversation_id"] == "conv_child"
++    assert result["provider"] == "max2"
++    assert "does not wake you" in result["note"]
++
++
++@pytest.mark.asyncio
++async def test_sys_session_create_on_the_runners_account_stays_colocated(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """The account this runner already uses for the family keeps the child on it."""
++    _child_account_host(monkeypatch, tmp_path)
++
++    result, requests = await _create_child_on_provider(
++        {"agent_id": "ag_x", "provider": "max1", "message": "start"}
++    )
++
++    creates = [body for method, path, body in requests if path == "/v1/sessions"]
++    assert creates == [{"agent_id": "ag_x", "parent_session_id": "conv_caller"}]
++    assert requests[-1][:2] == ("POST", "/v1/sessions/conv_child/events")
++    assert result["provider"] == "max1"
++    assert "note" not in result
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "arguments,parent_host,error,message",
++    [
++        ({"provider": "nope"}, True, "provider_not_found", "configured: codex_b, dbx, max1, max2"),
++        ({"provider": "max2"}, False, "provider_unavailable", "connected host"),
++    ],
++)
++async def test_sys_session_create_rejects_a_provider_before_creating(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    arguments: dict[str, Any],
++    parent_host: bool,
++    error: str,
++    message: str,
++) -> None:
++    """An unknown provider, or a parent on no host, fails before any child exists."""
++    _child_account_host(monkeypatch, tmp_path)
++
++    result, requests = await _create_child_on_provider(
++        {"agent_id": "ag_x", **arguments}, parent_host=parent_host
++    )
++
++    assert result["error"] == error
++    assert message in result["message"]
++    assert not [path for _, path, _ in requests if path == "/v1/sessions"]
++
++
++@pytest.mark.asyncio
++async def test_sys_session_create_reports_a_provider_not_signed_in(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """A subscription without a login fails with the command that signs it in."""
++    _child_account_host(monkeypatch, tmp_path)
++    (tmp_path / "m2" / ".credentials.json").unlink()
++
++    result, requests = await _create_child_on_provider({"agent_id": "ag_x", "provider": "max2"})
++
++    assert result["error"] == "provider_not_ready"
++    assert "claude auth login" in result["message"]
++    assert requests == []
++
++
++@pytest.mark.asyncio
++async def test_sys_session_create_deletes_a_child_its_provider_cannot_run(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """
++    A Claude account for a Codex agent is refused once the server resolves the
++    child's harness: the child is deleted before any message reaches it, and
++    the error lists the providers that can run it.
++    """
++    _child_account_host(monkeypatch, tmp_path)
++
++    result, requests = await _create_child_on_provider(
++        {"agent_id": "ag_codex", "provider": "max2", "message": "start"},
++        child_harness="codex-native",
++    )
++
++    assert result["error"] == "provider_not_for_harness"
++    assert "Providers for 'codex-native' on this host: codex_b (default), dbx" in result["message"]
++    assert ("DELETE", "/v1/sessions/conv_child", None) in requests
++    assert not [path for _, path, _ in requests if path.endswith("/events")]
++
++
++@pytest.mark.asyncio
++async def test_sys_session_create_refuses_a_provider_with_config_path() -> None:
++    """The multipart create cannot carry a provider, so it is refused, not dropped."""
++    result, requests = await _create_child_on_provider(
++        {"config_path": "helper.yaml", "provider": "max2"}
++    )
++
++    assert "supported only with 'agent_id'" in result["error"]
++    assert requests == []
++
++
+ @pytest.mark.asyncio
+ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
+     """
+diff --git a/tests/server/integration/test_session_host_launch.py b/tests/server/integration/test_session_host_launch.py
+index abc565ff31d896fec6c33942aa5b13ffb995f8ce..59280e0b4385cea58f7d5bf5190d109d2e95fc94 100644
+--- a/tests/server/integration/test_session_host_launch.py
++++ b/tests/server/integration/test_session_host_launch.py
+@@ -509,6 +509,48 @@ async def test_inline_launch_carries_the_session_provider(
+     assert conv.provider_override == "claude-max2"
+ 
+ 
++async def test_child_on_its_own_provider_gets_its_own_runner(
++    client: httpx.AsyncClient,
++    app: FastAPI,
++    db_uri: str,
++) -> None:
++    """A child that chooses a provider is launched on the host, not co-located.
++
++    The provider lives in the runner's environment, so sharing the parent's
++    runner would run the child on the parent's account.
++    """
++    comm = await _connect_host(app, [CAP_SESSION_PROVIDER])
++    agent = await create_test_agent(client)
++    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
++    parent = await client.post(
++        "/v1/sessions",
++        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
++    )
++    await responder
++    assert parent.status_code == 201, parent.text
++
++    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
++    child = await client.post(
++        "/v1/sessions",
++        json={
++            "agent_id": agent["id"],
++            "parent_session_id": parent.json()["id"],
++            "host_id": _HOST_ID,
++            "workspace": _WORKSPACE,
++            "provider_override": "claude-max2",
++        },
++    )
++    frame = await responder
++
++    assert child.status_code == 201, child.text
++    assert frame.session_id == child.json()["id"]
++    assert frame.provider == "claude-max2"
++    assert child.json()["runner_id"] not in (None, parent.json()["runner_id"])
++    conv = SqlAlchemyConversationStore(db_uri).get_conversation(child.json()["id"])
++    assert conv is not None
++    assert conv.parent_conversation_id == parent.json()["id"]
++
++
+ @pytest.mark.parametrize(
+     "payload,capabilities,detail",
+     [
+diff --git a/tests/server/routes/test_subagent_status_forward_recovery.py b/tests/server/routes/test_subagent_status_forward_recovery.py
+index c348e80e00604c816afd41b6cf523672c2aba2a3..500bcf4bf1af00d39abdf06b909b362e0422ec39 100644
+--- a/tests/server/routes/test_subagent_status_forward_recovery.py
++++ b/tests/server/routes/test_subagent_status_forward_recovery.py
+@@ -30,6 +30,8 @@ def _conv(
+     parent_id: str | None = None,
+     root_id: str | None = None,
+     labels: dict[str, str] | None = None,
++    host_id: str | None = None,
++    provider_override: str | None = None,
+ ) -> Any:
+     """Build a minimal conversation stand-in with the fields the helper reads."""
+     return types.SimpleNamespace(
+@@ -38,6 +40,8 @@ def _conv(
+         parent_conversation_id=parent_id,
+         root_conversation_id=root_id or conv_id,
+         labels=labels or {},
++        host_id=host_id,
++        provider_override=provider_override,
+     )
+ 
+ 
+@@ -91,6 +95,35 @@ def _patch_forward_and_wait(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+     return state
+ 
+ 
++async def test_child_on_its_own_provider_is_never_moved_to_the_parent_runner(
++    _patch_forward_and_wait: dict[str, Any],
++) -> None:
++    """A child launched in its own runner on another account keeps that runner.
++
++    Moving it onto the parent's runner would run it on the parent's account.
++    """
++    child = _conv(
++        "conv_child",
++        runner_id="runner_child",
++        parent_id="conv_parent",
++        host_id="host_1",
++        provider_override="claude-alt",
++    )
++    store = _FakeStore(_conv("conv_parent", runner_id="runner_parent"))
++
++    result = await _recover_subagent_status_forward_via_parent(
++        child,
++        runner_router=None,
++        tunnel_registry=object(),
++        conversation_store=store,  # type: ignore[arg-type]
++        forward_body={"type": "external_session_status", "data": {"status": "idle"}},
++    )
++
++    assert result is None
++    assert store.rebinds == []
++    assert _patch_forward_and_wait["forwarded_with"] == []
++
++
+ async def test_recover_rebinds_to_parent_runner_and_redelivers(
+     _patch_forward_and_wait: dict[str, Any],
+ ) -> None:
+diff --git a/tests/tools/builtins/test_list_models.py b/tests/tools/builtins/test_list_models.py
+index bb9f0b941f977b2a57a41f73bc345611d0b28299..aee9c809a053afb7f5f109fa15b3c31b0ba9f72a 100644
+--- a/tests/tools/builtins/test_list_models.py
++++ b/tests/tools/builtins/test_list_models.py
+@@ -110,3 +110,45 @@ def test_invoke_lists_acp_curated_models_without_gateway_credentials(
+     ]
+     assert parsed["acp_worker"]["source"] == "static"
+     assert parsed["acp_worker"]["verified"] is False
++
++
++def test_invoke_lists_the_host_providers_a_child_can_run_on(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """Agents find the names sys_session_create accepts as 'provider' here."""
++    isolate_provider_resolution(monkeypatch, tmp_path)
++    (tmp_path / "config.yaml").write_text(
++        "providers:\n"
++        "  dbx:\n"
++        "    kind: databricks\n"
++        "    profile: alt\n"
++        "    default: true\n"
++        "  gateway:\n"
++        "    kind: gateway\n"
++        "    openai:\n"
++        "      base_url: https://gateway.example.com/v1\n"
++        "      api_key: sk-secret\n"
++    )
++
++    with patch("omnigent.models.model_catalog.catalog_for_spec", return_value={"self": {}}):
++        parsed = json.loads(SysListModelsTool(spec=_make_spec()).invoke("{}", _ctx()))
++
++    assert parsed["host_providers"] == [
++        {
++            "name": "dbx",
++            "kind": "databricks",
++            "label": "Databricks profile alt",
++            "clis": ["claude", "codex"],
++            "default_for": ["claude", "codex"],
++            "ready": True,
++        },
++        {
++            "name": "gateway",
++            "kind": "gateway",
++            "label": "gateway · gateway.example.com",
++            "clis": ["codex"],
++            "default_for": [],
++            "ready": True,
++        },
++    ]
++    assert "sk-secret" not in json.dumps(parsed)

@@ -1,0 +1,278 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 27 Oct 2026 04:16:41 +0000
+Subject: [PATCH] fix(codex-native): bring web !command shell inputs up to its
+ PR
+
+When the bridge is idle, hold the injection lock until the forwarder records
+the shell command's turn, so a follow-up message cannot double-start; keep a
+trailing escaped space or heredoc body as part of the command; add the PR's
+typed-!command e2e test. Matches the Codex part of
+https://github.com/omnigent-ai/omnigent/pull/11396. The Run button, its e2e
+test and the claude-native shell test stay with run-suggested-commands.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (fix: hardens the typed !command that docs/run-suggested-commands.md describes; no setting)
+---
+ omnigent/inner/codex_native_executor.py       | 44 ++++++++-
+ .../messages/test_native_codex_shell_input.py | 39 ++++++++
+ tests/inner/test_codex_native_executor.py     | 99 ++++++++++++++++++-
+ 3 files changed, 174 insertions(+), 8 deletions(-)
+
+diff --git a/omnigent/inner/codex_native_executor.py b/omnigent/inner/codex_native_executor.py
+index a0aea841688329bdac2298550adafc41463fb057..22483cc0bfad04f419b347a7dd891c6abef158f0 100644
+--- a/omnigent/inner/codex_native_executor.py
++++ b/omnigent/inner/codex_native_executor.py
+@@ -447,6 +447,12 @@ async def _steer_codex_turn(
+         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+ 
+ 
++# How long an idle bridge waits for the forwarder to record a shell command's
++# turn before the injection lock is released.
++_SHELL_TURN_WAIT_SECONDS = 2.0
++_SHELL_TURN_POLL_SECONDS = 0.05
++
++
+ async def _run_codex_shell_command(
+     client: CodexAppServerClient,
+     *,
+@@ -462,7 +468,36 @@ async def _run_codex_shell_command(
+         state,
+         bridge_dir=bridge_dir,
+     )
+-    _logger.info("Codex native ran user shell command")
++    if state.active_turn_id is None:
++        # The ack carries no turn id, so hold the injection lock until the
++        # forwarder records the shell's turn/started; otherwise a follow-up
++        # message could read an idle bridge and double-start.
++        turn_id = await _wait_for_shell_turn(bridge_dir, thread_id=state.thread_id)
++        _logger.info("Codex native ran user shell command: turn_id=%s", turn_id)
++        return
++    _logger.info("Codex native ran user shell command in active turn")
++
++
++async def _wait_for_shell_turn(bridge_dir: Path, *, thread_id: str) -> str | None:
++    """
++    Wait for the forwarder to record a shell command's turn in bridge state.
++
++    :param bridge_dir: Native Codex bridge directory.
++    :param thread_id: Thread the shell command ran on, e.g. ``"thread_123"``.
++    :returns: The recorded turn id, or ``None`` when the wait ran out (a
++        short command can finish before its turn is observed).
++    """
++    polls = max(1, int(_SHELL_TURN_WAIT_SECONDS / _SHELL_TURN_POLL_SECONDS))
++    for _ in range(polls):
++        current = read_bridge_state(bridge_dir)
++        if (
++            current is not None
++            and current.thread_id == thread_id
++            and current.active_turn_id is not None
++        ):
++            return current.active_turn_id
++        await asyncio.sleep(_SHELL_TURN_POLL_SECONDS)
++    return None
+ 
+ 
+ async def _inject_codex_turn(
+@@ -1142,16 +1177,19 @@ def _shell_command_from_input_items(input_items: list[dict[str, object]]) -> str
+     :param input_items: Codex input items, e.g. ``[{"type": "text", "text": "!ls -la"}]``.
+     :returns: The command without its ``!`` prefix, e.g. ``"ls -la"``, or ``None``
+         when the input is a prompt (including ``!!`` and attachment-bearing input).
++        Only the surrounding whitespace and trailing newlines are dropped: a
++        trailing escaped space or a heredoc body is part of the command.
+     """
+     if len(input_items) != 1 or input_items[0].get("type") != "text":
+         return None
+     text = input_items[0].get("text")
+     if not isinstance(text, str):
+         return None
+-    text = text.strip()
++    text = text.lstrip()
+     if not text.startswith("!") or text.startswith("!!"):
+         return None
+-    return text[1:].strip() or None
++    command = text[1:].lstrip().rstrip("\r\n")
++    return command if command.strip() else None
+ 
+ 
+ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
+diff --git a/tests/e2e_ui/messages/test_native_codex_shell_input.py b/tests/e2e_ui/messages/test_native_codex_shell_input.py
+index 3f7c97e34cf145505f7773fc11d1a7a4e3802dff..99a7c5f0e13f877ef742f897e86fdf28558bc976 100644
+--- a/tests/e2e_ui/messages/test_native_codex_shell_input.py
++++ b/tests/e2e_ui/messages/test_native_codex_shell_input.py
+@@ -36,6 +36,45 @@ def _shell_inputs(client: httpx.Client, session_id: str) -> list[str]:
+     ]
+ 
+ 
++@pytest.mark.nightly
++@pytest.mark.timeout(300)
++def test_web_shell_input_runs_in_codex_shell_not_as_prompt(
++    page: Page,
++    native_codex_mock_session: tuple[str, str],
++    mock_llm_server_url: str,
++) -> None:
++    base_url, session_id = native_codex_mock_session
++    marker = f"shell-{uuid.uuid4().hex[:8]}"
++    leaked = f"prompt-leaked-{uuid.uuid4().hex[:8]}"
++    reset_mock_llm(mock_llm_server_url)
++    # Any prompt that reaches the model answers with the leak marker.
++    for model in ("default", _CODEX_MOCK_MODEL):
++        set_fallback_mock_llm(mock_llm_server_url, model, leaked)
++
++    page.goto(f"{base_url}/c/{session_id}")
++    _open_terminal_view(page)
++    _wait_terminal_connected(page)
++    _ensure_chat_view(page)
++    _send(page, "Hello")
++    expect(page.locator(_ASSISTANT, has_text=leaked).first).to_be_visible(timeout=90_000)
++    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
++
++    _send(page, f"!echo {marker}")
++
++    expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(1, timeout=60_000)
++    with httpx.Client(base_url=base_url, timeout=15) as client:
++        deadline = time.monotonic() + 60
++        while _shell_inputs(client, session_id) != [f"echo {marker}"]:
++            assert time.monotonic() < deadline, _shell_inputs(client, session_id)
++            time.sleep(1)
++        snapshot = client.get(f"/v1/sessions/{session_id}")
++        snapshot.raise_for_status()
++        assert snapshot.json()["pending_inputs"] == []
++    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
++    # The shell command never reached the model as a prompt.
++    assert page.locator(_ASSISTANT, has_text=leaked).count() == 1
++
++
+ @pytest.mark.nightly
+ @pytest.mark.timeout(300)
+ def test_run_button_runs_each_suggested_command_in_codex_shell(
+diff --git a/tests/inner/test_codex_native_executor.py b/tests/inner/test_codex_native_executor.py
+index 0c81c51dba368be7db8ff6c63950b3ce2278d6da..3a4078f8c6ec7b680d901f5f36d7439a60378a91 100644
+--- a/tests/inner/test_codex_native_executor.py
++++ b/tests/inner/test_codex_native_executor.py
+@@ -23,6 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
+     read_bridge_state,
+     read_codex_config_effort,
+     read_codex_config_model,
++    update_active_turn_id,
+     write_bridge_startup_error,
+     write_bridge_startup_timeout,
+     write_bridge_state,
+@@ -989,9 +990,17 @@ def test_shell_input_runs_through_thread_shell_command(
+     """A web ``!command`` runs in Codex's shell instead of prompting the model."""
+     _FakeCodexNativeClient.requests = []
+     _FakeCodexNativeClient.created = []
++
++    class _ShellClient(_FakeCodexNativeClient):
++        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
++            response = await super().request(method, params)
++            if method == "thread/shellCommand" and active_turn_id is None:
++                # The forwarder records the shell's turn from turn/started.
++                update_active_turn_id(tmp_path, "turn_shell")
++            return response
++
+     monkeypatch.setattr(
+-        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+-        _FakeCodexNativeClient,
++        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _ShellClient
+     )
+     _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+     executor = CodexNativeExecutor(bridge_dir=tmp_path)
+@@ -1005,13 +1014,93 @@ def test_shell_input_runs_through_thread_shell_command(
+     assert _FakeCodexNativeClient.requests == [
+         ("thread/shellCommand", {"threadId": "thread_123", "command": "gcloud auth login"})
+     ]
+-    # Codex reports the shell's turn through turn/started; nothing is recorded here.
++    # The ack carries no turn id; the executor leaves the recorded turn alone.
+     state = read_bridge_state(tmp_path)
+     assert state is not None
+-    assert state.active_turn_id == active_turn_id
++    assert state.active_turn_id == (active_turn_id or "turn_shell")
++
++
++def test_shell_input_waits_for_the_forwarder_to_record_its_turn(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """An idle bridge holds the injection lock until the shell's turn is recorded."""
++    _FakeCodexNativeClient.requests = []
++    _FakeCodexNativeClient.created = []
++    monkeypatch.setattr(
++        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
++        _FakeCodexNativeClient,
++    )
++    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.5)
++    _seed_bridge(tmp_path)
++    executor = CodexNativeExecutor(bridge_dir=tmp_path)
++
++    async def run() -> list[Any]:
++        async def forwarder_records_turn() -> None:
++            await asyncio.sleep(0.1)
++            update_active_turn_id(tmp_path, "turn_shell")
++
++        recorder = asyncio.create_task(forwarder_records_turn())
++        events = [
++            event
++            async for event in executor.run_turn(
++                [{"role": "user", "content": [{"type": "input_text", "text": "!sleep 1"}]}],
++                [],
++                "",
++            )
++        ]
++        # A follow-up message sent right after the shell command steers the
++        # shell's turn instead of starting a second one.
++        assert await executor.enqueue_session_message("main", "and then?")
++        await recorder
++        return events
++
++    events = asyncio.run(run())
++    assert [type(event) for event in events] == [TurnComplete]
++    assert [method for method, _params in _FakeCodexNativeClient.requests] == [
++        "thread/shellCommand",
++        "turn/steer",
++    ]
++    assert _FakeCodexNativeClient.requests[1][1]["expectedTurnId"] == "turn_shell"
++
++
++def test_shell_input_wait_for_its_turn_is_bounded(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """A shell command whose turn is never observed still returns promptly."""
++    _FakeCodexNativeClient.requests = []
++    _FakeCodexNativeClient.created = []
++    monkeypatch.setattr(
++        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
++        _FakeCodexNativeClient,
++    )
++    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.1)
++    _seed_bridge(tmp_path)
++
++    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "!true")
++
++    assert [type(event) for event in events] == [TurnComplete]
++    state = read_bridge_state(tmp_path)
++    assert state is not None
++    assert state.active_turn_id is None
++
++
++@pytest.mark.parametrize(
++    ("text", "command"),
++    [
++        ("!printf '<%s>' foo\\ \n", "printf '<%s>' foo\\ "),
++        ("!cat <<EOF\nhi\nEOF\n", "cat <<EOF\nhi\nEOF"),
++        ("  !  ls -la  ", "ls -la  "),
++    ],
++    ids=["escaped-trailing-space", "heredoc", "padding"],
++)
++def test_shell_command_keeps_its_body(text: str, command: str) -> None:
++    assert (
++        codex_native_executor._shell_command_from_input_items([{"type": "text", "text": text}])
++        == command
++    )
+ 
+ 
+-@pytest.mark.parametrize("text", ["!!not a command", "!", "say !hi"])
++@pytest.mark.parametrize("text", ["!!not a command", "!", "!  \n", "say !hi"])
+ def test_non_shell_bang_text_is_sent_as_a_prompt(
+     text: str,
+     monkeypatch: pytest.MonkeyPatch,

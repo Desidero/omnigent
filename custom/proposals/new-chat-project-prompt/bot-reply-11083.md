@@ -1,0 +1,2 @@
+<!-- posted 2026-10-23: https://github.com/omnigent-ai/omnigent/issues/11083#issuecomment-6372722004 -->
+Not a duplicate. #4409 asks for project rows in the command palette; this issue asks for a project prompt on every new-session entry point (hotkey, sidebar, palette, mobile drawer) and builds on #4409. I have a small PR for #4409 on its own, and the prompt stacked on top of it, so #4409 can close first.

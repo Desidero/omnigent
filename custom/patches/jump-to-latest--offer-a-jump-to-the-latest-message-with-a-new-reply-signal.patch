@@ -1,0 +1,554 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Sat, 24 Oct 2026 18:26:16 +0000
+Subject: [PATCH] feat(web): offer a jump to the latest message with a
+ new-reply signal
+
+A reader who scrolls up in the transcript releases follow-tail and then has
+no labelled way back and no sign that the conversation moved on below them.
+The stock ConversationScrollButton rendered an unlabeled arrow 16px inside
+the scroll container, inside the 32px scroll fade, with no notification
+state and no accessible name.
+
+Replace it with a bottom-edge pill mounted into the conversation wrapper
+(outside the fade) that reads the StickToBottom context: "Jump to latest"
+while the reader is away from the bottom, "New reply" while a turn streams
+below them, "N new messages" once distinct user/assistant messages have
+been appended since the last one they saw at the bottom (older history
+paged in above does not count). The notification state uses the filled
+primary button; the idle state matches the Jump-to-top pill. Clicking
+scrolls to the bottom and re-arms follow-tail. The pill is keyboard
+reachable with an aria-label that carries the count, always visible while
+away on desktop and touch alike, and appears only after a short settle so
+the mount pin and deep-link scrolls never flash it.
+
+The counting and labelling are pure helpers with unit tests; the pill is
+tested inside the real Conversation context with a simulated scroll-away.
+
+Not upstream yet: proposed from feat/transcript-jump-to-latest; drop this copy
+once it merges.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit f0bb4c17c732d0b7257a2f8eaab2573c454c33af)
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (transcript control that appears by itself when you scroll up; no setting)
+---
+ .../chat/JumpToLatestButton.test.tsx          | 257 ++++++++++++++++++
+ .../components/chat/JumpToLatestButton.tsx    | 183 +++++++++++++
+ web/src/components/chat/Transcript.tsx        |  20 +-
+ 3 files changed, 457 insertions(+), 3 deletions(-)
+ create mode 100644 web/src/components/chat/JumpToLatestButton.test.tsx
+ create mode 100644 web/src/components/chat/JumpToLatestButton.tsx
+
+diff --git a/web/src/components/chat/JumpToLatestButton.test.tsx b/web/src/components/chat/JumpToLatestButton.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..68fa9bc41f5c25631bdb633006f3b4419312d241
+--- /dev/null
++++ b/web/src/components/chat/JumpToLatestButton.test.tsx
+@@ -0,0 +1,257 @@
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { afterEach, describe, expect, it } from "vitest";
++import type { Bubble } from "@/lib/renderItems";
++import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
++import {
++  JumpToLatestButton,
++  countNewMessages,
++  jumpToLatestLabel,
++  lastSettledMessageKey,
++  transcriptMessageKeys,
++} from "./JumpToLatestButton";
++
++afterEach(cleanup);
++
++function user(itemId: string, text = "hello"): Extract<Bubble, { kind: "user" }> {
++  return { kind: "user", itemId, content: [{ type: "input_text", text }] };
++}
++
++function assistant(
++  responseId: string,
++  lifecycle: Extract<Bubble, { kind: "assistant" }>["lifecycle"] = "completed",
++  stableId = responseId,
++): Extract<Bubble, { kind: "assistant" }> {
++  return {
++    kind: "assistant",
++    responseId,
++    stableId,
++    lifecycle,
++    error: null,
++    items: [{ kind: "text", itemId: `${stableId}-text`, text: "reply", final: true }],
++  };
++}
++
++const systemUser: Extract<Bubble, { kind: "user" }> = {
++  kind: "user",
++  itemId: "sys-1",
++  content: [{ type: "input_text", text: "[System: timer fired]" }],
++};
++
++describe("transcript message keys", () => {
++  it("counts one key per user turn and per assistant response", () => {
++    expect(
++      transcriptMessageKeys([
++        user("u1"),
++        assistant("r1", "completed", "r1-a"),
++        assistant("r1", "completed", "r1-b"),
++        { kind: "compaction", itemId: "c1" },
++        user("u2"),
++        assistant("r2", "streaming"),
++      ]),
++    ).toEqual(["user:u1", "assistant:r1", "user:u2", "assistant:r2"]);
++  });
++
++  it("ignores system messages", () => {
++    expect(transcriptMessageKeys([user("u1"), systemUser])).toEqual(["user:u1"]);
++  });
++
++  it("treats a streaming reply as not yet seen", () => {
++    expect(lastSettledMessageKey([user("u1"), assistant("r1", "streaming")])).toBe("user:u1");
++    expect(lastSettledMessageKey([user("u1"), assistant("r1")])).toBe("assistant:r1");
++    expect(lastSettledMessageKey([systemUser])).toBeNull();
++    expect(lastSettledMessageKey([])).toBeNull();
++  });
++});
++
++describe("new message count", () => {
++  it("counts distinct messages after the last seen one", () => {
++    const keys = ["user:u1", "assistant:r1", "user:u2", "assistant:r2"];
++    expect(countNewMessages(keys, "assistant:r1")).toBe(2);
++    expect(countNewMessages(keys, "assistant:r2")).toBe(0);
++    expect(countNewMessages(keys, null)).toBe(4);
++  });
++
++  it("ignores older history landing above the seen message", () => {
++    expect(countNewMessages(["user:u0", "assistant:r0", "user:u1"], "user:u1")).toBe(0);
++  });
++
++  it("asks for a new baseline when the seen message is gone", () => {
++    expect(countNewMessages(["user:u9"], "user:u1")).toBeNull();
++  });
++});
++
++describe("jump to latest label", () => {
++  it("offers a plain jump with nothing new", () => {
++    expect(jumpToLatestLabel({ newCount: 0, streaming: false })).toEqual({
++      text: "Jump to latest",
++      ariaLabel: "Jump to the latest message",
++      attention: false,
++    });
++  });
++
++  it("signals a streaming reply", () => {
++    expect(jumpToLatestLabel({ newCount: 1, streaming: true })).toMatchObject({
++      text: "New reply",
++      attention: true,
++    });
++    expect(jumpToLatestLabel({ newCount: 0, streaming: true }).text).toBe("New reply");
++  });
++
++  it("counts appended messages, streaming or not", () => {
++    expect(jumpToLatestLabel({ newCount: 1, streaming: false }).text).toBe("1 new message");
++    expect(jumpToLatestLabel({ newCount: 3, streaming: false })).toMatchObject({
++      text: "3 new messages",
++      ariaLabel: "3 new messages, jump to the latest message",
++      attention: true,
++    });
++    expect(jumpToLatestLabel({ newCount: 2, streaming: true }).text).toBe("2 new messages");
++  });
++});
++
++describe("JumpToLatestButton", () => {
++  const SCROLL_HEIGHT = 2000;
++  const CLIENT_HEIGHT = 500;
++  const BOTTOM = SCROLL_HEIGHT - 1 - CLIENT_HEIGHT;
++
++  function transcript(containerEl: HTMLElement, bubbles: Bubble[], streaming = false) {
++    return (
++      <Conversation>
++        <ConversationContent>
++          <div style={{ height: SCROLL_HEIGHT }} />
++        </ConversationContent>
++        <JumpToLatestButton containerEl={containerEl} bubbles={bubbles} streaming={streaming} />
++      </Conversation>
++    );
++  }
++
++  function mount(bubbles: Bubble[], streaming = false) {
++    const containerEl = document.createElement("div");
++    document.body.append(containerEl);
++    const view = render(transcript(containerEl, bubbles, streaming));
++    const scrollEl = view.container.querySelector<HTMLElement>('[role="log"] > div')!;
++    let scrollTop = BOTTOM;
++    Object.defineProperties(scrollEl, {
++      scrollHeight: { configurable: true, value: SCROLL_HEIGHT },
++      clientHeight: { configurable: true, value: CLIENT_HEIGHT },
++      scrollTop: {
++        configurable: true,
++        get: () => scrollTop,
++        set: (value: number) => {
++          scrollTop = Math.max(0, Math.min(value, BOTTOM));
++        },
++      },
++    });
++    // StickToBottom only notices a reader scrolling up relative to a previous
++    // scroll event, so settle at the bottom first.
++    fireEvent.scroll(scrollEl);
++    const scrollTo = (top: number) => {
++      scrollEl.scrollTop = top;
++      fireEvent.scroll(scrollEl);
++    };
++    const rerender = (next: Bubble[], nextStreaming = false) =>
++      view.rerender(transcript(containerEl, next, nextStreaming));
++    return { scrollEl, scrollTo, rerender, containerEl, unmount: view.unmount };
++  }
++
++  const pill = () => screen.getByTestId("jump-to-latest");
++  const expectHidden = () => expect(pill()).toHaveAttribute("aria-hidden", "true");
++  const expectShown = async () =>
++    waitFor(() => {
++      expect(pill()).toHaveAttribute("aria-hidden", "false");
++      expect(pill()).toHaveAttribute("tabindex", "0");
++    });
++
++  it("stays hidden at the bottom and appears once the reader scrolls away", async () => {
++    const { scrollTo, containerEl, unmount } = mount([user("u1"), assistant("r1")]);
++    expectHidden();
++    expect(pill()).toHaveAttribute("tabindex", "-1");
++    expect(containerEl.contains(pill())).toBe(true);
++
++    scrollTo(400);
++    // Not before the settle delay: a mount pin or deep-link scroll never flashes it.
++    expectHidden();
++    await expectShown();
++    expect(pill()).toHaveTextContent("Jump to latest");
++    expect(pill()).toHaveAttribute("aria-label", "Jump to the latest message");
++    expect(pill()).toHaveAttribute("data-state", "idle");
++    unmount();
++  });
++
++  it("signals a reply streaming below and then counts what landed", async () => {
++    // The reader sent u2, then scrolled up while its reply streams.
++    const { scrollTo, rerender, unmount } = mount(
++      [user("u1"), assistant("r1"), user("u2"), assistant("r2", "streaming")],
++      true,
++    );
++    scrollTo(400);
++    await expectShown();
++    expect(pill()).toHaveTextContent("New reply");
++    expect(pill()).toHaveAttribute("aria-label", "New reply streaming, jump to it");
++    expect(pill()).toHaveAttribute("data-state", "new");
++
++    rerender([user("u1"), assistant("r1"), user("u2"), assistant("r2")]);
++    expect(pill()).toHaveTextContent("1 new message");
++
++    // Another client adds a turn below.
++    rerender([
++      user("u1"),
++      assistant("r1"),
++      user("u2"),
++      assistant("r2"),
++      user("u3"),
++      assistant("r3"),
++    ]);
++    expect(pill()).toHaveTextContent("3 new messages");
++    expect(pill()).toHaveAttribute("aria-label", "3 new messages, jump to the latest message");
++    unmount();
++  });
++
++  it("keeps counting a reply that was still streaming when the reader left", async () => {
++    const { scrollTo, rerender, unmount } = mount([user("u1"), assistant("r1", "streaming")]);
++    scrollTo(400);
++    await expectShown();
++
++    rerender([user("u1"), assistant("r1")]);
++    expect(pill()).toHaveTextContent("1 new message");
++    unmount();
++  });
++
++  it("does not count older history or a replaced conversation as new", async () => {
++    const { scrollTo, rerender, unmount } = mount([user("u5"), assistant("r5")]);
++    scrollTo(400);
++    await expectShown();
++
++    rerender([user("u4"), assistant("r4"), user("u5"), assistant("r5")]);
++    expect(pill()).toHaveTextContent("Jump to latest");
++
++    rerender([user("x1"), assistant("y1"), user("x2"), assistant("y2")]);
++    expect(pill()).toHaveTextContent("Jump to latest");
++    unmount();
++  });
++
++  it("returns to the bottom and re-engages follow on click or Enter", async () => {
++    const { scrollEl, scrollTo, rerender, unmount } = mount([user("u1"), assistant("r1")]);
++    scrollTo(400);
++    await expectShown();
++    rerender([user("u1"), assistant("r1"), user("u2"), assistant("r2")]);
++    expect(pill()).toHaveTextContent("2 new messages");
++
++    await userEvent.click(pill());
++    expectHidden();
++    await waitFor(() => expect(scrollEl.scrollTop).toBe(BOTTOM));
++
++    // Content growing while followed keeps the pill away.
++    rerender([user("u1"), assistant("r1"), user("u2"), assistant("r2"), user("u3")]);
++    expectHidden();
++
++    scrollTo(300);
++    await expectShown();
++    expect(pill()).toHaveTextContent("Jump to latest");
++    pill().focus();
++    await userEvent.keyboard("{Enter}");
++    expectHidden();
++    await waitFor(() => expect(scrollEl.scrollTop).toBe(BOTTOM));
++    unmount();
++  });
++});
+diff --git a/web/src/components/chat/JumpToLatestButton.tsx b/web/src/components/chat/JumpToLatestButton.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1ee4b4562a3da43434fdb842dff599ba517b0cd
+--- /dev/null
++++ b/web/src/components/chat/JumpToLatestButton.tsx
+@@ -0,0 +1,183 @@
++import { useCallback, useEffect, useMemo, useRef, useState } from "react";
++import { createPortal } from "react-dom";
++import { ArrowDownIcon } from "lucide-react";
++import { useStickToBottomContext } from "use-stick-to-bottom";
++import { Button } from "@/components/ui/button";
++import { cn } from "@/lib/utils";
++import type { Bubble } from "@/lib/renderItems";
++import { bubbleKey, isSystemBubble } from "@/components/chat/chatBubbleParts";
++
++/**
++ * One key per message a reader scrolled up can miss: each real user turn and
++ * each assistant response, however many bubbles the pipeline split it into.
++ */
++export function transcriptMessageKeys(bubbles: readonly Bubble[]): string[] {
++  const keys: string[] = [];
++  for (const bubble of bubbles) {
++    if (bubble.kind === "user") {
++      if (!isSystemBubble(bubble)) keys.push(bubbleKey(bubble));
++    } else if (bubble.kind === "assistant") {
++      const key = `assistant:${bubble.responseId}`;
++      if (keys.at(-1) !== key) keys.push(key);
++    }
++  }
++  return keys;
++}
++
++/**
++ * The newest message that is complete: a reply still streaming when the reader
++ * scrolls away is not something they have read, so it stays countable.
++ */
++export function lastSettledMessageKey(bubbles: readonly Bubble[]): string | null {
++  for (let i = bubbles.length - 1; i >= 0; i--) {
++    const bubble = bubbles[i]!;
++    if (bubble.kind === "user") {
++      if (!isSystemBubble(bubble)) return bubbleKey(bubble);
++    } else if (bubble.kind === "assistant" && bubble.lifecycle !== "streaming") {
++      return `assistant:${bubble.responseId}`;
++    }
++  }
++  return null;
++}
++
++/**
++ * Distinct messages after the last one the reader saw at the bottom. Older
++ * history landing above counts for nothing. `null` when `lastSeenKey` is no
++ * longer in the list (a conversation switch or a reload replaced it), so the
++ * caller re-baselines instead of reporting everything as new.
++ */
++export function countNewMessages(
++  keys: readonly string[],
++  lastSeenKey: string | null,
++): number | null {
++  if (lastSeenKey === null) return keys.length;
++  const seenIndex = keys.lastIndexOf(lastSeenKey);
++  if (seenIndex < 0) return null;
++  return new Set(keys.slice(seenIndex + 1)).size;
++}
++
++export interface JumpToLatestLabel {
++  text: string;
++  ariaLabel: string;
++  /** New content landed below the reader: use the attention treatment. */
++  attention: boolean;
++}
++
++/** Pill wording for what arrived while the reader was away. */
++export function jumpToLatestLabel({
++  newCount,
++  streaming,
++}: {
++  newCount: number;
++  streaming: boolean;
++}): JumpToLatestLabel {
++  if (newCount > 1) {
++    const text = `${newCount} new messages`;
++    return { text, ariaLabel: `${text}, jump to the latest message`, attention: true };
++  }
++  if (streaming) {
++    return { text: "New reply", ariaLabel: "New reply streaming, jump to it", attention: true };
++  }
++  if (newCount === 1) {
++    return { text: "1 new message", ariaLabel: "1 new message, jump to it", attention: true };
++  }
++  return { text: "Jump to latest", ariaLabel: "Jump to the latest message", attention: false };
++}
++
++/** How long the reader must be away from the bottom before the pill shows, so
++ *  the mount pin, a deep-link scroll or a momentum bounce never flash it. */
++export const JUMP_TO_LATEST_SETTLE_MS = 300;
++
++/**
++ * Bottom-edge pill for a reader who scrolled away from the live end: "Jump to
++ * latest", or what landed below them meanwhile ("New reply", "N new
++ * messages"). Clicking scrolls to the bottom and re-engages follow-tail.
++ *
++ * Rendered inside `<Conversation>` for the StickToBottom context, but mounted
++ * through a portal into the conversation wrapper: the scroll container carries
++ * the fade mask, which would also fade the pill.
++ *
++ * @param containerEl - The conversation wrapper the pill is mounted into.
++ * @param bubbles - The rendered bubbles, for the new-message count.
++ * @param streaming - A reply is being produced right now.
++ */
++export function JumpToLatestButton({
++  containerEl,
++  bubbles,
++  streaming,
++}: {
++  containerEl: HTMLElement | null;
++  bubbles: readonly Bubble[];
++  streaming: boolean;
++}) {
++  const { isAtBottom, scrollToBottom, state } = useStickToBottomContext();
++
++  // The last complete message seen at the bottom; frozen while away.
++  const lastSeenKeyRef = useRef<string | null>(null);
++  const keys = useMemo(() => transcriptMessageKeys(bubbles), [bubbles]);
++  let newCount = countNewMessages(keys, lastSeenKeyRef.current);
++  if (isAtBottom || newCount === null) {
++    lastSeenKeyRef.current = lastSettledMessageKey(bubbles);
++    newCount = countNewMessages(keys, lastSeenKeyRef.current);
++  }
++
++  const [settledAway, setSettledAway] = useState(false);
++  useEffect(() => {
++    if (isAtBottom) {
++      setSettledAway(false);
++      return;
++    }
++    const timer = setTimeout(() => setSettledAway(true), JUMP_TO_LATEST_SETTLE_MS);
++    return () => clearTimeout(timer);
++  }, [isAtBottom]);
++  const visible = settledAway && !isAtBottom;
++
++  const jumpToLatest = useCallback(() => {
++    // Re-arm follow-tail explicitly: the library's scrollToBottom leaves
++    // `escapedFromLock` as the reader's wheel-up set it.
++    state.escapedFromLock = false;
++    void scrollToBottom("instant");
++    // Rows below mount as the scroll lands; pin again once they are measured.
++    requestAnimationFrame(() => void scrollToBottom("instant"));
++  }, [scrollToBottom, state]);
++
++  if (!containerEl) return null;
++  const label = jumpToLatestLabel({ newCount: newCount ?? 0, streaming });
++  return createPortal(
++    <div
++      // Centered on the bottom edge, just above the composer, clear of the
++      // 32px scroll fade. z-40 matches the Jump-to-top pill.
++      className={cn(
++        "pointer-events-none absolute inset-x-0 bottom-3 z-40 flex justify-center transition-opacity duration-150",
++        visible ? "opacity-100" : "opacity-0",
++      )}
++    >
++      <Button
++        type="button"
++        variant={label.attention ? "default" : "outline"}
++        size="sm"
++        onClick={jumpToLatest}
++        aria-label={label.ariaLabel}
++        componentId="chat.nav.jump_to_latest"
++        data-testid="jump-to-latest"
++        data-state={label.attention ? "new" : "idle"}
++        // When hidden keep the button out of the tab order and a11y tree.
++        tabIndex={visible ? 0 : -1}
++        aria-hidden={!visible}
++        className={cn(
++          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
++          // The outline hover is a translucent wash; keep the fill opaque over
++          // the faded chat text behind the pill.
++          !label.attention && "bg-background hover:bg-background hover:brightness-95",
++          !label.attention &&
++            "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
++          visible ? "pointer-events-auto" : "pointer-events-none",
++        )}
++      >
++        <ArrowDownIcon className="size-3.5" aria-hidden />
++        {label.text}
++      </Button>
++    </div>,
++    containerEl,
++  );
++}
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index bee9d203641afd811fa0a0c1d9fcc608fe2c7263..03f6f78e1f321d0140a352dcd5670eb79446ff69 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -6,7 +6,6 @@ import {
+   Conversation,
+   ConversationContent,
+   ConversationEmptyState,
+-  ConversationScrollButton,
+ } from "@/components/ai-elements/conversation";
+ import { Message, MessageContent } from "@/components/ai-elements/message";
+ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
+@@ -71,6 +70,7 @@ import {
+   stripGatedSubagentRoutingChips,
+   stripPendingElicitations,
+ } from "@/components/chat/chatBubbleParts";
++import { JumpToLatestButton } from "@/components/chat/JumpToLatestButton";
+ import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
+ 
+ export interface TranscriptProps {
+@@ -78,7 +78,8 @@ export interface TranscriptProps {
+   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
+    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
+   setConversationEl: (el: HTMLDivElement | null) => void;
+-  /** Wrapper element the JumpToTopButton attaches its hover listeners to. */
++  /** Wrapper element the JumpToTopButton attaches its hover listeners to and
++   *  the JumpToLatestButton mounts into. */
+   containerEl: HTMLElement | null;
+   /** StickToBottom scroll container + lock controls, lifted by the bridge. */
+   scroller: ConversationScroller | null;
+@@ -326,6 +327,13 @@ function TranscriptImpl({
+   }, [nav]);
+ 
+   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
++  // A reply is landing below the reader: the live bubble streams, or the turn
++  // is busy before its first visible item.
++  const replyStreaming =
++    showWorkingIndicator ||
++    display.streamBubbles.some(
++      (bubble) => bubble.kind === "assistant" && bubble.lifecycle === "streaming",
++    );
+   const arcaWarning = useArcaShutdownBanner();
+   const showArcaBanner = arcaWarning.showForHost(hostId);
+   const itemLabelIndex = useMemo(
+@@ -452,7 +460,13 @@ function TranscriptImpl({
+               remeasureNonce={spacerMeasureNonce}
+             />
+           </ConversationContent>
+-          <ConversationScrollButton />
++          {/* Bottom-edge pill for a reader scrolled away from the live end;
++          reads the StickToBottom context here, mounts into the wrapper. */}
++          <JumpToLatestButton
++            containerEl={containerEl}
++            bubbles={display.streamBubbles}
++            streaming={replyStreaming}
++          />
+         </Conversation>
+         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
+         chat-scroll-fade mask. */}

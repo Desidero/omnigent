@@ -1,0 +1,2 @@
+<!-- posted 2026-10-23: https://github.com/omnigent-ai/omnigent/pull/10857#issuecomment-6372722604 -->
+One thing from running a `!`-prefixed workflow in native sessions: the fence parser here treats every line of a `bash` block as a command, so a block containing `!pip install x` (the shape Claude and Codex emit when they know the composer's `!` mode exists) would run `!pip` literally. Worth either stripping a leading `!` per line or skipping those lines, so the two conventions don't collide once this lands.
