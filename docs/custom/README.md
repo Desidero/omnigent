@@ -1,0 +1,270 @@
+# The custom patch series
+
+This branch is upstream Omnigent plus a series of patches that are waiting to
+land upstream or are kept locally. Each section below is one series, in apply
+order: what it changes for you, how to turn it on, and where its usage docs
+live. "Proposed from `<branch>`" names the contribution branch the patch goes
+upstream from; "carried" means a copy of someone else's upstream pull request.
+This page exists only on this branch.
+
+## claude-config-dir
+
+claude-native and claude-sdk follow Claude Code's `CLAUDE_CONFIG_DIR` for
+everything Omnigent reads and writes on Claude's behalf (settings, status line,
+transcripts, trust, the sandbox's writable roots) instead of assuming
+`~/.claude`.
+
+- **Turn on:** on by default; set `CLAUDE_CONFIG_DIR` as you would for the
+  Claude CLI.
+- **Docs:** none of its own; the per-account login directories that rely on it
+  are in [Model providers](../providers.md).
+- **Upstream:** not upstream yet; tracked by issue #7124 (upstream PR #9617,
+  which carried it, was closed without merging).
+
+## subscription-accounts
+
+Several Claude or Codex subscription accounts on one host: pick the account a
+new session runs on, give a project a default account, switch a running Claude
+session to another account, keep Claude token accounts that share one
+`~/.claude`, and let agents start a child session on another account.
+
+- **Turn on:** add entries to `providers:` in `~/.omnigent/config.yaml` with
+  `config_dir` (own login) or `token_ref` (shared login), or run
+  `omnigent setup` and add another account. The **Account** menu appears once
+  a harness has more than one provider.
+- **Docs:** [Model providers](../providers.md); the menu in
+  [Composer](../../feature-map/composer.md) (`account`) and child accounts in
+  [Native harnesses](../../feature-map/native-harnesses.md) (`child-account`).
+- **Upstream:** proposed from `feat/subscription-accounts` (design on upstream
+  issue #503).
+
+## session-history-paging
+
+Agents can list sessions by recent activity, and page through a session's
+whole history, forward from the start or from a saved cursor.
+
+- **Turn on:** on by default; new optional arguments on `sys_session_list`
+  (`updated_after`, `order_by`) and `sys_session_get_history`, and
+  `updated_after` on `GET /v1/sessions`. The older `ownership` argument is an
+  alias of upstream's `visibility` until 0.24.0.
+- **Docs:** [Agent YAML spec](../AGENT_YAML_SPEC.md) (session read tools) and
+  `omnigent/server/API.md` (List Sessions).
+- **Upstream:** proposed from `feat/session-history-paging`.
+
+## telemetry-attribution
+
+Exported spans carry the runner (`omnigent.runner.id`), the host
+(`omnigent.host.id`, a resource attribute) and, when you opt in, the acting
+user (`enduser.id`).
+
+- **Turn on:** with telemetry on (`OMNIGENT_TELEMETRY_ENABLED`), runner and
+  host need nothing more; set `OMNIGENT_OTEL_CAPTURE_USER=true` for the user.
+- **Docs:** `designs/OBSERVABILITY.md` (Configuration: the variable table and
+  actor attribution) and [Databricks](../databricks.md) (Reference: env var
+  summary).
+- **Upstream:** proposed from `feat/span-attribution`.
+
+## claude-sdk-web-tools
+
+claude-sdk agents can use Claude Code's own WebSearch and WebFetch.
+
+- **Turn on:** `native_tools: [WebSearch, WebFetch]` under the agent's
+  `executor` (`executor.config.native_tools` in a directory bundle).
+- **Docs:** [Agent YAML spec](../AGENT_YAML_SPEC.md) (Claude SDK built-in web
+  tools).
+- **Upstream:** proposed from `feat/claude-sdk-native-tools`.
+
+## claude-native-teammates
+
+Claude Code agent-team teammates show up as child sessions titled
+"<name>: <description>", and their deliveries no longer appear as raw
+`<teammate-message>` bubbles in the lead's chat.
+
+- **Turn on:** on by default.
+- **Docs:** none (fixes).
+- **Upstream:** proposed from `fix/claude-native-teammate-children` and
+  `fix/claude-native-teammate-delivery`.
+
+## claude-native-subagent-status
+
+A Claude sub-agent running a long tool call stays "running" until its turn
+actually ends.
+
+- **Turn on:** on by default.
+- **Docs:** none (fix).
+- **Upstream:** covered by the open upstream PR #12411, which fixes the same
+  bug; drop this copy once it merges. This copy also settles a child whose
+  result failed as failed rather than idle.
+
+## claude-native-coordinator-messages
+
+A parent agent's follow-ups to a running Claude sub-agent appear in the
+sub-agent's chat as "Message from parent agent".
+
+- **Turn on:** on by default.
+- **Docs:** none (fix).
+- **Upstream:** proposed from `fix/claude-native-coordinator-messages`.
+
+## skip-gzip-binary-files
+
+Images and PDFs load in the file viewer again instead of failing with a 500.
+
+- **Turn on:** on by default.
+- **Docs:** none (fix).
+- **Upstream:** carried from upstream PR #10585.
+
+## codex-native-mode-instructions
+
+A Default-mode Codex turn keeps Codex's own Default mode instructions instead
+of having them replaced by the agent's developer instructions (the Plan toggle
+already does this upstream).
+
+- **Turn on:** on by default.
+- **Docs:** none (fix).
+- **Upstream:** proposed from `fix/codex-native-default-mode-instructions`.
+
+## chat-item-labels
+
+Bracketed labels such as `[Q2]` in chat become chips that preview the item
+they refer to; `~~[Q2]~~` closes it, and an Open items bar lists what is still
+open, puts the items the latest reply mentions first, and lets you dismiss
+items. Agents get an instruction to label and close items.
+
+- **Turn on:** on by default; labels render once a transcript uses them.
+- **Docs:** [Item labels in chat](../chat-item-labels.md).
+- **Upstream:** proposed from `feat/chat-item-citations`; the latest-reply
+  emphasis and dismissing items are kept here only.
+
+## web-reconnect-shell-inputs
+
+A queued `!command` no longer stays stuck at the bottom of the chat after the
+connection drops and recovers.
+
+- **Turn on:** on by default.
+- **Docs:** none (fix).
+- **Upstream:** proposed from `fix/web-reconnect-settles-shell-inputs`.
+
+## chat-item-comments
+
+Comment on labelled items and send the comments together as one structured
+message the agent answers item by item.
+
+- **Turn on:** on by default; choose **Comment** in an item's popover.
+- **Docs:** [Item labels in chat](../chat-item-labels.md) (Comment on items).
+- **Upstream:** proposed from `feat/chat-item-comments`.
+
+## session-labels-ui
+
+View and edit a session's labels in the web UI, delete labels through the API
+(a `null` value), and give projects default labels for the sessions created in
+them; a `null` label on create leaves that project default off.
+
+- **Turn on:** on by default; the Labels section of the session info popover,
+  Project settings → **Default labels**, and the new-session composer's **+**
+  menu → Labels.
+- **Docs:** [Sessions](../../feature-map/sessions.md) (`labels`) and
+  `omnigent/server/API.md` (Create From Existing Agent, Bind Session Runner).
+- **Upstream:** proposed from `feat/session-labels-api` and
+  `feat/session-labels-ui`.
+
+## gateway-request-tags
+
+Requests to a Databricks Unity Gateway carry the session id and the session's
+labels in the `Databricks-Ai-Gateway-Request-Tags` header, next to upstream's
+CI tags and within its 4 KiB budget.
+
+- **Turn on:** on by default for gateway providers;
+  `OMNIGENT_GATEWAY_REQUEST_TAGS=0` in the host's (or CLI's) environment turns
+  it off.
+- **Docs:** [Databricks](../databricks.md) (Session request tags).
+- **Upstream:** proposed from `feat/gateway-request-tags`.
+
+## claude-native-delegate-idle
+
+A Claude lead session stops showing Working, and takes follow-ups without
+Steer, once its turn ends while agent-team teammates keep running. Upstream's
+background-agent hold (#12561) does this for sub-agents; this series counts
+teammates as background agents too.
+
+- **Turn on:** on by default.
+- **Docs:** none (fix).
+- **Upstream:** proposed as an extension of upstream's #12561.
+
+## delete-stops-runner
+
+Deleting a session stops its host-launched runner once no remaining session
+uses it.
+
+- **Turn on:** on by default.
+- **Docs:** [Sessions](../../feature-map/sessions.md) (`delete`).
+- **Upstream:** proposed from `fix/delete-stops-runner`.
+
+## app-error-boundary
+
+Upstream's render error fallback ("Unable to display …" with Try again) also
+shows the error, the component stack and the path, with Copy details and
+Reload.
+
+- **Turn on:** on by default; shown only when rendering crashes.
+- **Docs:** none (error screen).
+- **Upstream:** drafted, not on a contribution branch yet.
+
+## session-telemetry
+
+Every span of a turn carries session metadata (title, labels, project, agent,
+git branch and remote, workspace, host name), and the agent span records the
+model and reasoning effort the turn asked for and ran with, falling back to
+the session's and the agent's configured model when the harness reports none.
+
+- **Turn on:** with telemetry on (`OMNIGENT_TELEMETRY_ENABLED`); the session
+  title also needs `OMNIGENT_OTEL_CAPTURE_CONTENT`.
+- **Docs:** `designs/OBSERVABILITY.md` (Model and effort attributes, Session
+  attributes) and [Databricks](../databricks.md) (Which model and effort a
+  turn ran with).
+- **Upstream:** proposed from `feat/turn-model-effort` and, stacked on it,
+  `feat/session-telemetry`.
+
+## tolerate-retired-preferences
+
+A stored shared preference of a kind this build doesn't know, such as one a
+parked or newer series saved, no longer makes every read of that user's
+preferences fail with a 500. Reads skip it and log the kind once; the row
+stays stored for a build that knows it, and writing an unknown kind is still
+refused.
+
+- **Turn on:** on by default.
+- **Docs:** none (fix).
+- **Upstream:** proposed from `fix/tolerate-retired-preferences`.
+
+## link-rules
+
+Short references in chat messages (`BST-2135`, `PR #123`, `!123`,
+`owner/repo#123`, `session:<id>`) render as links, from rules each user sets in
+Settings and agents can change with approval. Git hosts are stored as `git`
+rules (GitHub, GitLab, Azure DevOps, plus self-hosted ones); the session's
+repository picks the one that links bare `#123`, and GitHub links
+`owner/repo#123` in every session. In a git checkout, agents are asked to say
+`issue #123` or `PR #123`.
+
+- **Turn on:** GitHub, GitLab, Azure DevOps and session references are on by
+  default. Edit, add (**Add git host** for GitHub Enterprise or a self-managed
+  GitLab) or turn on rules in Settings → General → **Chat links**; saving needs
+  `shared_preferences_authority_id` in the server config. A saved rule of the
+  old `github` kind reads as the GitHub `git` rule. Agents use
+  `sys_link_rules`, and each change waits for your approval.
+- **Docs:** [Chat link rules](../chat-link-rules.md),
+  [Server API](../../omnigent/server/API.md) (Chat Link Rules),
+  [Shared preference operations](../shared-preferences-api.md),
+  [Agent YAML](../AGENT_YAML_SPEC.md) (`tool_groups.link_rules`) and
+  [Preferences](../../feature-map/preferences.md) (`chat-link-rules`).
+- **Upstream:** proposed from `feat/chat-link-rules`; the git-reference
+  part (issue and pull request notation, its instruction) is planned from
+  `feat/git-ref-notation`.
+
+## custom-docs-index
+
+This page.
+
+- **Turn on:** nothing to turn on.
+- **Docs:** this file.
+- **Upstream:** kept here only.
