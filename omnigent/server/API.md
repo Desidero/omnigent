@@ -691,12 +691,11 @@ already uploaded or registered an agent. The response is the full
     `PATCH /v1/sessions/{id}` (last-write-wins). See
     `designs/NATIVE_RUNNER_SERVER_LAUNCH.md`.
 
-  apply_project_labels (boolean, default true)
-    A create with `project_id` merges the project's default labels (the
-    project config's `labels`) under `labels`, and the request's labels
-    win. `false` takes `labels` as the final set, so a default removed
-    for this one session is not added back. Labels apply only at
-    creation, not when a session moves into a project later.
+  A create with `project_id` merges the project's default labels (the
+  project config's `labels`) under the request's `labels`, and the
+  request's labels win. A `null` request value leaves that default off
+  the new session. Labels apply only at creation, not when a session
+  moves into a project later.
 
 400 Bad Request - invalid terminal_launch_args (count / length bounds)
 404 Not Found - no agent with that id

@@ -444,7 +444,7 @@ def create_imports_router(
             )
             await asyncio.to_thread(conversation_store.append, conversation.id, items)
             labels = {
-                # Project default labels resolved for an import into a project.
+                # Project defaults, when the import names a project.
                 **resolved_create.body.labels,
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,

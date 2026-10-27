@@ -161,11 +161,12 @@ async def test_project_labels_fill_under_request_labels(
     assert "k" * 129 not in labels
 
 
-async def test_final_request_labels_skip_project_labels(
+async def test_null_request_label_leaves_project_default_off(
     project_create_client: httpx.AsyncClient,
 ) -> None:
-    """A create whose labels are already the final set keeps a default removed
-    for this session off it, and still applies the project's other defaults."""
+    """A ``null`` request label leaves that project default off the new session
+    (mirroring the ``null`` delete on PATCH), the other defaults still apply,
+    and a ``null`` for a key the project doesn't default is ignored."""
     project_id = await _project(
         project_create_client,
         {"agent_id": CUSTOM_AGENT_ID, "labels": {"team": "ml", "env": "dev"}},
@@ -174,8 +175,7 @@ async def test_final_request_labels_skip_project_labels(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "labels": {"env": "dev", "owner": "me"},
-            "apply_project_labels": False,
+            "labels": {"team": None, "owner": "me", "never-set": None},
         },
         headers=_headers(),
     )
@@ -186,6 +186,36 @@ async def test_final_request_labels_skip_project_labels(
     assert body["labels"]["env"] == "dev"
     assert body["labels"]["owner"] == "me"
     assert "team" not in body["labels"]
+    assert "never-set" not in body["labels"]
+
+
+async def test_null_label_without_project_is_ignored(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"agent_id": CUSTOM_AGENT_ID, "labels": {"team": None, "owner": "me"}},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["labels"]["owner"] == "me"
+    assert "team" not in response.json()["labels"]
+
+
+@pytest.mark.parametrize("reserved_key", ["omnigent.archived_at", "cost_control.plan"])
+async def test_null_reserved_label_on_create_is_rejected(
+    project_create_client: httpx.AsyncClient,
+    reserved_key: str,
+) -> None:
+    """A ``null`` for a reserved key is rejected like setting it, even though
+    there is nothing to delete yet."""
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "labels": {reserved_key: None}},
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
 
 
 @pytest.mark.parametrize("malformed_labels", ["team=ml", ["team"], None])
@@ -547,13 +577,13 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
     assert session.json()["labels"]["team"] == "ml"
 
 
-async def test_multipart_final_labels_skip_project_labels(
+async def test_multipart_null_label_leaves_project_default_off(
     project_create_client: httpx.AsyncClient,
 ) -> None:
     project_id = await _project(
         project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
     )
-    metadata = {"project_id": project_id, "labels": {"env": "dev"}, "apply_project_labels": False}
+    metadata = {"project_id": project_id, "labels": {"env": "dev", "team": None}}
     response = await project_create_client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
