@@ -523,7 +523,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("agent_id" in body).toBe(false);
   });
 
-  it("pre-fills the project's default labels and leaves the server merge on", async () => {
+  it("pre-fills the project's default labels into the create", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
     renderLanding();
     await waitFor(() =>
@@ -533,10 +533,9 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
     expect((body.labels as Record<string, string>).team).toBe("ml");
-    expect("apply_project_labels" in body).toBe(false);
   });
 
-  it("sends the final labels without a removed project default", async () => {
+  it("sends a removed project default as null", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml", env: "dev" } });
     renderLanding();
     await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
@@ -557,11 +556,58 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
 
     const body = await submitAndReadBody();
-    const labels = body.labels as Record<string, string>;
+    const labels = body.labels as Record<string, string | null>;
     expect(labels.env).toBe("dev");
     expect(labels.owner).toBe("me");
-    expect(labels.team).toBeUndefined();
-    expect(body.apply_project_labels).toBe(false);
+    expect(labels.team).toBeNull();
+  });
+
+  it("keeps an edit still in progress when Done is clicked", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Edit labels (team: ml)" }));
+    const dialog = await screen.findByTestId("new-session-labels-dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Edit label team" }));
+    fireEvent.change(within(dialog).getByLabelText("Value for label team"), {
+      target: { value: "infra" },
+    });
+    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
+    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
+    expect(screen.getByTestId("new-session-label-chips")).toHaveTextContent("team: infra");
+
+    const body = await submitAndReadBody();
+    expect((body.labels as Record<string, string>).team).toBe("infra");
+  });
+
+  it("restores label edits with the composer draft", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
+    const first = renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Edit labels (team: ml)" }));
+    const dialog = await screen.findByTestId("new-session-labels-dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove label team" }));
+    await waitFor(() => expect(dialog).not.toHaveTextContent("team:"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(dialog).getByLabelText("New label key"), {
+      target: { value: "env" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("New label value"), {
+      target: { value: "dev" },
+    });
+    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
+    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
+    first.unmount();
+
+    renderLanding();
+    const chips = await screen.findByTestId("new-session-label-chips");
+    expect(chips).toHaveTextContent("env: dev");
+    expect(chips).not.toHaveTextContent("team:");
+
+    const body = await submitAndReadBody();
+    const labels = body.labels as Record<string, string | null>;
+    expect(labels.env).toBe("dev");
+    expect(labels.team).toBeNull();
   });
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {

@@ -11,15 +11,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { labelValidationError, userLabelEntries } from "@/lib/sessionLabels";
 
-/** What {@link LabelEditorHandle.takePendingLabel} found in the add row. */
+/** What {@link LabelEditorHandle.takePendingLabel} found in the add or edit row. */
 export type PendingLabel =
   { status: "none" } | { status: "valid"; key: string; value: string } | { status: "invalid" };
 
-/** Lets a parent that saves in bulk collect a label typed but not yet added. */
+/** Lets a parent that saves in bulk collect a label typed but not yet committed. */
 export interface LabelEditorHandle {
   /**
-   * Take the add row's label: a valid one is cleared from the row for the
-   * caller to save, and an invalid one shows its inline message.
+   * Take the label in the add row or the edit in progress: a valid one is
+   * cleared from its row for the caller to save, and an invalid one shows its
+   * inline message.
    */
   takePendingLabel: () => PendingLabel;
 }
@@ -147,6 +148,17 @@ export function LabelEditor({
 
   useImperativeHandle(handleRef, () => ({
     takePendingLabel: () => {
+      if (editingKey !== null) {
+        const value = editValue.trim();
+        const invalid = labelValidationError(editingKey, value);
+        if (invalid) {
+          setError(invalid);
+          return { status: "invalid" };
+        }
+        setError(null);
+        setEditingKey(null);
+        return { status: "valid", key: editingKey, value };
+      }
       if (!adding || (!newKey.trim() && !newValue.trim())) return { status: "none" };
       const label = validateNew();
       if (!label) return { status: "invalid" };

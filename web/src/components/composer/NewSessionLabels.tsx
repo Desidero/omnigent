@@ -60,7 +60,7 @@ export function NewSessionLabelChips({
   );
 }
 
-/** Edit the new session's labels; a valid label left in the add row is kept on close. */
+/** Edit the new session's labels; a valid label left in the add or edit row is kept on close. */
 export function NewSessionLabelsDialog({
   open,
   onOpenChange,
@@ -87,7 +87,10 @@ export function NewSessionLabelsDialog({
   };
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(true) : close())}>
-      <DialogContent className="sm:max-w-md" data-testid="new-session-labels-dialog">
+      <DialogContent
+        className="flex max-h-[85vh] flex-col sm:max-w-md"
+        data-testid="new-session-labels-dialog"
+      >
         <DialogHeader>
           <DialogTitle>Labels</DialogTitle>
           <DialogDescription>
@@ -96,15 +99,17 @@ export function NewSessionLabelsDialog({
               : "Added to the new session."}
           </DialogDescription>
         </DialogHeader>
-        <LabelEditor
-          labels={labels}
-          onSet={onSet}
-          onRemove={onRemove}
-          emptyText="No labels"
-          testIdPrefix="new-session-labels-editor"
-          handleRef={editorRef}
-          rowNote={(key, value) => (projectDefaults[key] === value ? "from project" : null)}
-        />
+        <div className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1">
+          <LabelEditor
+            labels={labels}
+            onSet={onSet}
+            onRemove={onRemove}
+            emptyText="No labels"
+            testIdPrefix="new-session-labels-editor"
+            handleRef={editorRef}
+            rowNote={(key, value) => (projectDefaults[key] === value ? "from project" : null)}
+          />
+        </div>
         <DialogFooter className="border-t-0 bg-transparent">
           <Button type="button" onClick={close} data-testid="new-session-labels-done">
             Done

@@ -88,17 +88,15 @@ describe("newSessionLabels", () => {
   it("layers this session's edits over the project defaults", () => {
     expect(newSessionLabels({ team: "ml" }, { env: "dev", team: "infra" })).toEqual({
       labels: { team: "infra", env: "dev" },
-      applyProjectLabels: true,
+      requestLabels: { team: "infra", env: "dev" },
     });
   });
 
-  it("turns the server merge off once a project default is removed", () => {
+  it("sends a removed project default as null so the server leaves it off", () => {
     expect(newSessionLabels({ team: "ml", env: "dev" }, { team: null })).toEqual({
       labels: { env: "dev" },
-      applyProjectLabels: false,
+      requestLabels: { team: null, env: "dev" },
     });
-    // A removal for a key the current project doesn't default is moot.
-    expect(newSessionLabels({}, { team: null }).applyProjectLabels).toBe(true);
   });
 });
 
