@@ -104,15 +104,16 @@ and steers messages while the agent is busy.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.
-- `palette-new-chat-in-project`: typing in the command palette also lists a
-  **New chat in <project>** row per matching project, which opens the
-  new-session composer with that project's defaults (host, workspace, agent,
-  model, worktree).
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
   opens and focuses the new-session composer in browsers. Native shells retain
   ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
+- `palette-new-chat-in-project`: typing in the ⌘K command palette lists a
+  "New chat in <project>" row per project; every typed word must match, so
+  `project`, `new omni` and `omni` all find it. Choosing a row opens the
+  new-session composer with that project's defaults. The rows are hidden while
+  the query is empty and absent from the sessions-only switcher.
 - `new-session-project-prompt`: when projects exist, the hotkey, the sidebar's
   New session links, and the palette's New chat first ask for a project (or No
   project), then open the composer with its defaults. Settings › General ›
@@ -226,14 +227,12 @@ and steers messages while the agent is busy.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
-- Press ⌘K (macOS) or Ctrl+K (Windows/Linux), or use the sidebar's Search, and
-  type part of a project name, such as `new omni` or `omni`: every typed word
-  must appear in the row label. Choose **New chat in <project>** to land on
-  `/?project=<name>`, the same composer as the project's pencil. The rows stay
-  hidden while the query is empty, and the sessions-only switcher omits them.
 - With the browser app focused, press ⌘+Shift+O (macOS) or
   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
   composer.
+- Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
+  **New chat in <project>** to open the new-session composer with that
+  project's host, workspace and agent prefilled.
 - With at least one project, press the hotkey or click New session (also from
   the mobile drawer): a "Start a new session in…" picker opens. Type part of a
   project name and press Enter to land on `/?project=<name>` with its defaults;
@@ -592,10 +591,9 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`palette-new-chat-in-project`:** component coverage in
-  `web/src/shell/CommandPalette.test.tsx`; no browser test. By hand with two
-  projects: open the palette, type the first word of one project's name and
-  expect only its **New chat in …** row; choose it and expect the composer
-  with that project's host, workspace and agent preselected.
+  `web/src/shell/CommandPalette.test.tsx` (`new chat in project`). Manually: ⌘K,
+  type part of a project name, press Enter on the row, and check the composer
+  shows that project's host, workspace and agent.
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the
   Create custom agent and new-session dialogs cover it. Manually: open the agent
   picker's custom agents, then Create custom agent → Import bundle, and pick a

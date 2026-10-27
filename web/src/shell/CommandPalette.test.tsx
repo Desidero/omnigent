@@ -371,6 +371,24 @@ describe("CommandPalette — new chat in project", () => {
     expect(screen.getByTestId("project-icon").textContent).toBe("🔥");
   });
 
+  it("lists every project when the query is the group heading's word", () => {
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "project" },
+    });
+    expect(screen.getByText("New chat in omnigent")).toBeTruthy();
+    expect(screen.getByText("New chat in home lab")).toBeTruthy();
+  });
+
+  it("opens the highlighted project row with Enter", () => {
+    const { onOpenChange } = renderPalette();
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "omni" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/?project=omnigent");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it("opens the composer with the project's defaults and closes", () => {
     const { onOpenChange } = renderPalette();
     fireEvent.change(screen.getByTestId("command-palette-input"), {

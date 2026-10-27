@@ -215,13 +215,13 @@ export function CommandPalette({
   }, [actions, query, sessionsOnly, projectStep]);
 
   const { data: projects = [] } = useProjects();
-  // Every typed word must appear in the row label, so "new omni" and "omni"
-  // both reach "New chat in omnigent". The project step lists every project
-  // until the user types, and matches names only.
+  // Every typed word must appear in the row label or the group heading, so
+  // "new omni", "omni" and "project" all reach "New chat in omnigent". The
+  // project step lists every project until the user types, and matches names only.
   const filteredProjects = useMemo(() => {
     if (projectStep) return projects.filter((project) => matchesEveryWord(project.name, query));
     if (sessionsOnly || query.trim() === "") return [];
-    return projects.filter((project) => matchesEveryWord(`new chat in ${project.name}`, query));
+    return projects.filter((project) => matchesEveryWord(`new chat in project ${project.name}`, query));
   }, [projects, query, sessionsOnly, projectStep]);
   const showNoProject = projectStep && matchesEveryWord("no project", query);
 
