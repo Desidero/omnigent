@@ -3699,7 +3699,7 @@ def _peer_delivery_time(entry: _JsonObject) -> float | None:
     origin = entry.get("origin")
     is_peer_origin = isinstance(origin, dict) and origin.get("kind") == "peer"
     if not any(
-        is_peer_origin or _is_unattributed_peer_delivery(text, entry=entry) for text in texts
+        is_peer_origin or _is_unattributed_teammate_delivery(text, record=entry) for text in texts
     ):
         return None
     return _transcript_timestamp(entry.get("timestamp"))
@@ -9178,9 +9178,7 @@ def _attachment_transcript_items_from_entry(
         return current_response_id, []
     if attachment.get("isMeta") is True:
         return current_response_id, []
-    if _is_trusted_agent_notification_text(
-        prompt, origin=attachment.get("origin")
-    ) or _is_unattributed_peer_delivery(prompt, entry=attachment):
+    if _is_internal_agent_text(prompt, record=attachment):
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     item = ClaudeTranscriptItem(
@@ -9632,27 +9630,37 @@ def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> 
     )
 
 
-def _is_unattributed_peer_delivery(text: str, *, entry: _JsonObject) -> bool:
+def _is_internal_agent_text(text: str, *, record: _JsonObject) -> bool:
+    """Hide agent traffic a user record or queued prompt carries, by provenance or framing."""
+    return _is_trusted_agent_notification_text(
+        text, origin=record.get("origin")
+    ) or _is_unattributed_teammate_delivery(text, record=record)
+
+
+def _is_unattributed_teammate_delivery(text: str, *, record: _JsonObject) -> bool:
     """
     Recognize a teammate delivery Claude framed itself but left without ``origin``.
 
-    Claude Code stamps typed and pasted prompts ``origin: {"kind": "human"}``, so a
-    record with no ``origin`` key and Claude's full framing came from a teammate.
+    Claude Code 2.1.303+ stamps typed and pasted prompts ``origin: {"kind": "human"}``,
+    queued mid-turn prompts included, so a record with no ``origin`` key and nothing
+    but Claude's framing came from a teammate. An older build that omits ``origin``
+    is protected only by that exact-framing rule. Deliveries wrapped in a
+    ``<system-reminder>`` start differently and are not matched.
     """
-    return "origin" not in entry and _peer_message_shape(text) == "framed"
+    return "origin" not in record and _teammate_envelope_shape(text) == "framed"
 
 
 def _is_agent_notification_text(text: str) -> bool:
     """Recognize possible agent context; text alone does not prove its origin."""
-    return _is_trusted_agent_notification_text(text) or _peer_message_shape(text) is not None
+    return _is_trusted_agent_notification_text(text) or _teammate_envelope_shape(text) is not None
 
 
-def _peer_message_shape(text: str) -> Literal["bare", "framed"] | None:
+def _teammate_envelope_shape(text: str) -> Literal["bare", "framed"] | None:
     """
     Classify team envelopes: ``framed`` with Claude's delivery prefix, else ``bare``.
 
     :returns: ``None`` when anything but envelopes (and, when framed, Claude's
-        trailing guidance) is present.
+        trailing guidance paragraph) is present.
     """
     stripped = text.lstrip()
     wrapped = False
@@ -9667,9 +9675,10 @@ def _peer_message_shape(text: str) -> Literal["bare", "framed"] | None:
         stripped = stripped[match.end() :].lstrip()
         if not stripped:
             return "framed" if wrapped else "bare"
-    # Wrapped peer messages can append Claude's own explanatory guidance.
+    # Framed deliveries can append Claude's own explanatory guidance, one
+    # paragraph; a line break after it means someone added their own text.
     if wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE):
-        return "framed"
+        return "framed" if "\n" not in stripped.rstrip() else None
     return None
 
 
@@ -9919,11 +9928,7 @@ def _user_transcript_items_from_entry(
     if isinstance(content, str):
         if not content:
             return current_response_id, []
-        if (
-            entry.get("isMeta") is True
-            or _is_trusted_agent_notification_text(content, origin=entry.get("origin"))
-            or _is_unattributed_peer_delivery(content, entry=entry)
-        ):
+        if entry.get("isMeta") is True or _is_internal_agent_text(content, record=entry):
             items.append(
                 ClaudeTranscriptItem(
                     source_id=_source_id(source_key, 0, "message"),
@@ -10014,11 +10019,7 @@ def _user_transcript_items_from_entry(
             text = block.get("text")
             if not isinstance(text, str) or not text:
                 continue
-            if (
-                entry.get("isMeta") is True
-                or _is_trusted_agent_notification_text(text, origin=entry.get("origin"))
-                or _is_unattributed_peer_delivery(text, entry=entry)
-            ):
+            if entry.get("isMeta") is True or _is_internal_agent_text(text, record=entry):
                 items.append(
                     ClaudeTranscriptItem(
                         source_id=_source_id(source_key, item_index, "message"),
