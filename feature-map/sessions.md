@@ -184,7 +184,7 @@ the header menu), and each place is a separate entry point.
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
-- `view-options`: the one filter menu, on the Projects header, with Grouping
+- `view-options`: the one filter menu, in the toolbar above the session list, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
@@ -211,11 +211,10 @@ the header menu), and each place is a separate entry point.
   with its label available to screen readers. Branch also resolves the workspace's
   checked-out branch when none was recorded at session creation, without hovering.
   All groupings replace
-  Projects, Shared and Sessions with titled groups; the first group's header takes
-  the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
+  Projects, Shared and Sessions with titled groups. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag, on by default; with
-  `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the Sessions header keeps a flat
-  Display filter and the tooltip keeps its plain layout.
+  `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the filter offers a flat Display
+  list and the tooltip keeps its plain layout.
 - `updated-filter`: **Updated** (Any time, Last 24 hours, Last 3 days, Last 7
   days or Last 30 days, as rolling windows) narrows the list to recently
   updated sessions. It is saved per device and works with any Display choice,
@@ -391,19 +390,21 @@ choice only when the server supports cleanup.
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
 
-**Sidebar filter menu:** with `sidebar_grouping_ui` on (the default), the funnel on the
-Projects header holds Grouping, Display, Ordering and Show. In
-Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
-first group's header. The Select sessions button sits beside it and selects
-project, Shared and Sessions rows together; the Sessions header keeps only New
-session. On Display → Shared with me, Projects is hidden (folders hold only the
-viewer's own sessions) and the Shared with me header carries the funnel, New
-session and Select sessions. Hovering a row opens
-its tooltip; the repo and PR rows load from the session's GitHub info only once
-the tooltip opens, and fall back to the PR the server stored for the session
-when the live lookup has none, with its age once that state is over five
-minutes old. With the flag off, the funnel sits on the Sessions header and
-offers Display only.
+**Sidebar filter menu:** the funnel and Select sessions sit in a toolbar row
+above the scrolling session list, labelled with the current Display choice, so
+they stay in view however far the list scrolls; while selecting, the bulk-action
+bar takes the row under them. With `sidebar_grouping_ui` on (the default), the
+funnel holds Grouping, Display, Ordering and Show; in Status, Harness, Created
+or Updated grouping, Projects is hidden. Select sessions selects project, Shared
+and Sessions rows together; the Sessions header keeps only New session. On
+Display → Shared with me, Projects is hidden (folders hold only the viewer's own
+sessions). Hovering a
+row opens its tooltip; the repo and PR rows load from the session's GitHub info
+only once the tooltip opens, and fall back to the PR the server stored for the
+session when the live lookup has none, with its age once that state is over
+five minutes old. With the flag off, the funnel offers Display only
+and Select sessions covers the flat list; the Projects menu selects folder
+sessions instead.
 
 **Offline pull requests:** link PRs to a session, then stop its host. Open the
 Pull Requests tab from the Workspace rail or composer (desktop and mobile).

@@ -807,6 +807,8 @@ function SidebarImpl({
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
+  // Where the session list portals its toolbar, above the scrolling list.
+  const [listToolbarSlot, setListToolbarSlot] = useState<HTMLDivElement | null>(null);
 
   const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
@@ -1507,6 +1509,7 @@ function SidebarImpl({
               )}
             </div>
 
+            <div ref={setListToolbarSlot} className="shrink-0" />
             <div className="relative flex min-h-0 flex-1 flex-col">
               <div
                 aria-hidden="true"
@@ -1556,6 +1559,7 @@ function SidebarImpl({
                     onDeselectAll={deselectAll}
                     onExitSelectionMode={exitSelectionMode}
                     getVisibleIdsRef={getVisibleIdsRef}
+                    toolbarSlot={listToolbarSlot}
                   />
                 ) : (
                   <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
@@ -2057,6 +2061,9 @@ interface ConversationListProps {
   onDeselectAll: () => void;
   onExitSelectionMode: () => void;
   getVisibleIdsRef: RefObject<() => string[]>;
+  /** Element above the scrolling list that receives the list toolbar (Select,
+      the filter menu and the bulk-action bar), so it never scrolls away. */
+  toolbarSlot: HTMLElement | null;
 }
 
 const ignoreChatStore = () => () => {};
@@ -2096,6 +2103,7 @@ function ConversationList({
   onDeselectAll,
   onExitSelectionMode,
   getVisibleIdsRef,
+  toolbarSlot,
 }: ConversationListProps) {
   const grids = useGridSessions();
   const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
@@ -3080,16 +3088,23 @@ function ConversationList({
     onToggleSelected,
     onProjectAssigned: expandProject,
   };
-  const sessionsBulkBar =
-    sessionsSelecting && !unifiedSelection ? (
-      <BulkActionBar
-        selectedIds={selectedIds}
-        allConversations={displayPagination.rows}
-        onDeselectAll={onDeselectAll}
-        onExit={onExitSelectionMode}
-        onProjectAssigned={expandProject}
-      />
-    ) : undefined;
+  // One bar for whichever scope is selecting; a unified selection spans the
+  // project folders and the flat lists.
+  const bulkBar = selectionMode ? (
+    <BulkActionBar
+      selectedIds={selectedIds}
+      allConversations={
+        !projectsSelecting
+          ? displayPagination.rows
+          : unifiedSelection
+            ? [...projectSessionPool, ...displayPagination.rows]
+            : projectSessionPool
+      }
+      onDeselectAll={onDeselectAll}
+      onExit={onExitSelectionMode}
+      onProjectAssigned={expandProject}
+    />
+  ) : undefined;
   // The filter stays reachable while bulk-selecting; switching scope just exits
   // selection. Only the "select" entry point hides, being already active.
   const selectSessionsButton = (
@@ -3113,7 +3128,6 @@ function ConversationList({
       <TooltipContent side="bottom">Select sessions</TooltipContent>
     </Tooltip>
   );
-  // A unified selection puts "Select sessions" on the Projects header instead.
   const sessionsHeaderActions = !selectionMode ? (
     <div className="flex items-center gap-0.5">
       <Tooltip>
@@ -3144,7 +3158,6 @@ function ConversationList({
           New session
         </TooltipContent>
       </Tooltip>
-      {!unifiedSelection && selectSessionsButton}
     </div>
   ) : undefined;
   const sessionsFilterMenu = (
@@ -3166,6 +3179,21 @@ function ConversationList({
         triggerRef={filterTriggerRef}
       />
     </>
+  );
+  // The list-wide controls live above the scrolling list (portalled into
+  // `toolbarSlot`), so the filter, Select and an in-progress selection's bulk
+  // actions stay in view however far the list is scrolled.
+  const listToolbar = (
+    <div data-testid="sidebar-list-toolbar" className="flex flex-col pt-2 pr-4 pl-2">
+      <div className="flex min-h-7 items-center gap-0.5 pl-2">
+        <span className="sidebar-compact-text min-w-0 flex-1 truncate text-muted-foreground">
+          {SIDEBAR_FILTERS.find((filter) => filter.value === activeTab)?.label}
+        </span>
+        {!selectionMode && selectSessionsButton}
+        {sessionsFilterMenu}
+      </div>
+      {bulkBar}
+    </div>
   );
 
   // Archived sessions are surfaced on the Settings page, not here, so they
@@ -3257,6 +3285,7 @@ function ConversationList({
         }}
       >
         {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
+        {toolbarSlot && createPortal(listToolbar, toolbarSlot)}
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <PinSavingContext.Provider value={pinWriting}>
             <div
@@ -3334,61 +3363,40 @@ function ConversationList({
                       title="Projects"
                       collapsed={effectiveCollapsedSections.includes("Projects")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                      persistentHeaderAction={groupingUi ? sessionsFilterMenu : undefined}
-                      afterHeader={
-                        projectsSelecting ? (
-                          <BulkActionBar
-                            selectedIds={selectedIds}
-                            allConversations={
-                              unifiedSelection
-                                ? [...projectSessionPool, ...displayPagination.rows]
-                                : projectSessionPool
-                            }
-                            onDeselectAll={onDeselectAll}
-                            onExit={onExitSelectionMode}
-                            onProjectAssigned={expandProject}
-                          />
-                        ) : undefined
-                      }
                       headerAction={
                         !selectionMode ? (
-                          <>
-                            <ProjectHeaderActions
-                              hostId={defaultProjectHostId}
-                              hostsLoading={hostsLoading}
-                              onOrderChange={(manual) => {
-                                const ranks = new Map(
-                                  projectOrder.data?.ordered_project_ids?.map((id, index) => [
-                                    id,
-                                    index,
-                                  ]),
-                                );
-                                const restored = [...projects].sort(
-                                  (a, b) =>
-                                    (ranks.get(a.id ?? "") ?? Infinity) -
-                                    (ranks.get(b.id ?? "") ?? Infinity),
-                                );
-                                saveOrder.mutate(manual ? restored : null);
-                              }}
-                              manualOrder={projectOrder.data?.sort_mode === "manual"}
-                              orderDisabled={saveOrder.isPending || !projectOrder.data}
-                              projectNames={sections.projectGroups.map((group) => group.name)}
-                              collapsed={effectiveCollapsedSections.includes("Projects")}
-                              expandedProjects={expandedProjects}
-                              // A unified selection starts from the header's own button.
-                              hasProjectSessions={
-                                !unifiedSelection &&
-                                sections.projectGroups.some(
-                                  (group) => group.conversations.length > 0,
-                                )
-                              }
-                              onExpandAll={expandAllProjects}
-                              onCollapseAll={collapseAllProjects}
-                              onProjectCreated={expandProject}
-                              onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                            />
-                            {unifiedSelection && selectSessionsButton}
-                          </>
+                          <ProjectHeaderActions
+                            hostId={defaultProjectHostId}
+                            hostsLoading={hostsLoading}
+                            onOrderChange={(manual) => {
+                              const ranks = new Map(
+                                projectOrder.data?.ordered_project_ids?.map((id, index) => [
+                                  id,
+                                  index,
+                                ]),
+                              );
+                              const restored = [...projects].sort(
+                                (a, b) =>
+                                  (ranks.get(a.id ?? "") ?? Infinity) -
+                                  (ranks.get(b.id ?? "") ?? Infinity),
+                              );
+                              saveOrder.mutate(manual ? restored : null);
+                            }}
+                            manualOrder={projectOrder.data?.sort_mode === "manual"}
+                            orderDisabled={saveOrder.isPending || !projectOrder.data}
+                            projectNames={sections.projectGroups.map((group) => group.name)}
+                            collapsed={effectiveCollapsedSections.includes("Projects")}
+                            expandedProjects={expandedProjects}
+                            // A unified selection starts from the header's own button.
+                            hasProjectSessions={
+                              !unifiedSelection &&
+                              sections.projectGroups.some((group) => group.conversations.length > 0)
+                            }
+                            onExpandAll={expandAllProjects}
+                            onCollapseAll={collapseAllProjects}
+                            onProjectCreated={expandProject}
+                            onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                          />
                         ) : undefined
                       }
                     >
@@ -3457,7 +3465,7 @@ function ConversationList({
                     </SectionGroup>
                   )}
                   {/* Other owners' sessions, above the viewer's own. On the Shared
-                    filter it's the only list, so it takes the list controls. */}
+                    filter it's the only list, so it takes the header actions. */}
                   {(sections.shared.length > 0 || sharedListOnly) && (
                     <ConversationSection
                       title="Shared with me"
@@ -3468,9 +3476,7 @@ function ConversationList({
                       footer={sharedListOnly ? sessionStatus : undefined}
                       collapsed={effectiveCollapsedSections.includes("Shared")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared")}
-                      afterHeader={sharedListOnly ? sessionsBulkBar : undefined}
                       headerAction={sharedListOnly ? sessionsHeaderActions : undefined}
-                      persistentHeaderAction={sharedListOnly ? sessionsFilterMenu : undefined}
                       headerStatus={sharedListOnly ? importStatus : undefined}
                       {...sessionRowProps}
                     />
@@ -3509,10 +3515,8 @@ function ConversationList({
                               }
                               collapsed={effectiveCollapsedSections.includes(group.title)}
                               onToggleCollapsed={() => effectiveToggleSectionCollapsed(group.title)}
-                              afterHeader={index === 0 ? sessionsBulkBar : undefined}
                               headerAction={index === 0 ? sessionsHeaderActions : undefined}
                               headerStatus={index === 0 ? importStatus : undefined}
-                              persistentHeaderAction={index === 0 ? sessionsFilterMenu : undefined}
                               reorderGroup={reorderable ? group.title : undefined}
                               {...sessionRowProps}
                             />
@@ -3532,12 +3536,8 @@ function ConversationList({
                           footer={sessionStatus}
                           collapsed={effectiveCollapsedSections.includes("Chats")}
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-                          afterHeader={sessionsBulkBar}
                           headerAction={sessionsHeaderActions}
                           headerStatus={importStatus}
-                          persistentHeaderAction={
-                            groupingUi && !grouped ? undefined : sessionsFilterMenu
-                          }
                           reorderGroup={reorderable ? "Sessions" : undefined}
                           {...sessionRowProps}
                         />
@@ -3717,7 +3717,6 @@ function SectionHeader({
   marker,
   active = false,
   hasAction,
-  hasPersistentAction,
   actionFocusVisible,
   collapsed,
   onToggleCollapsed,
@@ -3737,10 +3736,6 @@ function SectionHeader({
       full control column there; only at rest on hover-capable desktops do the
       badges return to the rows' badge column. */
   hasAction?: boolean;
-  /** Whether an always-visible control sits at the header's right edge (the
-      Sessions filter), which the collapsed badges must clear even at rest on
-      hover-capable desktops. */
-  hasPersistentAction?: boolean;
   /** Match badge fades to an overlay revealed by focus-visible rather than
       focus-within. Section groups use this to ignore pointer-returned focus. */
   actionFocusVisible?: boolean;
@@ -3755,13 +3750,11 @@ function SectionHeader({
   // Touch and narrow layouts reserve space for the visible controls. On hover
   // desktops the marker returns to the right edge until the controls appear.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
-  const clusterHoverDesktopMargin = hasPersistentAction
-    ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
-    : showsMarker
-      ? icon
-        ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
-        : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
+  const clusterHoverDesktopMargin = showsMarker
+    ? icon
+      ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
+      : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
+    : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
   const markerFade =
     "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
@@ -3812,7 +3805,7 @@ function SectionHeader({
             )
           : cn(
               "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
-              (hasAction || hasPersistentAction) && "mobile-touch-target",
+              hasAction && "mobile-touch-target",
             ),
         status && "w-auto min-w-0 max-w-1/2 shrink-0",
         "mobile-touch-target mobile-app:h-auto mobile-app:min-w-0 mobile-app:max-w-full mobile-app:pr-2",
@@ -3862,9 +3855,7 @@ function SectionHeader({
                   icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
                   clusterHoverDesktopMargin,
                 )
-              : hasPersistentAction
-                ? "mr-7"
-                : clusterRestMargin,
+              : clusterRestMargin,
             // Dot/spinner markers get the fixed size-6 centered box (center
             // lands 16px from the edge, matching the rows). The "awaiting"
             // pill keeps its natural width so its label isn't clipped.
@@ -4301,8 +4292,6 @@ function SectionGroup({
   collapsed,
   onToggleCollapsed,
   headerAction,
-  persistentHeaderAction,
-  afterHeader,
   children,
 }: {
   title: string;
@@ -4312,11 +4301,6 @@ function SectionGroup({
       "collapse all projects" toggle). Always shown without hover support and
       hover/focus-revealed on hover-capable desktop displays. */
   headerAction?: ReactNode;
-  /** Optional control that remains visible at the header's right edge. */
-  persistentHeaderAction?: ReactNode;
-  /** Optional content rendered directly under the header, above the children
-      (and shown even when collapsed) — e.g. the bulk-selection action bar. */
-  afterHeader?: ReactNode;
   children: ReactNode;
 }) {
   return (
@@ -4325,44 +4309,28 @@ function SectionGroup({
         <SectionHeader
           title={title}
           hasAction={headerAction != null}
-          hasPersistentAction={persistentHeaderAction != null}
           actionFocusVisible
           collapsed={collapsed}
           onToggleCollapsed={onToggleCollapsed}
         />
-        {persistentHeaderAction ? (
+        {headerAction && (
+          // Always visible (and hit-testable) except on md+ displays with a
+          // fine, hover-capable primary pointer — phones, touch tablets and
+          // coarse-pointer convertibles have no reliable hover, and the "New
+          // project" control lives here (the only way to create a project).
+          // On mouse/trackpad desktops it's hover/keyboard-focus-revealed.
+          // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
+          // clicking the button with the mouse doesn't leave it stuck visible:
+          // React reuses the same node when it swaps expand↔revert, so the
+          // clicked button keeps focus afterward.
           <div
             data-header-controls
-            className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
+            className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
           >
-            {headerAction && (
-              <div className="flex items-center gap-0.5 transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
-                {headerAction}
-              </div>
-            )}
-            {persistentHeaderAction}
+            {headerAction}
           </div>
-        ) : (
-          headerAction && (
-            // Always visible (and hit-testable) except on md+ displays with a
-            // fine, hover-capable primary pointer — phones, touch tablets and
-            // coarse-pointer convertibles have no reliable hover, and the "New
-            // project" control lives here (the only way to create a project).
-            // On mouse/trackpad desktops it's hover/keyboard-focus-revealed.
-            // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
-            // clicking the button with the mouse doesn't leave it stuck visible:
-            // React reuses the same node when it swaps expand↔revert, so the
-            // clicked button keeps focus afterward.
-            <div
-              data-header-controls
-              className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
-            >
-              {headerAction}
-            </div>
-          )
         )}
       </div>
-      {afterHeader}
       {!collapsed && <div className="flex flex-col gap-px pt-1">{children}</div>}
     </section>
   );
@@ -4391,8 +4359,6 @@ function ConversationSection({
   headerAction,
   headerStatus,
   headerContextMenu,
-  persistentHeaderAction,
-  afterHeader,
   footer,
   sessionShortcutSlots,
   onProjectAssigned,
@@ -4435,11 +4401,6 @@ function ConversationSection({
   headerStatus?: ReactNode;
   /** Optional context-menu content opened from the header button. */
   headerContextMenu?: ReactNode;
-  /** Optional control that remains visible at the header's right edge. */
-  persistentHeaderAction?: ReactNode;
-  /** Optional content rendered directly under the header, above the rows (and
-      shown even when collapsed) — e.g. the bulk-selection action bar. */
-  afterHeader?: ReactNode;
   /** Optional content rendered after the rows inside the expanded body (e.g. a
       project folder's "Show more" / loading row). */
   footer?: ReactNode;
@@ -4489,20 +4450,18 @@ function ConversationSection({
             marker={marker}
             active={active}
             hasAction={headerAction != null}
-            hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
             headerDrag={headerDrag}
             contextMenu={headerContextMenu}
             contextMenuDisabled={selectionMode}
           />
-          {(headerAction || persistentHeaderAction) && (
+          {headerAction && (
             // The pointer-events gate lives on this OUTER positioned box: CSS
             // hit-testing on a pointer-events-none child falls through to its
             // nearest interactive ancestor, so gating only the inner wrapper
             // would leave this box swallowing clicks aimed at the badges
-            // beneath it. The always-visible control re-enables hit-testing
-            // for itself; the inner wrapper carries the opacity reveal only.
+            // beneath it. The inner wrapper carries the opacity reveal only.
             // The focus reveal is scoped to focus WITHIN this control cluster
             // (not the whole header): keyboard focus on the header button must
             // not paint hit-testable controls over the still-visible badges —
@@ -4515,34 +4474,26 @@ function ConversationSection({
                   ? "ml-auto flex shrink-0 items-center gap-0.5 pr-1"
                   : "mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
                 protectsCollapsedBadge &&
-                  "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto",
+                  "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
             >
-              {headerAction && (
-                // Reveal keys off focus WITHIN the controls cluster (not the
-                // whole header): clicking the toggle to expand/collapse focuses
-                // the toggle inside SectionHeader — not this cluster — so it no
-                // longer pins the actions visible, and keyboard-focusing the
-                // control itself still reveals it.
-                <div
-                  className={cn(
-                    "flex items-center rounded transition-opacity",
-                    "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
-                  )}
-                >
-                  {headerAction}
-                </div>
-              )}
-              {persistentHeaderAction && (
-                <div className="pointer-events-auto flex items-center">
-                  {persistentHeaderAction}
-                </div>
-              )}
+              {/* Reveal keys off focus WITHIN the controls cluster (not the
+                whole header): clicking the toggle to expand/collapse focuses
+                the toggle inside SectionHeader — not this cluster — so it no
+                longer pins the actions visible, and keyboard-focusing the
+                control itself still reveals it. */}
+              <div
+                className={cn(
+                  "flex items-center rounded transition-opacity",
+                  "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
+                )}
+              >
+                {headerAction}
+              </div>
             </div>
           )}
         </div>
       )}
-      {afterHeader}
       {!isCollapsed && (
         <div className="pt-1">
           {conversations.length === 0 && emptyMessage ? (
