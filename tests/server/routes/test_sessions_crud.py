@@ -624,6 +624,37 @@ async def test_patch_session_null_label_deletes_it(
     assert conv.labels["owner"] == "ana"
 
 
+async def test_patch_session_mixed_label_edit_is_atomic(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PATCH that deletes one label and sets another applies both or
+    neither: when the upsert fails, the deleted label survives."""
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(session_id, {"team": "ml"})
+
+    def failing_upsert(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("upsert refused")
+
+    monkeypatch.setattr(sqlalchemy_store, "_upsert_prepared_labels", failing_upsert)
+    # The test transport re-raises the handler's exception instead of a 500.
+    with pytest.raises(RuntimeError, match="upsert refused"):
+        await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {"team": None, "env": "prod"}},
+            headers={"Content-Type": "application/json"},
+        )
+
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels["team"] == "ml"
+    assert "env" not in conv.labels
+
+
 @pytest.mark.parametrize(
     "reserved_key",
     [
@@ -656,18 +687,41 @@ async def test_patch_rejects_deleting_server_reserved_label(
     assert conv.labels[reserved_key] == "server-written"
 
 
+@pytest.mark.parametrize("bad_key", ["", "k" * 129])
+async def test_patch_rejects_malformed_label_key(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    bad_key: str,
+) -> None:
+    """An empty or over-width key is a 400 before any write, not a database
+    error mid-request."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {bad_key: "x", "team": "ml"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400, resp.text
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "team" not in conv.labels
+
+
 # ── Pinned session label (omnigent.pinned) ───────────────────────────
 
 
+@pytest.mark.parametrize("unpin_value", ["", None])
 async def test_patch_session_pins_and_unpins(
     client: httpx.AsyncClient,
     session_id: str,
     db_uri: str,
+    unpin_value: str | None,
 ) -> None:
     """PATCH with the canonical ``labels: {"omnigent.pinned": <pin-time>}`` pins
     the session for the CALLER: the server rewrites it to the per-user key
     ``omnigent.pinned.<user>`` in storage (so it doesn't pin for others), and an
-    empty value deletes that per-user key (unpin)."""
+    empty value (or ``null``) deletes that per-user key (unpin)."""
     from omnigent.stores.conversation_store import pinned_label_key
 
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -688,10 +742,10 @@ async def test_patch_session_pins_and_unpins(
     # …but the response collapses it back to the canonical key for the caller.
     assert resp.json()["labels"].get("omnigent.pinned") == "1721760000000"
 
-    # Unpin: empty string clears the per-user key.
+    # Unpin: an empty string or null clears the per-user key.
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
-        json={"labels": {"omnigent.pinned": ""}},
+        json={"labels": {"omnigent.pinned": unpin_value}},
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 200

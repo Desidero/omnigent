@@ -149,6 +149,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_permission_mode,
     _publish_sandbox_status,
     _publish_terminal_pending,
+    _reject_malformed_label_keys,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _require_codex_approval_mode_forward,
@@ -1195,6 +1196,9 @@ def register_core_routes(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
         )
+        _reject_malformed_label_keys(parsed_metadata.labels)
+        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+        _reject_server_reserved_label_seed(parsed_metadata.labels)
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
         )
@@ -1210,8 +1214,6 @@ def register_core_routes(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
         )
-        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
         parent_conv = None
@@ -2641,6 +2643,7 @@ def register_core_routes(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
+            _reject_malformed_label_keys(body.labels)
             _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
@@ -3380,9 +3383,17 @@ def register_core_routes(
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set[_clear_key] = None
         labels_to_upsert = {k: v for k, v in labels_to_set.items() if v is not None}
-        for _delete_key in (k for k, v in labels_to_set.items() if v is None):
-            await asyncio.to_thread(conversation_store.delete_label, session_id, _delete_key)
-        if labels_to_upsert:
+        labels_to_delete = [k for k, v in labels_to_set.items() if v is None]
+        # One store transaction, so a failed upsert does not leave the deletes
+        # behind and a concurrent reader never sees a half-applied edit.
+        if labels_to_delete:
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                labels_to_upsert,
+                delete_keys=labels_to_delete,
+            )
+        elif labels_to_upsert:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_upsert)
         # Only when the switch was forwarded: a silent PATCH writes no label,
         # and an unconfirmed mode must not reach the picker.
