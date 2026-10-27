@@ -240,16 +240,26 @@ export function CommandPalette({
     );
   }, [actions, query, sessionsOnly, projectStep]);
 
-  const { data: projects = [] } = useProjects();
+  const { data: projects = [], isSuccess: projectsLoaded, isError: projectsFailed } = useProjects();
   // Every typed word must appear in the row label or the group heading, so
   // "new omni", "omni" and "project" all reach "New chat in omnigent". The
   // project step lists every project until the user types, and matches names only.
   const filteredProjects = useMemo(() => {
     if (projectStep) return projects.filter((project) => matchesEveryWord(project.name, query));
     if (sessionsOnly || query.trim() === "") return [];
-    return projects.filter((project) => matchesEveryWord(`new chat in project ${project.name}`, query));
+    return projects.filter((project) =>
+      matchesEveryWord(`new chat in project ${project.name}`, query),
+    );
   }, [projects, query, sessionsOnly, projectStep]);
   const showNoProject = projectStep && matchesEveryWord("no project", query);
+  // The project step may open before the list resolves. Nothing to choose
+  // from means the plain composer, as if the prompt had never been offered.
+  const noProjectToOffer = projectsFailed || (projectsLoaded && projects.length === 0);
+  useEffect(() => {
+    if (!open || !projectStep || !noProjectToOffer) return;
+    onOpenChange(false);
+    navigate("/");
+  }, [open, projectStep, noProjectToOffer, onOpenChange, navigate]);
 
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", false, { enabled: open && !projectStep });
@@ -331,9 +341,12 @@ export function CommandPalette({
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
-  const loadError = searching
-    ? searchGroups.some((group) => group.isError)
-    : isError || isFetchNextPageError;
+  // The project step never reads sessions, so a stale fetch error stays hidden.
+  const loadError = projectStep
+    ? false
+    : searching
+      ? searchGroups.some((group) => group.isError)
+      : isError || isFetchNextPageError;
   const loadMoreError = searching
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;

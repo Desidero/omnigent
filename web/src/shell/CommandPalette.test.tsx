@@ -495,6 +495,29 @@ describe("CommandPalette — project step", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(navigate).toHaveBeenCalledWith(path);
   });
+
+  it.each([
+    ["", "/"],
+    ["lab", "/?project=home%20lab"],
+  ])("opens the first row with Enter after typing %j", (typed, path) => {
+    const { onOpenChange } = renderPalette({ projectStep: true });
+    const input = screen.getByTestId("command-palette-input");
+    if (typed) fireEvent.change(input, { target: { value: typed } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith(path);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("hides a stale session-load error", () => {
+    useConversations.mockReturnValue({ isError: true, isFetching: false, refetch: vi.fn() });
+    renderPalette({ projectStep: true });
+    expect(screen.queryByText("Couldn't load sessions.")).toBeNull();
+    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
+      "No project",
+      "🔥omnigent",
+      "home lab",
+    ]);
+  });
 });
 
 describe("CommandPalette — input", () => {

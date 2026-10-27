@@ -12,7 +12,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useState } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -5924,35 +5924,37 @@ describe("new-session browser shortcut", () => {
     setEmbedRoot(null);
   });
 
+  function pressNewSession() {
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      shellTree(
+        client,
+        "/c/conv_abc",
+        <>
+          <Route index element={<p>New session route</p>} />
+          <Route path="c/:conversationId" element={<p>Session route</p>} />
+        </>,
+        <AppShell />,
+      ),
+    );
+    fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
+  }
+
+  function restoreNoProjects() {
+    vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
+      typeof useProjects
+    >);
+    localStorage.clear();
+  }
+
   describe("with projects", () => {
     beforeEach(() => {
       vi.mocked(useProjects).mockReturnValue({
         data: [{ id: "p1", name: "omnigent" }],
       } as unknown as ReturnType<typeof useProjects>);
     });
-    afterEach(() => {
-      vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
-        typeof useProjects
-      >);
-      localStorage.clear();
-    });
-
-    function pressNewSession() {
-      mockConversations([{ id: "conv_abc", permission_level: null }]);
-      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      render(
-        shellTree(
-          client,
-          "/c/conv_abc",
-          <>
-            <Route index element={<p>New session route</p>} />
-            <Route path="c/:conversationId" element={<p>Session route</p>} />
-          </>,
-          <AppShell />,
-        ),
-      );
-      fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
-    }
+    afterEach(restoreNoProjects);
 
     it("asks for a project before opening the composer", () => {
       pressNewSession();
@@ -5968,6 +5970,55 @@ describe("new-session browser shortcut", () => {
       pressNewSession();
       expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
       expect(screen.getByText("New session route")).toBeInTheDocument();
+    });
+  });
+
+  describe("while the project list is still loading", () => {
+    interface ProjectsQuery {
+      data?: { id: string; name: string }[];
+      isSuccess?: boolean;
+    }
+    let projectsQuery: ProjectsQuery = {};
+    const subscribers = new Set<() => void>();
+    beforeEach(() => {
+      projectsQuery = {};
+      vi.mocked(useProjects).mockImplementation(
+        () =>
+          useSyncExternalStore(
+            (onChange) => {
+              subscribers.add(onChange);
+              return () => subscribers.delete(onChange);
+            },
+            () => projectsQuery,
+          ) as unknown as ReturnType<typeof useProjects>,
+      );
+    });
+    afterEach(() => {
+      subscribers.clear();
+      restoreNoProjects();
+    });
+
+    function resolveProjects(next: ProjectsQuery) {
+      projectsQuery = next;
+      act(() => subscribers.forEach((notify) => notify()));
+    }
+
+    it("asks for a project, then steps aside when the list resolves empty", () => {
+      pressNewSession();
+      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
+      expect(screen.queryByText("New session route")).toBeNull();
+
+      resolveProjects({ data: [], isSuccess: true });
+      expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
+      expect(screen.getByText("New session route")).toBeInTheDocument();
+    });
+
+    it("lists the projects once they arrive", () => {
+      pressNewSession();
+      resolveProjects({ data: [{ id: "p1", name: "omnigent" }], isSuccess: true });
+      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
+      expect(screen.getByText("omnigent")).toBeInTheDocument();
+      expect(screen.queryByText("New session route")).toBeNull();
     });
   });
 });
