@@ -5,8 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 // Layout regression tests for the sidebar's bulk-action bar (selection
-// mode). The bar is a single bordered pill rendered under the Sessions
-// header: an inline Exit (X) button, the "N selected" count, and the
+// mode). The bar is a single bordered pill rendered in the list toolbar
+// above the scrolling list: an inline Exit (X) button, the "N selected" count, and the
 // icon-only bulk actions grouped at the trailing edge. It lives
 // entirely in normal flow (no absolutely-positioned control, no
 // breakpoint-gated duplicate), which is what kept an earlier mobile-overflow
