@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -721,36 +722,71 @@ def test_init_with_endpoint_installs_sdk_provider(
     assert isinstance(otel_trace.get_tracer_provider(), SdkTracerProvider)
 
 
-def test_init_respects_capture_content_flag(
+def test_set_resource_attribute_replaces_key_and_keeps_others() -> None:
+    """``set_resource_attribute`` adds or replaces one ``OTEL_RESOURCE_ATTRIBUTES`` entry."""
+    env: dict[str, str] = {}
+    telemetry.set_resource_attribute(env, "omnigent.host.id", "host-1")
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == "omnigent.host.id=host-1"
+
+    env["OTEL_RESOURCE_ATTRIBUTES"] = "deployment.environment=prod, omnigent.host.id=stale,"
+    telemetry.set_resource_attribute(env, "omnigent.host.id", "host-2")
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == "deployment.environment=prod,omnigent.host.id=host-2"
+
+
+def test_init_resource_carries_host_id_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``init`` reads ``OMNIGENT_OTEL_CAPTURE_CONTENT`` each call
-    so operators can toggle it after restart.
+    A host id placed in ``OTEL_RESOURCE_ATTRIBUTES`` before ``init`` lands on
+    the provider's resource next to the service name, as the host daemon does
+    for itself and the runners it spawns.
+    """
+    from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=test")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
+    otel_trace._TRACER_PROVIDER = None  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = False  # type: ignore[attr-defined]
+
+    telemetry.set_resource_attribute(os.environ, "omnigent.host.id", "host-1")
+    telemetry.init("omni-host")
+
+    provider = otel_trace.get_tracer_provider()
+    assert isinstance(provider, SdkTracerProvider)
+    assert provider.resource.attributes["omnigent.host.id"] == "host-1"
+    assert provider.resource.attributes["deployment.environment"] == "test"
+    assert provider.resource.attributes["service.name"] == "omni-host"
+
+
+def test_init_reads_capture_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``init`` reads ``OMNIGENT_OTEL_CAPTURE_CONTENT`` and
+    ``OMNIGENT_OTEL_CAPTURE_USER`` each call so operators can toggle
+    them after restart.
     """
     monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
     monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
     monkeypatch.setattr(telemetry, "_initialized", False)
     monkeypatch.setattr(telemetry, "_metrics_initialized", False)
     monkeypatch.setattr(telemetry, "_logs_initialized", False)
-    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
-    monkeypatch.setattr(telemetry, "_runner_process", False)
     monkeypatch.setenv("OMNIGENT_OTEL_CAPTURE_CONTENT", "true")
     monkeypatch.setenv("OMNIGENT_OTEL_CAPTURE_USER", "true")
-    monkeypatch.setenv("OMNIGENT_OTEL_LOCAL_USER", " bob@example.com ")
-    telemetry.init("omni-runner")
+    telemetry.init()
     assert telemetry.should_capture_content() is True
     assert telemetry.should_capture_user() is True
-    assert telemetry._local_user == "bob@example.com"
-    assert telemetry._runner_process is True
 
     monkeypatch.setenv("OMNIGENT_OTEL_CAPTURE_CONTENT", "false")
     monkeypatch.delenv("OMNIGENT_OTEL_CAPTURE_USER")
-    monkeypatch.delenv("OMNIGENT_OTEL_LOCAL_USER")
     telemetry.init()
     assert telemetry.should_capture_content() is False
     assert telemetry.should_capture_user() is False
-    assert telemetry._local_user is None
 
 
 def test_init_disabled_by_default_is_noop(
@@ -911,15 +947,20 @@ def test_active_skill_processor_stamps_spans_while_active() -> None:
     assert telemetry._active_skill_var.get() is None
 
 
-def test_runner_id_processor_uses_bound_runner_then_runner_process_env(
+@pytest.mark.parametrize("process_source", ["runner", "harness"])
+def test_runner_id_processor_uses_bound_runner_then_own_process_env(
+    process_source: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Spans carry ``omnigent.runner.id`` from the runner bound to the request;
-    only runner/harness processes fall back to their own ``OMNIGENT_RUNNER_ID``.
+    only runner and harness processes fall back to their own
+    ``OMNIGENT_RUNNER_ID``.
 
+    :param process_source: Log source of the process under test.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    from omnigent import debug_logging
     from omnigent.debug_logging import runner_log_scope
     from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 
@@ -930,20 +971,20 @@ def test_runner_id_processor_uses_bound_runner_then_runner_process_env(
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     tracer = provider.get_tracer("test")
 
-    monkeypatch.setattr(telemetry, "_runner_process", False)
+    monkeypatch.setattr(debug_logging, "_process_source", "server")
     with runner_log_scope(None, "runner-bound"):
         with tracer.start_as_current_span("server.bound"):
             pass
     with tracer.start_as_current_span("server.unbound"):
         pass
-    monkeypatch.setattr(telemetry, "_runner_process", True)
-    with tracer.start_as_current_span("runner.unbound"):
+    monkeypatch.setattr(debug_logging, "_process_source", process_source)
+    with tracer.start_as_current_span("process.unbound"):
         pass
 
     spans = {s.name: s for s in exporter.get_finished_spans()}
     assert spans["server.bound"].attributes.get("omnigent.runner.id") == "runner-bound"
     assert "omnigent.runner.id" not in (spans["server.unbound"].attributes or {})
-    assert spans["runner.unbound"].attributes.get("omnigent.runner.id") == "runner-from-env"
+    assert spans["process.unbound"].attributes.get("omnigent.runner.id") == "runner-from-env"
 
 
 def test_user_id_processor_stamps_enduser_only_when_opted_in(
@@ -972,20 +1013,14 @@ def test_user_id_processor_stamps_enduser_only_when_opted_in(
         with tracer.start_as_current_span("capture.on"):
             with tracer.start_as_current_span("capture.on.child"):
                 pass
-    with current_user_id_scope("local"):
-        monkeypatch.setattr(telemetry, "_local_user", None)
-        with tracer.start_as_current_span("local.unnamed"):
-            pass
-        monkeypatch.setattr(telemetry, "_local_user", "bob@example.com")
-        with tracer.start_as_current_span("local.named"):
-            pass
+    with tracer.start_as_current_span("capture.on.nobody"):
+        pass
 
     spans = {s.name: s for s in exporter.get_finished_spans()}
     assert "enduser.id" not in (spans["capture.off"].attributes or {})
     assert spans["capture.on"].attributes.get("enduser.id") == "alice@example.com"
     assert spans["capture.on.child"].attributes.get("enduser.id") == "alice@example.com"
-    assert spans["local.unnamed"].attributes.get("enduser.id") == "local"
-    assert spans["local.named"].attributes.get("enduser.id") == "bob@example.com"
+    assert "enduser.id" not in (spans["capture.on.nobody"].attributes or {})
 
 
 def test_set_request_user_stamps_current_span_when_opted_in(
@@ -1007,14 +1042,82 @@ def test_set_request_user_stamps_current_span_when_opted_in(
     with tracer.start_as_current_span("GET /v1/sessions on"):
         telemetry.set_request_user("alice@example.com")
         telemetry.set_request_user(None)  # no-op, must not raise or clear
-    monkeypatch.setattr(telemetry, "_local_user", "bob@example.com")
-    with tracer.start_as_current_span("GET /v1/sessions local"):
-        telemetry.set_request_user("local")
 
     spans = {s.name: s for s in in_memory_exporter.get_finished_spans()}
     assert "enduser.id" not in (spans["GET /v1/sessions off"].attributes or {})
     assert spans["GET /v1/sessions on"].attributes.get("enduser.id") == "alice@example.com"
-    assert spans["GET /v1/sessions local"].attributes.get("enduser.id") == "bob@example.com"
+
+
+def test_fastapi_server_span_carries_enduser_id_when_opted_in(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The SERVER span and its children carry ``enduser.id`` once the gate is on.
+
+    The FastAPI server span starts before the app's own HTTP middleware runs,
+    so the processor's ``on_start`` misses it; ``set_request_user`` from that
+    middleware stamps it, and the user it binds covers the children. The
+    middleware is registered after ``instrument_fastapi_app``, as the server
+    app factory does, which pins that the server span is still current there.
+
+    :param in_memory_exporter: In-memory span exporter fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.trace import SpanKind
+    from starlette.requests import Request
+    from starlette.testclient import TestClient
+
+    from omnigent.debug_logging import USER_ID_ENV_VAR, current_user_id, set_current_user_id
+
+    monkeypatch.delenv(USER_ID_ENV_VAR, raising=False)
+    monkeypatch.setenv("OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION", "true")
+    otel_trace.get_tracer_provider().add_span_processor(telemetry._make_user_id_processor())
+
+    app = FastAPI()
+    telemetry.instrument_fastapi_app(app)
+
+    @app.middleware("http")
+    async def _bind_user(request: Request, call_next: Any) -> Any:
+        set_current_user_id(request.headers.get("x-forwarded-email"))
+        telemetry.set_request_user(current_user_id())
+        try:
+            return await call_next(request)
+        finally:
+            set_current_user_id(None)
+
+    @app.get("/v1/sessions/{session_id}/ping")
+    def ping(session_id: str) -> dict[str, bool]:
+        """
+        Start a child span inside the handler.
+
+        :param session_id: Session id from the path.
+        :returns: A trivial JSON body.
+        """
+        with otel_trace.get_tracer("test").start_as_current_span("inner"):
+            return {"ok": True}
+
+    def request_spans(capture_user: bool) -> list[Any]:
+        monkeypatch.setattr(telemetry, "_capture_user", capture_user)
+        in_memory_exporter.clear()
+        response = TestClient(app).get(
+            "/v1/sessions/conv_1/ping", headers={"X-Forwarded-Email": "alice@example.com"}
+        )
+        assert response.status_code == 200
+        return list(in_memory_exporter.get_finished_spans())
+
+    try:
+        gated_off = request_spans(False)
+        gated_on = request_spans(True)
+    finally:
+        FastAPIInstrumentor.uninstrument_app(app)
+
+    assert gated_off and all("enduser.id" not in (s.attributes or {}) for s in gated_off)
+    server_span = next(s for s in gated_on if s.kind is SpanKind.SERVER)
+    inner_span = next(s for s in gated_on if s.name == "inner")
+    assert server_span.attributes.get("enduser.id") == "alice@example.com"
+    assert inner_span.attributes.get("enduser.id") == "alice@example.com"
 
 
 def test_make_span_attribute_processor_is_generic() -> None:

@@ -644,6 +644,7 @@ explicit consent and PII handling in place.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Workspace URL (same as `DATABRICKS_HOST`) | Apps env |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Bearer $DATABRICKS_TOKEN` | Apps env |
 | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` to include message bodies in traces | Apps env (default off) |
+| `OMNIGENT_OTEL_CAPTURE_USER` | `true` to stamp the acting user as `enduser.id` on spans (usually an email) | Apps env (default off) |
 | `OMNIGENT_GATEWAY_REQUEST_TAGS` | `0` to stop tagging Unity Gateway requests with the session id and labels | Host daemon or CLI env (default on) |
 
 ---
