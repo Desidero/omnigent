@@ -868,6 +868,8 @@ function SidebarImpl({
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
+  // Where the session list portals its toolbar, above the scrolling list.
+  const [listToolbarSlot, setListToolbarSlot] = useState<HTMLDivElement | null>(null);
 
   const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
@@ -1587,6 +1589,7 @@ function SidebarImpl({
               )}
             </div>
 
+            <div ref={setListToolbarSlot} className="shrink-0" />
             <div className="relative flex min-h-0 flex-1 flex-col">
               <div
                 aria-hidden="true"
@@ -1638,6 +1641,7 @@ function SidebarImpl({
                     onDeselectAll={deselectAll}
                     onExitSelectionMode={exitSelectionMode}
                     getVisibleIdsRef={getVisibleIdsRef}
+                    toolbarSlot={listToolbarSlot}
                   />
                 ) : (
                   <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
@@ -2254,6 +2258,9 @@ interface ConversationListProps {
   onDeselectAll: () => void;
   onExitSelectionMode: () => void;
   getVisibleIdsRef: RefObject<() => string[]>;
+  /** Element above the scrolling list that receives the list toolbar (Select,
+      the filter menu and the bulk-action bar), so it never scrolls away. */
+  toolbarSlot: HTMLElement | null;
 }
 
 const ignoreChatStore = () => () => {};
@@ -2294,6 +2301,7 @@ function ConversationList({
   onDeselectAll,
   onExitSelectionMode,
   getVisibleIdsRef,
+  toolbarSlot,
 }: ConversationListProps) {
   const grids = useGridSessions();
   const nestedDrafts = useNestedSessionDrafts();
@@ -3474,16 +3482,23 @@ function ConversationList({
     onToggleSelected,
     onProjectAssigned: expandProject,
   };
-  const sessionsBulkBar =
-    sessionsSelecting && !unifiedSelection ? (
-      <BulkActionBar
-        selectedIds={selectedIds}
-        allConversations={displayPagination.rows}
-        onDeselectAll={onDeselectAll}
-        onExit={onExitSelectionMode}
-        onProjectAssigned={expandProject}
-      />
-    ) : undefined;
+  // One bar for whichever scope is selecting; a unified selection spans the
+  // project folders and the flat lists.
+  const bulkBar = selectionMode ? (
+    <BulkActionBar
+      selectedIds={selectedIds}
+      allConversations={
+        !projectsSelecting
+          ? displayPagination.rows
+          : unifiedSelection
+            ? [...projectSessionPool, ...displayPagination.rows]
+            : projectSessionPool
+      }
+      onDeselectAll={onDeselectAll}
+      onExit={onExitSelectionMode}
+      onProjectAssigned={expandProject}
+    />
+  ) : undefined;
   // The filter stays reachable while bulk-selecting; switching scope just exits
   // selection. Only the "select" entry point hides, being already active.
   const selectSessionsButton = (
@@ -3507,7 +3522,6 @@ function ConversationList({
       <TooltipContent side="bottom">Select sessions</TooltipContent>
     </Tooltip>
   );
-  // A unified selection puts "Select sessions" on the Projects header instead.
   const sessionsHeaderActions = !selectionMode ? (
     <div className="flex items-center gap-0.5">
       <Tooltip>
@@ -3538,7 +3552,6 @@ function ConversationList({
           New session
         </TooltipContent>
       </Tooltip>
-      {!unifiedSelection && selectSessionsButton}
     </div>
   ) : undefined;
   const sessionsFilterMenu = (
@@ -3575,6 +3588,21 @@ function ConversationList({
     activeDrag?.canMoveProject &&
     activeDrag.project !== null &&
     sections.sessions.length === 0;
+  // The list-wide controls sit above the scrolling list (portalled into
+  // `toolbarSlot`), so the filter, Select and a selection's bulk actions stay
+  // in view however far the list is scrolled.
+  const listToolbar = (
+    <div data-testid="sidebar-list-toolbar" className="flex flex-col pt-2 pr-4 pl-2">
+      <div className="flex min-h-7 items-center gap-0.5 pl-2 max-md:pl-4">
+        <span className="sidebar-compact-text min-w-0 flex-1 truncate text-muted-foreground">
+          {SIDEBAR_FILTERS.find((filter) => filter.value === activeTab)?.label}
+        </span>
+        {!selectionMode && selectSessionsButton}
+        {sessionsFilterMenu}
+      </div>
+      {bulkBar}
+    </div>
+  );
   return (
     <SidebarRowDataProvider
       projectNamesById={projectNamesById}
@@ -3692,6 +3720,7 @@ function ConversationList({
         }}
       >
         {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
+        {toolbarSlot && createPortal(listToolbar, toolbarSlot)}
         {(activeDrag?.canDetachNest || showProjectRemoval) &&
           removalTargetContainer &&
           createPortal(
@@ -3761,70 +3790,48 @@ function ConversationList({
                       </PinOrderContext.Provider>
                     </PinDropZone>
                   )}
-                  {/* Projects: one collapsible folder per project. With sidebar_grouping_ui on
-              it holds the one filter menu; Shared and grouped views hide it, and the
-              first list section takes its place. */}
+                  {/* Projects: one collapsible folder per project. Shared and grouped
+              views hide it. */}
                   {!grouped && !showShared && (
                     <SectionGroup
                       title="Projects"
                       collapsed={effectiveCollapsedSections.includes("Projects")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                      persistentHeaderAction={groupingUi ? sessionsFilterMenu : undefined}
-                      afterHeader={
-                        projectsSelecting ? (
-                          <BulkActionBar
-                            selectedIds={selectedIds}
-                            allConversations={
-                              unifiedSelection
-                                ? [...projectSessionPool, ...displayPagination.rows]
-                                : projectSessionPool
-                            }
-                            onDeselectAll={onDeselectAll}
-                            onExit={onExitSelectionMode}
-                            onProjectAssigned={expandProject}
-                          />
-                        ) : undefined
-                      }
                       headerAction={
                         !selectionMode ? (
-                          <>
-                            <ProjectHeaderActions
-                              hostId={defaultProjectHostId}
-                              hosts={hosts}
-                              hostsLoading={hostsLoading}
-                              onOrderChange={(manual) => {
-                                const ranks = new Map(
-                                  projectOrder.data?.ordered_project_ids?.map((id, index) => [
-                                    id,
-                                    index,
-                                  ]),
-                                );
-                                const restored = [...projects].sort(
-                                  (a, b) =>
-                                    (ranks.get(a.id ?? "") ?? Infinity) -
-                                    (ranks.get(b.id ?? "") ?? Infinity),
-                                );
-                                saveOrder.mutate(manual ? restored : null);
-                              }}
-                              manualOrder={projectOrder.data?.sort_mode === "manual"}
-                              orderDisabled={saveOrder.isPending || !projectOrder.data}
-                              projectNames={sections.projectGroups.map((group) => group.name)}
-                              collapsed={effectiveCollapsedSections.includes("Projects")}
-                              expandedProjects={expandedProjects}
-                              // A unified selection starts from the header's own button.
-                              hasProjectSessions={
-                                !unifiedSelection &&
-                                sections.projectGroups.some(
-                                  (group) => group.conversations.length > 0,
-                                )
-                              }
-                              onExpandAll={expandAllProjects}
-                              onCollapseAll={collapseAllProjects}
-                              onProjectCreated={expandProject}
-                              onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                            />
-                            {unifiedSelection && selectSessionsButton}
-                          </>
+                          <ProjectHeaderActions
+                            hostId={defaultProjectHostId}
+                            hosts={hosts}
+                            hostsLoading={hostsLoading}
+                            onOrderChange={(manual) => {
+                              const ranks = new Map(
+                                projectOrder.data?.ordered_project_ids?.map((id, index) => [
+                                  id,
+                                  index,
+                                ]),
+                              );
+                              const restored = [...projects].sort(
+                                (a, b) =>
+                                  (ranks.get(a.id ?? "") ?? Infinity) -
+                                  (ranks.get(b.id ?? "") ?? Infinity),
+                              );
+                              saveOrder.mutate(manual ? restored : null);
+                            }}
+                            manualOrder={projectOrder.data?.sort_mode === "manual"}
+                            orderDisabled={saveOrder.isPending || !projectOrder.data}
+                            projectNames={sections.projectGroups.map((group) => group.name)}
+                            collapsed={effectiveCollapsedSections.includes("Projects")}
+                            expandedProjects={expandedProjects}
+                            // A unified selection starts from the header's own button.
+                            hasProjectSessions={
+                              !unifiedSelection &&
+                              sections.projectGroups.some((group) => group.conversations.length > 0)
+                            }
+                            onExpandAll={expandAllProjects}
+                            onCollapseAll={collapseAllProjects}
+                            onProjectCreated={expandProject}
+                            onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                          />
                         ) : undefined
                       }
                     >
@@ -3902,7 +3909,7 @@ function ConversationList({
                     </SectionGroup>
                   )}
                   {/* Other owners' sessions, above the viewer's own. On the Shared
-                    filter it's the only list, so it takes the list controls. */}
+                    filter it's the only list, so it takes the header actions. */}
                   {(sections.shared.length > 0 || sharedListOnly) && (
                     <ConversationSection
                       title="Shared with me"
@@ -3913,9 +3920,7 @@ function ConversationList({
                       footer={sharedListOnly ? sessionStatus : undefined}
                       collapsed={effectiveCollapsedSections.includes("Shared")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared")}
-                      afterHeader={sharedListOnly ? sessionsBulkBar : undefined}
                       headerAction={sharedListOnly ? sessionsHeaderActions : undefined}
-                      persistentHeaderAction={sharedListOnly ? sessionsFilterMenu : undefined}
                       headerStatus={sharedListOnly ? importStatus : undefined}
                       {...sessionRowProps}
                     />
@@ -3958,10 +3963,8 @@ function ConversationList({
                               }
                               collapsed={effectiveCollapsedSections.includes(group.title)}
                               onToggleCollapsed={() => effectiveToggleSectionCollapsed(group.title)}
-                              afterHeader={index === 0 ? sessionsBulkBar : undefined}
                               headerAction={index === 0 ? sessionsHeaderActions : undefined}
                               headerStatus={index === 0 ? importStatus : undefined}
-                              persistentHeaderAction={index === 0 ? sessionsFilterMenu : undefined}
                               reorderGroup={reorderable ? group.title : undefined}
                               {...sessionRowProps}
                             />
@@ -3975,12 +3978,8 @@ function ConversationList({
                           footer={sessionStatus}
                           collapsed={effectiveCollapsedSections.includes("Chats")}
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-                          afterHeader={sessionsBulkBar}
                           headerAction={sessionsHeaderActions}
                           headerStatus={importStatus}
-                          persistentHeaderAction={
-                            groupingUi && !grouped ? undefined : sessionsFilterMenu
-                          }
                           reorderGroup={reorderable ? "Sessions" : undefined}
                           {...sessionRowProps}
                         />
