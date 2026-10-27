@@ -38,6 +38,45 @@ def _shell_inputs(client: httpx.Client, session_id: str) -> list[str]:
 
 @pytest.mark.nightly
 @pytest.mark.timeout(300)
+def test_web_shell_input_runs_in_codex_shell_not_as_prompt(
+    page: Page,
+    native_codex_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    base_url, session_id = native_codex_mock_session
+    marker = f"shell-{uuid.uuid4().hex[:8]}"
+    leaked = f"prompt-leaked-{uuid.uuid4().hex[:8]}"
+    reset_mock_llm(mock_llm_server_url)
+    # Any prompt that reaches the model answers with the leak marker.
+    for model in ("default", _CODEX_MOCK_MODEL):
+        set_fallback_mock_llm(mock_llm_server_url, model, leaked)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _ensure_chat_view(page)
+    _send(page, "Hello")
+    expect(page.locator(_ASSISTANT, has_text=leaked).first).to_be_visible(timeout=90_000)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+
+    _send(page, f"!echo {marker}")
+
+    expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(1, timeout=60_000)
+    with httpx.Client(base_url=base_url, timeout=15) as client:
+        deadline = time.monotonic() + 60
+        while _shell_inputs(client, session_id) != [f"echo {marker}"]:
+            assert time.monotonic() < deadline, _shell_inputs(client, session_id)
+            time.sleep(1)
+        snapshot = client.get(f"/v1/sessions/{session_id}")
+        snapshot.raise_for_status()
+        assert snapshot.json()["pending_inputs"] == []
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+    # The shell command never reached the model as a prompt.
+    assert page.locator(_ASSISTANT, has_text=leaked).count() == 1
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(300)
 def test_run_button_runs_each_suggested_command_in_codex_shell(
     page: Page,
     native_codex_mock_session: tuple[str, str],
