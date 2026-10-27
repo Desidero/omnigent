@@ -58,6 +58,12 @@ export interface ProjectConfig {
    * moving an existing session into the project doesn't add them.
    */
   labels?: Record<string, string>;
+  /**
+   * Default reasoning effort for new sessions with the default agent (e.g.
+   * `"high"`), from that harness's ladder; Codex validates it against the
+   * model's ladder. Unset = the harness's own configured effort.
+   */
+  effort?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */
