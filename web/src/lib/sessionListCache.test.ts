@@ -6,11 +6,13 @@ import {
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  parseProjectSessionsQueryKey,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
   overlayLabelsIntoCaches,
+  overlayTitleIntoCaches,
   removeIdsFromPages,
 } from "./sessionListCache";
 import type { Session } from "@/lib/types";
@@ -130,6 +132,27 @@ describe("mergeItemsIntoPages", () => {
     const { data: after } = mergeItemsIntoPages(before, changedLabels, DEFAULT_FILTERS, NO_ACTIVE);
     expect(after).not.toBe(before);
     expect(after!.pages[0].data[0].labels).toEqual({ x: "2" });
+  });
+
+  it("compares pull request summaries by value", () => {
+    const pullRequest = {
+      url: "https://github.com/acme/repo/pull/7",
+      provider: "github",
+      repository: "acme/repo",
+      number: 7,
+      state: "OPEN",
+    };
+    const before = data([conv("a", { pull_request: pullRequest })]);
+    const same = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", pull_request: { ...pullRequest } }],
+    ]);
+    const merged = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", pull_request: { ...pullRequest, state: "MERGED" } }],
+    ]);
+
+    expect(mergeItemsIntoPages(before, same, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(before);
+    const { data: after } = mergeItemsIntoPages(before, merged, DEFAULT_FILTERS, NO_ACTIVE);
+    expect(after!.pages[0].data[0].pull_request?.state).toBe("MERGED");
   });
 
   it("does not report ids absent from any page (structural additions)", () => {
@@ -447,20 +470,66 @@ describe("collectConversationIds", () => {
   });
 });
 
+describe("parseProjectSessionsQueryKey", () => {
+  it.each(["updated_at", "created_at"])(
+    "keeps sort and archive scope separate for %s",
+    (sortBy) => {
+      for (const archived of [false, true]) {
+        expect(
+          parseProjectSessionsQueryKey(["project-sessions", "archived", sortBy, archived]),
+        ).toEqual({ project: "archived", sortBy, archived });
+      }
+    },
+  );
+  it("rejects ambiguous keys", () => {
+    expect(() => parseProjectSessionsQueryKey(["project-sessions", "folder", "archived"])).toThrow(
+      "Invalid project sessions query key",
+    );
+  });
+});
+
+describe("project-folder cache membership", () => {
+  it.each([
+    ["project-sessions", "proj", "updated_at", true],
+    ["project-sessions", "proj", "created_at", true],
+  ])("retains a renamed archive in %j and evicts it from live folders", (...archivedKey) => {
+    const qc = new QueryClient();
+    const row = conv("a", { archived: true });
+    qc.setQueryData(archivedKey, data([row]));
+    const liveKey = ["project-sessions", "proj", "updated_at", false];
+    qc.setQueryData(liveKey, data([row]));
+
+    overlayTitleIntoCaches(qc, "a", "Renamed");
+
+    expect(qc.getQueryData<ConversationsInfiniteData>(archivedKey)!.pages[0].data).toEqual([
+      { ...row, title: "Renamed" },
+    ]);
+    expect(qc.getQueryData<ConversationsInfiniteData>(liveKey)!.pages[0].data).toEqual([]);
+
+    overlayArchivedIntoCaches(qc, "a", false);
+    expect(qc.getQueryData<ConversationsInfiniteData>(archivedKey)!.pages[0].data).toEqual([]);
+  });
+});
+
 describe("overlayArchivedIntoCaches", () => {
   it("flips the flag in an include-archived list and drops the row from a folder", () => {
     const qc = new QueryClient();
     // Sidebar/archived-view cache keeps archived rows (client filters them).
     qc.setQueryData(["conversations", "", true], data([conv("a"), conv("b")]));
     // Project folder is non-archived — an archived row no longer belongs.
-    qc.setQueryData(["project-sessions", "proj"], data([conv("a")]));
+    qc.setQueryData(["project-sessions", "proj", "updated_at", false], data([conv("a")]));
 
     overlayArchivedIntoCaches(qc, "a", true);
 
     const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", true])!;
     expect(list.pages[0].data.find((c) => c.id === "a")!.archived).toBe(true);
 
-    const folder = qc.getQueryData<ConversationsInfiniteData>(["project-sessions", "proj"])!;
+    const folder = qc.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "proj",
+      "updated_at",
+      false,
+    ])!;
     expect(folder.pages[0].data.map((c) => c.id)).toEqual([]);
   });
 });
@@ -471,14 +540,15 @@ describe("overlayLabelsIntoCaches", () => {
     const before = { team: "ml", "omnigent.wrapper": "claude" };
     const after = { env: "prod", "omnigent.wrapper": "claude" };
     qc.setQueryData(["conversations", "", false], data([conv("a", { labels: before })]));
-    qc.setQueryData(["project-sessions", "proj"], data([conv("a", { labels: before })]));
+    const folderKey = ["project-sessions", "proj", "updated_at", false];
+    qc.setQueryData(folderKey, data([conv("a", { labels: before })]));
     qc.setQueryData(["session", "a"], { id: "a", labels: before } as unknown as Session);
 
     overlayLabelsIntoCaches(qc, "a", after);
 
     const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!;
     expect(list.pages[0].data[0].labels).toEqual(after);
-    const folder = qc.getQueryData<ConversationsInfiniteData>(["project-sessions", "proj"])!;
+    const folder = qc.getQueryData<ConversationsInfiniteData>(folderKey)!;
     expect(folder.pages[0].data[0].labels).toEqual(after);
     expect(qc.getQueryData<Session>(["session", "a"])!.labels).toEqual(after);
   });
