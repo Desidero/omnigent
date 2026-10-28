@@ -5,19 +5,17 @@ Subject: [PATCH] feat(web): Termux-style extra-keys row for the terminal on
  touch devices
 
 Carried from upstream PR omnigent-ai/omnigent#6136 (btli), squashed from
-its head c5c34220 so we can try it on a phone before it merges. It adds
+its head d2c80fe8 so we can use it on a phone before it merges. It adds
 Esc / Tab / Shift+Tab / arrows / PgUp / PgDn and sticky Ctrl, Alt and Shift
 under the terminal, with a Touch & mobile setting (Auto / Always / Never).
 
-Local fixes on top, found on an iPhone and to be proposed on the PR:
-- Cancel touchend on the row. iOS still focuses the tapped key on the
-  synthetic click when only pointerdown is prevented, which blurs xterm and
-  dismisses the soft keyboard after every key.
-- Pad the iOS terminal view's row by the bottom safe area unless the keyboard
-  is docked. The native bottom bar that used to reserve it is retired, so the
-  bottom keys sat under the rounded corners and home indicator.
+The PR head includes the two iOS fixes we suggested on it: touchend is
+cancelled on the row so the soft keyboard stays up, and the row keeps the
+bottom safe-area padding unless a docked keyboard covers the home
+indicator. The web code matches the PR head; the only addition is the
+`touch-keys` entry in feature-map/terminals.md.
 
-Not ours to upstream as-is: drop this commit when #6136 lands.
+Not ours to upstream: drop this commit when #6136 lands.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
@@ -31,8 +29,8 @@ Signed-off-by: Desidero <desidero@gmail.com>
  ...terminalextrakeys--tablet-idle][linux].png | Bin 0 -> 8219 bytes
  ...rminalextrakeys--tablet-locked][linux].png | Bin 0 -> 8949 bytes
  .../blocks/TerminalExtraKeys.stories.tsx      | 117 +++++
- .../blocks/TerminalExtraKeys.test.tsx         | 408 ++++++++++++++++++
- .../components/blocks/TerminalExtraKeys.tsx   | 237 ++++++++++
+ .../blocks/TerminalExtraKeys.test.tsx         | 407 ++++++++++++++++++
+ .../components/blocks/TerminalExtraKeys.tsx   | 238 ++++++++++
  .../components/blocks/TerminalSession.test.ts | 125 ++++++
  web/src/components/blocks/TerminalSession.ts  |  64 ++-
  .../components/blocks/TerminalView.test.tsx   | 129 ++++++
@@ -42,12 +40,12 @@ Signed-off-by: Desidero <desidero@gmail.com>
  .../components/theme/AppearancePreviews.tsx   |  88 +++-
  .../useTerminalExtraKeysVisibility.test.ts    | 146 +++++++
  .../hooks/useTerminalExtraKeysVisibility.ts   |  32 ++
- web/src/index.css                             |  54 +++
+ web/src/index.css                             |  55 +++
  .../lib/terminalExtraKeysPreferences.test.ts  |  78 ++++
  web/src/lib/terminalExtraKeysPreferences.ts   |  90 ++++
  web/src/pages/SettingsPage.test.tsx           | 156 ++++++-
  web/src/pages/SettingsPage.tsx                |  87 +++-
- 25 files changed, 2506 insertions(+), 25 deletions(-)
+ 25 files changed, 2507 insertions(+), 25 deletions(-)
  create mode 100644 tests/e2e_ui/terminal/__init__.py
  create mode 100644 tests/e2e_ui/terminal/test_extra_keys.py
  create mode 100644 tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-armed][linux].png
@@ -1538,10 +1536,10 @@ index 0000000000000000000000000000000000000000..7aa1c55e08933e48a127d631204e760f
 +};
 diff --git a/web/src/components/blocks/TerminalExtraKeys.test.tsx b/web/src/components/blocks/TerminalExtraKeys.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f7989245862923153
+index 0000000000000000000000000000000000000000..767532994c1051a2c9d677ac0fa1352e70cb7cde
 --- /dev/null
 +++ b/web/src/components/blocks/TerminalExtraKeys.test.tsx
-@@ -0,0 +1,408 @@
+@@ -0,0 +1,407 @@
 +import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 +import { act } from "react";
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1552,9 +1550,9 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +} from "./TerminalExtraKeys";
 +import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
 +
-+const keyboardInset = vi.hoisted(() => vi.fn(() => 0));
++const keyboardInset = vi.hoisted(() => ({ value: 0 }));
 +vi.mock("@/hooks/useIOSNativeKeyboardInset", () => ({
-+  useIOSNativeKeyboardInset: keyboardInset,
++  useIOSNativeKeyboardInset: () => keyboardInset.value,
 +}));
 +
 +function makeTarget(applicationCursor = false) {
@@ -1620,6 +1618,7 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +
 +afterEach(() => {
 +  cleanup();
++  keyboardInset.value = 0;
 +  vi.useRealTimers();
 +  vi.restoreAllMocks();
 +});
@@ -1664,32 +1663,19 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +  });
 +});
 +
-+describe("TerminalExtraKeys pointer semantics", () => {
-+  it("cancels touchend so an iOS tap never moves focus off the terminal", () => {
-+    // WHY: iOS focuses the tapped button on the synthetic click even when
-+    // pointerdown was prevented, which dismisses the soft keyboard.
-+    const target = makeTarget();
-+    render(<TerminalExtraKeys target={target} />);
-+    const esc = key("Escape");
-+
-+    pointerDown(esc);
-+    pointerUp(esc);
-+    expect(fireEvent.touchEnd(esc)).toBe(false);
-+    expect(target.send).toHaveBeenCalledTimes(1);
-+  });
-+
-+  it("marks the row while the iOS keyboard is docked", () => {
-+    const target = makeTarget();
-+    keyboardInset.mockReturnValue(0);
-+    const { rerender } = render(<TerminalExtraKeys target={target} />);
-+    const row = screen.getByRole("toolbar", { name: "Terminal extra keys" });
++describe("TerminalExtraKeys bottom inset", () => {
++  it("marks the row while a docked iOS keyboard covers the home indicator", () => {
++    const { rerender } = render(<TerminalExtraKeys target={makeTarget()} />);
++    const row = screen.getByTestId("terminal-extra-keys");
 +    expect(row).not.toHaveAttribute("data-keyboard-open");
 +
-+    keyboardInset.mockReturnValue(336);
-+    rerender(<TerminalExtraKeys target={target} className="x" />);
++    keyboardInset.value = 320;
++    rerender(<TerminalExtraKeys target={makeTarget()} />);
 +    expect(row).toHaveAttribute("data-keyboard-open", "true");
 +  });
++});
 +
++describe("TerminalExtraKeys pointer semantics", () => {
 +  it("sends on pointerup exactly once per tap, and prevents the pointerdown default", () => {
 +    // WHY: pointerdown preventDefault keeps focus on xterm's textarea (soft
 +    // keyboard stays open) and suppresses compat mouse events; the trailing
@@ -1707,6 +1693,17 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +    expect(target.send).toHaveBeenCalledWith("\x1b");
 +
 +    fireEvent.click(esc, { detail: 1 });
++    expect(target.send).toHaveBeenCalledTimes(1);
++  });
++
++  it("cancels touchend so WebKit's synthetic click can't move focus off the terminal", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const esc = key("Escape");
++
++    pointerDown(esc);
++    pointerUp(esc);
++    expect(fireEvent.touchEnd(esc)).toBe(false);
 +    expect(target.send).toHaveBeenCalledTimes(1);
 +  });
 +
@@ -1952,10 +1949,10 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +});
 diff --git a/web/src/components/blocks/TerminalExtraKeys.tsx b/web/src/components/blocks/TerminalExtraKeys.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5d0c4adb5
+index 0000000000000000000000000000000000000000..b0d1935a8dd48f7f2eb52e0ba6f4b293909449c6
 --- /dev/null
 +++ b/web/src/components/blocks/TerminalExtraKeys.tsx
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,238 @@
 +// Termux-style extra-keys row under the terminal on touch devices: a fixed
 +// 2×7 grid of Esc / Tab / arrows plus sticky Ctrl / Alt / Shift. Modifier
 +// state lives in a ref so a keystroke never waits on a React render.
@@ -2029,6 +2026,7 @@ index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5
 +  const targetRef = useRef(target);
 +  targetRef.current = target;
 +  const transformRef = useRef<ExtraKeysInputTransform | null>(null);
++  // iOS only (0 elsewhere): a docked keyboard covers the home indicator.
 +  const keyboardOpen = useIOSNativeKeyboardInset() > 0;
 +
 +  // Single write point for modifier state: the ref feeds the transform, the
@@ -2163,8 +2161,8 @@ index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5
 +      data-keyboard-open={keyboardOpen || undefined}
 +      className={cn("terminal-extra-keys", className)}
 +      onContextMenu={(e) => e.preventDefault()}
-+      // iOS moves focus on the tap's synthetic click even after pointerdown is
-+      // prevented; cancelling touchend keeps xterm's textarea and the keyboard.
++      // Taps send on pointerup; WebKit still moves focus on the tap's synthetic
++      // click, so cancel it to keep xterm's textarea (and the keyboard) focused.
 +      onTouchEnd={(e) => e.preventDefault()}
 +    >
 +      {EXTRA_KEY_ROWS.map((row, rowIndex) =>
@@ -3413,10 +3411,10 @@ index 0000000000000000000000000000000000000000..56ce2c85cdf501993eecb467de760bc6
 +  return isIOSShell() || isAndroidShell() || coarsePointer;
 +}
 diff --git a/web/src/index.css b/web/src/index.css
-index eaf736c73af7b41c2d07358b35d8efeb5eb97934..5099140cc032ae04d270a1f6b430e0963235109c 100644
+index eaf736c73af7b41c2d07358b35d8efeb5eb97934..41105e88b6cac6041325c03f11ebdf7de8eed562 100644
 --- a/web/src/index.css
 +++ b/web/src/index.css
-@@ -1171,6 +1171,60 @@ html[data-electron-mac] .breadcrumb-folder {
+@@ -1171,6 +1171,61 @@ html[data-electron-mac] .breadcrumb-folder {
    }
  }
  
@@ -3440,7 +3438,8 @@ index eaf736c73af7b41c2d07358b35d8efeb5eb97934..5099140cc032ae04d270a1f6b430e096
 +}
 +
 +/* The mobile drawer already reserves the bottom inset, and a docked iOS
-+   keyboard covers the home indicator; don't add the inset in either case. */
++   keyboard covers the home indicator; don't add the inset in either case.
++   Android zeroes --omnigent-safe-bottom itself while the keyboard is up. */
 +:is([data-ios-native], [data-android-native]) .mobile-panel-drawer .terminal-extra-keys,
 +[data-ios-native] .terminal-extra-keys[data-keyboard-open] {
 +  padding-bottom: 0.25rem;
