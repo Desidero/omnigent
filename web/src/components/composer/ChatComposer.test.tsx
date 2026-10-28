@@ -195,6 +195,44 @@ describe("ChatComposer", () => {
     );
   });
 
+  describe("touch taps", () => {
+    function renderSendForm({ disabled = false } = {}) {
+      const onSubmit = vi.fn((event: FormEvent) => event.preventDefault());
+      render(
+        <form onSubmit={onSubmit}>
+          <textarea aria-label="Draft" />
+          <ComposerSendButton label="Send" disabled={disabled} />
+        </form>,
+      );
+      const send = screen.getByRole("button", { name: "Send" });
+      vi.spyOn(send, "getBoundingClientRect").mockReturnValue(
+        DOMRect.fromRect({ x: 300, y: 600, width: 32, height: 32 }),
+      );
+      return { onSubmit, send };
+    }
+    const endTouchAt = (button: HTMLElement, clientX: number, clientY: number) =>
+      fireEvent.touchEnd(button, { changedTouches: [{ clientX, clientY }] });
+
+    it("submits from a tap that ends on the button, without waiting for its click", () => {
+      const { onSubmit, send } = renderSendForm();
+      // No click follows, as when iOS drops the tap's synthetic click.
+      expect(endTouchAt(send, 316, 616)).toBe(false);
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves a touch that slid off the button alone", () => {
+      const { onSubmit, send } = renderSendForm();
+      expect(endTouchAt(send, 316, 400)).toBe(true);
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it("does not submit a disabled button from a tap", () => {
+      const { onSubmit, send } = renderSendForm({ disabled: true });
+      expect(endTouchAt(send, 316, 616)).toBe(true);
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+  });
+
   it("keeps an enabled send action independent from the theme accent", () => {
     render(<ComposerSendButton label="Send" />);
     expect(screen.getByRole("button", { name: "Send" })).toHaveClass(

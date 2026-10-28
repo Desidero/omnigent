@@ -468,13 +468,30 @@ export const ComposerSendButton = forwardRef<
     interrupt?: boolean;
   }
 >(function ComposerSendButton(
-  { label, busy = false, interrupt = false, className, ...props },
+  { label, busy = false, interrupt = false, className, onTouchEnd, ...props },
   ref,
 ) {
   return (
     <Button
       ref={ref}
       type="submit"
+      onTouchEnd={(event) => {
+        onTouchEnd?.(event);
+        // iOS can drop the click a tap synthesizes while the keyboard is up, so
+        // a tap that ends on the button submits itself and skips that click.
+        const button = event.currentTarget;
+        const touch = event.changedTouches[0];
+        if (event.defaultPrevented || button.disabled || !touch) return;
+        const bounds = button.getBoundingClientRect();
+        const endedOnButton =
+          touch.clientX >= bounds.left &&
+          touch.clientX <= bounds.right &&
+          touch.clientY >= bounds.top &&
+          touch.clientY <= bounds.bottom;
+        if (!endedOnButton) return;
+        event.preventDefault();
+        button.click();
+      }}
       size="icon"
       variant={interrupt ? "destructive" : "default"}
       className={cn(
