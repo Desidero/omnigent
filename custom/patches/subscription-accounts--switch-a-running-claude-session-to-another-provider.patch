@@ -52,10 +52,10 @@ Docs: none (documented with its series in docs/providers.md)
  create mode 100644 tests/server/routes/test_session_provider_switch.py
 
 diff --git a/omnigent/host/frames.py b/omnigent/host/frames.py
-index f113a5bd0f92e05348a5ae330edd3d70323d831b..b0f8270e5789127a9ae6f485f25ea3e83dadf1f5 100644
+index 448a321f3f30691c0ce02be222a9a71f89445e38..3fb4105990cf4c97deb1a1cf3c89d77154e7be6c 100644
 --- a/omnigent/host/frames.py
 +++ b/omnigent/host/frames.py
-@@ -1222,7 +1222,7 @@ class HostProvidersResultFrame:
+@@ -1343,7 +1343,7 @@ class HostProvidersResultFrame:
  
      request_id: str
      status: str
@@ -64,7 +64,7 @@ index f113a5bd0f92e05348a5ae330edd3d70323d831b..b0f8270e5789127a9ae6f485f25ea3e8
      error: str | None = None
  
  
-@@ -3087,13 +3087,15 @@ def _decode_providers_result(msg: _JsonObject) -> HostProvidersResultFrame:
+@@ -3382,13 +3382,15 @@ def _decode_providers_result(msg: _JsonObject) -> HostProvidersResultFrame:
      raw = msg.get("providers", [])
      if not isinstance(raw, list):
          raise ValueError("frame field must be a list of providers: 'providers'")
@@ -150,10 +150,10 @@ index d7c98c163e0b5421c54b631de0c85e0c715b76e8..c045f621c731bad34f2bd3bbc5d17281
          )
      return rows
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index 64755517c245ac2e5f4d0bb2d9dfc574ee3aaea4..359f2a83bb9d30bd664d3fc996635e63a82cab8e 100644
+index d532b3f4626ab3066c085e71a112a8b77b82f402..3d0bc77340162f9c0ffc1c0ece3de828c7186971 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -5085,6 +5085,10 @@ def _publish_status(
+@@ -5144,6 +5144,10 @@ def _publish_status(
      _session_status_cache[session_id] = status
      if previous_status != status:
          _publish_child_status_to_parent(session_id, status)
@@ -161,9 +161,9 @@ index 64755517c245ac2e5f4d0bb2d9dfc574ee3aaea4..359f2a83bb9d30bd664d3fc996635e63
 +        from omnigent.server.routes.sessions.routes_provider import note_session_status
 +
 +        note_session_status(status)
-     # Mirror the transition onto the conversation row (best-effort,
-     # deduplicated, off-loop) so replicas that don't hold this session's
-     # runner tunnel serve the same sidebar status.
+     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
+         # A turn can open or merge a PR while nobody watches; refresh what the server
+         # stores. Stops and archives publish idle without persisting it, and skip this.
 diff --git a/omnigent/server/routes/host_providers.py b/omnigent/server/routes/host_providers.py
 index e6887885dd8b77ee1805bcf5ec2da1c72b53f48f..00312154e4e47cac7b9dbd39f9011bcf896b4b88 100644
 --- a/omnigent/server/routes/host_providers.py
@@ -187,10 +187,10 @@ index e6887885dd8b77ee1805bcf5ec2da1c72b53f48f..00312154e4e47cac7b9dbd39f9011bcf
  
  class HostProvidersResponse(BaseModel):
 diff --git a/omnigent/server/routes/sessions/__init__.py b/omnigent/server/routes/sessions/__init__.py
-index 0b3ab7385c9ddd3e67a247d9db62a0f3b9bad387..091d3e1d43983a6c10fbcc2800efae3b59e735d5 100644
+index d79e60ef0f757c29b908bff335864ba8d36c5244..c7dbc60263ee941da04c0645c0a9367d82afba0d 100644
 --- a/omnigent/server/routes/sessions/__init__.py
 +++ b/omnigent/server/routes/sessions/__init__.py
-@@ -899,6 +899,7 @@ def create_sessions_router(
+@@ -904,6 +904,7 @@ def create_sessions_router(
      from omnigent.server.routes.sessions.routes_hooks import register_hooks_routes
      from omnigent.server.routes.sessions.routes_items import register_items_routes
      from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
@@ -198,8 +198,8 @@ index 0b3ab7385c9ddd3e67a247d9db62a0f3b9bad387..091d3e1d43983a6c10fbcc2800efae3b
      from omnigent.server.routes.sessions.routes_resources import register_resources_routes
      from omnigent.server.routes.sessions.routes_ui import register_ui_routes
  
-@@ -921,6 +922,16 @@ def create_sessions_router(
-         background_title_coordinator=background_title_coordinator,
+@@ -929,6 +930,16 @@ def create_sessions_router(
+         pull_request_refresher=pull_request_refresher,
      )
  
 +    register_provider_routes(
@@ -216,10 +216,10 @@ index 0b3ab7385c9ddd3e67a247d9db62a0f3b9bad387..091d3e1d43983a6c10fbcc2800efae3b
          router,
          conversation_store=conversation_store,
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index e11f743a2bf0af72b118e83299244f4a5286c95b..5c82574857e5a42ec9c8b0ddaf4ce91929550273 100644
+index 6ebd511e85e65d6a1b55033e8148b985f479f6ec..2aae1289fd1c026eb7df73ad1a7f029b822abfd7 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -280,27 +280,54 @@ async def _wake_runner_for_model_change(
+@@ -294,27 +294,54 @@ async def _wake_runner_for_model_change(
      runner_router: RunnerRouter | None,
  ) -> Conversation:
      """Restore a sleeping native session before applying an explicit model pick."""
@@ -640,10 +640,10 @@ index 0000000000000000000000000000000000000000..2233bde5d391a82d5641c11f262f2768
 +            host_registry=host_registry,
 +        )
 diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
-index e66b8b6230043ebaeaf4ed2ec83e7f69bc0bfa54..8362b1bbcfae1b04987a4d423307ab10266ce453 100644
+index b8cdf8a88fdde90c7b9473681a6bc82d9e9ad50c..caa01525481c488a576b4e26d002db849958ad0c 100644
 --- a/omnigent/stores/conversation_store/__init__.py
 +++ b/omnigent/stores/conversation_store/__init__.py
-@@ -1067,6 +1067,19 @@ class ConversationStore(ABC):
+@@ -1113,6 +1113,19 @@ class ConversationStore(ABC):
          """
          ...
  
@@ -664,10 +664,10 @@ index e66b8b6230043ebaeaf4ed2ec83e7f69bc0bfa54..8362b1bbcfae1b04987a4d423307ab10
      def update_conversation_with_changes(
          self,
 diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
-index ad2d6c954eb5dd0092f8e0031c26e9ea42b6c83d..bb8dd3adc3ebb9ef3b756458dd153fa98f1d8900 100644
+index 15e10187c36e8cd2be8c16b180cfb515b9ea8392..325b46c120e3f40ca7c014b79be33a74bab6ac13 100644
 --- a/omnigent/stores/conversation_store/sqlalchemy_store.py
 +++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
-@@ -3472,6 +3472,41 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3547,6 +3547,41 @@ class SqlAlchemyConversationStore(ConversationStore):
          descending_scan = is_desc if forward else not is_desc
          return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
  
@@ -710,10 +710,10 @@ index ad2d6c954eb5dd0092f8e0031c26e9ea42b6c83d..bb8dd3adc3ebb9ef3b756458dd153fa9
          self,
          conversation_id: str,
 diff --git a/openapi.json b/openapi.json
-index 2e77aec5a2922c7983467096a90c888f66818211..4a877bca1277a53ccfe55ab90784c1d374bb6de2 100644
+index 8fec332f1eba8dfeeff9328ab5c98d6da0e418c5..00b41f35c5f3c9377275d72f4d8c9bd6f5810565 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -3271,6 +3271,18 @@
+@@ -3323,6 +3323,18 @@
              "description": "`False` when a subscription account is not logged in.",
              "title": "Ready",
              "type": "boolean"
@@ -732,7 +732,7 @@ index 2e77aec5a2922c7983467096a90c888f66818211..4a877bca1277a53ccfe55ab90784c1d3
            }
          },
          "required": [
-@@ -7620,6 +7632,60 @@
+@@ -7765,6 +7777,60 @@
          "title": "SessionProjectSummary",
          "type": "object"
        },
@@ -790,10 +790,10 @@ index 2e77aec5a2922c7983467096a90c888f66818211..4a877bca1277a53ccfe55ab90784c1d3
 +        "title": "SessionProviderResponse",
 +        "type": "object"
 +      },
-       "SessionReasoningEffortEvent": {
-         "description": "Active reasoning-effort update from a terminal-backed integration.\n\nEmitted after an `external_reasoning_effort_change` POST from a native\nterminal forwarder when the user changes the thinking level inside the\nterminal UI. Lets the web effort picker reflect a TUI-side switch without\na reload.",
+       "SessionPullRequest": {
+         "description": "A pull request linked to a session, as `GET /v1/sessions/{id}/pull-requests` lists it.",
          "properties": {
-@@ -15503,6 +15569,59 @@
+@@ -16213,6 +16279,59 @@
          ]
        }
      },
@@ -850,14 +850,14 @@ index 2e77aec5a2922c7983467096a90c888f66818211..4a877bca1277a53ccfe55ab90784c1d3
 +        ]
 +      }
 +    },
-     "/v1/sessions/{session_id}/read-state": {
-       "put": {
-         "description": "Set the calling user's read-state for one session.\n\nRequires `LEVEL_READ` on the session in multi-user mode \u2014 you can\nonly track read-state for sessions you can see. Stores the values\nverbatim (the client enforces the baseline's monotonicity and the\nunread semantics); the server does not interpret them against\nsession status. Returns `204` \u2014 the client already has the\noptimistic state and re-reads the authoritative value on the next\n`GET /v1/sessions` poll.\n\n**Parameters**\n\n- `body` \u2014 The validated `ReadStatePutRequest`.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks read access.",
+     "/v1/sessions/{session_id}/pull-requests": {
+       "delete": {
+         "description": "Unlink a pull request from the session, whether or not its host is online.\n\nThe server's unlink stands on its own; it is also passed to the runner\nor host when one is reachable, so its local list stops reporting the PR.\n\n**Returns:** The first page of the session's remaining linked PRs.",
 diff --git a/tests/host/test_frames.py b/tests/host/test_frames.py
-index 4147f9d5c9ff0c1ff1a75df7ff6d814b1ffd0b8e..bbf8589cef7850c38812eb3869a177911f9d64b9 100644
+index 2a7b22e1be0a6acf7c2507b28d88c27b2db3203f..929bd4e9c69d62c77b2bc5e0e3c2fc67c07ebce8 100644
 --- a/tests/host/test_frames.py
 +++ b/tests/host/test_frames.py
-@@ -414,9 +414,10 @@ def test_mcp_servers_result_validates_reported_account_state(
+@@ -423,9 +423,10 @@ def test_mcp_servers_result_validates_reported_account_state(
                  {
                      "name": "claude-max2",
                      "kind": "subscription",
@@ -869,7 +869,7 @@ index 4147f9d5c9ff0c1ff1a75df7ff6d814b1ffd0b8e..bbf8589cef7850c38812eb3869a17791
                  }
              ],
          ),
-@@ -445,7 +446,8 @@ def test_providers_result_drops_unknown_fields() -> None:
+@@ -454,7 +455,8 @@ def test_providers_result_drops_unknown_fields() -> None:
          )
      )
      assert isinstance(frame, HostProvidersResultFrame)
@@ -1131,10 +1131,10 @@ index 0000000000000000000000000000000000000000..24f8a4df3142f347497a8b1708b71684
 +    assert store.conv.provider_override == before
 +    assert calls["stop"] == []
 diff --git a/tests/stores/test_conversation_store.py b/tests/stores/test_conversation_store.py
-index efdddb96d9c92b5c27bc8fb43e088d498ddb6669..d37c0e4a35b19954e6d82f4d6baae90ae44400af 100644
+index 2f2bb3d95a02a4921400d70ae2c63a3afc358817..666281cfadebcbbdc54cd9d020f7d0411cc70984 100644
 --- a/tests/stores/test_conversation_store.py
 +++ b/tests/stores/test_conversation_store.py
-@@ -217,6 +217,25 @@ def test_create_persists_initial_labels_and_overrides(
+@@ -218,6 +218,25 @@ def test_create_persists_initial_labels_and_overrides(
      assert fetched.harness_override == "codex-native"
  
  

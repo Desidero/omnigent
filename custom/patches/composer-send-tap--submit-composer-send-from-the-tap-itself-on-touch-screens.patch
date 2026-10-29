@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 28 Oct 2026 00:30:53 +0000
+Subject: [PATCH] fix(web): submit composer Send from the tap itself on touch
+ screens
+
+On an iPhone, in Safari and in the iOS app, tapping Send while the
+keyboard is up sometimes does nothing until the keyboard is dismissed.
+Send is a plain submit button: it only submits on the click that WebKit
+synthesizes after a tap. WebKit on iOS drops that click without telling
+the page, for example when the clickable node under the finger at
+touch-up differs from touch-down (commitPotentialTap) or when it treats
+the tap as a hover. The page still gets touchstart and touchend.
+
+ComposerSendButton now submits from a touchend that ends on an enabled
+button and cancels the touch, which suppresses the synthesized click so
+one tap sends once. Cancelling it also skips the compatibility mousedown,
+so the input keeps focus until the composer's own send handling resets
+it. The session, side-chat and new-session composers share the button.
+
+Carried here so phones get it before the upstream PR lands.
+
+Not upstream yet: proposed from fix/composer-send-tap-mobile; drop this
+copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (fix; no setting or API, Send behaves as before, more reliably on touch)
+---
+ .../components/composer/ChatComposer.test.tsx | 38 +++++++++++++++++++
+ web/src/components/composer/ChatComposer.tsx  | 19 +++++++++-
+ 2 files changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/web/src/components/composer/ChatComposer.test.tsx b/web/src/components/composer/ChatComposer.test.tsx
+index d008521451bcb26fe1f1e7b9883d5bd50bde0b74..ecee497e92f8c5dc28b363cac880832e9abb1ed8 100644
+--- a/web/src/components/composer/ChatComposer.test.tsx
++++ b/web/src/components/composer/ChatComposer.test.tsx
+@@ -195,6 +195,44 @@ describe("ChatComposer", () => {
+     );
+   });
+ 
++  describe("touch taps", () => {
++    function renderSendForm({ disabled = false } = {}) {
++      const onSubmit = vi.fn((event: FormEvent) => event.preventDefault());
++      render(
++        <form onSubmit={onSubmit}>
++          <textarea aria-label="Draft" />
++          <ComposerSendButton label="Send" disabled={disabled} />
++        </form>,
++      );
++      const send = screen.getByRole("button", { name: "Send" });
++      vi.spyOn(send, "getBoundingClientRect").mockReturnValue(
++        DOMRect.fromRect({ x: 300, y: 600, width: 32, height: 32 }),
++      );
++      return { onSubmit, send };
++    }
++    const endTouchAt = (button: HTMLElement, clientX: number, clientY: number) =>
++      fireEvent.touchEnd(button, { changedTouches: [{ clientX, clientY }] });
++
++    it("submits from a tap that ends on the button, without waiting for its click", () => {
++      const { onSubmit, send } = renderSendForm();
++      // No click follows, as when iOS drops the tap's synthetic click.
++      expect(endTouchAt(send, 316, 616)).toBe(false);
++      expect(onSubmit).toHaveBeenCalledTimes(1);
++    });
++
++    it("leaves a touch that slid off the button alone", () => {
++      const { onSubmit, send } = renderSendForm();
++      expect(endTouchAt(send, 316, 400)).toBe(true);
++      expect(onSubmit).not.toHaveBeenCalled();
++    });
++
++    it("does not submit a disabled button from a tap", () => {
++      const { onSubmit, send } = renderSendForm({ disabled: true });
++      expect(endTouchAt(send, 316, 616)).toBe(true);
++      expect(onSubmit).not.toHaveBeenCalled();
++    });
++  });
++
+   it("keeps an enabled send action independent from the theme accent", () => {
+     render(<ComposerSendButton label="Send" />);
+     expect(screen.getByRole("button", { name: "Send" })).toHaveClass(
+diff --git a/web/src/components/composer/ChatComposer.tsx b/web/src/components/composer/ChatComposer.tsx
+index 2de111d0ea42505b4710d7e30ba86532109b149b..c30dac28fb9e359dbff1e6d279cb58a0675b42e7 100644
+--- a/web/src/components/composer/ChatComposer.tsx
++++ b/web/src/components/composer/ChatComposer.tsx
+@@ -468,13 +468,30 @@ export const ComposerSendButton = forwardRef<
+     interrupt?: boolean;
+   }
+ >(function ComposerSendButton(
+-  { label, busy = false, interrupt = false, className, ...props },
++  { label, busy = false, interrupt = false, className, onTouchEnd, ...props },
+   ref,
+ ) {
+   return (
+     <Button
+       ref={ref}
+       type="submit"
++      onTouchEnd={(event) => {
++        onTouchEnd?.(event);
++        // iOS can drop the click a tap synthesizes while the keyboard is up, so
++        // a tap that ends on the button submits itself and skips that click.
++        const button = event.currentTarget;
++        const touch = event.changedTouches[0];
++        if (event.defaultPrevented || button.disabled || !touch) return;
++        const bounds = button.getBoundingClientRect();
++        const endedOnButton =
++          touch.clientX >= bounds.left &&
++          touch.clientX <= bounds.right &&
++          touch.clientY >= bounds.top &&
++          touch.clientY <= bounds.bottom;
++        if (!endedOnButton) return;
++        event.preventDefault();
++        button.click();
++      }}
+       size="icon"
+       variant={interrupt ? "destructive" : "default"}
+       className={cn(

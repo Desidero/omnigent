@@ -1,4 +1,4 @@
-<!-- posted 2026-10-23: https://github.com/omnigent-ai/omnigent/pull/6136#discussion_r4363312757 -->
+<!-- posted 2026-10-23: https://github.com/omnigent-ai/omnigent/pull/6136#discussion_r4363312757; addressed in d2c80fe (2026-10-27) -->
 We have been running this PR on iPhones (iOS app) for a few weeks now, and it is a big improvement for driving TUIs from a phone. Two iOS-specific issues came up that we have been carrying as a local fix; both still apply to the current head (92f437a).
 
 - **Every tap on the row dismisses the soft keyboard on iOS.** `pointerdown` is prevented, but WebKit still moves focus to the tapped button on the synthetic click that follows `touchend`, so xterm's textarea blurs and the keyboard closes after each key. Cancelling `touchend` on the toolbar keeps focus on the terminal (`web/src/components/blocks/TerminalExtraKeys.tsx`, line 204):
@@ -38,4 +38,4 @@ We also have two small unit tests for these (touchend returns `false` and sends 
 
 ---
 
-Carried copy: it cannot be dropped as-is when #6136 merges. The PR head (a plain rebase of the c5c3422 we squashed; the 2026-10-22 update changed none of the PR's files) has neither fix, so unless the author takes the suggestions, the two iOS hunks (touchend cancel; keyboard-open inset) plus their two tests must become a small follow-up patch or PR.
+Addressed: btli folded both fixes into the PR on 2026-10-27 (head `d2c80fe`, "fix(web): keep the iOS keyboard and home-indicator inset with extra keys", with us as co-author), including both unit tests. Our patch 1 now matches that head (see `../_reviews/review-6136-terminal-extra-keys.md`), so it can be dropped as-is when #6136 merges; no follow-up patch or PR is needed for the iOS fixes.

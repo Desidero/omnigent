@@ -48,18 +48,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  omnigent/onboarding/subscription_accounts.py  |  35 +++
  omnigent/runner/app.py                        |   7 +-
  omnigent/runner/child_account.py              | 130 +++++++++++
- omnigent/runner/tool_dispatch.py              | 204 +++++++++++++++--
+ omnigent/runner/tool_dispatch.py              | 208 ++++++++++++++++--
  .../server/routes/_sessions/orchestration.py  |   8 +-
  omnigent/server/schemas.py                    |   3 +-
  omnigent/tools/builtins/list_models.py        |  41 +++-
- omnigent/tools/builtins/spawn.py              |  22 +-
- .../onboarding/test_subscription_accounts.py  |  61 ++++++
+ omnigent/tools/builtins/spawn.py              |  20 ++
+ .../onboarding/test_subscription_accounts.py  |  61 +++++
  .../test_native_subagent_inbox_delivery.py    |  22 ++
- tests/runner/test_runner_dispatch.py          | 207 +++++++++++++++++-
+ tests/runner/test_runner_dispatch.py          | 207 ++++++++++++++++-
  .../integration/test_session_host_launch.py   |  42 ++++
  .../test_subagent_status_forward_recovery.py  |  33 +++
  tests/tools/builtins/test_list_models.py      |  42 ++++
- 16 files changed, 863 insertions(+), 32 deletions(-)
+ 16 files changed, 866 insertions(+), 31 deletions(-)
  create mode 100644 omnigent/runner/child_account.py
 
 diff --git a/docs/providers.md b/docs/providers.md
@@ -103,22 +103,22 @@ index aab5b61f7e379140766ee392e6d102f962c91914..168804089f68bb1b8dd344f3c49c5838
  
  A Claude session (claude-native or claude-sdk) can move to another provider
 diff --git a/feature-map/native-harnesses.md b/feature-map/native-harnesses.md
-index 26f7bc93176db9778ed9144db134517124dcb437..c93eeda2d4cc440f5e03e11a856c4cf87296c855 100644
+index c3f065fc822e1c9c25ff0dc26b6627aef7b1f9fa..17e3482547c2215e9a8d7acff424f88e5b01aa44 100644
 --- a/feature-map/native-harnesses.md
 +++ b/feature-map/native-harnesses.md
-@@ -51,6 +51,9 @@ implements them separately, so a fix for one harness does not reach the others.
+@@ -82,6 +82,9 @@ implements them separately, so a fix for one harness does not reach the others.
  - `subagent-discovery`: Claude children appear under the agent that spawned
-   them, including delayed spawns; an unresolved spawn does not keep an idle
-   runner re-reading unchanged conversations.
+   them, including forked slash commands and delayed spawns; an unresolved
+   spawn does not keep an idle runner re-reading unchanged conversations.
 +- `child-account`: with several accounts on the host, `sys_session_create`
 +  `provider` starts a Claude or Codex child on a chosen account; the child runs
 +  in its own runner when its parent's runner uses another account.
  - `disconnect`: startup waits and active operations settle when their native
    connection ends; reconnect can receive fresh events. Distinguish a native
    CLI disconnect, a runner going offline, and a browser stream reconnect.
-@@ -110,6 +113,12 @@ the linked session's Agents panel and check the child under its parent. Ask a
- child to delegate again to check nested ownership; completed children remain
- visible while the runner idles.
+@@ -145,6 +148,12 @@ visible while the runner idles. Also invoke an installed skill configured with
+ `context: fork`, such as `/code-review`, from Chat or the native terminal.
+ The skill's agent and any helpers it delegates should appear in the same tree.
  
 +**Child on another account:** with two Claude accounts (and a Codex one) under
 +`providers:` (see `docs/providers.md`), ask a Claude session to call
@@ -173,10 +173,10 @@ index c045f621c731bad34f2bd3bbc5d17281a9bcb6d4..3ea46fabff7fc0d347437ed249a48964
 +                defaults[name].append(cli)
 +    return list(rows.values())
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index 994ef539cd3d777cf5fc9281bcf8f7817a3e0ea2..bcaf48379146e7700b4161926c444ea054ff1dba 100644
+index c1284fe83c490e4c183df29cad7d969715331d09..a315679b8ac73897a94601e534b74f9b18b2e892 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
-@@ -6798,7 +6798,12 @@ def create_runner_app(
+@@ -6914,7 +6914,12 @@ def create_runner_app(
                  if (
                      delivery_ack.entry is not None
                      and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
@@ -327,10 +327,10 @@ index 0000000000000000000000000000000000000000..86467dd72475ebbf165fc3a13611aa6f
 +        f"Providers for {harness!r} on this host: {valid}.",
 +    )
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index 1635bdb6a7212cbb9e78049e516d8bf1e23b04f1..a3dcfedc277019104ed92e1b2313db277f220ceb 100644
+index c0e027e10de42d13953779ad1bc72c852563899a..28e161fcd885ab1eb01bf2a1ef562e22110375bb 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
-@@ -2423,13 +2423,14 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
+@@ -2433,13 +2433,14 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
      :param agent_spec: The calling session's agent spec; its
          ``sub_agents`` define the worker rows.
      :returns: JSON mapping of worker name (plus ``"self"``) to its
@@ -348,14 +348,18 @@ index 1635bdb6a7212cbb9e78049e516d8bf1e23b04f1..a3dcfedc277019104ed92e1b2313db27
      return json.dumps(catalog)
  
  
-@@ -3501,7 +3502,21 @@ async def _execute_session_create(
-                 )
-             }
-         )
+@@ -3520,7 +3521,25 @@ async def _execute_session_create(
+     if placement != "child" and message is not None:
+         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
+             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
 +    provider = args.get("provider")
 +    if provider is not None and (not isinstance(provider, str) or not provider):
 +        return json.dumps(
 +            {"error": "sys_session_create 'provider' must be a non-empty provider name"}
++        )
++    if provider is not None and placement != "child":
++        return json.dumps(
++            {"error": "sys_session_create 'provider' is supported only with placement 'child'"}
 +        )
      if has_config_path:
 +        if provider is not None:
@@ -370,7 +374,7 @@ index 1635bdb6a7212cbb9e78049e516d8bf1e23b04f1..a3dcfedc277019104ed92e1b2313db27
          # The multipart create carries only the config bundle, so an effort
          # passed here would never reach the child. Refuse instead of dropping it.
          if args.get("reasoning_effort") is not None:
-@@ -3523,6 +3538,15 @@ async def _execute_session_create(
+@@ -3542,6 +3561,15 @@ async def _execute_session_create(
              agent_spec=agent_spec,
              runner_workspace=runner_workspace,
          )
@@ -386,7 +390,7 @@ index 1635bdb6a7212cbb9e78049e516d8bf1e23b04f1..a3dcfedc277019104ed92e1b2313db27
      body = _build_session_create_body(
          str(agent_id),
          conversation_id,
-@@ -3555,6 +3579,123 @@ async def _execute_session_create(
+@@ -3672,6 +3700,123 @@ async def _execute_session_create(
      )
  
  
@@ -510,7 +514,7 @@ index 1635bdb6a7212cbb9e78049e516d8bf1e23b04f1..a3dcfedc277019104ed92e1b2313db27
  def _bundle_local_agent_source(source: Path) -> bytes:
      """
      Build gzipped agent-bundle bytes from a local source path.
-@@ -5689,32 +5830,51 @@ async def _agent_list_host_readiness(
+@@ -5919,32 +6064,51 @@ async def _agent_list_host_readiness(
      try:
          async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
              host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
@@ -582,10 +586,10 @@ index 1635bdb6a7212cbb9e78049e516d8bf1e23b04f1..a3dcfedc277019104ed92e1b2313db27
      server_client: httpx.AsyncClient,
      *,
 diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
-index 0b097cd642771bf2030bba891b220f0d5caa927b..49dbef34ad586c38f97af3b5f115f4703e573932 100644
+index b42c026d8b59f75458e6718474ff89e4360821c7..8f356e0b76a11cf02ca2e2273929c55e2010c157 100644
 --- a/omnigent/server/routes/_sessions/orchestration.py
 +++ b/omnigent/server/routes/_sessions/orchestration.py
-@@ -3740,6 +3740,10 @@ async def _heal_subagent_runner_binding_via_parent(
+@@ -3792,6 +3792,10 @@ async def _heal_subagent_runner_binding_via_parent(
      # live runner.  A single hop covers the common case; two hops cover nested
      # sub-agents where the immediate parent's runner is also stale but the root
      # is still healthy.
@@ -596,7 +600,7 @@ index 0b097cd642771bf2030bba891b220f0d5caa927b..49dbef34ad586c38f97af3b5f115f470
      candidate_ids: list[str] = []
      if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
          candidate_ids.append(child_conv.parent_conversation_id)
-@@ -11576,7 +11580,9 @@ async def _create_session_from_existing_agent(
+@@ -11675,7 +11679,9 @@ async def _create_session_from_existing_agent(
      # Inherit runner affinity from the parent session so the child
      # is assigned to the same runner (sub-agent co-location).
      inherited_runner_id: str | None = None
@@ -608,10 +612,10 @@ index 0b097cd642771bf2030bba891b220f0d5caa927b..49dbef34ad586c38f97af3b5f115f470
          if parent_conv is not None:
              inherited_runner_id = parent_conv.runner_id
 diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
-index 504d8555089429b1480bd3844b5b906e3af04ad2..fac60638a3ceb5569d13b71a5804c022f36ea98d 100644
+index 20f8fb3728f53c18e6625c5d9129549d2e4a7012..02479c47e396a5fd927f37d63e4e104471199d77 100644
 --- a/omnigent/server/schemas.py
 +++ b/omnigent/server/schemas.py
-@@ -1649,7 +1649,8 @@ class _SessionCreateRequestBase(BaseModel):
+@@ -1662,7 +1662,8 @@ class _SessionCreateRequestBase(BaseModel):
          for the session's harness family when launching the runner, and a
          missing login fails the launch. ``None`` uses the family default.
          Create-time only; host-bound sessions only. Sub-agents inherit it
@@ -694,21 +698,19 @@ index 70d9853effe87068e922795042364f0c4200b75f..3061be29e76539d1ca1dd949c8e2de4d
 -        return json.dumps(catalog_for_spec(self._spec))
 +        return json.dumps(list_models_payload(self._spec))
 diff --git a/omnigent/tools/builtins/spawn.py b/omnigent/tools/builtins/spawn.py
-index df9848f72033dbc590a39d6b98c446d3af3743be..2548311b9c2b12d9ce7fbca758fdeae934eeeca5 100644
+index 40d3ef17d6b8dada4d0bc041bab59d0cac166a2d..d0ceffe7093b7988884067eb894eddaa0dec5abe 100644
 --- a/omnigent/tools/builtins/spawn.py
 +++ b/omnigent/tools/builtins/spawn.py
-@@ -888,7 +888,9 @@ class SysSessionCreateTool(Tool):
-       a fresh session-scoped agent.
+@@ -890,6 +890,8 @@ class SysSessionCreateTool(Tool):
  
-     An optional ``message`` is queued as the child's first user turn;
--    an optional ``title`` labels the session.
-+    an optional ``title`` labels the session. An optional ``provider``
-+    runs the child on another account of this host (see
-+    ``docs/providers.md``).
+     An optional ``message`` starts the session's first user turn;
+     an optional ``title`` labels the session.
++    An optional ``provider`` runs a child on another account of this
++    host (see ``docs/providers.md``).
  
      Returns a handle ``{conversation_id, agent_id, title, status}``. The
      session runs asynchronously — use ``sys_session_get_history`` /
-@@ -1021,6 +1023,24 @@ class SysSessionCreateTool(Tool):
+@@ -1036,6 +1038,24 @@ class SysSessionCreateTool(Tool):
                                  "default."
                              ),
                          },
@@ -846,10 +848,10 @@ index 58563b6d873f19223a6231f4b49909922623fd7d..4db0eb352efa608afc66383a3a957656
  async def test_retained_result_is_delivered_when_parent_inbox_is_created(
      _clean_subagent_registry: None,
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index 110194521293d07ab6d66066d5636ba72fb8c773..0054b62e906dfb85135c22488cb06fd10ef532e9 100644
+index f563f52ec400d88105c2d8b91e465190e7feca8c..790b14936558532a52520984694f964eec1cb479 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
-@@ -4868,7 +4868,14 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
+@@ -4866,7 +4866,14 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
          conversation_id="conv_list_models",
      )
      payload = json.loads(output)
@@ -865,7 +867,7 @@ index 110194521293d07ab6d66066d5636ba72fb8c773..0054b62e906dfb85135c22488cb06fd1
      worker = payload["worker"]
      assert worker["source"] == "static"
      assert worker["verified"] is False
-@@ -8292,6 +8299,9 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
+@@ -8293,6 +8300,9 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
      assert captured["agent_id"] == "ag_x"
      assert captured["title"] == "auth"
      assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
@@ -875,7 +877,7 @@ index 110194521293d07ab6d66066d5636ba72fb8c773..0054b62e906dfb85135c22488cb06fd1
      handle = json.loads(output)
      assert handle["conversation_id"] == "conv_child"
      assert handle["agent_id"] == "ag_x"
-@@ -8518,6 +8528,201 @@ async def test_sys_session_create_config_not_found(tmp_path: Path) -> None:
+@@ -8519,6 +8529,201 @@ async def test_sys_session_create_config_not_found(tmp_path: Path) -> None:
      assert info["config_path"] == "nope.yaml"
  
  
@@ -1078,10 +1080,10 @@ index 110194521293d07ab6d66066d5636ba72fb8c773..0054b62e906dfb85135c22488cb06fd1
  async def test_sys_session_get_info_defaults_to_caller_session() -> None:
      """
 diff --git a/tests/server/integration/test_session_host_launch.py b/tests/server/integration/test_session_host_launch.py
-index abc565ff31d896fec6c33942aa5b13ffb995f8ce..59280e0b4385cea58f7d5bf5190d109d2e95fc94 100644
+index eb1401515f10ccd256f14ab371d27ff8bebe7026..e48fff429cd529c2825eb12cff5437672098148b 100644
 --- a/tests/server/integration/test_session_host_launch.py
 +++ b/tests/server/integration/test_session_host_launch.py
-@@ -509,6 +509,48 @@ async def test_inline_launch_carries_the_session_provider(
+@@ -511,6 +511,48 @@ async def test_inline_launch_carries_the_session_provider(
      assert conv.provider_override == "claude-max2"
  
  

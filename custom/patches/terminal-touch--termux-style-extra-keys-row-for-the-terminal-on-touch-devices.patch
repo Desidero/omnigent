@@ -5,19 +5,17 @@ Subject: [PATCH] feat(web): Termux-style extra-keys row for the terminal on
  touch devices
 
 Carried from upstream PR omnigent-ai/omnigent#6136 (btli), squashed from
-its head c5c34220 so we can try it on a phone before it merges. It adds
+its head d2c80fe8 so we can use it on a phone before it merges. It adds
 Esc / Tab / Shift+Tab / arrows / PgUp / PgDn and sticky Ctrl, Alt and Shift
 under the terminal, with a Touch & mobile setting (Auto / Always / Never).
 
-Local fixes on top, found on an iPhone and to be proposed on the PR:
-- Cancel touchend on the row. iOS still focuses the tapped key on the
-  synthetic click when only pointerdown is prevented, which blurs xterm and
-  dismisses the soft keyboard after every key.
-- Pad the iOS terminal view's row by the bottom safe area unless the keyboard
-  is docked. The native bottom bar that used to reserve it is retired, so the
-  bottom keys sat under the rounded corners and home indicator.
+The PR head includes the two iOS fixes we suggested on it: touchend is
+cancelled on the row so the soft keyboard stays up, and the row keeps the
+bottom safe-area padding unless a docked keyboard covers the home
+indicator. The web code matches the PR head; the only addition is the
+`touch-keys` entry in feature-map/terminals.md.
 
-Not ours to upstream as-is: drop this commit when #6136 lands.
+Not ours to upstream: drop this commit when #6136 lands.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
@@ -31,8 +29,8 @@ Signed-off-by: Desidero <desidero@gmail.com>
  ...terminalextrakeys--tablet-idle][linux].png | Bin 0 -> 8219 bytes
  ...rminalextrakeys--tablet-locked][linux].png | Bin 0 -> 8949 bytes
  .../blocks/TerminalExtraKeys.stories.tsx      | 117 +++++
- .../blocks/TerminalExtraKeys.test.tsx         | 408 ++++++++++++++++++
- .../components/blocks/TerminalExtraKeys.tsx   | 237 ++++++++++
+ .../blocks/TerminalExtraKeys.test.tsx         | 407 ++++++++++++++++++
+ .../components/blocks/TerminalExtraKeys.tsx   | 238 ++++++++++
  .../components/blocks/TerminalSession.test.ts | 125 ++++++
  web/src/components/blocks/TerminalSession.ts  |  64 ++-
  .../components/blocks/TerminalView.test.tsx   | 129 ++++++
@@ -42,12 +40,12 @@ Signed-off-by: Desidero <desidero@gmail.com>
  .../components/theme/AppearancePreviews.tsx   |  88 +++-
  .../useTerminalExtraKeysVisibility.test.ts    | 146 +++++++
  .../hooks/useTerminalExtraKeysVisibility.ts   |  32 ++
- web/src/index.css                             |  54 +++
+ web/src/index.css                             |  55 +++
  .../lib/terminalExtraKeysPreferences.test.ts  |  78 ++++
  web/src/lib/terminalExtraKeysPreferences.ts   |  90 ++++
- web/src/pages/SettingsPage.test.tsx           | 156 ++++++-
+ web/src/pages/SettingsPage.test.tsx           | 151 ++++++-
  web/src/pages/SettingsPage.tsx                |  87 +++-
- 25 files changed, 2506 insertions(+), 25 deletions(-)
+ 25 files changed, 2502 insertions(+), 25 deletions(-)
  create mode 100644 tests/e2e_ui/terminal/__init__.py
  create mode 100644 tests/e2e_ui/terminal/test_extra_keys.py
  create mode 100644 tests/e2e_ui/visual/snapshots/test_storybook_snapshot/test_story_matches_baseline/test_story_matches_baseline[chromium-components-terminal-terminalextrakeys--phone-armed][linux].png
@@ -66,7 +64,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/terminalExtraKeysPreferences.ts
 
 diff --git a/feature-map/terminals.md b/feature-map/terminals.md
-index ab6b53549f1ee23aaad13806a56adb7269eaf28a..0420a402f2cbbd9eb74b04c311a784716952385f 100644
+index a66c568a08eefa4d3f2bd1f0e67d3d6997345a90..75cb7a6c9e0e61d73aa5751dbc23ae18c87e018e 100644
 --- a/feature-map/terminals.md
 +++ b/feature-map/terminals.md
 @@ -29,6 +29,9 @@ reattach when the session moves to another host.
@@ -79,7 +77,7 @@ index ab6b53549f1ee23aaad13806a56adb7269eaf28a..0420a402f2cbbd9eb74b04c311a78471
  
  ## How to get to it (user POV)
  
-@@ -61,6 +64,13 @@ with their own terminal retain the switcher.
+@@ -64,6 +67,13 @@ with their own terminal retain the switcher.
    still being created, and it yields to a focused terminal or editor.
  - Select an open shell from the rail's shell list; close it from its tab.
  
@@ -93,7 +91,7 @@ index ab6b53549f1ee23aaad13806a56adb7269eaf28a..0420a402f2cbbd9eb74b04c311a78471
  **After the session moves:** open the host badge, choose "Switch host…", pick
  another host, then look at both the terminal strip and the agent terminal.
  Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
-@@ -116,6 +126,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
+@@ -126,6 +136,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
  - **`scrollback`, keyboard:** no e2e coverage. In a Codex terminal with more
    output than fits, press Page Up and expect older output; then check that the
    Codex terminal's other keys still behave as before.
@@ -1538,10 +1536,10 @@ index 0000000000000000000000000000000000000000..7aa1c55e08933e48a127d631204e760f
 +};
 diff --git a/web/src/components/blocks/TerminalExtraKeys.test.tsx b/web/src/components/blocks/TerminalExtraKeys.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f7989245862923153
+index 0000000000000000000000000000000000000000..767532994c1051a2c9d677ac0fa1352e70cb7cde
 --- /dev/null
 +++ b/web/src/components/blocks/TerminalExtraKeys.test.tsx
-@@ -0,0 +1,408 @@
+@@ -0,0 +1,407 @@
 +import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 +import { act } from "react";
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1552,9 +1550,9 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +} from "./TerminalExtraKeys";
 +import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
 +
-+const keyboardInset = vi.hoisted(() => vi.fn(() => 0));
++const keyboardInset = vi.hoisted(() => ({ value: 0 }));
 +vi.mock("@/hooks/useIOSNativeKeyboardInset", () => ({
-+  useIOSNativeKeyboardInset: keyboardInset,
++  useIOSNativeKeyboardInset: () => keyboardInset.value,
 +}));
 +
 +function makeTarget(applicationCursor = false) {
@@ -1620,6 +1618,7 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +
 +afterEach(() => {
 +  cleanup();
++  keyboardInset.value = 0;
 +  vi.useRealTimers();
 +  vi.restoreAllMocks();
 +});
@@ -1664,32 +1663,19 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +  });
 +});
 +
-+describe("TerminalExtraKeys pointer semantics", () => {
-+  it("cancels touchend so an iOS tap never moves focus off the terminal", () => {
-+    // WHY: iOS focuses the tapped button on the synthetic click even when
-+    // pointerdown was prevented, which dismisses the soft keyboard.
-+    const target = makeTarget();
-+    render(<TerminalExtraKeys target={target} />);
-+    const esc = key("Escape");
-+
-+    pointerDown(esc);
-+    pointerUp(esc);
-+    expect(fireEvent.touchEnd(esc)).toBe(false);
-+    expect(target.send).toHaveBeenCalledTimes(1);
-+  });
-+
-+  it("marks the row while the iOS keyboard is docked", () => {
-+    const target = makeTarget();
-+    keyboardInset.mockReturnValue(0);
-+    const { rerender } = render(<TerminalExtraKeys target={target} />);
-+    const row = screen.getByRole("toolbar", { name: "Terminal extra keys" });
++describe("TerminalExtraKeys bottom inset", () => {
++  it("marks the row while a docked iOS keyboard covers the home indicator", () => {
++    const { rerender } = render(<TerminalExtraKeys target={makeTarget()} />);
++    const row = screen.getByTestId("terminal-extra-keys");
 +    expect(row).not.toHaveAttribute("data-keyboard-open");
 +
-+    keyboardInset.mockReturnValue(336);
-+    rerender(<TerminalExtraKeys target={target} className="x" />);
++    keyboardInset.value = 320;
++    rerender(<TerminalExtraKeys target={makeTarget()} />);
 +    expect(row).toHaveAttribute("data-keyboard-open", "true");
 +  });
++});
 +
++describe("TerminalExtraKeys pointer semantics", () => {
 +  it("sends on pointerup exactly once per tap, and prevents the pointerdown default", () => {
 +    // WHY: pointerdown preventDefault keeps focus on xterm's textarea (soft
 +    // keyboard stays open) and suppresses compat mouse events; the trailing
@@ -1707,6 +1693,17 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +    expect(target.send).toHaveBeenCalledWith("\x1b");
 +
 +    fireEvent.click(esc, { detail: 1 });
++    expect(target.send).toHaveBeenCalledTimes(1);
++  });
++
++  it("cancels touchend so WebKit's synthetic click can't move focus off the terminal", () => {
++    const target = makeTarget();
++    render(<TerminalExtraKeys target={target} />);
++    const esc = key("Escape");
++
++    pointerDown(esc);
++    pointerUp(esc);
++    expect(fireEvent.touchEnd(esc)).toBe(false);
 +    expect(target.send).toHaveBeenCalledTimes(1);
 +  });
 +
@@ -1952,10 +1949,10 @@ index 0000000000000000000000000000000000000000..c9c1b2dc774b53cdeb008f0f79892458
 +});
 diff --git a/web/src/components/blocks/TerminalExtraKeys.tsx b/web/src/components/blocks/TerminalExtraKeys.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5d0c4adb5
+index 0000000000000000000000000000000000000000..b0d1935a8dd48f7f2eb52e0ba6f4b293909449c6
 --- /dev/null
 +++ b/web/src/components/blocks/TerminalExtraKeys.tsx
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,238 @@
 +// Termux-style extra-keys row under the terminal on touch devices: a fixed
 +// 2×7 grid of Esc / Tab / arrows plus sticky Ctrl / Alt / Shift. Modifier
 +// state lives in a ref so a keystroke never waits on a React render.
@@ -2029,6 +2026,7 @@ index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5
 +  const targetRef = useRef(target);
 +  targetRef.current = target;
 +  const transformRef = useRef<ExtraKeysInputTransform | null>(null);
++  // iOS only (0 elsewhere): a docked keyboard covers the home indicator.
 +  const keyboardOpen = useIOSNativeKeyboardInset() > 0;
 +
 +  // Single write point for modifier state: the ref feeds the transform, the
@@ -2163,8 +2161,8 @@ index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5
 +      data-keyboard-open={keyboardOpen || undefined}
 +      className={cn("terminal-extra-keys", className)}
 +      onContextMenu={(e) => e.preventDefault()}
-+      // iOS moves focus on the tap's synthetic click even after pointerdown is
-+      // prevented; cancelling touchend keeps xterm's textarea and the keyboard.
++      // Taps send on pointerup; WebKit still moves focus on the tap's synthetic
++      // click, so cancel it to keep xterm's textarea (and the keyboard) focused.
 +      onTouchEnd={(e) => e.preventDefault()}
 +    >
 +      {EXTRA_KEY_ROWS.map((row, rowIndex) =>
@@ -2194,7 +2192,7 @@ index 0000000000000000000000000000000000000000..1973ab9f53f69ecc1dbf1c78a49a57c5
 +  );
 +});
 diff --git a/web/src/components/blocks/TerminalSession.test.ts b/web/src/components/blocks/TerminalSession.test.ts
-index 9f5a3efb109cf0a79690900597ecd6ebf42e6fe1..6631ac27850748ce325401360dd584412dd065fa 100644
+index 0ced97a29b34225e063a38a324fbac04a0415197..7a50529c6f0e71cf96b0670e58991419d32191ed 100644
 --- a/web/src/components/blocks/TerminalSession.test.ts
 +++ b/web/src/components/blocks/TerminalSession.test.ts
 @@ -1211,6 +1211,131 @@ describe("TerminalSession", () => {
@@ -2330,18 +2328,18 @@ index 9f5a3efb109cf0a79690900597ecd6ebf42e6fe1..6631ac27850748ce325401360dd58441
      // WHY: layout changes (window resize, font load) must propagate a resize
      // frame, so the session must register a ResizeObserver on its container.
 diff --git a/web/src/components/blocks/TerminalSession.ts b/web/src/components/blocks/TerminalSession.ts
-index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e65baa970c 100644
+index 325a66cfa548d2930896ed8024f1eaae243144a7..31298323dd610845e3481f206aa11f6f4f2f3e53 100644
 --- a/web/src/components/blocks/TerminalSession.ts
 +++ b/web/src/components/blocks/TerminalSession.ts
-@@ -21,6 +21,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
+@@ -22,6 +22,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
  import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
  import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
  import { TerminalLinkProvider } from "./TerminalLinkProvider";
 +import { SHIFT_ENTER_CSI_U } from "./terminalExtraKeysModel";
  
- // Card background colors derived from the app's CSS palette.
- // Light: --card: oklch(1.000 0 0) = pure white.
-@@ -234,8 +235,8 @@ export type TerminalActivityListener = () => void;
+ const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
+ 
+@@ -230,8 +231,8 @@ export type TerminalActivityListener = () => void;
  /** Listener for user keyboard input sent to the terminal. */
  export type TerminalInputListener = () => void;
  
@@ -2352,7 +2350,7 @@ index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e6
  
  /** Readline line-editing bytes for the macOS Cmd key mappings below. */
  export const CMD_BACKSPACE_LINE_KILL = "\x15"; // Ctrl-U: kill to line start
-@@ -655,6 +656,13 @@ export class TerminalSession {
+@@ -651,6 +652,13 @@ export class TerminalSession {
    private focusOnConnect: boolean;
    /** ``performance.now()`` of the last keystroke; gates clipboard writes. */
    private lastUserInputAt = 0;
@@ -2366,7 +2364,7 @@ index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e6
    /** Guards {@link dispose} so calling it twice is a safe no-op. */
    private disposed = false;
    /**
-@@ -711,6 +719,7 @@ export class TerminalSession {
+@@ -707,6 +715,7 @@ export class TerminalSession {
      this.clipboardEnabled = clipboardEnabled;
      this.focusOnConnect = focusOnConnect;
      this.onClipboardRequest = onClipboardRequest;
@@ -2374,7 +2372,7 @@ index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e6
      // Read the user's code-font preference (Settings → Appearance) at
      // construction; a mid-session change is applied live via setFont(). The
      // xterm.js defaults (15px, no theme) feel out of place inside the app
-@@ -829,13 +838,11 @@ export class TerminalSession {
+@@ -825,13 +834,11 @@ export class TerminalSession {
        { signal },
      );
  
@@ -2392,7 +2390,7 @@ index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e6
      });
  
      this.term.attachCustomKeyEventHandler((e) => {
-@@ -846,11 +853,7 @@ export class TerminalSession {
+@@ -842,11 +849,7 @@ export class TerminalSession {
        // the CSI-u sequence once, on keydown.
        if (e.type === "keydown") {
          e.preventDefault();
@@ -2405,7 +2403,7 @@ index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e6
        }
        return false;
      });
-@@ -858,9 +861,9 @@ export class TerminalSession {
+@@ -854,9 +857,9 @@ export class TerminalSession {
      // Replace xterm's lossy wheel→mouse-report conversion (trackpad deltas
      // are damped and capped to one report per event, which reads as
      // "scrolling doesn't work" on macOS trackpads) with the accumulating
@@ -2418,7 +2416,7 @@ index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e6
      this.term.attachCustomWheelEventHandler((e) => {
        const result = wheelReportPayload(
          e,
-@@ -873,7 +876,7 @@ export class TerminalSession {
+@@ -869,7 +872,7 @@ export class TerminalSession {
        );
        this.wheelPartialLines = result.partial;
        if (!result.consume) return true;
@@ -2427,7 +2425,7 @@ index fdce5449db0fad77249f9731f87d93b3eca8c18e..91199a941604069cf44081038ae753e6
        e.preventDefault();
        return false;
      });
-@@ -984,6 +987,33 @@ export class TerminalSession {
+@@ -980,6 +983,33 @@ export class TerminalSession {
      this.term.focus();
    }
  
@@ -2635,18 +2633,18 @@ index 45a40e4490e143d5766c3f25d5450d5d5905d9f0..397da5cddac1a7766b08af55fc34d467
    it("addresses the terminal by resource id under /v1/sessions/.../resources/terminals", () => {
      expect(buildAttachPath("conv_abc", "terminal_bash_s1", false)).toBe(
 diff --git a/web/src/components/blocks/TerminalView.tsx b/web/src/components/blocks/TerminalView.tsx
-index a03c1dee791c993fd50ea77b70eda47301c04eac..a1203e274d9b0879b160f3dc8a39135277e46be2 100644
+index fedce5ac97a4248445e0d20affc44d4ba18eabff..b82c1dc3f7bd5e815c87e01d4c5fa85970cf86a9 100644
 --- a/web/src/components/blocks/TerminalView.tsx
 +++ b/web/src/components/blocks/TerminalView.tsx
 @@ -9,6 +9,7 @@
  import { Loader2Icon } from "lucide-react";
  import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
- import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+ import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 +import { useTerminalExtraKeysVisibility } from "@/hooks/useTerminalExtraKeysVisibility";
  import { Button } from "@/components/ui/button";
  import { toast } from "sonner";
  import {
-@@ -54,6 +55,7 @@ import {
+@@ -48,6 +49,7 @@ import {
    terminalTheme,
    WS_CLOSE_WRONG_REPLICA,
  } from "./TerminalSession";
@@ -2654,7 +2652,7 @@ index a03c1dee791c993fd50ea77b70eda47301c04eac..a1203e274d9b0879b160f3dc8a391352
  
  /**
   * Backoff schedule for automatic re-attach after a transport-level
-@@ -292,6 +294,20 @@ export function TerminalView({
+@@ -278,6 +280,20 @@ export function TerminalView({
    const isDarkRef = useRef(isDark);
    isDarkRef.current = isDark;
    const sessionRef = useRef<TerminalSession | null>(null);
@@ -2675,7 +2673,7 @@ index a03c1dee791c993fd50ea77b70eda47301c04eac..a1203e274d9b0879b160f3dc8a391352
    // Stable refs so callback prop changes never recreate the WS session.
    const onStateChangeRef = useRef(onStateChange);
    onStateChangeRef.current = onStateChange;
-@@ -607,6 +623,7 @@ export function TerminalView({
+@@ -593,6 +609,7 @@ export function TerminalView({
            notifyFileLink,
          );
          sessionRef.current = terminalSession;
@@ -2683,7 +2681,7 @@ index a03c1dee791c993fd50ea77b70eda47301c04eac..a1203e274d9b0879b160f3dc8a391352
          // Relay-connected with a direct URL on offer: negotiate the
          // loopback upgrade in the background. In Chrome this is what
          // raises the Local Network Access prompt; the probe socket
-@@ -800,6 +817,9 @@ export function TerminalView({
+@@ -786,6 +803,9 @@ export function TerminalView({
            />
          )}
        </div>
@@ -3413,10 +3411,10 @@ index 0000000000000000000000000000000000000000..56ce2c85cdf501993eecb467de760bc6
 +  return isIOSShell() || isAndroidShell() || coarsePointer;
 +}
 diff --git a/web/src/index.css b/web/src/index.css
-index eaf736c73af7b41c2d07358b35d8efeb5eb97934..5099140cc032ae04d270a1f6b430e0963235109c 100644
+index 8f196ef0ac97157e059ae3a20ba380e0f5e5b06e..8aa4c50734b180773a460ecfdab0df74580805d9 100644
 --- a/web/src/index.css
 +++ b/web/src/index.css
-@@ -1171,6 +1171,60 @@ html[data-electron-mac] .breadcrumb-folder {
+@@ -1244,6 +1244,61 @@ html[data-electron-mac] .breadcrumb-folder {
    }
  }
  
@@ -3440,7 +3438,8 @@ index eaf736c73af7b41c2d07358b35d8efeb5eb97934..5099140cc032ae04d270a1f6b430e096
 +}
 +
 +/* The mobile drawer already reserves the bottom inset, and a docked iOS
-+   keyboard covers the home indicator; don't add the inset in either case. */
++   keyboard covers the home indicator; don't add the inset in either case.
++   Android zeroes --omnigent-safe-bottom itself while the keyboard is up. */
 +:is([data-ios-native], [data-android-native]) .mobile-panel-drawer .terminal-extra-keys,
 +[data-ios-native] .terminal-extra-keys[data-keyboard-open] {
 +  padding-bottom: 0.25rem;
@@ -3658,7 +3657,7 @@ index 0000000000000000000000000000000000000000..a35f3196c11640a21b11d84155514fc8
 +  for (const listener of listeners) listener(mode);
 +}
 diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
-index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc1534695c 100644
+index ac593f55c1f983545ad400f400bef0b644dae599..d599ff4d3016d0b95c376c3de41fac61cc19ef71 100644
 --- a/web/src/pages/SettingsPage.test.tsx
 +++ b/web/src/pages/SettingsPage.test.tsx
 @@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
@@ -3669,21 +3668,16 @@ index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc
    archiveMutate: vi.fn(),
    deleteMutate: vi.fn(),
    bulkArchiveMutate: vi.fn(),
-@@ -51,7 +52,12 @@ const mocks = vi.hoisted(() => ({
+@@ -54,7 +55,7 @@ vi.mock("next-themes", () => ({
+   useTheme: () => ({
+     theme: mocks.theme,
+     systemTheme: "light",
+-    resolvedTheme: mocks.theme === "dark" ? "dark" : "light",
++    resolvedTheme: mocks.resolvedTheme ?? (mocks.theme === "dark" ? "dark" : "light"),
+     setTheme: mocks.setTheme,
+   }),
  }));
- 
- vi.mock("next-themes", () => ({
--  useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
-+  useTheme: () => ({
-+    theme: mocks.theme,
-+    resolvedTheme: mocks.resolvedTheme,
-+    systemTheme: "light",
-+    setTheme: mocks.setTheme,
-+  }),
- }));
- vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
- vi.mock("@/lib/CapabilitiesContext", () => ({
-@@ -236,6 +242,7 @@ beforeEach(() => {
+@@ -241,6 +242,7 @@ beforeEach(() => {
    mocks.conversationQuery.mockReset();
    mocks.theme = "system";
    mocks.isEmbedded = false;
@@ -3691,7 +3685,7 @@ index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc
    mocks.accountsEnabled = true;
    mocks.importSessionsPanel.mockClear();
    mocks.enabledConnections = [];
-@@ -592,6 +599,142 @@ describe("SettingsPage", () => {
+@@ -602,6 +604,142 @@ describe("SettingsPage", () => {
      expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
    });
  
@@ -3834,7 +3828,7 @@ index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc
    it("defaults transcripts to Chat and persists a Terminal default", () => {
      renderPage("/settings/appearance");
  
-@@ -908,6 +1051,9 @@ describe("SettingsPage", () => {
+@@ -968,6 +1106,9 @@ describe("SettingsPage", () => {
      mocks.theme = "dark";
      fireEvent.click(screen.getByTestId("theme-dark"));
      fireEvent.click(screen.getByTestId("terminal-theme-dark"));
@@ -3844,7 +3838,7 @@ index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc
      fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
        target: { value: "github" },
      });
-@@ -930,6 +1076,7 @@ describe("SettingsPage", () => {
+@@ -991,6 +1132,7 @@ describe("SettingsPage", () => {
  
      // Sanity: the non-default choices were persisted.
      expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -3852,7 +3846,7 @@ index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc
      expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
      expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
      expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
-@@ -960,8 +1107,13 @@ describe("SettingsPage", () => {
+@@ -1026,8 +1168,13 @@ describe("SettingsPage", () => {
      expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
      expect(document.documentElement.getAttribute("data-theme")).toBeNull();
  
@@ -3868,7 +3862,7 @@ index d8ea4cef3675aabef88f0ed3e37d2c3f467d1ef5..1c061d016b7f5517e9080ceba7891fbc
        "aria-checked",
        "true",
 diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
-index e8ef3490575a78f15bc399c29823e5b8b766f5fd..c5191815f5944f282d0224f4d4d83d5c6ba51118 100644
+index c3d4ee2868c1e253574aff415644524030a421bf..f4fd137f921549944e91195f0fe26840db074ec0 100644
 --- a/web/src/pages/SettingsPage.tsx
 +++ b/web/src/pages/SettingsPage.tsx
 @@ -80,7 +80,13 @@ import { McpRegistryConnections } from "@/components/McpRegistry";
@@ -3901,7 +3895,7 @@ index e8ef3490575a78f15bc399c29823e5b8b766f5fd..c5191815f5944f282d0224f4d4d83d5c
  import {
    readTerminalThemeMode,
    TERMINAL_THEME_DEFAULT,
-@@ -411,6 +425,12 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
+@@ -407,6 +421,12 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
    { mode: "dark", label: "Dark", icon: MoonIcon },
  ];
  
@@ -3914,7 +3908,7 @@ index e8ef3490575a78f15bc399c29823e5b8b766f5fd..c5191815f5944f282d0224f4d4d83d5c
  const transcriptViewCards: {
    value: TranscriptViewDefault;
    label: string;
-@@ -531,6 +551,65 @@ function TerminalThemeControl() {
+@@ -527,6 +547,65 @@ function TerminalThemeControl() {
    );
  }
  
@@ -3980,7 +3974,7 @@ index e8ef3490575a78f15bc399c29823e5b8b766f5fd..c5191815f5944f282d0224f4d4d83d5c
  /** Default surface for terminal-first transcripts without a per-tab choice. */
  function TranscriptViewDefaultControl() {
    const [value, setValue] = useState(() => readTranscriptViewDefault());
-@@ -938,6 +1017,7 @@ function AppearanceSection() {
+@@ -960,6 +1039,7 @@ function AppearanceSection() {
      setTheme("system");
  
      writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
@@ -3988,7 +3982,7 @@ index e8ef3490575a78f15bc399c29823e5b8b766f5fd..c5191815f5944f282d0224f4d4d83d5c
  
      writeThemePalette(DEFAULT_PALETTE);
      applyThemePalette(DEFAULT_PALETTE);
-@@ -972,6 +1052,7 @@ function AppearanceSection() {
+@@ -995,6 +1075,7 @@ function AppearanceSection() {
            "omnigent:code-font-family",
            "omnigent:code-font-weight",
            "omnigent:terminal-theme",
@@ -3996,7 +3990,7 @@ index e8ef3490575a78f15bc399c29823e5b8b766f5fd..c5191815f5944f282d0224f4d4d83d5c
            "omnigent:ui-theme-palette",
            "omnigent:custom-theme",
            "omnigent:default-transcript-view",
-@@ -1111,6 +1192,10 @@ function AppearanceSection() {
+@@ -1138,6 +1219,10 @@ function AppearanceSection() {
                <UiCodeFontWeightControl />
              </div>
            </SettingsGroup>

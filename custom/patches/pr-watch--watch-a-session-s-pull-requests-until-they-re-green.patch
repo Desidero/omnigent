@@ -18,13 +18,20 @@ default-off `pr_watch` feature.
 - A per-server poller (`omnigent/server/pr_watch.py`) reads each watched
   PR through the same path as the Pull Requests panel (runner, else host,
   running the provider CLI with the host's account), so it adds no
-  credentials. It reports failed checks on the head commit, comments and
-  reviews from other accounts, and merge conflicts once each, coalesced
+  credentials; the server vouches for the PR and stores what the read
+  reports, as it does for the panel. It reports failed checks on the head
+  commit, comments and reviews from other accounts, and merge conflicts once
+  each, coalesced
   across PRs into one `[System: PR watch ...]` message sent through the
   normal message path only while the session is idle. Only comments and
   reviews from the repository's owners, members and collaborators count;
   anyone else's text never reaches the agent. In "all" mode it enrols PRs
-  as the session's tracked list grows, skipping merged and closed ones.
+  as the session's linked list grows, skipping merged and closed ones. The
+  list is the server's stored one, which the Pull Requests tab shows, so an
+  unlink there ends the watch and a PR stored as merged or closed is skipped
+  without asking the host. Until the server has imported the session's PRs
+  from the host (the stored list may be partial then), the host's own list
+  decides.
 - Each PR's watch ends with a transcript note that starts no turn when its
   checks pass with no changes requested, it is merged or closed, its
   wake-up budget (default 10) is spent, checks cannot be read, or five
@@ -46,39 +53,39 @@ OMNIGENT_PR_WATCH_MAX_WAKES (10).
 Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- feature-map/README.md                         |   4 +
- feature-map/pr-watch.md                       | 106 ++
- omnigent/runner/git_providers/__init__.py     |   4 +
- omnigent/runner/github_resource.py            |  35 +-
- omnigent/server/app.py                        |  11 +
- omnigent/server/feature_flags.py              |   7 +
- omnigent/server/pr_watch.py                   | 974 ++++++++++++++++++
- omnigent/server/routes/_sessions/helpers.py   |   9 +
- omnigent/server/routes/sessions/__init__.py   |  14 +
- .../server/routes/sessions/routes_events.py   |  46 +-
- .../server/routes/sessions/routes_pr_watch.py | 241 +++++
- .../routes/sessions/routes_resources.py       |  17 +
- .../stores/conversation_store/__init__.py     |  23 +
- .../conversation_store/sqlalchemy_store.py    |  24 +
- openapi.json                                  | 372 +++++++
- tests/runner/test_github_resource.py          |   7 +
- tests/runner/test_github_reviewers.py         |  27 +-
- .../test_policy_deny_lifecycle_e2e.py         |  21 +
- .../integration/test_utility_endpoints.py     |   1 +
- tests/server/routes/test_session_pr_watch.py  | 207 ++++
- tests/server/test_feature_flags.py            |   1 +
- tests/server/test_pr_watch.py                 | 505 +++++++++
- tests/stores/test_conversation_store.py       |  15 +-
- .../composer/ComposerPrWatch.test.tsx         | 206 ++++
- .../components/composer/ComposerPrWatch.tsx   | 243 +++++
- web/src/hooks/usePullRequestWatch.ts          | 115 +++
- web/src/hooks/usePullRequests.ts              |   2 +-
- web/src/lib/capabilities.ts                   |   3 +-
- web/src/pages/ChatPage.tsx                    |   3 +
- web/src/shell/PullRequestPanel.tsx            |  10 +
- web/src/shell/PullRequestWatch.test.tsx       | 107 ++
- web/src/shell/PullRequestWatch.tsx            |  56 +
- 32 files changed, 3402 insertions(+), 14 deletions(-)
+ feature-map/README.md                         |    4 +
+ feature-map/pr-watch.md                       |  110 ++
+ omnigent/runner/git_providers/__init__.py     |    4 +
+ omnigent/runner/github_resource.py            |   35 +-
+ omnigent/server/app.py                        |   11 +
+ omnigent/server/feature_flags.py              |    7 +
+ omnigent/server/pr_watch.py                   | 1038 +++++++++++++++++
+ omnigent/server/routes/_sessions/helpers.py   |    9 +
+ omnigent/server/routes/sessions/__init__.py   |   14 +
+ .../server/routes/sessions/routes_events.py   |   46 +-
+ .../server/routes/sessions/routes_pr_watch.py |  241 ++++
+ .../routes/sessions/routes_resources.py       |   10 +
+ .../stores/conversation_store/__init__.py     |   23 +
+ .../conversation_store/sqlalchemy_store.py    |   24 +
+ openapi.json                                  |  372 ++++++
+ tests/runner/test_github_resource.py          |    7 +
+ tests/runner/test_github_reviewers.py         |   27 +-
+ .../test_policy_deny_lifecycle_e2e.py         |   21 +
+ .../integration/test_utility_endpoints.py     |    1 +
+ tests/server/routes/test_session_pr_watch.py  |  207 ++++
+ tests/server/routes/test_session_resources.py |   26 +
+ tests/server/test_feature_flags.py            |    1 +
+ tests/server/test_pr_watch.py                 |  575 +++++++++
+ tests/stores/test_conversation_store.py       |   15 +-
+ .../composer/ComposerPrWatch.test.tsx         |  206 ++++
+ .../components/composer/ComposerPrWatch.tsx   |  243 ++++
+ web/src/hooks/usePullRequestWatch.ts          |  115 ++
+ web/src/lib/capabilities.ts                   |    3 +-
+ web/src/pages/ChatPage.tsx                    |    3 +
+ web/src/shell/PullRequestPanel.tsx            |   10 +
+ web/src/shell/PullRequestWatch.test.tsx       |  107 ++
+ web/src/shell/PullRequestWatch.tsx            |   56 +
+ 32 files changed, 3558 insertions(+), 13 deletions(-)
  create mode 100644 feature-map/pr-watch.md
  create mode 100644 omnigent/server/pr_watch.py
  create mode 100644 omnigent/server/routes/sessions/routes_pr_watch.py
@@ -91,10 +98,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 web/src/shell/PullRequestWatch.tsx
 
 diff --git a/feature-map/README.md b/feature-map/README.md
-index 9b6040c758ed279b1c13e3112c59714b75f3d74b..0eccf3077f14d59063a48350edff63ca017203c2 100644
+index c51df3a4ea6c8dce7054939d91f7973c91812322..58e526f8a75b1b55c33c908e316e6a3622a943f2 100644
 --- a/feature-map/README.md
 +++ b/feature-map/README.md
-@@ -155,6 +155,10 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
+@@ -162,6 +162,10 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
  - [Azure DevOps pull requests](./azure-devops.md) covers the shared panel,
    composer, associations, partial results, and Canvas links.
  
@@ -107,10 +114,10 @@ index 9b6040c758ed279b1c13e3112c59714b75f3d74b..0eccf3077f14d59063a48350edff63ca
  The original five recipes form the seed set. Completing this set means checking
 diff --git a/feature-map/pr-watch.md b/feature-map/pr-watch.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..0cc84a941f18a32e911f55789b03dcbb84f6f611
+index 0000000000000000000000000000000000000000..de5513ae231a832e878a8cf599c4fba0624baf04
 --- /dev/null
 +++ b/feature-map/pr-watch.md
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,110 @@
 +# Watch pull requests until they're green
 +
 +A user picks which of a session's pull requests to watch from **Watch PRs** in
@@ -130,8 +137,12 @@ index 0000000000000000000000000000000000000000..0cc84a941f18a32e911f55789b03dcbb
 +  per open PR with its number, title, CI state and wake-ups used, and what a
 +  watch does. With **All** on every PR box is checked; unchecking one turns
 +  **All** off and keeps the rest.
-+- `all`: in **All** mode the server picks up each PR the session tracks,
++- `all`: in **All** mode the server picks up each PR linked to the session,
 +  including ones opened or attached later; merged and closed ones are skipped.
++  The list is the one the server stores for the Pull Requests tab, so a PR
++  unlinked there stops being watched and one the stored state shows as merged
++  or closed is skipped without asking the host. Until the server has imported
++  the session's PRs from its host, the host's own list is used.
 +- `panel`: the Pull Requests panel's **Watch until green** switch changes the
 +  same selection for the PR it shows.
 +- `access`: only users with edit access can change the selection; others see
@@ -218,7 +229,7 @@ index 0000000000000000000000000000000000000000..0cc84a941f18a32e911f55789b03dcbb
 +  and are skipped while the host is disconnected from this server replica.
 +- Forking a session does not copy its watches.
 diff --git a/omnigent/runner/git_providers/__init__.py b/omnigent/runner/git_providers/__init__.py
-index 71d41febee99f53d0dd7a74f287594aa57d9dca0..6e30bfd79f979a7c666eb2f6592884dd85a70fc1 100644
+index de2b4762a6f178a5b0d076f4cd2df3661f2e98f0..b621d71db2ffc50446986dfd3709a6ae36d016b5 100644
 --- a/omnigent/runner/git_providers/__init__.py
 +++ b/omnigent/runner/git_providers/__init__.py
 @@ -68,6 +68,10 @@ Additive fields:
@@ -233,10 +244,10 @@ index 71d41febee99f53d0dd7a74f287594aa57d9dca0..6e30bfd79f979a7c666eb2f6592884dd
  - Report lookup failures in ``warnings``. Mark incomplete checks/comments with
    ``checks.partial`` / ``comments_partial``; changed files use ``has_more`` or ``warning``.
 diff --git a/omnigent/runner/github_resource.py b/omnigent/runner/github_resource.py
-index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df83fb52285 100644
+index 58a23e647c1cd3179fc63b3a797e334b7e8c6533..035ac9785b4b304157fa0e60abf22544d21cb0fa 100644
 --- a/omnigent/runner/github_resource.py
 +++ b/omnigent/runner/github_resource.py
-@@ -96,10 +96,11 @@ _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
+@@ -97,10 +97,11 @@ _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
  _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
  
  # Always pass --json (bare gh pr view opens a pager); body, comments,
@@ -250,7 +261,7 @@ index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df8
  )
  _PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
  _PR_COMMENTS_FIELD = "reviews"
-@@ -434,6 +435,16 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
+@@ -435,6 +436,16 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
      }
  
  
@@ -265,9 +276,9 @@ index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df8
 +
 +
  # Cap the comments list so a very chatty PR can't bloat the payload; keep the
- # earliest comments after merging issue comments and review bodies.
+ # latest comments after merging issue comments and review bodies.
  _MAX_COMMENTS = 100
-@@ -461,7 +472,13 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
+@@ -462,7 +473,13 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
              )
          ):
              continue
@@ -282,7 +293,7 @@ index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df8
  
      requests = data.get("reviewRequests")
      for request in requests if isinstance(requests, list) else []:
-@@ -478,6 +495,15 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
+@@ -479,6 +496,15 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
      return list(reviewers.values())
  
  
@@ -298,7 +309,7 @@ index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df8
  def _shape_comments(
      raw: Any, reviews: Any = None, *, pr_url: str | None = None, cap: bool = True
  ) -> list[dict[str, Any]]:
-@@ -493,6 +519,7 @@ def _shape_comments(
+@@ -494,6 +520,7 @@ def _shape_comments(
                  "body": str(comment.get("body") or ""),
                  "created_at": comment.get("createdAt") or None,
                  "url": comment.get("url") or None,
@@ -306,7 +317,7 @@ index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df8
              }
          )
      for review in reviews if isinstance(reviews, list) else []:
-@@ -858,6 +885,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
+@@ -911,6 +938,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
              "body": body if isinstance(body, str) and body.strip() else None,
              **_comments_payload(data),
              **_merge_fields(data),
@@ -314,7 +325,7 @@ index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df8
          }
          if _PR_REVIEW_FIELDS.issubset(data):
              payload["pr"]["reviewers"] = _shape_reviewers(data)
-@@ -964,6 +992,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
+@@ -1017,6 +1045,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
          "body": data.get("body") or None,
          **_comments_payload(data),
          **_merge_fields(data),
@@ -323,10 +334,10 @@ index 95eb66155b6541bf00e08e07d99f6b8b2b59976c..704e93649e600554468eb6d067cd6df8
      if _PR_REVIEW_FIELDS.issubset(data):
          info["pr"]["reviewers"] = _shape_reviewers(data)
 diff --git a/omnigent/server/app.py b/omnigent/server/app.py
-index 3c8fc3460fe0fb6286be99d16921015839739883..acdafead6198e7d91432715c276d54874dc431a4 100644
+index 2934231932e10a87c70d47be6769d5e087ba7f3e..4e9b74fc1b779b07d224acdab20f1d427645b9c7 100644
 --- a/omnigent/server/app.py
 +++ b/omnigent/server/app.py
-@@ -103,6 +103,7 @@ from omnigent.server.performance_metrics import (
+@@ -116,6 +116,7 @@ from omnigent.server.performance_metrics import (
      set_request_session_id_for_access_log,
      set_request_user_agent_for_access_log,
  )
@@ -334,7 +345,7 @@ index 3c8fc3460fe0fb6286be99d16921015839739883..acdafead6198e7d91432715c276d5487
  from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
  from omnigent.server.routes.builtin_agents import create_builtin_agents_router
  from omnigent.server.routes.comments import create_comments_router
-@@ -1944,6 +1945,10 @@ def create_app(
+@@ -2087,6 +2088,10 @@ def create_app(
              # Turn completion is event-driven, with a lazy-on-read stale-running
              # backstop. Persistent scheduling separately recovers expired startups.
  
@@ -345,7 +356,7 @@ index 3c8fc3460fe0fb6286be99d16921015839739883..acdafead6198e7d91432715c276d5487
          managed_sandbox_reaper: ManagedSandboxReaper | None = None
          if sandbox_config is not None and sandbox_config.reaper.enabled:
              if host_store is None:
-@@ -1972,6 +1977,8 @@ def create_app(
+@@ -2118,6 +2123,8 @@ def create_app(
                  await scheduled_task_scheduler.stop()
              elif scheduled_task_scheduler is not None:
                  scheduled_task_scheduler.stop()
@@ -354,7 +365,7 @@ index 3c8fc3460fe0fb6286be99d16921015839739883..acdafead6198e7d91432715c276d5487
              if managed_sandbox_reaper is not None:
                  await managed_sandbox_reaper.shutdown()
              metrics_publish_task.cancel()
-@@ -3494,6 +3501,10 @@ def create_app(
+@@ -3650,6 +3657,10 @@ def create_app(
              register_runner_ingest=lambda handler: setattr(
                  app.state, "runner_event_ingest", handler
              ),
@@ -366,10 +377,10 @@ index 3c8fc3460fe0fb6286be99d16921015839739883..acdafead6198e7d91432715c276d5487
          prefix="/v1",
          tags=["sessions"],
 diff --git a/omnigent/server/feature_flags.py b/omnigent/server/feature_flags.py
-index ed07f265376bcf23bb4a730855462033b8faa74f..8c24559eb4bf1e8b3294dcc9f624a29bc3204457 100644
+index 0a8ff17efa2777d18774a87551bdba803b6af945..e048c2dcead04c345f3bbdf61232feccc45567c9 100644
 --- a/omnigent/server/feature_flags.py
 +++ b/omnigent/server/feature_flags.py
-@@ -32,6 +32,7 @@ class Feature(StrEnum):
+@@ -36,6 +36,7 @@ class Feature(StrEnum):
      GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
      AUTOMATIONS_V2 = "automations_v2"
      SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
@@ -377,7 +388,7 @@ index ed07f265376bcf23bb4a730855462033b8faa74f..8c24559eb4bf1e8b3294dcc9f624a29b
  
  
  @dataclass(frozen=True)
-@@ -124,6 +125,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+@@ -136,6 +137,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
          owner="web",
          review_by_release="0.20.0",
      ),
@@ -392,15 +403,17 @@ index ed07f265376bcf23bb4a730855462033b8faa74f..8c24559eb4bf1e8b3294dcc9f624a29b
  
 diff --git a/omnigent/server/pr_watch.py b/omnigent/server/pr_watch.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca2936389824
+index 0000000000000000000000000000000000000000..400f7ea9bec71f2c9b794ef3623e6516b6c21f1e
 --- /dev/null
 +++ b/omnigent/server/pr_watch.py
-@@ -0,0 +1,974 @@
+@@ -0,0 +1,1038 @@
 +"""Keep a session on its pull requests until CI passes and review is clear.
 +
 +A session opts in with ``PUT``/``PATCH /v1/sessions/{id}/pr-watch``, either for
-+chosen pull requests or for every PR it tracks now and later ("all" mode). One
-+:class:`PullRequestWatcher` per server polls every watched PR through the same
++chosen pull requests or for every PR it links now and later ("all" mode). The
++server's stored list of the session's PRs decides which PRs those are, once it
++has synced from the host; before that, the host's own list does. One
++:class:`PullRequestWatcher` per server reads every watched PR through the same
 +path the Pull Requests panel uses (runner, else host, running the provider CLI
 +with the host's credentials), so it needs no credentials of its own. When a
 +check fails on the head commit, a repository owner, member or collaborator
@@ -441,8 +454,10 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +from omnigent.db.db_models import LABEL_VALUE_MAX_LEN, workspace_scope
 +from omnigent.entities.conversation import Conversation
 +from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.server.session_pull_requests import open_store
 +from omnigent.stores import ConversationStore
 +from omnigent.stores.conversation_store import PR_WATCH_LABEL_PREFIX, is_pr_watch_label
++from omnigent.stores.session_pull_request_store import SessionPullRequests
 +
 +_logger = logging.getLogger(__name__)
 +
@@ -510,6 +525,9 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +DeliverMessage = Callable[[str, str | None, str], Awaitable[None]]
 +# ``post_note(session_id, text)`` adds a transcript note without starting a turn.
 +PostNote = Callable[[str, str], Awaitable[None]]
++# ``read_linked(session_id)`` returns the server's stored PRs for the session, or
++# ``None`` without PR storage.
++ReadLinked = Callable[[str], Awaitable[SessionPullRequests | None]]
 +
 +
 +def configured_interval_s(environ: Mapping[str, str] | None = None) -> float:
@@ -1031,6 +1049,29 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +    }
 +
 +
++@dataclass(frozen=True)
++class _Tracked:
++    """The session's PRs as one poll sees them.
++
++    :ivar urls: The PRs, in display order.
++    :ivar states: Each PR's last stored state (``"OPEN"``, ``"MERGED"``, ...), when the
++        server's list supplied them.
++    """
++
++    urls: list[str]
++    states: dict[str, str] = field(default_factory=dict)
++
++
++def _stored_tracked(stored: SessionPullRequests | None) -> _Tracked | None:
++    """The server's list once it has synced from the host; before that it may be partial."""
++    if stored is None or not stored.synced:
++        return None
++    return _Tracked(
++        urls=[entry.url for entry in stored.entries],
++        states={entry.url: entry.state for entry in stored.entries if entry.state},
++    )
++
++
 +def _tracked_urls(info: Mapping[str, Any]) -> list[str] | None:
 +    """The session's tracked PR URLs from a panel read, or ``None`` if the host has no list."""
 +    prs = info.get("prs")
@@ -1057,6 +1098,8 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +
 +    :param conversation_store: Store holding the watch labels.
 +    :param read_pr_info: Reads a session's PR through the panel's data path.
++    :param read_linked: Reads the session's PRs the server stores; ``None`` (or a
++        session not synced yet) falls back to the list the host reports.
 +    :param deliver_message: Sends a turn-starting message into a session.
 +    :param post_note: Adds a note to a session without starting a turn.
 +    :param interval_s: Seconds between polls.
@@ -1071,11 +1114,13 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        read_pr_info: ReadPrInfo,
 +        deliver_message: DeliverMessage,
 +        post_note: PostNote,
++        read_linked: ReadLinked | None = None,
 +        interval_s: float = DEFAULT_INTERVAL_S,
 +        polls_session: Callable[[Conversation], bool] | None = None,
 +    ) -> None:
 +        self._store = conversation_store
 +        self._read_pr_info = read_pr_info
++        self._read_linked = read_linked
 +        self._deliver_message = deliver_message
 +        self._post_note = post_note
 +        self._interval_s = interval_s
@@ -1139,6 +1184,17 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +            _logger.debug("pr watch: reading %s for %s failed: %s", pr_url, session_id, exc)
 +            return None
 +
++    async def _linked(self, session_id: str) -> _Tracked | None:
++        if self._read_linked is None:
++            return None
++        try:
++            return _stored_tracked(await self._read_linked(session_id))
++        except Exception:  # Storage trouble falls back to the host's list.
++            _logger.warning(
++                "pr watch: reading stored PRs for %s failed", session_id, exc_info=True
++            )
++            return None
++
 +    def _due_for_listing(self, conv: Conversation) -> bool:
 +        last = self._listed.get(conv.id)
 +        return (
@@ -1161,17 +1217,20 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        if self._polls_session is not None and not self._polls_session(conv):
 +            return
 +
++        linked = await self._linked(session_id)
 +        infos: dict[str, dict[str, Any]] = {}
-+        tracked: list[str] | None = None
++        tracked: list[str] | None = linked.urls if linked is not None else None
 +        for pr_url in watch.watching:
++            if tracked is not None and pr_url not in tracked:
++                continue
 +            info = await self._read(session_id, conv, pr_url)
 +            if info is not None:
 +                infos[pr_url] = info
 +                tracked = tracked if tracked is not None else _tracked_urls(info)
 +        if watch.all_prs:
-+            tracked = await self._enrol(session_id, conv, watch, infos, tracked)
++            tracked = await self._enrol(session_id, conv, watch, infos, tracked, linked)
 +        if tracked is not None:
-+            # Removed from the session's PR list: it can no longer be read.
++            # Unlinked from the session: it can no longer be read.
 +            for pr_url in [url for url in watch.watching if url not in tracked]:
 +                await remove_entry(self._store, session_id, pr_url)
 +                infos.pop(pr_url, None)
@@ -1203,9 +1262,11 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        watch: SessionWatch,
 +        infos: dict[str, dict[str, Any]],
 +        tracked: list[str] | None,
++        linked: _Tracked | None,
 +    ) -> list[str] | None:
 +        """Start watching the session's PRs that "all" mode has not seen yet.
 +
++        :param linked: The server's stored list; its states skip reading finished PRs.
 +        :returns: The session's tracked PR URLs, when known.
 +        """
 +        candidates = tracked
@@ -1227,6 +1288,12 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        now = int(time.time())
 +        for pr_url in candidates:
 +            if pr_url in watch.prs or len(watch.prs) >= MAX_WATCHED_PRS:
++                continue
++            stored_state = linked.states.get(pr_url, "") if linked is not None else ""
++            if stored_state in ("MERGED", "CLOSED"):
++                # Finished before it was watched: no need to ask the host.
++                watch.prs[pr_url] = WatchState(started_at=now, ended=stored_state.lower())
++                await save_entry(self._store, session_id, pr_url, watch.prs[pr_url])
 +                continue
 +            listed_pr = listing.get("pr") if listing is not None else None
 +            info = (
@@ -1353,6 +1420,13 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +    async def post_note(session_id: str, text: str) -> None:
 +        await append_note(conversation_store, session_id, text)
 +
++    pull_request_store = open_store(conversation_store)
++
++    async def read_linked(session_id: str) -> SessionPullRequests | None:
++        if pull_request_store is None:
++            return None
++        return await asyncio.to_thread(pull_request_store.read, session_id)
++
 +    def polls_session(conv: Conversation) -> bool:
 +        return (
 +            host_registry is None
@@ -1365,16 +1439,17 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        read_pr_info=read_pr_info,
 +        deliver_message=deliver_message,
 +        post_note=post_note,
++        read_linked=read_linked,
 +        interval_s=configured_interval_s(),
 +        polls_session=polls_session,
 +    )
 +    app.state.pr_watcher = watcher
 +    return watcher
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index 4bf8ab8907f2101c2cf84363e1077b05a07773d1..c1a2903a1b1c72bde5018156f138f98e67cf2b1e 100644
+index 9868e944f6a0190dee055c9dcd6a631add5446ff..113e19cb25394489d288f70b50952ebe69b49a3d 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -10641,6 +10641,15 @@ def _reject_server_reserved_label_seed(labels: Mapping[str, str | None] | None)
+@@ -10897,6 +10897,15 @@ def _reject_server_reserved_label_seed(labels: Mapping[str, str | None] | None)
              f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
              code=ErrorCode.INVALID_INPUT,
          )
@@ -1391,10 +1466,10 @@ index 4bf8ab8907f2101c2cf84363e1077b05a07773d1..c1a2903a1b1c72bde5018156f138f98e
      # only; a client write would forge the retention clock, including on shared
      # sessions the caller does not own.
 diff --git a/omnigent/server/routes/sessions/__init__.py b/omnigent/server/routes/sessions/__init__.py
-index 091d3e1d43983a6c10fbcc2800efae3b59e735d5..c16f1aa107109f2583fb195d97968d64204e8698 100644
+index c7dbc60263ee941da04c0645c0a9367d82afba0d..43284bb5f6d6af2c0142315c4c47097ba1e8b394 100644
 --- a/omnigent/server/routes/sessions/__init__.py
 +++ b/omnigent/server/routes/sessions/__init__.py
-@@ -819,6 +819,8 @@ def create_sessions_router(
+@@ -822,6 +822,8 @@ def create_sessions_router(
      register_runner_ingest: Callable[..., None] | None = None,
      register_startup_dispatch: Callable[..., None] | None = None,
      register_initial_file_upload: Callable[..., None] | None = None,
@@ -1403,7 +1478,7 @@ index 091d3e1d43983a6c10fbcc2800efae3b59e735d5..c16f1aa107109f2583fb195d97968d64
  ) -> APIRouter:
      """
      Factory that builds the sessions router.
-@@ -883,6 +885,8 @@ def create_sessions_router(
+@@ -886,6 +888,8 @@ def create_sessions_router(
          validate ownership when ``PATCH /v1/sessions/{id}`` files a
          session into a project. ``None`` disables the move-into-project
          action (a non-empty ``project_id`` is then rejected as unsupported).
@@ -1412,7 +1487,7 @@ index 091d3e1d43983a6c10fbcc2800efae3b59e735d5..c16f1aa107109f2583fb195d97968d64
      :param background_title_coordinator: Optional app-owned coordinator for
          semantic title generation after first-turn forwarding. ``None`` disables
          background titles in focused router tests.
-@@ -899,6 +903,7 @@ def create_sessions_router(
+@@ -904,6 +908,7 @@ def create_sessions_router(
      from omnigent.server.routes.sessions.routes_hooks import register_hooks_routes
      from omnigent.server.routes.sessions.routes_items import register_items_routes
      from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
@@ -1420,15 +1495,15 @@ index 091d3e1d43983a6c10fbcc2800efae3b59e735d5..c16f1aa107109f2583fb195d97968d64
      from omnigent.server.routes.sessions.routes_provider import register_provider_routes
      from omnigent.server.routes.sessions.routes_resources import register_resources_routes
      from omnigent.server.routes.sessions.routes_ui import register_ui_routes
-@@ -961,6 +966,7 @@ def create_sessions_router(
-         permission_store=permission_store,
+@@ -970,6 +975,7 @@ def create_sessions_router(
          host_registry=host_registry,
          register_initial_file_upload=register_initial_file_upload,
+         pull_request_refresher=pull_request_refresher,
 +        register_pr_info_reader=register_pr_info_reader,
      )
  
      register_ui_routes(
-@@ -977,6 +983,13 @@ def create_sessions_router(
+@@ -986,6 +992,13 @@ def create_sessions_router(
          permission_store=permission_store,
      )
  
@@ -1442,7 +1517,7 @@ index 091d3e1d43983a6c10fbcc2800efae3b59e735d5..c16f1aa107109f2583fb195d97968d64
      register_elicitations_routes(
          router,
          conversation_store=conversation_store,
-@@ -1003,6 +1016,7 @@ def create_sessions_router(
+@@ -1012,6 +1025,7 @@ def create_sessions_router(
          runner_tunnel_tokens=runner_tunnel_tokens,
          register_runner_ingest=register_runner_ingest,
          register_startup_dispatch=register_startup_dispatch,
@@ -1451,10 +1526,10 @@ index 091d3e1d43983a6c10fbcc2800efae3b59e735d5..c16f1aa107109f2583fb195d97968d64
  
      register_permissions_routes(
 diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
-index 77f59a4f5abf0fc34d5f7c919bc44ac7b7b067e0..ee8f4f0aec5de69b458caaccf16f9e015f4ca53c 100644
+index 9bfff9c062cdaba2f3fb1ba5b6cfdd7bc100d4a5..28fe33f80de88bc8648efd68c238b30d97bdb739 100644
 --- a/omnigent/server/routes/sessions/routes_events.py
 +++ b/omnigent/server/routes/sessions/routes_events.py
-@@ -744,6 +744,18 @@ class _RunnerEventContext:
+@@ -755,6 +755,18 @@ class _RunnerEventContext:
      runner_id: str
  
  
@@ -1473,7 +1548,7 @@ index 77f59a4f5abf0fc34d5f7c919bc44ac7b7b067e0..ee8f4f0aec5de69b458caaccf16f9e01
  _RUNNER_EVENT_TYPES = frozenset(
      {
          _EXTERNAL_CONVERSATION_ITEM_TYPE,
-@@ -773,13 +785,15 @@ def register_events_routes(
+@@ -785,13 +797,15 @@ def register_events_routes(
      register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
      | None = None,
      register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
@@ -1490,7 +1565,7 @@ index 77f59a4f5abf0fc34d5f7c919bc44ac7b7b067e0..ee8f4f0aec5de69b458caaccf16f9e01
      ) -> bool:
          if isinstance(request, _RunnerEventContext):
              return conv.runner_id == request.runner_id
-@@ -790,7 +804,8 @@ def register_events_routes(
+@@ -802,7 +816,8 @@ def register_events_routes(
          return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
  
      def _has_runner_created_by_authority(
@@ -1500,7 +1575,7 @@ index 77f59a4f5abf0fc34d5f7c919bc44ac7b7b067e0..ee8f4f0aec5de69b458caaccf16f9e01
      ) -> bool:
          if isinstance(request, _RunnerEventContext):
              return _has_bound_runner_authority(request, conv)
-@@ -800,7 +815,7 @@ def register_events_routes(
+@@ -812,7 +827,7 @@ def register_events_routes(
          return _has_bound_runner_authority(request, conv)
  
      async def _authorized_conversation(
@@ -1509,7 +1584,7 @@ index 77f59a4f5abf0fc34d5f7c919bc44ac7b7b067e0..ee8f4f0aec5de69b458caaccf16f9e01
          session_id: str,
          *,
          external_transcript: bool = False,
-@@ -808,7 +823,7 @@ def register_events_routes(
+@@ -820,7 +835,7 @@ def register_events_routes(
          """Authorize event writes, reserving transcripts for owners and bound runners."""
          user_id = (
              request.user_id
@@ -1518,8 +1593,8 @@ index 77f59a4f5abf0fc34d5f7c919bc44ac7b7b067e0..ee8f4f0aec5de69b458caaccf16f9e01
              else _get_user_id(request, auth_provider)
          )
          conv = None
-@@ -985,7 +1000,7 @@ def register_events_routes(
-         register_runner_ingest(ingest_runner_batch)
+@@ -1017,7 +1032,7 @@ def register_events_routes(
+             )
  
      async def _post_event_impl(
 -        request: Request | _RunnerEventContext | StartupInputContext,
@@ -1527,7 +1602,7 @@ index 77f59a4f5abf0fc34d5f7c919bc44ac7b7b067e0..ee8f4f0aec5de69b458caaccf16f9e01
          session_id: str,
          body: SessionEventInput,
          in_flight: contextlib.ExitStack | None = None,
-@@ -3353,6 +3368,27 @@ def register_events_routes(
+@@ -3455,6 +3470,27 @@ def register_events_routes(
      if register_startup_dispatch is not None:
          register_startup_dispatch(_post_event_impl)
  
@@ -1803,33 +1878,26 @@ index 0000000000000000000000000000000000000000..492c5a0f213eb5ba8363ae06a2acc4e9
 +        await clear_watch(conversation_store, session_id)
 +        return await _status(request, session_id)
 diff --git a/omnigent/server/routes/sessions/routes_resources.py b/omnigent/server/routes/sessions/routes_resources.py
-index 3bb5345668b0bdd0c97089bf1335e5cac9ff3d93..ad172fd7712a87ba648670a08342ef322b2aaf4a 100644
+index 379a7ee6a0930cd35312f143fc396a16eedb2863..bb2ac83ea799169fa17480d5c1f9d32ea95ce2f8 100644
 --- a/omnigent/server/routes/sessions/routes_resources.py
 +++ b/omnigent/server/routes/sessions/routes_resources.py
-@@ -240,6 +240,7 @@ def register_resources_routes(
-     permission_store: PermissionStore | None = None,
+@@ -284,6 +284,7 @@ def register_resources_routes(
      host_registry: HostRegistry | None = None,
      register_initial_file_upload: Callable[..., None] | None = None,
+     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
 +    register_pr_info_reader: Callable[..., None] | None = None,
  ) -> None:
      """Register the resources routes on router."""
- 
-@@ -3259,6 +3260,22 @@ def register_resources_routes(
-             runner_path=f"/v1/sessions/{session_id}/resources/github",
-         )
+     pull_request_store = server_prs.open_store(conversation_store)
+@@ -3597,6 +3598,15 @@ def register_resources_routes(
+         conv = await _validate_session(session_id, request, LEVEL_READ)
+         return await _github_info(session_id, conv, pr_url)
  
 +    async def read_pr_info(
 +        session_id: str, conv: Conversation, pr_url: str | None
 +    ) -> dict[str, Any]:
-+        """Read a tracked PR (``None``: the default one) like the panel, for the PR watcher."""
-+        return await _fs_get_with_host_fallback(
-+            session_id,
-+            conv,
-+            op="github_info",
-+            host_params={"pr_url": pr_url} if pr_url else {},
-+            runner_params={"pr_url": pr_url} if pr_url else None,
-+            runner_path=f"/v1/sessions/{session_id}/resources/github",
-+        )
++        """Read a linked PR (``None``: the default one) like the panel, for the PR watcher."""
++        return await _github_info(session_id, conv, pr_url)
 +
 +    if register_pr_info_reader is not None:
 +        register_pr_info_reader(read_pr_info)
@@ -1838,10 +1906,10 @@ index 3bb5345668b0bdd0c97089bf1335e5cac9ff3d93..ad172fd7712a87ba648670a08342ef32
          "/sessions/{session_id}/resources/github/changes",
          response_model=None,
 diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
-index d707122e97dc9497c7950fdb10e5aa90558012e4..ccec9d13d584a171c9c8b979973a8ccb905b5507 100644
+index 49a5c884df8aa16b8afcda82d56d3bf2d901bc25..74edb61b316f6fdb496ede95d8871836a7cb4ac5 100644
 --- a/omnigent/stores/conversation_store/__init__.py
 +++ b/omnigent/stores/conversation_store/__init__.py
-@@ -232,6 +232,15 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
+@@ -239,6 +239,15 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
      _SANDBOX_REPO_LABEL_KEY,
      _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
  }
@@ -1857,7 +1925,7 @@ index d707122e97dc9497c7950fdb10e5aa90558012e4..ccec9d13d584a171c9c8b979973a8ccb
  
  
  @dataclass(frozen=True)
-@@ -1259,6 +1268,20 @@ class ConversationStore(ABC):
+@@ -1309,6 +1318,20 @@ class ConversationStore(ABC):
          """
          ...
  
@@ -1879,18 +1947,18 @@ index d707122e97dc9497c7950fdb10e5aa90558012e4..ccec9d13d584a171c9c8b979973a8ccb
      def list_projects(
          self,
 diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
-index 8a229fabadd55d6fa4acfe1c8b73a03618a80950..691c43a477b3b870f0a37319703e3b0a3e881614 100644
+index 1a7178f641002dcc759b9a614fbd85c43fd754d0..3a654c74c328dffc6548b2f9ee97d323d40697c9 100644
 --- a/omnigent/stores/conversation_store/sqlalchemy_store.py
 +++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
-@@ -109,6 +109,7 @@ from omnigent.stores.conversation_store import (
-     CreatedSession,
+@@ -110,6 +110,7 @@ from omnigent.stores.conversation_store import (
      DailyCostState,
+     SessionActivity,
      SessionConnectivity,
 +    is_pr_watch_label,
      pinned_label_key,
  )
  from omnigent.stores.conversation_store.overrides import (
-@@ -2767,6 +2768,28 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -2826,6 +2827,28 @@ class SqlAlchemyConversationStore(ConversationStore):
              write,
          )
  
@@ -1919,7 +1987,7 @@ index 8a229fabadd55d6fa4acfe1c8b73a03618a80950..691c43a477b3b870f0a37319703e3b0a
      def list_projects(
          self,
          accessible_by: str | None = None,
-@@ -5222,6 +5245,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -5308,6 +5331,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                  )
                  and not key.startswith(f"{PINNED_LABEL_KEY}.")
                  and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
@@ -1928,10 +1996,10 @@ index 8a229fabadd55d6fa4acfe1c8b73a03618a80950..691c43a477b3b870f0a37319703e3b0a
              }
              source_workspace = source_meta_ref.workspace if source_meta_ref else None
 diff --git a/openapi.json b/openapi.json
-index 2ce68bd957046c4c216d23e4e66d141f63016c33..ad7229851d8becb5a2574a2155351dc67e7c6e7f 100644
+index 1c1ed566f331afe0f91392af8c3e2288da4ac611..632ac1bc50298160edf49ad43c11d8396228669f 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -5164,6 +5164,192 @@
+@@ -5241,6 +5241,192 @@
          "title": "ProjectOrderResponse",
          "type": "object"
        },
@@ -2124,7 +2192,7 @@ index 2ce68bd957046c4c216d23e4e66d141f63016c33..ad7229851d8becb5a2574a2155351dc6
        "QueuedEvent": {
          "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
          "properties": {
-@@ -15680,6 +15866,192 @@
+@@ -16390,6 +16576,192 @@
          ]
        }
      },
@@ -2318,7 +2386,7 @@ index 2ce68bd957046c4c216d23e4e66d141f63016c33..ad7229851d8becb5a2574a2155351dc6
        "post": {
          "description": "Switch a running session to another provider, e.g. another Claude account.\n\nOwner-only: the provider decides which of the host owner's accounts\npays for the session.",
 diff --git a/tests/runner/test_github_resource.py b/tests/runner/test_github_resource.py
-index 4596cd633db56d63bb8db502cbe9fa2bbca7dc3b..08c729ead3629540e0c36ef05c3ef7262447773d 100644
+index 86fd5ed2eb0701d42f22aa95ce54b5f7a44905d7..9f9d4114a52f22442ccc66ce1b16005f66656443 100644
 --- a/tests/runner/test_github_resource.py
 +++ b/tests/runner/test_github_resource.py
 @@ -1104,6 +1104,13 @@ def test_shape_comments_filters_minimized_and_caps() -> None:
@@ -2432,7 +2500,7 @@ index f3b251eb176582488fc9b5ce7ae79eb71b0a6c22..1e11ae969e2f02257523a628b16ca751
 +
 +    assert refused.value.code == ErrorCode.FORBIDDEN
 diff --git a/tests/server/integration/test_utility_endpoints.py b/tests/server/integration/test_utility_endpoints.py
-index a9f83460c92a163e78d5dd58b4b6f3ba6af08e86..12aba794f89698b018cc0877597d4665cfb34a90 100644
+index 83c0dcad580ad201cd95412c70dc53af875ca168..b0f002ff6495c44f40fd49ed032d1eea65a7d818 100644
 --- a/tests/server/integration/test_utility_endpoints.py
 +++ b/tests/server/integration/test_utility_endpoints.py
 @@ -99,6 +99,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
@@ -2656,11 +2724,48 @@ index 0000000000000000000000000000000000000000..5aed4b80ec5834d500920106901cef95
 +        headers=OWNER,
 +    )
 +    assert response.status_code == 400
+diff --git a/tests/server/routes/test_session_resources.py b/tests/server/routes/test_session_resources.py
+index 05536cd0d148e4d21583e498d78ea9286bd8da3d..6100e0fc9fb8d8a6db0b2008f534070e41fcf4e0 100644
+--- a/tests/server/routes/test_session_resources.py
++++ b/tests/server/routes/test_session_resources.py
+@@ -3390,6 +3390,32 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
+     assert runner.post_json_calls[-1][1]["action"] == "remove"
+ 
+ 
++@pytest.mark.asyncio
++async def test_the_pr_watch_reader_reads_like_the_panel(
++    runner_globals_reset: None, db_uri: str
++) -> None:
++    """The PR watcher's reader is vouched for, stored, and answered with the server's list."""
++    del runner_globals_reset
++    readers: list[Any] = []
++    app = _pr_app(db_uri, register_pr_info_reader=readers.append)
++    runner = _FakeRunnerClient(payload=_pr_info())
++    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
++    transport = httpx.ASGITransport(app=app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
++        await client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
++        set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
++        await client.delete(f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR})
++    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
++    [read] = readers
++    conv = app.state.test_conversation_store.get_conversation(_PR_SESSION)
++
++    info = await read(_PR_SESSION, conv, _SECOND_PR)
++
++    assert runner.get_params[-1] == {"pr_url": _SECOND_PR, "server_tracked": True}
++    # The host still reports the unlinked PR; the answer is the server's list.
++    assert [pr["url"] for pr in info["prs"]] == [_SECOND_PR]
++
++
+ @pytest.mark.asyncio
+ async def test_linking_checks_the_session_limit_before_asking_the_host(
+     pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 diff --git a/tests/server/test_feature_flags.py b/tests/server/test_feature_flags.py
-index d406e263f1309c5fbc8c66d92dc01e6a7ed97e28..791064da1db05da5e95644170a85090bfc6337c8 100644
+index c3b16c1da6f9401a0c62f3420a79c8ca8c7fd789..60bca0eb8dfd0802022568351d1895a5fc35edff 100644
 --- a/tests/server/test_feature_flags.py
 +++ b/tests/server/test_feature_flags.py
-@@ -32,6 +32,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
+@@ -36,6 +36,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
          "grid_sessions_display_ui": False,
          "automations_v2": False,
          "splittable_terminal_view_ui": False,
@@ -2670,10 +2775,10 @@ index d406e263f1309c5fbc8c66d92dc01e6a7ed97e28..791064da1db05da5e95644170a85090b
  
 diff --git a/tests/server/test_pr_watch.py b/tests/server/test_pr_watch.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff162b6b8bde
+index 0000000000000000000000000000000000000000..9626cb4b2e7da30dcd30d111ebc83cfa39737276
 --- /dev/null
 +++ b/tests/server/test_pr_watch.py
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,575 @@
 +"""Pull request watch: event detection, dedupe, stop rules, label storage and the poll loop."""
 +
 +from __future__ import annotations
@@ -2697,6 +2802,7 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +    wake_message,
 +)
 +from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.session_pull_request_store import SessionPullRequests, StoredPullRequest
 +
 +PR_URL = "https://github.com/org/repo/pull/7"
 +PR_9 = "https://github.com/org/repo/pull/9"
@@ -2933,6 +3039,8 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +        self.store = store
 +        self.infos: dict[str, dict[str, Any]] = {PR_URL: _info()}
 +        self.tracked: list[str] = [PR_URL]
++        # The server's stored list; ``None`` leaves the host's list in charge.
++        self.linked: SessionPullRequests | None = None
 +        self.reads: list[str | None] = []
 +        self.messages: list[tuple[str, str | None, str]] = []
 +        self.notes: list[tuple[str, str]] = []
@@ -2953,12 +3061,36 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +        async def note(session_id: str, text: str) -> None:
 +            self.notes.append((session_id, text))
 +
++        async def read_linked(session_id: str) -> SessionPullRequests | None:
++            return self.linked
++
 +        self.watcher = PullRequestWatcher(
 +            conversation_store=store,
 +            read_pr_info=read,
 +            deliver_message=deliver,
 +            post_note=note,
++            read_linked=read_linked,
 +            polls_session=lambda conv: polls,
++        )
++
++    def link(self, *prs: tuple[str, str | None], synced: bool = True) -> None:
++        """Store ``(url, state)`` pairs as the server's list of the session's PRs."""
++        self.linked = SessionPullRequests(
++            entries=[
++                StoredPullRequest(
++                    url=url,
++                    provider="github",
++                    host="github.com",
++                    repository="org/repo",
++                    number=int(url.rsplit("/", 1)[1]),
++                    relationship="created",
++                    first_seen_at=1.0,
++                    last_seen_at=1.0,
++                    state=state,
++                )
++                for url, state in prs
++            ],
++            synced=synced,
 +        )
 +
 +    @property
@@ -3100,6 +3232,49 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +    assert harness.state(session_id).all_prs
 +
 +
++async def test_all_mode_takes_the_session_prs_from_the_server_list(
++    store: SqlAlchemyConversationStore,
++) -> None:
++    harness = _Harness(store)
++    harness.info = _info(**_failing("lint"))
++    harness.infos[PR_9] = _info(number=9, url=PR_9)
++    # The host's own registry lags: it only knows #7.
++    harness.tracked = [PR_URL]
++    harness.link((PR_URL, "OPEN"), (PR_9, "MERGED"))
++    session_id = harness.watch_all()
++
++    await harness.watcher.poll_once()
++
++    # No listing read, and #9, merged by the stored state, is never read.
++    assert harness.reads == [PR_URL]
++    watch = harness.state(session_id)
++    assert watch.watching == [PR_URL] and watch.prs[PR_9].ended == "merged"
++    assert harness.messages[0][2].startswith("[System: PR watch — #7 needs attention]")
++
++    # Unlinked on the server: the watch goes even though the host still lists it.
++    harness.link((PR_9, "MERGED"))
++    harness.reads.clear()
++    await harness.watcher.poll_once()
++    assert harness.reads == [] and PR_URL not in harness.state(session_id).prs
++
++
++async def test_an_unsynced_server_list_leaves_the_host_list_in_charge(
++    store: SqlAlchemyConversationStore,
++) -> None:
++    harness = _Harness(store)
++    harness.info = _info(**_failing("lint"))
++    harness.infos[PR_9] = _info(number=9, url=PR_9, mergeable=False)
++    harness.tracked = [PR_URL, PR_9]
++    # Not imported from the host yet, so the stored list may be partial.
++    harness.link((PR_URL, "OPEN"), synced=False)
++    session_id = harness.watch_all()
++
++    await harness.watcher.poll_once()
++
++    assert harness.reads == [None, PR_9]
++    assert set(harness.state(session_id).watching) == {PR_URL, PR_9}
++
++
 +async def test_watcher_stops_with_a_note_when_green(store: SqlAlchemyConversationStore) -> None:
 +    harness = _Harness(store)
 +    session_id = harness.watch()
@@ -3180,7 +3355,7 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +
 +    assert harness.reads == [] and harness.notes == []
 diff --git a/tests/stores/test_conversation_store.py b/tests/stores/test_conversation_store.py
-index 4ef3a0ec5f8268f78359e602f88e89d1f62c428d..99a9858263af66a27bf59927d016424bcd025abc 100644
+index b8f39db696f199fbadf2aa1c30d3aeeb2b7710a2..7b5c184ae091e920640047698fefa57d2722db21 100644
 --- a/tests/stores/test_conversation_store.py
 +++ b/tests/stores/test_conversation_store.py
 @@ -15,6 +15,7 @@ from sqlalchemy import event, text
@@ -3191,7 +3366,7 @@ index 4ef3a0ec5f8268f78359e602f88e89d1f62c428d..99a9858263af66a27bf59927d016424b
  from omnigent.db.utils import get_or_create_engine
  from omnigent.entities import (
      CompactionData,
-@@ -72,13 +73,16 @@ class _RetryOnceMaker:
+@@ -73,13 +74,16 @@ class _RetryOnceMaker:
  def test_fork_drops_import_provenance_labels(
      conversation_store: SqlAlchemyConversationStore,
  ) -> None:
@@ -3209,7 +3384,7 @@ index 4ef3a0ec5f8268f78359e602f88e89d1f62c428d..99a9858263af66a27bf59927d016424b
              "kept": "yes",
          },
      )
-@@ -91,6 +95,15 @@ def test_fork_drops_import_provenance_labels(
+@@ -92,6 +96,15 @@ def test_fork_drops_import_provenance_labels(
      assert fork.labels["kept"] == "yes"
      assert IMPORT_SOURCE_LABEL_KEY not in fork.labels
      assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
@@ -3807,21 +3982,8 @@ index 0000000000000000000000000000000000000000..a81287a0b9457660843bb93b49096b45
 +    onSuccess: (status) => queryClient.setQueryData(watchKey(conversationId), status),
 +  });
 +}
-diff --git a/web/src/hooks/usePullRequests.ts b/web/src/hooks/usePullRequests.ts
-index 829053c4edd6f100341b3eb5f9e1814d3fe8a4bc..884f5e70dd2154e125f0281ed43eb57723121be2 100644
---- a/web/src/hooks/usePullRequests.ts
-+++ b/web/src/hooks/usePullRequests.ts
-@@ -334,7 +334,7 @@ export interface PullRequestFileDiffResponse {
- 
- /** Surface the server's error message (e.g. a git failure) rather than a bare
-  *  status code, mirroring the workspace hooks. */
--async function errorFromResponse(res: Response): Promise<Error> {
-+export async function errorFromResponse(res: Response): Promise<Error> {
-   let message = `${res.status} ${res.statusText}`;
-   try {
-     const body = (await res.json()) as { error?: { message?: string }; detail?: unknown };
 diff --git a/web/src/lib/capabilities.ts b/web/src/lib/capabilities.ts
-index a8eae74436a5d16aa2f6a93069ddbe771f317e11..345040a2669a9587a51a40c02868428931aceb87 100644
+index 0220a9408cf9590a325826ec4d8eb703ebdef776..ca251418e683d0c4ed3a1716a08fe7a76e5e9edf 100644
 --- a/web/src/lib/capabilities.ts
 +++ b/web/src/lib/capabilities.ts
 @@ -68,7 +68,8 @@ export type FeatureKey =
@@ -3835,10 +3997,10 @@ index a8eae74436a5d16aa2f6a93069ddbe771f317e11..345040a2669a9587a51a40c028684289
  /** Deployment-wide release-feature values advertised by the server. */
  export type FeatureValues = Record<string, boolean>;
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index a1450704fce48a8732cc83ff7403d6aa404282c2..13121340ef78b238890b182c19603c1cbb581398 100644
+index ddaa704fa4ff578f487c915d32a84b686bd7ff8d..a01aa0cac41d05de1eb1316a1164c3b92996f799 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
-@@ -261,6 +261,7 @@ import { buildFusionSections } from "@/components/composer/fusionSections";
+@@ -266,6 +266,7 @@ import { buildFusionSections } from "@/components/composer/fusionSections";
  import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
  import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
  import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
@@ -3846,7 +4008,7 @@ index a1450704fce48a8732cc83ff7403d6aa404282c2..13121340ef78b238890b182c19603c1c
  import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
  import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
  import { composerContextFromLabels } from "@/lib/composerContextAdapters";
-@@ -4075,6 +4076,8 @@ function ComposerImpl(
+@@ -4113,6 +4114,8 @@ function ComposerImpl(
              prNumberPrefix={composerGit.prNumberPrefix}
              onOpen={openComposerGithubTab}
            />
@@ -3856,10 +4018,10 @@ index a1450704fce48a8732cc83ff7403d6aa404282c2..13121340ef78b238890b182c19603c1c
              <div
                data-testid="composer-task-indicators"
 diff --git a/web/src/shell/PullRequestPanel.tsx b/web/src/shell/PullRequestPanel.tsx
-index 4b7a76a8d64d9faf9715a8888480d564828738ef..61da6194fd4e893b4ff20cb51ff1f06a3e38d2fa 100644
+index 68487195183100897bb02ff1cb4b6fce824a09f9..737dfcc5ce50f0cb9e94ae14b1f8af5bfb695842 100644
 --- a/web/src/shell/PullRequestPanel.tsx
 +++ b/web/src/shell/PullRequestPanel.tsx
-@@ -107,6 +107,7 @@ import {
+@@ -122,6 +122,7 @@ import {
  import { PullRequestLabels } from "./PullRequestLabels";
  import { PullRequestMerge } from "./PullRequestMerge";
  import { PullRequestReviewers } from "./PullRequestReviewers";
@@ -3867,10 +4029,10 @@ index 4b7a76a8d64d9faf9715a8888480d564828738ef..61da6194fd4e893b4ff20cb51ff1f06a
  
  // Shiki bundled themes matching the app's editor look; the concrete side is
  // chosen by `themeType` from the app's resolved light/dark mode.
-@@ -1683,6 +1684,15 @@ function PullRequestPanelDetails({
+@@ -1884,6 +1885,15 @@ function PullRequestPanelDetails({
                  editable={canEdit && !!data.capabilities.details_editing}
                />
-               <PullRequestStatus state={pr.state} />
+               <PullRequestStatus state={pr.state} isDraft={pr.is_draft === true} />
 +              {pr.state === "OPEN" && (
 +                <div className="ml-auto">
 +                  <PullRequestWatchSwitch

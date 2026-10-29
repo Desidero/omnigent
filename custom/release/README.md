@@ -1,8 +1,5 @@
 # Release tooling
 
-> **Status: pending cutover.** The workflow below does not run yet; see
-> [Cutover](../README.md#cutover).
-
 The workflow (`.github/workflows/custom-release.yml` on the `patches` branch)
 uses these scripts to turn a build of the series into a release on this fork;
 the host scripts then install a release on a machine that runs the Omnigent

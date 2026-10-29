@@ -27,16 +27,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 Docs: none (fix: sub-agent status stays accurate during long tool calls; no setting)
 ---
- omnigent/harnesses/claude_native/forwarder.py | 116 +++++++++++++++++-
+ omnigent/harnesses/claude_native/forwarder.py | 117 +++++++++++++++++-
  omnigent/server/subagent_activity.py          |  19 +++
  tests/e2e/test_subagent_status_compat_e2e.py  |   1 +
  .../forwarder/test_subagent_delivery.py       |   1 +
  .../forwarder/test_subagent_status.py         |  86 +++++++++++++
  tests/server/routes/test_subagent_activity.py |  11 ++
- 6 files changed, 231 insertions(+), 3 deletions(-)
+ 6 files changed, 231 insertions(+), 4 deletions(-)
 
 diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
-index 24dc6144db24d09c1b9ac9c5bbc3e231b5ddf3f8..e2da2ddb3cbb4dbb27a187f1e15ebf47008b1608 100644
+index 844e11b296fb426423a35e18b2ee00fd94b81f8a..c6a1bbc9076a943846f62dc85ece42c3c9cfcce9 100644
 --- a/omnigent/harnesses/claude_native/forwarder.py
 +++ b/omnigent/harnesses/claude_native/forwarder.py
 @@ -5,6 +5,7 @@ from __future__ import annotations
@@ -47,15 +47,16 @@ index 24dc6144db24d09c1b9ac9c5bbc3e231b5ddf3f8..e2da2ddb3cbb4dbb27a187f1e15ebf47
  import hashlib
  import json
  import logging
-@@ -15,6 +16,7 @@ import time
+@@ -15,7 +16,7 @@ import time
  from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
  from dataclasses import dataclass, field, replace
  from pathlib import Path
-+from typing import Literal
+-from typing import NotRequired, TypedDict
++from typing import Literal, NotRequired, TypedDict
  
  import httpx
  
-@@ -127,6 +129,16 @@ _MAX_SEEN_DELTA_KEYS = 5000
+@@ -129,6 +130,16 @@ _MAX_SEEN_DELTA_KEYS = 5000
  # Seconds without transcript activity before reporting an idle observation.
  # This heuristic does not establish that the sub-agent has completed.
  _SUBAGENT_IDLE_THRESHOLD_S = 5.0
@@ -72,7 +73,7 @@ index 24dc6144db24d09c1b9ac9c5bbc3e231b5ddf3f8..e2da2ddb3cbb4dbb27a187f1e15ebf47
  
  # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
  # One per Claude Task-tool subagent or in-process teammate; appears alongside
-@@ -141,6 +153,99 @@ _IN_PROCESS_TEAMMATE_TASK_KIND = "in_process_teammate"
+@@ -143,6 +154,99 @@ _IN_PROCESS_TEAMMATE_TASK_KIND = "in_process_teammate"
  _SUBAGENT_SPAWN_TOOL_NAMES = frozenset(AGENT_TOOL_NAMES)
  
  
@@ -172,7 +173,7 @@ index 24dc6144db24d09c1b9ac9c5bbc3e231b5ddf3f8..e2da2ddb3cbb4dbb27a187f1e15ebf47
  def _subagent_id_from_meta_path(meta_path: Path) -> str:
      """``agent-<id>.meta.json`` / ``agent-<id>.jsonl`` → ``<id>``."""
      return meta_path.stem.removeprefix("agent-").removesuffix(".meta")
-@@ -2506,9 +2611,14 @@ async def _forward_one_subagent(
+@@ -2562,9 +2666,14 @@ async def _forward_one_subagent(
          and new_entry.last_activity_ts is not None
          and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
      ):
@@ -228,10 +229,10 @@ index 53f3d5e3d3ab6da159776f722ff03a9573dc7789..6514d0e0e2ff096c69d0608b89478750
              return
          after = page.last_id
 diff --git a/tests/e2e/test_subagent_status_compat_e2e.py b/tests/e2e/test_subagent_status_compat_e2e.py
-index e4dfb74b18043872b589db114e4ebd0307e0bcaf..884251ae8bfc6063b679aac9a4db63f4678802de 100644
+index 7a4694d174361ac25896ab42ce5922ac5d4d2acb..bd2ef16c8e7def3f89ace2762c83d8e7e2c5d88b 100644
 --- a/tests/e2e/test_subagent_status_compat_e2e.py
 +++ b/tests/e2e/test_subagent_status_compat_e2e.py
-@@ -143,6 +143,7 @@ async def test_subagent_idle_reporting_with_old_server(
+@@ -278,6 +278,7 @@ async def test_subagent_idle_reporting_with_old_server(
                              "message": {
                                  "role": "assistant",
                                  "content": [{"type": "text", "text": text}],
