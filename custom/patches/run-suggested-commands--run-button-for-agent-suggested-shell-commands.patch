@@ -82,13 +82,13 @@ index 0000000000000000000000000000000000000000..70f7f781bbcea8b147d216718fb75c69
 +A `!command` you type yourself in a codex-native session's web composer now
 +runs the same way, as a shell command rather than a prompt.
 diff --git a/feature-map/native-harnesses.md b/feature-map/native-harnesses.md
-index c93eeda2d4cc440f5e03e11a856c4cf87296c855..2107d28aebb8a4b3508ea3f6f136215702bc2aa4 100644
+index 17e3482547c2215e9a8d7acff424f88e5b01aa44..d28b2cc1c45e64389e16769b67128584646a48af 100644
 --- a/feature-map/native-harnesses.md
 +++ b/feature-map/native-harnesses.md
-@@ -38,6 +38,10 @@ implements them separately, so a fix for one harness does not reach the others.
-   Shell commands and multi-file patches have no file link. A shell row reads
-   `$ command` and expands to a terminal panel with the command, its output
-   and exit status.
+@@ -68,6 +68,10 @@ implements them separately, so a fix for one harness does not reach the others.
+   the command (a script's first line and "+N lines") and expands to a
+   terminal panel with the command, its output and exit status, in the
+   Settings terminal theme.
 +- `run-suggested-commands`: in claude-native and codex-native chats, **Run**
 +  on a shell command an agent suggests queues it as a `!command` shell input
 +  after a confirmation; see [Run suggested commands](../docs/run-suggested-commands.md).
@@ -96,7 +96,7 @@ index c93eeda2d4cc440f5e03e11a856c4cf87296c855..2107d28aebb8a4b3508ea3f6f1362157
  - `working-status`: quiet work stays working; waiting for input is explained;
    completion, interruption and process exit settle the indicator. A following
    turn and reconnect must not leave a stale idle or working state.
-@@ -166,6 +170,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
+@@ -215,6 +219,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
  follow-up in the side pane, then close its tab. The parent conversation stays
  separate. See [sessions](./sessions.md) for all side-chat entry points.
  
@@ -108,7 +108,7 @@ index c93eeda2d4cc440f5e03e11a856c4cf87296c855..2107d28aebb8a4b3508ea3f6f1362157
  **Matrix.** "Mock" means the verification instance can drive the harness with
  the mock model; the others need their real CLI and vendor credentials. Test
  columns name one journey test per harness; "—" means none exists yet.
-@@ -628,6 +637,11 @@ Cross-harness journeys:
+@@ -773,6 +782,11 @@ Cross-harness journeys:
    After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
    prompt must remain a separate user turn outside the assistant's folded work,
    including after reload. This browser contract does not launch the Claude CLI.
@@ -121,7 +121,7 @@ index c93eeda2d4cc440f5e03e11a856c4cf87296c855..2107d28aebb8a4b3508ea3f6f1362157
    [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
    real CLI catalog regression and recorded browser journey across both
 diff --git a/omnigent/harnesses/codex_native/forwarder.py b/omnigent/harnesses/codex_native/forwarder.py
-index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c92bb151b 100644
+index 5b07ae7ffc7258d5a6befbe6dadc144af7945b34..554896dc990ced21b65589422b54b45881930486 100644
 --- a/omnigent/harnesses/codex_native/forwarder.py
 +++ b/omnigent/harnesses/codex_native/forwarder.py
 @@ -8,6 +8,7 @@ import hashlib
@@ -131,17 +131,17 @@ index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c
 +import shlex
  import urllib.error
  import urllib.request
- from collections.abc import AsyncIterator, Callable
-@@ -530,6 +531,8 @@ class _CodexForwarderState:
-     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
-     posted_user_turns: set[str] = field(default_factory=set)
+ from collections import deque
+@@ -565,6 +566,8 @@ class _CodexForwarderState:
+     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
+     resume_echo_thread_ids: set[str] = field(default_factory=set)
      posted_tool_calls: set[str] = field(default_factory=set)
 +    # User shell commands whose input was mirrored at item start.
 +    started_user_shell_items: set[str] = field(default_factory=set)
      partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
      _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
      completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
-@@ -3174,6 +3177,10 @@ async def _handle_event(
+@@ -3354,6 +3357,10 @@ async def _handle_event(
              # ``item/completed`` guard below remains the backstop for the
              # resume-backfill path, which replays only ``item/completed``.
              await _ensure_user_message_posted(client, route_session_id, params, event_state)
@@ -152,7 +152,7 @@ index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c
          elif isinstance(item, dict) and item.get("type") == "commandExecution":
              call_id = await _post_tool_call_item(client, route_session_id, params, item)
              if call_id is not None and event_state is not None:
-@@ -4018,6 +4025,10 @@ async def _maybe_handle_delta_event(
+@@ -4198,6 +4205,10 @@ async def _maybe_handle_delta_event(
          if not isinstance(delta, str):
              _logger.warning("Codex command output delta missing string delta: call_id=%s", call_id)
              return True
@@ -163,7 +163,7 @@ index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c
          turn_id = _turn_id_from_payload(params)
          if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
              _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
-@@ -4512,7 +4523,11 @@ def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
+@@ -4695,7 +4706,11 @@ def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
      if not isinstance(item, dict):
          return False
      item_type = item.get("type")
@@ -176,7 +176,7 @@ index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c
  
  
  async def _post_mcp_startup(
-@@ -5411,6 +5426,16 @@ async def _handle_completed_item_inner(
+@@ -5603,6 +5618,16 @@ async def _handle_completed_item_inner(
      if item_type == "plan":
          await _post_plan_item(client, session_id, params, item, source_id=source_id)
          return
@@ -193,7 +193,7 @@ index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c
      if item_type in _REVIEW_MODE_ITEM_TYPES:
          await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
          return
-@@ -6483,6 +6508,111 @@ async def _post_tool_call_item(
+@@ -6680,6 +6705,111 @@ async def _post_tool_call_item(
      return tool_call.call_id if posted else None
  
  
@@ -306,10 +306,10 @@ index 44b38dae4641681b283c50080075296e45a18e7d..78f53850558f2dadfa1afc23e8c3ae7c
      client: httpx.AsyncClient,
      session_id: str,
 diff --git a/omnigent/inner/codex_native_executor.py b/omnigent/inner/codex_native_executor.py
-index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41463fb057 100644
+index ad010f59839f9ded373fed06ccdd7c291554f231..825416f65503b9ddbebaca48854c62a7e1bcb0d1 100644
 --- a/omnigent/inner/codex_native_executor.py
 +++ b/omnigent/inner/codex_native_executor.py
-@@ -215,9 +215,17 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
+@@ -221,9 +221,17 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
                  await client.close()
  
  
@@ -328,7 +328,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
      params: CodexParams,
      state: CodexNativeBridgeState,
      *,
-@@ -235,7 +243,7 @@ async def _native_delivery_request(
+@@ -241,7 +249,7 @@ async def _native_delivery_request(
              session_id=state.session_id,
              thread_id=state.thread_id,
              requested_native_turn_id=state.active_turn_id,
@@ -337,7 +337,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
              outcome="server_draining",
              rpc_error_code=error.code,
          )
-@@ -266,13 +274,13 @@ async def _native_delivery_request(
+@@ -272,13 +280,13 @@ async def _native_delivery_request(
  
  async def _native_delivery_request_once(
      client: CodexAppServerClient,
@@ -353,7 +353,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
      expected = params.get("expectedTurnId") if method == "turn/steer" else None
      requested_turn_id = expected if isinstance(expected, str) else None
      requested_thread = params.get("threadId")
-@@ -318,6 +326,8 @@ async def _native_delivery_request_once(
+@@ -326,6 +334,8 @@ async def _native_delivery_request_once(
      else:
          turn_id = result.get("turnId") if result is not None else None
      native_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
@@ -362,7 +362,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
      log_input_event(
          _logger,
          "codex_native_delivery_finished",
-@@ -327,7 +337,7 @@ async def _native_delivery_request_once(
+@@ -335,7 +345,7 @@ async def _native_delivery_request_once(
          thread_id=thread_id,
          requested_native_turn_id=requested_turn_id,
          native_turn_id=native_turn_id,
@@ -371,7 +371,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
      )
      return response
  
-@@ -437,6 +447,24 @@ async def _steer_codex_turn(
+@@ -445,6 +455,24 @@ async def _steer_codex_turn(
          _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
  
  
@@ -396,7 +396,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
  async def _inject_codex_turn(
      client: CodexAppServerClient,
      *,
-@@ -648,13 +676,19 @@ class CodexNativeExecutor(Executor):
+@@ -656,13 +684,19 @@ class CodexNativeExecutor(Executor):
              if client is None:
                  return False
              try:
@@ -423,7 +423,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
              except Exception as exc:
                  ambiguous = isinstance(exc, InjectionDeliveryAmbiguous)
                  _logger.warning(
-@@ -910,8 +944,20 @@ class CodexNativeExecutor(Executor):
+@@ -919,8 +953,20 @@ class CodexNativeExecutor(Executor):
                      undelivered = True
                  else:
                      try:
@@ -445,7 +445,7 @@ index 865420e5fcde4ff0bc980b88380afd7eb6d9e87f..a0aea841688329bdac2298550adafc41
                              # /side opens an ephemeral fork as its own sub-agent chat.
                              # The fork must happen on the forwarder's connection —
                              # it owns the fork's event stream, while this client
-@@ -1089,6 +1135,25 @@ def _latest_user_content(messages: list[Message]) -> object:
+@@ -1104,6 +1150,25 @@ def _latest_user_content(messages: list[Message]) -> object:
      return None
  
  
@@ -621,10 +621,10 @@ index 0000000000000000000000000000000000000000..3f7c97e34cf145505f7773fc11d1a7a4
 +        # The shell commands never reached the model as prompts.
 +        assert page.locator(_ASSISTANT, has_text="Please run:").count() == 1
 diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
-index 05ae55fb2d18aa86a1a205e0185da3971ac363a8..a0b6f7368b15817297bea65673e903ffdb598229 100644
+index e739f243bff9c0dcdbc5d2e8d84e68f1db49aa81..52cd6fb56b5d21452190a13d81ab0c1a39411b5a 100644
 --- a/tests/harnesses/codex_native/test_codex_native.py
 +++ b/tests/harnesses/codex_native/test_codex_native.py
-@@ -6934,6 +6934,118 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path:
+@@ -6943,6 +6943,118 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path:
      }
  
  
@@ -744,10 +744,10 @@ index 05ae55fb2d18aa86a1a205e0185da3971ac363a8..a0b6f7368b15817297bea65673e903ff
      """
      A non-zero command exit is surfaced in the mirrored output.
 diff --git a/tests/inner/test_codex_native_executor.py b/tests/inner/test_codex_native_executor.py
-index 812dcf34777c3d19d0013dc33c176334047d97c6..0c81c51dba368be7db8ff6c63950b3ce2278d6da 100644
+index 5ac4779bcef223f3759a1e135eb040bfe0ab90dd..d5be35a9d8a09ab2edd07634a09d4bb2d3e05338 100644
 --- a/tests/inner/test_codex_native_executor.py
 +++ b/tests/inner/test_codex_native_executor.py
-@@ -975,6 +975,63 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
+@@ -1007,6 +1007,63 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
      ]
  
  
@@ -1004,10 +1004,10 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
    },
  );
 diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
-index b7670550805bf4f9d47d99e5fcf8324f50d15d3e..efe793260a1b39e028216e9fa4b044b77aa4336c 100644
+index 79c3f198ce018f1e22102f32088e19f8d49b995e..937aaf1cd484367b3ff1b633df69d165379b9ccc 100644
 --- a/web/src/components/blocks/BlockRenderer.tsx
 +++ b/web/src/components/blocks/BlockRenderer.tsx
-@@ -748,6 +748,7 @@ function renderItem(
+@@ -867,6 +867,7 @@ function renderItem(
            className={cn("min-w-0", followsText && "mt-2")}
          >
            <FilePathAwareMessageResponse
@@ -1016,7 +1016,7 @@ index b7670550805bf4f9d47d99e5fcf8324f50d15d3e..efe793260a1b39e028216e9fa4b044b7
              mode={isTextStreaming ? "streaming" : "static"}
            >
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index b6f15d20d83473e3769e872590a3a09310251d63..a4e12e3b0621be2ce056972b1f1b01a2cc8982c2 100644
+index 184db5481fe8bf2e116c25305c669eccd9a7551a..a21f66c05764942f4644fe80f8cac22581e9fb81 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
 @@ -11,13 +11,17 @@
@@ -1453,7 +1453,7 @@ index 0000000000000000000000000000000000000000..edf73abd8b759f2a25e89fd6b2a00bd9
 +  return text.includes("\n") ? null : bangCommand(text);
 +}
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e7754e375 100644
+index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854b3f21d22 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
 @@ -116,6 +116,7 @@ import {
@@ -1464,7 +1464,7 @@ index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e
  import { skillInvocationPrefix } from "@/lib/harnessSetup";
  import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
  import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-@@ -284,6 +285,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
+@@ -299,6 +300,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
  import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
  import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
  import { ConnectionIndicator } from "./ChatIndicators";
@@ -1472,7 +1472,7 @@ index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e
  import { Transcript } from "@/components/chat/Transcript";
  
  /** Server-info as consumers see it: the probe's result, or "loading". */
-@@ -991,6 +993,22 @@ export function ChatPage() {
+@@ -1042,6 +1044,22 @@ export function ChatPage() {
      ],
    );
  
@@ -1495,7 +1495,7 @@ index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e
    const onSendSlashCommand = useCallback(
      (name: string, args: string) => {
        if (!agentId) return;
-@@ -1167,6 +1185,7 @@ export function ChatPage() {
+@@ -1215,6 +1233,7 @@ export function ChatPage() {
        agentsError={agentsError}
        disabled={!agentId || agentsError !== null}
        onSend={onSend}
@@ -1503,7 +1503,7 @@ index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e
        onNewSession={openNewSession}
        onSendSlashCommand={onSendSlashCommand}
        onStop={onStop}
-@@ -1314,6 +1333,8 @@ interface MainAgentSurfaceProps {
+@@ -1364,6 +1383,8 @@ interface MainAgentSurfaceProps {
    agentsError: unknown;
    disabled: boolean;
    onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
@@ -1512,7 +1512,7 @@ index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e
    /**
     * Invoke a skill via the `slash_command` event path. Gated off inside
     * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
-@@ -1492,6 +1513,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1546,6 +1567,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
    agentsError,
    disabled,
    onSend,
@@ -1520,7 +1520,7 @@ index 7b95d5e7782b1c3481253fda6136f28cd50cef98..d669546a3f9a9d0631166ce973119e4e
    onSendSlashCommand,
    onNewSession,
    onStop,
-@@ -1775,21 +1797,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1831,21 +1853,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
            {/* The scrolling transcript column owns every streaming-hot store
            subscription and the bubble pipeline, so an SSE frame re-renders it
            alone — this surface's composer and chrome below bail out. */}

@@ -26,8 +26,9 @@ Docs: none (rebase and test coverage for the CLAUDE_CONFIG_DIR fix)
 ---
  .../test_claude_native_config_dir_profile.py  | 306 ++++++++++++++++++
  .../claude_native/test_claude_native.py       |  58 ++--
- .../test_claude_native_bridge.py              |  94 ++++--
- 3 files changed, 397 insertions(+), 61 deletions(-)
+ .../test_claude_native_bridge.py              |  96 ++++--
+ .../test_claude_native_daemon.py              |   3 +-
+ 4 files changed, 399 insertions(+), 64 deletions(-)
  create mode 100644 tests/e2e_ui/sessions/test_claude_native_config_dir_profile.py
 
 diff --git a/tests/e2e_ui/sessions/test_claude_native_config_dir_profile.py b/tests/e2e_ui/sessions/test_claude_native_config_dir_profile.py
@@ -343,11 +344,11 @@ index 0000000000000000000000000000000000000000..5b75972b122e589bfaadca4da3b2e6aa
 +    assert observed["settings_chain"] == "work", detail
 +    assert observed["status_bar"] == "work", detail
 diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
-index 21d831dc5afe5428eb5dbfa6c42b283cc6cdc79f..cbd4b425cfa94fab874b3b72907cf7e474af3d5d 100644
+index 18d06fd95e9bb291eb85d677947de71d1dc62f1d..51d7793723bcbe55a5194305ab83130712b15c20 100644
 --- a/tests/harnesses/claude_native/test_claude_native.py
 +++ b/tests/harnesses/claude_native/test_claude_native.py
-@@ -7656,6 +7656,37 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
-     assert not clone_project_dir.exists() or not any(clone_project_dir.iterdir())
+@@ -8221,6 +8221,37 @@ def test_copy_transcript_with_cwd_keeps_background_handles_for_the_same_session(
+     assert moved["cwd"] == str(tmp_path)
  
  
 +def test_find_claude_transcript_follows_claude_config_dir(
@@ -384,7 +385,7 @@ index 21d831dc5afe5428eb5dbfa6c42b283cc6cdc79f..cbd4b425cfa94fab874b3b72907cf7e4
  def test_clone_claude_transcript_repairs_stale_image_duplication(
      monkeypatch: pytest.MonkeyPatch,
      tmp_path: Path,
-@@ -12086,30 +12117,3 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
+@@ -12838,30 +12869,3 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
      dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
  
      assert claude_native.resolve_native_claude_config(spec=spec, refresh_models=False) is None
@@ -416,11 +417,20 @@ index 21d831dc5afe5428eb5dbfa6c42b283cc6cdc79f..cbd4b425cfa94fab874b3b72907cf7e4
 -        profile / "projects" / "-work-repo"
 -    )
 diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
-index 8c4632bcc988fcd81ef11be08651ab22125e4162..292eac59e83200ca384120d87aa1d7b6866e66a7 100644
+index 7c33c8e5e09ba083ee73b52a49d57b2bef726287..78454d1537df8bf6e60db8f6cf1c94575e7f7001 100644
 --- a/tests/harnesses/claude_native/test_claude_native_bridge.py
 +++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
-@@ -8114,6 +8114,48 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
-     assert claude_native_bridge.read_user_effort_level() is None
+@@ -8365,7 +8365,7 @@ def test_resolve_launch_effort_level_prefers_passed_effort(
+     """
+     settings = tmp_path / "settings.json"
+     settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+     assert claude_native_bridge.resolve_launch_effort_level(claude_args) == expected
+     invocation = _load_invocation_settings(augment_claude_args(claude_args, bridge_dir=tmp_path))
+     settings.unlink()
+@@ -8374,6 +8374,48 @@ def test_resolve_launch_effort_level_prefers_passed_effort(
+     assert invocation.get("effortLevel") == passed_effort
  
  
 +def _two_claude_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -468,7 +478,7 @@ index 8c4632bcc988fcd81ef11be08651ab22125e4162..292eac59e83200ca384120d87aa1d7b6
  # ---------------------------------------------------------------------------
  # launch_model storage and retrieval
  # ---------------------------------------------------------------------------
-@@ -9153,6 +9195,24 @@ def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
+@@ -9471,6 +9513,24 @@ def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
      assert claude_global_config_path(workspace, env) == Path(composed) / ".config.json"
  
  
@@ -493,10 +503,10 @@ index 8c4632bcc988fcd81ef11be08651ab22125e4162..292eac59e83200ca384120d87aa1d7b6
  def test_display_cost_approval_popup_builds_detached_tmux_command(
      tmp_path: Path,
      monkeypatch: pytest.MonkeyPatch,
-@@ -14478,37 +14538,3 @@ def test_hold_approval_wait_marker_refreshes_until_released(
-     settled = len(touches)
-     time.sleep(0.1)
-     assert len(touches) == settled, "the refresher must stop when the block exits"
+@@ -15262,37 +15322,3 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
+         with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
+             pytest.fail("delivery continued after a failed resize")
+     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
 -
 -
 -def test_ensure_trusted_writes_into_the_configured_claude_home(
@@ -531,3 +541,24 @@ index 8c4632bcc988fcd81ef11be08651ab22125e4162..292eac59e83200ca384120d87aa1d7b6
 -    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
 -
 -    assert claude_native_bridge.read_user_status_line_command() == "work-profile-hud"
+diff --git a/tests/harnesses/claude_native/test_claude_native_daemon.py b/tests/harnesses/claude_native/test_claude_native_daemon.py
+index b3f8804b81be58eb4ca0a2a2504cf88bf9066440..6156d73875a2d042bf6e1d094ab7d9535f9bdbd9 100644
+--- a/tests/harnesses/claude_native/test_claude_native_daemon.py
++++ b/tests/harnesses/claude_native/test_claude_native_daemon.py
+@@ -18,7 +18,6 @@ import click
+ import httpx
+ import pytest
+ 
+-from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+ from omnigent.harnesses.claude_native import main as claude_native
+ from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+ from omnigent.harnesses.codex_native import main as codex_native
+@@ -230,7 +229,7 @@ async def test_create_claude_session_stamps_passed_effort_over_settings(
+     """A pass-through ``--effort`` is the effort Claude runs at, so it is stamped."""
+     settings = tmp_path / "settings.json"
+     settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+     captured: dict[str, bytes] = {}
+ 
+     def handler(request: httpx.Request) -> httpx.Response:

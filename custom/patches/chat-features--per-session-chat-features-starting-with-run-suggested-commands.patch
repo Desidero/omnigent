@@ -63,8 +63,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  feature-map/preferences.md                    |  25 ++-
  omnigent/entities/conversation.py             |   5 +
  omnigent/harnesses/claude_native/bridge.py    |   7 +-
- omnigent/harnesses/claude_native/main.py      |  21 +-
- omnigent/harnesses/codex_native/main.py       |  18 +-
+ omnigent/harnesses/claude_native/main.py      |  22 +-
+ omnigent/harnesses/codex_native/main.py       |  22 +-
  omnigent/native/native_terminal.py            |  28 +++
  omnigent/preference_sync.py                   |   8 +-
  omnigent/preferences.py                       |  24 ++-
@@ -121,7 +121,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  web/src/lib/sharedPreferencesApi.ts           | 160 ++++++++++++++
  web/src/lib/types.ts                          |   5 +
  web/src/pages/ChatPage.composer.test.tsx      |  40 ++++
- web/src/pages/ChatPage.tsx                    |  36 +++-
+ web/src/pages/ChatPage.tsx                    |  41 +++-
  web/src/pages/SettingsPage.test.tsx           |   4 +
  web/src/pages/SettingsPage.tsx                |   2 +
  .../ChatFeaturesSettingsGroup.test.tsx        | 174 +++++++++++++++
@@ -134,7 +134,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  web/src/store/chatStore.ts                    |  34 +++
  web/src/store/conversationState.ts            |   3 +
  web/src/test/chatFeatureFixtures.ts           |  41 ++++
- 76 files changed, 3246 insertions(+), 86 deletions(-)
+ 76 files changed, 3254 insertions(+), 88 deletions(-)
  create mode 100644 omnigent/runtime/chat_features.py
  create mode 100644 tests/runner/test_session_init_protocol.py
  create mode 100644 tests/runtime/test_chat_features.py
@@ -216,7 +216,7 @@ index 7ff8d69aebf8d623c1664b9736861e10e8266d83..45a6f72ab09f5c369b6b5c7163a4a307
  and arbitrary plugin configuration are not supported preference keys.
  
 diff --git a/feature-map/preferences.md b/feature-map/preferences.md
-index d149a44dcc933b6ba6de50ccb35493e40af62162..13c94b2e95fdc41becd7378fea554f8f7dae0ec5 100644
+index 6b9f53256b86e0f76c6ac3cac1593cb99a7b8a10..5cea29cc0d1fdeb398d3fa5fb847208b89255306 100644
 --- a/feature-map/preferences.md
 +++ b/feature-map/preferences.md
 @@ -22,8 +22,11 @@ local; automatic client sync and shared/machine scope controls remain deferred.
@@ -232,7 +232,7 @@ index d149a44dcc933b6ba6de50ccb35493e40af62162..13c94b2e95fdc41becd7378fea554f8f
  
  - `configuration-copy`: review, save, show and import model defaults, harness
    selection/arguments and launcher plugin opt-outs; preserve local-only values.
-@@ -66,6 +69,13 @@ interactive launcher hook; OSS startup does not invoke it automatically. See the
+@@ -67,6 +70,13 @@ interactive launcher hook; OSS startup does not invoke it automatically. See the
  [configuration guide](../docs/cloud-configuration.md). Automatic prompting and
  plugin management by an external launcher require a separate integration.
  
@@ -246,7 +246,7 @@ index d149a44dcc933b6ba6de50ccb35493e40af62162..13c94b2e95fdc41becd7378fea554f8f
  **Shared scope controls:** the CLI and UI do not yet offer automatic following,
  saving machine overrides, removing a machine override,
  resolving conflicts, or continuing with temporary defaults. The API above can
-@@ -199,6 +209,19 @@ uv run --no-sync pytest tests/stores/test_preference_store.py \
+@@ -200,6 +210,19 @@ uv run --no-sync pytest tests/stores/test_preference_store.py \
    tests/server/routes/test_preferences.py tests/test_preference_sync.py --reruns 0 -q
  ```
  
@@ -267,7 +267,7 @@ index d149a44dcc933b6ba6de50ccb35493e40af62162..13c94b2e95fdc41becd7378fea554f8f
  pages, concurrent edits, limits, atomic rejection, and stable retry receipts.
  The [route matrix](../tests/server/routes/test_preferences.py) covers authenticated
 diff --git a/omnigent/entities/conversation.py b/omnigent/entities/conversation.py
-index 994d401427573199c0211835bffb73b17612429e..1c83ce192625680a2be1633b7edafabafb2caf2d 100644
+index 944da4b21438cf6d0b5fcc220b29a091a31dcdf8..962d984980218a6360b1b922c0f00a95e6485931 100644
 --- a/omnigent/entities/conversation.py
 +++ b/omnigent/entities/conversation.py
 @@ -136,6 +136,10 @@ class Conversation:
@@ -290,10 +290,10 @@ index 994d401427573199c0211835bffb73b17612429e..1c83ce192625680a2be1633b7edafaba
      task_summary: str | None = None
      external_session_id: str | None = None
 diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
-index b7dea0a5cf2787a74f7142556042c3651a677796..04bf63a1e42f34bb1378cab8269af37e5782f224 100644
+index 9b3ff59a2a13fe0fbe9eb53b0fa5d635a2c175aa..7696fbf9325a79b00374265975626f9243f1e72e 100644
 --- a/omnigent/harnesses/claude_native/bridge.py
 +++ b/omnigent/harnesses/claude_native/bridge.py
-@@ -2802,9 +2802,10 @@ def augment_claude_args(
+@@ -2824,9 +2824,10 @@ def augment_claude_args(
          / ``"none"`` / list of skill names), mapped to
          ``--setting-sources`` exactly as the SDK executor maps it onto
          ``setting_sources``. Defaults to ``"all"``.
@@ -308,18 +308,22 @@ index b7dea0a5cf2787a74f7142556042c3651a677796..04bf63a1e42f34bb1378cab8269af37e
          into ``--allowedTools`` without replacing the user's allowlist.
      :param subagent_router_dir: Directory advertising the runner's
 diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
-index da875ce713f9ac845d63077f9c621ace32abd991..c999a926a849950fd13ff9b0cb05bbd53f6a484f 100644
+index 5ea1eee2119c41329edcec7f75970b1d15c9a2fe..1c1ba57d8d2346e5b71a4c6ab98ca546f0dd0fe3 100644
 --- a/omnigent/harnesses/claude_native/main.py
 +++ b/omnigent/harnesses/claude_native/main.py
-@@ -149,6 +149,7 @@ from omnigent.native.native_terminal import (
+@@ -156,10 +156,10 @@ from omnigent.native.native_terminal import (
  from omnigent.native.native_terminal import (
      bind_session_runner as _bind_session_runner,
  )
-+from omnigent.native.native_terminal import fetch_session_chat_features
++from omnigent.native.native_terminal import fetch_session_chat_features, post_initial_prompt
  from omnigent.native.native_terminal import (
      normalize_extra_args as _normalize_extra_args,
  )
-@@ -3801,9 +3802,7 @@ def _run_with_local_server(
+-from omnigent.native.native_terminal import post_initial_prompt
+ from omnigent.native.native_terminal import (
+     request_with_429_retry as _request_with_429_retry,
+ )
+@@ -3918,9 +3918,7 @@ def _run_with_local_server(
                      claude_config=claude_config,
                      startup_profiler=startup_profiler,
                      startup_progress=progress,
@@ -330,7 +334,7 @@ index da875ce713f9ac845d63077f9c621ace32abd991..c999a926a849950fd13ff9b0cb05bbd5
                  )
              )
              _mark_startup_step(
-@@ -5115,7 +5114,7 @@ async def _prepare_claude_terminal(
+@@ -5248,7 +5246,7 @@ async def _prepare_claude_terminal(
      claude_config: ClaudeNativeUcodeConfig | None = None,
      startup_profiler: StartupProfiler | None = None,
      startup_progress: RunnerStartupProgress | None = None,
@@ -339,7 +343,7 @@ index da875ce713f9ac845d63077f9c621ace32abd991..c999a926a849950fd13ff9b0cb05bbd5
  ) -> PreparedClaudeTerminal:
      """
      Create/bind a session and launch its Claude terminal resource.
-@@ -5133,11 +5132,11 @@ async def _prepare_claude_terminal(
+@@ -5266,11 +5264,11 @@ async def _prepare_claude_terminal(
          marks. ``None`` disables output.
      :param startup_progress: Optional user-visible progress renderer,
          e.g. a handle from :func:`runner_startup_progress`.
@@ -356,7 +360,7 @@ index da875ce713f9ac845d63077f9c621ace32abd991..c999a926a849950fd13ff9b0cb05bbd5
      :returns: Prepared terminal details.
      :raises click.ClickException: If any server operation fails.
      """
-@@ -5287,7 +5286,9 @@ async def _prepare_claude_terminal(
+@@ -5421,7 +5419,9 @@ async def _prepare_claude_terminal(
              claude_config=claude_config_with_gateway_request_tags(
                  claude_config, session_id=session_id, labels=session_labels
              ),
@@ -368,18 +372,22 @@ index da875ce713f9ac845d63077f9c621ace32abd991..c999a926a849950fd13ff9b0cb05bbd5
          record_startup_event("terminal_available", session_id=session_id)
          _mark_startup_step(
 diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
-index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425895d34b6 100644
+index ac9394c98aef742446cd49a1eeaf891b984bb539..3b2614534add079368bbff312d63959fb9c47e26 100644
 --- a/omnigent/harnesses/codex_native/main.py
 +++ b/omnigent/harnesses/codex_native/main.py
-@@ -101,13 +101,14 @@ from omnigent.native.native_terminal import (
+@@ -101,13 +101,18 @@ from omnigent.native.native_terminal import (
  from omnigent.native.native_terminal import (
      bind_session_runner as _bind_session_runner,
  )
-+from omnigent.native.native_terminal import fetch_session_chat_features, request_with_429_retry
++from omnigent.native.native_terminal import (
++    fetch_session_chat_features,
++    post_initial_prompt,
++    request_with_429_retry,
++)
  from omnigent.native.native_terminal import (
      normalize_extra_args as _normalize_extra_args,
  )
--from omnigent.native.native_terminal import request_with_429_retry
+-from omnigent.native.native_terminal import post_initial_prompt, request_with_429_retry
  from omnigent.native.native_terminal import (
      terminal_attach_url as _attach_url,
  )
@@ -387,7 +395,7 @@ index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425
  from omnigent.runtime.prompt import native_startup_instructions
  from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
  from omnigent.util.http_retry import jittered_retry_delay
-@@ -744,9 +745,7 @@ def _run_with_local_server(
+@@ -744,9 +749,7 @@ def _run_with_local_server(
                      command=command,
                      model=model,
                      startup_progress=progress,
@@ -398,7 +406,7 @@ index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425
                  )
              if resolved_session_id is None:
                  _record_launch_for_fresh_session(prepared.session_id)
-@@ -1162,7 +1161,7 @@ async def _prepare_codex_terminal(
+@@ -1119,7 +1122,7 @@ async def _prepare_codex_terminal(
      command: str,
      model: str | None,
      startup_progress: RunnerStartupProgress | None = None,
@@ -407,7 +415,7 @@ index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425
  ) -> PreparedCodexTerminal:
      """
      Create/bind a session, start app-server, and launch Codex TUI.
-@@ -1177,8 +1176,8 @@ async def _prepare_codex_terminal(
+@@ -1134,8 +1137,8 @@ async def _prepare_codex_terminal(
      :param model: Optional model id.
      :param startup_progress: Optional user-visible progress renderer,
          e.g. a handle from :func:`runner_startup_progress`.
@@ -418,7 +426,7 @@ index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425
          Codex's private per-session config, applied on fresh launch and
          cold resume only — the reattach branch below returns before this
          is used, so it never relaunches or duplicates the value.
-@@ -1192,12 +1191,14 @@ async def _prepare_codex_terminal(
+@@ -1149,12 +1152,14 @@ async def _prepare_codex_terminal(
          thread_id: str | None = None
          # A new session carries only internal labels, so it tags just the session id.
          session_labels: dict[str, str] = {}
@@ -433,7 +441,7 @@ index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425
          else:
              _update_startup_progress(startup_progress, "Loading Codex session...")
              payload = await _fetch_codex_session(client, session_id)
-@@ -1211,6 +1212,7 @@ async def _prepare_codex_terminal(
+@@ -1168,6 +1173,7 @@ async def _prepare_codex_terminal(
                  )
              bridge_id = str(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
              session_labels = {str(key): str(value) for key, value in labels.items()}
@@ -441,7 +449,7 @@ index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425
              existing_terminal = await _find_running_codex_terminal(client, session_id)
              external_session_id = payload.get("external_session_id")
              thread_id = external_session_id if isinstance(external_session_id, str) else None
-@@ -1288,7 +1290,7 @@ async def _prepare_codex_terminal(
+@@ -1245,7 +1251,7 @@ async def _prepare_codex_terminal(
              bridge_dir=bridge_dir,
              ap_server_url=base_url,
              ap_auth_headers=headers,
@@ -451,7 +459,7 @@ index ea9b0cd102811ff7095cfc4d4f363645ef37eff2..d6b62d612933b6749f107721979a2425
              session_labels=session_labels,
          )
 diff --git a/omnigent/native/native_terminal.py b/omnigent/native/native_terminal.py
-index f810d8b72dc09b560570c0fbcd0a55082509701e..48c16ab6dfb630eed05ec1b05dc1fe5a706fcb18 100644
+index dbb220911284746057e30f19b2d6d984c088269e..6d54778392e0a440974f4ae476661ba987a7f512 100644
 --- a/omnigent/native/native_terminal.py
 +++ b/omnigent/native/native_terminal.py
 @@ -11,6 +11,11 @@ import click
@@ -466,7 +474,7 @@ index f810d8b72dc09b560570c0fbcd0a55082509701e..48c16ab6dfb630eed05ec1b05dc1fe5a
  from omnigent.util.http_retry import bounded_retry_after_seconds
  
  DAEMON_HOST_ONLINE_TIMEOUT_S = 30.0
-@@ -121,6 +126,29 @@ def terminal_attach_url(base_url: str, session_id: str, terminal_id: str) -> str
+@@ -178,6 +183,29 @@ def terminal_attach_url(base_url: str, session_id: str, terminal_id: str) -> str
      return urllib.parse.urlunsplit((scheme, parsed.netloc, path, "", ""))
  
  
@@ -586,10 +594,10 @@ index 97160f0feb0ee6da8db2511c1e80b34af93b530f..8ed73fd8fe32d9917da3c41784132dcd
  
      def with_value(self, key: PreferenceKey, value: PreferenceValue) -> PreferenceLayer:
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd7b3923e8 100644
+index b40a3fcc4168b64b7788539e9cbfac1b15b74c98..ec6602f1f1a5392b9f8f38a71eb753da90d35196 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
-@@ -199,6 +199,11 @@ from omnigent.runner.subagent_work import (
+@@ -198,6 +198,11 @@ from omnigent.runner.subagent_work import (
      unregister_subagent_work_for_session,
      wrapper_label_from_labels,
  )
@@ -601,8 +609,8 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
  from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
  from omnigent.runtime.prompt import (
      build_instructions,
-@@ -461,6 +466,25 @@ def _input_stable_id(source: Mapping[str, object]) -> str | None:
-     return validated if isinstance(validated, str) else None
+@@ -460,6 +465,25 @@ def _input_identity(source: Mapping[str, object]) -> dict[str, str | int]:
+     )
  
  
 +def _resolve_turn_chat_features(
@@ -627,7 +635,7 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
  def _response_body_preview(resp: object, *, limit: int = 500) -> str:
      """
      Return a short response-body preview for diagnostics.
-@@ -1285,6 +1309,9 @@ def create_runner_app(
+@@ -1283,6 +1307,9 @@ def create_runner_app(
      # snapshot and updated by ``effort_change``. In-process harnesses learn the
      # effort only from the forwarded turn body, which is built field by field.
      _session_reasoning_effort: dict[str, str] = {}
@@ -637,7 +645,7 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
      _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
      _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
      _session_cursor_model_names: dict[str, dict[str, str]] = {}
-@@ -2148,6 +2175,7 @@ def create_runner_app(
+@@ -2195,6 +2222,7 @@ def create_runner_app(
              _session_sub_agent_names[session_id] = envelope.sub_agent_name
          if snapshot.reasoning_effort:
              _session_reasoning_effort[session_id] = snapshot.reasoning_effort
@@ -645,7 +653,7 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
          _session_init_envelopes[session_id] = (time.monotonic(), envelope)
          return _SessionInitContext(envelope=envelope)
  
-@@ -3481,6 +3509,7 @@ def create_runner_app(
+@@ -3528,6 +3556,7 @@ def create_runner_app(
          _session_snapshot_locks.pop(session_id, None)
          _session_init_envelopes.pop(session_id, None)
          _session_reasoning_effort.pop(session_id, None)
@@ -653,7 +661,7 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
          _session_spec_locks.pop(session_id, None)
          _session_fs_registries.pop(session_id, None)
          _session_agent_ids.pop(session_id, None)
-@@ -4947,6 +4976,15 @@ def create_runner_app(
+@@ -5035,6 +5064,15 @@ def create_runner_app(
                  if _active_turns.get(conv) is _own_task and _own_task is not None:
                      _on_proxy_stream_end(conv)
  
@@ -669,7 +677,7 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
      def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
          """Reasoning block to forward on a turn, or ``None`` when unset.
  
-@@ -5070,15 +5108,20 @@ def create_runner_app(
+@@ -5158,15 +5196,20 @@ def create_runner_app(
              )
              # Gated harnesses use nullable to avoid the fallback literal.
              _authored_bg = raw_author_instructions(cached_spec) is not None
@@ -691,7 +699,7 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
                  )
              # Warn once per (conversation, harness, delivery) if the agent has
              # authored instructions but the harness can't deliver them.
-@@ -5750,10 +5793,14 @@ def create_runner_app(
+@@ -5838,10 +5881,14 @@ def create_runner_app(
                      if _instr_spec_ds is not None:
                          _per_req_instr = cast(str | None, body.get("instructions"))
                          _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
@@ -707,7 +715,7 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
                              ),
                          )
                          # Gated harnesses get nullable — skip the fallback literal.
-@@ -5765,7 +5812,10 @@ def create_runner_app(
+@@ -5853,7 +5900,10 @@ def create_runner_app(
                              _instr_body = {
                                  **body,
                                  "instructions": build_instructions(
@@ -720,10 +728,10 @@ index 206dfaec2938d58546d9e6758190465e615d4551..7ada3b1b03cba783b816b147d0de24cd
                              }
                          if _authored_ds and harness_name:
 diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3629a81ca 100644
+index 13f855645ef6d4b921dfcf5f15b0f7d3d8fcc66b..69f3416d35f26309486dc0cc60bf771591fa39ff 100644
 --- a/omnigent/runner/native/orchestration.py
 +++ b/omnigent/runner/native/orchestration.py
-@@ -96,6 +96,11 @@ from omnigent.runner.session_init_protocol import (
+@@ -103,6 +103,11 @@ from omnigent.runner.session_init_protocol import (
      RunnerSessionInitEnvelope,
  )
  from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
@@ -735,7 +743,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
  from omnigent.runtime.prompt import native_startup_instructions
  from omnigent.spec.types import AgentSpec
  
-@@ -652,6 +657,8 @@ class _CodexNativeLaunchConfig:
+@@ -665,6 +670,8 @@ class _CodexNativeLaunchConfig:
          session's id here. ``None`` when unlabelled: the bridge is then keyed
          by the session id.
      :param labels: The session's labels, for the Unity Gateway request tags.
@@ -744,7 +752,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
      """
  
      workspace: Path
-@@ -669,6 +676,7 @@ class _CodexNativeLaunchConfig:
+@@ -682,6 +689,7 @@ class _CodexNativeLaunchConfig:
      reasoning_effort: str | None = None
      bridge_id: str | None = None
      labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
@@ -752,7 +760,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
  
  
  @dataclasses.dataclass(frozen=True)
-@@ -1362,12 +1370,14 @@ async def _codex_native_launch_config(
+@@ -1384,12 +1392,14 @@ async def _codex_native_launch_config(
      # Only explicit values, including nulls, replace the legacy config read.
      if session_init is not None and launch_fields <= session_init.snapshot.model_fields_set:
          snapshot = session_init.snapshot.model_dump(mode="json")
@@ -767,7 +775,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
      terminal_launch_args = snapshot.get("terminal_launch_args")
      if terminal_launch_args is not None and not (
          isinstance(terminal_launch_args, list)
-@@ -1481,6 +1491,7 @@ async def _codex_native_launch_config(
+@@ -1503,6 +1513,7 @@ async def _codex_native_launch_config(
              if isinstance(labels, dict)
              else {}
          ),
@@ -775,7 +783,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
      )
  
  
-@@ -5589,7 +5600,8 @@ async def _auto_create_codex_terminal(
+@@ -5623,7 +5634,8 @@ async def _auto_create_codex_terminal(
              x
              for x in [
                  native_startup_instructions(
@@ -785,7 +793,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
                  ),
                  _codex_routing_note,
              ]
-@@ -7468,6 +7480,20 @@ def _claude_native_pinned_provider(agent_spec: AgentSpec | ResolvedSpec | None)
+@@ -7502,6 +7514,20 @@ def _claude_native_pinned_provider(agent_spec: AgentSpec | ResolvedSpec | None)
      return auth.name if isinstance(auth, ProviderAuth) else None
  
  
@@ -806,7 +814,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
  def _native_startup_raw_instructions_from_spec(
      agent_spec: AgentSpec | ResolvedSpec | None,
  ) -> str | None:
-@@ -8437,6 +8463,7 @@ class _ClaudeSessionLaunchMetadata:
+@@ -8609,6 +8635,7 @@ class _ClaudeSessionLaunchMetadata:
      fork_carry_history: bool = False
      #: The session's labels, for the Unity Gateway request tags.
      labels: Mapping[str, str] = dataclasses.field(default_factory=dict)
@@ -814,7 +822,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
      #: Both routing fields come from ``routing_class_from_snapshot``, so an
      #: auto-harness session always reads as routing-enabled too. Deriving them
      #: separately was the bug: a sub-agent child of a routed parent carries the
-@@ -8485,6 +8512,7 @@ def _claude_launch_metadata_from_envelope(
+@@ -8657,6 +8684,7 @@ def _claude_launch_metadata_from_envelope(
          ),
          fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
          labels=dict(snapshot.labels),
@@ -822,7 +830,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
      )
  
  
-@@ -8552,6 +8580,7 @@ async def _load_legacy_claude_launch_metadata(
+@@ -8724,6 +8752,7 @@ async def _load_legacy_claude_launch_metadata(
          ),
          fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
          labels={str(key): str(value) for key, value in labels.items()},
@@ -830,7 +838,7 @@ index 38a4e1e793a830a986607ea79fdf3a777be73cbb..a4daa55cb8cb16c361906e9d2437b1a3
      )
      permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
      _logger.info(
-@@ -9376,7 +9405,8 @@ async def _auto_create_claude_terminal(
+@@ -9572,7 +9601,8 @@ async def _auto_create_claude_terminal(
              x
              for x in [
                  native_startup_instructions(
@@ -1015,7 +1023,7 @@ index 0000000000000000000000000000000000000000..710ff7adac29e89c39d843a4c021732a
 +def _known_features(keys: Iterable[str]) -> frozenset[ChatFeature]:
 +    return frozenset(ChatFeature(key) for key in (k.strip() for k in keys) if key in _KNOWN_KEYS)
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index 235052c0f4f38e737161316e92a3e96189647343..1200e8e8881603d07bba5905193002782ea692a8 100644
+index 4fc12c419968d46c45045330d35bf504c7740799..4e8feb6655dcdc6407a5ab0192e1b40ca8a17915 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
 @@ -4,7 +4,7 @@ from __future__ import annotations
@@ -1114,10 +1122,10 @@ index 235052c0f4f38e737161316e92a3e96189647343..1200e8e8881603d07bba590519300278
  
  
 diff --git a/omnigent/server/app.py b/omnigent/server/app.py
-index ee8ef071b6bd4d9fa627e6317c89d066f01ee799..3c8fc3460fe0fb6286be99d16921015839739883 100644
+index 21d895d9bea9c11aabdcc125ca834561ed7fb51d..2934231932e10a87c70d47be6769d5e087ba7f3e 100644
 --- a/omnigent/server/app.py
 +++ b/omnigent/server/app.py
-@@ -113,7 +113,10 @@ from omnigent.server.routes.extensions import create_extensions_router
+@@ -126,7 +126,10 @@ from omnigent.server.routes.extensions import create_extensions_router
  from omnigent.server.routes.harnesses import create_harnesses_router
  from omnigent.server.routes.imports import create_imports_router
  from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -1129,7 +1137,7 @@ index ee8ef071b6bd4d9fa627e6317c89d066f01ee799..3c8fc3460fe0fb6286be99d169210158
  from omnigent.server.routes.projects import create_projects_router
  from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
  from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
-@@ -2032,6 +2035,8 @@ def create_app(
+@@ -2178,6 +2181,8 @@ def create_app(
      )
      app.state.startup_inputs = startup_inputs
      app.state.host_store = host_store
@@ -1138,7 +1146,7 @@ index ee8ef071b6bd4d9fa627e6317c89d066f01ee799..3c8fc3460fe0fb6286be99d169210158
      app.state.mcp_gateway_backend = mcp_gateway_backend
      app.state.mcp_registry = mcp_registry
      app.state.mcp_registry_auth = auth_provider
-@@ -3512,6 +3517,7 @@ def create_app(
+@@ -3668,6 +3673,7 @@ def create_app(
              project_store=project_store,
              host_registry=host_registry,
              host_store=host_store,
@@ -1146,7 +1154,7 @@ index ee8ef071b6bd4d9fa627e6317c89d066f01ee799..3c8fc3460fe0fb6286be99d169210158
          ),
          prefix="/v1",
          tags=["imports"],
-@@ -3686,6 +3692,11 @@ def create_app(
+@@ -3844,6 +3850,11 @@ def create_app(
              prefix="/v1",
              tags=["preferences"],
          )
@@ -1159,10 +1167,10 @@ index ee8ef071b6bd4d9fa627e6317c89d066f01ee799..3c8fc3460fe0fb6286be99d169210158
      # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
  
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05a07773d1 100644
+index 19273f386102ca8fb036f8329fc0b3a206dd2a70..9868e944f6a0190dee055c9dcd6a631add5446ff 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -98,6 +98,7 @@ from omnigent.runner.identity import (
+@@ -100,6 +100,7 @@ from omnigent.runner.identity import (
  )
  from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
  from omnigent.runner.routing import RunnerRouter
@@ -1170,15 +1178,15 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
  from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
  from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
  from omnigent.runtime import (
-@@ -107,6 +108,7 @@ from omnigent.runtime import (
+@@ -109,6 +110,7 @@ from omnigent.runtime import (
      pending_inputs,
  )
  from omnigent.runtime.agent_cache import AgentCache
 +from omnigent.runtime.chat_features import encode_chat_features, parse_chat_features
  from omnigent.runtime.policies.engine import PolicyEngine
  from omnigent.runtime.tool_output import cap_tool_output
- from omnigent.server import presence, session_live_state, shutdown_state
-@@ -3731,6 +3733,7 @@ async def _persist_external_acp_subagent_start(
+ from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
+@@ -3767,6 +3769,7 @@ async def _persist_external_acp_subagent_start(
              agent_id=parent_conv.agent_id,
              runner_id=parent_conv.runner_id,
              sub_agent_name=title_raw,
@@ -1186,7 +1194,7 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
          )
      except NameAlreadyExistsError:
          # The unique index fired but the label lookup missed — a concurrent POST
-@@ -3979,6 +3982,7 @@ async def _persist_external_subagent_start(
+@@ -4016,6 +4019,7 @@ async def _persist_external_subagent_start(
              agent_id=parent_conv.agent_id,
              runner_id=parent_conv.runner_id,
              sub_agent_name=agent_type,
@@ -1194,7 +1202,7 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
          )
      except NameAlreadyExistsError:
          # The (parent, title) unique index fired: the row already exists
-@@ -4101,6 +4105,7 @@ async def _create_and_publish_antigravity_child(
+@@ -4138,6 +4142,7 @@ async def _create_and_publish_antigravity_child(
              agent_id=parent_conv.agent_id,
              runner_id=parent_conv.runner_id,
              sub_agent_name=agent_type or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
@@ -1202,15 +1210,15 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
          )
      except NameAlreadyExistsError:
          # The (parent, title) unique index fired: a concurrent start, or a
-@@ -4381,6 +4386,7 @@ async def _create_and_publish_codex_child(
-             agent_id=parent_conv.agent_id,
-             runner_id=parent_conv.runner_id,
-             sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+@@ -4425,6 +4430,7 @@ async def _create_and_publish_codex_child(
+                 else None
+             ),
+             reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
 +            chat_features_override=parent_conv.chat_features_override,
          )
      except NameAlreadyExistsError:
          # A concurrent POST (or a retry that arrived before set_labels ran)
-@@ -4509,6 +4515,7 @@ async def _create_and_publish_devin_child(
+@@ -4553,6 +4559,7 @@ async def _create_and_publish_devin_child(
              agent_id=parent_conv.agent_id,
              runner_id=parent_conv.runner_id,
              sub_agent_name=_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
@@ -1218,7 +1226,7 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
          )
      except NameAlreadyExistsError:
          existing = await asyncio.to_thread(
-@@ -7969,6 +7976,7 @@ async def _dispatch_skill_slash_command_to_runner(
+@@ -8214,6 +8221,7 @@ async def _dispatch_skill_slash_command_to_runner(
      # time and never forwarded verbatim.
      if conv.harness_override is not None and conv.harness_override != "auto":
          runner_body["harness_override"] = conv.harness_override
@@ -1226,7 +1234,7 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
  
      try:
          await runner_client.post(
-@@ -10735,6 +10743,13 @@ def _require_cost_control_label_authority(
+@@ -10991,6 +10999,13 @@ def _require_cost_control_label_authority(
      )
  
  
@@ -1240,7 +1248,7 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
  def _persist_stored_session_bundle(
      conversation_store: ConversationStore,
      artifact_store: ArtifactStore,
-@@ -10794,6 +10809,7 @@ def _persist_stored_session_bundle(
+@@ -11050,6 +11065,7 @@ def _persist_stored_session_bundle(
              project_id=metadata.project_id,
              host_id=metadata.host_id,
              created_by=created_by,
@@ -1248,7 +1256,7 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
              **inference_kwargs,
          )
      except ConversationNotFoundError as exc:
-@@ -10874,6 +10890,7 @@ def _persist_session_for_uploaded_agent(
+@@ -11130,6 +11146,7 @@ def _persist_session_for_uploaded_agent(
              labels=metadata.labels,
              reasoning_effort=metadata.reasoning_effort,
              model_override=inference_model,
@@ -1257,10 +1265,10 @@ index 4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d..4bf8ab8907f2101c2cf84363e1077b05
      except IntegrityError as exc:
          raise OmnigentError(
 diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
-index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa706466247821a5ebef 100644
+index 8f356e0b76a11cf02ca2e2273929c55e2010c157..0e19aa18d773c85a0a02dfe909bba8710d8756df 100644
 --- a/omnigent/server/routes/_sessions/orchestration.py
 +++ b/omnigent/server/routes/_sessions/orchestration.py
-@@ -96,7 +96,10 @@ from omnigent.runner.mcp_execution_registry import (
+@@ -97,7 +97,10 @@ from omnigent.runner.mcp_execution_registry import (
      RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
  )
  from omnigent.runner.routing import RunnerRouter
@@ -1272,7 +1280,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
  from omnigent.runner.subagent_routing import (
      ROUTING_DECISION_LABEL_KEY,
      auto_harness_session,
-@@ -112,6 +115,7 @@ from omnigent.runtime import (
+@@ -113,6 +116,7 @@ from omnigent.runtime import (
      pending_inputs,
  )
  from omnigent.runtime.agent_cache import AgentCache
@@ -1280,7 +1288,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
  from omnigent.runtime.policies.approval import (
      build_elicitation_request_event,
      resolve_ask_timeout,
-@@ -365,6 +369,10 @@ from omnigent.server.routes._sessions.helpers import (
+@@ -369,6 +373,10 @@ from omnigent.server.routes._sessions.helpers import (
      _wait_for_managed_runner_tunnel,
      _wait_for_runner_client,
  )
@@ -1291,7 +1299,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
  from omnigent.server.runner_session_init import RunnerSessionInitializer
  from omnigent.server.schemas import (
      BackgroundTaskInfo,
-@@ -1506,6 +1514,7 @@ def _build_session_response(
+@@ -1533,6 +1541,7 @@ def _build_session_response(
          cost_control_mode_override=conv.cost_control_mode_override,
          subagent_routing_override=conv.subagent_routing_override,
          share_workspace_files=conv.share_workspace_files,
@@ -1299,7 +1307,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
          context_window=context_window,
          last_total_tokens=last_total_tokens,
          # Seed the client's cost indicator on resume. Uses the SUBTREE
-@@ -7370,6 +7379,8 @@ async def _forward_event_to_runner(
+@@ -7436,6 +7445,8 @@ async def _forward_event_to_runner(
      # raw dict (extra keys ignored) and the value never changes after create.
      if conv.reasoning_effort is not None:
          runner_body["reasoning"] = {"effort": conv.reasoning_effort}
@@ -1308,7 +1316,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
      # Per-session brain-harness override — create-time only, so no
      # per-event value exists; the persisted column is the source.
      # _routed_harness is non-None when the child routing path resolved one
-@@ -11371,6 +11382,11 @@ async def _create_session_from_existing_agent(
+@@ -11470,6 +11481,11 @@ async def _create_session_from_existing_agent(
      subagent_routing_override = _validated_subagent_routing_override(
          body.subagent_routing_override
      )
@@ -1320,7 +1328,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
  
      # A child of an auto-harness parent whose subagent-routing switch is on is
      # routed regardless of the harness/model the orchestrator chose: force the
-@@ -11843,6 +11859,18 @@ async def _create_session_from_existing_agent(
+@@ -11944,6 +11960,18 @@ async def _create_session_from_existing_agent(
              agent_for_user, agent_store, artifact_store, agent, user_id
          )
  
@@ -1339,7 +1347,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
      try:
          # Include spec-seeded defaults before create; overflow must not leave a session.
          encode_session_overrides(
-@@ -11853,6 +11881,7 @@ async def _create_session_from_existing_agent(
+@@ -11954,6 +11982,7 @@ async def _create_session_from_existing_agent(
                  "subagent_routing_override": subagent_routing_override,
                  "harness_override": harness_override,
                  "provider_override": provider_override,
@@ -1347,7 +1355,7 @@ index 49dbef34ad586c38f97af3b5f115f4703e573932..7123d1ff7afa5bfa1651fa7064662478
              }
          )
          with creation_stage("create_persistence_ms"):
-@@ -11875,6 +11904,7 @@ async def _create_session_from_existing_agent(
+@@ -11976,6 +12005,7 @@ async def _create_session_from_existing_agent(
                  subagent_routing_override=subagent_routing_override,
                  harness_override=harness_override,
                  provider_override=provider_override,
@@ -1583,18 +1591,18 @@ index ddf4951555e57a06bedcc6475d5baac519dadf86..5449a7a0bb04b66a11cdb2127a3eff8c
 +
 +    return router
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index 352ddb805781fefe599429e8c5e91b8e4470b4aa..417f4e61c0d19521289418bdfda85e5e6558991e 100644
+index d72041855bb333d75c67089307d8fe98710c9fcf..1f549659e61ce673017f6169effaa9c751bf69c1 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -52,6 +52,7 @@ from omnigent.runtime import (
+@@ -59,6 +59,7 @@ from omnigent.runtime import (
      user_session_stream,
  )
  from omnigent.runtime.agent_cache import AgentCache
 +from omnigent.runtime.chat_features import encode_chat_features, ordered_chat_features
  from omnigent.runtime.policies.approval import _ELICITATION_MODE
+ from omnigent.server import session_pull_requests as server_prs
  from omnigent.server._elicitation_registry import (
-     _harness_elicitation_owners,
-@@ -186,6 +187,10 @@ from omnigent.server.routes._sessions.orchestration import (
+@@ -198,6 +199,10 @@ from omnigent.server.routes._sessions.orchestration import (
      _validate_session_model_selection,
      ensure_runner_connected,
  )
@@ -1605,7 +1613,7 @@ index 352ddb805781fefe599429e8c5e91b8e4470b4aa..417f4e61c0d19521289418bdfda85e5e
  from omnigent.server.schemas import (
      AutomaticSessionRenameRequest,
      AutomaticSessionRenameResponse,
-@@ -1218,6 +1223,22 @@ def register_core_routes(
+@@ -1334,6 +1339,22 @@ def register_core_routes(
                  conversation_store=conversation_store,
                  runner_router=runner_router,
              )
@@ -1628,7 +1636,7 @@ index 352ddb805781fefe599429e8c5e91b8e4470b4aa..417f4e61c0d19521289418bdfda85e5e
  
          bundle_bytes = await bundle.read()
          # Validate the bundle BEFORE any row exists: the external-host
-@@ -2834,6 +2855,22 @@ def register_core_routes(
+@@ -3044,6 +3065,22 @@ def register_core_routes(
              body.subagent_routing_override
          )
  
@@ -1651,7 +1659,7 @@ index 352ddb805781fefe599429e8c5e91b8e4470b4aa..417f4e61c0d19521289418bdfda85e5e
          # Native-terminal pass-through args: ``None`` leaves them
          # unchanged; a provided list (including ``[]``) replaces the
          # stored value wholesale (resume is last-write-wins, never an
-@@ -3046,6 +3083,7 @@ def register_core_routes(
+@@ -3284,6 +3321,7 @@ def register_core_routes(
                  None if clear_subagent_routing else subagent_routing_override
              ),
              _unset_subagent_routing_override=clear_subagent_routing,
@@ -1660,26 +1668,26 @@ index 352ddb805781fefe599429e8c5e91b8e4470b4aa..417f4e61c0d19521289418bdfda85e5e
              # an omitted field leaves it unchanged; True/False set or clear it.
              share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
 diff --git a/omnigent/server/scheduled/fire.py b/omnigent/server/scheduled/fire.py
-index 7f519e0385d5dfabfc63d39d53deaf781e610d63..fc229074c64f2a0a6a94b273e13af6c8597d5580 100644
+index be9d64b95eb31e066389960b52c3fd0a20c1173e..8e5e53930714b72cc3ae0cd7ecef342ab1e7370e 100644
 --- a/omnigent/server/scheduled/fire.py
 +++ b/omnigent/server/scheduled/fire.py
-@@ -64,6 +64,7 @@ from omnigent.db.db_models import workspace_scope
- from omnigent.entities import Conversation, ScheduledTask
+@@ -77,6 +77,7 @@ from omnigent.db.db_models import workspace_scope
+ from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
  from omnigent.errors import ErrorCode, OmnigentError
  from omnigent.mcp_selection import mcp_selection_revision
 +from omnigent.runtime.chat_features import encode_chat_features
  from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
  from omnigent.server.bundles import agent_for_user
  from omnigent.server.host_registry import host_owner_scope
-@@ -73,6 +74,7 @@ from omnigent.server.routes._session_create_validation import (
-     validate_session_model_metadata,
+@@ -87,6 +88,7 @@ from omnigent.server.routes._session_create_validation import (
      validate_session_permission_mode,
  )
+ from omnigent.server.routes._sessions.helpers import _announce_session_added
 +from omnigent.server.routes.preferences import resolve_session_chat_features
- from omnigent.server.schemas import SessionEventInput
- 
- _logger = logging.getLogger(__name__)
-@@ -880,6 +882,12 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
+ from omnigent.server.scheduled.dispatch_scheduler import (
+     FireIdentity,
+     FireIdentityRevoked,
+@@ -1313,6 +1315,12 @@ def _session_labels(task: ScheduledTask) -> dict[str, str]:
  
  async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
      """Create a conversation bound to the task's agent, carrying the stored spec."""
@@ -1692,19 +1700,19 @@ index 7f519e0385d5dfabfc63d39d53deaf781e610d63..fc229074c64f2a0a6a94b273e13af6c8
      conv: Conversation = await asyncio.to_thread(
          deps.conversation_store.create_conversation,
          agent_id=task.agent_id,
-@@ -887,6 +895,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
-         host_id=task.host_id,
-         workspace=task.workspace,
+@@ -1322,6 +1330,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
          terminal_launch_args=await _permission_mode_launch_args(deps, task),
+         labels=_session_labels(task),
+         project_id=await _fire_project_id(deps, task),
 +        chat_features_override=encode_chat_features(chat_features),
      )
      reasoning_effort = task.reasoning_effort
      if reasoning_effort is None:
 diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
-index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b916c5daf93 100644
+index 08881f9c96a07c38b0870ae1dbda31f79fd2e5a4..3f8820abe8e32deab8b4aef5a47ee8ceea1e7e7f 100644
 --- a/omnigent/server/schemas.py
 +++ b/omnigent/server/schemas.py
-@@ -1660,6 +1660,9 @@ class _SessionCreateRequestBase(BaseModel):
+@@ -1673,6 +1673,9 @@ class _SessionCreateRequestBase(BaseModel):
          real message after the create returns. ``None`` everywhere else,
          including the bundle-agent auto path, which routes on the first
          message event instead.
@@ -1714,7 +1722,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
      :param apply_project_labels: Whether a ``project_id`` create adds the
          project's default labels under ``labels``. ``False`` when ``labels``
          is already the final set, e.g. a default removed for this session.
-@@ -1696,6 +1699,7 @@ class _SessionCreateRequestBase(BaseModel):
+@@ -1709,6 +1712,7 @@ class _SessionCreateRequestBase(BaseModel):
      harness_override: str | None = None
      provider_override: str | None = None
      smart_routing_message: str | None = None
@@ -1722,7 +1730,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
  
      @model_validator(mode="after")
      def _check_startup_input(self) -> Self:
-@@ -1911,6 +1915,8 @@ class SessionCreateMetadata(BaseModel):
+@@ -1924,6 +1928,8 @@ class SessionCreateMetadata(BaseModel):
          provision on ``host_type: "managed"`` (one of the server's
          ``sandbox_providers``); ``None`` takes the server's first. Only
          valid with ``host_type: "managed"``.
@@ -1731,7 +1739,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
      :param apply_project_labels: Same as on the JSON create: ``False`` skips
          the project's default labels because ``labels`` is the final set.
      """
-@@ -1930,6 +1936,7 @@ class SessionCreateMetadata(BaseModel):
+@@ -1943,6 +1949,7 @@ class SessionCreateMetadata(BaseModel):
      parent_session_id: str | None = None
      host_type: Literal["external", "managed"] = "external"
      sandbox_provider: str | None = None
@@ -1739,7 +1747,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
  
      model_config = ConfigDict(extra="forbid")
  
-@@ -2273,6 +2280,9 @@ class SessionResponse(BaseModel):
+@@ -2287,6 +2294,9 @@ class SessionResponse(BaseModel):
          via ``PATCH /v1/sessions/{id}``.
      :param provider_override: The host provider the session was created on,
          e.g. ``"claude-max2"``; ``None`` for the family default.
@@ -1749,7 +1757,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
      :param share_workspace_files: Whether the owner opted into letting
          view-level collaborators browse the workspace (Files/Changes/GitHub
          surfaces). ``False`` by default — read grants share the conversation
-@@ -2438,6 +2448,7 @@ class SessionResponse(BaseModel):
+@@ -2454,6 +2464,7 @@ class SessionResponse(BaseModel):
      cost_control_mode_override: str | None = None
      subagent_routing_override: str | None = None
      share_workspace_files: bool = False
@@ -1757,7 +1765,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
      context_window: int | None = None
      last_total_tokens: int | None = None
      total_cost_usd: float | None = None
-@@ -2544,6 +2555,11 @@ class UpdateSessionRequest(BaseModel):
+@@ -2560,6 +2571,11 @@ class UpdateSessionRequest(BaseModel):
          presence-is-the-clear-signal rule as
          ``cost_control_mode_override``). Effective on the next spawn, so
          it can be changed at any point in a session.
@@ -1769,7 +1777,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
      :param share_workspace_files: Opt-in that lets people with *view*
          (read-only) access browse the session's workspace files. ``True``
          turns sharing on, ``False`` turns it off (back to edit-only, the
-@@ -2603,6 +2619,7 @@ class UpdateSessionRequest(BaseModel):
+@@ -2619,6 +2635,7 @@ class UpdateSessionRequest(BaseModel):
      approval_mode: str | None = None
      cost_control_mode_override: str | None = None
      subagent_routing_override: str | None = None
@@ -1777,7 +1785,7 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
      share_workspace_files: bool | None = None
      external_session_id: str | None = None
      terminal_launch_args: list[str] | None = None
-@@ -5209,6 +5226,23 @@ HarnessStreamEvent = (
+@@ -5300,6 +5317,23 @@ HarnessStreamEvent = (
  )
  
  
@@ -1802,10 +1810,10 @@ index b804a65446249ff16aa0a023a81a849abf07913f..0889683eb3426ac386dd328e103c4b91
  
  
 diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
-index 07c7e7568e9f7d639efb22519c73b0de8c3d072a..d707122e97dc9497c7950fdb10e5aa90558012e4 100644
+index d0e9a1c500462ed351416e8f47d4c25c68e74c2c..49a5c884df8aa16b8afcda82d56d3bf2d901bc25 100644
 --- a/omnigent/stores/conversation_store/__init__.py
 +++ b/omnigent/stores/conversation_store/__init__.py
-@@ -504,6 +504,7 @@ class ConversationStore(ABC):
+@@ -529,6 +529,7 @@ class ConversationStore(ABC):
          subagent_routing_override: str | None = None,
          harness_override: str | None = None,
          provider_override: str | None = None,
@@ -1813,7 +1821,7 @@ index 07c7e7568e9f7d639efb22519c73b0de8c3d072a..d707122e97dc9497c7950fdb10e5aa90
      ) -> Conversation:
          """
          Create a new conversation. Generates a unique
-@@ -567,6 +568,7 @@ class ConversationStore(ABC):
+@@ -592,6 +593,7 @@ class ConversationStore(ABC):
          :param subagent_routing_override: Optional per-session sub-agent routing mode.
          :param harness_override: Optional per-session harness override.
          :param provider_override: Optional host provider the session runs on.
@@ -1821,7 +1829,7 @@ index 07c7e7568e9f7d639efb22519c73b0de8c3d072a..d707122e97dc9497c7950fdb10e5aa90
          :returns: The newly created :class:`Conversation`.
          :raises NameAlreadyExistsError: If
              ``parent_conversation_id`` is not ``None`` and a
-@@ -1008,6 +1010,7 @@ class ConversationStore(ABC):
+@@ -1054,6 +1056,7 @@ class ConversationStore(ABC):
          _unset_subagent_routing_override: bool = False,
          harness_override: str | None = None,
          _unset_harness_override: bool = False,
@@ -1829,7 +1837,7 @@ index 07c7e7568e9f7d639efb22519c73b0de8c3d072a..d707122e97dc9497c7950fdb10e5aa90
          share_workspace_files: bool | None = None,
          terminal_launch_args: list[str] | None = None,
          archived: bool | None = None,
-@@ -1055,6 +1058,8 @@ class ConversationStore(ABC):
+@@ -1101,6 +1104,8 @@ class ConversationStore(ABC):
              variant — the override is set once at session create and
              immutable thereafter (the harness process is spawned on
              the first turn).
@@ -1838,7 +1846,7 @@ index 07c7e7568e9f7d639efb22519c73b0de8c3d072a..d707122e97dc9497c7950fdb10e5aa90
          :param share_workspace_files: Whether view-level collaborators may
              browse the workspace. ``True`` stores the share, ``False``
              clears it (edit-only again), ``None`` leaves it unchanged.
-@@ -1100,6 +1105,7 @@ class ConversationStore(ABC):
+@@ -1146,6 +1151,7 @@ class ConversationStore(ABC):
          _unset_subagent_routing_override: bool = False,
          harness_override: str | None = None,
          _unset_harness_override: bool = False,
@@ -1846,7 +1854,7 @@ index 07c7e7568e9f7d639efb22519c73b0de8c3d072a..d707122e97dc9497c7950fdb10e5aa90
          share_workspace_files: bool | None = None,
          terminal_launch_args: list[str] | None = None,
          archived: bool | None = None,
-@@ -1871,6 +1877,7 @@ class ConversationStore(ABC):
+@@ -1921,6 +1927,7 @@ class ConversationStore(ABC):
          host_id: str | None = None,
          inference_snapshot: dict[str, Any] | None = None,
          created_by: str | None = None,
@@ -1854,7 +1862,7 @@ index 07c7e7568e9f7d639efb22519c73b0de8c3d072a..d707122e97dc9497c7950fdb10e5aa90
      ) -> CreatedSession:
          """
          Atomically create a session and its session-scoped agent.
-@@ -1915,6 +1922,7 @@ class ConversationStore(ABC):
+@@ -1965,6 +1972,7 @@ class ConversationStore(ABC):
          :param created_by: Identity of the creating user, recorded on the
              session-scoped agent so its code can only be mutated by the
              owner. ``None`` in single-user mode.
@@ -1877,10 +1885,10 @@ index c285cea491b905e0a20e33bbc0f591474363159d..a2536abedaf399ec6ae1648aeb592d48
  
  
 diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
-index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a03618a80950 100644
+index 958f1b2082113f5bceab9cc8551a89e9441c14bd..1a7178f641002dcc759b9a614fbd85c43fd754d0 100644
 --- a/omnigent/stores/conversation_store/sqlalchemy_store.py
 +++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
-@@ -246,6 +246,7 @@ def _to_conversation(
+@@ -272,6 +272,7 @@ def _to_conversation(
          provider_override=overrides["provider_override"],
          # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
          share_workspace_files=overrides["share_workspace_files"] == "on",
@@ -1888,7 +1896,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
          sub_agent_name=meta.sub_agent_name if meta else None,
          task_summary=meta.task_summary if meta else None,
          external_session_id=meta.external_session_id if meta else None,
-@@ -1003,6 +1004,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -1029,6 +1030,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          subagent_routing_override: str | None = None,
          harness_override: str | None = None,
          provider_override: str | None = None,
@@ -1896,7 +1904,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
      ) -> Conversation:
          """
          Create a new conversation in the database.
-@@ -1051,6 +1053,9 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -1077,6 +1079,9 @@ class SqlAlchemyConversationStore(ConversationStore):
              terminal.
          :param conversation_id: Optional caller-supplied identifier.
              ``None`` generates a new random id.
@@ -1906,7 +1914,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
          :returns: The newly created :class:`Conversation`.
          :raises NameAlreadyExistsError: If
              ``parent_conversation_id`` is set and a sibling row
-@@ -1084,6 +1089,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -1110,6 +1115,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                  "subagent_routing_override": subagent_routing_override,
                  "harness_override": harness_override,
                  "provider_override": provider_override,
@@ -1914,7 +1922,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
              }
          )
          prepared_labels = _prepare_label_updates(labels) if labels else {}
-@@ -3526,6 +3532,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3601,6 +3607,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          _unset_subagent_routing_override: bool = False,
          harness_override: str | None = None,
          _unset_harness_override: bool = False,
@@ -1922,7 +1930,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
          share_workspace_files: bool | None = None,
          terminal_launch_args: list[str] | None = None,
          archived: bool | None = None,
-@@ -3564,6 +3571,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3640,6 +3647,8 @@ class SqlAlchemyConversationStore(ConversationStore):
          :param _unset_harness_override: When ``True``, clear
              ``harness_override`` to ``None`` (used to replace the
              ``"auto"`` sentinel after first-message routing resolves).
@@ -1931,7 +1939,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
          :param share_workspace_files: Whether view-level collaborators may
              browse the workspace. ``True`` stores the share flag, ``False``
              clears it (back to edit-only), ``None`` leaves it unchanged.
-@@ -3644,6 +3653,9 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3722,6 +3731,9 @@ class SqlAlchemyConversationStore(ConversationStore):
              elif harness_override is not None:
                  overrides["harness_override"] = harness_override
                  overrides_changed = True
@@ -1941,7 +1949,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
              # Two-state flag: True stores ``"on"``, False clears it (edit-only
              # again), None leaves it untouched.
              if share_workspace_files is not None:
-@@ -3739,6 +3751,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3820,6 +3832,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          _unset_subagent_routing_override: bool = False,
          harness_override: str | None = None,
          _unset_harness_override: bool = False,
@@ -1949,7 +1957,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
          share_workspace_files: bool | None = None,
          terminal_launch_args: list[str] | None = None,
          archived: bool | None = None,
-@@ -3758,6 +3771,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3839,6 +3852,7 @@ class SqlAlchemyConversationStore(ConversationStore):
              _unset_subagent_routing_override=_unset_subagent_routing_override,
              harness_override=harness_override,
              _unset_harness_override=_unset_harness_override,
@@ -1957,7 +1965,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
              share_workspace_files=share_workspace_files,
              terminal_launch_args=terminal_launch_args,
              archived=archived,
-@@ -4469,6 +4483,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4550,6 +4564,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          host_id: str | None = None,
          inference_snapshot: dict[str, Any] | None = None,
          created_by: str | None = None,
@@ -1965,7 +1973,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
      ) -> CreatedSession:
          """
          Insert a conversation row and session-scoped agent.
-@@ -4521,6 +4536,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4602,6 +4617,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          :param created_by: Identity of the creating user, recorded on the
              session-scoped agent so its code can only be mutated by the
              owner. ``None`` in single-user mode.
@@ -1973,7 +1981,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
          :returns: A :class:`CreatedSession` with both entities.
          :raises ConversationNotFoundError: If
              ``parent_conversation_id`` is set but no such
-@@ -4544,6 +4560,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4625,6 +4641,7 @@ class SqlAlchemyConversationStore(ConversationStore):
              host_id=host_id,
              inference_snapshot=inference_snapshot,
              created_by=created_by,
@@ -1981,7 +1989,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
          )
  
      def _create_session_with_agent_with_id(
-@@ -4566,6 +4583,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4647,6 +4664,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          host_id: str | None = None,
          inference_snapshot: dict[str, Any] | None = None,
          created_by: str | None = None,
@@ -1989,7 +1997,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
      ) -> CreatedSession:
          """Body of :meth:`create_session_with_agent` under a caller-supplied
          ``conversation_id``. The public method generates a fresh id; this seam
-@@ -4577,6 +4595,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4658,6 +4676,7 @@ class SqlAlchemyConversationStore(ConversationStore):
              {
                  "reasoning_effort": reasoning_effort,
                  "model_override": model_override,
@@ -1997,7 +2005,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
              }
          )
          encoded_inference_snapshot = (
-@@ -4919,6 +4938,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -5000,6 +5019,7 @@ class SqlAlchemyConversationStore(ConversationStore):
              # — same gate — harness_override) copy only when copy_model_settings.
              # The routing switches (cost_control_mode_override,
              # subagent_routing_override) are intentionally never carried onto a fork.
@@ -2005,7 +2013,7 @@ index aa8de296bfaa20042204a8638e3b88301f501bbb..8a229fabadd55d6fa4acfe1c8b73a036
              # An explicit dialog pick (override_*_set) supersedes the inherited
              # value — the fork dialog seeds the picker from the source, so an
              # untouched picker sends nothing and inheritance stands.
-@@ -4942,6 +4962,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -5023,6 +5043,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                      "provider_override": (
                          source_overrides["provider_override"] if copy_model_settings else None
                      ),
@@ -2077,10 +2085,10 @@ index 4ed3d82cba790038c63f3f605ccc869aad079dbb..6b31e317e7b82642e953e4aebfc5b8d9
 +            return None
 +        cursor = page.next_cursor
 diff --git a/openapi.json b/openapi.json
-index 35f98fe8fe4417ca7654d5b53080599c4665c7ec..2ce68bd957046c4c216d23e4e66d141f63016c33 100644
+index af8f9a530ac9bbb30057c6e1cd1c94f04a3d7c8a..1c1ed566f331afe0f91392af8c3e2288da4ac611 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -861,6 +861,47 @@
+@@ -913,6 +913,47 @@
          "title": "CancelledEvent",
          "type": "object"
        },
@@ -2128,7 +2136,7 @@ index 35f98fe8fe4417ca7654d5b53080599c4665c7ec..2ce68bd957046c4c216d23e4e66d141f
        "ChildSessionList": {
          "description": "Paginated list of child sessions; `data` is a page of `ChildSessionSummary`.",
          "properties": {
-@@ -7994,6 +8035,14 @@
+@@ -8399,6 +8440,14 @@
              "description": "Per-shell detail for the running tally above, so a reload can restore each shell's description/command. `None` when none are tracked (or when an older runner reported only the count).",
              "title": "Background Tasks"
            },
@@ -2143,7 +2151,7 @@ index 35f98fe8fe4417ca7654d5b53080599c4665c7ec..2ce68bd957046c4c216d23e4e66d141f
            "context_window": {
              "anyOf": [
                {
-@@ -9959,6 +10008,21 @@
+@@ -10369,6 +10418,21 @@
              "description": "New archived state. `True` archives (hides the session from the default sidebar listing), `False` unarchives, `None` leaves unchanged. Owner-only (unlike `title`, which needs only edit access).",
              "title": "Archived"
            },
@@ -2165,7 +2173,7 @@ index 35f98fe8fe4417ca7654d5b53080599c4665c7ec..2ce68bd957046c4c216d23e4e66d141f
            "collaboration_mode": {
              "anyOf": [
                {
-@@ -11056,6 +11120,28 @@
+@@ -11466,6 +11530,28 @@
          "summary": "Branding Logo"
        }
      },
@@ -2195,10 +2203,10 @@ index 35f98fe8fe4417ca7654d5b53080599c4665c7ec..2ce68bd957046c4c216d23e4e66d141f
        "get": {
          "description": "List extensions installed and enabled when the server started.\n\nV1 treats operator installation as enablement. Installing, removing, or\nupgrading a package requires a server restart to refresh this snapshot.",
 diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
-index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f24533ac6f 100644
+index e5bf29bc9a214b87a50d7a69fe2f96ce20edbda3..e8c905411d452ac8846c06f6385e6c77fbe38db0 100644
 --- a/tests/harnesses/claude_native/test_claude_native.py
 +++ b/tests/harnesses/claude_native/test_claude_native.py
-@@ -40,6 +40,7 @@ from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
+@@ -41,6 +41,7 @@ from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
  from omnigent.native import native_terminal
  from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
  from omnigent.runtime import tool_result_replay as trc
@@ -2206,7 +2214,7 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
  from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
  from omnigent.spec import load_omnigent_yaml
  from omnigent.terminals.ws_common import (
-@@ -71,6 +72,9 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+@@ -72,6 +73,9 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
      )
  
  
@@ -2216,7 +2224,7 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
  def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
      bridge_root = tmp_path / "claude-native"
      monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
-@@ -1689,7 +1693,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+@@ -1722,7 +1726,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -2227,7 +2235,7 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
  
  
  def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
-@@ -1777,7 +1783,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
+@@ -1810,7 +1816,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -2238,7 +2246,7 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
  
  
  def test_local_resume_does_not_print_redundant_resume_hint(
-@@ -6199,6 +6207,15 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
+@@ -6530,6 +6538,15 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
          "_fetch_claude_session_labels",
          _fake_fetch_labels,
      )
@@ -2254,7 +2262,7 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
      monkeypatch.setattr(
          claude_native,
          "_bind_session_runner",
-@@ -6231,7 +6248,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
+@@ -6562,7 +6579,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
              session_bundle=None,
              claude_args=("--print", "hello"),
              command="claude",
@@ -2263,7 +2271,7 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
          )
          del http_client  # context-managed by the with block
  
-@@ -6249,9 +6266,12 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
+@@ -6580,9 +6597,12 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
          "--print",
          "hello",
      )
@@ -2279,7 +2287,7 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
      assert captured_terminal_args["allowed_tools"] == ()
  
      # Load-bearing for the duplicate-message bug: cold resume
-@@ -6317,12 +6337,22 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
+@@ -6650,12 +6670,22 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
          allowed_tools: tuple[str, ...] = (),
      ) -> str:
          """Return a fixed terminal id without spawning anything."""
@@ -2303,9 +2311,9 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
      monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
      monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
      monkeypatch.setattr(
-@@ -6347,7 +6377,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
+@@ -6680,7 +6710,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
              session_bundle=b"fake-bundle",
-             claude_args=(),
+             claude_args=("--effort", "xhigh"),
              command="claude",
 -            append_system_prompt="Fresh session bridge instructions.",
 +            author_instructions="Fresh session bridge instructions.",
@@ -2313,10 +2321,10 @@ index c00a59975e0ec93910323e4db04b111a4e27344d..d87a7b427adff138ba599ac74a0b42f2
          del http_client
  
 diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
-index 9c98a3c224550e62d5259043130b211d7c7e5d1b..a427399d63758f499016b9767d39d58a96519804 100644
+index 81af3c6a9690c0a218179dc3babac2da90b6489d..5aac810258581f05256875f596f98863dea769fb 100644
 --- a/tests/harnesses/claude_native/test_claude_native_bridge.py
 +++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
-@@ -4064,6 +4064,20 @@ def test_augment_claude_args_merges_caller_system_prompt(
+@@ -4204,6 +4204,20 @@ def test_augment_claude_args_merges_caller_system_prompt(
      assert "--verbose" in args
  
  
@@ -2461,7 +2469,7 @@ index 101d15d70c23f1e51be207960442f9bb4d08a679..f4319743706a4280e231f17e50185385
  @pytest.mark.parametrize("cleanup_failure", [None, "terminal", "client"])
  @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
 diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
-index c68825f1946efc1dfbef62eade9bbdca8457a8d3..d2679f3d9e393923bb1e4fc3d26e09b87e329852 100644
+index a2e039b20cbac9551ae9551787596c4f33a4e08d..d612339ca36c02a3cf7fd52d66203101431d35b2 100644
 --- a/tests/harnesses/codex_native/test_codex_native.py
 +++ b/tests/harnesses/codex_native/test_codex_native.py
 @@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
@@ -2482,7 +2490,7 @@ index c68825f1946efc1dfbef62eade9bbdca8457a8d3..d2679f3d9e393923bb1e4fc3d26e09b8
  def _write_codex_auth(path: Path, payload: object) -> None:
      """Write a test Codex auth.json payload."""
      path.parent.mkdir(parents=True, exist_ok=True)
-@@ -8809,7 +8813,16 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
+@@ -8818,7 +8822,16 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
          captured.update(kwargs)
          raise _Sentinel
  
@@ -2499,7 +2507,7 @@ index c68825f1946efc1dfbef62eade9bbdca8457a8d3..d2679f3d9e393923bb1e4fc3d26e09b8
      monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
  
      with pytest.raises(_Sentinel):
-@@ -8822,10 +8835,16 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
+@@ -8831,10 +8844,16 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
              codex_args=(),
              command="codex",
              model=None,
@@ -2518,7 +2526,7 @@ index c68825f1946efc1dfbef62eade9bbdca8457a8d3..d2679f3d9e393923bb1e4fc3d26e09b8
      assert captured["session_id"] == "conv_fresh_di"
  
  
-@@ -8972,7 +8991,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+@@ -8981,7 +9000,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
  
      assert captured.get("developer_instructions") is not None
      assert "Codex is running in the session terminal" in captured["developer_instructions"]
@@ -2529,7 +2537,7 @@ index c68825f1946efc1dfbef62eade9bbdca8457a8d3..d2679f3d9e393923bb1e4fc3d26e09b8
  
  
  def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
-@@ -9055,7 +9076,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
+@@ -9064,7 +9085,9 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
  
      assert captured.get("developer_instructions") is not None
      assert "Codex is running in the session terminal" in captured["developer_instructions"]
@@ -2541,10 +2549,10 @@ index c68825f1946efc1dfbef62eade9bbdca8457a8d3..d2679f3d9e393923bb1e4fc3d26e09b8
  
  @pytest.mark.asyncio
 diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
-index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d6d16da71 100644
+index e2e1e1876e4d4bd678d82f03891dc86fbd256754..2959536317935d56645c4e10e195584bd810ab03 100644
 --- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
 +++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
-@@ -74,6 +74,11 @@ from omnigent.runner.resource_registry import (
+@@ -77,6 +77,11 @@ from omnigent.runner.resource_registry import (
      SessionResourceRegistry,
  )
  from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
@@ -2555,9 +2563,9 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
 +)
  from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
  from omnigent.spec.types import AgentSpec, ExecutorSpec
- from omnigent.terminals import TerminalRegistry
-@@ -124,6 +129,18 @@ class _RecordingClaudeRegistry:
-         )
+ from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+@@ -162,6 +167,18 @@ class _ResumeSnapshotServerClient(NullServerClient):
+         return _Response()
  
  
 +(_RUN_COMMANDS_INSTRUCTION,) = chat_feature_instructions({ChatFeature.RUN_COMMANDS})
@@ -2575,7 +2583,7 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
  def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
      settings_path = Path(args[args.index("--settings") + 1])
      return json.loads(settings_path.read_text(encoding="utf-8"))
-@@ -2236,6 +2253,36 @@ async def test_claude_launch_metadata_envelope_never_calls_server() -> None:
+@@ -2274,6 +2291,36 @@ async def test_claude_launch_metadata_envelope_never_calls_server() -> None:
      assert metadata.terminal_launch_args == ["--verbose"]
      assert metadata.external_session_id == "claude-session-id"
      assert metadata.fork_carry_history is True
@@ -2612,7 +2620,7 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
  
  
  def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
-@@ -2274,13 +2321,34 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
+@@ -2312,13 +2359,34 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
  
  
  @pytest.mark.asyncio
@@ -2648,7 +2656,7 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
  
      The managed-host wiring in ``runner/native/orchestration.py``
      (``augment_claude_args(..., append_system_prompt=
-@@ -2324,7 +2392,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+@@ -2362,7 +2430,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
              )
  
      def _handle_request(_request: httpx.Request) -> httpx.Response:
@@ -2657,7 +2665,7 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
  
      fake_client = httpx.AsyncClient(
          base_url="http://test-server",
-@@ -2347,9 +2415,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+@@ -2385,9 +2453,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
          agent_spec=agent_spec,
      )
  
@@ -2668,16 +2676,16 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
  
  
  @pytest.mark.asyncio
-@@ -3089,7 +3155,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+@@ -3145,7 +3211,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
  
      # Session titles are generated by an isolated background job, so neither
      # fresh nor resumed Claude terminals receive framework rename instructions.
 -    assert _appended_system_prompt(launched_args) == ITEM_LABEL_INSTRUCTION
 +    assert _appended_system_prompt(launched_args) == _DEFAULT_NATIVE_GUIDANCE
  
- 
- @pytest.mark.asyncio
-@@ -5517,7 +5583,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
+     permission_mode_index = launched_args.index("--permission-mode")
+     assert launched_args[permission_mode_index + 1] == "auto"
+@@ -5837,7 +5903,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
      # early no longer cascades into "no server running" (#540).
      assert spec.keep_alive_after_exit is True
      args = spec.args
@@ -2686,7 +2694,7 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
      settings = _load_claude_invocation_settings(args)
      assert "PermissionRequest" in settings["hooks"]
      permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
-@@ -5732,7 +5798,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+@@ -6052,7 +6118,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
      assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
      # A pinned session's spawns stay on the claude family, so it gets neither
      # the routed-spawn note nor the pre-approvals the cross-family hop needs.
@@ -2695,7 +2703,7 @@ index 1edee01083977e32bba34488d00d9f20b229ce1e..5f960439c171b82c3063b9512084df0d
  
  
  async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
-@@ -5760,7 +5826,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
+@@ -6080,7 +6146,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
      assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
      assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
      # And the auto-harness extras, which only make sense alongside the router.
@@ -2738,7 +2746,7 @@ index 3872fb3387c92893a305f9b0138a1f31797426ff..06fb57347b922898af0c4d70836fabb9
  
      # Sandbox-override regression: the launched Codex terminal must inherit
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index 0e4ca57145e505a9e8aeced9246ea37e144f4ef3..fcffd4d5337512062e9d86a03048c4ced3e525b9 100644
+index 210e9f570f7b3c3cf72a66b18788ebdd439433bc..cb1968995a741ed2367b71edc33c6e78b15bf163 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
 @@ -91,6 +91,11 @@ from omnigent.runner.app import (
@@ -2753,7 +2761,7 @@ index 0e4ca57145e505a9e8aeced9246ea37e144f4ef3..fcffd4d5337512062e9d86a03048c4ce
  from omnigent.runtime.harnesses import _HARNESS_MODULES
  from omnigent.runtime.harnesses._executor_adapter import (
      _ORPHAN_RESYNC_THRESHOLD,
-@@ -12680,9 +12685,12 @@ class _ContractSnapshotClient(NullServerClient):
+@@ -12681,9 +12686,12 @@ class _ContractSnapshotClient(NullServerClient):
  _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
  
  
@@ -2768,7 +2776,7 @@ index 0e4ca57145e505a9e8aeced9246ea37e144f4ef3..fcffd4d5337512062e9d86a03048c4ce
  
  
  async def _contract_run_no_harness(
-@@ -13001,6 +13009,57 @@ async def test_cross_path_resolution_contract(
+@@ -13002,6 +13010,57 @@ async def test_cross_path_resolution_contract(
          )
  
  
@@ -3027,10 +3035,10 @@ index 6f3b96135bde6c2aa8a12f293fde03c7fdba15db..282ef96825ce1a7710ea9b4c55dbbe59
 +        f"Author\n\n{ITEM_LABEL_INSTRUCTION}"
 +    )
 diff --git a/tests/server/conftest.py b/tests/server/conftest.py
-index 84a488574d5ac18235082cd7817877b6aaa93e26..8665104a82232e10702a483e9a45fb1ad8d4aa07 100644
+index 01b9fed1cd39af8b546be411948e28b9bceba254..130ae1eba4b394cadd10ed5404be6f32ba6c3646 100644
 --- a/tests/server/conftest.py
 +++ b/tests/server/conftest.py
-@@ -49,6 +49,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
+@@ -51,6 +51,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
  from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
  from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
  from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
@@ -3038,7 +3046,7 @@ index 84a488574d5ac18235082cd7817877b6aaa93e26..8665104a82232e10702a483e9a45fb1a
  
  # ── Controllable mock LLM ─────────────────────────────
  
-@@ -602,7 +603,18 @@ def _first_party_origin_on_asgi(monkeypatch: pytest.MonkeyPatch) -> None:
+@@ -633,7 +634,18 @@ def _first_party_origin_on_asgi(monkeypatch: pytest.MonkeyPatch) -> None:
  
  
  @pytest.fixture()
@@ -3058,7 +3066,7 @@ index 84a488574d5ac18235082cd7817877b6aaa93e26..8665104a82232e10702a483e9a45fb1a
      """
      Build the FastAPI app with real stores and real workflow
      execution (mock LLM is patched in via runtime_init fixture).
-@@ -615,6 +627,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+@@ -646,6 +658,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
          patches the mock LLM.
      :param db_uri: SQLite database URI.
      :param tmp_path: Pytest temp directory for artifacts and cache.
@@ -3066,7 +3074,7 @@ index 84a488574d5ac18235082cd7817877b6aaa93e26..8665104a82232e10702a483e9a45fb1a
      """
      artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
      agent_store = SqlAlchemyAgentStore(db_uri)
-@@ -630,6 +643,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+@@ -661,6 +674,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
              cache_dir=tmp_path / "cache",
          ),
          comment_store=SqlAlchemyCommentStore(db_uri),
@@ -3276,10 +3284,10 @@ index 0000000000000000000000000000000000000000..c8e7b705ce5d75e600360917ebe093e2
 +    assert (await client.post(f"/v1/sessions/{sid}/events", json=message)).status_code == 202
 +    assert captured["body"]["chat_features"] == ["run_commands"]
 diff --git a/tests/server/integration/test_sessions_endpoints.py b/tests/server/integration/test_sessions_endpoints.py
-index e0917e71c13758b3d5edf7606f0f78d0968745d2..d5d3359afb4c6293dd60e285d23f75c7182039a7 100644
+index 158045df7b239cea957c042f3dd9f9913da13b2c..ca0d34a3d15dd38137c050678164403cc89faeb6 100644
 --- a/tests/server/integration/test_sessions_endpoints.py
 +++ b/tests/server/integration/test_sessions_endpoints.py
-@@ -2547,6 +2547,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
+@@ -2559,6 +2559,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
              # The forwarded message is the meta item; its store id lets the
              # runner dedup it on a cold-cache history reload.
              "persisted_item_id": meta["id"],
@@ -3288,7 +3296,7 @@ index e0917e71c13758b3d5edf7606f0f78d0968745d2..d5d3359afb4c6293dd60e285d23f75c7
      ]
      event_types = [event["type"] for _, event in published]
 diff --git a/tests/server/integration/test_sessions_harness_override.py b/tests/server/integration/test_sessions_harness_override.py
-index e9cba6d2065989dd2551368a8e89e7c34417eba5..197048ab8dba9dc88baf38527c0b694a353f5d2c 100644
+index bb3121bb4af5fdfc2c669008e1f4a7a23fa8b48e..5249bdda833db9cf63b4c996a785bfb3b0a24ad5 100644
 --- a/tests/server/integration/test_sessions_harness_override.py
 +++ b/tests/server/integration/test_sessions_harness_override.py
 @@ -15,6 +15,7 @@ from typing import Any
@@ -3299,7 +3307,7 @@ index e9cba6d2065989dd2551368a8e89e7c34417eba5..197048ab8dba9dc88baf38527c0b694a
  from tests.server.helpers import create_test_agent
  
  pytestmark = pytest.mark.asyncio
-@@ -487,7 +488,9 @@ async def test_override_storage_limit_is_checked_before_create(
+@@ -516,7 +517,9 @@ async def test_override_storage_limit_is_checked_before_create(
              }
          )
      limit = SqlConversation.__table__.c.session_overrides.type.length
@@ -3310,7 +3318,7 @@ index e9cba6d2065989dd2551368a8e89e7c34417eba5..197048ab8dba9dc88baf38527c0b694a
      overrides["harness_override"] += "a" * (limit - overhead + extra)
      store = get_conversation_store()
      before = {conv.id for conv in store.list_conversations().data}
-@@ -514,9 +517,11 @@ async def test_override_growth_rejects_patch_without_mutation(client: httpx.Asyn
+@@ -543,9 +546,11 @@ async def test_override_growth_rejects_patch_without_mutation(client: httpx.Asyn
  
      agent = await create_test_agent(client)
      limit = SqlConversation.__table__.c.session_overrides.type.length
@@ -3326,7 +3334,7 @@ index e9cba6d2065989dd2551368a8e89e7c34417eba5..197048ab8dba9dc88baf38527c0b694a
          "/v1/sessions", json={"agent_id": agent["id"], "harness_override": harness}
      )
 diff --git a/tests/server/routes/test_native_smart_routing_create.py b/tests/server/routes/test_native_smart_routing_create.py
-index 2581fcfffe84cba6b87f9e6b7eb7612e92e4d021..41f0b60e3cec7bc63e57a8285c14351aa88dd193 100644
+index d247233294f6619747ebc87c8cb2acba382c03fe..b4c3220c0f2af9ec291ce74dd136a75b7be61996 100644
 --- a/tests/server/routes/test_native_smart_routing_create.py
 +++ b/tests/server/routes/test_native_smart_routing_create.py
 @@ -967,7 +967,9 @@ async def test_unrouted_create_writes_no_subagent_routing_key(
@@ -3341,10 +3349,10 @@ index 2581fcfffe84cba6b87f9e6b7eb7612e92e4d021..41f0b60e3cec7bc63e57a8285c14351a
  
  async def test_native_candidates_impose_no_family_constraint() -> None:
 diff --git a/tests/server/scheduled/test_fire.py b/tests/server/scheduled/test_fire.py
-index b72fadb1d2e9f80bea5f9c9133b711b07e9e07ab..008abcb1931f6549727eb629a5f984289af02987 100644
+index 053f7376d5c2f83cf0fc129544cb240ebfbc1c88..498a1d02aa43e9cb1a015996f71475f47a72bc66 100644
 --- a/tests/server/scheduled/test_fire.py
 +++ b/tests/server/scheduled/test_fire.py
-@@ -643,6 +643,41 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
+@@ -929,6 +929,41 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
      assert conv_store.created[0]["terminal_launch_args"] is None
  
  
@@ -3387,10 +3395,10 @@ index b72fadb1d2e9f80bea5f9c9133b711b07e9e07ab..008abcb1931f6549727eb629a5f98428
  async def test_permission_mode_omitted_for_non_claude_agent() -> None:
      """A mis-stamped non-Claude row degrades to no --permission-mode flag.
 diff --git a/tests/stores/test_conversation_store.py b/tests/stores/test_conversation_store.py
-index dec38fba9e0766304c50406813e0fdd973c13a6f..4ef3a0ec5f8268f78359e602f88e89d1f62c428d 100644
+index 9ec04f98c1177ddb0fa8186c11d970a4caa066d7..b8f39db696f199fbadf2aa1c30d3aeeb2b7710a2 100644
 --- a/tests/stores/test_conversation_store.py
 +++ b/tests/stores/test_conversation_store.py
-@@ -194,6 +194,7 @@ def test_create_persists_initial_labels_and_overrides(
+@@ -195,6 +195,7 @@ def test_create_persists_initial_labels_and_overrides(
          cost_control_mode_override="on",
          subagent_routing_override="off",
          harness_override="codex-native",
@@ -3398,7 +3406,7 @@ index dec38fba9e0766304c50406813e0fdd973c13a6f..4ef3a0ec5f8268f78359e602f88e89d1
      )
  
      assert created.labels == {
-@@ -206,6 +207,8 @@ def test_create_persists_initial_labels_and_overrides(
+@@ -207,6 +208,8 @@ def test_create_persists_initial_labels_and_overrides(
      assert created.cost_control_mode_override == "on"
      assert created.subagent_routing_override == "off"
      assert created.harness_override == "codex-native"
@@ -3407,7 +3415,7 @@ index dec38fba9e0766304c50406813e0fdd973c13a6f..4ef3a0ec5f8268f78359e602f88e89d1
  
      fetched = conversation_store.get_conversation(created.id)
      assert fetched is not None
-@@ -215,6 +218,27 @@ def test_create_persists_initial_labels_and_overrides(
+@@ -216,6 +219,27 @@ def test_create_persists_initial_labels_and_overrides(
      assert fetched.cost_control_mode_override == "on"
      assert fetched.subagent_routing_override == "off"
      assert fetched.harness_override == "codex-native"
@@ -3435,7 +3443,7 @@ index dec38fba9e0766304c50406813e0fdd973c13a6f..4ef3a0ec5f8268f78359e602f88e89d1
  
  
  def test_set_provider_override_keeps_the_other_overrides(
-@@ -6068,7 +6092,10 @@ def test_fork_conversation_copy_model_settings_false_resets(
+@@ -6282,7 +6306,10 @@ def test_fork_conversation_copy_model_settings_false_resets(
      )
      source = conversation_store.create_conversation(agent_id="6bfca10f1de66d54bdff530d697d1b68")
      conversation_store.update_conversation(
@@ -3447,7 +3455,7 @@ index dec38fba9e0766304c50406813e0fdd973c13a6f..4ef3a0ec5f8268f78359e602f88e89d1
      )
  
      fork = conversation_store.fork_conversation(source.id, copy_model_settings=False)
-@@ -6083,6 +6110,8 @@ def test_fork_conversation_copy_model_settings_false_resets(
+@@ -6297,6 +6324,8 @@ def test_fork_conversation_copy_model_settings_false_resets(
      assert reloaded.reasoning_effort is None, (
          "copy_model_settings=False must drop the source's reasoning_effort"
      )
@@ -3456,7 +3464,7 @@ index dec38fba9e0766304c50406813e0fdd973c13a6f..4ef3a0ec5f8268f78359e602f88e89d1
  
      # Control: the default still copies, proving the reset is gated on the
      # flag and not a blanket drop.
-@@ -6091,6 +6120,7 @@ def test_fork_conversation_copy_model_settings_false_resets(
+@@ -6305,6 +6334,7 @@ def test_fork_conversation_copy_model_settings_false_resets(
      assert reloaded_default is not None
      assert reloaded_default.model_override == "claude-opus-4"
      assert reloaded_default.reasoning_effort == "high"
@@ -3519,10 +3527,10 @@ index 51f8cb60d1bf0cc1b0781ffc6d683f555c7c5804..e63b5f4375d9d0e3f6f6068358cc4708
 +    missing = SharedPreferenceKey(kind="harness_args", name="codex-native")
 +    assert read_preference_entry(store, missing, user_id="alice") is None
 diff --git a/tests/test_native_terminal.py b/tests/test_native_terminal.py
-index e43d88123b9333df5ad8b992e96e01fab2337eab..ac246d51b562e89ac6b26157ee7f833494cd1b2b 100644
+index 193c63819c81de8249ce788604b75d4f709a777b..360d46aba343903a8f0f53d14e6d776255fe33ee 100644
 --- a/tests/test_native_terminal.py
 +++ b/tests/test_native_terminal.py
-@@ -7,6 +7,7 @@ import httpx
+@@ -10,6 +10,7 @@ import httpx
  import pytest
  
  from omnigent.native import native_terminal
@@ -3530,7 +3538,7 @@ index e43d88123b9333df5ad8b992e96e01fab2337eab..ac246d51b562e89ac6b26157ee7f8334
  
  
  @pytest.mark.asyncio
-@@ -279,3 +280,33 @@ def test_normalize_extra_args_extra_args_wins_over_legacy_with_warning() -> None
+@@ -395,3 +396,33 @@ def test_normalize_extra_args_extra_args_wins_over_legacy_with_warning() -> None
              extra_args=("--new",), legacy_args=("--old",), legacy_param="pi_args"
          )
      assert result == ("--new",)
@@ -4271,19 +4279,19 @@ index edf73abd8b759f2a25e89fd6b2a00bd9f4d21469..93e8cdb66d44dce5ae43ab7847f67a0e
  function bangCommand(line: string): string | null {
    const trimmed = line.trim();
 diff --git a/web/src/lib/sessionsApi.test.ts b/web/src/lib/sessionsApi.test.ts
-index 4b59165c00159f57d12cf31de97196a4b315cdef..cbfba2c7aebb7872c64f746800fe7c3ae6767777 100644
+index 689a5cfb6356ca295f7f55789e9f17d81d45344f..f6bd1ef3cd32d8960b39314a245f362a2544c9d2 100644
 --- a/web/src/lib/sessionsApi.test.ts
 +++ b/web/src/lib/sessionsApi.test.ts
-@@ -174,6 +174,8 @@ describe("createSession", () => {
-       backgroundTaskCount: undefined,
+@@ -175,6 +175,8 @@ describe("createSession", () => {
        todos: [],
        codexModelOptions: [],
+       sideChatSettingsSupported: false,
 +      // A server without the setting reads as every feature on.
 +      chatFeatures: ["run_commands"],
        terminalPending: false,
        sandboxStatus: null,
        mcpStartup: null,
-@@ -969,6 +971,29 @@ describe("runner binding", () => {
+@@ -990,6 +992,29 @@ describe("runner binding", () => {
      expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
    });
  
@@ -4314,10 +4322,10 @@ index 4b59165c00159f57d12cf31de97196a4b315cdef..cbfba2c7aebb7872c64f746800fe7c3a
      fetchMock.mockResolvedValueOnce(
        mockJsonResponse({
 diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
-index fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95..5c1076d2c376dcbe9f65b831e0139d42eb7b0e16 100644
+index a225516fe8787135c92b5186926a05c69eb6e332..572c166020a45ea80967e81459e15e882ebd1d7a 100644
 --- a/web/src/lib/sessionsApi.ts
 +++ b/web/src/lib/sessionsApi.ts
-@@ -14,6 +14,7 @@ import type { ConversationItem } from "./conversationItems";
+@@ -15,6 +15,7 @@ import type { SideChatModelSettings } from "./sideChat";
  import type { MessageContentBlock } from "./blocks";
  import type { McpServerStartup } from "./events";
  import { authenticatedFetch } from "./identity";
@@ -4325,7 +4333,7 @@ index fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95..5c1076d2c376dcbe9f65b831e0139d42
  import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
  import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
  import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
-@@ -181,6 +182,8 @@ interface SessionResponseWire {
+@@ -182,6 +183,8 @@ interface SessionResponseWire {
    cost_control_mode_override?: "on" | "off" | null;
    /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
    subagent_routing_override?: "on" | "off" | null;
@@ -4334,7 +4342,7 @@ index fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95..5c1076d2c376dcbe9f65b831e0139d42
    /** Owner opt-in: view-level collaborators may browse workspace files. */
    share_workspace_files?: boolean;
    context_window?: number | null;
-@@ -350,6 +353,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
+@@ -352,6 +355,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
      providerOverride: wire.provider_override,
      costControlModeOverride: wire.cost_control_mode_override,
      subagentRoutingOverride: wire.subagent_routing_override,
@@ -4342,7 +4350,7 @@ index fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95..5c1076d2c376dcbe9f65b831e0139d42
      shareWorkspaceFiles: wire.share_workspace_files ?? false,
      contextWindow: wire.context_window,
      lastTotalTokens: wire.last_total_tokens,
-@@ -749,6 +753,7 @@ export async function createBundledSession(
+@@ -752,6 +756,7 @@ export async function createBundledSession(
      terminal_launch_args?: string[];
      git?: { branch_name: string; base_branch?: string };
      mcp_registry_services?: string[];
@@ -4350,7 +4358,7 @@ index fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95..5c1076d2c376dcbe9f65b831e0139d42
    } = {},
  ): Promise<{ id: string }> {
    const form = new FormData();
-@@ -1051,6 +1056,8 @@ export async function updateSession(
+@@ -1061,6 +1066,8 @@ export async function updateSession(
      codexApprovalMode?: string;
      costControlModeOverride?: "on" | "off" | null;
      subagentRoutingOverride?: "on" | "off" | null;
@@ -4359,7 +4367,7 @@ index fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95..5c1076d2c376dcbe9f65b831e0139d42
      /**
       * Owner opt-in that lets people with view (read-only) access browse the
       * workspace files. Owner-only server-side. `true`/`false` set or clear it.
-@@ -1062,7 +1069,8 @@ export async function updateSession(
+@@ -1072,7 +1079,8 @@ export async function updateSession(
      labels?: Record<string, string | null>;
    },
  ): Promise<Session> {
@@ -4369,7 +4377,7 @@ index fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95..5c1076d2c376dcbe9f65b831e0139d42
    if ("reasoningEffort" in updates) {
      body.reasoning_effort = updates.reasoningEffort ?? "default";
    }
-@@ -1084,6 +1092,9 @@ export async function updateSession(
+@@ -1094,6 +1102,9 @@ export async function updateSession(
    if ("subagentRoutingOverride" in updates) {
      body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
    }
@@ -4647,7 +4655,7 @@ index 0000000000000000000000000000000000000000..997f4c53b83c0e52ef59c4329a9d1389
 +  return error instanceof ApiError && error.status === 409;
 +}
 diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
-index bb0add0ac895ad663279529239eba5d11966549c..2ce5c0f9aba84bdac48f242b9d4b6bfbb39a9f76 100644
+index d65181d71ef9279e2443341976b92bcd0d4653ca..74954bc507230951a132aed5849723c123b021dd 100644
 --- a/web/src/lib/types.ts
 +++ b/web/src/lib/types.ts
 @@ -397,6 +397,11 @@ export interface Session {
@@ -4663,10 +4671,10 @@ index bb0add0ac895ad663279529239eba5d11966549c..2ce5c0f9aba84bdac48f242b9d4b6bfb
     * Whether the owner opted into letting people with *view* (read-only)
     * access browse this session's workspace files (the Files/Changes/Pull Requests
 diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
-index 70026d82948c111d0588fb58462304702c659bdd..eafa4e488a27916428aec3c446940a82d4a9a45b 100644
+index 2fca9f06918426ea8b3f119ed5bc29c489eae1d7..00312d3fc9a3343ca4c48bf8973ab2a97c8acff4 100644
 --- a/web/src/pages/ChatPage.composer.test.tsx
 +++ b/web/src/pages/ChatPage.composer.test.tsx
-@@ -7251,6 +7251,46 @@ describe("Composer config gear", () => {
+@@ -7692,6 +7692,46 @@ describe("Composer config gear", () => {
      expect(setCostControlMode).toHaveBeenCalledWith("off");
    });
  
@@ -4714,7 +4722,7 @@ index 70026d82948c111d0588fb58462304702c659bdd..eafa4e488a27916428aec3c446940a82
      renderWithTooltips(
        <Composer
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa404282c2 100644
+index fe85fac6fd18708476643e9b3881d4b28ff6dccd..ddaa704fa4ff578f487c915d32a84b686bd7ff8d 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
 @@ -126,7 +126,7 @@ import {
@@ -4726,17 +4734,17 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
  import { skillInvocationPrefix } from "@/lib/harnessSetup";
  import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
  import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-@@ -254,6 +254,9 @@ import {
- import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
- import { nativeModelLabel } from "@/components/HarnessConfigControls";
- import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+@@ -259,6 +259,9 @@ import {
+   type ComposerConfigSection,
+ } from "@/components/composer/ComposerConfigSections";
+ import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 +import { buildChatFeatureSections } from "@/components/composer/chatFeatureSections";
 +import { useChatFeatureCatalog } from "@/hooks/useChatFeaturePreferences";
 +import { type ChatFeatureDefinition, chatFeaturesApplyOnRestart } from "@/lib/chatFeatures";
  import { buildFusionSections } from "@/components/composer/fusionSections";
  import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
  import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
-@@ -298,6 +301,8 @@ import { ConnectionIndicator } from "./ChatIndicators";
+@@ -313,6 +316,8 @@ import { ConnectionIndicator } from "./ChatIndicators";
  import { RunCommandsProvider } from "@/components/chat/RunCommandsProvider";
  import { Transcript } from "@/components/chat/Transcript";
  
@@ -4745,7 +4753,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
  /** Server-info as consumers see it: the probe's result, or "loading". */
  type ServerInfoValue = ServerInfo | "loading";
  
-@@ -707,6 +712,7 @@ export function ChatPage() {
+@@ -722,6 +727,7 @@ export function ChatPage() {
      activeSession ?? optimisticRoutingSession,
      sessionHost,
    );
@@ -4753,7 +4761,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
    // Sub-agent routing is a separate knob with a different gate: a native CLI
    // can't per-turn route itself, but the sub-agents it spawns are routed per
    // spawn — where the launch actually installed that apparatus. See
-@@ -1222,6 +1228,7 @@ export function ChatPage() {
+@@ -1272,6 +1278,7 @@ export function ChatPage() {
        showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
        showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
        costRoutingEligible={costRoutingEligible}
@@ -4761,7 +4769,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
        subagentRoutingEligible={subagentRoutingEligible}
        subAgentLabel={subAgentLabel}
        wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
-@@ -1390,6 +1397,8 @@ interface MainAgentSurfaceProps {
+@@ -1444,6 +1451,8 @@ interface MainAgentSurfaceProps {
    showPollyCodexGoalControl?: boolean;
    /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
    costRoutingEligible: boolean;
@@ -4770,7 +4778,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
    /** Session passes `isSubagentRoutingSession` (top-level, native Claude/Codex or non-native). */
    subagentRoutingEligible: boolean;
    /**
-@@ -1550,6 +1559,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1606,6 +1615,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
    showClaudeGoalControl = false,
    showPollyCodexGoalControl = false,
    costRoutingEligible,
@@ -4778,7 +4786,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
    subagentRoutingEligible,
    subAgentLabel,
    wrapperLabel,
-@@ -1588,6 +1598,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1644,6 +1654,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
    // Cold selector (harness rarely changes) — gates the selection popup's "Ask
    // in side chat" action to harnesses that support side chat.
    const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
@@ -4786,7 +4794,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
  
    // Ref forwarded to SelectionPopup to scope selection detection to the
    // conversation area, preventing selections in the composer from triggering
-@@ -1808,7 +1819,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1864,7 +1875,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
            subscription and the bubble pipeline, so an SSE frame re-renders it
            alone — this surface's composer and chrome below bail out. */}
            <RunCommandsProvider
@@ -4799,15 +4807,15 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
            >
              <Transcript
                hostId={hostId}
-@@ -1882,6 +1897,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
-             }
+@@ -1940,6 +1955,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+             sendReconnectsArca={sendReconnectsArca}
              onShowReconnectHelp={onShowReconnectHelp}
              costRoutingEligible={costRoutingEligible}
 +            chatFeatureCatalog={chatFeatureCatalog}
              subagentRoutingEligible={subagentRoutingEligible}
              subAgentLabel={subAgentLabel}
              wrapperLabel={wrapperLabel}
-@@ -2033,6 +2049,8 @@ interface ComposerProps {
+@@ -2098,6 +2114,8 @@ interface ComposerProps {
    onShowReconnectHelp?: () => void;
    /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
    costRoutingEligible?: boolean;
@@ -4816,15 +4824,15 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
    /**
     * Session passes `isSubagentRoutingSession` — a top-level session that gets
     * the gear modal's "Subagent routing" row. Wider than `costRoutingEligible`:
-@@ -2365,6 +2383,7 @@ function ComposerImpl(
-     unreachable = false,
+@@ -2387,6 +2405,7 @@ function ComposerImpl(
+     sendReconnectsArca = false,
      onShowReconnectHelp,
      costRoutingEligible = false,
 +    chatFeatureCatalog = NO_CHAT_FEATURES,
      subAgentLabel = null,
      wrapperLabel = null,
      onViewportShrinkPinScroll,
-@@ -4386,6 +4405,7 @@ function ComposerImpl(
+@@ -4431,6 +4450,7 @@ function ComposerImpl(
                    modelLabelHostId={composerSession?.hostId}
                    costRoutingEligible={costRoutingEligible}
                    modelPickWakesSession={nativeTerminalSession && runnerOnline === false}
@@ -4832,7 +4840,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
                    // Config changes persist server-side and apply on the next
                    // wake/turn (the runner forward is best-effort), so the gear
                    // stays live wherever a message could be sent — including
-@@ -5050,6 +5070,7 @@ function SessionHarnessPicker({
+@@ -4871,6 +4891,7 @@ function SessionHarnessPicker({
    modelLabelHostId,
    costRoutingEligible,
    modelPickWakesSession,
@@ -4840,7 +4848,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
    disabled,
    openNonce = 0,
  }: {
-@@ -5071,6 +5092,7 @@ function SessionHarnessPicker({
+@@ -4893,6 +4914,7 @@ function SessionHarnessPicker({
    costRoutingEligible: boolean;
    /** A model pick must first wake this native session's runner, which can take a while. */
    modelPickWakesSession: boolean;
@@ -4848,7 +4856,7 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
    disabled: boolean;
    openNonce?: number;
  }) {
-@@ -5087,6 +5109,7 @@ function SessionHarnessPicker({
+@@ -4925,6 +4947,7 @@ function SessionHarnessPicker({
    const selectedEffort = useSessionEffort();
    const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
    const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -4856,10 +4864,14 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
    const {
      effectiveModel,
      modelLabel,
-@@ -5353,6 +5376,15 @@ function SessionHarnessPicker({
-               })
-             : []),
-           ...(accountSection ? [accountSection] : []),
+@@ -5317,7 +5340,19 @@ function SessionHarnessPicker({
+       <ComposerConfigSections
+         models={modelSection}
+         efforts={effortSection}
+-        extra={[...(fusionSections ?? []), ...(accountSection ? [accountSection] : [])]}
++        extra={[
++          ...(fusionSections ?? []),
++          ...(accountSection ? [accountSection] : []),
 +          ...buildChatFeatureSections({
 +            catalog: chatFeatureCatalog,
 +            enabled: sessionChatFeatures,
@@ -4869,11 +4881,12 @@ index 096ea0cb23dcf19ccfc3f17caee6413153d4f40a..a1450704fce48a8732cc83ff7403d6aa
 +            showRestartNote: chatFeaturesApplyOnRestart(sessionHarness),
 +            disabled: busy || pendingModelChange !== null,
 +          }),
-         ]}
++        ]}
        />
      </>
+   );
 diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
-index 1c061d016b7f5517e9080ceba7891fbc1534695c..392c967ca9350ec6aed8271e81a0736b9c72948b 100644
+index d599ff4d3016d0b95c376c3de41fac61cc19ef71..16be8456da1584713107f7c482b42953300bcbe0 100644
 --- a/web/src/pages/SettingsPage.test.tsx
 +++ b/web/src/pages/SettingsPage.test.tsx
 @@ -197,6 +197,10 @@ vi.mock("@/pages/MembersPage", () => ({
@@ -4888,7 +4901,7 @@ index 1c061d016b7f5517e9080ceba7891fbc1534695c..392c967ca9350ec6aed8271e81a0736b
    McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
  }));
 diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
-index a46d0969cb0bdd2bdf00058c8d67ada9dc78ab4b..4c163443c5a347a33fb24fc3a93f2cf79af1d2d1 100644
+index 376eeba24c8387a0f965729e42883a3b3ad37ae7..3d4c399b806be12d2ace9f4208200c355a008a53 100644
 --- a/web/src/pages/SettingsPage.tsx
 +++ b/web/src/pages/SettingsPage.tsx
 @@ -43,6 +43,7 @@ import {
@@ -4899,7 +4912,7 @@ index a46d0969cb0bdd2bdf00058c8d67ada9dc78ab4b..4c163443c5a347a33fb24fc3a93f2cf7
  import {
    ArchiveRestoreIcon,
    AlertTriangleIcon,
-@@ -1957,6 +1958,7 @@ function GeneralSection() {
+@@ -1984,6 +1985,7 @@ function GeneralSection() {
              <NewChatProjectPromptControl />
            </div>
          </SettingsGroup>
@@ -5297,7 +5310,7 @@ index 0000000000000000000000000000000000000000..31f5439d203b88e6fcb1c1e5b9effc80
 +  );
 +}
 diff --git a/web/src/shell/NewChatDialog.flow.test.tsx b/web/src/shell/NewChatDialog.flow.test.tsx
-index d8a1aa8bf4d2560a539a0e672c0d36b19e7c6840..a1127f9e1cd44b1549d41bf5f929959d8c0cb4b8 100644
+index 8ef11fb06fc0d04a6142bfa2a830177c9d26153b..ed3aa0d0206a91f7a65efae22775bb1fd5071776 100644
 --- a/web/src/shell/NewChatDialog.flow.test.tsx
 +++ b/web/src/shell/NewChatDialog.flow.test.tsx
 @@ -35,6 +35,7 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
@@ -5317,7 +5330,7 @@ index d8a1aa8bf4d2560a539a0e672c0d36b19e7c6840..a1127f9e1cd44b1549d41bf5f929959d
      // Sessions already on screen when the create starts. "Never seen by this
      // tab" is part of how the screen recognizes its own announced row, so the
 diff --git a/web/src/shell/NewChatDialog.projectPrefill.test.tsx b/web/src/shell/NewChatDialog.projectPrefill.test.tsx
-index 3b9f1fc9b5334485124764e1f7cc6817fce75b4a..fc9afcec1e7fd7fd8ffc54283dc9dd6ad3ca51bb 100644
+index 6240b53f7348a46f400d2397aa51152333f245f4..1d96065626f62d4282727ee4cc0ff190d30b3195 100644
 --- a/web/src/shell/NewChatDialog.projectPrefill.test.tsx
 +++ b/web/src/shell/NewChatDialog.projectPrefill.test.tsx
 @@ -32,6 +32,7 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
@@ -5353,10 +5366,10 @@ index 3b9f1fc9b5334485124764e1f7cc6817fce75b4a..fc9afcec1e7fd7fd8ffc54283dc9dd6a
      return (
        <QueryClientProvider client={client}>
 diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
-index eeeea8e11175b84673d1a54f58a7e67d6eb10ecf..2bf59c7fcefc99ccee698cfac1d6899ee132f123 100644
+index e9400b81365926157903508be5dfc9ecce2ffa6d..e03a90e7131bf70d921da8c4d1c0dce5080fd17c 100644
 --- a/web/src/shell/NewChatDialog.test.tsx
 +++ b/web/src/shell/NewChatDialog.test.tsx
-@@ -110,6 +110,13 @@ import {
+@@ -138,6 +138,13 @@ import {
  import { setPendingInitialPrompt } from "@/store/chatStore";
  import { clearSessionDrafts } from "@/lib/sessionDrafts";
  import { TooltipProvider } from "@/components/ui/tooltip";
@@ -5370,7 +5383,7 @@ index eeeea8e11175b84673d1a54f58a7e67d6eb10ecf..2bf59c7fcefc99ccee698cfac1d6899e
  
  describe("ComposerAddMenu", () => {
    it("groups real actions and opens the existing attachment picker only after selection", () => {
-@@ -1345,6 +1352,9 @@ function LandingNavigationProbe() {
+@@ -1375,6 +1382,9 @@ function LandingNavigationProbe() {
    );
  }
  
@@ -5380,7 +5393,7 @@ index eeeea8e11175b84673d1a54f58a7e67d6eb10ecf..2bf59c7fcefc99ccee698cfac1d6899e
  function renderLanding(
    infoOverrides: Partial<ServerInfo> = {},
    route = "/",
-@@ -1354,6 +1364,7 @@ function renderLanding(
+@@ -1384,6 +1394,7 @@ function renderLanding(
    const client = new QueryClient({
      defaultOptions: { queries: { retry: false } },
    });
@@ -5388,7 +5401,7 @@ index eeeea8e11175b84673d1a54f58a7e67d6eb10ecf..2bf59c7fcefc99ccee698cfac1d6899e
    const info: ServerInfo = {
      accounts_enabled: false,
      single_user: false,
-@@ -10416,6 +10427,75 @@ describe("NewChatLandingScreen smart routing", () => {
+@@ -10831,6 +10842,75 @@ describe("NewChatLandingScreen smart routing", () => {
    });
  });
  
@@ -5465,18 +5478,18 @@ index eeeea8e11175b84673d1a54f58a7e67d6eb10ecf..2bf59c7fcefc99ccee698cfac1d6899e
    beforeEach(() => {
      setupLandingMocks();
 diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
-index 07081008346470e5a11f217eed04e8a1b2199d25..b6ef5245a9e7f8945b9e06b38d288826d5e2188f 100644
+index 026e087729e86061f07f78dd11304940b9603211..41d98ffed04051553982dcc7ffdfa0689cec3d4e 100644
 --- a/web/src/shell/NewChatDialog.tsx
 +++ b/web/src/shell/NewChatDialog.tsx
-@@ -36,6 +36,7 @@ import {
-   PickerSectionHeader,
- } from "@/components/composer/HarnessMenuRow";
- import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+@@ -40,6 +40,7 @@ import {
+   type ComposerConfigSection,
+ } from "@/components/composer/ComposerConfigSections";
+ import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 +import { NewChatFeatureSection } from "@/components/composer/chatFeatureSections";
  import { buildFusionSections } from "@/components/composer/fusionSections";
  import {
    compactModelTriggerLabel,
-@@ -2708,6 +2709,10 @@ export function NewChatLandingScreen() {
+@@ -2756,6 +2757,10 @@ export function NewChatLandingScreen() {
      _setCostControlMode(mode);
      if (mode === "on") _setPickedModel("");
    }, []);
@@ -5487,9 +5500,9 @@ index 07081008346470e5a11f217eed04e8a1b2199d25..b6ef5245a9e7f8945b9e06b38d288826
    // Controls the working-directory popover so picking a directory closes it.
    const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
    const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
-@@ -4155,6 +4160,11 @@ export function NewChatLandingScreen() {
-             ...(accountSection ? [accountSection] : []),
-           ]}
+@@ -4217,6 +4222,11 @@ export function NewChatLandingScreen() {
+           efforts={effortSection}
+           extra={[...(fusionSections ?? []), ...(accountSection ? [accountSection] : [])]}
          />
 +        <NewChatFeatureSection
 +          picked={pickedChatFeatures}
@@ -5499,7 +5512,7 @@ index 07081008346470e5a11f217eed04e8a1b2199d25..b6ef5245a9e7f8945b9e06b38d288826
        </>
      ) : null;
    const hostModelCatalogs: Record<string, NativeModelOption[] | undefined> = {
-@@ -5796,6 +5806,7 @@ export function NewChatLandingScreen() {
+@@ -5920,6 +5930,7 @@ export function NewChatLandingScreen() {
          // A config-seeded workspace is omitted on a `project_id` create so the
          // server default-fills it (same field semantics as the JSON path).
          if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
@@ -5507,7 +5520,7 @@ index 07081008346470e5a11f217eed04e8a1b2199d25..b6ef5245a9e7f8945b9e06b38d288826
          if (createProjectId !== null) {
            // Atomic filing: the server sets first-class `project_id` at create.
            metadata.project_id = createProjectId;
-@@ -5846,6 +5857,7 @@ export function NewChatLandingScreen() {
+@@ -5970,6 +5981,7 @@ export function NewChatLandingScreen() {
                ? null
                : (selectedNativeHarness ?? pickedHarness ?? null),
              costControlModeOverride: costControlOverride ?? null,
@@ -5515,7 +5528,7 @@ index 07081008346470e5a11f217eed04e8a1b2199d25..b6ef5245a9e7f8945b9e06b38d288826
              boundAgentId: effectiveAgentId,
              // Name (not just id) so the in-session temp composer can evaluate
              // routing eligibility (isCostRoutingSession needs a bound agent).
-@@ -5951,6 +5963,7 @@ export function NewChatLandingScreen() {
+@@ -6075,6 +6087,7 @@ export function NewChatLandingScreen() {
            model_override: normalizedModelOverride ?? undefined,
            reasoning_effort: normalizedReasoningEffort ?? undefined,
            cost_control_mode_override: costControlOverride,
@@ -5524,10 +5537,10 @@ index 07081008346470e5a11f217eed04e8a1b2199d25..b6ef5245a9e7f8945b9e06b38d288826
            // path does; the server tells them apart by the bound agent being a
            // native wrapper, and routes at create time (the terminal launches
 diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
-index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771ec1245e7 100644
+index 98cb80032c7673bad1b95f205913eb4fc552f773..615d28e7a1c273df42008b001537cd3b2a84c680 100644
 --- a/web/src/store/chatStore.test.ts
 +++ b/web/src/store/chatStore.test.ts
-@@ -278,6 +278,8 @@ let sessionPendingInputs: Map<
+@@ -281,6 +281,8 @@ let sessionPendingInputs: Map<
  // absent key = unset (the wire field comes back null).
  let sessionCostControlOverrides: Map<string, "on" | "off">;
  let sessionSubagentRoutingOverrides: Map<string, "on" | "off">;
@@ -5536,7 +5549,7 @@ index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771
  // Per-session labels the snapshot/PATCH handlers serve.
  let sessionLabels: Map<string, Record<string, string>>;
  // Per-session MCP startup map the GET snapshot handler serves; absent key =
-@@ -353,6 +355,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
+@@ -356,6 +358,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
            runner_id?: string;
            cost_control_mode_override?: "on" | "off" | null;
            subagent_routing_override?: "on" | "off" | null;
@@ -5544,7 +5557,7 @@ index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771
            collaboration_mode?: string;
            approval_mode?: string;
          })
-@@ -374,6 +377,9 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
+@@ -377,6 +380,9 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
          sessionSubagentRoutingOverrides.set(sessionId, body.subagent_routing_override);
        }
      }
@@ -5554,7 +5567,7 @@ index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771
      if ("collaboration_mode" in body && typeof body.collaboration_mode === "string") {
        labels["omnigent.codex_native.collaboration_mode"] = body.collaboration_mode;
        sessionLabels.set(sessionId, labels);
-@@ -392,6 +398,9 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
+@@ -395,6 +401,9 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
        labels,
        cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
        subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
@@ -5564,7 +5577,7 @@ index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771
      });
    }
    if (snapshotMatch && (init?.method ?? "GET") === "GET") {
-@@ -407,6 +416,9 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
+@@ -410,6 +419,9 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
        pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
        cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
        subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
@@ -5574,7 +5587,7 @@ index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771
        mcp_startup: sessionMcpStartup.get(sessionId) ?? null,
        terminal_pending: sessionTerminalPending.get(sessionId) ?? false,
      });
-@@ -510,6 +522,7 @@ beforeEach(() => {
+@@ -513,6 +525,7 @@ beforeEach(() => {
    sessionPendingInputs = new Map();
    sessionCostControlOverrides = new Map();
    sessionSubagentRoutingOverrides = new Map();
@@ -5582,7 +5595,7 @@ index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771
    sessionLabels = new Map();
    sessionMcpStartup = new Map();
    sessionTerminalPending = new Map();
-@@ -16978,6 +16991,58 @@ describe("chatStore — setProvider", () => {
+@@ -17586,6 +17599,58 @@ describe("chatStore — setProvider", () => {
    });
  });
  
@@ -5642,7 +5655,7 @@ index 2fcc0e933fe0f1bce0008b9ce5bfc188e2c210d3..4936be97a01b9b7d6071b702c5cda771
  // ever read the bind-time snapshot would keep showing a stale value (the
  // "Default shown while 'on' is stored" mismatch). These pin the re-read.
 diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
-index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50462b2454 100644
+index 0cfcf9131eb475a3f2f08cc3b9e6323bb2a0ee35..7f08d4590d3807009bd9bf06ba77106ece92df8c 100644
 --- a/web/src/store/chatStore.ts
 +++ b/web/src/store/chatStore.ts
 @@ -84,6 +84,7 @@ import {
@@ -5653,7 +5666,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
  import { isStaleCursorError } from "@/lib/staleCursor";
  import type {
    McpServerStartup,
-@@ -330,6 +331,8 @@ export interface OptimisticSessionModel {
+@@ -338,6 +339,8 @@ export interface OptimisticSessionModel {
    costControlModeOverride?: "on" | "off" | null;
    /** The `subagent_routing_override` the create POSTs, when set. */
    subagentRoutingOverride?: "on" | "off" | null;
@@ -5662,7 +5675,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
    /** Bound agent identity for the composer, when resolved. */
    boundAgentId?: string | null;
    boundAgentName?: string | null;
-@@ -398,6 +401,7 @@ export function beginLocalConversation(
+@@ -406,6 +409,7 @@ export function beginLocalConversation(
            ...(model.subagentRoutingOverride !== undefined
              ? { subagentRoutingOverride: model.subagentRoutingOverride }
              : {}),
@@ -5670,7 +5683,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
          };
  
    const entry = conversationRegistry.acquire(tempConvId);
-@@ -827,6 +831,11 @@ export interface ConversationState {
+@@ -835,6 +839,11 @@ export interface ConversationState {
     * on bind and written through `setSubagentRouting`.
     */
    subagentRoutingOverride: "on" | "off" | null;
@@ -5682,7 +5695,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
    /**
     * Per-session Codex collaboration-mode flag. Hydrated from
     * ``omnigent.codex_native.collaboration_mode`` on bind and updated by the
-@@ -1336,6 +1345,12 @@ export interface ChatActions {
+@@ -1356,6 +1365,12 @@ export interface ChatActions {
     * unrouted sub-agents. No-ops when there is no active conversation.
     */
    setSubagentRouting: (mode: "on" | "off") => Promise<void>;
@@ -5695,7 +5708,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
    /**
     * Re-read the active session's routing switches (cost control + sub-agent
     * routing) from the server and apply them.
-@@ -2070,6 +2085,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+@@ -2150,6 +2165,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
    sessionHostId: null,
    costControlModeOverride: null,
    subagentRoutingOverride: null,
@@ -5703,7 +5716,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
    codexPlanMode: false,
    claudePermissionMode: "",
    codexApprovalMode: "",
-@@ -3594,6 +3610,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+@@ -3721,6 +3737,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
      }
    },
  
@@ -5726,7 +5739,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
    refreshSessionOverrides: async () => {
      const { conversationId } = get();
      if (!conversationId) return;
-@@ -4529,6 +4561,7 @@ function sessionBindingPatch(
+@@ -4701,6 +4733,7 @@ function sessionBindingPatch(
    | "subAgentName"
    | "costControlModeOverride"
    | "subagentRoutingOverride"
@@ -5734,7 +5747,7 @@ index 301a75a13f7e036919dc8a80c2c8bf58e2353b25..da6d6f84eba759679661033c63305c50
    | "codexPlanMode"
    | "claudePermissionMode"
    | "codexApprovalMode"
-@@ -4562,6 +4595,7 @@ function sessionBindingPatch(
+@@ -4734,6 +4767,7 @@ function sessionBindingPatch(
      subAgentName: session.subAgentName ?? null,
      costControlModeOverride: session.costControlModeOverride ?? null,
      subagentRoutingOverride: session.subagentRoutingOverride ?? null,

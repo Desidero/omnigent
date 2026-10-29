@@ -58,25 +58,25 @@ Signed-off-by: Desidero <desidero@gmail.com>
  openapi.json                                  |  11 +-
  ...test_session_create_project_consistency.py | 117 +++-
  .../routes/test_sessions_cost_labels.py       |  31 +-
- tests/server/routes/test_sessions_crud.py     |  70 ++-
- web/src/components/AgentInfo.test.tsx         | 127 +++++
+ tests/server/routes/test_sessions_crud.py     |  70 +-
+ web/src/components/AgentInfo.test.tsx         | 127 ++++
  web/src/components/AgentInfo.tsx              |  38 +-
- web/src/components/LabelEditor.tsx            | 323 +++++++++++
+ web/src/components/LabelEditor.tsx            | 323 ++++++++++
  .../components/composer/ComposerAddMenu.tsx   |  32 +-
  .../components/composer/NewSessionLabels.tsx  | 116 ++++
  web/src/hooks/useSessionLabels.ts             |  51 ++
  web/src/lib/projectsApi.ts                    |   9 +-
  web/src/lib/sessionLabels.test.ts             | 111 ++++
  web/src/lib/sessionLabels.ts                  |  92 +++
- web/src/lib/sessionListCache.test.ts          |  21 +
- web/src/lib/sessionListCache.ts               |  88 +--
+ web/src/lib/sessionListCache.test.ts          |  29 +
+ web/src/lib/sessionListCache.ts               | 103 +--
  web/src/lib/sessionsApi.ts                    |  10 +-
  .../NewChatDialog.projectCreate.test.tsx      |  43 +-
  web/src/shell/NewChatDialog.test.tsx          |  19 +
  web/src/shell/NewChatDialog.tsx               |  37 +-
- web/src/shell/ProjectSettingsDialog.test.tsx  | 162 +++++-
- web/src/shell/ProjectSettingsDialog.tsx       | 531 ++++++++++--------
- 30 files changed, 1863 insertions(+), 313 deletions(-)
+ web/src/shell/ProjectSettingsDialog.test.tsx  | 162 ++++-
+ web/src/shell/ProjectSettingsDialog.tsx       | 601 ++++++++++--------
+ 30 files changed, 1911 insertions(+), 358 deletions(-)
  create mode 100644 web/src/components/LabelEditor.tsx
  create mode 100644 web/src/components/composer/NewSessionLabels.tsx
  create mode 100644 web/src/hooks/useSessionLabels.ts
@@ -84,10 +84,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/sessionLabels.ts
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index cb81e352cee3d0194381b8feae9b0d8258298e1a..a4cbbf08c0cda9813df81a31316214a0bc733e8c 100644
+index e502b65f42e4be5cf1e2ae2f6d8b6649ce55bed5..8746259e7f5dddcf475f7d2025d11f58eac50555 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
-@@ -49,6 +49,12 @@ the header menu), and each place is a separate entry point.
+@@ -62,6 +62,12 @@ the header menu), and each place is a separate entry point.
    project folder from the row menu, the header menu, or the header's folder tag.
  - `project-rename`: the project menu opens a dialog with the name selected;
    typing replaces it without losing characters as the menu closes.
@@ -100,7 +100,7 @@ index cb81e352cee3d0194381b8feae9b0d8258298e1a..a4cbbf08c0cda9813df81a31316214a0
  - `bulk-actions`: select several rows, then mark as read or unread, archive,
    unarchive, or delete them.
  - `fork`: fork the whole session or from a message; the fork keeps images and
-@@ -201,6 +207,15 @@ session), archive or unarchive, and delete.
+@@ -225,6 +231,15 @@ session), archive or unarchive, and delete.
  **Project folder:** right-click its header or open its three-dot menu, then
  choose Rename project. Start typing as soon as the dialog opens.
  
@@ -116,7 +116,7 @@ index cb81e352cee3d0194381b8feae9b0d8258298e1a..a4cbbf08c0cda9813df81a31316214a0
  **Pinned section drag:** drag a pinned row onto another pinned row to reorder
  the Pinned section, or drop an unpinned row onto a pinned row to pin it into
  that slot.
-@@ -472,6 +487,18 @@ plain `uv run pytest`, which starts a private server for the test.
+@@ -555,6 +570,18 @@ plain `uv run pytest`, which starts a private server for the test.
    `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
    Repeat from the header menu's Add to project by hand and expect the row to
    regroup under that project.
@@ -136,10 +136,10 @@ index cb81e352cee3d0194381b8feae9b0d8258298e1a..a4cbbf08c0cda9813df81a31316214a0
    `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
  - **`project-rename`, project header right-click and three-dot menus:**
 diff --git a/omnigent/db/db_models.py b/omnigent/db/db_models.py
-index 14e8aaac8acba1284e44f68ea8ce1d0beb91a7ab..45d69882eb83b4bd21b41ed293e094af8b98a2bd 100644
+index da0b4c401c42378ddf3bb9094ea4cc322ec952be..340b3f7bcbf7323c463dd85037627575ea27b044 100644
 --- a/omnigent/db/db_models.py
 +++ b/omnigent/db/db_models.py
-@@ -991,6 +991,8 @@ class SqlConversationItem(ConversationBase):
+@@ -995,6 +995,8 @@ class SqlConversationItem(ConversationBase):
  # (and the session-status error-label path) can clamp values to fit instead
  # of letting an over-length write raise ``DataError`` on PostgreSQL.
  LABEL_VALUE_MAX_LEN = 256
@@ -148,7 +148,7 @@ index 14e8aaac8acba1284e44f68ea8ce1d0beb91a7ab..45d69882eb83b4bd21b41ed293e094af
  
  
  class SqlConversationLabel(ConversationBase):
-@@ -1037,7 +1039,7 @@ class SqlConversationLabel(ConversationBase):
+@@ -1041,7 +1043,7 @@ class SqlConversationLabel(ConversationBase):
          Uuid16(),
          primary_key=True,
      )
@@ -158,7 +158,7 @@ index 14e8aaac8acba1284e44f68ea8ce1d0beb91a7ab..45d69882eb83b4bd21b41ed293e094af
      updated_at: Mapped[int] = mapped_column(Integer)
  
 diff --git a/omnigent/server/API.md b/omnigent/server/API.md
-index 0459828226737cb5b0463cab4f0b8669cf8ee255..407e2337fffe9e795cb3ae7ad359c45bc81f4f7e 100644
+index c7434f9d43ff09fe9694ab3798b9c74ed2345c4b..fce98096e30ac99fa3ae4c541346d51ce8bd3b8a 100644
 --- a/omnigent/server/API.md
 +++ b/omnigent/server/API.md
 @@ -691,6 +691,13 @@ already uploaded or registered an agent. The response is the full
@@ -267,10 +267,10 @@ index 10d06fbc8043489ce904777c842034c26a7026d7..2aa10e28b7791505e9828d6b835a8b79
      resolved_data.update(updates)
      # Re-validate project hints because config is intentionally stored as
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index 359f2a83bb9d30bd664d3fc996635e63a82cab8e..4418d3cefcd552481cafa17f4c2ab6aa8b0bd20d 100644
+index 3d0bc77340162f9c0ffc1c0ece3de828c7186971..19273f386102ca8fb036f8329fc0b3a206dd2a70 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -10593,7 +10593,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
+@@ -10838,7 +10838,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
          )
  
  
@@ -293,10 +293,10 @@ index 8535ae950adb7f380358ce0aac17cd4661074f71..18bf827d9fccdb98da762e9f272236ef
                  IMPORT_SOURCE_LABEL_KEY: source,
                  IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index 80dcdde064171b76d61dfa012eb6d4aaa95c27b3..352ddb805781fefe599429e8c5e91b8e4470b4aa 100644
+index 1a77d78ed2c13914f10028780f28eea1659dd155..d72041855bb333d75c67089307d8fe98710c9fcf 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -2734,11 +2734,12 @@ def register_core_routes(
+@@ -2944,11 +2944,12 @@ def register_core_routes(
                      code=ErrorCode.INVALID_INPUT,
                  )
              requested_codex_approval_mode = body.approval_mode
@@ -311,7 +311,7 @@ index 80dcdde064171b76d61dfa012eb6d4aaa95c27b3..352ddb805781fefe599429e8c5e91b8e
          if PINNED_LABEL_KEY in labels_to_set:
              labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
          if requested_codex_collaboration_mode is not None:
-@@ -3333,30 +3334,29 @@ def register_core_routes(
+@@ -3582,30 +3583,29 @@ def register_core_routes(
                  _approval_result,
              )
              labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
@@ -357,10 +357,10 @@ index 80dcdde064171b76d61dfa012eb6d4aaa95c27b3..352ddb805781fefe599429e8c5e91b8e
          # Archiving means "get this out of my way", which contradicts a pin
          # ("keep it at the top"), so drop the archiver's own pin — otherwise the
 diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
-index fac60638a3ceb5569d13b71a5804c022f36ea98d..b804a65446249ff16aa0a023a81a849abf07913f 100644
+index 02479c47e396a5fd927f37d63e4e104471199d77..08881f9c96a07c38b0870ae1dbda31f79fd2e5a4 100644
 --- a/omnigent/server/schemas.py
 +++ b/omnigent/server/schemas.py
-@@ -1660,6 +1660,9 @@ class _SessionCreateRequestBase(BaseModel):
+@@ -1673,6 +1673,9 @@ class _SessionCreateRequestBase(BaseModel):
          real message after the create returns. ``None`` everywhere else,
          including the bundle-agent auto path, which routes on the first
          message event instead.
@@ -370,7 +370,7 @@ index fac60638a3ceb5569d13b71a5804c022f36ea98d..b804a65446249ff16aa0a023a81a849a
      """
  
      inference_configuration_revision: str | None = None
-@@ -1673,6 +1676,7 @@ class _SessionCreateRequestBase(BaseModel):
+@@ -1686,6 +1689,7 @@ class _SessionCreateRequestBase(BaseModel):
      mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
      title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
      labels: dict[str, str] = Field(default_factory=dict)
@@ -378,7 +378,7 @@ index fac60638a3ceb5569d13b71a5804c022f36ea98d..b804a65446249ff16aa0a023a81a849a
      parent_session_id: str | None = None
      sub_agent_name: str | None = None
      host_type: Literal["external", "managed"] = "external"
-@@ -1907,6 +1911,8 @@ class SessionCreateMetadata(BaseModel):
+@@ -1920,6 +1924,8 @@ class SessionCreateMetadata(BaseModel):
          provision on ``host_type: "managed"`` (one of the server's
          ``sandbox_providers``); ``None`` takes the server's first. Only
          valid with ``host_type: "managed"``.
@@ -387,7 +387,7 @@ index fac60638a3ceb5569d13b71a5804c022f36ea98d..b804a65446249ff16aa0a023a81a849a
      """
  
      inference_configuration_revision: str | None = None
-@@ -1916,6 +1922,7 @@ class SessionCreateMetadata(BaseModel):
+@@ -1929,6 +1935,7 @@ class SessionCreateMetadata(BaseModel):
      title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
      project_id: str | None = None
      labels: dict[str, str] = Field(default_factory=dict)
@@ -395,7 +395,7 @@ index fac60638a3ceb5569d13b71a5804c022f36ea98d..b804a65446249ff16aa0a023a81a849a
      reasoning_effort: str | None = None
      host_id: str | None = None
      workspace: str | None = None
-@@ -2484,7 +2491,9 @@ class UpdateSessionRequest(BaseModel):
+@@ -2500,7 +2507,9 @@ class UpdateSessionRequest(BaseModel):
      :param title: New title, e.g. ``"debugging auth flow"``.
          ``None`` leaves unchanged.
      :param labels: Guardrails labels to upsert. Merges with existing
@@ -406,7 +406,7 @@ index fac60638a3ceb5569d13b71a5804c022f36ea98d..b804a65446249ff16aa0a023a81a849a
      :param reasoning_effort: Per-session reasoning-effort hint.
          Accepted metadata values are ``"none"``, ``"minimal"``,
          ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
-@@ -2586,7 +2595,7 @@ class UpdateSessionRequest(BaseModel):
+@@ -2602,7 +2611,7 @@ class UpdateSessionRequest(BaseModel):
  
      runner_id: str | None = None
      title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -429,10 +429,10 @@ index 20aaadf64e88f0250355cf57f8bec965caeccc54..9482e5654c1c3bc31d2eaa303a162048
      Return the policy-owned ``cost_control.*`` keys present in *labels*.
  
 diff --git a/openapi.json b/openapi.json
-index 759ad12874e87fbce29d92518a11cad5709d9274..35f98fe8fe4417ca7654d5b53080599c4665c7ec 100644
+index 98bddd24fb0bb4adf98e267d4d2df35897809e26..af8f9a530ac9bbb30057c6e1cd1c94f04a3d7c8a 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -10005,7 +10005,14 @@
+@@ -10415,7 +10415,14 @@
              "anyOf": [
                {
                  "additionalProperties": {
@@ -448,7 +448,7 @@ index 759ad12874e87fbce29d92518a11cad5709d9274..35f98fe8fe4417ca7654d5b53080599c
                  },
                  "type": "object"
                },
-@@ -10013,7 +10020,7 @@
+@@ -10423,7 +10430,7 @@
                  "type": "null"
                }
              ],
@@ -776,7 +776,7 @@ index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..50d0f39e2b6aa47d9b98cfbde1f81762
  
  
 diff --git a/web/src/components/AgentInfo.test.tsx b/web/src/components/AgentInfo.test.tsx
-index 70276ffd0c7d1749ab1c338f8b149186b8080126..1ac5c1b68cc76ba636450e46b80f75e723d2b6d4 100644
+index 85e2d8a328881c1ea446d6ec376abc4d8e126d88..1de38bf3ec01934836bc4f980be08d78b0de888f 100644
 --- a/web/src/components/AgentInfo.test.tsx
 +++ b/web/src/components/AgentInfo.test.tsx
 @@ -58,6 +58,23 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
@@ -812,7 +812,7 @@ index 70276ffd0c7d1749ab1c338f8b149186b8080126..1ac5c1b68cc76ba636450e46b80f75e7
  });
  
  function renderButton(agent: Agent | undefined) {
-@@ -949,6 +968,114 @@ describe("SessionPoliciesSection", () => {
+@@ -953,6 +972,114 @@ describe("SessionPoliciesSection", () => {
    });
  });
  
@@ -928,7 +928,7 @@ index 70276ffd0c7d1749ab1c338f8b149186b8080126..1ac5c1b68cc76ba636450e46b80f75e7
    beforeEach(() => {
      createMcpMutate.mockClear();
 diff --git a/web/src/components/AgentInfo.tsx b/web/src/components/AgentInfo.tsx
-index 9ad67732aa21105d3ce6b70ebead6212d78e5bb5..4724cb2c4e85b46235b400c4bd18f95818143431 100644
+index f529af34f62978b4b06f00ff1b331e134901d426..29585c317cb1c237287243fcb0039a5d825633cb 100644
 --- a/web/src/components/AgentInfo.tsx
 +++ b/web/src/components/AgentInfo.tsx
 @@ -35,7 +35,7 @@ import {
@@ -1327,7 +1327,7 @@ index 0000000000000000000000000000000000000000..2636747097485a1a26698649007e74d1
 +  );
 +}
 diff --git a/web/src/components/composer/ComposerAddMenu.tsx b/web/src/components/composer/ComposerAddMenu.tsx
-index 785d7c49688664211f4106c230977efea5b780ab..80da9939b05456a0277a06987b11cd617123bc8c 100644
+index 836481c1ee2aacafac22e33f5aa33afb8e2e896f..75fb0ce52e3130de93fc32f9f5e2efda09970ba6 100644
 --- a/web/src/components/composer/ComposerAddMenu.tsx
 +++ b/web/src/components/composer/ComposerAddMenu.tsx
 @@ -5,6 +5,7 @@ import {
@@ -1338,7 +1338,7 @@ index 785d7c49688664211f4106c230977efea5b780ab..80da9939b05456a0277a06987b11cd61
    TargetIcon,
  } from "lucide-react";
  import { Button } from "@/components/ui/button";
-@@ -35,6 +36,8 @@ export function ComposerAddMenu({
+@@ -46,6 +47,8 @@ export function ComposerAddMenu({
    onSideChat,
    projects = EMPTY_PROJECTS,
    onProjectSelect,
@@ -1347,7 +1347,7 @@ index 785d7c49688664211f4106c230977efea5b780ab..80da9939b05456a0277a06987b11cd61
  }: {
    disabled: boolean;
    onAttach: () => void;
-@@ -55,10 +58,15 @@ export function ComposerAddMenu({
+@@ -66,10 +69,15 @@ export function ComposerAddMenu({
    onSideChat?: () => void;
    projects?: readonly { name: string }[];
    onProjectSelect?: (name: string) => void;
@@ -1363,7 +1363,7 @@ index 785d7c49688664211f4106c230977efea5b780ab..80da9939b05456a0277a06987b11cd61
    const triggerRef = useRef<HTMLButtonElement>(null);
    const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
    const measure = useCallback(() => {
-@@ -121,6 +129,10 @@ export function ComposerAddMenu({
+@@ -132,6 +140,10 @@ export function ComposerAddMenu({
              pendingGoalRef.current = false;
              requestAnimationFrame(() => onGoal?.());
            }
@@ -1374,7 +1374,7 @@ index 785d7c49688664211f4106c230977efea5b780ab..80da9939b05456a0277a06987b11cd61
          }}
          side="top"
          align="start"
-@@ -158,7 +170,7 @@ export function ComposerAddMenu({
+@@ -169,7 +181,7 @@ export function ComposerAddMenu({
                  <span>Files and images</span>
                </DropdownMenuItem>
              </div>
@@ -1383,8 +1383,8 @@ index 785d7c49688664211f4106c230977efea5b780ab..80da9939b05456a0277a06987b11cd61
                <div className="flex flex-col gap-0.5">
                  <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                  <div className="flex flex-col gap-px">
-@@ -210,6 +222,24 @@ export function ComposerAddMenu({
-                       </span>
+@@ -218,6 +230,24 @@ export function ComposerAddMenu({
+                       />
                      </DropdownMenuItem>
                    )}
 +                  {onLabels && (
@@ -1588,7 +1588,7 @@ index 0000000000000000000000000000000000000000..ba3e84ac2150b3f620cd527cccb7ff8f
 +  };
 +}
 diff --git a/web/src/lib/projectsApi.ts b/web/src/lib/projectsApi.ts
-index d0653595336fdec6386f6b6e6de16ded01eca0ee..5a21d4350a75ba3d617ed512fd1aaba8ceddddb4 100644
+index afa9435b64a7299b2c6a3799cc4ae0e39d346e72..029c46f046f88681fd21fa905afeac42e994f726 100644
 --- a/web/src/lib/projectsApi.ts
 +++ b/web/src/lib/projectsApi.ts
 @@ -17,7 +17,8 @@ import { apiErrorFromResponse } from "./sessionsApi";
@@ -1601,7 +1601,7 @@ index d0653595336fdec6386f6b6e6de16ded01eca0ee..5a21d4350a75ba3d617ed512fd1aaba8
   */
  export interface ProjectConfig {
    /** Default host id, or the sandbox sentinel. */
-@@ -57,6 +58,12 @@ export interface ProjectConfig {
+@@ -63,6 +64,12 @@ export interface ProjectConfig {
     * harness on it, the composer falls back to the host default and says so.
     */
    provider?: string;
@@ -1830,13 +1830,13 @@ index 0000000000000000000000000000000000000000..27ddff8e09be661e0e38f06a3a95bae3
 +  return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
 +}
 diff --git a/web/src/lib/sessionListCache.test.ts b/web/src/lib/sessionListCache.test.ts
-index cd9ae2723bb16210f30cb6c9793bfcf15d8023c2..b1bec2087a66b5fef9d808cc1e1ceb01e2b85272 100644
+index 2f8d59c2879f24c28196a5bdcd41356505169f16..a42e207570a828bb4e0a507047c956ddcd4dc3f7 100644
 --- a/web/src/lib/sessionListCache.test.ts
 +++ b/web/src/lib/sessionListCache.test.ts
-@@ -10,8 +10,10 @@ import {
-   mergeItemsIntoPages,
+@@ -12,8 +12,10 @@ import {
    nullsToUndefined,
    overlayArchivedIntoCaches,
+   overlayTitleIntoCaches,
 +  overlayLabelsIntoCaches,
    removeIdsFromPages,
  } from "./sessionListCache";
@@ -1844,7 +1844,7 @@ index cd9ae2723bb16210f30cb6c9793bfcf15d8023c2..b1bec2087a66b5fef9d808cc1e1ceb01
  
  function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
    return {
-@@ -463,6 +465,25 @@ describe("overlayArchivedIntoCaches", () => {
+@@ -532,6 +534,33 @@ describe("overlayArchivedIntoCaches", () => {
    });
  });
  
@@ -1854,14 +1854,22 @@ index cd9ae2723bb16210f30cb6c9793bfcf15d8023c2..b1bec2087a66b5fef9d808cc1e1ceb01
 +    const before = { team: "ml", "omnigent.wrapper": "claude" };
 +    const after = { env: "prod", "omnigent.wrapper": "claude" };
 +    qc.setQueryData(["conversations", "", false], data([conv("a", { labels: before })]));
-+    qc.setQueryData(["project-sessions", "proj"], data([conv("a", { labels: before })]));
++    qc.setQueryData(
++      ["project-sessions", "proj", "updated_at", false],
++      data([conv("a", { labels: before })]),
++    );
 +    qc.setQueryData(["session", "a"], { id: "a", labels: before } as unknown as Session);
 +
 +    overlayLabelsIntoCaches(qc, "a", after);
 +
 +    const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!;
 +    expect(list.pages[0].data[0].labels).toEqual(after);
-+    const folder = qc.getQueryData<ConversationsInfiniteData>(["project-sessions", "proj"])!;
++    const folder = qc.getQueryData<ConversationsInfiniteData>([
++      "project-sessions",
++      "proj",
++      "updated_at",
++      false,
++    ])!;
 +    expect(folder.pages[0].data[0].labels).toEqual(after);
 +    expect(qc.getQueryData<Session>(["session", "a"])!.labels).toEqual(after);
 +  });
@@ -1871,12 +1879,12 @@ index cd9ae2723bb16210f30cb6c9793bfcf15d8023c2..b1bec2087a66b5fef9d808cc1e1ceb01
    const candidate = (id: string, extra: Partial<Conversation> = {}) =>
      new Map<string, SessionListWireItem>([[id, { id, updated_at: 100, ...extra }]]);
 diff --git a/web/src/lib/sessionListCache.ts b/web/src/lib/sessionListCache.ts
-index 522e152f44e5ec0f1f04c28488cc6bfad2ddcd28..24a76f3ddb148e457af010085e9b14cf86448066 100644
+index 61975b2f0323d865fc1d781742d20449fee0b28b..552d71030dc06a8dff67755bd9bebab2fb33df50 100644
 --- a/web/src/lib/sessionListCache.ts
 +++ b/web/src/lib/sessionListCache.ts
-@@ -464,6 +464,33 @@ export function collectConversationIds(datas: (ConversationsInfiniteData | undef
-  */
- export const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+@@ -486,6 +486,38 @@ export function filtersFromProjectQueryKey(key: readonly unknown[]): Conversatio
+   };
+ }
  
 +/**
 + * Merge a partial wire row into the flat `["conversations"]` lists and the
@@ -1900,7 +1908,12 @@ index 522e152f44e5ec0f1f04c28488cc6bfad2ddcd28..24a76f3ddb148e457af010085e9b14cf
 +  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
 +    queryKey: ["project-sessions"],
 +  })) {
-+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
++    const { data: next } = mergeItemsIntoPages(
++      data,
++      itemsById,
++      filtersFromProjectQueryKey(key),
++      undefined,
++    );
 +    if (next !== data) queryClient.setQueryData(key, next);
 +  }
 +}
@@ -1908,7 +1921,7 @@ index 522e152f44e5ec0f1f04c28488cc6bfad2ddcd28..24a76f3ddb148e457af010085e9b14cf
  /**
   * Overlay a title into every cache that holds a row for one session.
   *
-@@ -496,26 +523,7 @@ export function overlayTitleIntoCaches(
+@@ -518,31 +550,7 @@ export function overlayTitleIntoCaches(
      title,
      ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
    };
@@ -1929,14 +1942,19 @@ index 522e152f44e5ec0f1f04c28488cc6bfad2ddcd28..24a76f3ddb148e457af010085e9b14cf
 -  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
 -    queryKey: ["project-sessions"],
 -  })) {
--    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+-    const { data: next } = mergeItemsIntoPages(
+-      data,
+-      itemsById,
+-      filtersFromProjectQueryKey(key),
+-      undefined,
+-    );
 -    if (next !== data) queryClient.setQueryData(key, next);
 -  }
 +  mergeWireIntoListCaches(queryClient, wire);
    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
      old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
    );
-@@ -546,25 +554,29 @@ export function overlayArchivedIntoCaches(
+@@ -573,30 +581,29 @@ export function overlayArchivedIntoCaches(
    id: string,
    archived: boolean,
  ): void {
@@ -1955,7 +1973,12 @@ index 522e152f44e5ec0f1f04c28488cc6bfad2ddcd28..24a76f3ddb148e457af010085e9b14cf
 -  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
 -    queryKey: ["project-sessions"],
 -  })) {
--    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+-    const { data: next } = mergeItemsIntoPages(
+-      data,
+-      itemsById,
+-      filtersFromProjectQueryKey(key),
+-      undefined,
+-    );
 -    if (next !== data) queryClient.setQueryData(key, next);
 -  }
 +  mergeWireIntoListCaches(queryClient, { id, archived });
@@ -1985,10 +2008,10 @@ index 522e152f44e5ec0f1f04c28488cc6bfad2ddcd28..24a76f3ddb148e457af010085e9b14cf
 +  queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
 +}
 diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
-index bad2fdb0f521dc9ebd13b1522ccb1e2b2b764efb..fa6b0bb7ce0505fb55783c67ee7fdbf0d2ff4c95 100644
+index ea757a3965fb9877a5508d8ddcbcd03d4dbdf834..a225516fe8787135c92b5186926a05c69eb6e332 100644
 --- a/web/src/lib/sessionsApi.ts
 +++ b/web/src/lib/sessionsApi.ts
-@@ -745,6 +745,7 @@ export async function createBundledSession(
+@@ -748,6 +748,7 @@ export async function createBundledSession(
      workspace?: string;
      project_id?: string;
      labels?: Record<string, string>;
@@ -1996,7 +2019,7 @@ index bad2fdb0f521dc9ebd13b1522ccb1e2b2b764efb..fa6b0bb7ce0505fb55783c67ee7fdbf0
      terminal_launch_args?: string[];
      git?: { branch_name: string; base_branch?: string };
      mcp_registry_services?: string[];
-@@ -1057,10 +1058,11 @@ export async function updateSession(
+@@ -1067,10 +1068,11 @@ export async function updateSession(
      shareWorkspaceFiles?: boolean;
      runnerId?: string;
      silent?: boolean;
@@ -2010,7 +2033,7 @@ index bad2fdb0f521dc9ebd13b1522ccb1e2b2b764efb..fa6b0bb7ce0505fb55783c67ee7fdbf0
    if ("reasoningEffort" in updates) {
      body.reasoning_effort = updates.reasoningEffort ?? "default";
    }
-@@ -1089,8 +1091,8 @@ export async function updateSession(
+@@ -1099,8 +1101,8 @@ export async function updateSession(
      body.runner_id = updates.runnerId;
    }
    if (updates.labels !== undefined) {
@@ -2083,10 +2106,10 @@ index b580b49ce8efeb18525b797bb019f157c31fcbb1..4f21243da6f334c6f4d263dc89eba5ec
      setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
      vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
 diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
-index 5a4853f2d2a8fe97a35ff088d5e2dc17e6505f52..eeeea8e11175b84673d1a54f58a7e67d6eb10ecf 100644
+index 01eac5b7ec630f1d5e6d897c93bc5570999e04a4..e9400b81365926157903508be5dfc9ecce2ffa6d 100644
 --- a/web/src/shell/NewChatDialog.test.tsx
 +++ b/web/src/shell/NewChatDialog.test.tsx
-@@ -158,6 +158,25 @@ describe("ComposerAddMenu", () => {
+@@ -187,6 +187,25 @@ describe("ComposerAddMenu", () => {
      expect(onProjectSelect).toHaveBeenCalledWith("docs");
    });
  
@@ -2113,10 +2136,10 @@ index 5a4853f2d2a8fe97a35ff088d5e2dc17e6505f52..eeeea8e11175b84673d1a54f58a7e67d
      const onPlan = vi.fn();
      render(
 diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
-index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1b2199d25 100644
+index 8fba969e357a73383d4913f6ac8699960a265452..026e087729e86061f07f78dd11304940b9603211 100644
 --- a/web/src/shell/NewChatDialog.tsx
 +++ b/web/src/shell/NewChatDialog.tsx
-@@ -54,6 +54,12 @@ import {
+@@ -58,6 +58,12 @@ import {
    ComposerSendButton,
  } from "@/components/composer/ChatComposer";
  import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
@@ -2129,7 +2152,7 @@ index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1
  import { useQuery, useQueryClient } from "@tanstack/react-query";
  import {
    MonitorCloudIcon,
-@@ -2624,6 +2630,13 @@ export function NewChatLandingScreen() {
+@@ -2672,6 +2678,13 @@ export function NewChatLandingScreen() {
    // Pre-filled from the `?project=` param so the sidebar's per-project
    // "new session" pencil lands here with the project already selected.
    const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
@@ -2143,7 +2166,7 @@ index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1
    // The landing screen stays mounted while the `?project=` param changes (e.g.
    // clicking a different project's pencil), so the lazy initializer above won't
    // re-run — sync the selection to the param whenever it changes.
-@@ -5773,7 +5786,10 @@ export function NewChatLandingScreen() {
+@@ -5897,7 +5910,10 @@ export function NewChatLandingScreen() {
        if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
          // Custom agents upload their bundle with the session, then launch on the host below.
          const bundle = await buildAgentBundle(pendingAgent);
@@ -2155,7 +2178,7 @@ index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1
          if (mcpServicesForLaunch.length) {
            metadata.mcp_registry_services = mcpServicesForLaunch;
          }
-@@ -5905,9 +5921,12 @@ export function NewChatLandingScreen() {
+@@ -6029,9 +6045,12 @@ export function NewChatLandingScreen() {
            // model would all describe a CLI the router may not pick. The
            // server stamps the routed wrapper's labels once it has rebound.
            labels: {
@@ -2168,7 +2191,7 @@ index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1
            // Permission / approval / cursor mode → CLI flag pair, persisted as
            // terminal_launch_args. Omitted for the default and non-native agents.
            terminal_launch_args: smartRoutingHarnessSelected
-@@ -6918,6 +6937,11 @@ export function NewChatLandingScreen() {
+@@ -7042,6 +7061,11 @@ export function NewChatLandingScreen() {
                  delivered as an "[Attached: <path>]" marker prepended to the
                  first message at create time. */}
                      <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
@@ -2180,7 +2203,7 @@ index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1
                      {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                      <ComposerAttachments files={files} onRemove={removeFile} />
                      {/* Rejected-attachment feedback: unsupported type or too large */}
-@@ -6952,6 +6976,8 @@ export function NewChatLandingScreen() {
+@@ -7076,6 +7100,8 @@ export function NewChatLandingScreen() {
                            (supportsPermissionMode && permissionMode === "plan") ||
                            (supportsCursorMode && cursorExecMode === "plan")
                          }
@@ -2189,7 +2212,7 @@ index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1
                          projects={projectList ?? []}
                          onProjectSelect={(name) => {
                            const params = new URLSearchParams(searchParams);
-@@ -7673,6 +7699,15 @@ export function NewChatLandingScreen() {
+@@ -7815,6 +7841,15 @@ export function NewChatLandingScreen() {
              : undefined
          }
        />
@@ -2206,7 +2229,7 @@ index 0fd2c9397e68ec13e86d541f76589d54a473ee05..07081008346470e5a11f217eed04e8a1
    );
  }
 diff --git a/web/src/shell/ProjectSettingsDialog.test.tsx b/web/src/shell/ProjectSettingsDialog.test.tsx
-index 0579f5df75942b7ef6b2f9cc71aed9e516544ef6..7efff875cd4eb03ada48b2db8610c3d0e9b883a1 100644
+index 210ce85da6db5e101b077516f74807d6fa69269b..141cc56680b67aa329ca1a49e9a87d3efac15aa5 100644
 --- a/web/src/shell/ProjectSettingsDialog.test.tsx
 +++ b/web/src/shell/ProjectSettingsDialog.test.tsx
 @@ -1,4 +1,4 @@
@@ -2396,16 +2419,16 @@ index 0579f5df75942b7ef6b2f9cc71aed9e516544ef6..7efff875cd4eb03ada48b2db8610c3d0
      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
      renderDialog();
 diff --git a/web/src/shell/ProjectSettingsDialog.tsx b/web/src/shell/ProjectSettingsDialog.tsx
-index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1af8b51ca6 100644
+index 5a8530d7108a6010f5d98c0119ddbe96d9bc59a2..1b4f712fef06bc58ab1e8f44ffe1fbfef0647d41 100644
 --- a/web/src/shell/ProjectSettingsDialog.tsx
 +++ b/web/src/shell/ProjectSettingsDialog.tsx
-@@ -12,12 +12,14 @@
- // harness stay per-agent run config, out of scope here. The host and agent
- // pickers reuse the composer's components; the working directory reuses its
- // filesystem browser (inline, so it scrolls inside the modal).
-+// Default labels are stamped on new sessions server-side at creation.
- // Fields are optional: an unset one stores no default (an absent key), and an
- // all-default dialog stores an empty config.
+@@ -1,11 +1,13 @@
+ // Project settings dialog: edits the stored defaults (`config`) the new-session
+ // composer prefills (host, workspace, agent, worktree and base branch, a model
+ // and effort for native harnesses, and the account — a host `providers:` entry —
+-// new sessions run on). An unset field stores no key.
++// new sessions run on), and default labels, which the server stamps on new
++// sessions at creation. An unset field stores no key.
  
  import { ChevronDownIcon } from "lucide-react";
  import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -2414,7 +2437,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
  import {
    Dialog,
    DialogContent,
-@@ -51,6 +53,7 @@ import {
+@@ -42,6 +44,7 @@ import {
  } from "@/lib/nativeCodingAgents";
  import type { ProjectConfig } from "@/lib/projectsApi";
  import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
@@ -2422,8 +2445,8 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
  import { AgentHarnessPicker } from "./NewChatDialog";
  import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
  
-@@ -144,6 +147,20 @@ export function ProjectSettingsDialog({
-   const [model, setModel] = useState<string>(NONE);
+@@ -138,6 +141,20 @@ export function ProjectSettingsDialog({
+   const [effort, setEffort] = useState<string>(NONE);
    // Default account (provider name); NONE runs on the host's default.
    const [provider, setProvider] = useState<string>(NONE);
 +  // Labels stamped on sessions created in the project; empty stores no key.
@@ -2443,16 +2466,16 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
    const [workspaceOpen, setWorkspaceOpen] = useState(false);
  
    // The agent picker and the host Select portal their dropdowns OUTSIDE
-@@ -195,6 +212,8 @@ export function ProjectSettingsDialog({
-     setAgentId(c.agent_id ?? null);
-     setModel(c.model ?? NONE);
+@@ -191,6 +208,8 @@ export function ProjectSettingsDialog({
+     // The server stores config untyped, so ignore a malformed effort.
+     setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
      setProvider(c.provider ?? NONE);
 +    setLabels(labelRecordFromUnknown(c.labels));
 +    setDiscardWarned(false);
      setWorkspaceOpen(false);
    }, [open, stored, loadFailed]);
  
-@@ -203,6 +222,15 @@ export function ProjectSettingsDialog({
+@@ -199,6 +218,15 @@ export function ProjectSettingsDialog({
      // Guard against submitting a blank draft seeded from a failed load, which
      // the server would read as "clear the stored defaults".
      if (loadFailed) return;
@@ -2468,7 +2491,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
      // Preserve config keys owned by other dialogs, then replace only the fields
      // this form edits.
      const config: ProjectConfig = { ...(stored ?? {}) };
-@@ -240,6 +268,8 @@ export function ProjectSettingsDialog({
+@@ -238,6 +266,8 @@ export function ProjectSettingsDialog({
      // A sandbox brings its own credentials, so a host account can't apply.
      if (provider !== NONE && hostId !== SANDBOX_HOST_CHOICE) config.provider = provider;
      else delete config.provider;
@@ -2477,7 +2500,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
  
      updateConfig.mutate(
        { id: projectId, name: projectName, config },
-@@ -333,10 +363,12 @@ export function ProjectSettingsDialog({
+@@ -366,10 +396,12 @@ export function ProjectSettingsDialog({
    const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
  
    return (
@@ -2492,7 +2515,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
          // Keep a nested dropdown's dismiss (pick an option, or click the modal
          // body while it's open) from closing the whole Dialog. See
          // `guardDialogDismiss`; real backdrop clicks and Escape still close.
-@@ -350,259 +382,300 @@ export function ProjectSettingsDialog({
+@@ -383,297 +415,338 @@ export function ProjectSettingsDialog({
              a starting point you can change per session; leave a field blank for no default.
            </DialogDescription>
          </DialogHeader>
@@ -2538,11 +2561,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -                  : "Absolute path on the host"
 -            }
 -            htmlFor="project-settings-workspace"
-+        <form onSubmit={onSubmit} className="contents">
-+          <div
-+            className="-mx-1 flex min-h-0 flex-col gap-4 overflow-y-auto px-1"
-+            data-testid="project-settings-body"
-           >
+-          >
 -            {hostId === NONE ? (
 -              // Mirror the new-session composer: the working directory can only
 -              // be chosen once a host is selected (the file browser lists
@@ -2559,62 +2578,14 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -              <div
 -                className="relative flex flex-col gap-1.5"
 -                data-testid="project-settings-workspace"
-+            <Field label="Host" hint="Where new sessions run by default">
-+              <Select
-+                value={hostId}
-+                onValueChange={setHostId}
-+                onOpenChange={onDropdownOpenChange}
-+                disabled={isLoading}
-               >
+-              >
 -                <button
 -                  type="button"
 -                  onClick={() => setWorkspaceOpen(true)}
 -                  aria-expanded={workspaceOpen}
 -                  disabled={isLoading}
 -                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-+                <SelectTrigger className="w-full" data-testid="project-settings-host">
-+                  <SelectValue placeholder="No default" />
-+                </SelectTrigger>
-+                <SelectContent>
-+                  <SelectItem value={NONE}>No default</SelectItem>
-+                  {managedSandboxesEnabled && (
-+                    <SelectItem value={SANDBOX_HOST_CHOICE}>
-+                      {sandboxOptionLabel(sandboxProvider)}
-+                    </SelectItem>
-+                  )}
-+                  {onlineHosts.map((h) => (
-+                    <SelectItem key={h.host_id} value={h.host_id}>
-+                      {h.name}
-+                    </SelectItem>
-+                  ))}
-+                  {storedHostMissing && (
-+                    <SelectItem value={hostId}>
-+                      {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
-+                    </SelectItem>
-+                  )}
-+                </SelectContent>
-+              </Select>
-+            </Field>
-+
-+            <Field
-+              label="Working directory"
-+              hint={
-+                hostId === NONE
-+                  ? "Pick a host first"
-+                  : browsableHostId
-+                    ? "Browse the host or type a path"
-+                    : "Absolute path on the host"
-+              }
-+              htmlFor="project-settings-workspace"
-+            >
-+              {hostId === NONE ? (
-+                // Mirror the new-session composer: the working directory can only
-+                // be chosen once a host is selected (the file browser lists
-+                // against a concrete host, and a path is host-relative anyway).
-+                <p
-+                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
-+                  data-testid="project-settings-workspace"
-                 >
+-                >
 -                  <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
 -                    {workspace || "Browse…"}
 -                  </span>
@@ -2622,38 +2593,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -                    className={`size-4 shrink-0 opacity-50 transition-transform ${
 -                      workspaceOpen ? "rotate-180" : ""
 -                    }`}
-+                  Pick a host first
-+                </p>
-+              ) : browsableHostId ? (
-+                // Browsing uses the shared full-screen picker; navigation is
-+                // provisional until the user confirms a folder.
-+                <div
-+                  className="relative flex flex-col gap-1.5"
-+                  data-testid="project-settings-workspace"
-+                >
-+                  <button
-+                    type="button"
-+                    onClick={() => setWorkspaceOpen(true)}
-+                    aria-expanded={workspaceOpen}
-+                    disabled={isLoading}
-+                    className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-+                  >
-+                    <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
-+                      {workspace || "Browse…"}
-+                    </span>
-+                    <ChevronDownIcon
-+                      className={`size-4 shrink-0 opacity-50 transition-transform ${
-+                        workspaceOpen ? "rotate-180" : ""
-+                      }`}
-+                    />
-+                  </button>
-+                  <WorkspacePickerDialog
-+                    open={workspaceOpen}
-+                    onOpenChange={setWorkspaceOpen}
-+                    hostId={browsableHostId}
-+                    initialPath={workspace}
-+                    onConfirm={setWorkspace}
-                   />
+-                  />
 -                </button>
 -                <WorkspacePickerDialog
 -                  open={workspaceOpen}
@@ -2661,19 +2601,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -                  hostId={browsableHostId}
 -                  initialPath={workspace}
 -                  onConfirm={setWorkspace}
-+                </div>
-+              ) : (
-+                // A host is picked but not browsable (sandbox / offline stored
-+                // host) — fall back to typing an absolute path.
-+                <input
-+                  id="project-settings-workspace"
-+                  data-testid="project-settings-workspace"
-+                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-+                  placeholder="/path/to/repo"
-+                  value={workspace}
-+                  onChange={(e) => setWorkspace(e.target.value)}
-+                  disabled={isLoading}
-                 />
+-                />
 -              </div>
 -            ) : (
 -              // A host is picked but not browsable (sandbox / offline stored
@@ -2693,7 +2621,11 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -          <Field
 -            label="Random worktree"
 -            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
--          >
++        <form onSubmit={onSubmit} className="contents">
++          <div
++            className="-mx-1 flex min-h-0 flex-col gap-4 overflow-y-auto px-1"
++            data-testid="project-settings-body"
+           >
 -            <div className="flex sm:justify-end">
 -              <Switch
 -                data-testid="project-settings-worktree"
@@ -2703,17 +2635,13 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -              />
 -            </div>
 -          </Field>
-+              )}
-+            </Field>
- 
+-
 -          {useWorktree && (
-             <Field
+-            <Field
 -              label="Base branch"
 -              hint="Branch new worktrees fork from; blank uses the current branch"
 -              htmlFor="project-settings-base-branch"
-+              label="Random worktree"
-+              hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
-             >
+-            >
 -              <input
 -                id="project-settings-base-branch"
 -                data-testid="project-settings-base-branch"
@@ -2723,17 +2651,9 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -                onChange={(e) => setBaseBranch(e.target.value)}
 -                disabled={isLoading}
 -              />
-+              <div className="flex sm:justify-end">
-+                <Switch
-+                  data-testid="project-settings-worktree"
-+                  checked={useWorktree}
-+                  onCheckedChange={setUseWorktree}
-+                  disabled={isLoading}
-+                />
-+              </div>
-             </Field>
+-            </Field>
 -          )}
- 
+-
 -          <Field label="Agent" hint="Default agent / harness for new sessions">
 -            <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
 -              <AgentHarnessPicker
@@ -2746,7 +2666,10 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -                onSelectAgent={(a) => {
 -                  // A model default belongs to the picked harness's vocab —
 -                  // don't carry an alias onto a different agent.
--                  if (a.id !== agentId) setModel(NONE);
+-                  if (a.id !== agentId) {
+-                    setModel(NONE);
+-                    setEffort(NONE);
+-                  }
 -                  setAgentId(a.id);
 -                }}
 -                pendingAgent={null}
@@ -2783,6 +2706,152 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -                  onClick={() => {
 -                    setAgentId(null);
 -                    setModel(NONE);
+-                    setEffort(NONE);
+-                  }}
+-                >
+-                  Clear
+-                </Button>
+-              )}
+-            </div>
+-          </Field>
+-
+-          {supportsModelDefault && (
+-            <Field
+-              label="Model"
+-              hint={
+-                modelPickerEmpty
+-                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
+-                  : "Default model for new sessions with this agent"
+-              }
+-            >
++            <Field label="Host" hint="Where new sessions run by default">
+               <Select
+-                value={model}
+-                onValueChange={selectModel}
++                value={hostId}
++                onValueChange={setHostId}
+                 onOpenChange={onDropdownOpenChange}
+-                disabled={isLoading || modelPickerEmpty}
++                disabled={isLoading}
+               >
+-                <SelectTrigger className="w-full" data-testid="project-settings-model">
++                <SelectTrigger className="w-full" data-testid="project-settings-host">
+                   <SelectValue placeholder="No default" />
+                 </SelectTrigger>
+                 <SelectContent>
+                   <SelectItem value={NONE}>No default</SelectItem>
+-                  {modelOptions.map((m) => (
+-                    <SelectItem key={m.id} value={m.id}>
+-                      {m.label}
++                  {managedSandboxesEnabled && (
++                    <SelectItem value={SANDBOX_HOST_CHOICE}>
++                      {sandboxOptionLabel(sandboxProvider)}
++                    </SelectItem>
++                  )}
++                  {onlineHosts.map((h) => (
++                    <SelectItem key={h.host_id} value={h.host_id}>
++                      {h.name}
+                     </SelectItem>
+                   ))}
+-                  {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
++                  {storedHostMissing && (
++                    <SelectItem value={hostId}>
++                      {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
++                    </SelectItem>
++                  )}
+                 </SelectContent>
+               </Select>
+             </Field>
+-          )}
+ 
+-          {supportsEffortDefault && (
+             <Field
+-              label="Effort"
++              label="Working directory"
+               hint={
+-                effortDropped
+-                  ? `The saved effort (${normalizeEffortLabel(effort)}) isn't available for this model; saving clears it.`
+-                  : effortPickerEmpty
+-                    ? "Pick a model or connect a host to see effort levels."
+-                    : "Default reasoning effort for new sessions with this agent"
++                hostId === NONE
++                  ? "Pick a host first"
++                  : browsableHostId
++                    ? "Browse the host or type a path"
++                    : "Absolute path on the host"
+               }
++              htmlFor="project-settings-workspace"
+             >
++              {hostId === NONE ? (
++                // Mirror the new-session composer: the working directory can only
++                // be chosen once a host is selected (the file browser lists
++                // against a concrete host, and a path is host-relative anyway).
++                <p
++                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
++                  data-testid="project-settings-workspace"
++                >
++                  Pick a host first
++                </p>
++              ) : browsableHostId ? (
++                // Browsing uses the shared full-screen picker; navigation is
++                // provisional until the user confirms a folder.
++                <div
++                  className="relative flex flex-col gap-1.5"
++                  data-testid="project-settings-workspace"
++                >
++                  <button
++                    type="button"
++                    onClick={() => setWorkspaceOpen(true)}
++                    aria-expanded={workspaceOpen}
++                    disabled={isLoading}
++                    className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
++                  >
++                    <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
++                      {workspace || "Browse…"}
++                    </span>
++                    <ChevronDownIcon
++                      className={`size-4 shrink-0 opacity-50 transition-transform ${
++                        workspaceOpen ? "rotate-180" : ""
++                      }`}
++                    />
++                  </button>
++                  <WorkspacePickerDialog
++                    open={workspaceOpen}
++                    onOpenChange={setWorkspaceOpen}
++                    hostId={browsableHostId}
++                    initialPath={workspace}
++                    onConfirm={setWorkspace}
++                  />
++                </div>
++              ) : (
++                // A host is picked but not browsable (sandbox / offline stored
++                // host) — fall back to typing an absolute path.
++                <input
++                  id="project-settings-workspace"
++                  data-testid="project-settings-workspace"
++                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
++                  placeholder="/path/to/repo"
++                  value={workspace}
++                  onChange={(e) => setWorkspace(e.target.value)}
++                  disabled={isLoading}
++                />
++              )}
++            </Field>
++
++            <Field
++              label="Random worktree"
++              hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
++            >
++              <div className="flex sm:justify-end">
++                <Switch
++                  data-testid="project-settings-worktree"
++                  checked={useWorktree}
++                  onCheckedChange={setUseWorktree}
++                  disabled={isLoading}
++                />
++              </div>
++            </Field>
++
 +            {useWorktree && (
 +              <Field
 +                label="Base branch"
@@ -2813,9 +2882,12 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 +                  onSelectAgent={(a) => {
 +                    // A model default belongs to the picked harness's vocab —
 +                    // don't carry an alias onto a different agent.
-+                    if (a.id !== agentId) setModel(NONE);
++                    if (a.id !== agentId) {
++                      setModel(NONE);
++                      setEffort(NONE);
++                    }
 +                    setAgentId(a.id);
-                   }}
++                  }}
 +                  pendingAgent={null}
 +                  pendingAgentId="__unused_pending_agent__"
 +                  onSelectPending={() => {}}
@@ -2850,6 +2922,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 +                    onClick={() => {
 +                      setAgentId(null);
 +                      setModel(NONE);
++                      setEffort(NONE);
 +                    }}
 +                  >
 +                    Clear
@@ -2869,15 +2942,10 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 +              >
 +                <Select
 +                  value={model}
-+                  onValueChange={setModel}
++                  onValueChange={selectModel}
 +                  onOpenChange={onDropdownOpenChange}
 +                  disabled={isLoading || modelPickerEmpty}
-                 >
--                  Clear
--                </Button>
--              )}
--            </div>
--          </Field>
++                >
 +                  <SelectTrigger className="w-full" data-testid="project-settings-model">
 +                    <SelectValue placeholder="No default" />
 +                  </SelectTrigger>
@@ -2893,39 +2961,64 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 +                </Select>
 +              </Field>
 +            )}
- 
--          {supportsModelDefault && (
--            <Field
--              label="Model"
--              hint={
--                modelPickerEmpty
--                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
--                  : "Default model for new sessions with this agent"
--              }
--            >
++
++            {supportsEffortDefault && (
++              <Field
++                label="Effort"
++                hint={
++                  effortDropped
++                    ? `The saved effort (${normalizeEffortLabel(effort)}) isn't available for this model; saving clears it.`
++                    : effortPickerEmpty
++                      ? "Pick a model or connect a host to see effort levels."
++                      : "Default reasoning effort for new sessions with this agent"
++                }
++              >
++                <Select
++                  value={effortValue}
++                  onValueChange={setEffort}
++                  onOpenChange={onDropdownOpenChange}
++                  disabled={isLoading || effortPickerEmpty}
++                >
++                  <SelectTrigger className="w-full" data-testid="project-settings-effort">
++                    <SelectValue placeholder="No default" />
++                  </SelectTrigger>
++                  <SelectContent>
++                    <SelectItem value={NONE}>No default</SelectItem>
++                    {(effortOptions ?? []).map((e) => (
++                      <SelectItem key={e.value} value={e.value}>
++                        {e.label}
++                      </SelectItem>
++                    ))}
++                    {storedEffortMissing && (
++                      <SelectItem value={effortValue}>{normalizeEffortLabel(effortValue)}</SelectItem>
++                    )}
++                  </SelectContent>
++                </Select>
++              </Field>
++            )}
 +            <Field label="Account" hint={accountHint}>
                <Select
--                value={model}
--                onValueChange={setModel}
+-                value={effortValue}
+-                onValueChange={setEffort}
 +                value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
 +                onValueChange={(v) => setProvider(v || NONE)}
                  onOpenChange={onDropdownOpenChange}
--                disabled={isLoading || modelPickerEmpty}
+-                disabled={isLoading || effortPickerEmpty}
 +                disabled={
 +                  isLoading ||
 +                  hostId === SANDBOX_HOST_CHOICE ||
 +                  (accountOptions.length === 0 && provider === NONE)
 +                }
                >
--                <SelectTrigger className="w-full" data-testid="project-settings-model">
+-                <SelectTrigger className="w-full" data-testid="project-settings-effort">
 +                <SelectTrigger className="w-full" data-testid="project-settings-account">
                    <SelectValue placeholder="No default" />
                  </SelectTrigger>
                  <SelectContent>
                    <SelectItem value={NONE}>No default</SelectItem>
--                  {modelOptions.map((m) => (
--                    <SelectItem key={m.id} value={m.id}>
--                      {m.label}
+-                  {(effortOptions ?? []).map((e) => (
+-                    <SelectItem key={e.value} value={e.value}>
+-                      {e.label}
 +                  {accountOptions.map((p) => (
 +                    <SelectItem
 +                      key={p.name}
@@ -2938,7 +3031,9 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 +                      {p.ready ? "" : " · not signed in"}
                      </SelectItem>
                    ))}
--                  {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
+-                  {storedEffortMissing && (
+-                    <SelectItem value={effortValue}>{normalizeEffortLabel(effortValue)}</SelectItem>
+-                  )}
 +                  {unlistedProviders.map((name) => (
 +                    <SelectItem key={name} value={name}>{`${name} (not listed here)`}</SelectItem>
 +                  ))}
@@ -2946,7 +3041,6 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
                </Select>
              </Field>
 -          )}
- 
 -          <Field label="Account" hint={accountHint}>
 -            <Select
 -              value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
@@ -2981,6 +3075,7 @@ index e2ab37b3ddeb6ef82efc297b69876e1d592581b8..466407de939ef15fc50077b4d1384e1a
 -              </SelectContent>
 -            </Select>
 -          </Field>
++
 +            <div className="flex flex-col gap-1.5" data-testid="project-settings-labels">
 +              <div className="flex flex-col">
 +                <span className="font-medium text-ui">Default labels</span>

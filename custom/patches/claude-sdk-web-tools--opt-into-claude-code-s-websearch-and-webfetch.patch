@@ -70,7 +70,7 @@ index 7734c5c0c9ed7367a823741a5e31f10ba0e4dd77..59b5eadb581ba41a8a99c5e4fed9e836
  
  `harness: antigravity` runs the agent through Google's
 diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
-index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee74187421e 100644
+index 9ef1e9621951bfc07e2b2ed90fec721703c75470..aee9d303486cf55a61d4e5304b785eee3734742d 100644
 --- a/omnigent/inner/claude_sdk_executor.py
 +++ b/omnigent/inner/claude_sdk_executor.py
 @@ -41,6 +41,7 @@ from contextlib import ExitStack, contextmanager, suppress
@@ -81,15 +81,15 @@ index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee7
  
  from omnigent._platform import resolve_cli_binary, stable_user_id
  from omnigent.claude_paths import claude_config_dir, claude_json_path
-@@ -63,6 +64,7 @@ from omnigent.models.claude_model_vocabulary import (
-     served_canonical_overrides,
+@@ -64,6 +65,7 @@ from omnigent.models.claude_model_vocabulary import (
  )
  from omnigent.models.model_metadata import concrete_reported_model
+ from omnigent.models.model_override import is_databricks_model_id
 +from omnigent.process_logging import env_truthy
  from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
  from omnigent.spec.types import RetryPolicy
  from omnigent.util.json_serialization import json_dumps_transport_safe
-@@ -822,6 +824,40 @@ def _kill_process_tree(process: _Process | None) -> None:
+@@ -824,6 +826,40 @@ def _kill_process_tree(process: _Process | None) -> None:
      _proc.kill_tree(process)
  
  
@@ -130,7 +130,7 @@ index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee7
  @contextmanager
  def _unset_env_var(name: str) -> Iterator[None]:
      """
-@@ -1689,6 +1725,7 @@ class ClaudeSDKExecutor(Executor):
+@@ -1712,6 +1748,7 @@ class ClaudeSDKExecutor(Executor):
          skills_filter: str | list[str] = "all",
          api_key_helper: str | None = None,
          system_prompt_preset: str | None = None,
@@ -138,7 +138,7 @@ index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee7
      ) -> None:
          """Create a ClaudeSDKExecutor.
  
-@@ -1764,6 +1801,10 @@ class ClaudeSDKExecutor(Executor):
+@@ -1787,6 +1824,10 @@ class ClaudeSDKExecutor(Executor):
                  Injected into ``_extra_env`` as
                  :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                  the SDK's ``settings.apiKeyHelper`` option at turn time.
@@ -147,9 +147,9 @@ index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee7
 +                still pass the TOOL_CALL policy gate, and are pre-approved
 +                in ``auto`` mode like Omnigent's own tools.
          """
-         # Fail loud: a ``databricks-*`` model requires the gateway transport.
-         if not gateway and model is not None and model.startswith("databricks-"):
-@@ -1793,6 +1834,7 @@ class ClaudeSDKExecutor(Executor):
+         # Fail loud: a Databricks model requires the gateway transport.
+         if not gateway and model is not None and is_databricks_model_id(model):
+@@ -1816,6 +1857,7 @@ class ClaudeSDKExecutor(Executor):
          self._bundle_dir = bundle_dir
          self._agent_name = agent_name
          self._skills_filter = skills_filter
@@ -157,7 +157,7 @@ index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee7
          # Write the bundle's plugin manifest now (idempotent) so that
          # ``--plugin-dir <bundle>`` produces clean
          # ``<agent-name>:<skill-name>`` labels in Claude's skill
-@@ -2585,6 +2627,11 @@ class ClaudeSDKExecutor(Executor):
+@@ -2607,6 +2649,11 @@ class ClaudeSDKExecutor(Executor):
          # never prompt; otherwise defer to the elicitation gate.
          if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
              return PermissionResultAllow()
@@ -169,7 +169,7 @@ index 5524d009954e96fdf8fdd010ed363c44bfc34812..36590b66022a07a90542bf6806b9bee7
          return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
  
      async def run_turn(
-@@ -2755,8 +2802,13 @@ class ClaudeSDKExecutor(Executor):
+@@ -2777,8 +2824,13 @@ class ClaudeSDKExecutor(Executor):
          # OS-environment tools are provided via Omnigent ``sys_os_*``
          # MCP tools (declared via ``os_env`` in the spec), not the
          # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
@@ -349,10 +349,10 @@ index 28eecfd7ba4d2b2aed546850e13cc84fecf8c9ce..13be407d2dcf5f1865492d88bdb1b48b
      return None
  
 diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
-index 76f3c043a735cb50336337e3c3b14ba82edad6c5..1935d7d3491f46f1d80b4c8909675078f9e7078e 100644
+index 4230c3778b67aad8634c79f1f102c63f8a9c8b67..2fe3286a6a598050e6ee05409734d70590b7761e 100644
 --- a/omnigent/runtime/workflow.py
 +++ b/omnigent/runtime/workflow.py
-@@ -1448,6 +1448,10 @@ def _build_claude_sdk_spawn_env(
+@@ -1449,6 +1449,10 @@ def _build_claude_sdk_spawn_env(
      # Explicitly clear inherited presets for agents that have not opted in.
      preset = spec.executor.config.get("system_prompt_preset")
      env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
@@ -434,10 +434,10 @@ index c12722c51ad7f77b4158ea704ae8f169e375e5f7..e27f79b197da78b965dc2b37331dbaea
  
  # Copy the resolver dict onto the subclass before mutating — it's inherited
 diff --git a/tests/inner/test_claude_sdk_executor.py b/tests/inner/test_claude_sdk_executor.py
-index 2c3d7c8407b7dc92fb4212a25b20a006bd9a9814..82cc0ce66ad8a8ab27137fd88f023069f908c9e0 100644
+index 290cc01e4f6676a57184e3d9bfbb0972a2b2522c..69c74f1baa07b45e32fd741fccf6922b6b818181 100644
 --- a/tests/inner/test_claude_sdk_executor.py
 +++ b/tests/inner/test_claude_sdk_executor.py
-@@ -3516,6 +3516,53 @@ def test_unset_env_var_restores_on_exception(monkeypatch):
+@@ -3559,6 +3559,53 @@ def test_unset_env_var_restores_on_exception(monkeypatch):
      assert os.environ["CLAUDECODE"] == "original"
  
  
@@ -491,7 +491,7 @@ index 2c3d7c8407b7dc92fb4212a25b20a006bd9a9814..82cc0ce66ad8a8ab27137fd88f023069
  def test_databricks_model_without_routing_raises() -> None:
      """``databricks-*`` model with ``gateway=False`` raises ``ValueError``.
  
-@@ -5144,6 +5191,88 @@ class TestToolCallPolicyGate(unittest.TestCase):
+@@ -5187,6 +5234,88 @@ class TestToolCallPolicyGate(unittest.TestCase):
  
          _run(_t())
  

@@ -28,8 +28,8 @@ Signed-off-by: Desidero <desidero@gmail.com>
 Docs: none (performance: history pages carry tool-output previews and expanding a tool row loads the rest; no setting)
 ---
  web/src/components/blocks/BlockRenderer.tsx |   2 +
- web/src/components/blocks/ToolCard.test.ts  |  68 +++++++++++-
- web/src/components/blocks/ToolCard.tsx      |  85 +++++++++++++-
+ web/src/components/blocks/ToolCard.test.ts  |  64 +++++++++++
+ web/src/components/blocks/ToolCard.tsx      |  87 ++++++++++++++-
  web/src/lib/blocks.ts                       |   2 +
  web/src/lib/conversationItems.ts            |   5 +
  web/src/lib/itemsToBlocks.test.ts           |  40 +++++++
@@ -40,13 +40,13 @@ Docs: none (performance: history pages carry tool-output previews and expanding 
  web/src/lib/sessionsApi.ts                  |  85 +++++++++++++-
  web/src/store/chatStore.test.ts             |  82 ++++++++++++++
  web/src/store/chatStore.ts                  |  75 ++++++++++++-
- 13 files changed, 628 insertions(+), 14 deletions(-)
+ 13 files changed, 626 insertions(+), 14 deletions(-)
 
 diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
-index efe793260a1b39e028216e9fa4b044b77aa4336c..a481d5faa3d781c064f44f1b9216c28f40f18f8b 100644
+index 937aaf1cd484367b3ff1b633df69d165379b9ccc..770e139e24ad32cd5bbc7deab1be8f8c8bc68c5d 100644
 --- a/web/src/components/blocks/BlockRenderer.tsx
 +++ b/web/src/components/blocks/BlockRenderer.tsx
-@@ -798,6 +798,8 @@ function renderItem(
+@@ -916,6 +916,8 @@ function renderItem(
            state={item.state}
            startedAt={item.startedAt}
            duration={item.duration}
@@ -56,28 +56,34 @@ index efe793260a1b39e028216e9fa4b044b77aa4336c..a481d5faa3d781c064f44f1b9216c28f
        );
      case "native_tool":
 diff --git a/web/src/components/blocks/ToolCard.test.ts b/web/src/components/blocks/ToolCard.test.ts
-index 507d5cdcb9916c66b43c0bd2f6a3ca3301c4da54..fa56de80a9f112ad8617c4866c6f16961194da44 100644
+index c3eac5ee07e83aa62f28e2742fb50a5a1a7368aa..25a1d82200db0d682dffd0ce0e84787c31ffbbe6 100644
 --- a/web/src/components/blocks/ToolCard.test.ts
 +++ b/web/src/components/blocks/ToolCard.test.ts
-@@ -4,9 +4,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
- import { TooltipProvider } from "@/components/ui/tooltip";
+@@ -5,11 +5,14 @@ import { TooltipProvider } from "@/components/ui/tooltip";
  import { FileViewerContext } from "@/shell/FileViewerContext";
  import type { RenderItem } from "@/lib/renderItems";
+ import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
 +import { useChatStore } from "@/store/chatStore";
- import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
+ import { ToolCard, ToolGroupSummary, formatToolDuration } from "./ToolCard";
+ import { getOutputPreview } from "./ToolCodePanel";
+ import type * as ToolViewsModule from "./toolViews";
+ import type { ToolView } from "./toolViews";
  
--afterEach(cleanup);
 +const realLoadToolOutput = useChatStore.getState().loadToolOutput;
 +
-+afterEach(() => {
-+  cleanup();
+ // Tests register the views they exercise here, in place of the real registry.
+ const registeredViews = vi.hoisted(() => new Map<string, ToolView>());
+ vi.mock("./toolViews", () => ({ toolViewFor: (name: string) => registeredViews.get(name) }));
+@@ -17,6 +20,7 @@ vi.mock("./toolViews", () => ({ toolViewFor: (name: string) => registeredViews.g
+ afterEach(() => {
+   cleanup();
+   registeredViews.clear();
 +  useChatStore.setState({ loadToolOutput: realLoadToolOutput });
-+});
+ });
  
  // Render helper: ToolCard reads a Tooltip (trigger title) so it needs the
- // TooltipProvider; createElement keeps this in a .ts file without JSX.
-@@ -123,6 +129,66 @@ describe("ToolCard rendering", () => {
-     expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+@@ -343,6 +347,66 @@ describe("ToolCard rendering", () => {
+     expect(screen.getByTestId("tool-error-box")).toHaveTextContent("permission denied");
    });
  
 +  it("fetches the full output once when a lean-page preview row is expanded", async () => {
@@ -144,26 +150,35 @@ index 507d5cdcb9916c66b43c0bd2f6a3ca3301c4da54..fa56de80a9f112ad8617c4866c6f1696
      // WHY: a running tool (input-available, output null) shows the
      // waiting-for-output indicator, not an empty/error panel.
 diff --git a/web/src/components/blocks/ToolCard.tsx b/web/src/components/blocks/ToolCard.tsx
-index 70dbe93fd043102fecb8a1b7acd2f5eee630c2c0..8b617668a77c99943a1f80bc75126c719318d4b1 100644
+index 0bbed43460cd4f1821e1f3bcaadd07b2ba4a83a2..979d77ad5d093bb8be0c0dbbcfc1b3aec20cd7f0 100644
 --- a/web/src/components/blocks/ToolCard.tsx
 +++ b/web/src/components/blocks/ToolCard.tsx
-@@ -27,6 +27,7 @@ import {
-   CodeBlockHeader,
-   CodeBlockTitle,
+@@ -4,7 +4,7 @@
+ 
+ import { ChevronRightIcon, CircleSlashIcon, Loader2Icon, XCircleIcon } from "lucide-react";
+ import type { CSSProperties, ReactNode } from "react";
+-import { useEffect, useMemo, useState } from "react";
++import { useCallback, useEffect, useMemo, useState } from "react";
+ import {
+   CodeBlockActions,
+   type CodeColorScheme,
+@@ -12,6 +12,7 @@ import {
+   CodeBlockContainer,
+   CodeBlockContent,
  } from "@/components/ai-elements/code-block";
 +import { useScopedConversationId } from "@/components/chat/conversationScope";
- import { Button } from "@/components/ui/button";
- import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
- import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-@@ -45,6 +46,7 @@ import {
- } from "@/lib/toolTitle";
+ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+ import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
+ import { Badge } from "@/components/ui/badge";
+@@ -44,6 +45,7 @@ import {
+ } from "@/lib/toolValue";
  import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
  import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 +import { useChatStore } from "@/store/chatStore";
- 
- const OUTPUT_PREVIEW_LINE_LIMIT = 80;
- const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
-@@ -168,8 +170,17 @@ interface ToolCardProps {
+ import {
+   DIFF_TONE_CLASS,
+   CodePanel,
+@@ -120,8 +122,17 @@ interface ToolCardProps {
    startedAt?: number | null;
    /** Completed runtime in seconds. Undefined when historical data lacks timing. */
    duration?: number;
@@ -181,16 +196,16 @@ index 70dbe93fd043102fecb8a1b7acd2f5eee630c2c0..8b617668a77c99943a1f80bc75126c71
  export function ToolCard({
    name,
    nativeToolType,
-@@ -179,6 +190,8 @@ export function ToolCard({
+@@ -130,6 +141,8 @@ export function ToolCard({
    state,
    startedAt,
    duration,
 +  resultItemId,
 +  truncatedOutputLength,
  }: ToolCardProps) {
-   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
-   const shellCall = useMemo(() => shellToolCall(name, args), [name, args]);
-@@ -199,8 +212,26 @@ export function ToolCard({
+   const view = toolViewFor(name);
+   const call = useMemo<ToolCall>(
+@@ -153,8 +166,26 @@ export function ToolCard({
        : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
    const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
  
@@ -217,11 +232,11 @@ index 70dbe93fd043102fecb8a1b7acd2f5eee630c2c0..8b617668a77c99943a1f80bc75126c71
 +    <Collapsible defaultOpen={false} onOpenChange={onOpenChange} className="group not-prose w-full">
        <ToolTriggerRow
          title={title}
-         name={name}
-@@ -238,11 +269,61 @@ export function ToolCard({
-           (state === "output-error" || state === "cancelled" || state === "no-output") && (
-             <EmptyOutputState state={state} />
-           )}
+         displayPath={linkPath}
+@@ -168,11 +199,61 @@ export function ToolCard({
+       {/* The whole body, code panels included, sits on the Interface font's caption step. */}
+       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 text-sm [&_code]:text-sm [&_pre]:text-sm data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+         <DefaultToolBody call={call} duration={displayDuration} view={view} />
 +        {isOutputPreview && output !== null && (
 +          <OutputPreviewNotice
 +            shownChars={output.length}
@@ -277,10 +292,10 @@ index 70dbe93fd043102fecb8a1b7acd2f5eee630c2c0..8b617668a77c99943a1f80bc75126c71
 +  );
 +}
 +
- /**
-  * Render the folded (older) part of a contiguous tool run as one muted
-  * summary line ("Read 2 files"). Clicking expands to show each tool as
-@@ -276,6 +357,8 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
+ interface ToolCardBodyProps extends ToolBodyProps {
+   view: ToolView | undefined;
+ }
+@@ -430,6 +511,8 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
                  state={item.state}
                  startedAt={item.startedAt}
                  duration={item.duration}
@@ -290,10 +305,10 @@ index 70dbe93fd043102fecb8a1b7acd2f5eee630c2c0..8b617668a77c99943a1f80bc75126c71
              );
            }
 diff --git a/web/src/lib/blocks.ts b/web/src/lib/blocks.ts
-index c771be8f2bf0a37741a12a40a9e16c4df4f50b46..363b3dc18afa94b20f21e0f287cf9b97c363f0e6 100644
+index 13c3533b538dc69b2bb1745c33ff1afc9058f817..c70999ce73a50d4d759f6bec0c9c373ae43f0eb7 100644
 --- a/web/src/lib/blocks.ts
 +++ b/web/src/lib/blocks.ts
-@@ -266,6 +266,8 @@ export interface ToolResultBlock {
+@@ -267,6 +267,8 @@ export interface ToolResultBlock {
    callId: string;
    agentName: string;
    output: string;
@@ -303,10 +318,10 @@ index c771be8f2bf0a37741a12a40a9e16c4df4f50b46..363b3dc18afa94b20f21e0f287cf9b97
  
  /** A provider-native tool output (web_search, mcp, etc.). */
 diff --git a/web/src/lib/conversationItems.ts b/web/src/lib/conversationItems.ts
-index 9ba1103e97b50bfae5879d408d4bdcac1cbe4681..0efa7b679860cea50670018be1b873672c9fb64f 100644
+index 6eac60794c7d86b3e37a69bf1cdca46a08521567..0586f41fbb22fd31f78da9bc769d03fa6b66da68 100644
 --- a/web/src/lib/conversationItems.ts
 +++ b/web/src/lib/conversationItems.ts
-@@ -54,7 +54,12 @@ export interface FunctionCallItem extends BaseItem {
+@@ -66,7 +66,12 @@ export interface FunctionCallItem extends BaseItem {
  export interface FunctionCallOutputItem extends BaseItem {
    type: "function_call_output";
    call_id: string;
@@ -320,10 +335,10 @@ index 9ba1103e97b50bfae5879d408d4bdcac1cbe4681..0efa7b679860cea50670018be1b87367
  
  /**
 diff --git a/web/src/lib/itemsToBlocks.test.ts b/web/src/lib/itemsToBlocks.test.ts
-index 167bab501281cd92e0bd9e83016db5ef89636d64..c6789f244edbef9f1f9b8740b53b74a067954ddd 100644
+index 1ef3522b52e841c25c3b460e82a71297fd8fa2be..12bb0e7fbcf2fc8e59d4455a962e02706873ce22 100644
 --- a/web/src/lib/itemsToBlocks.test.ts
 +++ b/web/src/lib/itemsToBlocks.test.ts
-@@ -545,6 +545,26 @@ describe("itemsToBlocks — tool calls", () => {
+@@ -566,6 +566,26 @@ describe("itemsToBlocks — tool calls", () => {
      expect(result.output).toBe("12:00:00 UTC");
    });
  
@@ -350,7 +365,7 @@ index 167bab501281cd92e0bd9e83016db5ef89636d64..c6789f244edbef9f1f9b8740b53b74a0
    it("multiple tool calls in one response_id stay flat (no bubble boundary)", () => {
      const items: ConversationItem[] = [
        userMessage("resp_1", "Read three files"),
-@@ -655,6 +675,26 @@ describe("itemsToBlocks — answered question and plan cards", () => {
+@@ -676,6 +696,26 @@ describe("itemsToBlocks — answered question and plan cards", () => {
      });
    });
  
@@ -378,10 +393,10 @@ index 167bab501281cd92e0bd9e83016db5ef89636d64..c6789f244edbef9f1f9b8740b53b74a0
      // No output yet (still parked, or the pair split across history pages):
      // the live snapshot owns the pending card, and a rebuilt one would have
 diff --git a/web/src/lib/itemsToBlocks.ts b/web/src/lib/itemsToBlocks.ts
-index d1afe524a51695a7955e82ba4b1288046db97c94..1f11ad5da19bc74595d969478b61d6994c462060 100644
+index 8049ebb9e9095af11dec8b4fb0c7befccbfdd186..271df5d4b1df96d6ece8947854e1f25819ae507a 100644
 --- a/web/src/lib/itemsToBlocks.ts
 +++ b/web/src/lib/itemsToBlocks.ts
-@@ -74,6 +74,18 @@ import { readSubagentActivity } from "./subagentActivity";
+@@ -75,6 +75,18 @@ import { readSubagentActivity } from "./subagentActivity";
  const ASK_USER_QUESTION_TOOL = "AskUserQuestion";
  const EXIT_PLAN_MODE_TOOL = "ExitPlanMode";
  
@@ -400,7 +415,7 @@ index d1afe524a51695a7955e82ba4b1288046db97c94..1f11ad5da19bc74595d969478b61d699
  // Claude Code's ExitPlanMode result opens with this when the user
  // approved; a rejection returns the feedback they typed instead.
  const PLAN_APPROVED_PREFIX = "User has approved your plan";
-@@ -139,7 +151,11 @@ function agentNamesByResponseId(items: ConversationItem[]): Map<string, string |
+@@ -140,7 +152,11 @@ function agentNamesByResponseId(items: ConversationItem[]): Map<string, string |
  function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
    const outputs = new Map<string, string>();
    for (const item of items) {
@@ -413,7 +428,7 @@ index d1afe524a51695a7955e82ba4b1288046db97c94..1f11ad5da19bc74595d969478b61d699
    }
    return outputs;
  }
-@@ -401,6 +417,9 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
+@@ -404,6 +420,9 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
      callId: item.call_id,
      agentName: ctx.agent ?? "",
      output: item.output,
@@ -424,7 +439,7 @@ index d1afe524a51695a7955e82ba4b1288046db97c94..1f11ad5da19bc74595d969478b61d699
  }
  
 diff --git a/web/src/lib/renderItems.test.ts b/web/src/lib/renderItems.test.ts
-index 9e93843c250240fe7848fd0449f18dac876b52e3..0a129b759b7918a226bfb2327d799faed96e3605 100644
+index 696e352a684cd30469bff1d40ce72825cef5a6ac..43a500516b2c2f764d453939ecd21463ab562cd7 100644
 --- a/web/src/lib/renderItems.test.ts
 +++ b/web/src/lib/renderItems.test.ts
 @@ -6,7 +6,13 @@
@@ -442,7 +457,7 @@ index 9e93843c250240fe7848fd0449f18dac876b52e3..0a129b759b7918a226bfb2327d799fae
  import { BlockStream } from "./blockStream";
  import type { ConversationItem } from "./conversationItems";
  import type { StreamEvent } from "./events";
-@@ -1404,6 +1410,40 @@ describe("buildBubbles — tool joining", () => {
+@@ -1574,6 +1580,40 @@ describe("buildBubbles — tool joining", () => {
      expect(t.duration).toBe(2.25);
    });
  
@@ -484,10 +499,10 @@ index 9e93843c250240fe7848fd0449f18dac876b52e3..0a129b759b7918a226bfb2327d799fae
      const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
      const blocks: AnyBlock[] = [
 diff --git a/web/src/lib/renderItems.ts b/web/src/lib/renderItems.ts
-index 7e3b2c61c31d09eba6b22a0f94484ee1bfdf0763..3c0a3d8aef4f507d208557ea19b3dfa8f1127cb7 100644
+index a10858132496b1010bfd0c8da7467575de3ee8a0..a7319160bfd8a0ecd0bb9040cb6f7ab0032e5d23 100644
 --- a/web/src/lib/renderItems.ts
 +++ b/web/src/lib/renderItems.ts
-@@ -90,6 +90,10 @@ export type RenderItem =
+@@ -93,6 +93,10 @@ export type RenderItem =
        state: ToolState;
        startedAt: number | null;
        duration: number | undefined;
@@ -498,7 +513,7 @@ index 7e3b2c61c31d09eba6b22a0f94484ee1bfdf0763..3c0a3d8aef4f507d208557ea19b3dfa8
      }
    | {
        kind: "native_tool";
-@@ -1819,7 +1823,20 @@ function toolItem(
+@@ -1912,7 +1916,20 @@ function toolItem(
      state = "no-output";
    }
  
@@ -521,7 +536,7 @@ index 7e3b2c61c31d09eba6b22a0f94484ee1bfdf0763..3c0a3d8aef4f507d208557ea19b3dfa8
  
  /** Same keys, each value strictly equal. */
 diff --git a/web/src/lib/sessionsApi.test.ts b/web/src/lib/sessionsApi.test.ts
-index 4a274811bb1b7ee9bb7c92ddb4504fb3125fcc9c..300d2a2b8c7ea476050bd34b1266767e7df3d315 100644
+index a9bd87a76a9db5916fd389658fb8f436c68928cc..57e76cec2207ebae268d1d06c1633762ab5bb7c0 100644
 --- a/web/src/lib/sessionsApi.test.ts
 +++ b/web/src/lib/sessionsApi.test.ts
 @@ -15,6 +15,7 @@ import {
@@ -532,7 +547,7 @@ index 4a274811bb1b7ee9bb7c92ddb4504fb3125fcc9c..300d2a2b8c7ea476050bd34b1266767e
    fetchSessionItemsPage,
    forkSession,
    getSession,
-@@ -1529,6 +1530,121 @@ describe("fetchSessionItemsPage", () => {
+@@ -1563,6 +1564,121 @@ describe("fetchSessionItemsPage", () => {
    });
  });
  
@@ -655,7 +670,7 @@ index 4a274811bb1b7ee9bb7c92ddb4504fb3125fcc9c..300d2a2b8c7ea476050bd34b1266767e
    it("POSTs the event body verbatim and returns {queued, itemId}", async () => {
      fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_123" }));
 diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
-index 07d2d4a870335f934a52b735290e758ef5e8b39a..80e88bd57f95024b13f461bfff2566f1d7ec9054 100644
+index 034b85ad8cd183a0a5716702f032edaedfa2b4ea..ef76ef2c34cee9df31c845d1f82dbdeac317d5e3 100644
 --- a/web/src/lib/sessionsApi.ts
 +++ b/web/src/lib/sessionsApi.ts
 @@ -10,7 +10,12 @@
@@ -669,10 +684,10 @@ index 07d2d4a870335f934a52b735290e758ef5e8b39a..80e88bd57f95024b13f461bfff2566f1
 +  isFunctionCallOutputItem,
 +} from "./conversationItems";
 +import { TOOLS_RENDERED_FROM_OUTPUT } from "./itemsToBlocks";
+ import type { SideChatModelSettings } from "./sideChat";
  import type { MessageContentBlock } from "./blocks";
  import type { McpServerStartup } from "./events";
- import { authenticatedFetch } from "./identity";
-@@ -1333,18 +1338,92 @@ export async function fetchSessionItemsPage(
+@@ -1343,18 +1348,92 @@ export async function fetchSessionItemsPage(
      olderThan,
      limit = SESSION_HISTORY_PAGE_SIZE,
      signal,
@@ -768,10 +783,10 @@ index 07d2d4a870335f934a52b735290e758ef5e8b39a..80e88bd57f95024b13f461bfff2566f1
  
  /**
 diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
-index e595c448b091cb9aefda6f572c62662c64cefefb..08d69e15d301f95fb648a51fbd001fbce23d3dec 100644
+index 1995bd8b6e9e09652cb94cfeb0bf83656626c005..79d5268ded30829a9e89fcbbb707c1fcb3f94de5 100644
 --- a/web/src/store/chatStore.test.ts
 +++ b/web/src/store/chatStore.test.ts
-@@ -275,6 +275,8 @@ let client: QueryClient;
+@@ -278,6 +278,8 @@ let client: QueryClient;
  const fetchMock = vi.fn();
  let sessionSnapshots: Map<string, ConversationItem[]>;
  let sessionItems: Map<string, ConversationItem[]>;
@@ -780,7 +795,7 @@ index e595c448b091cb9aefda6f572c62662c64cefefb..08d69e15d301f95fb648a51fbd001fbc
  let sessionPendingElicitations: Map<string, Record<string, unknown>[]>;
  let sessionPendingInputs: Map<
    string,
-@@ -301,6 +303,14 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
+@@ -304,6 +306,14 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
    // the matched session id below.
    const path = url.split("?")[0]!;
    if (url.match(/\/v1\/sessions\/[^/]+\/stream$/)) return streamResponse();
@@ -795,7 +810,7 @@ index e595c448b091cb9aefda6f572c62662c64cefefb..08d69e15d301f95fb648a51fbd001fbc
    const itemsMatch = url.match(/^\/v1\/sessions\/([^/]+)\/items(?:\?.*)?$/);
    if (itemsMatch) {
      const sessionId = itemsMatch[1]!;
-@@ -524,6 +534,7 @@ beforeEach(() => {
+@@ -527,6 +537,7 @@ beforeEach(() => {
    client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
    sessionSnapshots = new Map();
    sessionItems = new Map();
@@ -803,7 +818,7 @@ index e595c448b091cb9aefda6f572c62662c64cefefb..08d69e15d301f95fb648a51fbd001fbc
    sessionPendingElicitations = new Map();
    sessionPendingInputs = new Map();
    sessionCostControlOverrides = new Map();
-@@ -1985,6 +1996,77 @@ describe("chatStore — switchTo", () => {
+@@ -1988,6 +1999,77 @@ describe("chatStore — switchTo", () => {
      expect(String(itemFetches[0]![0])).toContain("order=desc");
    });
  
@@ -882,7 +897,7 @@ index e595c448b091cb9aefda6f572c62662c64cefefb..08d69e15d301f95fb648a51fbd001fbc
      "loadMoreHistory prepends the correct page (scoped pane: %s)",
      async (scoped) => {
 diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
-index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090f38fc2c8 100644
+index 631b8595f0f2d6fa49234bc36c15697540c62f81..71c4320e92c4177d76edfc001252a1150eb630a8 100644
 --- a/web/src/store/chatStore.ts
 +++ b/web/src/store/chatStore.ts
 @@ -62,7 +62,12 @@ import {
@@ -907,7 +922,7 @@ index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090
    fetchSessionItemsPage,
    HOST_OFFLINE_CODE,
    INITIAL_WINDOW_ITEMS,
-@@ -1399,6 +1405,13 @@ export interface ChatActions {
+@@ -1419,6 +1425,13 @@ export interface ChatActions {
     * the same cursor, or while a page is in flight, is a no-op.
     */
    prefetchMoreHistory: (sessionId?: string) => void;
@@ -921,7 +936,7 @@ index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090
    /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
    flashUserMessage: (itemId: string) => void;
    /** Queue an "@"-mention chip into the active composer from outside it. */
-@@ -1462,7 +1475,7 @@ const prefetchedHistoryPages = new Map<
+@@ -1489,7 +1502,7 @@ const prefetchedHistoryPages = new Map<
  conversationRegistry.subscribeDisposed((id) => prefetchedHistoryPages.delete(id));
  
  function fetchOlderHistoryPage(conversationId: string, cursor: string): Promise<SessionItemsPage> {
@@ -930,7 +945,7 @@ index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090
      olderThan: cursor,
      limit: scrollUpHistoryPageSize(isMobileViewport()),
    });
-@@ -3803,8 +3816,58 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+@@ -3930,8 +3943,58 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
        }
      });
    },
@@ -989,7 +1004,7 @@ index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090
  // ── Store-action setter ──────────────────────────────────
  //
  // The store's own actions (`send`, `stop`, the picker setters, `loadMoreHistory`)
-@@ -4817,7 +4880,7 @@ async function bindStream(
+@@ -4990,7 +5053,7 @@ async function bindStream(
          staleTime: 0,
          retry: false,
        }),
@@ -998,7 +1013,7 @@ index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090
      ]);
      if (isConversationDisposed(id)) return;
      const items = page.items;
-@@ -5627,7 +5690,7 @@ async function rehydrateWindowOnReconnect(
+@@ -5791,7 +5854,7 @@ async function rehydrateWindowOnReconnect(
    const generation = get().historyGeneration;
    let fresh: SessionItemsPage;
    try {
@@ -1007,7 +1022,7 @@ index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090
    } catch {
      return;
    }
-@@ -5745,7 +5808,7 @@ async function reconcileOnReconnect(
+@@ -5917,7 +5980,7 @@ async function reconcileOnReconnect(
          staleTime: 0,
          retry: false,
        }),
@@ -1016,7 +1031,7 @@ index f2b0a9b6d8eb2cd489e8a9515823a94e72936e8b..2d837bf738b1897207e6866a1581c090
      ]);
    } catch {
      return;
-@@ -5767,7 +5830,7 @@ async function reconcileOnReconnect(
+@@ -5939,7 +6002,7 @@ async function reconcileOnReconnect(
      if (!cursor) break;
      let older: SessionItemsPage;
      try {
