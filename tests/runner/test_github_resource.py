@@ -357,7 +357,8 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch, host: st
     assert info["pr"] is None
     assert info["base_ref"] is None
     assert sum(c[:2] == ("pr", "view") for c in calls) == 1
-    assert info["repo"] == info["workspace_repo"] == {"name_with_owner": "corp/app", "host": host}
+    assert info["workspace_repo"] == {"name_with_owner": "corp/app", "host": host}
+    assert info["repo"] == {**info["workspace_repo"], "url": f"https://{host}/corp/app"}
 
 
 def test_reference_info_without_gh_reports_repo_host(
@@ -375,6 +376,45 @@ def test_reference_info_without_gh_reports_repo_host(
     info = github_resource._reference_info(str(repo), reference)
     assert info["pr"] is None
     assert info["repo"] == {"name_with_owner": "corp/app", "host": "ghe.example.com"}
+
+
+@pytest.mark.parametrize(
+    ("view", "expected"),
+    [
+        (
+            {"nameWithOwner": "o/r", "url": "https://git.example.com/o/r"},
+            {
+                "name_with_owner": "o/r",
+                "host": "git.example.com",
+                "url": "https://git.example.com/o/r",
+            },
+        ),
+        ({"nameWithOwner": "o/r", "url": "javascript:x"}, {"name_with_owner": "o/r"}),
+        ({"nameWithOwner": "o/r"}, {"name_with_owner": "o/r"}),
+    ],
+)
+def test_github_info_no_pr_reports_the_repository_url(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, view: dict[str, str], expected: dict[str, str]
+) -> None:
+    """Without a PR the repo's web URL gives chat links the host; only http(s) is kept."""
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            assert "url" in argv[-1].split(",")
+            return (0, json.dumps(view), "")
+        if head == ("pr", "view"):
+            return (1, "", "no pull requests found for branch")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    assert github_info(str(repo))["repo"] == expected
 
 
 def test_github_info_pr_via_commit_fork_fallback(
