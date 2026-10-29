@@ -144,7 +144,10 @@ from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
-from omnigent.server.routes.preferences import create_preferences_router
+from omnigent.server.routes.preferences import (
+    create_link_rules_router,
+    create_preferences_router,
+)
 from omnigent.server.routes.proactive_agent_admin import create_proactive_agent_admin_router
 from omnigent.server.routes.proactive_agent_settings import (
     create_proactive_agent_settings_router,
@@ -4529,6 +4532,11 @@ def create_app(
             prefix="/v1",
             tags=["preferences"],
         )
+    app.include_router(
+        create_link_rules_router(preference_store, auth_provider, policy=preference_policy),
+        prefix="/v1",
+        tags=["link-rules"],
+    )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 

@@ -24,6 +24,9 @@ local; automatic client sync and shared/machine scope controls remain deferred.
   distinct across shared, machine, project, and session scopes.
 - `shared-operations`: opt-in server API; read/save all four groups, retry an
   edit, remove a preference, inspect competing edits, and resolve them explicitly.
+- `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
+  the `link_rules` shared preference, validated on save and served with the
+  defaults by `GET`/`PUT /v1/link-rules`.
 
 - `configuration-copy`: review, save, show and import model defaults, harness
   selection/arguments and launcher plugin opt-outs; preserve local-only values.
@@ -66,6 +69,14 @@ before the subcommand to include its existing JSON preferences. `onboard` is an
 interactive launcher hook; OSS startup does not invoke it automatically. See the
 [configuration guide](../docs/cloud-configuration.md). Automatic prompting and
 plugin management by an external launcher require a separate integration.
+
+**Chat link rules API:** `GET /v1/link-rules` returns the rules in effect;
+`PUT /v1/link-rules` with `expected_version` replaces them (`rules: null`
+restores the defaults). Covered by `tests/test_link_rules.py` (pattern, URL and
+git host checks, which `git` rule a session uses, reading and saving the old
+`github` kind) and `tests/server/routes/test_link_rules.py` (per-user storage,
+stale versions, rejected rules, the old kind on input, a server without shared
+preferences).
 
 **Shared scope controls:** the CLI and UI do not yet offer automatic following,
 saving machine overrides, removing a machine override,
