@@ -351,6 +351,7 @@ guardrails:
         "prompt_check",
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
     from omnigent.spec.types import FunctionPolicySpec

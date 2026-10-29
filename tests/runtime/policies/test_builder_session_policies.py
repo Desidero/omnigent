@@ -336,9 +336,10 @@ def test_build_engine_includes_session_policies(db_uri: str) -> None:
 
     assert isinstance(engine.policies[0], FunctionPolicy)
     assert engine.policies[0].spec.name == "test_policy"
-    assert [p.spec.name for p in engine.policies[-2:]] == [
+    assert [p.spec.name for p in engine.policies[-3:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
 
@@ -360,6 +361,7 @@ def test_build_engine_no_store_returns_noop(db_uri: str) -> None:
     assert [p.spec.name for p in engine.policies] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
 
@@ -419,6 +421,7 @@ def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
         "admin_policy",
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
 
@@ -888,6 +891,7 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "yaml_admin_policy",
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
 

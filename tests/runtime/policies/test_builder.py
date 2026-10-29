@@ -112,6 +112,7 @@ name: no-guardrails
     assert [p.spec.name for p in engine.policies] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
     assert engine.label_defs == {}
     assert engine.labels == {}
@@ -144,6 +145,7 @@ guardrails: {}
     assert [p.spec.name for p in engine.policies] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
     assert engine.label_defs == {}
     assert engine.labels == {}
@@ -199,6 +201,7 @@ guardrails:
         "charlie",
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
 
@@ -539,9 +542,10 @@ def test_build_from_programmatic_spec(
     )
     assert engine.ask_timeout == 45
     assert engine.policies[0].spec.name == "taint_web"
-    assert [p.spec.name for p in engine.policies[-2:]] == [
+    assert [p.spec.name for p in engine.policies[-3:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
     assert engine.labels == {"integrity": "1"}
 
@@ -584,6 +588,7 @@ def test_default_policies_appended_after_agent_policies(
         "admin_policy",
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
 
@@ -609,9 +614,10 @@ def test_default_policies_alone_builds_live_engine(
         default_policies=[admin_policy],
     )
     assert engine.policies[0].spec.name == "admin_audit"
-    assert [p.spec.name for p in engine.policies[-2:]] == [
+    assert [p.spec.name for p in engine.policies[-3:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
     ]
 
 
@@ -637,7 +643,11 @@ def test_empty_default_policies_preserves_existing_behaviour(
         default_policies=[],
     )
     # Only the two hardcoded approval guards.
-    guards = ["__ask_on_add_policy", "__ask_on_scheduled_task_change"]
+    guards = [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+        "__ask_on_link_rule_change",
+    ]
     assert [p.spec.name for p in engine_none.policies] == guards
     assert [p.spec.name for p in engine_empty.policies] == guards
 

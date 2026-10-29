@@ -104,12 +104,18 @@ from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
 from omnigent.native.native_terminal import (
+    fetch_git_workspace,
+    fetch_link_rules,
+    post_initial_prompt,
+    request_with_429_retry,
+)
+from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native.native_terminal import post_initial_prompt, request_with_429_retry
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.runtime.prompt import append_framework_instructions, link_rule_instructions
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1138,7 +1144,8 @@ async def _prepare_codex_terminal(
     :param model: Optional model id.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
-    :param developer_instructions: Session startup instructions persisted into
+    :param developer_instructions: Session startup instructions, plus the user's
+        chat-links instructions, persisted into
         Codex's private per-session config, applied on fresh launch and
         cold resume only — the reattach branch below returns before this
         is used, so it never relaunches or duplicates the value.
@@ -1249,7 +1256,12 @@ async def _prepare_codex_terminal(
             bridge_dir=bridge_dir,
             ap_server_url=base_url,
             ap_auth_headers=headers,
-            developer_instructions=developer_instructions,
+            developer_instructions=append_framework_instructions(
+                developer_instructions,
+                link_rule_instructions(
+                    await fetch_link_rules(client), await fetch_git_workspace(Path.cwd())
+                ),
+            ),
             terminal_launch_args=codex_args,
             session_labels=session_labels,
         )

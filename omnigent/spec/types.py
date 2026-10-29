@@ -899,6 +899,7 @@ class ToolGroupsConfig:
         ``sys_session_update``.
     :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
         which write to and read the owner's Inbox. Off by default.
+    :param link_rules: ``sys_link_rules``, for the user's chat link rules.
     """
 
     browser: bool = True
@@ -909,6 +910,7 @@ class ToolGroupsConfig:
     journal: bool = True
     projects: bool = True
     user_inbox: bool = False
+    link_rules: bool = True
 
 
 @dataclass

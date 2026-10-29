@@ -106,6 +106,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_workflow_save",
         "sys_workflow_load",
         "sys_workflow_list",
+        # The chat link-rule tool is auto-registered like the
+        # scheduled-task tools; every change asks the user first.
+        "sys_link_rules",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -1748,6 +1751,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
     "projects": frozenset(
         {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
     ),
+    "link_rules": frozenset({"sys_link_rules"}),
 }
 
 
@@ -1763,6 +1767,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
 
 def test_tool_groups_default_registers_every_group() -> None:
     """An absent ``tool_groups:`` block changes nothing: all 19 register."""
+    """An absent ``tool_groups:`` block changes nothing: all 17 register."""
     names = _tool_names(_grouped_spec())
     for group, members in _TOOL_GROUP_MEMBERS.items():
         assert members <= names, f"{group} members missing by default: {members - names}"
@@ -1780,13 +1785,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 20 gated tools are gone but the session
+    With every group off, the 22 gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 21
+    assert len(gated) == 22
     assert not (gated & names)
     assert {
         "sys_session_list",

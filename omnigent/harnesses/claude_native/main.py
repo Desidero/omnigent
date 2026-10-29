@@ -26,6 +26,7 @@ import uuid
 
 from omnigent.claude_paths import claude_config_dir
 from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.runtime.prompt import append_framework_instructions, link_rule_instructions
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
@@ -158,9 +159,13 @@ from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
 from omnigent.native.native_terminal import (
+    fetch_git_workspace,
+    fetch_link_rules,
+    post_initial_prompt,
+)
+from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native.native_terminal import post_initial_prompt
 from omnigent.native.native_terminal import (
     request_with_429_retry as _request_with_429_retry,
 )
@@ -5416,7 +5421,8 @@ async def _prepare_claude_terminal(
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
     :param append_system_prompt: Session startup instructions for
-        ``--append-system-prompt``, applied on fresh launch and cold
+        ``--append-system-prompt``, to which the user's chat-links
+        instructions are added here, applied on fresh launch and cold
         resume only — the hot-reattach fast path below returns before
         this is used, so it never relaunches or duplicates the flag.
     :returns: Prepared terminal details.
@@ -5552,6 +5558,12 @@ async def _prepare_claude_terminal(
             startup_profiler,
             "transcript forward state reset",
             startup_progress=startup_progress,
+        )
+        append_system_prompt = append_framework_instructions(
+            append_system_prompt,
+            link_rule_instructions(
+                await fetch_link_rules(client), await fetch_git_workspace(Path.cwd())
+            ),
         )
         # Cold-resume args first so user-supplied tail args keep their relative position.
         _mark_startup_step(

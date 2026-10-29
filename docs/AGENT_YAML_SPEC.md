@@ -1178,6 +1178,7 @@ tool_groups:
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
   journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
   projects: false         # sys_project_* / sys_session_update
+  link_rules: false       # sys_link_rules (chat link rules)
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values

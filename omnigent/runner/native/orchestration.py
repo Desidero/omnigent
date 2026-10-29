@@ -75,6 +75,7 @@ from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
+from omnigent.link_rules import GitWorkspace, LinkRule
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -86,6 +87,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native.native_dispatch import resolve_hook
+from omnigent.native.native_terminal import fetch_git_workspace, fetch_link_rules
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
@@ -5884,7 +5886,11 @@ async def _auto_create_codex_terminal(
     _codex_developer_instructions = "\n\n".join(
         x
         for x in [
-            _native_startup_instructions_from_spec(agent_spec),
+            _native_startup_instructions_from_spec(
+                agent_spec,
+                await _launch_link_rules(server_client),
+                await fetch_git_workspace(workspace),
+            ),
             _codex_routing_note,
         ]
         if x
@@ -7870,8 +7876,21 @@ def _claude_native_pinned_provider(agent_spec: AgentSpec | ResolvedSpec | None) 
     return auth.name if isinstance(auth, ProviderAuth) else None
 
 
+async def _launch_link_rules(
+    server_client: httpx.AsyncClient | None,
+) -> tuple[LinkRule, ...]:
+    """The user's chat link rules for a native launch; none without a server.
+
+    :param server_client: The runner's client to the Omnigent server, or ``None``.
+    :returns: The rules in effect, or ``()`` when they can't be read.
+    """
+    return () if server_client is None else await fetch_link_rules(server_client)
+
+
 def _native_startup_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
+    link_rules: Sequence[LinkRule] = (),
+    git_workspace: GitWorkspace | None = None,
 ) -> str:
     """Compose native startup instructions without turn-bound framework metadata.
 
@@ -7881,12 +7900,14 @@ def _native_startup_instructions_from_spec(
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
+    :param link_rules: The user's chat link rules at launch.
+    :param git_workspace: The session's git checkout, or ``None`` outside one.
     :returns: Author instructions followed by stable framework guidance.
     """
     from omnigent.runtime.prompt import build_native_startup_instructions
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    return build_native_startup_instructions(spec)
+    return build_native_startup_instructions(spec, link_rules, git_workspace)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -9281,8 +9302,8 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
-        claude_terminal_relay_env,
         claude_launch_config_dir,
+        claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -9979,7 +10000,16 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
-            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
+            x
+            for x in [
+                _native_startup_instructions_from_spec(
+                    agent_spec,
+                    await _launch_link_rules(server_client),
+                    await fetch_git_workspace(workspace),
+                ),
+                routed_spawn_note,
+            ]
+            if x
         ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
