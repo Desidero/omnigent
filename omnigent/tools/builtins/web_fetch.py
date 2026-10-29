@@ -257,6 +257,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
             user_inbox=False,
             memory=False,
             files=False,
+            link_rules=False,
         ),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,

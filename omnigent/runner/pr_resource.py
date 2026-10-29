@@ -12,6 +12,7 @@ Servers that track a session's PRs vouch for the PR a request targets
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import dataclasses
 import functools
@@ -26,6 +27,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any, ParamSpec, TypeVar
 
@@ -40,6 +42,7 @@ from omnigent.git_providers import (
     providers,
     resolve_remote,
 )
+from omnigent.link_rules import GitWorkspace
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
@@ -314,6 +317,93 @@ def resolve_provider(
     :raises ValueError: If ``pr_url`` is not associated with the session.
     """
     return _resolve(root, _default_pr(session_id, pr_url))
+
+
+def workspace_git(root: str | Path) -> GitWorkspace | None:
+    """The git remote a workspace's chat references link to, for agent prompts.
+
+    :param root: The session's workspace directory.
+    :returns: ``None`` outside a git checkout; otherwise the provider that
+        claims its first remote (``None`` when none does) and that remote's host
+        (``None`` without a network remote).
+    """
+    from omnigent.runtime.prompt import is_git_checkout
+
+    if not is_git_checkout(Path(root)):
+        return None
+    try:
+        resolution = _workspace_provider(str(root))
+    except Exception:  # the prompt hint is optional; never fail a turn
+        _logger.debug("Could not resolve the git provider of %s", root, exc_info=True)
+        return GitWorkspace()
+    if resolution.remote_host is None:
+        return GitWorkspace()
+    provider = None if resolution.unclaimed else resolution.provider
+    return GitWorkspace(provider=provider, host=resolution.remote_host)
+
+
+class WorkspaceGitCache:
+    """Each workspace's :func:`workspace_git`, resolved off the turn path.
+
+    Outside a checkout (a stat walk) there is nothing to resolve. In one, a
+    turn gets the cached remote; an entry older than ``ttl_s`` is still served
+    while a background lookup replaces it. Only a workspace seen for the first
+    time waits, for at most ``first_wait_s``, then reads as a checkout of
+    unknown remote until its lookup lands.
+
+    :param ttl_s: How long a resolved remote counts as current.
+    :param first_wait_s: How long a first lookup may hold up a turn.
+    :param resolve: The blocking lookup, run in a worker thread.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_s: float,
+        first_wait_s: float,
+        resolve: Callable[[str], GitWorkspace | None] = workspace_git,
+    ) -> None:
+        self._ttl_s = ttl_s
+        self._first_wait_s = first_wait_s
+        self._resolve = resolve
+        self._entries: dict[str, tuple[float, GitWorkspace | None]] = {}
+        self._lookups: dict[str, asyncio.Task[GitWorkspace | None]] = {}
+
+    async def get(self, workspace: Path) -> GitWorkspace | None:
+        """The workspace's git remote, or ``None`` outside a git checkout.
+
+        :param workspace: The session's workspace directory.
+        :returns: The cached or freshly resolved remote; ``GitWorkspace()``
+            while a first lookup is still running.
+        """
+        from omnigent.runtime.prompt import is_git_checkout
+
+        if not is_git_checkout(workspace):
+            return None
+        key = str(workspace)
+        entry = self._entries.get(key)
+        if entry is not None and time.monotonic() - entry[0] <= self._ttl_s:
+            return entry[1]
+        lookup = self._lookups.get(key)
+        if lookup is None:
+            lookup = asyncio.get_running_loop().create_task(self._lookup(key))
+            self._lookups[key] = lookup
+        if entry is not None:
+            return entry[1]
+        try:
+            return await asyncio.wait_for(asyncio.shield(lookup), self._first_wait_s)
+        except TimeoutError:
+            return GitWorkspace()
+
+    async def _lookup(self, key: str) -> GitWorkspace | None:
+        try:
+            resolved = await asyncio.to_thread(self._resolve, key)
+        except Exception:  # the prompt hint is optional; never fail a turn
+            _logger.debug("Could not resolve the git remote of %s", key, exc_info=True)
+            resolved = GitWorkspace()
+        self._entries[key] = (time.monotonic(), resolved)
+        self._lookups.pop(key, None)
+        return resolved
 
 
 def _facet(provider_id: str | None) -> PullRequestFacet | None:

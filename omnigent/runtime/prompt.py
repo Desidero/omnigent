@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from omnigent.entities import (
@@ -15,6 +16,14 @@ from omnigent.entities import (
     NativeToolData,
 )
 from omnigent.inner.native_attachments import expand_framework_notices
+from omnigent.link_rules import (
+    GitWorkspace,
+    LinkRule,
+    LinkRuleKind,
+    describe_link_syntax,
+    enabled_link_rules,
+    git_reference_instruction,
+)
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import (
     image_omitted_placeholder,
@@ -100,6 +109,60 @@ ITEM_LABEL_INSTRUCTION = (
     "reopen it; if the comment asks for more work, mention the label plainly to "
     "reopen it."
 )
+
+
+def is_git_checkout(path: Path) -> bool:
+    """
+    Whether ``path`` lies inside a git checkout.
+
+    Looks for ``.git`` in the directory or any ancestor: a directory for a
+    main checkout, a file for a linked worktree. A stat walk costs microseconds
+    and needs no git binary, so it can run on every turn.
+
+    :param path: A workspace directory.
+    :returns: ``True`` when ``path`` or an ancestor holds ``.git``.
+    """
+    try:
+        return any((candidate / ".git").exists() for candidate in (path, *path.parents))
+    except OSError:
+        return False
+
+
+def link_rule_instructions(
+    rules: Sequence[LinkRule], git_workspace: GitWorkspace | None = None
+) -> list[str]:
+    """The chat-links instructions for the user's enabled link rules.
+
+    The chat UI links these references (web/src/lib/linkRules.ts) wherever
+    they appear as plain text, so agents should write them bare. Issue and
+    pull request wording is added only for a session in a git checkout, so a
+    model working outside a repository is not told about notation it has no
+    use for.
+
+    :param rules: The user's link rules, saved or default.
+    :param git_workspace: The session's git checkout, or ``None`` when its
+        workspace is not one.
+    :returns: Up to two instructions: the non-git rules' syntaxes, then the
+        issue and pull request notation the session's git rules link.
+    """
+    syntaxes = [
+        describe_link_syntax(rule)
+        for rule in enabled_link_rules(rules)
+        if rule.kind != LinkRuleKind.GIT
+    ]
+    instructions = []
+    if syntaxes:
+        instructions.append(
+            "Chat links: the chat UI turns these references into links when they "
+            "appear as plain text, not inside code or a markdown link: "
+            + "; ".join(syntaxes)
+            + "."
+        )
+    if git_workspace is not None and (
+        git_instruction := git_reference_instruction(rules, git_workspace)
+    ):
+        instructions.append(git_instruction)
+    return instructions
 
 
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
@@ -267,17 +330,29 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
     return None
 
 
-def build_native_startup_instructions(spec: AgentSpec | None) -> str:
+def build_native_startup_instructions(
+    spec: AgentSpec | None,
+    link_rules: Sequence[LinkRule] = (),
+    git_workspace: GitWorkspace | None = None,
+) -> str:
     """Compose author text and stable guidance for native session startup.
 
     Startup channels persist across turns, so they must not carry per-turn
     framework metadata or guidance for tools the native harness does not expose.
+    A link rule changed later reaches the agent on its next launch.
 
     :param spec: Resolved agent spec, or ``None`` when unavailable.
-    :returns: Author instructions followed by workspace-image and item-label guidance.
+    :param link_rules: The user's chat link rules at launch.
+    :param git_workspace: The session's git checkout, or ``None`` outside one.
+    :returns: Author instructions followed by workspace-image, item-label and
+        chat-links guidance.
     """
     authored = raw_author_instructions(spec) if spec is not None else None
-    framework = (WORKSPACE_IMAGE_INSTRUCTION, ITEM_LABEL_INSTRUCTION)
+    framework = (
+        WORKSPACE_IMAGE_INSTRUCTION,
+        ITEM_LABEL_INSTRUCTION,
+        *link_rule_instructions(link_rules, git_workspace),
+    )
     return append_framework_instructions(authored, framework) or "\n\n".join(framework)
 
 

@@ -913,6 +913,7 @@ class ToolGroupsConfig:
     :param files: ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``,
         which share workspace files through the session's file store. Off by
         default.
+    :param link_rules: ``sys_link_rules``, for the user's chat link rules.
     """
 
     browser: bool = True
@@ -925,6 +926,7 @@ class ToolGroupsConfig:
     user_inbox: bool = True
     memory: bool = True
     files: bool = False
+    link_rules: bool = True
 
 
 @dataclass
