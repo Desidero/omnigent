@@ -1,0 +1,1291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 29 Oct 2026 20:19:26 +0000
+Subject: [PATCH] feat: let agents manage chat link rules and tell them the
+ active syntaxes
+
+Agents set up most of a user's tooling, so they should be able to add a
+link rule when asked ("link BST-123 to our Jira"), and they should write
+references in the form the chat links instead of wrapping them in code.
+
+- sys_link_rules lists, adds, updates and removes rules. The runner proxies
+  it to /v1/link-rules: it applies one change to the rules it read, checks
+  the list with the server's validator and saves it with that version, so a
+  concurrent edit from Settings is refused rather than overwritten. It is a
+  framework tool group (tool_groups.link_rules) and rides the native relay.
+- Rules run in every viewer's browser, so every add, update and remove asks
+  the user first: __ask_on_link_rule_change joins the approval policies
+  every engine carries, and the tool skips the no-policy fast path, like the
+  scheduled-task tools. Listing is not gated.
+- A framework instruction names each enabled rule's syntax (#123 and
+  owner/repo#123, session:<id>, ABC-123 for a short form) so agents write
+  them as plain text. SDK harnesses get it per turn from rules the runner
+  rereads after a minute; native Claude and Codex get it at launch, from the
+  runner or from omnigent claude/codex, so a rule changed mid-session reaches
+  their prompt on the next launch. A failed read just leaves it out.
+
+Not upstream yet: proposed from feat/chat-link-rules; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/AGENT_YAML_SPEC.md                       |   1 +
+ docs/chat-link-rules.md                       |  36 +++++
+ feature-map/preferences.md                    |  15 +-
+ omnigent/harnesses/claude_native/main.py      |  10 +-
+ omnigent/harnesses/codex_native/main.py       |   5 +-
+ omnigent/native/native_terminal.py            |  24 ++++
+ omnigent/policies/builtins/safety.py          |  37 +++++
+ omnigent/runner/app.py                        |  25 ++++
+ omnigent/runner/native/orchestration.py       |  15 ++
+ omnigent/runner/tool_dispatch.py              | 121 ++++++++++++++++
+ omnigent/runtime/policies/builder.py          |  24 +++-
+ omnigent/runtime/prompt.py                    |  30 +++-
+ omnigent/spec/types.py                        |   2 +
+ omnigent/tools/builtins/link_rules.py         |  87 ++++++++++++
+ omnigent/tools/manager.py                     |  15 ++
+ tests/runner/test_link_rules_tool_dispatch.py | 133 ++++++++++++++++++
+ tests/runtime/policies/test_builder.py        |  16 ++-
+ .../policies/test_builder_session_policies.py |   6 +-
+ .../policies/test_yaml_full_roundtrip.py      |   1 +
+ tests/runtime/test_prompt.py                  |  32 +++++
+ tests/test_native_terminal.py                 |  26 ++++
+ tests/tools/test_manager.py                   |  10 +-
+ 22 files changed, 654 insertions(+), 17 deletions(-)
+ create mode 100644 omnigent/tools/builtins/link_rules.py
+ create mode 100644 tests/runner/test_link_rules_tool_dispatch.py
+
+diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
+index 59b5eadb581ba41a8a99c5e4fed9e836878178cc..4453c39b52beef354adfbf676f6f678b2273d263 100644
+--- a/docs/AGENT_YAML_SPEC.md
++++ b/docs/AGENT_YAML_SPEC.md
+@@ -905,6 +905,7 @@ tool_groups:
+   comments: false         # list_comments / update_comment
+   policies: false         # sys_add_policy / sys_policy_registry
+   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
++  link_rules: false       # sys_link_rules (chat link rules)
+ ```
+ 
+ Every group defaults to `true`, so omitting the block changes nothing. Values
+diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
+index c62b2cdb0a25539e1cba9679a43a78c55c218ae2..da8372b852243fb91b0ae019e2dee2a21991434e 100644
+--- a/docs/chat-link-rules.md
++++ b/docs/chat-link-rules.md
+@@ -121,3 +121,39 @@ config); without them the defaults apply and can't be changed.
+   a version check.
+ - The [shared preferences API](shared-preferences-api.md) reads and writes the
+   same value, with its conflict handling.
++
++## Agents
++
++### The `sys_link_rules` tool
++
++Agents can read and change the rules with `sys_link_rules`:
++
++| `action` | Arguments | Effect |
++| --- | --- | --- |
++| `list` | none | Returns the rules in effect and whether they are saved |
++| `add` | `name`, then `kind` (default `url`), `pattern`, `url`, `enabled` (default true) | Appends a rule |
++| `update` | `name`, then any of `new_name`, `kind`, `pattern`, `url`, `enabled` | Changes one rule |
++| `remove` | `name` | Deletes one rule |
++
++Names match case-insensitively. The tool checks the changed list with the
++server's validator before saving it, and saves it with the version it read, so
++a change made meanwhile from Settings is refused rather than overwritten.
++
++Every `add`, `update` and `remove` parks on an approval prompt in the session,
++showing the rule's name, pattern and URL, even when no other policy applies
++(the built-in `__ask_on_link_rule_change` policy, like the one for scheduled
++tasks). `list` is not gated. Agents get the tool unless their spec sets
++`tool_groups.link_rules: false` ([agent YAML](AGENT_YAML_SPEC.md#tool-groups)),
++and native Claude and Codex sessions get it through the tool relay.
++
++### What agents are told
++
++Agents are told which references the chat links, so they write them as plain
++text instead of code: one short framework instruction listing each enabled
++rule's syntax, such as `` `#123` or `owner/repo#123` `` and `` `ABC-123`
++(Jira) ``. With every rule off there is no instruction.
++
++A rule saved mid-session renders in the chat right away. SDK harnesses read
++the rules again for a later turn (the runner keeps them for up to a minute).
++Native Claude and Codex sessions get their instructions once, at launch, so
++they see a changed rule in their prompt only after their next launch.
+diff --git a/feature-map/preferences.md b/feature-map/preferences.md
+index 2e0419435883c40e2d2459d2833e8ce8a3346878..670637851030db566dc91700810ca606c7b4ef98 100644
+--- a/feature-map/preferences.md
++++ b/feature-map/preferences.md
+@@ -30,7 +30,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
+ - `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
+   the `link_rules` shared preference, validated on save and served with the
+   defaults by `GET`/`PUT /v1/link-rules`, edited in Settings → General → Chat
+-  links and applied to every chat message.
++  links and applied to every chat message. Agents change them with
++  `sys_link_rules` after the user approves, and are told the active syntaxes.
+ 
+ - `configuration-copy`: review, save, show and import model defaults, harness
+   selection/arguments and launcher plugin opt-outs; preserve local-only values.
+@@ -101,6 +102,18 @@ cd web && npx vitest run src/lib/linkRules.test.ts \
+   src/pages/settings/LinkRulesSettingsGroup.test.tsx
+ ```
+ 
++**Agents and link rules:** in a session, ask the agent to add a rule (for
++example "link BST-123 to https://jira.example.com/browse/BST-123"). The
++`sys_link_rules` call waits on an approval card naming the rule; approve it and
++check the rule appears in Settings → General → Chat links and that `BST-7` in
++a later message renders as a link. Deny it and check nothing changed. Ask the
++agent to list the rules: that call is not gated. Component coverage:
++
++```sh
++uv run --no-sync pytest tests/runner/test_link_rules_tool_dispatch.py \
++  tests/runtime/test_prompt.py -k "link_rule" tests/test_native_terminal.py --reruns 0 -q
++```
++
+ **Shared scope controls:** the CLI and UI do not yet offer automatic following,
+ saving machine overrides, removing a machine override,
+ resolving conflicts, or continuing with temporary defaults. The API above can
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index 1c1ba57d8d2346e5b71a4c6ab98ca546f0dd0fe3..be40fe2d0312777d4141a4528f180f5761f951a4 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -156,7 +156,11 @@ from omnigent.native.native_terminal import (
+ from omnigent.native.native_terminal import (
+     bind_session_runner as _bind_session_runner,
+ )
+-from omnigent.native.native_terminal import fetch_session_chat_features, post_initial_prompt
++from omnigent.native.native_terminal import (
++    fetch_link_rules,
++    fetch_session_chat_features,
++    post_initial_prompt,
++)
+ from omnigent.native.native_terminal import (
+     normalize_extra_args as _normalize_extra_args,
+ )
+@@ -5420,7 +5424,9 @@ async def _prepare_claude_terminal(
+                 claude_config, session_id=session_id, labels=session_labels
+             ),
+             append_system_prompt=native_startup_instructions(
+-                author_instructions, await fetch_session_chat_features(client, session_id)
++                author_instructions,
++                await fetch_session_chat_features(client, session_id),
++                await fetch_link_rules(client),
+             ),
+         )
+         record_startup_event("terminal_available", session_id=session_id)
+diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
+index 3b2614534add079368bbff312d63959fb9c47e26..d6aeb68a9cb414e2cf99fcd82d83490f12dd4a5e 100644
+--- a/omnigent/harnesses/codex_native/main.py
++++ b/omnigent/harnesses/codex_native/main.py
+@@ -102,6 +102,7 @@ from omnigent.native.native_terminal import (
+     bind_session_runner as _bind_session_runner,
+ )
+ from omnigent.native.native_terminal import (
++    fetch_link_rules,
+     fetch_session_chat_features,
+     post_initial_prompt,
+     request_with_429_retry,
+@@ -1251,7 +1252,9 @@ async def _prepare_codex_terminal(
+             bridge_dir=bridge_dir,
+             ap_server_url=base_url,
+             ap_auth_headers=headers,
+-            developer_instructions=native_startup_instructions(author_instructions, chat_features),
++            developer_instructions=native_startup_instructions(
++                author_instructions, chat_features, await fetch_link_rules(client)
++            ),
+             terminal_launch_args=codex_args,
+             session_labels=session_labels,
+         )
+diff --git a/omnigent/native/native_terminal.py b/omnigent/native/native_terminal.py
+index 6d54778392e0a440974f4ae476661ba987a7f512..2a31e4c2f545b1817af21f1cd8cbde6714a2b1d0 100644
+--- a/omnigent/native/native_terminal.py
++++ b/omnigent/native/native_terminal.py
+@@ -11,6 +11,7 @@ import click
+ import httpx
+ 
+ from omnigent.host.daemon_launch import error_text
++from omnigent.link_rules import LinkRule, LinkRuleError, validate_link_rules
+ from omnigent.runtime.chat_features import (
+     DEFAULT_CHAT_FEATURES,
+     ChatFeature,
+@@ -206,6 +207,29 @@ async def fetch_session_chat_features(
+     return chat_features_from_wire(payload.get("chat_features"))
+ 
+ 
++async def fetch_link_rules(client: httpx.AsyncClient) -> tuple[LinkRule, ...]:
++    """Read the caller's chat link rules for a launch's framework instructions.
++
++    Best-effort: a failed read, or a server that predates ``/v1/link-rules``,
++    gives no rules, so the launch goes ahead without the chat-links instruction.
++
++    :param client: HTTP client pointed at the Omnigent server, authenticated as
++        the session's user.
++    :returns: The rules in effect, saved or default.
++    """
++    try:
++        resp = await client.get("/v1/link-rules")
++        payload = resp.json() if resp.status_code == 200 else None
++    except Exception:  # noqa: BLE001 — the instruction is optional; never fail a launch or turn
++        return ()
++    if not isinstance(payload, dict):
++        return ()
++    try:
++        return validate_link_rules(payload.get("rules"))
++    except LinkRuleError:
++        return ()
++
++
+ async def bind_session_runner(
+     client: httpx.AsyncClient,
+     session_id: str,
+diff --git a/omnigent/policies/builtins/safety.py b/omnigent/policies/builtins/safety.py
+index 198b0b450c58d9efa3897eb4c5c205e699a95f72..46eff831a18241e3eacf8394ff746fbb35f0f057 100644
+--- a/omnigent/policies/builtins/safety.py
++++ b/omnigent/policies/builtins/safety.py
+@@ -464,6 +464,43 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+     }
+ 
+ 
++# The chat link-rule tool. Its rules run in every viewer's browser, so the
++# builder injects ``ask_on_link_rule_change`` and exempts it from the fast path.
++LINK_RULE_APPROVAL_TOOLS: frozenset[str] = frozenset({"sys_link_rules"})
++
++
++def ask_on_link_rule_change(event: PolicyEvent) -> PolicyResponse:
++    """ASK for user approval before an agent changes a chat link rule.
++
++    Matches ``event["target"]`` like :func:`ask_on_scheduled_task_change`.
++    Listing the rules (``action: "list"``) is not gated.
++
++    :param event: Policy event dict.
++    :returns: ASK for an add, update or remove; ALLOW otherwise.
++    """
++    if event.get("type") != "tool_call" or event.get("target") not in LINK_RULE_APPROVAL_TOOLS:
++        return _ALLOW
++    data = event.get("data")
++    args = data.get("arguments") if isinstance(data, dict) else None
++    if not isinstance(args, dict):
++        args = {}
++    action = args.get("action")
++    if action == "list":
++        return _ALLOW
++    name = _clip(str(args.get("name") or "(unnamed)"))
++    fields = [
++        f"{key}={_clip(str(args[key]))}"
++        for key in ("new_name", "kind", "pattern", "url", "enabled")
++        if key in args
++    ]
++    detail = f" ({', '.join(fields)})" if fields else ""
++    verb = action if action in ("add", "update", "remove") else "change"
++    return {
++        "result": "ASK",
++        "reason": f"Agent wants to {verb} chat link rule {name!r}{detail}. Approve?",
++    }
++
++
+ # ── Skill blocking ──────────────────────────────────────────────────────────
+ 
+ 
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index 826e24b440134f4826776b5a03d2411755bc2e74..bb3cf94a6328b8487ba510ea816a35b65d709368 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -70,12 +70,14 @@ from omnigent.harness_plugins import (
+     model_env_keys,
+     spawn_env_builders,
+ )
++from omnigent.link_rules import LinkRule
+ from omnigent.llms.errors import detect_request_size_overflow
+ from omnigent.native.failure_telemetry import failure_log_attributes
+ from omnigent.native.input_diagnostics import input_attributes
+ from omnigent.native.native_coding_agents import (
+     native_coding_agent_for_harness,
+ )
++from omnigent.native.native_terminal import fetch_link_rules
+ from omnigent.runner import native as _native
+ from omnigent.runner import pending_approvals, pr_reports
+ from omnigent.runner import subagent_work as _subagent_work
+@@ -207,6 +209,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
+ from omnigent.runtime.prompt import (
+     build_instructions,
+     build_instructions_nullable,
++    link_rule_instructions,
+     raw_author_instructions,
+ )
+ from omnigent.server.schemas import (
+@@ -221,6 +224,8 @@ _logger = logging.getLogger(__name__)
+ 
+ # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
+ _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
++# How long a turn's chat-links instruction reuses the last read of the rules.
++_LINK_RULES_CACHE_TTL_S = 60.0
+ 
+ 
+ # Pending questions outlive prompt delivery; poll outside the turn watchdog.
+@@ -1313,6 +1318,8 @@ def create_runner_app(
+     # session_id → enabled chat features, seeded from the session-init snapshot
+     # and refreshed by every forwarded turn body, so a PATCH applies next turn.
+     _session_chat_features: dict[str, frozenset[ChatFeature]] = {}
++    # (fetched at, rules): the user's chat link rules, re-read after a TTL.
++    _link_rules_cache: list[tuple[float, tuple[LinkRule, ...]]] = []
+     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
+     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+     _session_cursor_model_names: dict[str, dict[str, str]] = {}
+@@ -5109,6 +5116,18 @@ def create_runner_app(
+         """
+         return _resolve_turn_chat_features(_session_chat_features, conv, msg_body)
+ 
++    async def _turn_link_rule_instructions() -> list[str]:
++        """The chat-links instruction for this turn, from rules cached briefly.
++
++        Rules are per user and a runner serves one user, so one cache entry
++        covers every session; a saved change reaches the next turn after
++        :data:`_LINK_RULES_CACHE_TTL_S`.
++        """
++        now = time.monotonic()
++        if not _link_rules_cache or now - _link_rules_cache[0][0] > _LINK_RULES_CACHE_TTL_S:
++            _link_rules_cache[:] = [(now, await fetch_link_rules(server_client))]
++        return link_rule_instructions(_link_rules_cache[0][1])
++
+     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
+         """Reasoning block to forward on a turn, or ``None`` when unset.
+ 
+@@ -5233,12 +5252,14 @@ def create_runner_app(
+             # Gated harnesses use nullable to avoid the fallback literal.
+             _authored_bg = raw_author_instructions(cached_spec) is not None
+             _bg_chat_features = _turn_chat_features(conv, msg_body)
++            _bg_link_rules = await _turn_link_rule_instructions()
+             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+                 instructions = build_instructions_nullable(
+                     cached_spec,
+                     _raw_per_request_instructions,
+                     [],
+                     chat_features=_bg_chat_features,
++                    framework_instructions=_bg_link_rules,
+                 )
+             else:
+                 instructions = build_instructions(
+@@ -5246,6 +5267,7 @@ def create_runner_app(
+                     _raw_per_request_instructions,
+                     [],
+                     chat_features=_bg_chat_features,
++                    framework_instructions=_bg_link_rules,
+                 )
+             # Warn once per (conversation, harness, delivery) if the agent has
+             # authored instructions but the harness can't deliver them.
+@@ -5920,6 +5942,7 @@ def create_runner_app(
+                         _per_req_instr = cast(str | None, body.get("instructions"))
+                         _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
+                         _ds_chat_features = _turn_chat_features(conv_id, body)
++                        _ds_link_rules = await _turn_link_rule_instructions()
+                         _ic_ds = InstructionComposition(
+                             authored_present=_authored_ds,
+                             composed=build_instructions_nullable(
+@@ -5927,6 +5950,7 @@ def create_runner_app(
+                                 _per_req_instr,
+                                 [],
+                                 chat_features=_ds_chat_features,
++                                framework_instructions=_ds_link_rules,
+                             ),
+                         )
+                         # Gated harnesses get nullable — skip the fallback literal.
+@@ -5942,6 +5966,7 @@ def create_runner_app(
+                                     _per_req_instr,
+                                     [],
+                                     chat_features=_ds_chat_features,
++                                    framework_instructions=_ds_link_rules,
+                                 ),
+                             }
+                         if _authored_ds and harness_name:
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 69f3416d35f26309486dc0cc60bf771591fa39ff..92e1acfd88924bfee4fbfca9f31ebca9cbe76cb3 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -69,6 +69,7 @@ from omnigent.harness_plugins import native_provider_for_key
+ from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+ from omnigent.inference_config import ModelNotAllowedError
+ from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
++from omnigent.link_rules import LinkRule
+ from omnigent.models.model_override import validate_model_override
+ from omnigent.native.failure_telemetry import (
+     FailureContext,
+@@ -80,6 +81,7 @@ from omnigent.native.native_coding_agents import (
+     native_coding_agent_for_terminal_name,
+ )
+ from omnigent.native.native_dispatch import resolve_hook
++from omnigent.native.native_terminal import fetch_link_rules
+ from omnigent.pi_prompt import pi_prompt_args
+ from omnigent.process_logging import process_log_reference
+ from omnigent.runner.resource_registry import (
+@@ -5636,6 +5638,7 @@ async def _auto_create_codex_terminal(
+                 native_startup_instructions(
+                     _native_startup_raw_instructions_from_spec(agent_spec),
+                     launch_config.chat_features,
++                    await _launch_link_rules(server_client),
+                 ),
+                 _codex_routing_note,
+             ]
+@@ -7528,6 +7531,17 @@ def _session_init_chat_features(
+     return chat_features_from_wire(getattr(session_init.snapshot, "chat_features", None))
+ 
+ 
++async def _launch_link_rules(
++    server_client: httpx.AsyncClient | None,
++) -> tuple[LinkRule, ...]:
++    """The user's chat link rules for a native launch; none without a server.
++
++    :param server_client: The runner's client to the Omnigent server, or ``None``.
++    :returns: The rules in effect, or ``()`` when they can't be read.
++    """
++    return () if server_client is None else await fetch_link_rules(server_client)
++
++
+ def _native_startup_raw_instructions_from_spec(
+     agent_spec: AgentSpec | ResolvedSpec | None,
+ ) -> str | None:
+@@ -9603,6 +9617,7 @@ async def _auto_create_claude_terminal(
+                 native_startup_instructions(
+                     _native_startup_raw_instructions_from_spec(agent_spec),
+                     launch_metadata.chat_features,
++                    await _launch_link_rules(server_client),
+                 ),
+                 routed_spawn_note,
+             ]
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index 95308a4172359c5c15dc408c848d3798e5d6af4f..f9666beadcce66daabfdc4243ca8ebc17dfb89c2 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -36,6 +36,7 @@ from datetime import UTC, datetime
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Protocol, cast
+ 
++from omnigent.link_rules import LinkRuleError, validate_link_rules
+ from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+ from omnigent.util.json_serialization import json_dumps_transport_safe
+ from omnigent.util.json_types import JsonObject as _JsonObject
+@@ -442,6 +443,10 @@ _SCHEDULED_TASK_TOOLS = frozenset(
+     }
+ )
+ 
++# Priority 5l.2: Chat link rules — the runner proxies the Omnigent server's
++# /v1/link-rules endpoints, which validate every rule.
++_LINK_RULE_TOOLS = frozenset({"sys_link_rules"})
++
+ # Priority 5m: Embedded-browser tools.
+ # Runner dispatch POSTs a blocking action request to the server, which parks a
+ # Future + publishes ``browser.action_request`` on the session stream; the
+@@ -495,6 +500,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
+     | _AGENT_TOOLS
+     | _POLICY_TOOLS
+     | _SCHEDULED_TASK_TOOLS
++    | _LINK_RULE_TOOLS
+     | _TERMINAL_TOOLS
+     # ``browser_*`` must ride the native relay: the Omnigent desktop app
+     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
+@@ -905,6 +911,7 @@ _ALL_LOCAL_TOOLS = (
+     | _AGENT_TOOLS
+     | _POLICY_TOOLS
+     | _SCHEDULED_TASK_TOOLS
++    | _LINK_RULE_TOOLS
+ )
+ _PLACEHOLDER_CWDS = (None, "", ".", "./")
+ 
+@@ -5111,6 +5118,118 @@ async def _execute_scheduled_task_tool(
+     return json.dumps(resp.json())
+ 
+ 
++_LINK_RULE_FIELDS = ("kind", "pattern", "url", "enabled")
++
++
++def _changed_link_rules(rules: list[_JsonObject], args: _JsonObject) -> list[_JsonObject] | str:
++    """Apply one add/update/remove to the rule list, or explain why it can't apply.
++
++    :param rules: The rules in effect, as ``GET /v1/link-rules`` returns them.
++    :param args: The tool arguments; ``action`` is ``add``, ``update`` or ``remove``.
++    :returns: The new list, or an error message.
++    """
++    action = args.get("action")
++    name = args.get("name")
++    if not isinstance(name, str) or not name.strip():
++        return f"{action} needs the rule's name"
++    folded = name.strip().casefold()
++    index = next(
++        (at for at, rule in enumerate(rules) if str(rule.get("name", "")).casefold() == folded),
++        None,
++    )
++    if action == "add":
++        if index is not None:
++            return f"a rule named {name.strip()!r} already exists; use update"
++        added: _JsonObject = {"name": name.strip(), "kind": "url", "enabled": True}
++        added.update({key: args[key] for key in _LINK_RULE_FIELDS if key in args})
++        return [*rules, added]
++    if index is None:
++        names = ", ".join(repr(rule.get("name")) for rule in rules) or "none"
++        return f"no rule named {name.strip()!r} (rules: {names})"
++    if action == "remove":
++        return [rule for at, rule in enumerate(rules) if at != index]
++    changed = {**rules[index]}
++    changed.update({key: args[key] for key in _LINK_RULE_FIELDS if key in args})
++    if isinstance(args.get("new_name"), str):
++        changed["name"] = args["new_name"]
++    return [changed if at == index else rule for at, rule in enumerate(rules)]
++
++
++async def _execute_link_rules_tool(
++    arguments: str,
++    *,
++    server_client: httpx.AsyncClient | None,
++) -> str:
++    """Runner-local handler for ``sys_link_rules``.
++
++    Lists the rules, or reads them, applies one change, checks the result with
++    the server's validator and writes the whole list back with the version it
++    read, so a concurrent edit is refused instead of overwritten.
++
++    :param arguments: JSON-encoded arguments string from the LLM.
++    :param server_client: HTTP client pointed at the Omnigent server; ``None``
++        returns an error string.
++    :returns: Tool output JSON string.
++    """
++    tool = "sys_link_rules"
++    if server_client is None:
++        return json.dumps({"error": f"{tool} requires server access"})
++    try:
++        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
++    except json.JSONDecodeError:
++        return json.dumps({"error": f"{tool}: malformed JSON arguments"})
++    action = args.get("action")
++    if action not in ("list", "add", "update", "remove"):
++        return json.dumps({"error": f"{tool}: action must be list, add, update or remove"})
++    try:
++        current = await server_client.get("/v1/link-rules", timeout=30.0)
++        if current.status_code >= 400:
++            return json.dumps(
++                {"error": f"server returned {current.status_code}", "details": current.text[:500]}
++            )
++        state = current.json()
++        rules = [
++            {key: value for key, value in rule.items() if value is not None}
++            for rule in state.get("rules", [])
++        ]
++        if action == "list":
++            return json.dumps({"saved": state.get("saved"), "rules": rules})
++        if not state.get("supported"):
++            return json.dumps(
++                {"error": "saving link rules needs shared preferences enabled on the server"}
++            )
++        changed = _changed_link_rules(rules, args)
++        if isinstance(changed, str):
++            return json.dumps({"error": f"{tool}: {changed}"})
++        try:
++            validate_link_rules(changed)
++        except LinkRuleError as exc:
++            return json.dumps({"error": f"{tool}: {exc}"})
++        resp = await server_client.put(
++            "/v1/link-rules",
++            json={"rules": changed, "expected_version": state.get("version", 0)},
++            timeout=30.0,
++        )
++    except Exception as exc:  # noqa: BLE001
++        return json.dumps({"error": f"{tool} failed: {exc}"})
++    if resp.status_code == 409:
++        return json.dumps({"error": f"{tool}: the rules changed meanwhile; list them and retry"})
++    if resp.status_code >= 400:
++        return json.dumps(
++            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
++        )
++    saved = resp.json()
++    return json.dumps(
++        {
++            "saved": saved.get("saved"),
++            "rules": [
++                {key: value for key, value in rule.items() if value is not None}
++                for rule in saved.get("rules", [])
++            ],
++        }
++    )
++
++
+ @dataclass
+ class _ParsedTitle:
+     """
+@@ -7384,6 +7503,8 @@ async def execute_tool(
+                 arguments,
+                 server_client=server_client,
+             )
++        elif tool_name in _LINK_RULE_TOOLS:
++            output = await _execute_link_rules_tool(arguments, server_client=server_client)
+         elif tool_name in _BROWSER_TOOLS:
+             output = await _execute_browser_tool(
+                 tool_name,
+diff --git a/omnigent/runtime/policies/builder.py b/omnigent/runtime/policies/builder.py
+index b11affef744bf5d513c3916ef9c36876a09d8d1e..6f286ee6c02a56989cf2d1c643662f73b8944e21 100644
+--- a/omnigent/runtime/policies/builder.py
++++ b/omnigent/runtime/policies/builder.py
+@@ -30,7 +30,10 @@ from omnigent.entities import Policy as StoredPolicy
+ from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+ from omnigent.llms.context_window import fetch_model_pricing_with_provider
+ from omnigent.policies.base import Policy
+-from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
++from omnigent.policies.builtins.safety import (
++    LINK_RULE_APPROVAL_TOOLS,
++    SCHEDULED_TASK_APPROVAL_TOOLS,
++)
+ from omnigent.policies.function import resolve_function_policy
+ from omnigent.policies.schema import (
+     SESSION_COST_ASK_APPROVED_STATE_KEY,
+@@ -96,10 +99,21 @@ _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
+     ),
+ )
+ 
++# Chat link rules run in every viewer's browser: each change asks first.
++_ASK_ON_LINK_RULE_CHANGE_SPEC = FunctionPolicySpec(
++    name="__ask_on_link_rule_change",
++    on=None,
++    function=FunctionRef(
++        path="omnigent.policies.builtins.safety.ask_on_link_rule_change",
++        arguments=None,
++    ),
++)
++
+ # Appended to every engine after the session, agent, and admin policies.
+ _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
+     _ASK_ON_ADD_POLICY_SPEC,
+     _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC,
++    _ASK_ON_LINK_RULE_CHANGE_SPEC,
+ )
+ 
+ # Bounded cache of ``conversation_id -> session owner``. The owner
+@@ -437,10 +451,12 @@ def any_policies_apply(
+         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
+     """
+     # The engine unconditionally injects _REQUIRED_APPROVAL_SPECS, so their
+-    # TOOL_CALL events must always reach it: never fast-path sys_add_policy
+-    # or the scheduled-task mutation tools.
++    # TOOL_CALL events must always reach it: never fast-path sys_add_policy,
++    # the scheduled-task mutation tools or the link-rule tool.
+     if phase == Phase.TOOL_CALL and (
+-        tool_name == "sys_add_policy" or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
++        tool_name == "sys_add_policy"
++        or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
++        or tool_name in LINK_RULE_APPROVAL_TOOLS
+     ):
+         return True
+     if spec.guardrails and spec.guardrails.policies:
+diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
+index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..11e87b149191ac05a656e691468a45c071e61fbe 100644
+--- a/omnigent/runtime/prompt.py
++++ b/omnigent/runtime/prompt.py
+@@ -15,6 +15,7 @@ from omnigent.entities import (
+     NativeToolData,
+ )
+ from omnigent.inner.native_attachments import expand_framework_notices
++from omnigent.link_rules import LinkRule, describe_link_syntax, enabled_link_rules
+ from omnigent.runtime.chat_features import ChatFeature, chat_feature_instructions
+ from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+ from omnigent.runtime.tool_result_replay import (
+@@ -96,6 +97,24 @@ ITEM_LABEL_INSTRUCTION = (
+ )
+ 
+ 
++def link_rule_instructions(rules: Sequence[LinkRule]) -> list[str]:
++    """The chat-links instruction for the user's enabled link rules.
++
++    The chat UI links these references (web/src/lib/linkRules.ts) wherever
++    they appear as plain text, so agents should write them bare.
++
++    :param rules: The user's link rules, saved or default.
++    :returns: One instruction naming each enabled rule's syntax, or none.
++    """
++    syntaxes = [describe_link_syntax(rule) for rule in enabled_link_rules(rules)]
++    if not syntaxes:
++        return []
++    return [
++        "Chat links: the chat UI turns these references into links when they "
++        "appear as plain text, not inside code or a markdown link: " + "; ".join(syntaxes) + "."
++    ]
++
++
+ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+     """
+     Framework instructions that apply to every turn of ``spec``.
+@@ -129,19 +148,26 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+ def native_startup_instructions(
+     author_instructions: str | None,
+     chat_features: Iterable[ChatFeature],
++    link_rules: Sequence[LinkRule] = (),
+ ) -> str | None:
+     """Author instructions plus the framework text a native launch channel carries.
+ 
+     Native harnesses take instructions once, at launch, so only framework
+-    instructions that hold for every turn of the session belong here.
++    instructions that hold for every turn of the session belong here. A link
++    rule changed later reaches the agent on its next launch.
+ 
+     :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
+     :param chat_features: The session's enabled chat features.
++    :param link_rules: The user's chat link rules at launch.
+     :returns: The combined text, or ``None`` when there is nothing to send.
+     """
+     return append_framework_instructions(
+         author_instructions,
+-        [ITEM_LABEL_INSTRUCTION, *chat_feature_instructions(chat_features)],
++        [
++            ITEM_LABEL_INSTRUCTION,
++            *chat_feature_instructions(chat_features),
++            *link_rule_instructions(link_rules),
++        ],
+     )
+ 
+ 
+diff --git a/omnigent/spec/types.py b/omnigent/spec/types.py
+index 6d525c98f8096f9bb68a7ed6e35de39d27a32ebd..af0a6555a5695da1305ea28e93750c46fc5c4680 100644
+--- a/omnigent/spec/types.py
++++ b/omnigent/spec/types.py
+@@ -890,6 +890,7 @@ class ToolGroupsConfig:
+     :param comments: ``list_comments`` and ``update_comment``.
+     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
+     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
++    :param link_rules: ``sys_link_rules``, for the user's chat link rules.
+     """
+ 
+     browser: bool = True
+@@ -897,6 +898,7 @@ class ToolGroupsConfig:
+     comments: bool = True
+     policies: bool = True
+     agent_discovery: bool = True
++    link_rules: bool = True
+ 
+ 
+ @dataclass
+diff --git a/omnigent/tools/builtins/link_rules.py b/omnigent/tools/builtins/link_rules.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b071ef125d99bf0f1551b64d7c4694e842ea05c0
+--- /dev/null
++++ b/omnigent/tools/builtins/link_rules.py
+@@ -0,0 +1,87 @@
++"""Built-in tool for the user's chat link rules.
++
++``sys_link_rules`` lists, adds, updates and removes the rules that turn short
++references in chat messages into links (``docs/chat-link-rules.md``). The
++runner dispatches it to the Omnigent server's ``/v1/link-rules`` endpoints,
++which validate every rule; every change asks the user first through the
++``__ask_on_link_rule_change`` policy.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from omnigent.tools.base import Tool
++
++
++class SysLinkRulesTool(Tool):
++    """List or change chat link rules. Runner-dispatched to ``/v1/link-rules``."""
++
++    @classmethod
++    def name(cls) -> str:
++        """:returns: ``"sys_link_rules"``."""
++        return "sys_link_rules"
++
++    @classmethod
++    def description(cls) -> str:
++        """:returns: Human-readable description of the tool."""
++        return (
++            "List, add, update or remove the user's chat link rules, which turn short "
++            "references in chat messages into links. A 'url' rule has a pattern (a short "
++            "form such as 'BST-{num}', with {num} digits, {key} an uppercase key, {id} "
++            "letters/digits/_/-, or a raw '/regex/' without lookaround, named groups or "
++            "backreferences) and an https URL template using the same placeholders "
++            "('{1}' for a regex group), e.g. 'https://jira.example.com/browse/BST-{num}'. "
++            "The built-in 'github' (#123) and 'session' (session:<id>) kinds take no "
++            "pattern or url. Every change asks the user to approve it; only change rules "
++            "when the user asks."
++        )
++
++    def get_schema(self) -> dict[str, Any]:
++        """:returns: The OpenAI-format tool schema."""
++        return {
++            "type": "function",
++            "function": {
++                "name": self.name(),
++                "description": self.description(),
++                "parameters": {
++                    "type": "object",
++                    "properties": {
++                        "action": {
++                            "type": "string",
++                            "enum": ["list", "add", "update", "remove"],
++                            "description": "What to do.",
++                        },
++                        "name": {
++                            "type": "string",
++                            "description": (
++                                "add: the new rule's name. update/remove: the rule to change."
++                            ),
++                        },
++                        "new_name": {
++                            "type": "string",
++                            "description": "update: rename the rule.",
++                        },
++                        "kind": {
++                            "type": "string",
++                            "enum": ["url", "github", "session"],
++                            "description": "add: the rule's kind (default 'url').",
++                        },
++                        "pattern": {
++                            "type": "string",
++                            "description": "add/update, url kind: the pattern.",
++                        },
++                        "url": {
++                            "type": "string",
++                            "description": "add/update, url kind: the link template.",
++                        },
++                        "enabled": {
++                            "type": "boolean",
++                            "description": "add/update: whether chat messages use the rule.",
++                        },
++                    },
++                    "required": ["action"],
++                    "additionalProperties": False,
++                },
++            },
++        }
+diff --git a/omnigent/tools/manager.py b/omnigent/tools/manager.py
+index c67cb8a3da92eb05860f320cde148f8dc79262a2..a79067cd1e4052df1c3e80d4abcc787042066cbf 100644
+--- a/omnigent/tools/manager.py
++++ b/omnigent/tools/manager.py
+@@ -190,6 +190,7 @@ class ToolManager:
+         self._register_comment_tools()
+         self._register_policy_tools()
+         self._register_scheduled_task_tools()
++        self._register_link_rule_tools()
+         self._register_browser_tools()
+ 
+     def _register_policy_tools(self) -> None:
+@@ -229,6 +230,20 @@ class ToolManager:
+         ):
+             self._tools[tool.name()] = tool
+ 
++    def _register_link_rule_tools(self) -> None:
++        """
++        Auto-register ``sys_link_rules`` for the user's chat link rules.
++
++        Registered without spec opt-in; ``tool_groups.link_rules: false``
++        drops it. The runner dispatches it via the Omnigent server's
++        ``/v1/link-rules`` endpoints, and every change asks the user first.
++        """
++        if not self._spec.tool_groups.link_rules:
++            return
++        from omnigent.tools.builtins.link_rules import SysLinkRulesTool
++
++        self._tools[SysLinkRulesTool.name()] = SysLinkRulesTool()
++
+     def _register_async_inbox_tools(self) -> None:
+         """
+         Register the async-dispatch builtins when the agent spec
+diff --git a/tests/runner/test_link_rules_tool_dispatch.py b/tests/runner/test_link_rules_tool_dispatch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7f591b6ba4850b1c9dad700313afa5ba6029264
+--- /dev/null
++++ b/tests/runner/test_link_rules_tool_dispatch.py
+@@ -0,0 +1,133 @@
++"""``sys_link_rules``: the runner's handler against the real ``/v1/link-rules`` routes,
++its registration, and the approval it asks for."""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Mapping
++from typing import Any
++
++import httpx
++import pytest
++
++from omnigent.link_rules import DEFAULT_LINK_RULES
++from omnigent.policies.builtins.safety import ask_on_link_rule_change
++from omnigent.runner.tool_dispatch import (
++    _ALL_LOCAL_TOOLS,
++    _LINK_RULE_TOOLS,
++    _NATIVE_RELAY_BUILTIN_TOOLS,
++    _execute_link_rules_tool,
++)
++from omnigent.runtime.agent_cache import AgentCache
++from omnigent.server.app import create_app
++from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++from omnigent.stores.artifact_store.local import LocalArtifactStore
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
++from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
++
++TRACKER = {
++    "action": "add",
++    "name": "Tracker",
++    "pattern": "BST-{num}",
++    "url": "https://jira.example.com/browse/BST-{num}",
++}
++
++
++@pytest.fixture
++def server_client(db_uri, tmp_path):
++    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
++    app = create_app(
++        SqlAlchemyAgentStore(db_uri),
++        SqlAlchemyFileStore(db_uri),
++        SqlAlchemyConversationStore(db_uri),
++        artifacts,
++        AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
++        preference_store=SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority"),
++    )
++    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
++
++
++async def _call(client: httpx.AsyncClient, **args: object) -> Any:
++    return json.loads(await _execute_link_rules_tool(json.dumps(args), server_client=client))
++
++
++async def test_list_add_update_remove(server_client):
++    async with server_client as client:
++        listed = await _call(client, action="list")
++        assert listed["saved"] is False
++        assert [rule["name"] for rule in listed["rules"]] == [r.name for r in DEFAULT_LINK_RULES]
++
++        added = await _call(client, **TRACKER)
++        assert added["saved"] is True
++        assert added["rules"][-1] == {
++            "name": "Tracker",
++            "kind": "url",
++            "pattern": "BST-{num}",
++            "url": "https://jira.example.com/browse/BST-{num}",
++            "enabled": True,
++        }
++        assert "already exists" in (await _call(client, **TRACKER))["error"]
++
++        updated = await _call(
++            client, action="update", name="tracker", enabled=False, new_name="Tix"
++        )
++        assert updated["rules"][-1]["name"] == "Tix"
++        assert updated["rules"][-1]["enabled"] is False
++
++        removed = await _call(client, action="remove", name="GitHub")
++        assert "GitHub" not in [rule["name"] for rule in removed["rules"]]
++        assert "no rule named" in (await _call(client, action="remove", name="GitHub"))["error"]
++
++
++@pytest.mark.parametrize(
++    ("change", "message"),
++    [
++        ({"url": "javascript:alert(1)//{num}"}, "https://"),
++        ({"pattern": "/(a+)+/"}, "repeated group"),
++        ({"pattern": "/(?<=x)BST-(\\d+)/"}, "lookaround"),
++        ({"kind": "github"}, "takes no pattern"),
++    ],
++)
++async def test_invalid_changes_are_refused_before_saving(server_client, change, message):
++    async with server_client as client:
++        result = await _call(client, **{**TRACKER, **change})
++        assert message in result["error"]
++        assert (await _call(client, action="list"))["saved"] is False
++
++
++async def test_bad_arguments(server_client):
++    async with server_client as client:
++        assert "action must be" in (await _call(client, action="wipe"))["error"]
++        assert "needs the rule's name" in (await _call(client, action="remove"))["error"]
++    assert (
++        "server access"
++        in json.loads(await _execute_link_rules_tool('{"action":"list"}', server_client=None))[
++            "error"
++        ]
++    )
++
++
++def test_registered_for_local_dispatch_and_the_native_relay():
++    assert {"sys_link_rules"} == _LINK_RULE_TOOLS
++    assert _LINK_RULE_TOOLS <= _ALL_LOCAL_TOOLS
++    assert _LINK_RULE_TOOLS <= _NATIVE_RELAY_BUILTIN_TOOLS
++
++
++def _event(args: Mapping[str, object], target: str = "sys_link_rules") -> Any:
++    return {
++        "type": "tool_call",
++        "target": target,
++        "data": {"name": target, "arguments": args},
++    }
++
++
++def test_every_change_asks_and_listing_does_not():
++    assert ask_on_link_rule_change(_event({"action": "list"}))["result"] == "ALLOW"
++    assert ask_on_link_rule_change(_event(TRACKER, target="other"))["result"] == "ALLOW"
++    asked = ask_on_link_rule_change(_event(TRACKER))
++    assert asked["result"] == "ASK"
++    assert "add chat link rule 'Tracker'" in asked["reason"]
++    assert "url=https://jira.example.com/browse/BST-{num}" in asked["reason"]
++    for args in ({"action": "remove", "name": "GitHub"}, {"action": "update", "name": "x"}, {}):
++        assert ask_on_link_rule_change(_event(args))["result"] == "ASK"
+diff --git a/tests/runtime/policies/test_builder.py b/tests/runtime/policies/test_builder.py
+index d77ac1b891bd34e527014e40c99207b8eea86f73..c940348288f71fdc3d3e8773fe692c8659fb881d 100644
+--- a/tests/runtime/policies/test_builder.py
++++ b/tests/runtime/policies/test_builder.py
+@@ -112,6 +112,7 @@ name: no-guardrails
+     assert [p.spec.name for p in engine.policies] == [
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+     assert engine.label_defs == {}
+     assert engine.labels == {}
+@@ -144,6 +145,7 @@ guardrails: {}
+     assert [p.spec.name for p in engine.policies] == [
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+     assert engine.label_defs == {}
+     assert engine.labels == {}
+@@ -199,6 +201,7 @@ guardrails:
+         "charlie",
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+ 
+ 
+@@ -539,9 +542,10 @@ def test_build_from_programmatic_spec(
+     )
+     assert engine.ask_timeout == 45
+     assert engine.policies[0].spec.name == "taint_web"
+-    assert [p.spec.name for p in engine.policies[-2:]] == [
++    assert [p.spec.name for p in engine.policies[-3:]] == [
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+     assert engine.labels == {"integrity": "1"}
+ 
+@@ -584,6 +588,7 @@ def test_default_policies_appended_after_agent_policies(
+         "admin_policy",
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+ 
+ 
+@@ -609,9 +614,10 @@ def test_default_policies_alone_builds_live_engine(
+         default_policies=[admin_policy],
+     )
+     assert engine.policies[0].spec.name == "admin_audit"
+-    assert [p.spec.name for p in engine.policies[-2:]] == [
++    assert [p.spec.name for p in engine.policies[-3:]] == [
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+ 
+ 
+@@ -637,7 +643,11 @@ def test_empty_default_policies_preserves_existing_behaviour(
+         default_policies=[],
+     )
+     # Only the two hardcoded approval guards.
+-    guards = ["__ask_on_add_policy", "__ask_on_scheduled_task_change"]
++    guards = [
++        "__ask_on_add_policy",
++        "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
++    ]
+     assert [p.spec.name for p in engine_none.policies] == guards
+     assert [p.spec.name for p in engine_empty.policies] == guards
+ 
+diff --git a/tests/runtime/policies/test_builder_session_policies.py b/tests/runtime/policies/test_builder_session_policies.py
+index 2fb4f0e817586046209da3084323d1f7023058f1..eb1789edf995b608afad8bc3d37e05f7e8839f7b 100644
+--- a/tests/runtime/policies/test_builder_session_policies.py
++++ b/tests/runtime/policies/test_builder_session_policies.py
+@@ -282,9 +282,10 @@ def test_build_engine_includes_session_policies(db_uri: str) -> None:
+ 
+     assert isinstance(engine.policies[0], FunctionPolicy)
+     assert engine.policies[0].spec.name == "test_policy"
+-    assert [p.spec.name for p in engine.policies[-2:]] == [
++    assert [p.spec.name for p in engine.policies[-3:]] == [
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+ 
+ 
+@@ -306,6 +307,7 @@ def test_build_engine_no_store_returns_noop(db_uri: str) -> None:
+     assert [p.spec.name for p in engine.policies] == [
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+ 
+ 
+@@ -365,6 +367,7 @@ def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
+         "admin_policy",
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+ 
+ 
+@@ -834,4 +837,5 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
+         "yaml_admin_policy",
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+diff --git a/tests/runtime/policies/test_yaml_full_roundtrip.py b/tests/runtime/policies/test_yaml_full_roundtrip.py
+index f8c4d4c643534f783cffac5e3505b6c601f1bf78..776377ab2bd9d8da5d710daae6ac9b789c8ce655 100644
+--- a/tests/runtime/policies/test_yaml_full_roundtrip.py
++++ b/tests/runtime/policies/test_yaml_full_roundtrip.py
+@@ -351,6 +351,7 @@ guardrails:
+         "prompt_check",
+         "__ask_on_add_policy",
+         "__ask_on_scheduled_task_change",
++        "__ask_on_link_rule_change",
+     ]
+ 
+     from omnigent.spec.types import FunctionPolicySpec
+diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
+index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..bc378950d71bc1b72a10f5589f1baab6876a973e 100644
+--- a/tests/runtime/test_prompt.py
++++ b/tests/runtime/test_prompt.py
+@@ -2,12 +2,14 @@
+ 
+ import json
+ import re
++from dataclasses import replace
+ from types import SimpleNamespace
+ from typing import cast
+ 
+ import pytest
+ 
+ from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
++from omnigent.link_rules import DEFAULT_LINK_RULES
+ from omnigent.runner.subagent_work import (
+     _format_subagent_wake_notice,
+ )
+@@ -22,6 +24,7 @@ from omnigent.runtime.prompt import (
+     build_instructions,
+     build_instructions_nullable,
+     history_to_input_items,
++    link_rule_instructions,
+     native_startup_instructions,
+     raw_author_instructions,
+ )
+@@ -460,6 +463,35 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+ 
+ 
++def test_link_rule_instructions_name_each_enabled_syntax() -> None:
++    """The chat-links instruction lists only enabled rules, and none means no text."""
++    [instruction] = link_rule_instructions(DEFAULT_LINK_RULES)
++    assert "`#123` or `owner/repo#123`" in instruction
++    assert "`session:<session id>`" in instruction
++    assert "ABC-123" not in instruction  # the Jira example is off by default
++    assert "not inside code" in instruction
++    assert link_rule_instructions(()) == []
++    disabled = [replace(rule, enabled=False) for rule in DEFAULT_LINK_RULES]
++    assert link_rule_instructions(disabled) == []
++
++
++def test_native_startup_instructions_carry_link_rules_last() -> None:
++    """A native launch appends the chat-links instruction after the other framework text."""
++    text = native_startup_instructions("Agent prompt", frozenset(), DEFAULT_LINK_RULES)
++    assert text is not None
++    assert text.startswith(f"Agent prompt\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert text.endswith(link_rule_instructions(DEFAULT_LINK_RULES)[0])
++
++
++def test_build_instructions_takes_link_rules_as_framework_text() -> None:
++    """SDK turns pass the per-turn chat-links instruction as framework text."""
++    spec = _spec("Author.")
++    [instruction] = link_rule_instructions(DEFAULT_LINK_RULES)
++    assert build_instructions(spec, None, [], framework_instructions=[instruction]).endswith(
++        instruction
++    )
++
++
+ def test_native_startup_instructions_append_item_labels_after_author_text() -> None:
+     """Native launch channels carry the author text first, then the label guidance."""
+     assert native_startup_instructions("  Agent prompt  ", frozenset()) == (
+diff --git a/tests/test_native_terminal.py b/tests/test_native_terminal.py
+index 360d46aba343903a8f0f53d14e6d776255fe33ee..4f8b461a5d0476ba8a3908eb65727aad2fae7c98 100644
+--- a/tests/test_native_terminal.py
++++ b/tests/test_native_terminal.py
+@@ -426,3 +426,29 @@ async def test_fetch_session_chat_features(
+ 
+     assert features == expected
+     assert paths == ["/v1/sessions/conv%2Fabc"]
++
++
++@pytest.mark.parametrize(
++    ("status_code", "payload", "expected"),
++    [
++        (200, {"rules": [{"name": "GitHub", "kind": "github", "url": None}]}, ("GitHub",)),
++        (404, {"detail": "Not Found"}, ()),
++        (200, {"rules": [{"name": "x", "kind": "url", "pattern": "/(a+)+/"}]}, ()),
++        (200, {"rules": "nope"}, ()),
++    ],
++)
++async def test_fetch_link_rules(
++    status_code: int, payload: dict[str, object], expected: tuple[str, ...]
++) -> None:
++    """The caller's rules feed a launch's instructions; any failed read means none."""
++
++    async def _handler(request: httpx.Request) -> httpx.Response:
++        assert request.url.path == "/v1/link-rules"
++        return httpx.Response(status_code, json=payload)
++
++    async with httpx.AsyncClient(
++        base_url="http://test", transport=httpx.MockTransport(_handler)
++    ) as client:
++        rules = await native_terminal.fetch_link_rules(client)
++
++    assert tuple(rule.name for rule in rules) == expected
+diff --git a/tests/tools/test_manager.py b/tests/tools/test_manager.py
+index 369f9226ce86e7c81f7fdccc784078fce0079c4a..cbec669d9466d474bdb38e3cedf867659a62fdca 100644
+--- a/tests/tools/test_manager.py
++++ b/tests/tools/test_manager.py
+@@ -88,6 +88,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
+         "sys_scheduled_task_list",
+         "sys_scheduled_task_update",
+         "sys_scheduled_task_delete",
++        # The chat link-rule tool is auto-registered like the
++        # scheduled-task tools; every change asks the user first.
++        "sys_link_rules",
+         # Embedded-browser tools are always auto-registered (framework-
+         # owned) so any agent can drive the desktop app's browser without
+         # the spec opting in. Schema-only; runner-dispatched.
+@@ -1711,6 +1714,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
+     "comments": frozenset({"list_comments", "update_comment"}),
+     "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
+     "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
++    "link_rules": frozenset({"sys_link_rules"}),
+ }
+ 
+ 
+@@ -1725,7 +1729,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
+ 
+ 
+ def test_tool_groups_default_registers_every_group() -> None:
+-    """An absent ``tool_groups:`` block changes nothing: all 16 register."""
++    """An absent ``tool_groups:`` block changes nothing: all 17 register."""
+     names = _tool_names(_grouped_spec())
+     for group, members in _TOOL_GROUP_MEMBERS.items():
+         assert members <= names, f"{group} members missing by default: {members - names}"
+@@ -1743,13 +1747,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
+ 
+ def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
+     """
+-    With every group off, the 16 gated tools are gone but the session
++    With every group off, the 17 gated tools are gone but the session
+     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
+     participation and async handles depend on them, so they have no key.
+     """
+     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
+     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
+-    assert len(gated) == 16
++    assert len(gated) == 17
+     assert not (gated & names)
+     assert {
+         "sys_session_list",

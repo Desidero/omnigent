@@ -1,0 +1,2044 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 29 Oct 2026 20:05:15 +0000
+Subject: [PATCH] feat(web): render chat link rules and edit them in Settings
+
+Short references in chat messages (BST-2135, #123, session:<id>) are plain
+text today. This renders the user's link rules from /v1/link-rules and adds a
+Settings group to edit them.
+
+- web/src/lib/linkRules.ts checks and compiles a rule with the same checks as
+  the server, so a rule that slipped past it still can't run, and links text
+  through a remark pass after item labels have become chips. Like item
+  labels, it never rewrites links (file links included), inline code, code
+  blocks or raw HTML, and it applies to agent and user messages. Compiled
+  regexes take their leading boundary as a group instead of lookbehind, which
+  older Safari can't parse. Captures are percent-encoded and every href is
+  re-parsed as http(s) before use.
+- GitHub references link on the session's own provider host, read from the
+  git info the PR panel already fetches; the runner's GitHub resource now
+  reports the repository URL so a session with no PR knows its host. #N goes
+  to /pull/N for a known PR and /issues/N otherwise.
+- session:<id>[/<message id>] opens /c/<id>?message=<message id> in the app,
+  the deep link item labels use for Show in conversation.
+- Settings > General > Chat links lists, adds, edits, toggles, deletes and
+  resets rules, shows each rule's error, and previews sample text with the
+  rules being edited.
+
+Not upstream yet: proposed from feat/chat-link-rules; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-link-rules.md                       |  31 +
+ feature-map/preferences.md                    |  17 +-
+ omnigent/runner/github_resource.py            |  11 +-
+ tests/runner/test_github_resource.py          |  35 ++
+ .../blocks/ChatMarkdown.linkRules.test.tsx    | 185 ++++++
+ web/src/components/blocks/ChatMarkdown.tsx    |  52 +-
+ .../components/chat/LinkRulesScope.test.ts    |  46 ++
+ web/src/components/chat/LinkRulesScope.tsx    |  55 ++
+ web/src/components/chat/Transcript.tsx        |   8 +-
+ web/src/hooks/useLinkRules.ts                 |  14 +
+ web/src/hooks/usePullRequests.ts              |   2 +
+ web/src/lib/linkRules.test.ts                 | 172 ++++++
+ web/src/lib/linkRules.ts                      | 556 ++++++++++++++++++
+ web/src/lib/linkRulesApi.ts                   |  79 +++
+ web/src/pages/SettingsPage.test.tsx           |   3 +
+ web/src/pages/SettingsPage.tsx                |   2 +
+ .../settings/LinkRulesSettingsGroup.test.tsx  | 164 ++++++
+ .../pages/settings/LinkRulesSettingsGroup.tsx | 313 ++++++++++
+ 18 files changed, 1735 insertions(+), 10 deletions(-)
+ create mode 100644 web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
+ create mode 100644 web/src/components/chat/LinkRulesScope.test.ts
+ create mode 100644 web/src/components/chat/LinkRulesScope.tsx
+ create mode 100644 web/src/hooks/useLinkRules.ts
+ create mode 100644 web/src/lib/linkRules.test.ts
+ create mode 100644 web/src/lib/linkRules.ts
+ create mode 100644 web/src/lib/linkRulesApi.ts
+ create mode 100644 web/src/pages/settings/LinkRulesSettingsGroup.test.tsx
+ create mode 100644 web/src/pages/settings/LinkRulesSettingsGroup.tsx
+
+diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
+index 7133177c422a1d1a144c58c1d620cf3b9f8a42f1..c62b2cdb0a25539e1cba9679a43a78c55c218ae2 100644
+--- a/docs/chat-link-rules.md
++++ b/docs/chat-link-rules.md
+@@ -4,6 +4,37 @@ Link rules turn short references in chat messages, such as `BST-2135` or
+ `#123`, into links. Each user has one list of rules, saved as a shared
+ preference, so every session and device shows the same links.
+ 
++## Setting them up
++
++Settings → General → **Chat links** lists the rules. Each one can be turned on
++or off, renamed, edited (pattern and URL for a `url` rule) or deleted; **Add
++rule** adds a `url` rule, and a removed GitHub or Sessions rule can be added
++back. A rule that fails a check shows why under it, and **Save** stays off
++until every rule passes. **Reset to defaults** removes the saved list. The
++**Preview** box renders its text with the rules being edited, before they are
++saved. GitHub references don't link in the preview, which has no session.
++
++A saved rule applies to messages as soon as the transcript refetches the
++rules, in every open session.
++
++## In the chat
++
++Rules apply to agent and user messages alike, after item labels (`[Q2]`) and
++file links have been found, and never inside links, inline code, code blocks
++or raw HTML. Where two rules match overlapping text, the match that starts
++first wins, then the rule listed first. A link's tooltip names its rule.
++
++- `url` and `github` links open in a new tab like any other web link.
++- A `github` reference links to the session's repository on its provider's own
++  host (GitHub Enterprise included), taken from the session's git info: the
++  repository URL, or the host of a known pull request. `#123` goes to
++  `/pull/123` when the session knows that pull request and to `/issues/123`
++  otherwise, which GitHub redirects for pull requests. `owner/repo#123` links
++  on the same host. A session with no GitHub repository leaves them as text.
++- A `session` reference opens the session in the app, scrolled to the message
++  when one is named (`/c/<session id>?message=<message id>`, the same link
++  as an item's **Show in conversation**).
++
+ ## Rules
+ 
+ A rule has a `name` (unique, up to 64 characters), a `kind`, a `pattern`, a
+diff --git a/feature-map/preferences.md b/feature-map/preferences.md
+index ea8f36b32375aae980552bbee1038dfcac9f8aa2..2e0419435883c40e2d2459d2833e8ce8a3346878 100644
+--- a/feature-map/preferences.md
++++ b/feature-map/preferences.md
+@@ -29,7 +29,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
+   server when it creates a session.
+ - `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
+   the `link_rules` shared preference, validated on save and served with the
+-  defaults by `GET`/`PUT /v1/link-rules`.
++  defaults by `GET`/`PUT /v1/link-rules`, edited in Settings → General → Chat
++  links and applied to every chat message.
+ 
+ - `configuration-copy`: review, save, show and import model defaults, harness
+   selection/arguments and launcher plugin opt-outs; preserve local-only values.
+@@ -86,6 +87,20 @@ restores the defaults). Covered by `tests/test_link_rules.py` (pattern and URL
+ checks) and `tests/server/routes/test_link_rules.py` (per-user storage, stale
+ versions, rejected rules, a server without shared preferences).
+ 
++**Chat links in Settings and the chat:** Settings → General → Chat links lists,
++edits, previews, saves and resets the rules; without shared preferences it
++shows the defaults read-only. In a session, write `ABC-12` (after turning on
++and editing the Jira example), `#12`, or `session:<id>` in a message and check
++each renders as a link, while the same text in backticks stays code. Component
++coverage:
++
++```sh
++cd web && npx vitest run src/lib/linkRules.test.ts \
++  src/components/blocks/ChatMarkdown.linkRules.test.tsx \
++  src/components/chat/LinkRulesScope.test.ts \
++  src/pages/settings/LinkRulesSettingsGroup.test.tsx
++```
++
+ **Shared scope controls:** the CLI and UI do not yet offer automatic following,
+ saving machine overrides, removing a machine override,
+ resolving conflicts, or continuing with temporary defaults. The API above can
+diff --git a/omnigent/runner/github_resource.py b/omnigent/runner/github_resource.py
+index 035ac9785b4b304157fa0e60abf22544d21cb0fa..e9a78a549d6488a4f9ee763084dd6b12fd7f3e7e 100644
+--- a/omnigent/runner/github_resource.py
++++ b/omnigent/runner/github_resource.py
+@@ -950,15 +950,20 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
+         return payload
+ 
+     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
+-    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root, token=token)
++    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner,url"], cwd=root, token=token)
+     if rc == 0:
+         try:
+-            nwo = json.loads(out).get("nameWithOwner")
++            view = json.loads(out)
++            nwo = view.get("nameWithOwner")
++            repo_url = view.get("url")
+         except (ValueError, AttributeError):
+-            nwo = None
++            nwo = repo_url = None
+         if nwo:
+             payload["authenticated"] = True
+             payload["repo"] = {"name_with_owner": nwo}
++            # The repository's host, for linking #123 in chat without a PR.
++            if isinstance(repo_url, str) and repo_url.startswith(("https://", "http://")):
++                payload["repo"]["url"] = repo_url
+             return payload  # -> no-pr
+ 
+     # Repo unreachable / not signed in — enumerate accounts so the panel can offer
+diff --git a/tests/runner/test_github_resource.py b/tests/runner/test_github_resource.py
+index 9f9d4114a52f22442ccc66ce1b16005f66656443..cebbac91a1b88d5e4a177cb6b1d3c72843d7476c 100644
+--- a/tests/runner/test_github_resource.py
++++ b/tests/runner/test_github_resource.py
+@@ -189,6 +189,41 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+     assert sum(c[:2] == ("pr", "view") for c in calls) == 1
+ 
+ 
++@pytest.mark.parametrize(
++    ("view", "expected"),
++    [
++        (
++            {"nameWithOwner": "o/r", "url": "https://git.example.com/o/r"},
++            {"name_with_owner": "o/r", "url": "https://git.example.com/o/r"},
++        ),
++        ({"nameWithOwner": "o/r", "url": "javascript:x"}, {"name_with_owner": "o/r"}),
++        ({"nameWithOwner": "o/r"}, {"name_with_owner": "o/r"}),
++    ],
++)
++def test_github_info_no_pr_reports_the_repository_url(
++    repo: Path, monkeypatch: pytest.MonkeyPatch, view: dict[str, str], expected: dict[str, str]
++) -> None:
++    """Without a PR the repo's web URL gives chat links the host; only http(s) is kept."""
++
++    def fake_gh(
++        argv: Sequence[str], *, cwd: str, token: str | None = None
++    ) -> tuple[int, str, str]:
++        head = tuple(argv[:2])
++        if head == ("auth", "status"):
++            return (0, "", "")
++        if head == ("repo", "view"):
++            assert "url" in argv[-1].split(",")
++            return (0, json.dumps(view), "")
++        if head == ("pr", "view"):
++            return (1, "", "no pull requests found for branch")
++        return (1, "", "no stub")
++
++    monkeypatch.setattr(github_resource, "_gh", fake_gh)
++    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
++
++    assert github_info(str(repo))["repo"] == expected
++
++
+ def test_github_info_pr_via_commit_fork_fallback(
+     repo: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+diff --git a/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx b/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5910c2d04
+--- /dev/null
++++ b/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
+@@ -0,0 +1,185 @@
++// Link rules in chat markdown: references in plain text become links after
++// item labels and file links have taken theirs, and text in links, code and
++// code blocks is never rewritten.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { MemoryRouter, useLocation } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  ItemLabelIndexContext,
++  ItemLabelMessageContext,
++  ItemLabelSessionContext,
++  buildItemLabelIndex,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import {
++  compileLinkRules,
++  type GithubLinkTarget,
++  type LinkRule,
++  LinkRuleMatchersContext,
++} from "@/lib/linkRules";
++import { FilePathAwareMessageResponse } from "./ChatMarkdown";
++
++const JIRA: LinkRule = {
++  name: "Jira",
++  kind: "url",
++  pattern: "BST-{num}",
++  url: "https://jira.example.com/browse/BST-{num}",
++  enabled: true,
++};
++const GITHUB_RULE: LinkRule = {
++  name: "GitHub",
++  kind: "github",
++  pattern: "",
++  url: null,
++  enabled: true,
++};
++const SESSION_RULE: LinkRule = {
++  name: "Sessions",
++  kind: "session",
++  pattern: "",
++  url: null,
++  enabled: true,
++};
++const GITHUB: GithubLinkTarget = {
++  origin: "https://git.example.com",
++  repo: "acme/app",
++  pullNumbers: new Set(),
++};
++
++const DEFINING: ItemLabelSource = {
++  messageId: "resp_1",
++  role: "assistant",
++  text: "[Q1] Should BST-1 ship? [Q2] Who reviews it?",
++};
++
++const INDEX = buildItemLabelIndex([{ source: DEFINING, labels: ["Q1", "Q2"], struck: [] }]);
++
++beforeEach(() => {
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () => new Response("{}", { status: 404 })),
++  );
++});
++
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++});
++
++function LocationProbe() {
++  const location = useLocation();
++  return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
++}
++
++function renderMarkdown(markdown: string, rules: LinkRule[] = [JIRA], breaks = false) {
++  const matchers = compileLinkRules(rules, GITHUB);
++  return render(
++    <QueryClientProvider client={new QueryClient()}>
++      <MemoryRouter initialEntries={["/c/current"]}>
++        <ItemLabelSessionContext.Provider value="current">
++          <ItemLabelIndexContext.Provider value={INDEX}>
++            <ItemLabelMessageContext.Provider value="resp_2">
++              <LinkRuleMatchersContext.Provider value={matchers}>
++                <FilePathAwareMessageResponse breaks={breaks}>
++                  {markdown}
++                </FilePathAwareMessageResponse>
++              </LinkRuleMatchersContext.Provider>
++            </ItemLabelMessageContext.Provider>
++          </ItemLabelIndexContext.Provider>
++        </ItemLabelSessionContext.Provider>
++        <LocationProbe />
++      </MemoryRouter>
++    </QueryClientProvider>,
++  );
++}
++
++function linkFor(text: string): HTMLAnchorElement | null {
++  return (screen.queryByText(text, { selector: "a" }) as HTMLAnchorElement | null) ?? null;
++}
++
++describe("chat link rules", () => {
++  it("links a reference in plain text with the rule's name as its title", async () => {
++    renderMarkdown("Tracking BST-2135 here.");
++    const link = await screen.findByText("BST-2135", { selector: "a" });
++    expect(link.getAttribute("href")).toBe("https://jira.example.com/browse/BST-2135");
++    expect(link.getAttribute("title")).toBe("Jira");
++  });
++
++  it("applies to user messages rendered with line breaks too", async () => {
++    renderMarkdown("first line\nBST-7", [JIRA], true);
++    expect((await screen.findByText("BST-7", { selector: "a" })).getAttribute("href")).toBe(
++      "https://jira.example.com/browse/BST-7",
++    );
++  });
++
++  it("leaves inline code, code blocks and existing links alone", async () => {
++    renderMarkdown(
++      [
++        "Inline `BST-1` code.",
++        "",
++        "```",
++        "BST-2 in a block",
++        "```",
++        "",
++        "[BST-3 link](https://example.com/other) and BST-4.",
++      ].join("\n"),
++    );
++    await screen.findByText("BST-4", { selector: "a" });
++    expect(screen.getByText("BST-1").tagName).toBe("CODE");
++    expect(linkFor("BST-1")).toBe(null);
++    expect(screen.getByText(/BST-2 in a block/).closest("a")).toBe(null);
++    expect(screen.getByText("BST-3 link").getAttribute("href")).toBe("https://example.com/other");
++  });
++
++  it("runs after item labels and file links", async () => {
++    renderMarkdown("[Q1] covers BST-5 and [notes](docs/BST-6.md).");
++    await screen.findByText("BST-5", { selector: "a" });
++    // The label is still a chip, not a rule link.
++    expect(screen.getByRole("button", { name: /Q1/ })).toBeTruthy();
++    // The file link keeps its path; the rule doesn't relink its text.
++    expect(linkFor("BST-6")).toBe(null);
++  });
++
++  it("encodes what a hostile message puts in a capture", async () => {
++    const rule: LinkRule = {
++      name: "Any",
++      kind: "url",
++      pattern: "/T:([^ ]{1,30})/",
++      url: "https://e.example/q?x={1}",
++      enabled: true,
++    };
++    renderMarkdown('T:"onmouseover=alert(1)', [rule]);
++    const link = await screen.findByText('T:"onmouseover=alert(1)', { selector: "a" });
++    expect(link.getAttribute("href")).toBe("https://e.example/q?x=%22onmouseover%3Dalert(1)");
++    expect(link.getAttribute("onmouseover")).toBe(null);
++  });
++
++  it("links GitHub references on the session's repository host", async () => {
++    renderMarkdown("Fixes #12.", [GITHUB_RULE]);
++    expect((await screen.findByText("#12", { selector: "a" })).getAttribute("href")).toBe(
++      "https://git.example.com/acme/app/issues/12",
++    );
++  });
++
++  it("opens a session reference in the app at the message", async () => {
++    renderMarkdown("See session:abc123def/resp_9 for context.", [SESSION_RULE]);
++    const link = await screen.findByText("session:abc123def/resp_9", { selector: "a" });
++    expect(link.getAttribute("href")).toBe("/c/abc123def?message=resp_9");
++    fireEvent.click(link);
++    expect(screen.getByTestId("location").textContent).toBe("/c/abc123def?message=resp_9");
++  });
++
++  it("keeps a hand-written session href as text where no rules apply", async () => {
++    const { container } = render(
++      <MemoryRouter>
++        <FilePathAwareMessageResponse>
++          {"[forged](#omnigent-session-abc123def) and BST-8"}
++        </FilePathAwareMessageResponse>
++      </MemoryRouter>,
++    );
++    await screen.findByText(/and BST-8/);
++    expect(container.querySelector("a")).toBe(null);
++  });
++});
+diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
+index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be411d954a5 100644
+--- a/web/src/components/blocks/ChatMarkdown.tsx
++++ b/web/src/components/blocks/ChatMarkdown.tsx
+@@ -8,6 +8,8 @@
+ //   2. Markdown links whose href is a file path: see `WorkspaceFileLink`.
+ //   3. Item labels (`[Q3]`) that preview where they were raised and take
+ //      comments: see `ItemLabelChip`.
++//   4. Link rules (`BST-12`, `#123`, `session:<id>`) the user configures: see
++//      `remarkLinkRules` and `SessionReferenceLink`.
+ //
+ // Lives apart from `BlockRenderer` so approval cards can render agent markdown
+ // without importing the block dispatcher that renders them.
+@@ -58,6 +60,12 @@ import {
+   type ItemLabelSource,
+ } from "@/lib/itemLabels";
+ import { itemCommentTitle } from "@/lib/itemComments";
++import {
++  LinkRuleMatchersContext,
++  SESSION_REFERENCE_HREF_PREFIX,
++  parseSessionReference,
++  remarkLinkRules,
++} from "@/lib/linkRules";
+ import {
+   requestItemComment,
+   useCanCommentOnItems,
+@@ -70,7 +78,7 @@ import { SessionImage } from "@/components/SessionImage";
+ import { Button } from "@/components/ui/button";
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+ import { relativeTime } from "@/lib/relativeTime";
+-import { useSearchParams } from "@/lib/routing";
++import { Link, useSearchParams } from "@/lib/routing";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ import { keyedAttachments } from "@/lib/blocks";
+ import { cn } from "@/lib/utils";
+@@ -908,7 +916,34 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
+   );
+ }
+ 
+-/** Routes item-label links to {@link ItemLabelChip} and every other link to {@link WorkspaceFileLink}. */
++/**
++ * A `session:<id>` or `session:<id>/<message id>` reference: opens that session
++ * in the app, scrolled to the message. Only link-rule providers, which sit
++ * under the router, produce these hrefs; anywhere else the text stays plain.
++ */
++function SessionReferenceLink({ href, children }: { href: string; children: React.ReactNode }) {
++  const linkRulesActive = useContext(LinkRuleMatchersContext).length > 0;
++  const reference = parseSessionReference(href);
++  if (!linkRulesActive || reference === null) return children;
++  const query = reference.messageId
++    ? `?${MESSAGE_QUERY_PARAM}=${encodeURIComponent(reference.messageId)}`
++    : "";
++  return (
++    <Link
++      to={`/c/${encodeURIComponent(reference.sessionId)}${query}`}
++      className={STREAMDOWN_LINK_CLASS}
++      data-streamdown="link"
++      title={reference.messageId ? "Open the message in its session" : "Open the session"}
++    >
++      {children}
++    </Link>
++  );
++}
++
++/**
++ * Routes item-label links to {@link ItemLabelChip}, session references to
++ * {@link SessionReferenceLink}, and every other link to {@link WorkspaceFileLink}.
++ */
+ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
+   if (props.href?.startsWith(ITEM_LABEL_HREF_PREFIX)) {
+     return (
+@@ -917,6 +952,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
+       </ItemLabelChip>
+     );
+   }
++  if (props.href?.startsWith(SESSION_REFERENCE_HREF_PREFIX)) {
++    return <SessionReferenceLink href={props.href}>{props.children}</SessionReferenceLink>;
++  }
+   return <WorkspaceFileLink {...props} />;
+ }
+ 
+@@ -1037,7 +1075,9 @@ function remarkHtmlAsText() {
+  * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
+  * block rendering too, stripping `<pre>` and collapsing whitespace.
+  *
+- * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`.
++ * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`;
++ * after them, the user's link rules (from {@link LinkRuleMatchersContext})
++ * link the references left in plain text.
+  *
+  * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
+  * instead of collapsing to spaces per CommonMark. Used for user bubbles,
+@@ -1057,6 +1097,7 @@ export function FilePathAwareMessageResponse({
+   ...props
+ }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
+   const components = FILE_PATH_AWARE_COMPONENTS;
++  const linkMatchers = useContext(LinkRuleMatchersContext);
+ 
+   // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
+   const remarkPlugins = useMemo(
+@@ -1064,9 +1105,12 @@ export function FilePathAwareMessageResponse({
+       ...Object.values(defaultRemarkPlugins),
+       ...(literalHtml ? [remarkHtmlAsText] : []),
+       remarkItemLabels,
++      ...(linkMatchers.length > 0
++        ? [[remarkLinkRules, linkMatchers] as [typeof remarkLinkRules, typeof linkMatchers]]
++        : []),
+       ...(breaks ? [remarkBreaks] : []),
+     ],
+-    [breaks, literalHtml],
++    [breaks, literalHtml, linkMatchers],
+   );
+ 
+   // Throttle the markdown so the live (still-growing) bubble re-parses a few
+diff --git a/web/src/components/chat/LinkRulesScope.test.ts b/web/src/components/chat/LinkRulesScope.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..36ab74743123456e4373facda431752b920dfc80
+--- /dev/null
++++ b/web/src/components/chat/LinkRulesScope.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, it } from "vitest";
++import type { PullRequestAssociation, PullRequestInfo } from "@/hooks/usePullRequests";
++import { githubLinkTarget } from "./LinkRulesScope";
++
++function info(fields: Partial<PullRequestInfo>): PullRequestInfo {
++  return { object: "session.github.info", available: true, provider: "github", ...fields };
++}
++
++function association(number: number, repository: string, url: string): PullRequestAssociation {
++  return { url, host: new URL(url).host, repository, number, relationship: "created" };
++}
++
++describe("githubLinkTarget", () => {
++  it("uses the host the repository reports, not github.com", () => {
++    expect(
++      githubLinkTarget(
++        info({ repo: { name_with_owner: "acme/app", url: "https://ghe.example.com/acme/app" } }),
++      ),
++    ).toEqual({ origin: "https://ghe.example.com", repo: "acme/app", pullNumbers: new Set() });
++  });
++
++  it("falls back to a known pull request's host and collects pull numbers", () => {
++    const target = githubLinkTarget(
++      info({
++        repo: { name_with_owner: "acme/app" },
++        prs: [
++          association(5, "acme/app", "https://ghe.example.com/acme/app/pull/5"),
++          association(9, "other/lib", "https://ghe.example.com/other/lib/pull/9"),
++        ],
++      }),
++    );
++    expect(target?.origin).toBe("https://ghe.example.com");
++    expect([...(target?.pullNumbers ?? [])]).toEqual([5]);
++  });
++
++  it.each([
++    ["no info", undefined],
++    ["not a repo", info({ available: false })],
++    ["another provider", info({ provider: "gitlab", repo: { name_with_owner: "a/b" } })],
++    ["no repository", info({ repo: null })],
++    ["an unknown host", info({ repo: { name_with_owner: "acme/app" } })],
++    ["a non-http URL", info({ repo: { name_with_owner: "acme/app", url: "javascript:alert(1)" } })],
++  ])("is null with %s", (_case, value) => {
++    expect(githubLinkTarget(value)).toBe(null);
++  });
++});
+diff --git a/web/src/components/chat/LinkRulesScope.tsx b/web/src/components/chat/LinkRulesScope.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b9810d4793ce9810d900e2edfbfeb01dafa4824
+--- /dev/null
++++ b/web/src/components/chat/LinkRulesScope.tsx
+@@ -0,0 +1,55 @@
++import { useMemo } from "react";
++import { useLinkRules } from "@/hooks/useLinkRules";
++import { type PullRequestInfo, usePullRequestInfo } from "@/hooks/usePullRequests";
++import { compileLinkRules, type GithubLinkTarget, LinkRuleMatchersContext } from "@/lib/linkRules";
++
++function originOf(url: string | null | undefined): string | null {
++  if (!url) return null;
++  try {
++    const parsed = new URL(url);
++    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.origin : null;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * Where the session's `#123` references link, from its git provider info: the
++ * repository's own host (never assumed to be github.com), or `null` when the
++ * session has no GitHub repository or its host isn't known yet.
++ */
++export function githubLinkTarget(info: PullRequestInfo | undefined): GithubLinkTarget | null {
++  if (!info?.available) return null;
++  // An absent provider is a host that predates the field, which serves GitHub.
++  if (info.provider !== undefined && info.provider !== "github") return null;
++  const repo = info.repo?.name_with_owner;
++  if (!repo) return null;
++  const sameRepo = (other: string) => other.toLowerCase() === repo.toLowerCase();
++  const known = (info.prs ?? []).filter((pr) => sameRepo(pr.repository));
++  const origin =
++    originOf(info.repo?.url) ?? originOf(info.pr?.url) ?? originOf(known[0]?.url) ?? null;
++  if (origin === null) return null;
++  const pullNumbers = new Set(known.map((pr) => pr.number));
++  if (info.pr) pullNumbers.add(info.pr.number);
++  return { origin, repo, pullNumbers };
++}
++
++/** Compiles the user's link rules for the transcript of `sessionId`. */
++export function LinkRulesScope({
++  sessionId,
++  children,
++}: {
++  sessionId: string | null;
++  children: React.ReactNode;
++}) {
++  const { data: settings } = useLinkRules();
++  const { data: info } = usePullRequestInfo(sessionId ?? undefined);
++  const github = useMemo(() => githubLinkTarget(info), [info]);
++  const matchers = useMemo(
++    () => compileLinkRules(settings?.rules ?? [], github),
++    [settings, github],
++  );
++  return (
++    <LinkRuleMatchersContext.Provider value={matchers}>{children}</LinkRuleMatchersContext.Provider>
++  );
++}
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index 03f6f78e1f321d0140a352dcd5670eb79446ff69..3570f27ec5b83c7e8bbb6e3672ffcf7f98873ef3 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -40,6 +40,7 @@ import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
+ import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+ import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
+ import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
++import { LinkRulesScope } from "@/components/chat/LinkRulesScope";
+ import {
+   RunnerStartingIndicator,
+   McpStartupIndicator,
+@@ -498,7 +499,10 @@ function TranscriptImpl({
+   );
+ }
+ 
+-/** Gives the transcript's item labels their index, and the session their drafts belong to. */
++/**
++ * Gives the transcript's item labels their index, the session their drafts
++ * belong to, and the user's link rules.
++ */
+ function ItemLabelScope({
+   index,
+   sessionId,
+@@ -511,7 +515,7 @@ function ItemLabelScope({
+   return (
+     <ItemLabelIndexContext.Provider value={index}>
+       <ItemLabelSessionContext.Provider value={sessionId}>
+-        {children}
++        <LinkRulesScope sessionId={sessionId}>{children}</LinkRulesScope>
+       </ItemLabelSessionContext.Provider>
+     </ItemLabelIndexContext.Provider>
+   );
+diff --git a/web/src/hooks/useLinkRules.ts b/web/src/hooks/useLinkRules.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..94151ca2ce887f27a28f2e89db4c6d84f25bda55
+--- /dev/null
++++ b/web/src/hooks/useLinkRules.ts
+@@ -0,0 +1,14 @@
++import { useQuery } from "@tanstack/react-query";
++import { getLinkRules, type LinkRuleSettings } from "@/lib/linkRulesApi";
++
++/** Shared cache key, so a saved rule reaches every open transcript. */
++export const LINK_RULES_QUERY_KEY = ["preferences", "shared", "link_rules"];
++
++/** The user's chat link rules, saved or default. */
++export function useLinkRules() {
++  return useQuery<LinkRuleSettings>({
++    queryKey: LINK_RULES_QUERY_KEY,
++    queryFn: getLinkRules,
++    staleTime: 60_000,
++  });
++}
+diff --git a/web/src/hooks/usePullRequests.ts b/web/src/hooks/usePullRequests.ts
+index 17024c3db63dd0fbeb7b2d78eac55f38c95b7fb4..b7e77cce83596753bbd69124ac2dd75a7174264c 100644
+--- a/web/src/hooks/usePullRequests.ts
++++ b/web/src/hooks/usePullRequests.ts
+@@ -152,6 +152,8 @@ export interface PullRequest {
+ 
+ export interface PullRequestRepo {
+   name_with_owner: string | null;
++  /** The repository's web URL, when the host reports it (GitHub without a PR). */
++  url?: string | null;
+ }
+ 
+ /** A `gh`-configured account — one option in the panel's account selector. */
+diff --git a/web/src/lib/linkRules.test.ts b/web/src/lib/linkRules.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..dbd2b200dedb201a5bb9bf47bcf8ecdb5cc5c938
+--- /dev/null
++++ b/web/src/lib/linkRules.test.ts
+@@ -0,0 +1,172 @@
++import { describe, expect, it } from "vitest";
++import {
++  compileLinkPattern,
++  compileLinkRules,
++  findLinks,
++  type GithubLinkTarget,
++  type LinkRule,
++  linkRuleError,
++  linkRuleErrors,
++  parseSessionReference,
++} from "./linkRules";
++
++function urlRule(pattern: string, url: string, name = "Rule"): LinkRule {
++  return { name, kind: "url", pattern, url, enabled: true };
++}
++
++const GITHUB: GithubLinkTarget = {
++  origin: "https://git.example.com",
++  repo: "acme/app",
++  pullNumbers: new Set([7]),
++};
++
++function links(text: string, rules: LinkRule[], github: GithubLinkTarget | null = null) {
++  return findLinks(text, compileLinkRules(rules, github)).map(({ start, end, href }) => ({
++    text: text.slice(start, end),
++    href,
++  }));
++}
++
++describe("compileLinkPattern", () => {
++  it.each([
++    ["BST-{num}", String.raw`BST\-(\d{1,10})`, 1],
++    ["{key}-{num}", String.raw`([A-Z][A-Z0-9]{1,9})\-(\d{1,10})`, 2],
++    ["/(ENG-\\d+)/", String.raw`(ENG-\d{1,64})`, 1],
++    ["/x.*y/", "x.{0,64}y", 0],
++  ])("compiles %s", (pattern, source, groups) => {
++    const compiled = compileLinkPattern(pattern);
++    expect(compiled.source).toBe(source);
++    expect(compiled.groupCount).toBe(groups);
++  });
++
++  it.each([
++    ["", "required"],
++    ["BST", "needs a placeholder"],
++    ["BST-{nope}", "unknown placeholder"],
++    ["/(a+)+/", "repeated group"],
++    ["/(a|b)*/", "repeated group"],
++    ["/(a)\\1/", "backreferences"],
++    ["/(?<name>a)/", "named groups"],
++    ["/(?<=a)b/", "lookaround"],
++    ["/(?i)a/", "inline flags"],
++    ["/a{1000}/", "capped"],
++    ["/[]a]/", "start of a [ ] class"],
++    ["/(a/", "unbalanced ("],
++    ["/a*/", "empty text"],
++    ["/a+b+c+d+/", "at most 3 repeats"],
++    ["x".repeat(201), "longer than"],
++  ])("rejects %s", (pattern, message) => {
++    expect(() => compileLinkPattern(pattern)).toThrow(message);
++  });
++});
++
++describe("linkRuleError", () => {
++  it.each([
++    ["javascript:alert(1)//{num}", "https://"],
++    ["data:text/html,{num}", "https://"],
++    ["https://{num}.example.com/", "https://"],
++    ["https://user@evil.example/{num}", "https://"],
++    ["https://example.com/{3}", "no matching group"],
++    ["https://example.com/{key}", "unknown placeholder"],
++    ["https://example.com/ {num}", "spaces"],
++  ])("rejects the template %s", (url, message) => {
++    expect(linkRuleError(urlRule("BST-{num}", url))).toContain(message);
++  });
++
++  it("accepts a template on a fixed host", () => {
++    expect(linkRuleError(urlRule("BST-{num}", "https://jira.example.com/browse/BST-{num}"))).toBe(
++      null,
++    );
++  });
++
++  it("refuses a pattern on a built-in kind", () => {
++    expect(
++      linkRuleError({ name: "GH", kind: "github", pattern: "#{num}", url: null, enabled: true }),
++    ).toContain("takes no pattern");
++  });
++
++  it("reports repeated names and a built-in kind listed twice", () => {
++    const session: LinkRule = { name: "S", kind: "session", pattern: "", url: null, enabled: true };
++    expect(
++      linkRuleErrors([
++        urlRule("A-{num}", "https://e.com/{num}", "Jira"),
++        urlRule("B-{num}", "https://e.com/{num}", "jira"),
++        session,
++        { ...session, name: "S2" },
++      ]),
++    ).toEqual([null, "two rules are named jira", null, "only one session rule"]);
++  });
++});
++
++describe("findLinks", () => {
++  const jira = urlRule("BST-{num}", "https://jira.example.com/browse/BST-{num}", "Jira");
++
++  it("links whole words only", () => {
++    expect(links("BST-1, (BST-22) XBST-3 BST-4x", [jira])).toEqual([
++      { text: "BST-1", href: "https://jira.example.com/browse/BST-1" },
++      { text: "BST-22", href: "https://jira.example.com/browse/BST-22" },
++    ]);
++  });
++
++  it("percent-encodes every captured value", () => {
++    const rule = urlRule("/T:([^ ]{1,20})/", "https://e.example/q?x={1}");
++    expect(links('T:"><img/onerror=1>', [rule])).toEqual([
++      { text: 'T:"><img/onerror=1>', href: "https://e.example/q?x=%22%3E%3Cimg%2Fonerror%3D1%3E" },
++    ]);
++  });
++
++  it("never yields a link off its template's host", () => {
++    const rule = urlRule("/go:([a-z./:]{1,30})/", "https://safe.example/{1}");
++    const [found] = links("go:javascript://evil.example", [rule]);
++    expect(new URL(found.href).host).toBe("safe.example");
++  });
++
++  it("skips disabled and invalid rules", () => {
++    expect(links("BST-1", [{ ...jira, enabled: false }])).toEqual([]);
++    expect(links("BST-1", [{ ...jira, url: "javascript:x//{num}" }])).toEqual([]);
++  });
++
++  it("gives an overlap to the earliest match, then the first rule", () => {
++    const wide = urlRule("{key}-{num}", "https://wide.example/{key}-{num}", "Wide");
++    expect(links("BST-9", [jira, wide])[0].href).toContain("jira.example.com");
++    expect(links("BST-9", [wide, jira])[0].href).toContain("wide.example");
++  });
++
++  it("links GitHub references on the session's own host", () => {
++    const github: LinkRule = { name: "GH", kind: "github", pattern: "", url: null, enabled: true };
++    expect(links("Fixes #12, see #7 and other/lib#3. a#4", [github], GITHUB)).toEqual([
++      { text: "#12", href: "https://git.example.com/acme/app/issues/12" },
++      { text: "#7", href: "https://git.example.com/acme/app/pull/7" },
++      { text: "other/lib#3", href: "https://git.example.com/other/lib/issues/3" },
++    ]);
++    expect(links("#12", [github], null)).toEqual([]);
++  });
++
++  it("turns session references into in-app hrefs", () => {
++    const session: LinkRule = { name: "S", kind: "session", pattern: "", url: null, enabled: true };
++    expect(links("see session:abc123def and session:abc123def/resp_9", [session])).toEqual([
++      { text: "session:abc123def", href: "#omnigent-session-abc123def" },
++      { text: "session:abc123def/resp_9", href: "#omnigent-session-abc123def/resp_9" },
++    ]);
++  });
++});
++
++describe("parseSessionReference", () => {
++  it("reads the session and message ids", () => {
++    expect(parseSessionReference("#omnigent-session-abc123/resp_1")).toEqual({
++      sessionId: "abc123",
++      messageId: "resp_1",
++    });
++    expect(parseSessionReference("#omnigent-session-abc123")).toEqual({
++      sessionId: "abc123",
++      messageId: null,
++    });
++  });
++
++  it.each(["#omnigent-session-ab", "#omnigent-session-abc123/x?y", "#other-abc123"])(
++    "rejects %s",
++    (href) => {
++      expect(parseSessionReference(href)).toBe(null);
++    },
++  );
++});
+diff --git a/web/src/lib/linkRules.ts b/web/src/lib/linkRules.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50f00a1e6c
+--- /dev/null
++++ b/web/src/lib/linkRules.ts
+@@ -0,0 +1,556 @@
++// Chat link rules: short references such as `BST-2135`, `#123` or
++// `session:<id>` that chat messages render as links. The server validates a
++// rule when it is saved (omnigent/link_rules.py); this module checks it again
++// before compiling, with the same rules, because every viewer's browser runs
++// the result on every message. See docs/chat-link-rules.md.
++//
++// Compiled regexes avoid lookbehind and named groups, which older Safari can't
++// parse: a match's leading boundary is consumed as group 1 instead.
++
++import { createContext } from "react";
++
++export type LinkRuleKind = "url" | "github" | "session";
++
++export interface LinkRule {
++  name: string;
++  kind: LinkRuleKind;
++  /** `url` kind: a short form (`BST-{num}`) or a raw `/regex/`; `""` otherwise. */
++  pattern: string;
++  /** `url` kind: the http(s) template, e.g. `https://jira.example.com/browse/BST-{num}`. */
++  url: string | null;
++  enabled: boolean;
++}
++
++export const MAX_LINK_RULES = 32;
++export const MAX_LINK_RULE_NAME_LENGTH = 64;
++export const MAX_LINK_PATTERN_LENGTH = 200;
++export const MAX_LINK_URL_LENGTH = 500;
++const MAX_REPEAT = 64;
++const MAX_REPEATS = 3;
++const MAX_GROUPS = 9;
++
++/** Short-form placeholders and the text each one matches. */
++export const SHORT_FORM_PLACEHOLDERS: Record<string, string> = {
++  num: String.raw`\d{1,10}`,
++  key: "[A-Z][A-Z0-9]{1,9}",
++  id: "[A-Za-z0-9_-]{1,64}",
++};
++
++const LEADING_BOUNDARY = "(^|[^A-Za-z0-9_])";
++const TRAILING_BOUNDARY = "(?![A-Za-z0-9_])";
++const SHORT_FORM_TOKEN = /\{([a-z]+)\}/g;
++const URL_PLACEHOLDER = /\{([a-z]+|\d)\}/g;
++const URL_FIXED_PREFIX = /^https?:\/\/[^/?#{}\s@\\]+[/?#]/i;
++const CLASS_ESCAPES = new Set(["d", "D", "w", "W", "s", "S"]);
++const ALPHANUMERIC = /^[A-Za-z0-9]$/;
++
++/** Fragment href a session reference carries from the remark pass to the link renderer. */
++export const SESSION_REFERENCE_HREF_PREFIX = "#omnigent-session-";
++
++export class LinkRuleError extends Error {}
++
++interface CompiledPattern {
++  source: string;
++  groupNames: string[];
++  groupCount: number;
++}
++
++/**
++ * Compile a `url` rule's pattern after checking it is safe to run.
++ *
++ * @throws LinkRuleError naming the problem.
++ */
++export function compileLinkPattern(pattern: string): CompiledPattern {
++  if (!pattern) throw new LinkRuleError("pattern: required for a url rule");
++  if (pattern.length > MAX_LINK_PATTERN_LENGTH) {
++    throw new LinkRuleError(`pattern: longer than ${MAX_LINK_PATTERN_LENGTH} characters`);
++  }
++  const compiled =
++    pattern.length >= 2 && pattern.startsWith("/") && pattern.endsWith("/")
++      ? checkRegex(pattern.slice(1, -1))
++      : compileShortForm(pattern);
++  let regex: RegExp;
++  try {
++    regex = new RegExp(`^(?:${compiled.source})$`);
++  } catch (error) {
++    throw new LinkRuleError(`pattern: ${(error as Error).message}`);
++  }
++  if (regex.test("")) throw new LinkRuleError("pattern: must not match empty text");
++  return compiled;
++}
++
++function escapeRegex(text: string): string {
++  return text.replace(/[\\^$.*+?()[\]{}|/-]/g, "\\$&");
++}
++
++function compileShortForm(pattern: string): CompiledPattern {
++  if (/\s/.test(pattern)) throw new LinkRuleError("pattern: a short form can't contain spaces");
++  const parts: string[] = [];
++  const groupNames: string[] = [];
++  let last = 0;
++  for (const match of pattern.matchAll(SHORT_FORM_TOKEN)) {
++    const literal = pattern.slice(last, match.index);
++    if (/[{}]/.test(literal))
++      throw new LinkRuleError("pattern: unmatched { or } in the short form");
++    parts.push(escapeRegex(literal));
++    const name = match[1];
++    const placeholder = SHORT_FORM_PLACEHOLDERS[name];
++    if (placeholder === undefined) {
++      const known = Object.keys(SHORT_FORM_PLACEHOLDERS)
++        .map((key) => `{${key}}`)
++        .join(", ");
++      throw new LinkRuleError(`pattern: unknown placeholder {${name}}; use ${known}`);
++    }
++    parts.push(`(${placeholder})`);
++    groupNames.push(name);
++    last = (match.index ?? 0) + match[0].length;
++  }
++  const tail = pattern.slice(last);
++  if (/[{}]/.test(tail)) throw new LinkRuleError("pattern: unmatched { or } in the short form");
++  parts.push(escapeRegex(tail));
++  if (groupNames.length === 0) {
++    throw new LinkRuleError("pattern: a short form needs a placeholder such as {num}");
++  }
++  if (groupNames.length > MAX_REPEATS + 1) {
++    throw new LinkRuleError(`pattern: at most ${MAX_REPEATS + 1} placeholders`);
++  }
++  return { source: parts.join(""), groupNames, groupCount: groupNames.length };
++}
++
++interface GroupState {
++  hasRepeat: boolean;
++  hasAlternation: boolean;
++}
++
++/** Check a raw regex against the shared safe subset and cap its repeats. */
++function checkRegex(body: string): CompiledPattern {
++  const out: string[] = [];
++  const stack: GroupState[] = [{ hasRepeat: false, hasAlternation: false }];
++  // What a quantifier would apply to: nothing, an atom, or a closed group.
++  let last: GroupState | "atom" | null = null;
++  let groups = 0;
++  let repeats = 0;
++  let index = 0;
++  while (index < body.length) {
++    const char = body[index];
++    if (char === "\\") {
++      if (index + 1 >= body.length) throw new LinkRuleError("pattern: ends with a lone backslash");
++      const escaped = body[index + 1];
++      if (escaped === "b" || escaped === "B") last = null;
++      else if (CLASS_ESCAPES.has(escaped) || !ALPHANUMERIC.test(escaped)) last = "atom";
++      else {
++        throw new LinkRuleError(
++          `pattern: \\${escaped} isn't supported (no backreferences or letter escapes other than \\d \\w \\s \\b and their capitals)`,
++        );
++      }
++      out.push(body.slice(index, index + 2));
++      index += 2;
++    } else if (char === "[") {
++      const end = classEnd(body, index);
++      out.push(body.slice(index, end + 1));
++      last = "atom";
++      index = end + 1;
++    } else if (char === "(") {
++      if (body.startsWith("(?", index)) {
++        if (!body.startsWith("(?:", index)) {
++          throw new LinkRuleError(
++            "pattern: only (?: ) groups are supported; no lookaround, named groups or inline flags",
++          );
++        }
++        out.push("(?:");
++        index += 3;
++      } else {
++        groups += 1;
++        out.push("(");
++        index += 1;
++      }
++      stack.push({ hasRepeat: false, hasAlternation: false });
++      last = null;
++    } else if (char === ")") {
++      if (stack.length === 1) throw new LinkRuleError("pattern: unbalanced )");
++      const closed = stack.pop()!;
++      const parent = stack[stack.length - 1];
++      parent.hasRepeat ||= closed.hasRepeat;
++      parent.hasAlternation ||= closed.hasAlternation;
++      out.push(")");
++      last = closed;
++      index += 1;
++    } else if (char === "|") {
++      stack[stack.length - 1].hasAlternation = true;
++      out.push("|");
++      last = null;
++      index += 1;
++    } else if (char === "*" || char === "+" || char === "?" || char === "{") {
++      const quantifier = readQuantifier(body, index);
++      if (quantifier === null)
++        throw new LinkRuleError("pattern: escape a literal { or } as \\{ or \\}");
++      const { text, low, high, end } = quantifier;
++      if (last === null) throw new LinkRuleError(`pattern: nothing to repeat before ${text}`);
++      if (high === null || high > 1) {
++        if (last !== "atom" && (last.hasRepeat || last.hasAlternation)) {
++          throw new LinkRuleError("pattern: a repeated group can't contain another repeat or |");
++        }
++        repeats += 1;
++        if (repeats > MAX_REPEATS)
++          throw new LinkRuleError(`pattern: at most ${MAX_REPEATS} repeats`);
++      }
++      if ((high !== null && high > MAX_REPEAT) || low > MAX_REPEAT) {
++        throw new LinkRuleError(`pattern: repeat counts are capped at ${MAX_REPEAT}`);
++      }
++      stack[stack.length - 1].hasRepeat = true;
++      out.push(high === null ? `{${low},${MAX_REPEAT}}` : text);
++      index = end;
++      if (body[index] === "?") {
++        out.push("?");
++        index += 1;
++      }
++      last = null;
++    } else if (char === "}") {
++      throw new LinkRuleError("pattern: escape a literal { or } as \\{ or \\}");
++    } else if (char === "^" || char === "$") {
++      out.push(char);
++      last = null;
++      index += 1;
++    } else {
++      out.push(char);
++      last = "atom";
++      index += 1;
++    }
++  }
++  if (stack.length !== 1) throw new LinkRuleError("pattern: unbalanced (");
++  if (groups > MAX_GROUPS) throw new LinkRuleError(`pattern: at most ${MAX_GROUPS} capture groups`);
++  return { source: out.join(""), groupNames: [], groupCount: groups };
++}
++
++function classEnd(body: string, start: number): number {
++  let index = start + 1;
++  if (body[index] === "^") index += 1;
++  // Python reads []] as a class holding ], a browser as an empty class.
++  if (body[index] === "]") {
++    throw new LinkRuleError("pattern: escape ] at the start of a [ ] class as \\]");
++  }
++  while (index < body.length) {
++    const char = body[index];
++    if (char === "\\") {
++      const escaped = body[index + 1] ?? "";
++      if (!escaped || (ALPHANUMERIC.test(escaped) && !CLASS_ESCAPES.has(escaped))) {
++        throw new LinkRuleError(`pattern: \\${escaped} isn't supported inside [ ]`);
++      }
++      index += 2;
++      continue;
++    }
++    if (char === "[") throw new LinkRuleError("pattern: escape [ inside a [ ] class as \\[");
++    if (char === "]") return index;
++    index += 1;
++  }
++  throw new LinkRuleError("pattern: unclosed [");
++}
++
++function readQuantifier(
++  body: string,
++  start: number,
++): { text: string; low: number; high: number | null; end: number } | null {
++  const char = body[start];
++  if (char === "*") return { text: "*", low: 0, high: null, end: start + 1 };
++  if (char === "+") return { text: "+", low: 1, high: null, end: start + 1 };
++  if (char === "?") return { text: "?", low: 0, high: 1, end: start + 1 };
++  const match = /^\{(\d{1,4})(,(\d{0,4}))?\}/.exec(body.slice(start));
++  if (!match) return null;
++  const low = Number(match[1]);
++  const high = match[2] === undefined ? low : match[3] ? Number(match[3]) : null;
++  if (high !== null && high < low) {
++    throw new LinkRuleError("pattern: a {min,max} repeat needs min <= max");
++  }
++  return { text: match[0], low, high, end: start + match[0].length };
++}
++
++/**
++ * Check that a URL template always yields an http(s) link whose scheme and
++ * host no match can change.
++ *
++ * @throws LinkRuleError naming the problem.
++ */
++export function checkUrlTemplate(template: string, compiled: CompiledPattern): void {
++  if (!template) throw new LinkRuleError("url: required for a url rule");
++  if (template.length > MAX_LINK_URL_LENGTH) {
++    throw new LinkRuleError(`url: longer than ${MAX_LINK_URL_LENGTH} characters`);
++  }
++  // oxlint-disable-next-line no-control-regex -- rejecting control characters is the point
++  if (/[\s\u0000-\u001f\u007f]/.test(template)) {
++    throw new LinkRuleError("url: can't contain spaces or control characters");
++  }
++  const first = template.indexOf("{");
++  const prefix = first >= 0 ? template.slice(0, first) : `${template}/`;
++  if (!URL_FIXED_PREFIX.test(prefix)) {
++    throw new LinkRuleError(
++      "url: must start with https:// or http:// and a host, followed by / ? or # before any placeholder",
++    );
++  }
++  for (const match of template.matchAll(URL_PLACEHOLDER)) {
++    const token = match[1];
++    if (/^\d$/.test(token)) {
++      if (Number(token) > compiled.groupCount) {
++        throw new LinkRuleError(
++          `url: {${token}} has no matching group in the pattern (${compiled.groupCount} group(s))`,
++        );
++      }
++    } else if (!compiled.groupNames.includes(token)) {
++      const available = compiled.groupNames.map((name) => `{${name}}`).join(", ") || "{0}, {1}…";
++      throw new LinkRuleError(`url: unknown placeholder {${token}}; use ${available}`);
++    }
++  }
++  if (/[{}]/.test(template.replace(URL_PLACEHOLDER, ""))) {
++    throw new LinkRuleError("url: unmatched { or }");
++  }
++}
++
++/** Why `rule` can't be used, or `null` when it is valid on its own. */
++export function linkRuleError(rule: LinkRule): string | null {
++  const name = rule.name.trim();
++  if (!name) return "name: required";
++  if (name.length > MAX_LINK_RULE_NAME_LENGTH) {
++    return `name: longer than ${MAX_LINK_RULE_NAME_LENGTH} characters`;
++  }
++  try {
++    if (rule.kind === "url") checkUrlTemplate(rule.url ?? "", compileLinkPattern(rule.pattern));
++    else if (rule.pattern || rule.url)
++      return `the built-in ${rule.kind} kind takes no pattern or url`;
++  } catch (error) {
++    if (error instanceof LinkRuleError) return error.message;
++    throw error;
++  }
++  return null;
++}
++
++/**
++ * Per-rule errors for a whole list, including repeated names and a built-in
++ * kind listed twice; `null` where a rule is fine.
++ */
++export function linkRuleErrors(rules: readonly LinkRule[]): (string | null)[] {
++  const names = new Map<string, number>();
++  const builtins = new Map<LinkRuleKind, number>();
++  return rules.map((rule, index) => {
++    const own = linkRuleError(rule);
++    if (own) return own;
++    const folded = rule.name.trim().toLowerCase();
++    if (names.has(folded)) return `two rules are named ${rule.name.trim()}`;
++    names.set(folded, index);
++    if (rule.kind !== "url") {
++      if (builtins.has(rule.kind)) return `only one ${rule.kind} rule`;
++      builtins.set(rule.kind, index);
++    }
++    return null;
++  });
++}
++
++/** Where `#123` and `owner/repo#123` link: the session's repository on its provider's host. */
++export interface GithubLinkTarget {
++  /** Scheme and host, e.g. `https://github.example.com`. */
++  origin: string;
++  /** `owner/repo` of the session's repository. */
++  repo: string;
++  /** Pull request numbers known on `repo`; other numbers link as issues. */
++  pullNumbers: ReadonlySet<number>;
++}
++
++/** One compiled rule: a global regex and how to turn its match into an href. */
++export interface LinkMatcher {
++  name: string;
++  regex: RegExp;
++  href: (match: RegExpExecArray) => string | null;
++}
++
++const GITHUB_QUALIFIED = String.raw`([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})#(\d{1,10})`;
++const GITHUB_LOCAL = String.raw`#(\d{1,10})`;
++const SESSION_REFERENCE = String.raw`session:([A-Za-z0-9_-]{6,64})(?:/([A-Za-z0-9_-]{1,128}))?`;
++
++function bounded(source: string): RegExp {
++  return new RegExp(`${LEADING_BOUNDARY}(?:${source})${TRAILING_BOUNDARY}`, "g");
++}
++
++function safeHttpUrl(href: string): string | null {
++  try {
++    const url = new URL(href);
++    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
++  } catch {
++    return null;
++  }
++}
++
++function githubHref(target: GithubLinkTarget, repo: string, number: string): string | null {
++  const [owner, name] = repo.split("/");
++  const sameRepo = repo.toLowerCase() === target.repo.toLowerCase();
++  // GitHub redirects /issues/N to the pull request when N is one.
++  const section = sameRepo && target.pullNumbers.has(Number(number)) ? "pull" : "issues";
++  return safeHttpUrl(
++    `${target.origin}/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${section}/${number}`,
++  );
++}
++
++/**
++ * Compile the enabled rules into matchers, skipping any that fail the checks.
++ *
++ * @param rules - The user's rules, in priority order.
++ * @param github - The session's repository, or `null` when it has none, which
++ *   leaves GitHub references as text.
++ */
++export function compileLinkRules(
++  rules: readonly LinkRule[],
++  github: GithubLinkTarget | null,
++): LinkMatcher[] {
++  const errors = linkRuleErrors(rules);
++  const matchers: LinkMatcher[] = [];
++  rules.forEach((rule, index) => {
++    if (!rule.enabled || errors[index] !== null) return;
++    if (rule.kind === "github") {
++      if (github === null) return;
++      matchers.push(
++        {
++          name: rule.name,
++          regex: bounded(GITHUB_QUALIFIED),
++          href: (match) => githubHref(github, `${match[2]}/${match[3]}`, match[4]),
++        },
++        {
++          name: rule.name,
++          regex: bounded(GITHUB_LOCAL),
++          href: (match) => githubHref(github, github.repo, match[2]),
++        },
++      );
++    } else if (rule.kind === "session") {
++      matchers.push({
++        name: rule.name,
++        regex: bounded(SESSION_REFERENCE),
++        href: (match) =>
++          `${SESSION_REFERENCE_HREF_PREFIX}${match[2]}${match[3] ? `/${match[3]}` : ""}`,
++      });
++    } else {
++      const compiled = compileLinkPattern(rule.pattern);
++      const template = rule.url ?? "";
++      matchers.push({
++        name: rule.name,
++        regex: bounded(compiled.source),
++        href: (match) => {
++          const whole = match[0].slice(match[1].length);
++          const value = (token: string) => {
++            if (/^\d$/.test(token)) return token === "0" ? whole : (match[Number(token) + 1] ?? "");
++            return match[compiled.groupNames.indexOf(token) + 2] ?? "";
++          };
++          return safeHttpUrl(
++            template.replace(URL_PLACEHOLDER, (_text, token: string) =>
++              encodeURIComponent(value(token)),
++            ),
++          );
++        },
++      });
++    }
++  });
++  return matchers;
++}
++
++/** A link found in text: `[start, end)` and where it goes. */
++export interface LinkSpan {
++  start: number;
++  end: number;
++  href: string;
++  name: string;
++}
++
++/**
++ * Find the links in `text`. Overlaps go to the earliest match, then to the
++ * rule listed first.
++ */
++export function findLinks(text: string, matchers: readonly LinkMatcher[]): LinkSpan[] {
++  const found: (LinkSpan & { order: number })[] = [];
++  matchers.forEach((matcher, order) => {
++    matcher.regex.lastIndex = 0;
++    for (let match = matcher.regex.exec(text); match; match = matcher.regex.exec(text)) {
++      const start = match.index + match[1].length;
++      const end = match.index + match[0].length;
++      if (end === match.index) matcher.regex.lastIndex += 1;
++      if (end <= start) continue;
++      const href = matcher.href(match);
++      if (href) found.push({ start, end, href, name: matcher.name, order });
++    }
++  });
++  found.sort((a, b) => a.start - b.start || a.order - b.order);
++  const spans: LinkSpan[] = [];
++  let reached = 0;
++  for (const { order: _order, ...span } of found) {
++    if (span.start < reached) continue;
++    spans.push(span);
++    reached = span.end;
++  }
++  return spans;
++}
++
++interface MdastNode {
++  type: string;
++  value?: string;
++  url?: string;
++  title?: string | null;
++  children?: MdastNode[];
++}
++
++// Text under these nodes is already a link (including item-label chips and
++// file links), code, or raw markup, so no rule rewrites it.
++const SKIPPED_PARENTS = new Set([
++  "link",
++  "linkReference",
++  "definition",
++  "inlineCode",
++  "code",
++  "html",
++]);
++
++function splitText(node: MdastNode, matchers: readonly LinkMatcher[]): MdastNode[] {
++  const text = node.value ?? "";
++  const spans = findLinks(text, matchers);
++  if (spans.length === 0) return [node];
++  const parts: MdastNode[] = [];
++  let last = 0;
++  for (const span of spans) {
++    if (span.start > last) parts.push({ type: "text", value: text.slice(last, span.start) });
++    parts.push({
++      type: "link",
++      url: span.href,
++      title: span.name,
++      children: [{ type: "text", value: text.slice(span.start, span.end) }],
++    });
++    last = span.end;
++  }
++  if (last < text.length) parts.push({ type: "text", value: text.slice(last) });
++  return parts;
++}
++
++function linkify(node: MdastNode, matchers: readonly LinkMatcher[]): void {
++  if (!node.children || SKIPPED_PARENTS.has(node.type)) return;
++  node.children = node.children.flatMap((child) => {
++    if (child.type === "text") return splitText(child, matchers);
++    linkify(child, matchers);
++    return [child];
++  });
++}
++
++/**
++ * Remark plugin applying link rules to text. It runs after item labels have
++ * become links, and never touches links, code or raw HTML.
++ */
++export function remarkLinkRules(matchers: readonly LinkMatcher[]) {
++  return (tree: MdastNode) => {
++    if (matchers.length > 0) linkify(tree, matchers);
++  };
++}
++
++/** Compiled matchers for the chat markdown under this provider; empty turns rules off. */
++export const LinkRuleMatchersContext = createContext<readonly LinkMatcher[]>([]);
++
++/** Split a session reference href into the session and optional message ids. */
++export function parseSessionReference(
++  href: string,
++): { sessionId: string; messageId: string | null } | null {
++  if (!href.startsWith(SESSION_REFERENCE_HREF_PREFIX)) return null;
++  const [sessionId, messageId] = href.slice(SESSION_REFERENCE_HREF_PREFIX.length).split("/");
++  if (!/^[A-Za-z0-9_-]{6,64}$/.test(sessionId ?? "")) return null;
++  if (messageId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(messageId)) return null;
++  return { sessionId, messageId: messageId ?? null };
++}
+diff --git a/web/src/lib/linkRulesApi.ts b/web/src/lib/linkRulesApi.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7396cf11dc4539bbaa563cb9486cf34f77cc023b
+--- /dev/null
++++ b/web/src/lib/linkRulesApi.ts
+@@ -0,0 +1,79 @@
++// The user's chat link rules (`/v1/link-rules`), stored by the server as the
++// `link_rules` shared preference. See docs/chat-link-rules.md.
++
++import { authenticatedFetch } from "./identity";
++import type { LinkRule } from "./linkRules";
++import { apiErrorFromResponse } from "./sessionsApi";
++
++/** The rules in effect for the caller. */
++export interface LinkRuleSettings {
++  /** False when the server can't save rules (no shared preferences, or too old). */
++  supported: boolean;
++  /** False while the defaults apply. */
++  saved: boolean;
++  /** Sent back as `expected_version`; `0` when nothing is saved. */
++  version: number;
++  rules: LinkRule[];
++  defaults: LinkRule[];
++}
++
++/** What a server without the route offers: nothing to save and no rules. */
++export const UNSUPPORTED_LINK_RULES: LinkRuleSettings = {
++  supported: false,
++  saved: false,
++  version: 0,
++  rules: [],
++  defaults: [],
++};
++
++function normalizeRule(rule: LinkRule): LinkRule {
++  return { ...rule, pattern: rule.pattern ?? "", url: rule.url ?? null };
++}
++
++function normalize(settings: LinkRuleSettings): LinkRuleSettings {
++  return {
++    ...settings,
++    rules: settings.rules.map(normalizeRule),
++    defaults: settings.defaults.map(normalizeRule),
++  };
++}
++
++/** Read the caller's link rules: the saved list, or the defaults. */
++export async function getLinkRules(): Promise<LinkRuleSettings> {
++  const res = await authenticatedFetch("/v1/link-rules");
++  if (res.status === 404) return UNSUPPORTED_LINK_RULES;
++  if (!res.ok) throw await apiErrorFromResponse(res);
++  return normalize((await res.json()) as LinkRuleSettings);
++}
++
++/**
++ * Replace the caller's link rules.
++ *
++ * @param rules - The whole list, or `null` to restore the defaults.
++ * @param expectedVersion - The version the edit replaces; a stale one is
++ *   refused with a 409 `ApiError`.
++ * @returns The rules as stored afterwards.
++ */
++export async function saveLinkRules(
++  rules: LinkRule[] | null,
++  expectedVersion: number,
++): Promise<LinkRuleSettings> {
++  const res = await authenticatedFetch("/v1/link-rules", {
++    method: "PUT",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({
++      rules:
++        rules === null
++          ? null
++          : rules.map(({ name, kind, pattern, url, enabled }) => ({
++              name,
++              kind,
++              enabled,
++              ...(kind === "url" ? { pattern, url } : {}),
++            })),
++      expected_version: expectedVersion,
++    }),
++  });
++  if (!res.ok) throw await apiErrorFromResponse(res);
++  return normalize((await res.json()) as LinkRuleSettings);
++}
+diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
+index 03ea92e4529acb86fe11967043a49c039d04a471..beacf0052d6cd1eb3521af62e41e0e6b5b61fc74 100644
+--- a/web/src/pages/SettingsPage.test.tsx
++++ b/web/src/pages/SettingsPage.test.tsx
+@@ -202,6 +202,9 @@ vi.mock("@/pages/PoliciesPage", () => ({
+ vi.mock("@/pages/settings/ChatFeaturesSettingsGroup", () => ({
+   ChatFeaturesSettingsGroup: () => null,
+ }));
++vi.mock("@/pages/settings/LinkRulesSettingsGroup", () => ({
++  LinkRulesSettingsGroup: () => null,
++}));
+ vi.mock("@/components/McpRegistry", () => ({
+   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
+ }));
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index 3d4c399b806be12d2ace9f4208200c355a008a53..4d5520a3d671abbcb64de8734a59d78ed693e998 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -44,6 +44,7 @@ import {
+ } from "react";
+ import { useViewerId } from "@/hooks/useViewerId";
+ import { ChatFeaturesSettingsGroup } from "@/pages/settings/ChatFeaturesSettingsGroup";
++import { LinkRulesSettingsGroup } from "@/pages/settings/LinkRulesSettingsGroup";
+ import {
+   ArchiveRestoreIcon,
+   AlertTriangleIcon,
+@@ -1986,6 +1987,7 @@ function GeneralSection() {
+           </div>
+         </SettingsGroup>
+         <ChatFeaturesSettingsGroup />
++        <LinkRulesSettingsGroup />
+         <SettingsGroup title="Terminal" testId="settings-group-terminal">
+           <TerminalClipboardControl />
+         </SettingsGroup>
+diff --git a/web/src/pages/settings/LinkRulesSettingsGroup.test.tsx b/web/src/pages/settings/LinkRulesSettingsGroup.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4672eb779cb29a908dd04c415e16982edfb7d059
+--- /dev/null
++++ b/web/src/pages/settings/LinkRulesSettingsGroup.test.tsx
+@@ -0,0 +1,164 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { authenticatedFetch } from "@/lib/identity";
++import type { LinkRule } from "@/lib/linkRules";
++import { LinkRulesSettingsGroup } from "./LinkRulesSettingsGroup";
++
++vi.mock("@/lib/identity", () => ({
++  authenticatedFetch: vi.fn(),
++}));
++
++const mockAuthenticatedFetch = vi.mocked(authenticatedFetch);
++
++const GITHUB: LinkRule = { name: "GitHub", kind: "github", pattern: "", url: null, enabled: true };
++const JIRA: LinkRule = {
++  name: "Jira",
++  kind: "url",
++  pattern: "ABC-{num}",
++  url: "https://jira.example.com/browse/ABC-{num}",
++  enabled: false,
++};
++
++function jsonResponse(body: unknown, status = 200): Response {
++  return {
++    ok: status >= 200 && status < 300,
++    status,
++    statusText: "",
++    json: async () => body,
++  } as unknown as Response;
++}
++
++function settings(rules: LinkRule[], { saved = false, version = 0, supported = true } = {}) {
++  return { supported, saved, version, rules, defaults: [GITHUB, JIRA] };
++}
++
++/** Answer reads with `reads` in order (the last repeats) and PUTs with `writes`. */
++function serve(reads: unknown[], writes: Response[] = []) {
++  const puts: unknown[] = [];
++  mockAuthenticatedFetch.mockImplementation(async (_path, init) => {
++    if ((init as RequestInit | undefined)?.method === "PUT") {
++      puts.push(JSON.parse(String((init as RequestInit).body)));
++      const next = writes.shift();
++      if (!next) throw new Error("unexpected PUT");
++      return next;
++    }
++    return jsonResponse(reads.length > 1 ? reads.shift() : reads[0]);
++  });
++  return puts;
++}
++
++function renderGroup() {
++  return render(
++    <QueryClientProvider
++      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
++    >
++      <MemoryRouter>
++        <TooltipProvider>
++          <LinkRulesSettingsGroup />
++        </TooltipProvider>
++      </MemoryRouter>
++    </QueryClientProvider>,
++  );
++}
++
++beforeEach(() => {
++  mockAuthenticatedFetch.mockReset();
++});
++
++afterEach(() => {
++  cleanup();
++});
++
++describe("LinkRulesSettingsGroup", () => {
++  it("lists the rules and previews them as the chat would", async () => {
++    serve([settings([GITHUB, { ...JIRA, enabled: true }])]);
++    renderGroup();
++    expect(await screen.findByTestId("link-rule-0")).toBeTruthy();
++    expect((screen.getByTestId("link-rule-1-pattern") as HTMLInputElement).value).toBe("ABC-{num}");
++    const preview = screen.getByTestId("link-rules-preview");
++    await waitFor(() =>
++      expect(preview.querySelector("a")?.getAttribute("href")).toBe(
++        "https://jira.example.com/browse/ABC-345",
++      ),
++    );
++    // Code in the sample stays text.
++    expect(preview.querySelector("code a")).toBe(null);
++  });
++
++  it("shows a rule's error and blocks saving until it is fixed", async () => {
++    const puts = serve(
++      [settings([GITHUB, JIRA])],
++      [jsonResponse(settings([GITHUB, JIRA], { saved: true, version: 1 }))],
++    );
++    renderGroup();
++    const url = (await screen.findByTestId("link-rule-1-url")) as HTMLInputElement;
++    fireEvent.change(url, { target: { value: "javascript:alert(1)//{num}" } });
++    expect(screen.getByTestId("link-rule-1-error").textContent).toContain("https://");
++    expect((screen.getByTestId("link-rules-save") as HTMLButtonElement).disabled).toBe(true);
++
++    fireEvent.change(url, { target: { value: "https://tracker.example.com/ABC-{num}" } });
++    expect(screen.queryByTestId("link-rule-1-error")).toBe(null);
++    fireEvent.click(screen.getByTestId("link-rules-save"));
++    await waitFor(() => expect(puts).toHaveLength(1));
++    expect(puts[0]).toEqual({
++      rules: [
++        { name: "GitHub", kind: "github", enabled: true },
++        {
++          name: "Jira",
++          kind: "url",
++          enabled: false,
++          pattern: "ABC-{num}",
++          url: "https://tracker.example.com/ABC-{num}",
++        },
++      ],
++      expected_version: 0,
++    });
++  });
++
++  it("adds, toggles and deletes rules, and resets to the defaults", async () => {
++    const puts = serve(
++      [settings([JIRA], { saved: true, version: 3 })],
++      [jsonResponse(settings([GITHUB, JIRA]))],
++    );
++    renderGroup();
++    await screen.findByTestId("link-rule-0");
++    fireEvent.click(screen.getByTestId("link-rules-add"));
++    expect(screen.getByTestId("link-rule-1-error").textContent).toContain("pattern: required");
++    fireEvent.click(screen.getByTestId("link-rule-1-delete"));
++    fireEvent.click(screen.getByTestId("link-rules-add-github"));
++    expect(screen.getByTestId("link-rule-1").textContent).toContain("Built in");
++    fireEvent.click(screen.getByTestId("link-rule-0-enabled"));
++    expect(screen.getByTestId("link-rules-add-session")).toBeTruthy();
++
++    fireEvent.click(screen.getByTestId("link-rules-reset"));
++    await waitFor(() => expect(puts).toEqual([{ rules: null, expected_version: 3 }]));
++    await waitFor(() =>
++      expect(screen.getByTestId("link-rule-0").textContent).toContain("Built in"),
++    );
++  });
++
++  it("asks for a review when the rules changed elsewhere", async () => {
++    serve(
++      [
++        settings([JIRA], { saved: true, version: 1 }),
++        settings([GITHUB], { saved: true, version: 2 }),
++      ],
++      [jsonResponse({ detail: "The link rules changed since they were read" }, 409)],
++    );
++    renderGroup();
++    fireEvent.click(await screen.findByTestId("link-rule-0-enabled"));
++    fireEvent.click(screen.getByTestId("link-rules-save"));
++    expect((await screen.findByRole("alert")).textContent).toContain("changed on another device");
++  });
++
++  it("keeps the defaults read-only without shared preferences", async () => {
++    serve([settings([GITHUB, JIRA], { supported: false })]);
++    renderGroup();
++    expect((await screen.findByRole("note")).textContent).toContain("shared preferences");
++    expect((screen.getByTestId("link-rules-add") as HTMLButtonElement).disabled).toBe(true);
++    expect((screen.getByTestId("link-rule-1-url") as HTMLInputElement).disabled).toBe(true);
++  });
++});
+diff --git a/web/src/pages/settings/LinkRulesSettingsGroup.tsx b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568fea90b74
+--- /dev/null
++++ b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
+@@ -0,0 +1,313 @@
++import { useQueryClient } from "@tanstack/react-query";
++import { useMemo, useState } from "react";
++import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
++import { SettingsGroup } from "@/components/SettingsGroup";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { Switch } from "@/components/ui/switch";
++import { Textarea } from "@/components/ui/textarea";
++import { LINK_RULES_QUERY_KEY, useLinkRules } from "@/hooks/useLinkRules";
++import {
++  compileLinkRules,
++  type LinkRule,
++  type LinkRuleKind,
++  LinkRuleMatchersContext,
++  linkRuleErrors,
++  MAX_LINK_RULES,
++} from "@/lib/linkRules";
++import { saveLinkRules } from "@/lib/linkRulesApi";
++import { ApiError } from "@/lib/sessionsApi";
++
++const DEFAULT_SAMPLE =
++  "Fixes #12 and ABC-345 (see ENG-6). Earlier: session:0123456789abcdef. `ABC-1` in code stays text.";
++
++const BUILTIN_DESCRIPTIONS: Record<Exclude<LinkRuleKind, "url">, string> = {
++  github:
++    "#123 and owner/repo#123 link to issues and pull requests on the session's repository host.",
++  session: "session:<id> and session:<id>/<message id> open that session, or a message in it.",
++};
++
++function newUrlRule(rules: readonly LinkRule[]): LinkRule {
++  const taken = new Set(rules.map((rule) => rule.name.trim().toLowerCase()));
++  let number = 1;
++  while (taken.has(`rule ${number}`)) number += 1;
++  return { name: `Rule ${number}`, kind: "url", pattern: "", url: "", enabled: true };
++}
++
++/** The user's chat link rules: list, edit, preview and save them. */
++export function LinkRulesSettingsGroup() {
++  const queryClient = useQueryClient();
++  const query = useLinkRules();
++  const current = query.data;
++  // Unsaved edits; null while the list shows what is saved.
++  const [draft, setDraft] = useState<LinkRule[] | null>(null);
++  const [saving, setSaving] = useState(false);
++  const [message, setMessage] = useState<string | null>(null);
++  const [sample, setSample] = useState(DEFAULT_SAMPLE);
++  const rules = useMemo(() => draft ?? current?.rules ?? [], [draft, current]);
++  const errors = useMemo(() => linkRuleErrors(rules), [rules]);
++  // The preview has no session, so GitHub references stay text there.
++  const matchers = useMemo(() => compileLinkRules(rules, null), [rules]);
++
++  if (!current) {
++    return (
++      <SettingsGroup title="Chat links" testId="settings-group-link-rules">
++        <p className="text-sm text-muted-foreground">
++          {query.isError ? "Chat links are unavailable." : "Loading chat links…"}
++        </p>
++      </SettingsGroup>
++    );
++  }
++
++  const editable = current.supported && !saving;
++  const update = (index: number, change: Partial<LinkRule>) =>
++    setDraft(rules.map((rule, at) => (at === index ? { ...rule, ...change } : rule)));
++  const missingBuiltins = (["github", "session"] as const).filter(
++    (kind) => !rules.some((rule) => rule.kind === kind),
++  );
++
++  const save = async (next: LinkRule[] | null) => {
++    setSaving(true);
++    setMessage(null);
++    try {
++      const saved = await saveLinkRules(next, current.version);
++      queryClient.setQueryData(LINK_RULES_QUERY_KEY, saved);
++      setDraft(null);
++    } catch (error) {
++      if (error instanceof ApiError && error.status === 409) {
++        setMessage("Your rules changed on another device. Review them and save again.");
++        void queryClient.invalidateQueries({ queryKey: LINK_RULES_QUERY_KEY });
++      } else {
++        setMessage(error instanceof ApiError ? error.message : "Couldn't save your chat links.");
++      }
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  return (
++    <SettingsGroup title="Chat links" testId="settings-group-link-rules">
++      <p className="text-sm text-muted-foreground">
++        Turn short references in chat messages into links. A pattern is a short form such as{" "}
++        <code>BST-{"{num}"}</code> (also <code>{"{key}"}</code> and <code>{"{id}"}</code>) or a{" "}
++        <code>/regex/</code>; the URL fills in the same placeholders.
++      </p>
++      {!current.supported && (
++        <p className="mt-2 text-sm text-muted-foreground" role="note">
++          These are the defaults. Saving rules needs shared preferences enabled on the server.
++        </p>
++      )}
++      <div className="mt-2 flex flex-col">
++        {rules.map((rule, index) => (
++          <LinkRuleRow
++            // Rules have no stable id; the position is the identity while editing.
++            // oxlint-disable-next-line react/no-array-index-key
++            key={index}
++            index={index}
++            rule={rule}
++            error={errors[index]}
++            disabled={!editable}
++            onChange={(change) => update(index, change)}
++            onDelete={() => setDraft(rules.filter((_rule, at) => at !== index))}
++          />
++        ))}
++        {rules.length === 0 && (
++          <p className="mt-4 text-sm text-muted-foreground">
++            No rules: messages show no extra links.
++          </p>
++        )}
++      </div>
++      <div className="mt-4 flex flex-wrap gap-2">
++        <Button
++          variant="outline"
++          size="sm"
++          disabled={!editable || rules.length >= MAX_LINK_RULES}
++          onClick={() => setDraft([...rules, newUrlRule(rules)])}
++          data-testid="link-rules-add"
++          componentId="settings.general.link_rules.add"
++        >
++          Add rule
++        </Button>
++        {missingBuiltins.map((kind) => (
++          <Button
++            key={kind}
++            variant="outline"
++            size="sm"
++            disabled={!editable || rules.length >= MAX_LINK_RULES}
++            onClick={() =>
++              setDraft([
++                ...rules,
++                {
++                  name: kind === "github" ? "GitHub" : "Sessions",
++                  kind,
++                  pattern: "",
++                  url: null,
++                  enabled: true,
++                },
++              ])
++            }
++            data-testid={`link-rules-add-${kind}`}
++            componentId={`settings.general.link_rules.add_${kind}`}
++          >
++            {kind === "github" ? "Add GitHub references" : "Add session references"}
++          </Button>
++        ))}
++        <span className="flex-1" />
++        {draft !== null && (
++          <Button
++            variant="ghost"
++            size="sm"
++            disabled={saving}
++            onClick={() => {
++              setDraft(null);
++              setMessage(null);
++            }}
++            data-testid="link-rules-discard"
++            componentId="settings.general.link_rules.discard"
++          >
++            Discard
++          </Button>
++        )}
++        <Button
++          variant="outline"
++          size="sm"
++          disabled={!editable || (!current.saved && draft === null)}
++          onClick={() => void save(null)}
++          data-testid="link-rules-reset"
++          componentId="settings.general.link_rules.reset"
++        >
++          Reset to defaults
++        </Button>
++        <Button
++          size="sm"
++          disabled={!editable || draft === null || errors.some((error) => error !== null)}
++          onClick={() => void save(rules)}
++          data-testid="link-rules-save"
++          componentId="settings.general.link_rules.save"
++        >
++          Save
++        </Button>
++      </div>
++      {message && (
++        <p role="alert" className="mt-2 text-sm text-destructive">
++          {message}
++        </p>
++      )}
++      <div className="mt-4 border-t border-border pt-4">
++        <label className="text-sm font-medium" htmlFor="link-rules-preview-input">
++          Preview
++        </label>
++        <Textarea
++          id="link-rules-preview-input"
++          className="mt-2"
++          rows={2}
++          value={sample}
++          onChange={(event) => setSample(event.target.value)}
++          data-testid="link-rules-preview-input"
++        />
++        <div
++          className="mt-2 rounded-md border border-border p-3 text-sm"
++          data-testid="link-rules-preview"
++        >
++          <LinkRuleMatchersContext.Provider value={matchers}>
++            <FilePathAwareMessageResponse>{sample}</FilePathAwareMessageResponse>
++          </LinkRuleMatchersContext.Provider>
++        </div>
++        <p className="mt-1 text-xs text-muted-foreground">
++          GitHub references link only in a session whose repository is on GitHub.
++        </p>
++      </div>
++    </SettingsGroup>
++  );
++}
++
++function LinkRuleRow({
++  index,
++  rule,
++  error,
++  disabled,
++  onChange,
++  onDelete,
++}: {
++  index: number;
++  rule: LinkRule;
++  error: string | null;
++  disabled: boolean;
++  onChange: (change: Partial<LinkRule>) => void;
++  onDelete: () => void;
++}) {
++  const errorId = `link-rule-${index}-error`;
++  return (
++    <div className="mt-4 border-t border-border pt-4" data-testid={`link-rule-${index}`}>
++      <div className="flex items-center gap-3">
++        <Switch
++          checked={rule.enabled}
++          disabled={disabled}
++          onCheckedChange={(enabled) => onChange({ enabled })}
++          aria-label={`Use ${rule.name || "this rule"}`}
++          data-testid={`link-rule-${index}-enabled`}
++          componentId="settings.general.link_rules.enabled"
++        />
++        <Input
++          className="h-8 max-w-48"
++          value={rule.name}
++          disabled={disabled}
++          onChange={(event) => onChange({ name: event.target.value })}
++          aria-label="Rule name"
++          aria-describedby={error ? errorId : undefined}
++          data-testid={`link-rule-${index}-name`}
++        />
++        <span className="text-xs text-muted-foreground">
++          {rule.kind === "url" ? "Link" : "Built in"}
++        </span>
++        <span className="flex-1" />
++        <Button
++          variant="ghost"
++          size="sm"
++          disabled={disabled}
++          onClick={onDelete}
++          aria-label={`Delete ${rule.name || "this rule"}`}
++          data-testid={`link-rule-${index}-delete`}
++          componentId="settings.general.link_rules.delete"
++        >
++          Delete
++        </Button>
++      </div>
++      {rule.kind === "url" ? (
++        <div className="mt-2 grid gap-2 sm:grid-cols-2">
++          <Input
++            className="h-8 font-mono"
++            value={rule.pattern}
++            disabled={disabled}
++            placeholder="BST-{num} or /regex/"
++            onChange={(event) => onChange({ pattern: event.target.value })}
++            aria-label="Pattern"
++            aria-describedby={error ? errorId : undefined}
++            data-testid={`link-rule-${index}-pattern`}
++          />
++          <Input
++            className="h-8 font-mono"
++            value={rule.url ?? ""}
++            disabled={disabled}
++            placeholder="https://jira.example.com/browse/BST-{num}"
++            onChange={(event) => onChange({ url: event.target.value })}
++            aria-label="Link URL"
++            aria-describedby={error ? errorId : undefined}
++            data-testid={`link-rule-${index}-url`}
++          />
++        </div>
++      ) : (
++        <p className="mt-2 text-sm text-muted-foreground">{BUILTIN_DESCRIPTIONS[rule.kind]}</p>
++      )}
++      {error && (
++        <p
++          id={errorId}
++          className="mt-1 text-sm text-destructive"
++          data-testid={`link-rule-${index}-error`}
++        >
++          {error}
++        </p>
++      )}
++    </div>
++  );
++}
