@@ -58,7 +58,10 @@ def changed_patch_texts(since: str | None) -> tuple[list[str], str]:
     current = series_patches()
     if since is None:
         return [(ROOT / "patches" / name).read_text() for name in current], "all patches"
-    names = git("diff", "--name-only", f"{since}...HEAD", "--", "custom/BASE", "custom/series", "custom/patches/").split()
+    # git runs in custom/, where a bare pathspec would mean custom/custom/...; anchor at the top.
+    names = git(
+        "diff", "--name-only", f"{since}...HEAD", "--", ":/custom/BASE", ":/custom/series", ":/custom/patches/"
+    ).split()
     if "custom/BASE" in names:
         return [(ROOT / "patches" / name).read_text() for name in current], "BASE moved: all patches"
     texts = []
