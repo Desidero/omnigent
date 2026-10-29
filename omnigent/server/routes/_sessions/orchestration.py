@@ -55,7 +55,6 @@ from omnigent.harness_availability import (
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
 )
-from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
@@ -6505,6 +6504,8 @@ async def _forward_native_terminal_message(
             )
     forward_options: dict[str, Any] = {}
     if native_shell_authorized:
+        from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
+
         forward_options["headers"] = {CODEX_SHELL_AUTHORIZED_HEADER: "1"}
     try:
         resp = await runner_client.post(
