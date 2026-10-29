@@ -200,7 +200,10 @@ def test_pr_info_returns_the_azure_devops_payload_for_the_branch_pr(
     assert info["capabilities"] == NO_CAPABILITIES
     assert info["auth"]["cli"] == {"name": "az", "available": False}
     assert not LEGACY_FIELDS & info.keys()
-    assert info["repo"] == {"name_with_owner": "contoso/web/app"}
+    assert info["repo"] == {
+        "name_with_owner": "contoso/web/app",
+        "url": "https://dev.azure.com/contoso/web/_git/app",
+    }
     assert (info["branch"], info["base_ref"]) == ("feat", "main")
     pr = info["pr"]
     assert (pr["number"], pr["url"], pr["title"], pr["state"]) == (
@@ -279,7 +282,10 @@ def test_every_remote_form_reaches_the_same_repository(
     info = pr_resource.pr_info(str(workspace), session_id=SESSION)
 
     assert info["provider"] == "azure_devops"
-    assert info["repo"] == {"name_with_owner": "contoso/web/app"}
+    assert info["repo"] == {
+        "name_with_owner": "contoso/web/app",
+        "url": "https://dev.azure.com/contoso/web/_git/app",
+    }
     assert info["pr"]["url"] == PR_URL
 
 

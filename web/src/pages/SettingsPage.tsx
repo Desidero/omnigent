@@ -45,6 +45,7 @@ import {
 } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import { ChatFeaturesSettingsGroup } from "@/pages/settings/ChatFeaturesSettingsGroup";
+import { LinkRulesSettingsGroup } from "@/pages/settings/LinkRulesSettingsGroup";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
@@ -2075,6 +2076,7 @@ function GeneralSection() {
           </div>
         </SettingsGroup>
         <ChatFeaturesSettingsGroup />
+        <LinkRulesSettingsGroup />
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
         </SettingsGroup>

@@ -164,6 +164,8 @@ def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Moc
     assert info["provider"] == "gitlab" and info["auth"]["authenticated"]
     assert info["branch"] == "feature"
     assert info["repo"]["name_with_owner"] == "team/sub/project"
+    # The repository's web URL gives chat links its host when no MR names one.
+    assert info["repo"]["url"] == "https://gitlab.com/team/sub/project"
     assert info["selected_pr_url"] == URL
     pr = info["pr"]
     assert pr["number"] == 7 and pr["state"] == "OPEN" and pr["is_draft"]

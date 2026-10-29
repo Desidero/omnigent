@@ -362,7 +362,10 @@ def test_workspace_info_shows_the_branch_pr_without_legacy_fields(
         "capabilities": NO_CAPABILITIES,
         "branch": "feature",
         "base_ref": "main",
-        "repo": {"name_with_owner": "contoso/web/app"},
+        "repo": {
+            "name_with_owner": "contoso/web/app",
+            "url": "https://dev.azure.com/contoso/web/_git/app",
+        },
     }
     assert info["pr"] == {
         "number": 7,
@@ -408,7 +411,10 @@ def test_workspace_info_without_a_pr(
 
     info = facet.workspace_info(str(workspace))
 
-    assert info["repo"] == {"name_with_owner": "contoso/web/app"}
+    assert info["repo"] == {
+        "name_with_owner": "contoso/web/app",
+        "url": "https://dev.azure.com/contoso/web/_git/app",
+    }
     assert info["pr"] is None
     assert info["base_ref"] is None
     assert info["auth"]["authenticated"] is True
@@ -433,7 +439,10 @@ def test_workspace_info_without_a_token_sends_no_request(
         "accounts": None,
         "selected_account": None,
     }
-    assert info["repo"] == {"name_with_owner": "contoso/web/app"}
+    assert info["repo"] == {
+        "name_with_owner": "contoso/web/app",
+        "url": "https://dev.azure.com/contoso/web/_git/app",
+    }
     assert info["pr"] is None
     assert ado_transport.requests == []
 
@@ -521,7 +530,10 @@ def test_origin_names_the_repository_with_its_case(
 
     info = facet.workspace_info(str(workspace))
 
-    assert info["repo"] == {"name_with_owner": "Contoso/My Web/App"}
+    assert info["repo"] == {
+        "name_with_owner": "Contoso/My Web/App",
+        "url": "https://dev.azure.com/Contoso/My%20Web/_git/App",
+    }
     # Tracked PRs dedupe on the lower-cased canonical URL.
     assert info["pr"]["url"] == "https://dev.azure.com/contoso/my%20web/_git/app/pullrequest/7"
 

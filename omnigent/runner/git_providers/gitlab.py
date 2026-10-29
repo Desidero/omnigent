@@ -181,6 +181,11 @@ def _resolved(
     return None
 
 
+def _repo_payload(host: str, repository: str) -> dict[str, str]:
+    """The panel's ``repo``: its path and web URL, which chat links read the host from."""
+    return {"name_with_owner": repository, "url": f"https://{host}/{repository}"}
+
+
 def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
     repo = reference or next(iter(_remotes(root)), None)
     host = repo.host if repo else "gitlab.com"
@@ -191,7 +196,7 @@ def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, 
         "provider_display": provider_display("gitlab"),
         "branch": _branch(root),
         "base_ref": None,
-        "repo": {"name_with_owner": repo.repository} if repo else None,
+        "repo": _repo_payload(repo.host, repo.repository) if repo else None,
         "pr": None,
         "selected_pr_url": reference.url if reference else None,
         "capabilities": _CAPABILITIES.to_json(),
@@ -320,7 +325,7 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
         info["auth"]["hint"] = None
         if resolved:
             client, ref, mr = resolved
-            info.update(repo={"name_with_owner": ref.repository}, selected_pr_url=ref.url)
+            info.update(repo=_repo_payload(ref.host, ref.repository), selected_pr_url=ref.url)
             info["pr"] = _pr_payload(client, ref, mr, info["warnings"])
             info["base_ref"] = info["pr"]["base_ref"]
     except ValueError as exc:

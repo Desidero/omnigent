@@ -428,6 +428,13 @@ def _name(repo: AzureRepo) -> str:
     return f"{repo.org}/{repo.project}/{repo.repo}"
 
 
+def _repo_payload(repo: AzureRepo) -> dict[str, str]:
+    """The panel's ``repo``: its name and web URL, which chat links read the host from."""
+    org, project, name = (quote(part, safe="") for part in (repo.org, repo.project, repo.repo))
+    url = f"https://dev.azure.com/{org}/{project}/_git/{name}"
+    return {"name_with_owner": _name(repo), "url": url}
+
+
 def _branch_pr(
     client: AzureDevOpsClient, repo: AzureRepo, branch: str | None
 ) -> dict[str, Any] | None:
@@ -756,7 +763,7 @@ class AzureDevOpsPullRequests:
             authenticated=token is not None,
             branch=branch,
             base_ref=None,
-            repo=None if repo is None else {"name_with_owner": _name(repo)},
+            repo=None if repo is None else _repo_payload(repo),
             pr=None,
         )
         if repo is None or token is None:
