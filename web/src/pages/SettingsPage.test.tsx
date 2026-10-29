@@ -202,6 +202,9 @@ vi.mock("@/pages/PoliciesPage", () => ({
 vi.mock("@/pages/settings/ChatFeaturesSettingsGroup", () => ({
   ChatFeaturesSettingsGroup: () => null,
 }));
+vi.mock("@/pages/settings/LinkRulesSettingsGroup", () => ({
+  LinkRulesSettingsGroup: () => null,
+}));
 vi.mock("@/components/McpRegistry", () => ({
   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
 }));

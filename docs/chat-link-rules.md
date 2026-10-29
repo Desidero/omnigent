@@ -4,6 +4,37 @@ Link rules turn short references in chat messages, such as `BST-2135` or
 `#123`, into links. Each user has one list of rules, saved as a shared
 preference, so every session and device shows the same links.
 
+## Setting them up
+
+Settings → General → **Chat links** lists the rules. Each one can be turned on
+or off, renamed, edited (pattern and URL for a `url` rule) or deleted; **Add
+rule** adds a `url` rule, and a removed GitHub or Sessions rule can be added
+back. A rule that fails a check shows why under it, and **Save** stays off
+until every rule passes. **Reset to defaults** removes the saved list. The
+**Preview** box renders its text with the rules being edited, before they are
+saved. GitHub references don't link in the preview, which has no session.
+
+A saved rule applies to messages as soon as the transcript refetches the
+rules, in every open session.
+
+## In the chat
+
+Rules apply to agent and user messages alike, after item labels (`[Q2]`) and
+file links have been found, and never inside links, inline code, code blocks
+or raw HTML. Where two rules match overlapping text, the match that starts
+first wins, then the rule listed first. A link's tooltip names its rule.
+
+- `url` and `github` links open in a new tab like any other web link.
+- A `github` reference links to the session's repository on its provider's own
+  host (GitHub Enterprise included), taken from the session's git info: the
+  repository URL, or the host of a known pull request. `#123` goes to
+  `/pull/123` when the session knows that pull request and to `/issues/123`
+  otherwise, which GitHub redirects for pull requests. `owner/repo#123` links
+  on the same host. A session with no GitHub repository leaves them as text.
+- A `session` reference opens the session in the app, scrolled to the message
+  when one is named (`/c/<session id>?message=<message id>`, the same link
+  as an item's **Show in conversation**).
+
 ## Rules
 
 A rule has a `name` (unique, up to 64 characters), a `kind`, a `pattern`, a

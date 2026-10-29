@@ -29,7 +29,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
   server when it creates a session.
 - `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
   the `link_rules` shared preference, validated on save and served with the
-  defaults by `GET`/`PUT /v1/link-rules`.
+  defaults by `GET`/`PUT /v1/link-rules`, edited in Settings → General → Chat
+  links and applied to every chat message.
 
 - `configuration-copy`: review, save, show and import model defaults, harness
   selection/arguments and launcher plugin opt-outs; preserve local-only values.
@@ -85,6 +86,20 @@ on any server.
 restores the defaults). Covered by `tests/test_link_rules.py` (pattern and URL
 checks) and `tests/server/routes/test_link_rules.py` (per-user storage, stale
 versions, rejected rules, a server without shared preferences).
+
+**Chat links in Settings and the chat:** Settings → General → Chat links lists,
+edits, previews, saves and resets the rules; without shared preferences it
+shows the defaults read-only. In a session, write `ABC-12` (after turning on
+and editing the Jira example), `#12`, or `session:<id>` in a message and check
+each renders as a link, while the same text in backticks stays code. Component
+coverage:
+
+```sh
+cd web && npx vitest run src/lib/linkRules.test.ts \
+  src/components/blocks/ChatMarkdown.linkRules.test.tsx \
+  src/components/chat/LinkRulesScope.test.ts \
+  src/pages/settings/LinkRulesSettingsGroup.test.tsx
+```
 
 **Shared scope controls:** the CLI and UI do not yet offer automatic following,
 saving machine overrides, removing a machine override,

@@ -40,6 +40,7 @@ import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
 import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
+import { LinkRulesScope } from "@/components/chat/LinkRulesScope";
 import {
   RunnerStartingIndicator,
   McpStartupIndicator,
@@ -498,7 +499,10 @@ function TranscriptImpl({
   );
 }
 
-/** Gives the transcript's item labels their index, and the session their drafts belong to. */
+/**
+ * Gives the transcript's item labels their index, the session their drafts
+ * belong to, and the user's link rules.
+ */
 function ItemLabelScope({
   index,
   sessionId,
@@ -511,7 +515,7 @@ function ItemLabelScope({
   return (
     <ItemLabelIndexContext.Provider value={index}>
       <ItemLabelSessionContext.Provider value={sessionId}>
-        {children}
+        <LinkRulesScope sessionId={sessionId}>{children}</LinkRulesScope>
       </ItemLabelSessionContext.Provider>
     </ItemLabelIndexContext.Provider>
   );

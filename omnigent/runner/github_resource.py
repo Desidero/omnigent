@@ -950,15 +950,20 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         return payload
 
     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
-    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root, token=token)
+    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner,url"], cwd=root, token=token)
     if rc == 0:
         try:
-            nwo = json.loads(out).get("nameWithOwner")
+            view = json.loads(out)
+            nwo = view.get("nameWithOwner")
+            repo_url = view.get("url")
         except (ValueError, AttributeError):
-            nwo = None
+            nwo = repo_url = None
         if nwo:
             payload["authenticated"] = True
             payload["repo"] = {"name_with_owner": nwo}
+            # The repository's host, for linking #123 in chat without a PR.
+            if isinstance(repo_url, str) and repo_url.startswith(("https://", "http://")):
+                payload["repo"]["url"] = repo_url
             return payload  # -> no-pr
 
     # Repo unreachable / not signed in — enumerate accounts so the panel can offer
