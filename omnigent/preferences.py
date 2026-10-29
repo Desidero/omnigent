@@ -13,6 +13,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypeAlias
 
+from omnigent.link_rules import encode_link_rules, parse_link_rules_json
+
 
 class PreferenceScope(StrEnum):
     BUILTIN = "builtin"
@@ -63,11 +65,12 @@ class PreferenceKind(StrEnum):
     HARNESS = "harness"
     HARNESS_ARGS = "harness_args"
     PLUGIN = "plugin"
+    LINK_RULES = "link_rules"
 
 
 @dataclass(frozen=True)
 class PreferenceKey:
-    """One merge unit: a model, default harness, ordered args, or plugin toggle."""
+    """One merge unit: a model, default harness, ordered args, plugin toggle or link rules."""
 
     kind: PreferenceKind
     name: str | PluginIdentity
@@ -84,6 +87,8 @@ class PreferenceKey:
             raise ValueError("unknown model preference key")
         if self.kind == PreferenceKind.HARNESS and self.name != "default":
             raise ValueError("the harness preference key must be 'default'")
+        if self.kind == PreferenceKind.LINK_RULES and self.name != "default":
+            raise ValueError("the link_rules preference key must be 'default'")
         if self.kind == PreferenceKind.HARNESS_ARGS:
             from omnigent.harness_aliases import canonicalize_harness
 
@@ -97,6 +102,13 @@ class PreferenceKey:
 PreferenceValue: TypeAlias = str | bool | tuple[str, ...]
 
 
+def normalize_preference_value(key: PreferenceKey, value: PreferenceValue) -> PreferenceValue:
+    """Canonical form of ``value``: link rules are compact JSON with trimmed names."""
+    if key.kind == PreferenceKind.LINK_RULES and isinstance(value, str):
+        return encode_link_rules(parse_link_rules_json(value))
+    return value
+
+
 def _require_name(value: object) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("preference identifiers must be non-empty strings")
@@ -107,6 +119,12 @@ def _validate_value(key: PreferenceKey, value: PreferenceValue) -> None:
         valid = isinstance(value, bool)
     elif key.kind == PreferenceKind.HARNESS_ARGS:
         valid = isinstance(value, tuple) and all(isinstance(arg, str) for arg in value)
+    elif key.kind == PreferenceKind.LINK_RULES:
+        if not isinstance(value, str):
+            raise ValueError("link_rules must be a JSON array of rules, as a string")
+        # LinkRuleError is a ValueError naming the rule and field at fault.
+        parse_link_rules_json(value)
+        valid = True
     else:
         valid = isinstance(value, str) and bool(value.strip())
     if not valid:
@@ -129,9 +147,11 @@ class PreferenceLayer:
             _require_name(self.installation_id)
         elif self.installation_id is not None:
             raise ValueError("only machine preferences have an installation ID")
-        values = dict(self.values)
-        for key, value in values.items():
+        for key, value in self.values.items():
             _validate_value(key, value)
+        values = {
+            key: normalize_preference_value(key, value) for key, value in self.values.items()
+        }
         object.__setattr__(self, "values", MappingProxyType(values))
 
     def with_value(self, key: PreferenceKey, value: PreferenceValue) -> PreferenceLayer:
