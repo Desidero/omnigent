@@ -79,6 +79,13 @@ import { SessionImage } from "@/components/SessionImage";
 import { Button } from "@/components/ui/button";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { relativeTime } from "@/lib/relativeTime";
+import {
+  LinkRuleMatchersContext,
+  SESSION_REFERENCE_HREF_PREFIX,
+  linkMatchersKey,
+  parseSessionReference,
+  remarkLinkRules,
+} from "@/lib/linkRules";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { keyedAttachments } from "@/lib/blocks";
 import { cn } from "@/lib/utils";
@@ -960,7 +967,34 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
   );
 }
 
-/** Routes item-label links to {@link ItemLabelChip} and every other link to {@link WorkspaceFileLink}. */
+/**
+ * A `session:<id>` or `session:<id>/<message id>` reference: opens that session
+ * in the app, scrolled to the message. Only link-rule providers, which sit
+ * under the router, produce these hrefs; anywhere else the text stays plain.
+ */
+function SessionReferenceLink({ href, children }: { href: string; children: React.ReactNode }) {
+  const linkRulesActive = useContext(LinkRuleMatchersContext).length > 0;
+  const reference = parseSessionReference(href);
+  if (!linkRulesActive || reference === null) return children;
+  const query = reference.messageId
+    ? `?${MESSAGE_QUERY_PARAM}=${encodeURIComponent(reference.messageId)}`
+    : "";
+  return (
+    <Link
+      to={`/c/${encodeURIComponent(reference.sessionId)}${query}`}
+      className={STREAMDOWN_LINK_CLASS}
+      data-streamdown="link"
+      title={reference.messageId ? "Open the message in its session" : "Open the session"}
+    >
+      {children}
+    </Link>
+  );
+}
+
+/**
+ * Routes item-label links to {@link ItemLabelChip}, session references to
+ * {@link SessionReferenceLink}, and every other link to {@link WorkspaceFileLink}.
+ */
 function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
   if (props.href?.startsWith(ITEM_LABEL_HREF_PREFIX)) {
     return (
@@ -968,6 +1002,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
         {props.children}
       </ItemLabelChip>
     );
+  }
+  if (props.href?.startsWith(SESSION_REFERENCE_HREF_PREFIX)) {
+    return <SessionReferenceLink href={props.href}>{props.children}</SessionReferenceLink>;
   }
   return <MarkdownLink {...props} />;
 }
@@ -1216,7 +1253,9 @@ function remarkHtmlAsText() {
  * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
  * block rendering too, stripping `<pre>` and collapsing whitespace.
  *
- * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`.
+ * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`;
+ * after them, the user's link rules (from {@link LinkRuleMatchersContext})
+ * link the references left in plain text.
  *
  * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
  * instead of collapsing to spaces per CommonMark. Used for user bubbles,
@@ -1237,6 +1276,7 @@ export function FilePathAwareMessageResponse({
   ...props
 }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
+  const linkMatchers = useContext(LinkRuleMatchersContext);
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
   const remarkPlugins = useMemo(
@@ -1244,9 +1284,12 @@ export function FilePathAwareMessageResponse({
       ...Object.values(defaultRemarkPlugins),
       ...(literalHtml ? [remarkHtmlAsText] : []),
       remarkItemLabels,
+      ...(linkMatchers.length > 0
+        ? [[remarkLinkRules, linkMatchers] as [typeof remarkLinkRules, typeof linkMatchers]]
+        : []),
       ...(breaks ? [remarkBreaks] : []),
     ],
-    [breaks, literalHtml],
+    [breaks, literalHtml, linkMatchers],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few
@@ -1277,6 +1320,9 @@ export function FilePathAwareMessageResponse({
 
   return (
     <MessageResponse
+      // Streamdown's memo ignores `remarkPlugins`: remount when the link rules
+      // or the session's repository arrive after the message rendered.
+      key={linkMatchersKey(linkMatchers)}
       {...props}
       components={components}
       remarkPlugins={remarkPlugins}

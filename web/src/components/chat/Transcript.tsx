@@ -45,6 +45,7 @@ import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
+import { LinkRulesScope } from "@/components/chat/LinkRulesScope";
 import {
   RunnerStartingIndicator,
   McpStartupIndicator,
@@ -616,7 +617,7 @@ function ItemLabelScope({
   return (
     <ItemLabelIndexContext.Provider value={index}>
       <ItemLabelSessionContext.Provider value={sessionId}>
-        {children}
+        <LinkRulesScope sessionId={sessionId}>{children}</LinkRulesScope>
       </ItemLabelSessionContext.Provider>
     </ItemLabelIndexContext.Provider>
   );

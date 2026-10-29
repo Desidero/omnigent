@@ -4,6 +4,83 @@ Link rules turn short references in chat messages, such as `BST-2135` or
 `PR #123`, into links. Each user has one list of rules, saved as a shared
 preference, so every session and device shows the same links.
 
+## Setting them up
+
+Settings → General → **Chat links** lists the rules. Each one can be turned on
+or off, renamed, edited (pattern and URL for a `url` rule, provider and host
+for a `git` rule) or deleted; **Add rule** adds a `url` rule, **Add git host**
+a `git` rule (for GitHub Enterprise or a self-managed GitLab, say), and a
+removed Sessions rule can be added back. A rule that fails a check shows why
+under it, and **Save** stays off until every rule passes. **Reset to
+defaults** removes the saved list. The **Preview** box renders its text with
+the rules being edited, before they are saved. The preview has no session, so
+only GitHub's `owner/repo#123` links there.
+
+A saved rule applies to messages as soon as the transcript refetches the
+rules, in every open session.
+
+## In the chat
+
+Rules apply to agent and user messages alike, after item labels (`[Q2]`) and
+file links have been found, and never inside links, inline code, code blocks
+or raw HTML. Where two rules match overlapping text, the match that starts
+first wins, then the rule listed first. A link's tooltip names its rule.
+
+- `url` and `git` links open in a new tab like any other web link.
+- `git` references link as described in [Git references](#git-references).
+- A `session` reference opens the session in the app, scrolled to the message
+  when one is named (`/c/<session id>?message=<message id>`, the same link
+  as an item's **Show in conversation**).
+
+A message that rendered before the rules or the session's repository loaded
+renders again once they arrive.
+
+### Git references
+
+The session's repository comes from its git info (the Pull Requests panel's
+query): the provider the server resolved, the repository path and its host,
+taken from the repository URL or a known pull request's, never assumed from
+the provider.
+
+**Which rule a session uses.** The `git` rule whose host is the repository's
+host owns the session's references; a disabled one turns them off. With no
+rule for that host, the first enabled rule for the provider the server
+resolved does (so a GitHub Enterprise or self-managed GitLab host links with
+nobody listing it, on its own host). A session with no repository, or one on
+a host no rule or provider covers, leaves bare references as text: a bare
+`#123` is never guessed onto a host. Projects carry no repository of their
+own (only a default workspace path), so there is no project fallback.
+
+| In the session's rule | Links to |
+| --- | --- |
+| `#123` | GitHub: the pull request when the session knows one by that number, else `/issues/123` (GitHub redirects for pull requests). GitLab: `/-/issues/123`. Azure DevOps: work item 123 |
+| `issue #123`, `work item #123` | The issue (GitLab, GitHub) or work item (Azure DevOps) |
+| `PR #123`, `pull #123`, `pull request #123`, `MR #123`, `merge request #123` | The pull or merge request |
+| `!123` (GitLab, Azure DevOps only) | The merge or pull request |
+| `owner/repo#123`, `group/sub/project!123` | That repository on the session's host (not on Azure DevOps, which has no notation for another repository) |
+
+**GitHub links qualified references everywhere.** GitHub is referenced often
+even from private repositories elsewhere, so the first enabled GitHub rule
+(`github.com` by default) links `owner/repo#123` in every session, including
+sessions on GitLab or Azure DevOps and sessions with no repository. GitLab
+writes `group/project#123` the same way, so when the session's repository is
+on another host, a qualified reference stays with the session's host if
+
+- its path has more than two segments (`group/sub/project#123`: GitHub
+  repositories are always `owner/repo`), or
+- its first segment is the session repository's top-level owner or group
+  (`acme/web#4` in a session on `acme/backend/api`), or
+- it uses the provider's `!` marker;
+
+and goes to GitHub otherwise (`facebook/react#7`). Comparing the top-level
+group rather than the full namespace keeps sibling subgroups
+(`acme/frontend/web#7`) on the session's host. Turning the GitHub rule off
+turns this off: qualified references then stay with the session's host, and
+link nowhere in a session without a repository.
+
+References never link inside a path, URL or entity (after `/`, `.`, `:`, `#`,
+`!` or `&`), and a number has at most seven digits.
+
 ## Rules
 
 A rule has a `name` (unique, up to 64 characters), a `kind`, a `pattern`, a
