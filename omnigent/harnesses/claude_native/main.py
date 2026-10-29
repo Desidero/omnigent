@@ -157,7 +157,12 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
-from omnigent.native.native_terminal import fetch_session_chat_features, post_initial_prompt
+from omnigent.native.native_terminal import (
+    fetch_git_workspace,
+    fetch_link_rules,
+    fetch_session_chat_features,
+    post_initial_prompt,
+)
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
@@ -5569,7 +5574,10 @@ async def _prepare_claude_terminal(
                 claude_config, session_id=session_id, labels=session_labels
             ),
             append_system_prompt=native_startup_instructions(
-                author_instructions, await fetch_session_chat_features(client, session_id)
+                author_instructions,
+                await fetch_session_chat_features(client, session_id),
+                await fetch_link_rules(client),
+                await fetch_git_workspace(Path.cwd()),
             ),
         )
         record_startup_event("terminal_available", session_id=session_id)

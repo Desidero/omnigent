@@ -21,6 +21,7 @@ from omnigent.git_providers import (
     host_of,
     reset_for_tests,
 )
+from omnigent.link_rules import GitWorkspace
 from omnigent.runner import github_resource, pr_resource
 from omnigent.runner.pr_resource import ProviderResolution
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
@@ -471,3 +472,25 @@ def test_the_github_facet_loads_without_the_panel_module() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        ("git@gitlab.com:group/sub/project.git", GitWorkspace("gitlab", "gitlab.com")),
+        ("https://github.com/o/r.git", GitWorkspace("github", "github.com")),
+        # No provider claims the host: the prompt can still match a listed host.
+        ("git@git.example.test:o/r.git", GitWorkspace(None, "git.example.test")),
+        (None, GitWorkspace()),
+    ],
+)
+def test_workspace_git_reports_the_remote_a_prompt_links_to(
+    repo: Path, remote: str | None, expected: GitWorkspace
+) -> None:
+    if remote is not None:
+        _git(repo, "remote", "add", "origin", remote)
+    assert pr_resource.workspace_git(repo) == expected
+
+
+def test_workspace_git_is_none_outside_a_checkout(tmp_path: Path) -> None:
+    assert pr_resource.workspace_git(tmp_path) is None

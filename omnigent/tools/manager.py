@@ -190,6 +190,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_link_rule_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -228,6 +229,20 @@ class ToolManager:
             SysScheduledTaskDeleteTool(),
         ):
             self._tools[tool.name()] = tool
+
+    def _register_link_rule_tools(self) -> None:
+        """
+        Auto-register ``sys_link_rules`` for the user's chat link rules.
+
+        Registered without spec opt-in; ``tool_groups.link_rules: false``
+        drops it. The runner dispatches it via the Omnigent server's
+        ``/v1/link-rules`` endpoints, and every change asks the user first.
+        """
+        if not self._spec.tool_groups.link_rules:
+            return
+        from omnigent.tools.builtins.link_rules import SysLinkRulesTool
+
+        self._tools[SysLinkRulesTool.name()] = SysLinkRulesTool()
 
     def _register_async_inbox_tools(self) -> None:
         """

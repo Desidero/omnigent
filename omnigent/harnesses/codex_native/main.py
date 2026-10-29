@@ -104,6 +104,8 @@ from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
 from omnigent.native.native_terminal import (
+    fetch_git_workspace,
+    fetch_link_rules,
     fetch_session_chat_features,
     post_initial_prompt,
     request_with_429_retry,
@@ -1261,7 +1263,12 @@ async def _prepare_codex_terminal(
             bridge_dir=bridge_dir,
             ap_server_url=base_url,
             ap_auth_headers=headers,
-            developer_instructions=native_startup_instructions(author_instructions, chat_features),
+            developer_instructions=native_startup_instructions(
+                author_instructions,
+                chat_features,
+                await fetch_link_rules(client),
+                await fetch_git_workspace(Path.cwd()),
+            ),
             terminal_launch_args=codex_args,
             session_labels=session_labels,
         )

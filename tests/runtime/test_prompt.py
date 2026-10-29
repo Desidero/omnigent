@@ -2,12 +2,15 @@
 
 import json
 import re
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
+from omnigent.link_rules import DEFAULT_LINK_RULES, GitWorkspace, LinkRule, LinkRuleKind
 from omnigent.runner.subagent_work import (
     _format_subagent_wake_notice,
 )
@@ -22,6 +25,8 @@ from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
     history_to_input_items,
+    is_git_checkout,
+    link_rule_instructions,
     native_startup_instructions,
     raw_author_instructions,
 )
@@ -458,6 +463,98 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
     result = build_instructions_nullable(spec, None, [])
     assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+
+
+def test_link_rule_instructions_name_each_enabled_syntax() -> None:
+    """The chat-links instruction lists only enabled rules, and none means no text."""
+    [instruction] = link_rule_instructions(DEFAULT_LINK_RULES)
+    assert "`session:<session id>`" in instruction
+    assert "ABC-123" not in instruction  # the Jira example is off by default
+    assert "#123" not in instruction  # git wording waits for a git checkout
+    assert "not inside code" in instruction
+    assert link_rule_instructions(()) == []
+    disabled = [replace(rule, enabled=False) for rule in DEFAULT_LINK_RULES]
+    assert link_rule_instructions(disabled) == []
+    assert link_rule_instructions(disabled, GitWorkspace("github", "github.com")) == []
+
+
+def test_native_startup_instructions_carry_link_rules_last() -> None:
+    """A native launch appends the chat-links instruction after the other framework text."""
+    workspace = GitWorkspace("github", "github.com")
+    text = native_startup_instructions("Agent prompt", frozenset(), DEFAULT_LINK_RULES, workspace)
+    assert text is not None
+    assert text.startswith(f"Agent prompt\n\n{ITEM_LABEL_INSTRUCTION}")
+    assert text.endswith("\n\n".join(link_rule_instructions(DEFAULT_LINK_RULES, workspace)))
+
+
+def test_build_instructions_takes_link_rules_as_framework_text() -> None:
+    """SDK turns pass the per-turn chat-links instruction as framework text."""
+    spec = _spec("Author.")
+    [instruction] = link_rule_instructions(DEFAULT_LINK_RULES)
+    assert build_instructions(spec, None, [], framework_instructions=[instruction]).endswith(
+        instruction
+    )
+
+
+# ─── Issue and pull request wording follows the session's git checkout ────
+
+
+def test_git_checkout_detected_from_any_directory_inside_it(tmp_path: Path) -> None:
+    """A ``.git`` directory (main checkout) or file (linked worktree) at the
+    workspace or any ancestor counts; a plain directory does not."""
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "src" / "pkg").mkdir(parents=True)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: ../checkout/.git/worktrees/worktree\n")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    assert is_git_checkout(checkout)
+    assert is_git_checkout(checkout / "src" / "pkg")
+    assert is_git_checkout(worktree)
+    assert not is_git_checkout(plain)
+    assert not is_git_checkout(tmp_path / "missing")
+
+
+def _git_instruction(workspace: GitWorkspace | None, rules=DEFAULT_LINK_RULES) -> str | None:
+    texts = [text for text in link_rule_instructions(rules, workspace) if "PR #123" in text]
+    return texts[0] if texts else None
+
+
+def test_git_wording_only_in_a_git_checkout() -> None:
+    assert _git_instruction(None) is None
+    instruction = _git_instruction(GitWorkspace("github", "github.com"))
+    assert instruction is not None
+    for form in ("issue #123", "PR #123", "owner/repo#123"):
+        assert f"`{form}`" in instruction
+    assert "!123" not in instruction
+
+
+def test_git_wording_names_the_session_providers_own_notation() -> None:
+    gitlab = _git_instruction(GitWorkspace("gitlab", "gitlab.com"))
+    assert gitlab is not None and "`!123` for a merge request" in gitlab
+    azure = _git_instruction(GitWorkspace("azure_devops", "dev.azure.com"))
+    assert azure is not None and "`!123` for a pull request" in azure
+    # A self-managed host the user listed counts even when no provider claims it.
+    ours = LinkRule(name="Ours", kind=LinkRuleKind.GIT, provider="gitlab", host="git.example.com")
+    listed = _git_instruction(GitWorkspace(None, "git.example.com"), (*DEFAULT_LINK_RULES, ours))
+    assert listed is not None and "`!123`" in listed
+
+
+def test_git_wording_without_a_session_repository_keeps_github_references() -> None:
+    """With no repository (or an unknown host), only GitHub's qualified form links."""
+    for workspace in (GitWorkspace(), GitWorkspace(None, "git.example.com")):
+        instruction = _git_instruction(workspace)
+        assert instruction is not None
+        assert "`owner/repo#123`" in instruction and "!123" not in instruction
+    only_azure = [
+        replace(rule, enabled=rule.provider == "azure_devops") for rule in DEFAULT_LINK_RULES
+    ]
+    assert _git_instruction(GitWorkspace(), only_azure) is None
+    azure = _git_instruction(GitWorkspace("azure_devops", "dev.azure.com"), only_azure)
+    assert azure is not None and "owner/repo#123" not in azure
 
 
 def test_native_startup_instructions_append_item_labels_after_author_text() -> None:

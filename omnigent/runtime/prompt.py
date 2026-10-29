@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
 from omnigent.entities import (
@@ -15,6 +16,14 @@ from omnigent.entities import (
     NativeToolData,
 )
 from omnigent.inner.native_attachments import expand_framework_notices
+from omnigent.link_rules import (
+    GitWorkspace,
+    LinkRule,
+    LinkRuleKind,
+    describe_link_syntax,
+    enabled_link_rules,
+    git_reference_instruction,
+)
 from omnigent.runtime.chat_features import ChatFeature, chat_feature_instructions
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import (
@@ -96,6 +105,60 @@ ITEM_LABEL_INSTRUCTION = (
 )
 
 
+def is_git_checkout(path: Path) -> bool:
+    """
+    Whether ``path`` lies inside a git checkout.
+
+    Looks for ``.git`` in the directory or any ancestor: a directory for a
+    main checkout, a file for a linked worktree. A stat walk costs microseconds
+    and needs no git binary, so it can run on every turn.
+
+    :param path: A workspace directory.
+    :returns: ``True`` when ``path`` or an ancestor holds ``.git``.
+    """
+    try:
+        return any((candidate / ".git").exists() for candidate in (path, *path.parents))
+    except OSError:
+        return False
+
+
+def link_rule_instructions(
+    rules: Sequence[LinkRule], git_workspace: GitWorkspace | None = None
+) -> list[str]:
+    """The chat-links instructions for the user's enabled link rules.
+
+    The chat UI links these references (web/src/lib/linkRules.ts) wherever
+    they appear as plain text, so agents should write them bare. Issue and
+    pull request wording is added only for a session in a git checkout, so a
+    model working outside a repository is not told about notation it has no
+    use for.
+
+    :param rules: The user's link rules, saved or default.
+    :param git_workspace: The session's git checkout, or ``None`` when its
+        workspace is not one.
+    :returns: Up to two instructions: the non-git rules' syntaxes, then the
+        issue and pull request notation the session's git rules link.
+    """
+    syntaxes = [
+        describe_link_syntax(rule)
+        for rule in enabled_link_rules(rules)
+        if rule.kind != LinkRuleKind.GIT
+    ]
+    instructions = []
+    if syntaxes:
+        instructions.append(
+            "Chat links: the chat UI turns these references into links when they "
+            "appear as plain text, not inside code or a markdown link: "
+            + "; ".join(syntaxes)
+            + "."
+        )
+    if git_workspace is not None and (
+        git_instruction := git_reference_instruction(rules, git_workspace)
+    ):
+        instructions.append(git_instruction)
+    return instructions
+
+
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.
@@ -129,19 +192,28 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
 def native_startup_instructions(
     author_instructions: str | None,
     chat_features: Iterable[ChatFeature],
+    link_rules: Sequence[LinkRule] = (),
+    git_workspace: GitWorkspace | None = None,
 ) -> str | None:
     """Author instructions plus the framework text a native launch channel carries.
 
     Native harnesses take instructions once, at launch, so only framework
-    instructions that hold for every turn of the session belong here.
+    instructions that hold for every turn of the session belong here. A link
+    rule changed later reaches the agent on its next launch.
 
     :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
     :param chat_features: The session's enabled chat features.
+    :param link_rules: The user's chat link rules at launch.
+    :param git_workspace: The session's git checkout, or ``None`` outside one.
     :returns: The combined text, or ``None`` when there is nothing to send.
     """
     return append_framework_instructions(
         author_instructions,
-        [ITEM_LABEL_INSTRUCTION, *chat_feature_instructions(chat_features)],
+        [
+            ITEM_LABEL_INSTRUCTION,
+            *chat_feature_instructions(chat_features),
+            *link_rule_instructions(link_rules, git_workspace),
+        ],
     )
 
 

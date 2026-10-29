@@ -6,11 +6,13 @@ import asyncio
 import urllib.parse
 import warnings
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import click
 import httpx
 
 from omnigent.host.daemon_launch import error_text
+from omnigent.link_rules import GitWorkspace, LinkRule, LinkRuleError, validate_link_rules
 from omnigent.runtime.chat_features import (
     DEFAULT_CHAT_FEATURES,
     ChatFeature,
@@ -204,6 +206,40 @@ async def fetch_session_chat_features(
     if not isinstance(payload, dict):
         return DEFAULT_CHAT_FEATURES
     return chat_features_from_wire(payload.get("chat_features"))
+
+
+async def fetch_link_rules(client: httpx.AsyncClient) -> tuple[LinkRule, ...]:
+    """Read the caller's chat link rules for a launch's framework instructions.
+
+    Best-effort: a failed read, or a server that predates ``/v1/link-rules``,
+    gives no rules, so the launch goes ahead without the chat-links instruction.
+
+    :param client: HTTP client pointed at the Omnigent server, authenticated as
+        the session's user.
+    :returns: The rules in effect, saved or default.
+    """
+    try:
+        resp = await client.get("/v1/link-rules")
+        payload = resp.json() if resp.status_code == 200 else None
+    except Exception:  # noqa: BLE001 — the instruction is optional; never fail a launch or turn
+        return ()
+    if not isinstance(payload, dict):
+        return ()
+    try:
+        return validate_link_rules(payload.get("rules"))
+    except LinkRuleError:
+        return ()
+
+
+async def fetch_git_workspace(workspace: str | Path) -> GitWorkspace | None:
+    """The git remote of a launch's workspace, for its issue and pull request wording.
+
+    :param workspace: The session's workspace directory.
+    :returns: ``None`` outside a git checkout, else its provider and host.
+    """
+    from omnigent.runner.pr_resource import workspace_git
+
+    return await asyncio.to_thread(workspace_git, workspace)
 
 
 async def bind_session_runner(
