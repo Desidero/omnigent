@@ -46,6 +46,7 @@ import { paneCornersSetting } from "@/shell/settingsCommands";
 import { usePaneCorners } from "@/shell/useFloatingPanes";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
+import { LinkRulesSettingsGroup } from "@/pages/settings/LinkRulesSettingsGroup";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
@@ -2321,6 +2322,7 @@ function GeneralSection() {
             <NewChatProjectPromptControl />
           </div>
         </SettingsGroup>
+        <LinkRulesSettingsGroup />
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
         </SettingsGroup>

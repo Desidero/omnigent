@@ -192,6 +192,8 @@ export interface PullRequestRepo {
   /** Host of the repo's forge instance, e.g. "github.com"; absent from older hosts and
    *  providers that don't report it. */
   host?: string;
+  /** The repository's web URL, when the host reports it; chat links read its host. */
+  url?: string | null;
 }
 
 /** A `gh`-configured account — one option in the panel's account selector. */
