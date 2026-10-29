@@ -1401,6 +1401,7 @@ tool_groups:
   user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
   memory: false           # memory_search / _get / _list / _write / _delete
   files: true             # sys_files_upload / sys_files_list / sys_files_download (off by default)
+  link_rules: false       # sys_link_rules (chat link rules)
 ```
 
 Every group except `files` defaults to `true`, so omitting the block changes
