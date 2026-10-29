@@ -396,6 +396,7 @@ request carries it, and the series holds a copy until it merges).
 | `delete-stops-runner` | Deleting a session stops its host-launched runner once no remaining session uses it, instead of leaving the process running until its idle timeout. | PR open ([#11391](https://github.com/omnigent-ai/omnigent/pull/11391)) |
 | `app-error-boundary` | A rendering error shows the error, its stack and a Reload button instead of a blank window. | proposed |
 | `jump-to-latest` | A labelled Jump-to-latest pill, outside the scroll fade, that counts new replies landing below a reader who scrolled up. | proposed |
+| `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. Needs `chat-features` and `chat-item-comments`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
 | `custom-docs-index` | `docs/custom/README.md`, the index of the series: what each changes, how to turn it on, and where its docs are. | custom only |
 
 

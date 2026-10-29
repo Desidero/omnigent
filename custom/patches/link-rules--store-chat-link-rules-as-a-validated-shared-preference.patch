@@ -1,0 +1,1696 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 29 Oct 2026 19:51:05 +0000
+Subject: [PATCH] feat(server): store chat link rules as a validated shared
+ preference
+
+Chat messages should turn short references such as BST-2135 or #123 into
+links, using rules each user sets. The rules run in every viewer's browser on
+every message, and agents will be able to write them, so the server checks a
+rule before it is stored.
+
+- omnigent/link_rules.py holds the rule shape ({name, kind, pattern, url,
+  enabled}), the defaults (GitHub and session references on, two example url
+  rules off) and the validator. A url rule's pattern is a short form such as
+  BST-{num} or a raw /regex/ limited to a subset Python and every supported
+  browser parse alike: no backreferences, lookaround, named groups or inline
+  flags (older Safari can't parse named groups or lookbehind), no repeated
+  group holding a repeat or |, at most three repeats capped at 64 characters,
+  200 characters in all. Its URL template must be http(s) with a fixed scheme
+  and host before any placeholder, so a match can't choose where a link goes.
+- The rules are the {"kind": "link_rules", "name": "default"} shared
+  preference, a JSON array in a string that the preference layer validates
+  and stores in a canonical form. null restores the defaults.
+- GET /v1/link-rules returns the rules in effect, saved or default, and PUT
+  replaces the list with a version check, refusing a stale edit instead of
+  storing a conflict. Without shared preferences the defaults are read-only.
+
+Not upstream yet: proposed from feat/chat-link-rules; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-link-rules.md                |  92 +++++
+ docs/shared-preferences-api.md         |   7 +-
+ feature-map/preferences.md             |   9 +
+ omnigent/link_rules.py                 | 541 +++++++++++++++++++++++++
+ omnigent/preference_sync.py            |   8 +-
+ omnigent/preferences.py                |  16 +-
+ omnigent/server/API.md                 |  36 ++
+ omnigent/server/app.py                 |   6 +
+ omnigent/server/routes/preferences.py  | 132 +++++-
+ omnigent/server/schemas.py             |  41 ++
+ openapi.json                           | 190 +++++++++
+ tests/server/routes/test_link_rules.py | 152 +++++++
+ tests/test_link_rules.py               | 209 ++++++++++
+ 13 files changed, 1430 insertions(+), 9 deletions(-)
+ create mode 100644 docs/chat-link-rules.md
+ create mode 100644 omnigent/link_rules.py
+ create mode 100644 tests/server/routes/test_link_rules.py
+ create mode 100644 tests/test_link_rules.py
+
+diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7133177c422a1d1a144c58c1d620cf3b9f8a42f1
+--- /dev/null
++++ b/docs/chat-link-rules.md
+@@ -0,0 +1,92 @@
++# Chat link rules
++
++Link rules turn short references in chat messages, such as `BST-2135` or
++`#123`, into links. Each user has one list of rules, saved as a shared
++preference, so every session and device shows the same links.
++
++## Rules
++
++A rule has a `name` (unique, up to 64 characters), a `kind`, a `pattern`, a
++`url` and `enabled`. There are three kinds:
++
++| Kind | Matches | Links to |
++| --- | --- | --- |
++| `url` | The rule's `pattern` | The rule's `url` template, filled from the match |
++| `github` | `#123` and `owner/repo#123` | The issue or pull request on the session's own repository host |
++| `session` | `session:<session id>` and `session:<session id>/<message id>` | That Omnigent session, scrolled to the message |
++
++The `github` and `session` kinds are built in: they take no `pattern` or `url`,
++and a list can hold at most one of each. A list holds up to 32 rules.
++
++With nothing saved, these defaults apply: GitHub and Sessions on, and two
++example `url` rules off, a Jira-style short form (`ABC-{num}`) and a raw
++regex (`/(ENG-\d+)/`). Edit an example's pattern and URL before turning it on.
++
++### Patterns
++
++A `url` rule's pattern is either a short form or a raw regex.
++
++A **short form** is literal text with placeholders:
++
++| Placeholder | Matches |
++| --- | --- |
++| `{num}` | 1 to 10 digits |
++| `{key}` | An uppercase letter, then 1 to 9 uppercase letters or digits |
++| `{id}` | 1 to 64 letters, digits, `_` or `-` |
++
++For example `BST-{num}` matches `BST-2135`, and `{key}-{num}` matches any
++Jira-style key. A short form has no spaces and at most four placeholders.
++
++A **raw regex** is written between slashes, such as `/(ENG-\d+)/`. It may use
++only a subset that Python and every supported browser read the same way:
++
++- Groups are `( )` or `(?: )`, at most nine capturing. No lookahead,
++  lookbehind, named groups, inline flags or backreferences; older Safari
++  can't parse named groups or lookbehind.
++- Escapes are `\d \w \s \b` and their capitals, plus escaped punctuation. A
++  literal `{`, `}` or `[` inside a class is escaped.
++- A repeated group can't contain another repeat or `|` (no `(a+)+`), there are
++  at most three repeats, and every repeat stops at 64 characters (`+` reads as
++  `{1,64}`).
++- The pattern can't match empty text, and is at most 200 characters.
++
++Every pattern matches whole words only: the match must start at the beginning
++of the text or after a character other than a letter, digit or `_`, and must
++not be followed by one. Matching is case-sensitive.
++
++### URL templates
++
++A `url` template is an `https:` or `http:` link of up to 500 characters with
++placeholders for the match: a short form's placeholder names (`{num}`,
++`{key}`, `{id}`; a repeated name means its first use), or `{1}` to `{9}` for a
++regex's groups, and `{0}` for the whole match. Each value is percent-encoded
++before it goes in. Everything before the first placeholder must be a complete
++scheme and host followed by `/`, `?` or `#`, so a match can never choose where
++the link goes:
++
++```json
++{"name": "Jira", "kind": "url", "pattern": "BST-{num}",
++ "url": "https://jira.example.com/browse/BST-{num}", "enabled": true}
++```
++
++## Where rules are checked
++
++Rules run in every viewer's browser on every message, and agents can write
++them, so the server checks a rule when it is saved (the shared-preference
++operation and `PUT /v1/link-rules` both run the same validator,
++`omnigent/link_rules.py`) and the web client checks it again when it compiles
++the rule.
++
++## Saving rules
++
++Rules are the `{"kind": "link_rules", "name": "default"}` shared preference:
++a JSON array in a string, stored compactly. `null` removes the saved list so
++the defaults apply, and `"[]"` turns every rule off. Saving needs shared
++preferences on the server (`shared_preferences_authority_id` in the server
++config); without them the defaults apply and can't be changed.
++
++- [`GET` and `PUT /v1/link-rules`](../omnigent/server/API.md#chat-link-rules-v1link-rules)
++  read the rules in effect (saved or default) and replace the whole list with
++  a version check.
++- The [shared preferences API](shared-preferences-api.md) reads and writes the
++  same value, with its conflict handling.
+diff --git a/docs/shared-preferences-api.md b/docs/shared-preferences-api.md
+index 45a6f72ab09f5c369b6b5c7163a4a3071ae18048..608591071def677ec9455a5c6d6d30b307137de3 100644
+--- a/docs/shared-preferences-api.md
++++ b/docs/shared-preferences-api.md
+@@ -1,8 +1,8 @@
+ # Shared preference operations
+ 
+ This opt-in API stores model choice (`model` and `opencode_model`), the default
+-harness, ordered arguments per harness, plugin enable/disable choices, and the
+-chat features new sessions start with. It provides durable values, versions,
++harness, ordered arguments per harness, plugin enable/disable choices, the
++chat features new sessions start with, and chat link rules. It provides durable values, versions,
+ conflict alternatives, and retry receipts. It does not import settings, enable
+ automatic client sync, or change launches. The one value the server reads is
+ the chat-features default, when it creates a session without its own set.
+@@ -74,9 +74,10 @@ authenticated context; it does not select another user or workspace.
+ | `{"kind":"harness_args","name":"claude-sdk"}` | Ordered string array; `[]` explicitly clears inherited arguments |
+ | `{"kind":"plugin","name":{"ecosystem":"claude","source":"catalog","name":"tools"}}` | Boolean; `false` explicitly disables the plugin |
+ | `{"kind":"chat_features","name":"default"}` | Array of chat-feature keys, stored sorted and unique; `[]` explicitly enables none |
++| `{"kind":"link_rules","name":"default"}` | [Chat link rules](chat-link-rules.md) as a JSON array in a string, validated and stored compactly; `"[]"` explicitly turns every rule off |
+ 
+ For every key, `null` removes the shared choice; with no chat-features default,
+-new sessions get every feature. Chat-feature keys a server doesn't know are kept,
++new sessions get every feature, and with no link rules the defaults apply. Chat-feature keys a server doesn't know are kept,
+ so builds that add features can share the value; session creation ignores them. Harness aliases use the existing
+ canonicalization rules. Credentials, executable commands, plugin installation,
+ and arbitrary plugin configuration are not supported preference keys.
+diff --git a/feature-map/preferences.md b/feature-map/preferences.md
+index 5cea29cc0d1fdeb398d3fa5fb847208b89255306..ea8f36b32375aae980552bbee1038dfcac9f8aa2 100644
+--- a/feature-map/preferences.md
++++ b/feature-map/preferences.md
+@@ -27,6 +27,9 @@ local; automatic client sync and shared/machine scope controls remain deferred.
+ - `chat-features-default`: the chat features new sessions start with, saved as
+   the `chat_features` shared preference from Settings → General and read by the
+   server when it creates a session.
++- `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
++  the `link_rules` shared preference, validated on save and served with the
++  defaults by `GET`/`PUT /v1/link-rules`.
+ 
+ - `configuration-copy`: review, save, show and import model defaults, harness
+   selection/arguments and launcher plugin opt-outs; preserve local-only values.
+@@ -77,6 +80,12 @@ switches are disabled with a note, and new sessions get every feature. The
+ new-chat agent menu and the session configure menu set one session's features
+ on any server.
+ 
++**Chat link rules API:** `GET /v1/link-rules` returns the rules in effect;
++`PUT /v1/link-rules` with `expected_version` replaces them (`rules: null`
++restores the defaults). Covered by `tests/test_link_rules.py` (pattern and URL
++checks) and `tests/server/routes/test_link_rules.py` (per-user storage, stale
++versions, rejected rules, a server without shared preferences).
++
+ **Shared scope controls:** the CLI and UI do not yet offer automatic following,
+ saving machine overrides, removing a machine override,
+ resolving conflicts, or continuing with temporary defaults. The API above can
+diff --git a/omnigent/link_rules.py b/omnigent/link_rules.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7969254de
+--- /dev/null
++++ b/omnigent/link_rules.py
+@@ -0,0 +1,541 @@
++"""Chat link rules: short references in chat messages that render as links.
++
++Each viewer's browser runs the rules on every message, and agents can write
++them, so a rule is validated here when it is saved and again by the web client
++(``web/src/lib/linkRules.ts``) when it is compiled. Both sides accept the same
++subset of regular expressions: one that Python and every supported browser
++parse the same way, with no backreferences, lookbehind or named groups (older
++Safari cannot parse the last two), no nested or alternating repeats, and
++repeats capped at :data:`MAX_REPEAT`.
++
++A ``url`` rule's pattern is a short form such as ``BST-{num}`` or a raw
++``/regex/``; its URL template fills ``{num}``-style placeholders (or ``{1}``,
++``{2}`` for regex groups, ``{0}`` for the whole match) with percent-encoded
++captures. The ``github`` and ``session`` kinds are built in and take no
++pattern or URL.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++from collections.abc import Iterable, Sequence
++from dataclasses import dataclass
++from enum import StrEnum
++from typing import Any
++from urllib.parse import urlsplit
++
++
++class LinkRuleKind(StrEnum):
++    """What a rule links to."""
++
++    URL = "url"
++    GITHUB = "github"
++    SESSION = "session"
++
++
++BUILTIN_KINDS = frozenset({LinkRuleKind.GITHUB, LinkRuleKind.SESSION})
++MAX_RULES = 32
++MAX_NAME_LENGTH = 64
++MAX_PATTERN_LENGTH = 200
++MAX_URL_LENGTH = 500
++MAX_REPEAT = 64
++MAX_REPEATS = 3
++MAX_GROUPS = 9
++
++# Short-form placeholders and the text each one matches.
++SHORT_FORM_PLACEHOLDERS: dict[str, str] = {
++    "num": r"\d{1,10}",
++    "key": r"[A-Z][A-Z0-9]{1,9}",
++    "id": r"[A-Za-z0-9_-]{1,64}",
++}
++# Sample values for describing a short form to agents.
++_PLACEHOLDER_EXAMPLES = {"num": "123", "key": "ABC", "id": "a1b2"}
++_SHORT_FORM_TOKEN = re.compile(r"\{([a-z]+)\}")
++_URL_PLACEHOLDER = re.compile(r"\{([a-z]+|\d)\}")
++# Everything up to the first placeholder must be a complete scheme and host,
++# so a capture can never choose where the link goes.
++_URL_FIXED_PREFIX = re.compile(r"^https?://[^/?#{}\s@\\]+[/?#]", re.IGNORECASE)
++# Matches start after a non-word character or at the start of the text and must
++# not run into a word character. Compiled rules consume that one leading
++# character as group 1 instead of using lookbehind, which older Safari lacks.
++_WORD_CHAR_CLASS = "[A-Za-z0-9_]"
++_LEADING_BOUNDARY = "(^|[^A-Za-z0-9_])"
++_TRAILING_BOUNDARY = f"(?!{_WORD_CHAR_CLASS})"
++_CLASS_ESCAPES = frozenset("dDwWsS")
++
++
++class LinkRuleError(ValueError):
++    """A rule that can't be saved; the message says which field and why."""
++
++
++@dataclass(frozen=True)
++class LinkRule:
++    """One saved rule.
++
++    :param name: Unique display name, e.g. ``"Jira"``.
++    :param kind: What the rule links to.
++    :param pattern: ``url`` kind only: a short form such as ``"BST-{num}"`` or a
++        raw ``"/regex/"``; ``""`` for the built-in kinds.
++    :param url: ``url`` kind only: the link template, e.g.
++        ``"https://jira.example.com/browse/BST-{num}"``.
++    :param enabled: Whether chat messages use the rule.
++    """
++
++    name: str
++    kind: LinkRuleKind
++    pattern: str = ""
++    url: str | None = None
++    enabled: bool = True
++
++    def to_wire(self) -> dict[str, Any]:
++        """The rule as stored and served, omitting ``url`` when unset."""
++        wire: dict[str, Any] = {
++            "name": self.name,
++            "kind": str(self.kind),
++            "pattern": self.pattern,
++            "enabled": self.enabled,
++        }
++        if self.url is not None:
++            wire["url"] = self.url
++        return wire
++
++
++@dataclass(frozen=True)
++class CompiledPattern:
++    """A pattern as a matching regex plus its placeholder names.
++
++    :param source: The pattern's own regex, without the word boundaries.
++    :param group_names: For a short form, each capture group's placeholder name
++        in order; empty for a raw regex.
++    :param group_count: Number of capture groups in ``source``.
++    """
++
++    source: str
++    group_names: tuple[str, ...]
++    group_count: int
++
++    def bounded(self) -> str:
++        """The full regex: leading boundary as group 1, then the pattern."""
++        return f"{_LEADING_BOUNDARY}(?:{self.source}){_TRAILING_BOUNDARY}"
++
++
++DEFAULT_LINK_RULES: tuple[LinkRule, ...] = (
++    LinkRule(name="GitHub", kind=LinkRuleKind.GITHUB),
++    LinkRule(name="Sessions", kind=LinkRuleKind.SESSION),
++    LinkRule(
++        name="Jira",
++        kind=LinkRuleKind.URL,
++        pattern="ABC-{num}",
++        url="https://jira.example.com/browse/ABC-{num}",
++        enabled=False,
++    ),
++    LinkRule(
++        name="Linear",
++        kind=LinkRuleKind.URL,
++        pattern="/(ENG-\\d+)/",
++        url="https://linear.app/example/issue/{1}",
++        enabled=False,
++    ),
++)
++
++
++def compile_pattern(pattern: str) -> CompiledPattern:
++    """Compile a ``url`` rule's pattern after checking it is safe to run.
++
++    :param pattern: A short form (``"BST-{num}"``) or a raw ``"/regex/"``.
++    :returns: The compiled pattern.
++    :raises LinkRuleError: If the pattern is empty, too long, uses an unknown
++        placeholder or an unsupported regex construct, or can match empty text.
++    """
++    if not pattern:
++        raise LinkRuleError("pattern: required for a url rule")
++    if len(pattern) > MAX_PATTERN_LENGTH:
++        raise LinkRuleError(f"pattern: longer than {MAX_PATTERN_LENGTH} characters")
++    if len(pattern) >= 2 and pattern.startswith("/") and pattern.endswith("/"):
++        source, group_count = _check_regex(pattern[1:-1])
++        compiled = CompiledPattern(source=source, group_names=(), group_count=group_count)
++    else:
++        compiled = _compile_short_form(pattern)
++    try:
++        regex = re.compile(compiled.source, re.ASCII)
++    except re.error as exc:
++        raise LinkRuleError(f"pattern: {exc}") from exc
++    if regex.fullmatch(""):
++        raise LinkRuleError("pattern: must not match empty text")
++    return compiled
++
++
++def _compile_short_form(pattern: str) -> CompiledPattern:
++    if any(char.isspace() for char in pattern):
++        raise LinkRuleError("pattern: a short form can't contain spaces")
++    parts: list[str] = []
++    names: list[str] = []
++    last = 0
++    for match in _SHORT_FORM_TOKEN.finditer(pattern):
++        literal = pattern[last : match.start()]
++        if "{" in literal or "}" in literal:
++            raise LinkRuleError("pattern: unmatched { or } in the short form")
++        parts.append(re.escape(literal))
++        name = match.group(1)
++        if name not in SHORT_FORM_PLACEHOLDERS:
++            known = ", ".join(f"{{{key}}}" for key in SHORT_FORM_PLACEHOLDERS)
++            raise LinkRuleError(f"pattern: unknown placeholder {{{name}}}; use {known}")
++        parts.append(f"({SHORT_FORM_PLACEHOLDERS[name]})")
++        names.append(name)
++        last = match.end()
++    tail = pattern[last:]
++    if "{" in tail or "}" in tail:
++        raise LinkRuleError("pattern: unmatched { or } in the short form")
++    parts.append(re.escape(tail))
++    if not names:
++        raise LinkRuleError("pattern: a short form needs a placeholder such as {num}")
++    if len(names) > MAX_REPEATS + 1:
++        raise LinkRuleError(f"pattern: at most {MAX_REPEATS + 1} placeholders")
++    return CompiledPattern(source="".join(parts), group_names=tuple(names), group_count=len(names))
++
++
++@dataclass
++class _Group:
++    has_repeat: bool = False
++    has_alternation: bool = False
++
++
++def _check_regex(body: str) -> tuple[str, int]:
++    """Check a raw regex against the shared safe subset and cap its repeats.
++
++    :param body: The regex between the slashes.
++    :returns: The regex with unbounded repeats rewritten to ``{n,MAX_REPEAT}``,
++        and its capture-group count.
++    :raises LinkRuleError: On any construct outside the subset.
++    """
++    out: list[str] = []
++    stack = [_Group()]
++    # What a quantifier would apply to: None (nothing), "atom", or a closed group.
++    last: _Group | str | None = None
++    groups = 0
++    repeats = 0
++    index = 0
++    length = len(body)
++    while index < length:
++        char = body[index]
++        if char == "\\":
++            if index + 1 >= length:
++                raise LinkRuleError("pattern: ends with a lone backslash")
++            escaped = body[index + 1]
++            if escaped in "bB":
++                last = None
++            elif escaped in _CLASS_ESCAPES or not escaped.isalnum():
++                last = "atom"
++            else:
++                raise LinkRuleError(
++                    f"pattern: \\{escaped} isn't supported (no backreferences or "
++                    "letter escapes other than \\d \\w \\s \\b and their capitals)"
++                )
++            out.append(body[index : index + 2])
++            index += 2
++        elif char == "[":
++            end = _class_end(body, index)
++            out.append(body[index : end + 1])
++            last = "atom"
++            index = end + 1
++        elif char == "(":
++            if body.startswith("(?", index):
++                if not body.startswith("(?:", index):
++                    raise LinkRuleError(
++                        "pattern: only (?: ) groups are supported; no lookaround, "
++                        "named groups or inline flags"
++                    )
++                out.append("(?:")
++                index += 3
++            else:
++                groups += 1
++                out.append("(")
++                index += 1
++            stack.append(_Group())
++            last = None
++        elif char == ")":
++            if len(stack) == 1:
++                raise LinkRuleError("pattern: unbalanced )")
++            closed = stack.pop()
++            parent = stack[-1]
++            parent.has_repeat |= closed.has_repeat
++            parent.has_alternation |= closed.has_alternation
++            out.append(")")
++            last = closed
++            index += 1
++        elif char == "|":
++            stack[-1].has_alternation = True
++            out.append("|")
++            last = None
++            index += 1
++        elif char in "*+?" or char == "{":
++            quantifier = _read_quantifier(body, index)
++            if quantifier is None:
++                raise LinkRuleError("pattern: escape a literal { or } as \\{ or \\}")
++            text, low, high, end = quantifier
++            if last is None:
++                raise LinkRuleError(f"pattern: nothing to repeat before {text}")
++            repeats_more = high is None or high > 1
++            if repeats_more:
++                if isinstance(last, _Group) and (last.has_repeat or last.has_alternation):
++                    raise LinkRuleError(
++                        "pattern: a repeated group can't contain another repeat or |"
++                    )
++                repeats += 1
++                if repeats > MAX_REPEATS:
++                    raise LinkRuleError(f"pattern: at most {MAX_REPEATS} repeats")
++            if high is not None and high > MAX_REPEAT:
++                raise LinkRuleError(f"pattern: repeat counts are capped at {MAX_REPEAT}")
++            if low > MAX_REPEAT:
++                raise LinkRuleError(f"pattern: repeat counts are capped at {MAX_REPEAT}")
++            stack[-1].has_repeat = True
++            out.append(text if high is not None else f"{{{low},{MAX_REPEAT}}}")
++            index = end
++            if index < length and body[index] == "?":
++                out.append("?")
++                index += 1
++            last = None
++        elif char == "}":
++            raise LinkRuleError("pattern: escape a literal { or } as \\{ or \\}")
++        elif char in "^$":
++            out.append(char)
++            last = None
++            index += 1
++        else:
++            out.append(char)
++            last = "atom"
++            index += 1
++    if len(stack) != 1:
++        raise LinkRuleError("pattern: unbalanced (")
++    if groups > MAX_GROUPS:
++        raise LinkRuleError(f"pattern: at most {MAX_GROUPS} capture groups")
++    return "".join(out), groups
++
++
++def _class_end(body: str, start: int) -> int:
++    """Index of the ``]`` closing the character class opened at ``start``."""
++    index = start + 1
++    if index < len(body) and body[index] == "^":
++        index += 1
++    if index < len(body) and body[index] == "]":
++        # Python reads []] as a class holding ], a browser as an empty class.
++        raise LinkRuleError("pattern: escape ] at the start of a [ ] class as \\]")
++    while index < len(body):
++        char = body[index]
++        if char == "\\":
++            escaped = body[index + 1] if index + 1 < len(body) else ""
++            if not escaped or (escaped.isalnum() and escaped not in _CLASS_ESCAPES):
++                raise LinkRuleError(f"pattern: \\{escaped} isn't supported inside [ ]")
++            index += 2
++            continue
++        if char == "[":
++            raise LinkRuleError("pattern: escape [ inside a [ ] class as \\[")
++        if char == "]":
++            return index
++        index += 1
++    raise LinkRuleError("pattern: unclosed [")
++
++
++def _read_quantifier(body: str, start: int) -> tuple[str, int, int | None, int] | None:
++    """Parse the quantifier at ``start``.
++
++    :returns: ``(text, low, high, end)`` where ``high`` is ``None`` when
++        unbounded, or ``None`` when ``{`` doesn't start a valid quantifier.
++    """
++    char = body[start]
++    if char == "*":
++        return "*", 0, None, start + 1
++    if char == "+":
++        return "+", 1, None, start + 1
++    if char == "?":
++        return "?", 0, 1, start + 1
++    match = re.compile(r"\{(\d{1,4})(,(\d{0,4}))?\}").match(body, start)
++    if match is None:
++        return None
++    low = int(match.group(1))
++    if match.group(2) is None:
++        high: int | None = low
++    elif match.group(3):
++        high = int(match.group(3))
++    else:
++        high = None
++    if high is not None and high < low:
++        raise LinkRuleError("pattern: a {min,max} repeat needs min <= max")
++    return match.group(0), low, high, match.end()
++
++
++def check_url_template(template: str, compiled: CompiledPattern) -> None:
++    """Check that a URL template always yields an http(s) link.
++
++    :param template: E.g. ``"https://jira.example.com/browse/{key}-{num}"``.
++    :param compiled: The rule's compiled pattern, whose groups the
++        placeholders must name.
++    :raises LinkRuleError: If the template is too long, isn't http(s), lets a
++        capture reach the scheme or host, or names an unknown placeholder.
++    """
++    if not template:
++        raise LinkRuleError("url: required for a url rule")
++    if len(template) > MAX_URL_LENGTH:
++        raise LinkRuleError(f"url: longer than {MAX_URL_LENGTH} characters")
++    if any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in template):
++        raise LinkRuleError("url: can't contain spaces or control characters")
++    first = template.find("{")
++    # A template with no placeholder may end at the host.
++    prefix = template[:first] if first >= 0 else template + "/"
++    if not _URL_FIXED_PREFIX.match(prefix):
++        raise LinkRuleError(
++            "url: must start with https:// or http:// and a host, followed by / ? or # "
++            "before any placeholder"
++        )
++    scheme = urlsplit(template).scheme.lower()
++    if scheme not in ("http", "https"):
++        raise LinkRuleError("url: must be an https: or http: link")
++    names = set(compiled.group_names)
++    for match in _URL_PLACEHOLDER.finditer(template):
++        token = match.group(1)
++        if token.isdigit():
++            if int(token) > compiled.group_count:
++                raise LinkRuleError(
++                    f"url: {{{token}}} has no matching group in the pattern "
++                    f"({compiled.group_count} group(s))"
++                )
++        elif token not in names:
++            available = ", ".join(f"{{{name}}}" for name in compiled.group_names) or "{0}, {1}…"
++            raise LinkRuleError(f"url: unknown placeholder {{{token}}}; use {available}")
++    leftover = _URL_PLACEHOLDER.sub("", template)
++    if "{" in leftover or "}" in leftover:
++        raise LinkRuleError("url: unmatched { or }")
++
++
++def validate_link_rule(raw: object) -> LinkRule:
++    """Validate one rule from the wire.
++
++    :param raw: A mapping with ``name``, ``kind``, ``pattern``, ``url`` and
++        ``enabled``; built-in kinds may omit ``pattern``.
++    :returns: The rule, with its name trimmed.
++    :raises LinkRuleError: Naming the field at fault.
++    """
++    if not isinstance(raw, dict):
++        raise LinkRuleError("a rule must be an object")
++    unknown = sorted(set(raw) - {"name", "kind", "pattern", "url", "enabled"})
++    if unknown:
++        raise LinkRuleError(f"unknown field(s): {', '.join(unknown)}")
++    name = raw.get("name")
++    if not isinstance(name, str) or not name.strip():
++        raise LinkRuleError("name: required")
++    name = name.strip()
++    if len(name) > MAX_NAME_LENGTH:
++        raise LinkRuleError(f"name: longer than {MAX_NAME_LENGTH} characters")
++    try:
++        kind = LinkRuleKind(raw.get("kind"))
++    except ValueError:
++        raise LinkRuleError("kind: must be url, github or session") from None
++    enabled = raw.get("enabled", True)
++    if not isinstance(enabled, bool):
++        raise LinkRuleError("enabled: must be true or false")
++    pattern = raw.get("pattern", "")
++    url = raw.get("url")
++    if not isinstance(pattern, str):
++        raise LinkRuleError("pattern: must be a string")
++    if url is not None and not isinstance(url, str):
++        raise LinkRuleError("url: must be a string")
++    try:
++        if kind in BUILTIN_KINDS:
++            if pattern or url:
++                raise LinkRuleError(f"the built-in {kind} kind takes no pattern or url")
++        else:
++            check_url_template(url or "", compile_pattern(pattern))
++    except LinkRuleError as exc:
++        raise LinkRuleError(f"{name}: {exc}") from None
++    return LinkRule(name=name, kind=kind, pattern=pattern, url=url or None, enabled=enabled)
++
++
++def validate_link_rules(raw: object) -> tuple[LinkRule, ...]:
++    """Validate a whole rule list.
++
++    :param raw: A list of rule mappings.
++    :returns: The rules in order.
++    :raises LinkRuleError: On a bad rule, too many rules, a repeated name, or a
++        built-in kind listed twice.
++    """
++    if not isinstance(raw, list):
++        raise LinkRuleError("link rules must be a list")
++    if len(raw) > MAX_RULES:
++        raise LinkRuleError(f"at most {MAX_RULES} link rules")
++    rules = tuple(validate_link_rule(entry) for entry in raw)
++    seen: set[str] = set()
++    builtins: set[LinkRuleKind] = set()
++    for rule in rules:
++        folded = rule.name.casefold()
++        if folded in seen:
++            raise LinkRuleError(f"two rules are named {rule.name!r}")
++        seen.add(folded)
++        if rule.kind in BUILTIN_KINDS:
++            if rule.kind in builtins:
++                raise LinkRuleError(f"only one {rule.kind} rule")
++            builtins.add(rule.kind)
++    return rules
++
++
++def parse_link_rules_json(value: str) -> tuple[LinkRule, ...]:
++    """Parse and validate the stored JSON form.
++
++    :param value: A JSON array of rules, as :func:`encode_link_rules` writes it.
++    :returns: The rules.
++    :raises LinkRuleError: If the JSON is malformed or a rule is invalid.
++    """
++    try:
++        raw = json.loads(value)
++    except ValueError as exc:
++        raise LinkRuleError(f"link rules must be a JSON array: {exc}") from None
++    return validate_link_rules(raw)
++
++
++def encode_link_rules(rules: Iterable[LinkRule]) -> str:
++    """Canonical stored form: compact JSON, keys in a fixed order."""
++    return json.dumps(
++        [rule.to_wire() for rule in rules], ensure_ascii=False, separators=(",", ":")
++    )
++
++
++def link_rules_from_value(value: object) -> tuple[LinkRule, ...]:
++    """Rules from a stored preference value, leniently.
++
++    :param value: The stored JSON string; anything else (``None`` after a
++        reset, never saved) means the defaults.
++    :returns: The saved rules, or :data:`DEFAULT_LINK_RULES` when there is no
++        usable value.
++    """
++    if not isinstance(value, str):
++        return DEFAULT_LINK_RULES
++    try:
++        return parse_link_rules_json(value)
++    except LinkRuleError:
++        return DEFAULT_LINK_RULES
++
++
++def describe_link_syntax(rule: LinkRule) -> str:
++    """How an agent writes a reference that ``rule`` links, for its prompt.
++
++    :param rule: An enabled rule.
++    :returns: E.g. ``"`ABC-123` (Jira)"``.
++    """
++    if rule.kind == LinkRuleKind.GITHUB:
++        return "`#123` or `owner/repo#123` (issues and pull requests on this session's repository)"
++    if rule.kind == LinkRuleKind.SESSION:
++        return (
++            "`session:<session id>` or `session:<session id>/<message id>` "
++            "(an Omnigent session, or a message in it)"
++        )
++    if rule.pattern.startswith("/") and rule.pattern.endswith("/") and len(rule.pattern) >= 2:
++        return f"text matching `{rule.pattern}` ({rule.name})"
++    example = _SHORT_FORM_TOKEN.sub(
++        lambda m: _PLACEHOLDER_EXAMPLES.get(m.group(1), m.group(0)), rule.pattern
++    )
++    return f"`{example}` ({rule.name})"
++
++
++def enabled_link_rules(rules: Sequence[LinkRule]) -> tuple[LinkRule, ...]:
++    """The rules chat messages use."""
++    return tuple(rule for rule in rules if rule.enabled)
+diff --git a/omnigent/preference_sync.py b/omnigent/preference_sync.py
+index 0f596cd65546d011c179cfbaf6535a83395bd143..f8f41a63c81d5081aceb36d463988f156e02018d 100644
+--- a/omnigent/preference_sync.py
++++ b/omnigent/preference_sync.py
+@@ -118,9 +118,11 @@ class PreferenceMutation(ProtocolModel):
+             layer = PreferenceLayer(
+                 PreferenceScope.SHARED, self.identity.as_identity(), {key: value}
+             )
+-            if isinstance(canonical := layer.values[key], tuple):
+-                # Store the canonical form, e.g. a chat-feature set's sorted unique keys.
+-                object.__setattr__(self, "value", list(canonical))
++            # Store the canonical form, e.g. a chat-feature set's sorted unique keys.
++            canonical = layer.values[key]
++            object.__setattr__(
++                self, "value", list(canonical) if isinstance(canonical, tuple) else canonical
++            )
+         if len(self.resolves) != len(set(self.resolves)):
+             raise ValueError("conflict IDs must be unique")
+         return self
+diff --git a/omnigent/preferences.py b/omnigent/preferences.py
+index 8ed73fd8fe32d9917da3c41784132dcdb339cd04..1a1000ddfc29d6b54cb4c3d1d2dc597d8a4aad45 100644
+--- a/omnigent/preferences.py
++++ b/omnigent/preferences.py
+@@ -13,6 +13,8 @@ from enum import StrEnum
+ from types import MappingProxyType
+ from typing import TypeAlias
+ 
++from omnigent.link_rules import encode_link_rules, parse_link_rules_json
++
+ 
+ class PreferenceScope(StrEnum):
+     BUILTIN = "builtin"
+@@ -64,6 +66,7 @@ class PreferenceKind(StrEnum):
+     HARNESS_ARGS = "harness_args"
+     PLUGIN = "plugin"
+     CHAT_FEATURES = "chat_features"
++    LINK_RULES = "link_rules"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -87,6 +90,8 @@ class PreferenceKey:
+             raise ValueError("the harness preference key must be 'default'")
+         if self.kind == PreferenceKind.CHAT_FEATURES and self.name != "default":
+             raise ValueError("the chat_features preference key must be 'default'")
++        if self.kind == PreferenceKind.LINK_RULES and self.name != "default":
++            raise ValueError("the link_rules preference key must be 'default'")
+         if self.kind == PreferenceKind.HARNESS_ARGS:
+             from omnigent.harness_aliases import canonicalize_harness
+ 
+@@ -101,9 +106,12 @@ PreferenceValue: TypeAlias = str | bool | tuple[str, ...]
+ 
+ 
+ def normalize_preference_value(key: PreferenceKey, value: PreferenceValue) -> PreferenceValue:
+-    """Canonical form of ``value``: a chat-feature set is unique keys in sorted order."""
++    """Canonical form of ``value``: a chat-feature set is unique keys in sorted order,
++    link rules are compact JSON with trimmed names."""
+     if key.kind == PreferenceKind.CHAT_FEATURES and isinstance(value, tuple):
+         return tuple(sorted(set(value)))
++    if key.kind == PreferenceKind.LINK_RULES and isinstance(value, str):
++        return encode_link_rules(parse_link_rules_json(value))
+     return value
+ 
+ 
+@@ -123,6 +131,12 @@ def _validate_value(key: PreferenceKey, value: PreferenceValue) -> None:
+             isinstance(feature, str) and feature and feature == feature.strip()
+             for feature in value
+         )
++    elif key.kind == PreferenceKind.LINK_RULES:
++        if not isinstance(value, str):
++            raise ValueError("link_rules must be a JSON array of rules, as a string")
++        # LinkRuleError is a ValueError naming the rule and field at fault.
++        parse_link_rules_json(value)
++        valid = True
+     else:
+         valid = isinstance(value, str) and bool(value.strip())
+     if not valid:
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index 245d248dededad1d050006538a7ecda1345854a2..cbe4ffddb0861cf3cf925fdf3f9d143c96530efc 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -1544,6 +1544,42 @@ Updated clients preserve later bubbles when that older server's receipt arrives.
+ 
+ ---
+ 
++## Chat Link Rules (`/v1/link-rules`)
++
++The caller's [chat link rules](../../docs/chat-link-rules.md): short references
++in chat messages that the web UI renders as links. They are stored as the
++`link_rules` shared preference, so saving needs shared preferences on the
++server (`shared_preferences_authority_id`); reading always works.
++
++### Get Link Rules
++
++```
++GET /v1/link-rules
++-> 200 {
++  "supported": true,          // false: no shared preferences, rules are read-only
++  "saved": false,             // false: the defaults apply
++  "version": 0,               // send back as expected_version
++  "rules": [{"name": "GitHub", "kind": "github", "pattern": "", "url": null, "enabled": true}, ...],
++  "defaults": [...]
++}
++```
++
++### Replace Link Rules
++
++```
++PUT /v1/link-rules
++{"rules": [{"name": "Jira", "kind": "url", "pattern": "BST-{num}",
++            "url": "https://jira.example.com/browse/BST-{num}", "enabled": true}],
++ "expected_version": 1}
++-> 200 (same shape as GET)
++```
++
++`rules` is the whole list; `null` removes the saved rules so the defaults apply.
++Returns 422 with the rule and field at fault when a rule fails validation, and
++409 when `expected_version` is stale or the server has no shared preferences.
++
++---
++
+ ## Not Yet
+ 
+ - `PUT /api/agents/{id}` — update agent (new bundle)
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index 4e9b74fc1b779b07d224acdab20f1d427645b9c7..0cb5be356f2ba8cece758a8e6cf6c48439fad8c5 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -129,6 +129,7 @@ from omnigent.server.routes.imports import create_imports_router
+ from omnigent.server.routes.policy_registry import create_policy_registry_router
+ from omnigent.server.routes.preferences import (
+     create_chat_features_router,
++    create_link_rules_router,
+     create_preferences_router,
+ )
+ from omnigent.server.routes.projects import create_projects_router
+@@ -3866,6 +3867,11 @@ def create_app(
+         prefix="/v1",
+         tags=["chat-features"],
+     )
++    app.include_router(
++        create_link_rules_router(preference_store, auth_provider, policy=preference_policy),
++        prefix="/v1",
++        tags=["link-rules"],
++    )
+ 
+     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
+ 
+diff --git a/omnigent/server/routes/preferences.py b/omnigent/server/routes/preferences.py
+index 5449a7a0bb04b66a11cdb2127a3eff8ca0cd7222..258fd5b5aff4f8f06c79f7510009c16eb7cedb80 100644
+--- a/omnigent/server/routes/preferences.py
++++ b/omnigent/server/routes/preferences.py
+@@ -1,11 +1,15 @@
+-"""Per-user preference routes (``/v1/preferences``) and the chat-feature catalog.
++"""Per-user preference routes (``/v1/preferences``), the chat-feature catalog,
++and the chat link rules (``/v1/link-rules``).
+ 
+ Shared preferences take explicit reads and versioned edits. The only value the
+ server adopts is the chat-features default, read when a session is created.
++Link rules are a shared preference too; their route serves the defaults when
++none are saved and gives agent tools a single versioned write.
+ """
+ 
+ import asyncio
+ import logging
++import uuid
+ from collections.abc import Iterable
+ from functools import partial
+ from typing import Annotated, Any
+@@ -15,7 +19,16 @@ from pydantic import TypeAdapter, ValidationError
+ 
+ from omnigent.configuration_profile import ConfigurationSave, ConfigurationSnapshot
+ from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.link_rules import (
++    DEFAULT_LINK_RULES,
++    LinkRule,
++    LinkRuleError,
++    encode_link_rules,
++    link_rules_from_value,
++    validate_link_rules,
++)
+ from omnigent.preference_sync import (
++    MAX_VALUE_BYTES,
+     PREFERENCE_PAGE_SIZE,
+     Name,
+     PreferenceMutation,
+@@ -39,7 +52,13 @@ from omnigent.server.preference_requests import (
+     read_preference_payload,
+ )
+ from omnigent.server.routes._auth_helpers import require_user
+-from omnigent.server.schemas import ChatFeatureCatalogResponse, ChatFeatureOption
++from omnigent.server.schemas import (
++    ChatFeatureCatalogResponse,
++    ChatFeatureOption,
++    LinkRuleModel,
++    LinkRulesResponse,
++    LinkRulesUpdateRequest,
++)
+ from omnigent.stores.preference_store import PreferenceStore, read_preference_entry
+ 
+ _logger = logging.getLogger(__name__)
+@@ -226,3 +245,112 @@ def create_chat_features_router(auth_provider: AuthProvider | None = None) -> AP
+         )
+ 
+     return router
++
++
++LINK_RULES_PREFERENCE_KEY = SharedPreferenceKey(kind="link_rules", name="default")
++# Edits through /v1/link-rules (agent tools, scripts) share one source ID.
++_LINK_RULES_INSTALLATION_ID = "link-rules-api"
++_STALE_LINK_RULES = "The link rules changed since they were read; read them and retry"
++
++
++def _link_rule_models(rules: tuple[LinkRule, ...]) -> list[LinkRuleModel]:
++    return [LinkRuleModel.model_validate(rule.to_wire()) for rule in rules]
++
++
++def _link_rules_response(*, supported: bool, value: object, version: int) -> LinkRulesResponse:
++    saved = isinstance(value, str)
++    return LinkRulesResponse(
++        supported=supported,
++        saved=saved,
++        version=version,
++        rules=_link_rule_models(link_rules_from_value(value)),
++        defaults=_link_rule_models(DEFAULT_LINK_RULES),
++    )
++
++
++def create_link_rules_router(
++    store: PreferenceStore | None,
++    auth_provider: AuthProvider | None = None,
++    *,
++    policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
++) -> APIRouter:
++    """Build the chat link-rule routes (``GET``/``PUT /link-rules``).
++
++    The rules are the caller's ``link_rules`` shared preference. Without a
++    preference store the read serves the defaults with ``supported: false``
++    and a save is refused.
++
++    :param store: The shared-preference store, or ``None`` when disabled.
++    :param auth_provider: Identifies the caller; ``None`` in single-user mode.
++    :param policy: Rollout hooks shared with the preference routes.
++    :returns: A configured :class:`APIRouter`.
++    """
++    router = APIRouter()
++
++    def caller(request: Request) -> str | None:
++        authenticated = require_user(request, auth_provider)
++        return None if authenticated is None else _USER_ID.validate_python(authenticated)
++
++    def enabled_store() -> PreferenceStore | None:
++        return store if store is not None and policy.is_enabled() else None
++
++    def read(active: PreferenceStore, user_id: str | None) -> LinkRulesResponse:
++        entry = read_preference_entry(active, LINK_RULES_PREFERENCE_KEY, user_id=user_id)
++        if entry is None:
++            return _link_rules_response(supported=True, value=None, version=0)
++        return _link_rules_response(supported=True, value=entry.value, version=entry.version)
++
++    @router.get("/link-rules")
++    async def get_link_rules(request: Request) -> LinkRulesResponse:
++        """The caller's chat link rules, or the defaults when none are saved."""
++        user_id = caller(request)
++        active = enabled_store()
++        if active is None:
++            return _link_rules_response(supported=False, value=None, version=0)
++        return await policy.run(user_id, partial(read, active, user_id))
++
++    @router.put("/link-rules")
++    async def put_link_rules(request: Request, body: LinkRulesUpdateRequest) -> LinkRulesResponse:
++        """Replace the caller's link rules; ``rules: null`` restores the defaults.
++
++        Returns 422 naming the rule and field when a rule is invalid, and 409
++        when ``expected_version`` is stale or shared preferences are off.
++        """
++        user_id = caller(request)
++        active = enabled_store()
++        if active is None:
++            raise HTTPException(409, "Saving link rules needs shared preferences on the server")
++        value: str | None = None
++        if body.rules is not None:
++            try:
++                value = encode_link_rules(validate_link_rules(body.rules))
++            except LinkRuleError as exc:
++                raise HTTPException(422, f"Invalid link rule: {exc}") from exc
++            if len(value.encode()) > MAX_VALUE_BYTES - 64:
++                raise HTTPException(422, "Link rules are too large to save; remove some rules")
++
++        def write() -> LinkRulesResponse:
++            # Refuse a stale edit up front: applying it would store a conflict
++            # for the user to resolve in Settings.
++            current = read_preference_entry(active, LINK_RULES_PREFERENCE_KEY, user_id=user_id)
++            if body.expected_version != (0 if current is None else current.version):
++                raise HTTPException(409, _STALE_LINK_RULES)
++            mutation = PreferenceMutation(
++                protocol_version=1,
++                identity=active.identity(user_id),
++                operation_id=uuid.uuid4(),
++                installation_id=_LINK_RULES_INSTALLATION_ID,
++                key=LINK_RULES_PREFERENCE_KEY,
++                expected_version=body.expected_version,
++                value=value,
++            )
++            result = active.apply(mutation, user_id=user_id)
++            if result.status == "conflict":
++                raise HTTPException(409, _STALE_LINK_RULES)
++            return _link_rules_response(
++                supported=True, value=result.entry.value, version=result.entry.version
++            )
++
++        return await policy.run(user_id, write)
++
++    return router
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 1da9448c32e17b0b7498615cba9b25a4bd8ee676..fc7e48a8d718f608de545697b9a820d49c5a64ca 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -5334,6 +5334,47 @@ class ChatFeatureCatalogResponse(BaseModel):
+     available: list[ChatFeatureOption]
+ 
+ 
++class LinkRuleModel(BaseModel):
++    """One chat link rule; see ``docs/chat-link-rules.md``."""
++
++    name: str = Field(description="Unique display name, e.g. 'Jira'.")
++    kind: Literal["url", "github", "session"]
++    pattern: str = Field(
++        default="",
++        description="url kind: a short form like 'BST-{num}' or a raw '/regex/'; "
++        "empty for github and session.",
++    )
++    url: str | None = Field(
++        default=None,
++        description="url kind: the http(s) link template, e.g. "
++        "'https://jira.example.com/browse/BST-{num}'.",
++    )
++    enabled: bool = True
++
++
++class LinkRulesResponse(BaseModel):
++    """The caller's chat link rules."""
++
++    supported: bool = Field(
++        description="False when the server has no shared preferences, so rules can't be saved."
++    )
++    saved: bool = Field(description="False when the defaults apply because nothing is saved.")
++    version: int = Field(description="Send back as expected_version when saving; 0 if unsaved.")
++    rules: list[LinkRuleModel] = Field(description="The rules in effect, saved or default.")
++    defaults: list[LinkRuleModel]
++
++
++class LinkRulesUpdateRequest(BaseModel):
++    """Replace the caller's link rules, or reset them with ``rules: null``."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    rules: list[dict[str, Any]] | None = Field(
++        description="The full rule list; null removes the saved rules so the defaults apply."
++    )
++    expected_version: int = Field(ge=0, description="The version the edit replaces.")
++
++
+ # ── Projects ──────────────────────────────────────────────────────
+ 
+ 
+diff --git a/openapi.json b/openapi.json
+index d6227ae0d0531ecde41470f6456b7521fbb01ddc..a249edb7e3485774d4f87d57d5356ad8832568a9 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -3725,6 +3725,134 @@
+         "title": "LaunchRunnerRequest",
+         "type": "object"
+       },
++      "LinkRuleModel": {
++        "description": "One chat link rule; see `docs/chat-link-rules.md`.",
++        "properties": {
++          "enabled": {
++            "default": true,
++            "title": "Enabled",
++            "type": "boolean"
++          },
++          "kind": {
++            "enum": [
++              "url",
++              "github",
++              "session"
++            ],
++            "title": "Kind",
++            "type": "string"
++          },
++          "name": {
++            "description": "Unique display name, e.g. 'Jira'.",
++            "title": "Name",
++            "type": "string"
++          },
++          "pattern": {
++            "default": "",
++            "description": "url kind: a short form like 'BST-{num}' or a raw '/regex/'; empty for github and session.",
++            "title": "Pattern",
++            "type": "string"
++          },
++          "url": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "url kind: the http(s) link template, e.g. 'https://jira.example.com/browse/BST-{num}'.",
++            "title": "Url"
++          }
++        },
++        "required": [
++          "name",
++          "kind"
++        ],
++        "title": "LinkRuleModel",
++        "type": "object"
++      },
++      "LinkRulesResponse": {
++        "description": "The caller's chat link rules.",
++        "properties": {
++          "defaults": {
++            "items": {
++              "$ref": "#/components/schemas/LinkRuleModel"
++            },
++            "title": "Defaults",
++            "type": "array"
++          },
++          "rules": {
++            "description": "The rules in effect, saved or default.",
++            "items": {
++              "$ref": "#/components/schemas/LinkRuleModel"
++            },
++            "title": "Rules",
++            "type": "array"
++          },
++          "saved": {
++            "description": "False when the defaults apply because nothing is saved.",
++            "title": "Saved",
++            "type": "boolean"
++          },
++          "supported": {
++            "description": "False when the server has no shared preferences, so rules can't be saved.",
++            "title": "Supported",
++            "type": "boolean"
++          },
++          "version": {
++            "description": "Send back as expected_version when saving; 0 if unsaved.",
++            "format": "int64",
++            "title": "Version",
++            "type": "integer"
++          }
++        },
++        "required": [
++          "supported",
++          "saved",
++          "version",
++          "rules",
++          "defaults"
++        ],
++        "title": "LinkRulesResponse",
++        "type": "object"
++      },
++      "LinkRulesUpdateRequest": {
++        "additionalProperties": false,
++        "description": "Replace the caller's link rules, or reset them with `rules: null`.",
++        "properties": {
++          "expected_version": {
++            "description": "The version the edit replaces.",
++            "format": "int64",
++            "minimum": 0.0,
++            "title": "Expected Version",
++            "type": "integer"
++          },
++          "rules": {
++            "anyOf": [
++              {
++                "items": {
++                  "additionalProperties": true,
++                  "type": "object"
++                },
++                "type": "array"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "The full rule list; null removes the saved rules so the defaults apply.",
++            "title": "Rules"
++          }
++        },
++        "required": [
++          "rules",
++          "expected_version"
++        ],
++        "title": "LinkRulesUpdateRequest",
++        "type": "object"
++      },
+       "LocalImportRequest": {
+         "description": "Request to import local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server. A\nsupplied `session_id` loads that exact session without enumerating local\nhistory.",
+         "properties": {
+@@ -13441,6 +13569,68 @@
+         ]
+       }
+     },
++    "/v1/link-rules": {
++      "get": {
++        "description": "The caller's chat link rules, or the defaults when none are saved.",
++        "operationId": "get_link_rules_v1_link_rules_get",
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/LinkRulesResponse"
++                }
++              }
++            },
++            "description": "Successful Response"
++          }
++        },
++        "summary": "Get Link Rules",
++        "tags": [
++          "link-rules"
++        ]
++      },
++      "put": {
++        "description": "Replace the caller's link rules; `rules: null` restores the defaults.\n\nReturns 422 naming the rule and field when a rule is invalid, and 409\nwhen `expected_version` is stale or shared preferences are off.",
++        "operationId": "put_link_rules_v1_link_rules_put",
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/LinkRulesUpdateRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/LinkRulesResponse"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Put Link Rules",
++        "tags": [
++          "link-rules"
++        ]
++      }
++    },
+     "/v1/mcp/{service_id}": {
+       "post": {
+         "operationId": "gateway_v1_mcp__service_id__post",
+diff --git a/tests/server/routes/test_link_rules.py b/tests/server/routes/test_link_rules.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2fb9474ddc917b2bb9499e6af93eeed83ace21f7
+--- /dev/null
++++ b/tests/server/routes/test_link_rules.py
+@@ -0,0 +1,152 @@
++"""``/v1/link-rules``: the caller's chat link rules over shared preferences."""
++
++import httpx
++import pytest
++
++from omnigent.link_rules import DEFAULT_LINK_RULES
++from omnigent.runtime.agent_cache import AgentCache
++from omnigent.server.app import create_app
++from omnigent.server.auth import UnifiedAuthProvider
++from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++from omnigent.stores.artifact_store.local import LocalArtifactStore
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
++from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
++
++ALICE = {"X-Forwarded-Email": "alice@example.test"}
++BOB = {"X-Forwarded-Email": "bob@example.test"}
++JIRA = {
++    "name": "Jira",
++    "kind": "url",
++    "pattern": "BST-{num}",
++    "url": "https://jira.example.com/browse/BST-{num}",
++    "enabled": True,
++}
++
++
++def _app(db_uri, tmp_path, *, with_store: bool):
++    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
++    store = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
++    return create_app(
++        SqlAlchemyAgentStore(db_uri),
++        SqlAlchemyFileStore(db_uri),
++        SqlAlchemyConversationStore(db_uri),
++        artifacts,
++        AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
++        auth_provider=UnifiedAuthProvider(source="header"),
++        preference_store=store if with_store else None,
++    )
++
++
++@pytest.fixture
++def client_factory(db_uri, tmp_path, monkeypatch):
++    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
++
++    def build(*, with_store: bool = True) -> httpx.AsyncClient:
++        app = _app(db_uri, tmp_path, with_store=with_store)
++        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
++
++    return build
++
++
++async def test_defaults_until_saved_then_per_user(client_factory):
++    async with client_factory() as client:
++        assert (await client.get("/v1/link-rules")).status_code == 401
++        initial = (await client.get("/v1/link-rules", headers=ALICE)).json()
++        assert initial["supported"] is True
++        assert initial["saved"] is False
++        assert initial["version"] == 0
++        assert [rule["name"] for rule in initial["rules"]] == [
++            rule.name for rule in DEFAULT_LINK_RULES
++        ]
++        assert initial["defaults"] == initial["rules"]
++
++        saved = await client.put(
++            "/v1/link-rules",
++            headers=ALICE,
++            json={"rules": [{"name": "GitHub", "kind": "github"}, JIRA], "expected_version": 0},
++        )
++        assert saved.status_code == 200, saved.text
++        body = saved.json()
++        assert body["saved"] is True and body["version"] == 1
++        assert body["rules"][1] == JIRA
++        assert body["rules"][0] == {
++            "name": "GitHub",
++            "kind": "github",
++            "pattern": "",
++            "url": None,
++            "enabled": True,
++        }
++
++        # Bob still sees the defaults: rules are per user.
++        assert (await client.get("/v1/link-rules", headers=BOB)).json()["saved"] is False
++
++        reset = await client.put(
++            "/v1/link-rules", headers=ALICE, json={"rules": None, "expected_version": 1}
++        )
++        assert reset.status_code == 200
++        assert reset.json()["saved"] is False
++        assert len(reset.json()["rules"]) == len(DEFAULT_LINK_RULES)
++
++
++async def test_stale_version_is_refused_without_storing_a_conflict(client_factory):
++    async with client_factory() as client:
++        first = {"rules": [JIRA], "expected_version": 0}
++        assert (await client.put("/v1/link-rules", headers=ALICE, json=first)).status_code == 200
++        stale = await client.put(
++            "/v1/link-rules", headers=ALICE, json={"rules": [], "expected_version": 0}
++        )
++        assert stale.status_code == 409
++        shared = (await client.get("/v1/preferences/shared", headers=ALICE)).json()
++        assert shared["conflicts"] == []
++        assert (await client.get("/v1/link-rules", headers=ALICE)).json()["rules"] == [JIRA]
++
++
++@pytest.mark.parametrize(
++    "rule",
++    [
++        {**JIRA, "url": "javascript:alert(1)//{num}"},
++        {**JIRA, "url": "https://{num}.example.com/"},
++        {**JIRA, "pattern": "/(a+)+$/"},
++        {**JIRA, "pattern": "/(?<=x)BST-(\\d+)/"},
++        {"name": "GitHub", "kind": "github", "pattern": "#{num}"},
++    ],
++)
++async def test_invalid_rules_are_rejected_with_the_reason(client_factory, rule):
++    async with client_factory() as client:
++        response = await client.put(
++            "/v1/link-rules", headers=ALICE, json={"rules": [rule], "expected_version": 0}
++        )
++        assert response.status_code == 422
++        assert "Invalid link rule" in response.text
++        assert (await client.get("/v1/link-rules", headers=ALICE)).json()["saved"] is False
++
++
++async def test_the_shared_preference_route_validates_rules_too(client_factory):
++    async with client_factory() as client:
++        identity = (await client.get("/v1/preferences/shared", headers=ALICE)).json()["identity"]
++        response = await client.post(
++            "/v1/preferences/shared/operations",
++            headers=ALICE,
++            json={
++                "protocol_version": 1,
++                "identity": identity,
++                "operation_id": "00000000-0000-4000-8000-000000000001",
++                "installation_id": "web-test",
++                "key": {"kind": "link_rules", "name": "default"},
++                "expected_version": 0,
++                "value": '[{"name":"x","kind":"url","pattern":"X-{num}","url":"data:,{num}"}]',
++            },
++        )
++        assert response.status_code == 422
++
++
++async def test_without_shared_preferences_the_defaults_are_read_only(client_factory):
++    async with client_factory(with_store=False) as client:
++        body = (await client.get("/v1/link-rules", headers=ALICE)).json()
++        assert body["supported"] is False
++        assert len(body["rules"]) == len(DEFAULT_LINK_RULES)
++        refused = await client.put(
++            "/v1/link-rules", headers=ALICE, json={"rules": [JIRA], "expected_version": 0}
++        )
++        assert refused.status_code == 409
+diff --git a/tests/test_link_rules.py b/tests/test_link_rules.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6abbc94daa34fcf979ce3a616c550ca3819e7222
+--- /dev/null
++++ b/tests/test_link_rules.py
+@@ -0,0 +1,209 @@
++"""Chat link rules: the pattern compiler, URL template check and stored form."""
++
++import json
++import re
++from uuid import uuid4
++
++import pytest
++
++from omnigent.link_rules import (
++    DEFAULT_LINK_RULES,
++    MAX_REPEAT,
++    LinkRuleError,
++    LinkRuleKind,
++    check_url_template,
++    compile_pattern,
++    describe_link_syntax,
++    encode_link_rules,
++    link_rules_from_value,
++    parse_link_rules_json,
++    validate_link_rules,
++)
++from omnigent.preference_sync import PreferenceMutation
++
++
++@pytest.mark.parametrize(
++    ("pattern", "text", "captures"),
++    [
++        ("BST-{num}", "see BST-42.", ("42",)),
++        ("{key}-{num}", "(ENG-7)", ("ENG", "7")),
++        ("PR.{id}", "PR.a_b-1 done", ("a_b-1",)),
++        ("/(ENG-\\d+)/", "fixes ENG-12", ("ENG-12",)),
++        ("/T(\\d{2,4})/", "T123", ("123",)),
++    ],
++)
++def test_compiled_pattern_matches_whole_words(pattern, text, captures):
++    compiled = compile_pattern(pattern)
++    match = re.search(compiled.bounded(), text, re.ASCII)
++    assert match is not None
++    assert match.groups()[1:] == captures
++
++
++@pytest.mark.parametrize("text", ["XBST-42", "BST-42x", "BST-", "bst-42"])
++def test_short_form_needs_word_boundaries(text):
++    assert re.search(compile_pattern("BST-{num}").bounded(), text, re.ASCII) is None
++
++
++def test_short_form_escapes_literal_regex_characters():
++    compiled = compile_pattern("a.b+{num}")
++    assert re.search(compiled.bounded(), "a.b+1", re.ASCII)
++    assert re.search(compiled.bounded(), "axbb1", re.ASCII) is None
++
++
++def test_unbounded_repeats_are_capped():
++    compiled = compile_pattern("/x.*y/")
++    assert compiled.source == f"x.{{0,{MAX_REPEAT}}}y"
++    assert compile_pattern("/a{2,}/").source == f"a{{2,{MAX_REPEAT}}}"
++
++
++@pytest.mark.parametrize(
++    ("pattern", "message"),
++    [
++        ("", "required"),
++        ("x" * 201, "longer than"),
++        ("BST", "needs a placeholder"),
++        ("BST-{nope}", "unknown placeholder"),
++        ("BST {num}", "spaces"),
++        ("BST-{num", "unmatched"),
++        ("/(a+)+/", "repeated group"),
++        ("/(a|b)*/", "repeated group"),
++        ("/(?:a?)+/", "repeated group"),
++        ("/(a)\\1/", "backreferences"),
++        ("/(?<name>a)/", "named groups"),
++        ("/(?P<name>a)/", "named groups"),
++        ("/(?<=a)b/", "lookaround"),
++        ("/(?=a)b/", "lookaround"),
++        ("/(?i)a/", "inline flags"),
++        ("/\\p{L}/", "isn't supported"),
++        ("/a{1000}/", "capped"),
++        ("/a{3,2}/", "min <= max"),
++        ("/a{/", "escape a literal"),
++        ("/[]a]/", "start of a [ ] class"),
++        ("/[a[b]/", "inside a [ ] class"),
++        ("/(a/", "unbalanced ("),
++        ("/a)/", "unbalanced )"),
++        ("/a*/", "empty text"),
++        ("/*a/", "nothing to repeat"),
++        ("/a**/", "nothing to repeat"),
++        ("/\\b+/", "nothing to repeat"),
++        ("/a+b+c+d+/", "at most 3 repeats"),
++        ("/(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)/", "capture groups"),
++    ],
++)
++def test_unsafe_patterns_are_rejected(pattern, message):
++    with pytest.raises(LinkRuleError, match=re.escape(message)):
++        compile_pattern(pattern)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "https://jira.example.com/browse/{key}-{num}",
++        "http://tracker.example.com/?id={num}",
++        "https://example.com#{0}",
++        "https://example.com",
++    ],
++)
++def test_url_templates_that_stay_on_their_host(template):
++    check_url_template(template, compile_pattern("{key}-{num}"))
++
++
++@pytest.mark.parametrize(
++    ("template", "message"),
++    [
++        ("javascript:alert(1)//{num}", "https://"),
++        ("data:text/html,{num}", "https://"),
++        ("JAVASCRIPT://example.com/{num}", "https://"),
++        ("https://{key}.example.com/{num}", "https://"),
++        ("https://user@evil.example/{num}", "https://"),
++        ("//example.com/{num}", "https://"),
++        ("ftp://example.com/{num}", "https://"),
++        ("https://example.com/ {num}", "spaces"),
++        ("https://example.com/{zzz}", "unknown placeholder"),
++        ("https://example.com/{3}", "no matching group"),
++        ("https://example.com/{num", "unmatched"),
++        ("", "required"),
++    ],
++)
++def test_url_templates_that_could_leave_http_are_rejected(template, message):
++    with pytest.raises(LinkRuleError, match=re.escape(message)):
++        check_url_template(template, compile_pattern("{key}-{num}"))
++
++
++def test_builtin_kinds_take_no_pattern_or_url():
++    with pytest.raises(LinkRuleError, match="takes no pattern"):
++        validate_link_rules([{"name": "GH", "kind": "github", "pattern": "#{num}"}])
++    rules = validate_link_rules([{"name": " GH ", "kind": "github"}])
++    assert rules[0].name == "GH" and rules[0].kind == LinkRuleKind.GITHUB
++
++
++@pytest.mark.parametrize(
++    ("rules", "message"),
++    [
++        ({"name": "x"}, "must be a list"),
++        ([{"name": "", "kind": "github"}], "name: required"),
++        ([{"name": "a", "kind": "ftp"}], "kind:"),
++        ([{"name": "a", "kind": "github", "enabled": "yes"}], "enabled:"),
++        ([{"name": "a", "kind": "github", "color": "red"}], "unknown field"),
++        ([{"name": "a", "kind": "github"}, {"name": "A", "kind": "session"}], "two rules"),
++        ([{"name": "a", "kind": "session"}, {"name": "b", "kind": "session"}], "only one"),
++        ([{"name": f"r{i}", "kind": "github"} for i in range(33)], "at most 32"),
++        ([{"name": "Jira", "kind": "url", "pattern": "B-{num}"}], "Jira: url: required"),
++    ],
++)
++def test_rule_lists_are_validated(rules, message):
++    with pytest.raises(LinkRuleError, match=re.escape(message)):
++        validate_link_rules(rules)
++
++
++def test_defaults_round_trip_through_the_stored_form():
++    encoded = encode_link_rules(DEFAULT_LINK_RULES)
++    assert parse_link_rules_json(encoded) == DEFAULT_LINK_RULES
++    assert [rule.enabled for rule in DEFAULT_LINK_RULES] == [True, True, False, False]
++
++
++def test_unusable_stored_values_fall_back_to_the_defaults():
++    assert link_rules_from_value(None) == DEFAULT_LINK_RULES
++    assert link_rules_from_value("not json") == DEFAULT_LINK_RULES
++    assert link_rules_from_value("[]") == ()
++
++
++def test_describe_link_syntax_shows_an_example():
++    jira, linear = DEFAULT_LINK_RULES[2], DEFAULT_LINK_RULES[3]
++    assert describe_link_syntax(jira) == "`ABC-123` (Jira)"
++    assert describe_link_syntax(linear) == "text matching `/(ENG-\\d+)/` (Linear)"
++    assert "owner/repo#123" in describe_link_syntax(DEFAULT_LINK_RULES[0])
++
++
++def _mutation(value: object) -> PreferenceMutation:
++    return PreferenceMutation.model_validate(
++        {
++            "protocol_version": 1,
++            "identity": {"authority_id": "a", "user_id": "u", "workspace_id": "w"},
++            "operation_id": str(uuid4()),
++            "installation_id": "web-1",
++            "key": {"kind": "link_rules", "name": "default"},
++            "expected_version": 0,
++            "value": value,
++        }
++    )
++
++
++def test_shared_preference_edits_store_the_canonical_form():
++    value = json.dumps([{"enabled": True, "kind": "github", "name": "  GitHub "}], indent=2)
++    stored = _mutation(value).value
++    assert stored == '[{"name":"GitHub","kind":"github","pattern":"","enabled":true}]'
++
++
++@pytest.mark.parametrize(
++    "value",
++    [
++        '[{"name":"x","kind":"url","pattern":"/(a+)+/","url":"https://e.com/{0}"}]',
++        '[{"name":"x","kind":"url","pattern":"X-{num}","url":"javascript:x//{num}"}]',
++        "not json",
++        ["github"],
++    ],
++)
++def test_shared_preference_edits_reject_invalid_rules(value):
++    with pytest.raises(ValueError):
++        _mutation(value)
