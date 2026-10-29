@@ -190,7 +190,7 @@ class CodexNativeBridgeState:
         ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
         e.g. ``"turn_abc123"``.
-    :param pending_shell_command_id: Submission awaiting its shell item event.
+    :param pending_shell_command_id: Submission awaiting authoritative turn reconciliation.
     :param pending_shell_parent_turn_id: Turn that was active before that submission.
     :param active_shell_turn_id: Standalone shell turn that cannot process prompts.
     """
@@ -1761,27 +1761,47 @@ def clear_pending_shell_command(bridge_dir: Path, request_id: str) -> None:
         )
 
 
-def record_user_shell_turn(bridge_dir: Path, thread_id: str, turn_id: str) -> None:
-    """Resolve a shell submission and keep standalone shell turns out of steering."""
+def reconcile_shell_command_state(
+    bridge_dir: Path, observed: CodexNativeBridgeState, active_turn_id: str | None
+) -> None:
+    """Clear captured shell markers only after Codex's submission queue has drained."""
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
         if (
             state is None
-            or state.thread_id != thread_id
-            or state.active_turn_id not in {None, turn_id}
-            or state.pending_shell_command_id is None
+            or state.session_id != observed.session_id
+            or state.thread_id != observed.thread_id
+            or state.socket_path != observed.socket_path
         ):
             return
-        auxiliary = state.pending_shell_parent_turn_id == turn_id
-        _write_bridge_state_unlocked(
-            bridge_dir,
-            replace(
+        updated = state
+        if (
+            observed.pending_shell_command_id is not None
+            and state.pending_shell_command_id == observed.pending_shell_command_id
+            and (active_turn_id is None or active_turn_id == observed.pending_shell_parent_turn_id)
+        ):
+            updated = replace(
                 state,
                 pending_shell_command_id=None,
                 pending_shell_parent_turn_id=None,
-                active_shell_turn_id=state.active_shell_turn_id if auxiliary else turn_id,
-            ),
-        )
+            )
+        # Older bridges persisted an observed standalone shell separately.
+        if (
+            observed.active_shell_turn_id is not None
+            and state.active_shell_turn_id == observed.active_shell_turn_id
+            and active_turn_id != observed.active_shell_turn_id
+        ):
+            updated = replace(
+                updated,
+                active_shell_turn_id=None,
+                active_turn_id=(
+                    None
+                    if state.active_turn_id == observed.active_shell_turn_id
+                    else state.active_turn_id
+                ),
+            )
+        if updated != state:
+            _write_bridge_state_unlocked(bridge_dir, updated)
 
 
 def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | None = None) -> None:

@@ -15,7 +15,10 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.harnesses.codex_native.bridge import read_bridge_state
+from omnigent.harnesses.codex_native.bridge import (
+    mark_shell_command_pending,
+    read_bridge_state,
+)
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -210,6 +213,55 @@ def test_web_prompt_during_standalone_shell_gets_model_reply(
             ]
             assert len(requests) == 1, requests
             assert output in json.dumps(requests[0]["input"])
+            assert not [item for item in transcript if item.get("type") == "error"]
+
+            poll_until(
+                lambda: (
+                    (state := read_bridge_state(bridge)) is not None
+                    and state.active_turn_id is None
+                    and state.pending_shell_command_id is None
+                ),
+                timeout_s=30,
+                interval_s=0.1,
+            )
+            state = read_bridge_state(bridge)
+            assert state is not None
+            # Simulate a disconnected submission that never reached the native server.
+            assert mark_shell_command_pending(bridge, state, uuid.uuid4().hex)
+            recovered = f"RECOVERED_REPLY_{uuid.uuid4().hex}"
+            configure_reply(recovered)
+            send_user_text(client, session_id=session_id, text=f"Reply with {recovered}")
+            poll_until(lambda: assistant_has(recovered), timeout_s=60, interval_s=0.1)
+            poll_until(
+                lambda: client.get(f"/v1/sessions/{session_id}").json()["pending_inputs"] == [],
+                timeout_s=30,
+                interval_s=0.1,
+            )
+            state = read_bridge_state(bridge)
+            assert state is not None and state.pending_shell_command_id is None
+            transcript = items()
+            assert (
+                sum(
+                    item.get("role") == "assistant"
+                    and recovered in json.dumps(item.get("content"))
+                    for item in transcript
+                )
+                == 1
+            )
+            assert (
+                sum(
+                    item.get("type") == "terminal_command" and item.get("kind") == "input"
+                    for item in transcript
+                )
+                == 1
+            )
+            recovered_requests = [
+                request
+                for request in get_mock_requests(mock_llm_server_url)
+                if request.get("prompt_cache_key") == state.thread_id
+                and recovered in json.dumps(request.get("input"))
+            ]
+            assert len(recovered_requests) == 1, recovered_requests
             assert not [item for item in transcript if item.get("type") == "error"]
         finally:
             release.touch()

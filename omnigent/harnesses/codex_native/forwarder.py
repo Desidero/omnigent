@@ -55,7 +55,6 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
-    record_user_shell_turn,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -3189,12 +3188,6 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        items = turn.get("items")
-        if state.pending_shell_command_id is not None and isinstance(items, list):
-            if any(
-                isinstance(item, dict) and _user_shell_command(item) is not None for item in items
-            ):
-                record_user_shell_turn(bridge_dir, thread_id, turn_id)
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
@@ -3326,13 +3319,6 @@ async def _handle_event(
         return
     event_state = forwarder_state
     event_bridge_dir = bridge_dir if not is_child else None
-    if method == "item/started" and event_bridge_dir is not None:
-        item = params.get("item")
-        if isinstance(item, dict) and _user_shell_command(item) is not None:
-            thread_id = _thread_id_from_params(params)
-            turn_id = _turn_id_from_payload(params)
-            if thread_id is not None and turn_id is not None:
-                record_user_shell_turn(event_bridge_dir, thread_id, turn_id)
     child_usage_baseline: _UsageTotals | None = None
     if is_child and forwarder_state is not None:
         child_thread_id = _thread_id_from_params(params)

@@ -21,8 +21,8 @@ from tests.harnesses.codex_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
-async def test_pending_shell_reconnect_recovers_a_missed_completed_turn(tmp_path: Path) -> None:
-    """A shell with no observed turn still needs resume history to settle its marker."""
+async def test_shell_reconnect_preserves_a_newer_unresolved_submission(tmp_path: Path) -> None:
+    """Old shell history is mirrored without resolving an uncorrelated newer submission."""
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -30,7 +30,7 @@ async def test_pending_shell_reconnect_recovers_a_missed_completed_turn(tmp_path
             socket_path=str(tmp_path / "app-server.sock"),
             thread_id="thread_1",
             codex_home=str(tmp_path / "codex-home"),
-            pending_shell_command_id="submission_1",
+            pending_shell_command_id="new_submission",
         ),
     )
     native_client = MagicMock()
@@ -79,7 +79,7 @@ async def test_pending_shell_reconnect_recovers_a_missed_completed_turn(tmp_path
     native_client.request.assert_awaited_once_with("thread/resume", {"threadId": "thread_1"})
     bridge = read_bridge_state(tmp_path)
     assert bridge is not None
-    assert bridge.pending_shell_command_id is None
+    assert bridge.pending_shell_command_id == "new_submission"
     assert bridge.active_turn_id is None
     assert bridge.active_shell_turn_id is None
     assert any(
@@ -144,8 +144,8 @@ async def test_running_shell_replay_waits_for_actual_output(
         assert terminal_items == [{"kind": "input", "input": "printf shell-output"}]
         bridge = read_bridge_state(tmp_path)
         assert bridge is not None
-        assert bridge.pending_shell_command_id is None
-        assert bridge.active_shell_turn_id == ("turn_1" if parent_turn_id is None else None)
+        assert bridge.pending_shell_command_id == "submission_1"
+        assert bridge.active_shell_turn_id is None
 
         completion = {
             "method": "item/completed",
