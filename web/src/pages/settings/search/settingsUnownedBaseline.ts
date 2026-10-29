@@ -41,6 +41,14 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: "Skill content area's entry is picked at runtime, which the guard can't read.",
   },
+  "src/pages/settings/LinkRulesSettingsGroup.tsx › LINK_PREVIEW_COMPONENTS › a": {
+    count: 1,
+    reason: "Link inside the chat links preview's rendered sample.",
+  },
+  "src/pages/settings/LinkRulesSettingsGroup.tsx › LinkRulesSettingsGroup › SettingsContent": {
+    count: 1,
+    reason: "Chat links preview; its markdown's element map is a plain object.",
+  },
   "src/pages/settings/SettingsHarnessesSection.tsx › CredentialCard › button": {
     count: 1,
     reason:

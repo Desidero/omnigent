@@ -87,6 +87,14 @@ import { SessionImage } from "@/components/SessionImage";
 import { Button } from "@/components/ui/button";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { relativeTime } from "@/lib/relativeTime";
+import {
+  LinkRuleMatchersContext,
+  SESSION_REFERENCE_HREF_PREFIX,
+  linkMatchersKey,
+  parseSessionReference,
+  remarkLinkRules,
+  type ParkedReference,
+} from "@/lib/linkRules";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { keyedAttachments } from "@/lib/blocks";
 import { cn } from "@/lib/utils";
@@ -1015,7 +1023,41 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
   );
 }
 
-/** Routes item-label links to {@link ItemLabelChip} and every other link to {@link WorkspaceFileLink}. */
+// A reference the built-in pull request links parked, as the link rules see it.
+const parkedPullRequestRef: ParkedReference = (url) => {
+  const reference = parsePullRequestRefHref(url);
+  if (reference === null) return null;
+  return reference.repo === null ? "bare" : "qualified";
+};
+
+/**
+ * A `session:<id>` or `session:<id>/<message id>` reference: opens that session
+ * in the app, scrolled to the message. Only link-rule providers, which sit
+ * under the router, produce these hrefs; anywhere else the text stays plain.
+ */
+function SessionReferenceLink({ href, children }: { href: string; children: React.ReactNode }) {
+  const linkRulesActive = useContext(LinkRuleMatchersContext).length > 0;
+  const reference = parseSessionReference(href);
+  if (!linkRulesActive || reference === null) return children;
+  const query = reference.messageId
+    ? `?${MESSAGE_QUERY_PARAM}=${encodeURIComponent(reference.messageId)}`
+    : "";
+  return (
+    <Link
+      to={`/c/${encodeURIComponent(reference.sessionId)}${query}`}
+      className={STREAMDOWN_LINK_CLASS}
+      data-streamdown="link"
+      title={reference.messageId ? "Open the message in its session" : "Open the session"}
+    >
+      {children}
+    </Link>
+  );
+}
+
+/**
+ * Routes item-label links to {@link ItemLabelChip}, session references to
+ * {@link SessionReferenceLink}, and every other link to {@link WorkspaceFileLink}.
+ */
 function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
   if (props.href?.startsWith(ITEM_LABEL_HREF_PREFIX)) {
     return (
@@ -1023,6 +1065,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
         {props.children}
       </ItemLabelChip>
     );
+  }
+  if (props.href?.startsWith(SESSION_REFERENCE_HREF_PREFIX)) {
+    return <SessionReferenceLink href={props.href}>{props.children}</SessionReferenceLink>;
   }
   return <MarkdownLink {...props} />;
 }
@@ -1304,7 +1349,11 @@ function remarkHtmlAsText() {
  * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
  * block rendering too, stripping `<pre>` and collapsing whitespace.
  *
- * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`.
+ * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`;
+ * after them, the user's link rules (from {@link LinkRuleMatchersContext})
+ * link the references left in plain text. They also read what the built-in
+ * pull request links parked: `PR #12` and `owner/repo#12` are theirs, and a
+ * bare `#12` no rule matches stays with the built-in links.
  *
  * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
  * instead of collapsing to spaces per CommonMark. Used for user bubbles,
@@ -1339,22 +1388,32 @@ export function FilePathAwareMessageResponse({
 }) {
   const components =
     leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
+  const linkMatchers = useContext(LinkRuleMatchersContext);
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
   const remarkPlugins = useMemo(
     () => [
       ...Object.values(defaultRemarkPlugins),
-      // Before the leading command split: PR and label splitting rebuild text nodes,
-      // which would drop its `kbd` tag, and their new nodes have no source position.
+      // Before the leading command split: PR, label and link-rule splitting rebuild text
+      // nodes, which would drop its `kbd` tag, and their new nodes have no source position.
       ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
       ...(literalHtml ? [remarkHtmlAsText] : []),
       remarkItemLabels,
+      ...(linkMatchers.length > 0
+        ? [
+            [remarkLinkRules, linkMatchers, parkedPullRequestRef] as [
+              typeof remarkLinkRules,
+              typeof linkMatchers,
+              ParkedReference,
+            ],
+          ]
+        : []),
       ...(leadingCommand !== undefined
         ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
         : []),
       ...(breaks ? [remarkBreaks] : []),
     ],
-    [breaks, literalHtml, linkPullRequestRefs, leadingCommand],
+    [breaks, literalHtml, linkPullRequestRefs, linkMatchers, leadingCommand],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few
@@ -1385,9 +1444,10 @@ export function FilePathAwareMessageResponse({
 
   return (
     <MessageResponse
-      // Streamdown's memo ignores plugin changes, so a command published after
-      // the first render needs a fresh tree.
-      key={leadingCommand}
+      // Streamdown's memo ignores `remarkPlugins`: remount when the link rules or
+      // the session's repository arrive after the message rendered, or a command
+      // is published after the first render.
+      key={`${leadingCommand ?? ""}\n${linkMatchersKey(linkMatchers)}`}
       {...props}
       components={components}
       remarkPlugins={remarkPlugins}

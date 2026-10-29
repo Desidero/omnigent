@@ -1172,6 +1172,9 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             payload["authenticated"] = True
             payload["repo"] = _repo_payload(nwo, url)
             payload["workspace_repo"] = dict(payload["repo"])
+            # The repository's web URL, for linking #123 in chat without a PR.
+            if isinstance(url, str) and url.startswith(("https://", "http://")):
+                payload["repo"]["url"] = url
             return payload  # -> no-pr
 
     # Repo unreachable / not signed in — enumerate accounts so the panel can offer

@@ -171,6 +171,26 @@ const ROUTES: readonly SettingsRoute[] = [
   },
   { url: "/v1/settings/session-title-instructions", body: { instructions: null, max_chars: 500 } },
   {
+    url: "/v1/link-rules",
+    body: {
+      supported: true,
+      saved: false,
+      version: 0,
+      rules: [
+        { name: "GitHub", kind: "git", provider: "github", host: "github.com", enabled: true },
+        {
+          name: "Tracker",
+          kind: "url",
+          pattern: "ABC-{num}",
+          url: "https://tracker.example.com/browse/ABC-{num}",
+          enabled: true,
+        },
+        { name: "Sessions", kind: "session", enabled: true },
+      ],
+      defaults: [],
+    },
+  },
+  {
     url: "/v1/mcp-registry/services",
     body: {
       data: [
@@ -419,6 +439,8 @@ const GENERAL_WEB_HIDES = {
 const TITLES_LOADED = "0 / 500 characters";
 const TITLES_SAVED = "16 / 500 characters";
 const TITLES_FAILED = "Couldn't load your title instructions.";
+// What shows the chat link rules loaded.
+const CHAT_LINKS_LOADED = { label: "Name of rule 1" };
 const NO_CONNECTIONS = "The server lists no GitHub or Databricks connection.";
 
 /** A managed MCP service as the registry lists it. */
@@ -692,14 +714,38 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
   {
     section: "general",
     scenario: "web",
-    ready: [TITLES_LOADED],
+    ready: [TITLES_LOADED, CHAT_LINKS_LOADED],
     hides: GENERAL_WEB_HIDES,
     states: { "session-title-instructions": ["loaded"] },
+    inlineActions: [
+      {
+        name: "a chat link rule added",
+        open: () => userEvent.click(screen.getByRole("button", { name: "Add rule" })),
+        witness: { label: "Discard chat link changes" },
+        states: { "chat-link-rules": ["edited"] },
+        close: () =>
+          userEvent.click(screen.getByRole("button", { name: "Discard chat link changes" })),
+      },
+      {
+        name: "session references removed",
+        open: () =>
+          userEvent.click(
+            within(screen.getByRole("region", { name: "Chat link rule Sessions" })).getByRole(
+              "button",
+              { name: "Delete rule" },
+            ),
+          ),
+        witness: { label: "Add session references" },
+        states: { "chat-link-rules": ["edited", "no session rule"] },
+        close: () =>
+          userEvent.click(screen.getByRole("button", { name: "Discard chat link changes" })),
+      },
+    ],
   },
   {
     section: "general",
     scenario: "web › title instructions saved",
-    ready: [TITLES_SAVED],
+    ready: [TITLES_SAVED, CHAT_LINKS_LOADED],
     hides: GENERAL_WEB_HIDES,
     states: { "session-title-instructions": ["saved"] },
     routes: [
@@ -712,7 +758,7 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
   {
     section: "general",
     scenario: "web › title instructions failed to load",
-    ready: [TITLES_FAILED],
+    ready: [TITLES_FAILED, CHAT_LINKS_LOADED],
     hides: GENERAL_WEB_HIDES,
     states: { "session-title-instructions": ["load failed"] },
     routes: [
