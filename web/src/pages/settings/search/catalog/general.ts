@@ -56,6 +56,57 @@ export const SESSION_TITLE_INSTRUCTIONS_ENTRY = settingsEntry({
   },
 });
 
+export const CHAT_LINK_RULES_ENTRY = settingsEntry({
+  id: "chat-link-rules",
+  section: "general",
+  label: "Chat links",
+  description:
+    "Turn short references in chat messages, such as an issue key, PR #123 or session:<id>, into links.",
+  keywords: [
+    "link rules",
+    "references",
+    "issue links",
+    "ticket",
+    "jira",
+    "git host",
+    "github",
+    "gitlab",
+    "azure devops",
+    "pull request",
+    "session links",
+  ],
+  parts: {
+    addRule: "Add rule",
+    addGitHost: "Add git host",
+    addSessions: "Add session references",
+    discard: "Discard chat link changes",
+    reset: "Reset chat links to defaults",
+    save: "Save chat links",
+    preview: "Preview text",
+  },
+  // Discard shows once a rule is edited; session references can be added back while none is listed.
+  presence: {
+    addSessions: { states: ["no session rule"] },
+    discard: { states: ["edited"] },
+  },
+  // The user's rules; none of their data is searchable. A field is named after its rule.
+  regions: {
+    rules: {
+      rowActions: { use: "Use rule", delete: "Delete rule" },
+      rowFields: {
+        name: { before: "Name of rule " },
+        pattern: { before: "Pattern for " },
+        url: { before: "Link URL for " },
+        provider: { before: "Git provider for " },
+        host: { before: "Host for " },
+      },
+    },
+  },
+  // The sample text rendered with the rules being edited.
+  contentAreas: ["preview"],
+  focus: "addRule",
+});
+
 export const OPEN_SUBAGENTS_IN_PANEL_ENTRY = settingsEntry({
   id: "open-subagents-in-panel",
   section: "general",
@@ -246,6 +297,7 @@ export const GENERAL_SETTINGS = [
   SESSION_TITLE_INSTRUCTIONS_ENTRY,
   NEW_CHAT_PROJECT_PROMPT_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  CHAT_LINK_RULES_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_IN_DESKTOP_APP_ENTRY,
