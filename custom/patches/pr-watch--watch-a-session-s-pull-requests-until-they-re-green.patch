@@ -18,13 +18,20 @@ default-off `pr_watch` feature.
 - A per-server poller (`omnigent/server/pr_watch.py`) reads each watched
   PR through the same path as the Pull Requests panel (runner, else host,
   running the provider CLI with the host's account), so it adds no
-  credentials. It reports failed checks on the head commit, comments and
-  reviews from other accounts, and merge conflicts once each, coalesced
+  credentials; the server vouches for the PR and stores what the read
+  reports, as it does for the panel. It reports failed checks on the head
+  commit, comments and reviews from other accounts, and merge conflicts once
+  each, coalesced
   across PRs into one `[System: PR watch ...]` message sent through the
   normal message path only while the session is idle. Only comments and
   reviews from the repository's owners, members and collaborators count;
   anyone else's text never reaches the agent. In "all" mode it enrols PRs
-  as the session's tracked list grows, skipping merged and closed ones.
+  as the session's linked list grows, skipping merged and closed ones. The
+  list is the server's stored one, which the Pull Requests tab shows, so an
+  unlink there ends the watch and a PR stored as merged or closed is skipped
+  without asking the host. Until the server has imported the session's PRs
+  from the host (the stored list may be partial then), the host's own list
+  decides.
 - Each PR's watch ends with a transcript note that starts no turn when its
   checks pass with no changes requested, it is merged or closed, its
   wake-up budget (default 10) is spent, checks cannot be read, or five
@@ -46,38 +53,39 @@ OMNIGENT_PR_WATCH_MAX_WAKES (10).
 Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- feature-map/README.md                         |   4 +
- feature-map/pr-watch.md                       | 106 ++
- omnigent/runner/git_providers/__init__.py     |   4 +
- omnigent/runner/github_resource.py            |  35 +-
- omnigent/server/app.py                        |  11 +
- omnigent/server/feature_flags.py              |   7 +
- omnigent/server/pr_watch.py                   | 974 ++++++++++++++++++
- omnigent/server/routes/_sessions/helpers.py   |   9 +
- omnigent/server/routes/sessions/__init__.py   |  14 +
- .../server/routes/sessions/routes_events.py   |  46 +-
- .../server/routes/sessions/routes_pr_watch.py | 241 +++++
- .../routes/sessions/routes_resources.py       |  17 +
- .../stores/conversation_store/__init__.py     |  23 +
- .../conversation_store/sqlalchemy_store.py    |  24 +
- openapi.json                                  | 372 +++++++
- tests/runner/test_github_resource.py          |   7 +
- tests/runner/test_github_reviewers.py         |  27 +-
- .../test_policy_deny_lifecycle_e2e.py         |  21 +
- .../integration/test_utility_endpoints.py     |   1 +
- tests/server/routes/test_session_pr_watch.py  | 207 ++++
- tests/server/test_feature_flags.py            |   1 +
- tests/server/test_pr_watch.py                 | 505 +++++++++
- tests/stores/test_conversation_store.py       |  15 +-
- .../composer/ComposerPrWatch.test.tsx         | 206 ++++
- .../components/composer/ComposerPrWatch.tsx   | 243 +++++
- web/src/hooks/usePullRequestWatch.ts          | 115 +++
- web/src/lib/capabilities.ts                   |   3 +-
- web/src/pages/ChatPage.tsx                    |   3 +
- web/src/shell/PullRequestPanel.tsx            |  10 +
- web/src/shell/PullRequestWatch.test.tsx       | 107 ++
- web/src/shell/PullRequestWatch.tsx            |  56 +
- 31 files changed, 3401 insertions(+), 13 deletions(-)
+ feature-map/README.md                         |    4 +
+ feature-map/pr-watch.md                       |  110 ++
+ omnigent/runner/git_providers/__init__.py     |    4 +
+ omnigent/runner/github_resource.py            |   35 +-
+ omnigent/server/app.py                        |   11 +
+ omnigent/server/feature_flags.py              |    7 +
+ omnigent/server/pr_watch.py                   | 1038 +++++++++++++++++
+ omnigent/server/routes/_sessions/helpers.py   |    9 +
+ omnigent/server/routes/sessions/__init__.py   |   14 +
+ .../server/routes/sessions/routes_events.py   |   46 +-
+ .../server/routes/sessions/routes_pr_watch.py |  241 ++++
+ .../routes/sessions/routes_resources.py       |   10 +
+ .../stores/conversation_store/__init__.py     |   23 +
+ .../conversation_store/sqlalchemy_store.py    |   24 +
+ openapi.json                                  |  372 ++++++
+ tests/runner/test_github_resource.py          |    7 +
+ tests/runner/test_github_reviewers.py         |   27 +-
+ .../test_policy_deny_lifecycle_e2e.py         |   21 +
+ .../integration/test_utility_endpoints.py     |    1 +
+ tests/server/routes/test_session_pr_watch.py  |  207 ++++
+ tests/server/routes/test_session_resources.py |   26 +
+ tests/server/test_feature_flags.py            |    1 +
+ tests/server/test_pr_watch.py                 |  575 +++++++++
+ tests/stores/test_conversation_store.py       |   15 +-
+ .../composer/ComposerPrWatch.test.tsx         |  206 ++++
+ .../components/composer/ComposerPrWatch.tsx   |  243 ++++
+ web/src/hooks/usePullRequestWatch.ts          |  115 ++
+ web/src/lib/capabilities.ts                   |    3 +-
+ web/src/pages/ChatPage.tsx                    |    3 +
+ web/src/shell/PullRequestPanel.tsx            |   10 +
+ web/src/shell/PullRequestWatch.test.tsx       |  107 ++
+ web/src/shell/PullRequestWatch.tsx            |   56 +
+ 32 files changed, 3558 insertions(+), 13 deletions(-)
  create mode 100644 feature-map/pr-watch.md
  create mode 100644 omnigent/server/pr_watch.py
  create mode 100644 omnigent/server/routes/sessions/routes_pr_watch.py
@@ -106,10 +114,10 @@ index c51df3a4ea6c8dce7054939d91f7973c91812322..58e526f8a75b1b55c33c908e316e6a36
  The original five recipes form the seed set. Completing this set means checking
 diff --git a/feature-map/pr-watch.md b/feature-map/pr-watch.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..0cc84a941f18a32e911f55789b03dcbb84f6f611
+index 0000000000000000000000000000000000000000..de5513ae231a832e878a8cf599c4fba0624baf04
 --- /dev/null
 +++ b/feature-map/pr-watch.md
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,110 @@
 +# Watch pull requests until they're green
 +
 +A user picks which of a session's pull requests to watch from **Watch PRs** in
@@ -129,8 +137,12 @@ index 0000000000000000000000000000000000000000..0cc84a941f18a32e911f55789b03dcbb
 +  per open PR with its number, title, CI state and wake-ups used, and what a
 +  watch does. With **All** on every PR box is checked; unchecking one turns
 +  **All** off and keeps the rest.
-+- `all`: in **All** mode the server picks up each PR the session tracks,
++- `all`: in **All** mode the server picks up each PR linked to the session,
 +  including ones opened or attached later; merged and closed ones are skipped.
++  The list is the one the server stores for the Pull Requests tab, so a PR
++  unlinked there stops being watched and one the stored state shows as merged
++  or closed is skipped without asking the host. Until the server has imported
++  the session's PRs from its host, the host's own list is used.
 +- `panel`: the Pull Requests panel's **Watch until green** switch changes the
 +  same selection for the PR it shows.
 +- `access`: only users with edit access can change the selection; others see
@@ -391,15 +403,17 @@ index 0a8ff17efa2777d18774a87551bdba803b6af945..e048c2dcead04c345f3bbdf61232fecc
  
 diff --git a/omnigent/server/pr_watch.py b/omnigent/server/pr_watch.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca2936389824
+index 0000000000000000000000000000000000000000..400f7ea9bec71f2c9b794ef3623e6516b6c21f1e
 --- /dev/null
 +++ b/omnigent/server/pr_watch.py
-@@ -0,0 +1,974 @@
+@@ -0,0 +1,1038 @@
 +"""Keep a session on its pull requests until CI passes and review is clear.
 +
 +A session opts in with ``PUT``/``PATCH /v1/sessions/{id}/pr-watch``, either for
-+chosen pull requests or for every PR it tracks now and later ("all" mode). One
-+:class:`PullRequestWatcher` per server polls every watched PR through the same
++chosen pull requests or for every PR it links now and later ("all" mode). The
++server's stored list of the session's PRs decides which PRs those are, once it
++has synced from the host; before that, the host's own list does. One
++:class:`PullRequestWatcher` per server reads every watched PR through the same
 +path the Pull Requests panel uses (runner, else host, running the provider CLI
 +with the host's credentials), so it needs no credentials of its own. When a
 +check fails on the head commit, a repository owner, member or collaborator
@@ -440,8 +454,10 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +from omnigent.db.db_models import LABEL_VALUE_MAX_LEN, workspace_scope
 +from omnigent.entities.conversation import Conversation
 +from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.server.session_pull_requests import open_store
 +from omnigent.stores import ConversationStore
 +from omnigent.stores.conversation_store import PR_WATCH_LABEL_PREFIX, is_pr_watch_label
++from omnigent.stores.session_pull_request_store import SessionPullRequests
 +
 +_logger = logging.getLogger(__name__)
 +
@@ -509,6 +525,9 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +DeliverMessage = Callable[[str, str | None, str], Awaitable[None]]
 +# ``post_note(session_id, text)`` adds a transcript note without starting a turn.
 +PostNote = Callable[[str, str], Awaitable[None]]
++# ``read_linked(session_id)`` returns the server's stored PRs for the session, or
++# ``None`` without PR storage.
++ReadLinked = Callable[[str], Awaitable[SessionPullRequests | None]]
 +
 +
 +def configured_interval_s(environ: Mapping[str, str] | None = None) -> float:
@@ -1030,6 +1049,29 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +    }
 +
 +
++@dataclass(frozen=True)
++class _Tracked:
++    """The session's PRs as one poll sees them.
++
++    :ivar urls: The PRs, in display order.
++    :ivar states: Each PR's last stored state (``"OPEN"``, ``"MERGED"``, ...), when the
++        server's list supplied them.
++    """
++
++    urls: list[str]
++    states: dict[str, str] = field(default_factory=dict)
++
++
++def _stored_tracked(stored: SessionPullRequests | None) -> _Tracked | None:
++    """The server's list once it has synced from the host; before that it may be partial."""
++    if stored is None or not stored.synced:
++        return None
++    return _Tracked(
++        urls=[entry.url for entry in stored.entries],
++        states={entry.url: entry.state for entry in stored.entries if entry.state},
++    )
++
++
 +def _tracked_urls(info: Mapping[str, Any]) -> list[str] | None:
 +    """The session's tracked PR URLs from a panel read, or ``None`` if the host has no list."""
 +    prs = info.get("prs")
@@ -1056,6 +1098,8 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +
 +    :param conversation_store: Store holding the watch labels.
 +    :param read_pr_info: Reads a session's PR through the panel's data path.
++    :param read_linked: Reads the session's PRs the server stores; ``None`` (or a
++        session not synced yet) falls back to the list the host reports.
 +    :param deliver_message: Sends a turn-starting message into a session.
 +    :param post_note: Adds a note to a session without starting a turn.
 +    :param interval_s: Seconds between polls.
@@ -1070,11 +1114,13 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        read_pr_info: ReadPrInfo,
 +        deliver_message: DeliverMessage,
 +        post_note: PostNote,
++        read_linked: ReadLinked | None = None,
 +        interval_s: float = DEFAULT_INTERVAL_S,
 +        polls_session: Callable[[Conversation], bool] | None = None,
 +    ) -> None:
 +        self._store = conversation_store
 +        self._read_pr_info = read_pr_info
++        self._read_linked = read_linked
 +        self._deliver_message = deliver_message
 +        self._post_note = post_note
 +        self._interval_s = interval_s
@@ -1138,6 +1184,17 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +            _logger.debug("pr watch: reading %s for %s failed: %s", pr_url, session_id, exc)
 +            return None
 +
++    async def _linked(self, session_id: str) -> _Tracked | None:
++        if self._read_linked is None:
++            return None
++        try:
++            return _stored_tracked(await self._read_linked(session_id))
++        except Exception:  # Storage trouble falls back to the host's list.
++            _logger.warning(
++                "pr watch: reading stored PRs for %s failed", session_id, exc_info=True
++            )
++            return None
++
 +    def _due_for_listing(self, conv: Conversation) -> bool:
 +        last = self._listed.get(conv.id)
 +        return (
@@ -1160,17 +1217,20 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        if self._polls_session is not None and not self._polls_session(conv):
 +            return
 +
++        linked = await self._linked(session_id)
 +        infos: dict[str, dict[str, Any]] = {}
-+        tracked: list[str] | None = None
++        tracked: list[str] | None = linked.urls if linked is not None else None
 +        for pr_url in watch.watching:
++            if tracked is not None and pr_url not in tracked:
++                continue
 +            info = await self._read(session_id, conv, pr_url)
 +            if info is not None:
 +                infos[pr_url] = info
 +                tracked = tracked if tracked is not None else _tracked_urls(info)
 +        if watch.all_prs:
-+            tracked = await self._enrol(session_id, conv, watch, infos, tracked)
++            tracked = await self._enrol(session_id, conv, watch, infos, tracked, linked)
 +        if tracked is not None:
-+            # Removed from the session's PR list: it can no longer be read.
++            # Unlinked from the session: it can no longer be read.
 +            for pr_url in [url for url in watch.watching if url not in tracked]:
 +                await remove_entry(self._store, session_id, pr_url)
 +                infos.pop(pr_url, None)
@@ -1202,9 +1262,11 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        watch: SessionWatch,
 +        infos: dict[str, dict[str, Any]],
 +        tracked: list[str] | None,
++        linked: _Tracked | None,
 +    ) -> list[str] | None:
 +        """Start watching the session's PRs that "all" mode has not seen yet.
 +
++        :param linked: The server's stored list; its states skip reading finished PRs.
 +        :returns: The session's tracked PR URLs, when known.
 +        """
 +        candidates = tracked
@@ -1226,6 +1288,12 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        now = int(time.time())
 +        for pr_url in candidates:
 +            if pr_url in watch.prs or len(watch.prs) >= MAX_WATCHED_PRS:
++                continue
++            stored_state = linked.states.get(pr_url, "") if linked is not None else ""
++            if stored_state in ("MERGED", "CLOSED"):
++                # Finished before it was watched: no need to ask the host.
++                watch.prs[pr_url] = WatchState(started_at=now, ended=stored_state.lower())
++                await save_entry(self._store, session_id, pr_url, watch.prs[pr_url])
 +                continue
 +            listed_pr = listing.get("pr") if listing is not None else None
 +            info = (
@@ -1352,6 +1420,13 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +    async def post_note(session_id: str, text: str) -> None:
 +        await append_note(conversation_store, session_id, text)
 +
++    pull_request_store = open_store(conversation_store)
++
++    async def read_linked(session_id: str) -> SessionPullRequests | None:
++        if pull_request_store is None:
++            return None
++        return await asyncio.to_thread(pull_request_store.read, session_id)
++
 +    def polls_session(conv: Conversation) -> bool:
 +        return (
 +            host_registry is None
@@ -1364,6 +1439,7 @@ index 0000000000000000000000000000000000000000..50d28544813cbdf547570d414b38ca29
 +        read_pr_info=read_pr_info,
 +        deliver_message=deliver_message,
 +        post_note=post_note,
++        read_linked=read_linked,
 +        interval_s=configured_interval_s(),
 +        polls_session=polls_session,
 +    )
@@ -1802,7 +1878,7 @@ index 0000000000000000000000000000000000000000..492c5a0f213eb5ba8363ae06a2acc4e9
 +        await clear_watch(conversation_store, session_id)
 +        return await _status(request, session_id)
 diff --git a/omnigent/server/routes/sessions/routes_resources.py b/omnigent/server/routes/sessions/routes_resources.py
-index 379a7ee6a0930cd35312f143fc396a16eedb2863..2f66788c15b9f16d52d27c8869e61fb2f49bc232 100644
+index 379a7ee6a0930cd35312f143fc396a16eedb2863..bb2ac83ea799169fa17480d5c1f9d32ea95ce2f8 100644
 --- a/omnigent/server/routes/sessions/routes_resources.py
 +++ b/omnigent/server/routes/sessions/routes_resources.py
 @@ -284,6 +284,7 @@ def register_resources_routes(
@@ -1813,22 +1889,15 @@ index 379a7ee6a0930cd35312f143fc396a16eedb2863..2f66788c15b9f16d52d27c8869e61fb2
  ) -> None:
      """Register the resources routes on router."""
      pull_request_store = server_prs.open_store(conversation_store)
-@@ -3597,6 +3598,22 @@ def register_resources_routes(
+@@ -3597,6 +3598,15 @@ def register_resources_routes(
          conv = await _validate_session(session_id, request, LEVEL_READ)
          return await _github_info(session_id, conv, pr_url)
  
 +    async def read_pr_info(
 +        session_id: str, conv: Conversation, pr_url: str | None
 +    ) -> dict[str, Any]:
-+        """Read a tracked PR (``None``: the default one) like the panel, for the PR watcher."""
-+        return await _fs_get_with_host_fallback(
-+            session_id,
-+            conv,
-+            op="github_info",
-+            host_params={"pr_url": pr_url} if pr_url else {},
-+            runner_params={"pr_url": pr_url} if pr_url else None,
-+            runner_path=f"/v1/sessions/{session_id}/resources/github",
-+        )
++        """Read a linked PR (``None``: the default one) like the panel, for the PR watcher."""
++        return await _github_info(session_id, conv, pr_url)
 +
 +    if register_pr_info_reader is not None:
 +        register_pr_info_reader(read_pr_info)
@@ -2655,6 +2724,43 @@ index 0000000000000000000000000000000000000000..5aed4b80ec5834d500920106901cef95
 +        headers=OWNER,
 +    )
 +    assert response.status_code == 400
+diff --git a/tests/server/routes/test_session_resources.py b/tests/server/routes/test_session_resources.py
+index 05536cd0d148e4d21583e498d78ea9286bd8da3d..6100e0fc9fb8d8a6db0b2008f534070e41fcf4e0 100644
+--- a/tests/server/routes/test_session_resources.py
++++ b/tests/server/routes/test_session_resources.py
+@@ -3390,6 +3390,32 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
+     assert runner.post_json_calls[-1][1]["action"] == "remove"
+ 
+ 
++@pytest.mark.asyncio
++async def test_the_pr_watch_reader_reads_like_the_panel(
++    runner_globals_reset: None, db_uri: str
++) -> None:
++    """The PR watcher's reader is vouched for, stored, and answered with the server's list."""
++    del runner_globals_reset
++    readers: list[Any] = []
++    app = _pr_app(db_uri, register_pr_info_reader=readers.append)
++    runner = _FakeRunnerClient(payload=_pr_info())
++    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
++    transport = httpx.ASGITransport(app=app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
++        await client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
++        set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
++        await client.delete(f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR})
++    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
++    [read] = readers
++    conv = app.state.test_conversation_store.get_conversation(_PR_SESSION)
++
++    info = await read(_PR_SESSION, conv, _SECOND_PR)
++
++    assert runner.get_params[-1] == {"pr_url": _SECOND_PR, "server_tracked": True}
++    # The host still reports the unlinked PR; the answer is the server's list.
++    assert [pr["url"] for pr in info["prs"]] == [_SECOND_PR]
++
++
+ @pytest.mark.asyncio
+ async def test_linking_checks_the_session_limit_before_asking_the_host(
+     pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 diff --git a/tests/server/test_feature_flags.py b/tests/server/test_feature_flags.py
 index c3b16c1da6f9401a0c62f3420a79c8ca8c7fd789..60bca0eb8dfd0802022568351d1895a5fc35edff 100644
 --- a/tests/server/test_feature_flags.py
@@ -2669,10 +2775,10 @@ index c3b16c1da6f9401a0c62f3420a79c8ca8c7fd789..60bca0eb8dfd0802022568351d1895a5
  
 diff --git a/tests/server/test_pr_watch.py b/tests/server/test_pr_watch.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff162b6b8bde
+index 0000000000000000000000000000000000000000..9626cb4b2e7da30dcd30d111ebc83cfa39737276
 --- /dev/null
 +++ b/tests/server/test_pr_watch.py
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,575 @@
 +"""Pull request watch: event detection, dedupe, stop rules, label storage and the poll loop."""
 +
 +from __future__ import annotations
@@ -2696,6 +2802,7 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +    wake_message,
 +)
 +from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.session_pull_request_store import SessionPullRequests, StoredPullRequest
 +
 +PR_URL = "https://github.com/org/repo/pull/7"
 +PR_9 = "https://github.com/org/repo/pull/9"
@@ -2932,6 +3039,8 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +        self.store = store
 +        self.infos: dict[str, dict[str, Any]] = {PR_URL: _info()}
 +        self.tracked: list[str] = [PR_URL]
++        # The server's stored list; ``None`` leaves the host's list in charge.
++        self.linked: SessionPullRequests | None = None
 +        self.reads: list[str | None] = []
 +        self.messages: list[tuple[str, str | None, str]] = []
 +        self.notes: list[tuple[str, str]] = []
@@ -2952,12 +3061,36 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +        async def note(session_id: str, text: str) -> None:
 +            self.notes.append((session_id, text))
 +
++        async def read_linked(session_id: str) -> SessionPullRequests | None:
++            return self.linked
++
 +        self.watcher = PullRequestWatcher(
 +            conversation_store=store,
 +            read_pr_info=read,
 +            deliver_message=deliver,
 +            post_note=note,
++            read_linked=read_linked,
 +            polls_session=lambda conv: polls,
++        )
++
++    def link(self, *prs: tuple[str, str | None], synced: bool = True) -> None:
++        """Store ``(url, state)`` pairs as the server's list of the session's PRs."""
++        self.linked = SessionPullRequests(
++            entries=[
++                StoredPullRequest(
++                    url=url,
++                    provider="github",
++                    host="github.com",
++                    repository="org/repo",
++                    number=int(url.rsplit("/", 1)[1]),
++                    relationship="created",
++                    first_seen_at=1.0,
++                    last_seen_at=1.0,
++                    state=state,
++                )
++                for url, state in prs
++            ],
++            synced=synced,
 +        )
 +
 +    @property
@@ -3097,6 +3230,49 @@ index 0000000000000000000000000000000000000000..4fedac51b0936393636d2f09964cff16
 +    await harness.watcher.poll_once()
 +    assert harness.reads == [None, None]
 +    assert harness.state(session_id).all_prs
++
++
++async def test_all_mode_takes_the_session_prs_from_the_server_list(
++    store: SqlAlchemyConversationStore,
++) -> None:
++    harness = _Harness(store)
++    harness.info = _info(**_failing("lint"))
++    harness.infos[PR_9] = _info(number=9, url=PR_9)
++    # The host's own registry lags: it only knows #7.
++    harness.tracked = [PR_URL]
++    harness.link((PR_URL, "OPEN"), (PR_9, "MERGED"))
++    session_id = harness.watch_all()
++
++    await harness.watcher.poll_once()
++
++    # No listing read, and #9, merged by the stored state, is never read.
++    assert harness.reads == [PR_URL]
++    watch = harness.state(session_id)
++    assert watch.watching == [PR_URL] and watch.prs[PR_9].ended == "merged"
++    assert harness.messages[0][2].startswith("[System: PR watch — #7 needs attention]")
++
++    # Unlinked on the server: the watch goes even though the host still lists it.
++    harness.link((PR_9, "MERGED"))
++    harness.reads.clear()
++    await harness.watcher.poll_once()
++    assert harness.reads == [] and PR_URL not in harness.state(session_id).prs
++
++
++async def test_an_unsynced_server_list_leaves_the_host_list_in_charge(
++    store: SqlAlchemyConversationStore,
++) -> None:
++    harness = _Harness(store)
++    harness.info = _info(**_failing("lint"))
++    harness.infos[PR_9] = _info(number=9, url=PR_9, mergeable=False)
++    harness.tracked = [PR_URL, PR_9]
++    # Not imported from the host yet, so the stored list may be partial.
++    harness.link((PR_URL, "OPEN"), synced=False)
++    session_id = harness.watch_all()
++
++    await harness.watcher.poll_once()
++
++    assert harness.reads == [None, PR_9]
++    assert set(harness.state(session_id).watching) == {PR_URL, PR_9}
 +
 +
 +async def test_watcher_stops_with_a_note_when_green(store: SqlAlchemyConversationStore) -> None:

@@ -1,6 +1,6 @@
 <!-- Draft PR body for the terminal-touch series; title: feat(web): long-press to select, copy and paste in the terminal on touch devices -->
 
-> Status: the first commit of this series (Termux-style extra-keys row) is a squashed copy of upstream PR #6136, which is still open. Its two iOS fixes (cancel `touchend` on the key row so the soft keyboard stays up; pad the row by the bottom safe area unless the keyboard is docked) will be suggested on #6136 rather than sent here. Drop that commit once #6136 lands. This PR body covers the two new commits, a follow-up to #6136.
+> Status: the first commit of this series (Termux-style extra-keys row) is a squashed copy of upstream PR #6136, which is still open. Our two iOS fixes (cancel `touchend` on the key row so the soft keyboard stays up; pad the row by the bottom safe area unless the keyboard is docked) were suggested on #6136 on 2026-10-23 and folded into it at `d2c80fe`; the copy matches that head. Drop that commit once #6136 lands. This PR body covers the two new commits, a follow-up to #6136. Issue draft: `issue.md`.
 
 ## Related issue
 
