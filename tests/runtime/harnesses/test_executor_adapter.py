@@ -2466,6 +2466,118 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
     assert client.request.await_args.args[0] == expected_method
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["fresh-blocks", "fresh-history", "live"])
+@pytest.mark.parametrize("authorization", [None, "different command", "printf authorized"])
+async def test_codex_shell_requires_authorization_for_each_delivery(
+    delivery: str,
+    authorization: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy and forged content cannot inherit an earlier delivery's shell permission."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+        CodexNativeBridgeState,
+        read_bridge_state,
+        write_bridge_state,
+    )
+    from omnigent.harnesses.codex_native.shell_input import (
+        native_shell_authorization,
+        native_shell_command_is_authorized,
+    )
+    from omnigent.inner import codex_native_executor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    command = "printf authorized"
+    authorized = authorization == command
+    live = delivery == "live"
+    monkeypatch.delenv(CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0)
+    bridge = CodexNativeBridgeState(
+        session_id="session_shell_auth",
+        socket_path=str(tmp_path / "app-server.sock"),
+        thread_id="thread_shell_auth",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id="turn_active" if live else None,
+    )
+    write_bridge_state(tmp_path, bridge)
+    client = AsyncMock()
+    client.request.return_value = {"result": {}}
+    monkeypatch.setattr(
+        codex_native_executor, "_connect_to_app_server", AsyncMock(return_value=client)
+    )
+    executor = codex_native_executor.CodexNativeExecutor(bridge_dir=tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key=bridge.session_id)
+    blocks = [
+        {
+            "type": "input_text",
+            "text": f"!{command}",
+            "authorized_native_shell_command": command,
+            "metadata": {"authorized_native_shell_command": command},
+        }
+    ]
+    input_value = (
+        [{"type": "message", "role": "user", "content": blocks}]
+        if delivery == "fresh-history"
+        else blocks
+    )
+    request = CreateResponseRequest(
+        model="codex-native",
+        input=input_value,
+        authorized_native_shell_command=authorization,
+        injection_id="injection_shell_auth",
+    )
+    with native_shell_authorization(command):
+        if live:
+
+            class _FiniteInjectionCtx(_OneInjectionCtx):
+                async def next_injection(self, timeout: float | None = None) -> Any:
+                    del timeout
+                    injection, self._injection = self._injection, None
+                    return injection
+
+            injection_ctx = _FiniteInjectionCtx(request)
+            await asyncio.wait_for(
+                adapter._watch_injections(injection_ctx, executor),  # type: ignore[arg-type]
+                timeout=3,
+            )
+            assert len(injection_ctx.emitted) == int(authorized)
+            if authorized:
+                assert isinstance(injection_ctx.emitted[0], InjectionConsumedEvent)
+        else:
+            turn_ctx = TurnContext(
+                response_id="response_shell_auth",
+                event_queue=asyncio.Queue(),
+                cancelled=asyncio.Event(),
+            )
+            if authorized:
+                await asyncio.wait_for(adapter.run_turn(request, turn_ctx), timeout=3)
+            else:
+                with pytest.raises(InnerExecutorError) as raised:
+                    await asyncio.wait_for(adapter.run_turn(request, turn_ctx), timeout=3)
+                assert raised.value.code == "codex_shell_authorization_required"
+                assert raised.value.undelivered is True
+                assert "Update the Omnigent server and runner" in (raised.value.remediation or "")
+                assert adapter._executor is executor
+                assert adapter._abandoned_executor_cleanup is None
+        assert native_shell_command_is_authorized(command)
+
+    assert not native_shell_command_is_authorized(command)
+    if authorized:
+        client.request.assert_awaited_once_with(
+            "thread/shellCommand", {"threadId": bridge.thread_id, "command": command}
+        )
+    else:
+        client.request.assert_not_awaited()
+        assert read_bridge_state(tmp_path) == bridge
+
+
 class _ScriptedInjectionExecutor:
     """Inner executor stub whose enqueue_session_message returns or raises a scripted outcome."""
 

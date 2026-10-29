@@ -25,6 +25,7 @@ from fastapi import Response
 
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -358,6 +359,7 @@ class ExecutorAdapter(HarnessApp):
                 phase_scope(ErrorPhase.TURN),
                 trace_cm,
                 input_delivery_scope(input_identity, response_id=ctx.response_id),
+                native_shell_authorization(request.authorized_native_shell_command),
             ):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id
@@ -746,8 +748,12 @@ class ExecutorAdapter(HarnessApp):
             if ctx.cancelled.is_set():
                 return
             try:
-                with input_delivery_scope(
-                    injection.model_dump(include=set(INPUT_FIELDS)), response_id=ctx.response_id
+                with (
+                    input_delivery_scope(
+                        injection.model_dump(include=set(INPUT_FIELDS)),
+                        response_id=ctx.response_id,
+                    ),
+                    native_shell_authorization(injection.authorized_native_shell_command),
                 ):
                     log_input_event(
                         _logger, "native_input_steering_started", session_id=ctx.session_id

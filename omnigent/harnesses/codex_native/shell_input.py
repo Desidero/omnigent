@@ -2,6 +2,31 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
+from contextvars import ContextVar
+
+CODEX_SHELL_AUTHORIZED_HEADER = "X-Omnigent-Codex-Shell-Authorized"
+
+_authorized_shell_command: ContextVar[str | None] = ContextVar(
+    "authorized_native_shell_command", default=None
+)
+
+
+@contextlib.contextmanager
+def native_shell_authorization(command: str | None) -> Iterator[None]:
+    """Bind runner-validated authorization to one delivery, never its user content."""
+    token = _authorized_shell_command.set(command)
+    try:
+        yield
+    finally:
+        _authorized_shell_command.reset(token)
+
+
+def native_shell_command_is_authorized(command: str) -> bool:
+    """Require authorization for the exact shell body being delivered."""
+    return _authorized_shell_command.get() == command
+
 
 def shell_command_from_input(input_value: object) -> str | None:
     """Classify raw harness input, including its latest role-keyed user message."""

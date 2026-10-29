@@ -159,7 +159,9 @@ def test_shell_reconciliation_requires_idle_or_the_original_parent(
         assert updated.active_shell_turn_id is None
 
 
-@pytest.mark.parametrize("changed_field", ["pending_shell_command_id", "thread_id", "socket_path"])
+@pytest.mark.parametrize(
+    "changed_field", ["pending_shell_command_id", "session_id", "thread_id", "socket_path"]
+)
 def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
     tmp_path: Path, changed_field: str
 ) -> None:

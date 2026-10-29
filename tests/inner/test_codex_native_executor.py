@@ -31,6 +31,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_startup_timeout,
     write_bridge_state,
 )
+from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -151,12 +152,15 @@ class _FakeCodexNativeClient:
         yield {}
 
 
-def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
+def _collect_turn_events(
+    executor: CodexNativeExecutor, text: str, *, shell_authorized: bool = False
+) -> list[Any]:
     """
     Run one native executor turn and collect its events.
 
     :param executor: Native Codex executor under test.
     :param text: User text to send, e.g. ``"hello"``.
+    :param shell_authorized: Whether the test's trusted delivery authorizes this shell body.
     :returns: Events yielded by :meth:`CodexNativeExecutor.run_turn`.
     """
 
@@ -166,14 +170,16 @@ def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
 
         :returns: Events yielded by the turn.
         """
-        events: list[Any] = []
-        async for event in executor.run_turn(
-            [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
-            [],
-            "",
-        ):
-            events.append(event)
-        return events
+        command = codex_native_executor._shell_command_from_content(text)
+        with native_shell_authorization(command if shell_authorized else None):
+            return [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
+                    [],
+                    "",
+                )
+            ]
 
     return asyncio.run(run())
 
@@ -1059,9 +1065,10 @@ def test_shell_input_runs_through_thread_shell_command(
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
     if live_injection:
-        assert asyncio.run(executor.enqueue_session_message("main", "  !gcloud auth login\n"))
+        with native_shell_authorization("gcloud auth login"):
+            assert asyncio.run(executor.enqueue_session_message("main", "  !gcloud auth login\n"))
     else:
-        events = _collect_turn_events(executor, "  !gcloud auth login\n")
+        events = _collect_turn_events(executor, "  !gcloud auth login\n", shell_authorized=True)
         assert [type(event) for event in events] == [TurnComplete]
 
     assert [
@@ -1110,14 +1117,15 @@ def test_shell_followup_waits_for_a_model_turn(
             "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
             _RunningShellClient,
         )
-        events = [
-            event
-            async for event in executor.run_turn(
-                [{"role": "user", "content": [{"type": "input_text", "text": "!sleep 1"}]}],
-                [],
-                "",
-            )
-        ]
+        with native_shell_authorization("sleep 1"):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": [{"type": "input_text", "text": "!sleep 1"}]}],
+                    [],
+                    "",
+                )
+            ]
         update_active_turn_id(tmp_path, "turn_shell")
         followup_executor = CodexNativeExecutor(bridge_dir=tmp_path) if restart else executor
 
@@ -1177,12 +1185,13 @@ def test_shell_input_wait_for_its_turn_is_bounded(
 
     async def run() -> list[Any]:
         async with asyncio.timeout(1):
-            return [
-                event
-                async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
-                    [{"role": "user", "content": "!true"}], [], ""
-                )
-            ]
+            with native_shell_authorization("true"):
+                return [
+                    event
+                    async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+                        [{"role": "user", "content": "!true"}], [], ""
+                    )
+                ]
 
     events = asyncio.run(run())
 
@@ -1205,7 +1214,9 @@ def test_unobserved_shell_blocks_followup_after_executor_restart(
     )
     monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0)
     _seed_bridge(tmp_path, active_turn_id=previous_turn)
-    _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "!sleep 1")
+    _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "!sleep 1", shell_authorized=True
+    )
     if previous_turn is not None:
         clear_active_turn_id_if_matches(tmp_path, previous_turn)
 
@@ -1285,7 +1296,9 @@ def test_shell_submission_failure_retains_only_ambiguous_pending_input(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", FailingShellClient
     )
     _seed_bridge(tmp_path)
-    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "!true")
+    events = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "!true", shell_authorized=True
+    )
     assert isinstance(events[0], ExecutorError)
     state = read_bridge_state(tmp_path)
     assert state is not None
@@ -1365,7 +1378,9 @@ def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RotatingShellClient
     )
-    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "!printf once")
+    events = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "!printf once", shell_authorized=True
+    )
 
     assert [type(event) for event in events] == [TurnComplete]
     assert read_bridge_state(tmp_path) == replacement

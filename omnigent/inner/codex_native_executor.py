@@ -55,6 +55,9 @@ from omnigent.harnesses.codex_native.bridge import (
     update_active_turn_id,
 )
 from omnigent.harnesses.codex_native.shell_input import (
+    native_shell_command_is_authorized,
+)
+from omnigent.harnesses.codex_native.shell_input import (
     shell_command_from_content as _shell_command_from_content,
 )
 from omnigent.inner.codex_goal_command import (
@@ -110,6 +113,14 @@ _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     code="codex_delivery_unconfirmed",
     title="Codex delivery is unconfirmed",
     remediation="Check the native terminal for the message before sending it again.",
+)
+_CODEX_SHELL_AUTHORIZATION_REQUIRED = CodexStartupFailure(
+    message="This shell command was not delivered because the server did not authorize "
+    "native shell execution.",
+    code="codex_shell_authorization_required",
+    title="Shell command authorization required",
+    remediation="Update the Omnigent server and runner, then send the command again "
+    "as the session owner.",
 )
 
 
@@ -484,6 +495,8 @@ async def _run_codex_shell_command(
     command: str,
 ) -> None:
     """Run a web ``!command`` in the thread's shell, inside any active turn."""
+    if not native_shell_command_is_authorized(command):
+        raise _CodexNativeInputUndelivered(_CODEX_SHELL_AUTHORIZATION_REQUIRED)
     state = await _wait_for_shell_completion(client, bridge_dir, state)
     request_id = uuid.uuid4().hex
     if not mark_shell_command_pending(bridge_dir, state, request_id):
@@ -937,6 +950,18 @@ class CodexNativeExecutor(Executor):
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
+        shell_command = _shell_command_from_content(latest_user_content)
+        if shell_command is not None and not native_shell_command_is_authorized(shell_command):
+            failure = _CODEX_SHELL_AUTHORIZATION_REQUIRED
+            yield ExecutorError(
+                message=failure.message,
+                code=failure.code,
+                title=failure.title,
+                remediation=failure.remediation,
+                undelivered=True,
+                preserve_session=True,
+            )
+            return
         goal_objective = goal_objective_from_content(latest_user_content)
         if goal_objective is not None:
             # Reject over-long objectives here so the app-server's raw
@@ -1067,11 +1092,6 @@ class CodexNativeExecutor(Executor):
                     undelivered = True
                 else:
                     try:
-                        shell_command = (
-                            _shell_command_from_content(latest_user_content)
-                            if goal_objective is None
-                            else None
-                        )
                         side_question = side_chat.side_chat_question(input_items)
                         if shell_command is not None:
                             await _run_codex_shell_command(
@@ -1164,7 +1184,11 @@ class CodexNativeExecutor(Executor):
                 undelivered=undelivered,
                 # Failed delivery does not own cancellation of an independent native turn.
                 preserve_session=delivery_unconfirmed
-                or (startup_failure is not None and startup_failure.code == "codex_shell_busy")
+                or (
+                    startup_failure is not None
+                    and startup_failure.code
+                    in {"codex_shell_busy", "codex_shell_authorization_required"}
+                )
                 or (undelivered and state is not None and state.active_turn_id is not None),
             )
         else:
