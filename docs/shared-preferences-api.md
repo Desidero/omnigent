@@ -1,9 +1,10 @@
 # Shared preference operations
 
 This opt-in API stores model choice (`model` and `opencode_model`), the default
-harness, ordered arguments per harness, and plugin enable/disable choices. It
-provides durable values, versions, conflict alternatives, and retry receipts.
-It does not import settings, enable automatic client sync, or change launches.
+harness, ordered arguments per harness, plugin enable/disable choices, and chat
+link rules. It provides durable values, versions, conflict alternatives, and
+retry receipts. It does not import settings, enable automatic client sync, or
+change launches.
 
 ## Enable an isolated server
 
@@ -71,8 +72,10 @@ authenticated context; it does not select another user or workspace.
 | `{"kind":"harness","name":"default"}` | Nonempty harness name |
 | `{"kind":"harness_args","name":"claude-sdk"}` | Ordered string array; `[]` explicitly clears inherited arguments |
 | `{"kind":"plugin","name":{"ecosystem":"claude","source":"catalog","name":"tools"}}` | Boolean; `false` explicitly disables the plugin |
+| `{"kind":"link_rules","name":"default"}` | [Chat link rules](chat-link-rules.md) as a JSON array in a string, validated and stored compactly; `"[]"` explicitly turns every rule off |
 
-For every key, `null` removes the shared choice. Harness aliases use the existing
+For every key, `null` removes the shared choice; with no link rules the
+defaults apply. Harness aliases use the existing
 canonicalization rules. Credentials, executable commands, plugin installation,
 and arbitrary plugin configuration are not supported preference keys.
 
