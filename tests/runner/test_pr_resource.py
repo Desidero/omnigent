@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
 import sys
+import threading
 import types
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -23,6 +25,7 @@ from omnigent.git_providers import (
     load_facet,
     reset_for_tests,
 )
+from omnigent.link_rules import GitWorkspace
 from omnigent.runner import github_resource, pr_resource
 from omnigent.runner.git_providers import (
     ProviderCapabilities,
@@ -712,3 +715,86 @@ def test_the_github_facet_loads_without_the_panel_module() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        ("git@gitlab.com:group/sub/project.git", GitWorkspace("gitlab", "gitlab.com")),
+        ("https://github.com/o/r.git", GitWorkspace("github", "github.com")),
+        # No provider claims the host: the prompt can still match a listed host.
+        ("git@git.example.test:o/r.git", GitWorkspace(None, "git.example.test")),
+        (None, GitWorkspace()),
+    ],
+)
+def test_workspace_git_reports_the_remote_a_prompt_links_to(
+    repo: Path, remote: str | None, expected: GitWorkspace
+) -> None:
+    if remote is not None:
+        _git(repo, "remote", "add", "origin", remote)
+    assert pr_resource.workspace_git(repo) == expected
+
+
+def test_workspace_git_is_none_outside_a_checkout(tmp_path: Path) -> None:
+    assert pr_resource.workspace_git(tmp_path) is None
+
+
+_GITHUB = GitWorkspace("github", "github.com")
+_GITLAB = GitWorkspace("gitlab", "gitlab.com")
+
+
+class _HeldRemote:
+    """A ``workspace_git`` stand-in whose lookups block until released."""
+
+    def __init__(self, remote: GitWorkspace) -> None:
+        self.remote = remote
+        self.calls = 0
+        self.released = threading.Event()
+
+    def __call__(self, root: str) -> GitWorkspace:
+        self.calls += 1
+        assert self.released.wait(budget(5)), "lookup never released"
+        return self.remote
+
+
+async def _await_remote(
+    cache: pr_resource.WorkspaceGitCache, workspace: Path, expected: GitWorkspace
+) -> None:
+    deadline = asyncio.get_running_loop().time() + budget(5)
+    while await cache.get(workspace) != expected:
+        assert asyncio.get_running_loop().time() < deadline, f"never resolved to {expected}"
+        await asyncio.sleep(0.01)
+
+
+async def test_workspace_git_cache_looks_nothing_up_outside_a_checkout(tmp_path: Path) -> None:
+    lookup = _HeldRemote(_GITHUB)
+    cache = pr_resource.WorkspaceGitCache(ttl_s=60, first_wait_s=budget(5), resolve=lookup)
+
+    assert await cache.get(tmp_path) is None
+    assert lookup.calls == 0
+
+
+async def test_workspace_git_cache_bounds_the_first_lookup(repo: Path) -> None:
+    lookup = _HeldRemote(_GITLAB)
+    cache = pr_resource.WorkspaceGitCache(ttl_s=60, first_wait_s=0.05, resolve=lookup)
+
+    # A slow first lookup leaves the turn with a checkout of unknown remote.
+    assert await cache.get(repo) == GitWorkspace()
+    assert await cache.get(repo) == GitWorkspace()
+    lookup.released.set()
+    await _await_remote(cache, repo, _GITLAB)
+    assert lookup.calls == 1
+
+
+async def test_workspace_git_cache_serves_the_last_remote_while_it_refreshes(repo: Path) -> None:
+    lookup = _HeldRemote(_GITHUB)
+    lookup.released.set()
+    # A negative TTL makes every entry stale, so each read starts a refresh.
+    cache = pr_resource.WorkspaceGitCache(ttl_s=-1, first_wait_s=budget(5), resolve=lookup)
+    assert await cache.get(repo) == _GITHUB
+
+    lookup.released.clear()
+    lookup.remote = _GITLAB
+    assert await cache.get(repo) == _GITHUB
+    lookup.released.set()
+    await _await_remote(cache, repo, _GITLAB)

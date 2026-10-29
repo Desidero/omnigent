@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.inner.claude_model_access import ClaudeModelAccess
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.pr_resource import WorkspaceGitCache
     from omnigent.runner.tool_dispatch import UnknownSessionWorkspace
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -76,12 +77,14 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.inner.executor import NativeTurnAcceptance
+from omnigent.link_rules import GitWorkspace, LinkRule
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
+from omnigent.native.native_terminal import fetch_link_rules
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals, pr_reports
 from omnigent.runner import subagent_work as _subagent_work
@@ -227,6 +230,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
+    link_rule_instructions,
     raw_author_instructions,
 )
 from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
@@ -245,6 +249,10 @@ _BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="run
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
+# How long a turn's chat-links instruction reuses the last read of the rules.
+_LINK_RULES_CACHE_TTL_S = 60.0
+# How long a turn waits for the first lookup of its workspace's git remote.
+_GIT_WORKSPACE_FIRST_WAIT_S = 1.0
 
 
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
@@ -1559,6 +1567,10 @@ def create_runner_app(
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
     # effort only from the forwarded turn body, which is built field by field.
     _session_reasoning_effort: dict[str, str] = {}
+    # (fetched at, rules): the user's chat link rules, re-read after a TTL.
+    _link_rules_cache: list[tuple[float, tuple[LinkRule, ...]]] = []
+    # Each workspace's git remote, made on the first turn that needs one.
+    _git_workspace_cache: list[WorkspaceGitCache] = []
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -6354,6 +6366,32 @@ def create_runner_app(
                 if _turn_message_bodies.get(conv) is msg_body:
                     _turn_message_bodies.pop(conv, None)
 
+    async def _turn_link_rule_instructions(conv: str) -> list[str]:
+        """The chat-links instructions for this turn, from rules cached briefly.
+
+        Rules are per user and a runner serves one user, so one cache entry
+        covers every session; a saved change reaches the next turn after
+        :data:`_LINK_RULES_CACHE_TTL_S`. The session's workspace decides the
+        issue and pull request wording; its remote is looked up in the
+        background and refreshed after the same interval.
+        """
+        now = time.monotonic()
+        if not _link_rules_cache or now - _link_rules_cache[0][0] > _LINK_RULES_CACHE_TTL_S:
+            _link_rules_cache[:] = [(now, await fetch_link_rules(server_client))]
+        git_workspace: GitWorkspace | None = None
+        workspace = await _session_runtime_cwd(conv)
+        if workspace is not None:
+            if not _git_workspace_cache:
+                from omnigent.runner.pr_resource import WorkspaceGitCache
+
+                _git_workspace_cache.append(
+                    WorkspaceGitCache(
+                        ttl_s=_LINK_RULES_CACHE_TTL_S, first_wait_s=_GIT_WORKSPACE_FIRST_WAIT_S
+                    )
+                )
+            git_workspace = await _git_workspace_cache[0].get(workspace)
+        return link_rule_instructions(_link_rules_cache[0][1], git_workspace)
+
     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
         """Reasoning block to forward on a turn, or ``None`` when unset.
 
@@ -6484,15 +6522,20 @@ def create_runner_app(
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
+            _bg_link_rules = await _turn_link_rule_instructions(conv)
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
-                    cached_spec, _raw_per_request_instructions, []
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=_bg_link_rules,
                 )
             else:
                 instructions = build_instructions(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    framework_instructions=_bg_link_rules,
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -7276,10 +7319,14 @@ def create_runner_app(
                     if _instr_spec_ds is not None:
                         _per_req_instr = cast(str | None, body.get("instructions"))
                         _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
+                        _ds_link_rules = await _turn_link_rule_instructions(conv_id)
                         _ic_ds = InstructionComposition(
                             authored_present=_authored_ds,
                             composed=build_instructions_nullable(
-                                _instr_spec_ds, _per_req_instr, []
+                                _instr_spec_ds,
+                                _per_req_instr,
+                                [],
+                                framework_instructions=_ds_link_rules,
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
@@ -7291,7 +7338,10 @@ def create_runner_app(
                             _instr_body = {
                                 **body,
                                 "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                    _instr_spec_ds,
+                                    _per_req_instr,
+                                    [],
+                                    framework_instructions=_ds_link_rules,
                                 ),
                             }
                         if _authored_ds and harness_name:
