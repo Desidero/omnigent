@@ -730,10 +730,14 @@ class ExecutorAdapter(HarnessApp):
             if injection is None:
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
-            text = _extract_user_text(injection.input)
-            if not text:
+            content = (
+                _normalize_message_content(injection.input)
+                if executor.supports_multimodal_live_message_queue()
+                else _extract_user_text(injection.input)
+            )
+            if not content:
                 _logger.warning(
-                    "skipping in-band injection with no text payload: %r",
+                    "skipping in-band injection with no supported payload: %r",
                     injection.input,
                 )
                 continue
@@ -747,7 +751,9 @@ class ExecutorAdapter(HarnessApp):
                         _logger, "native_input_steering_started", session_id=ctx.session_id
                     )
                     try:
-                        accepted = await executor.enqueue_session_message(self._session_key, text)
+                        accepted = await executor.enqueue_session_message(
+                            self._session_key, content
+                        )
                         outcome = "executor_accepted" if accepted else "executor_refused"
                     except InjectionDeliveryAmbiguous:
                         # The harness may already hold the message; resending could duplicate it.

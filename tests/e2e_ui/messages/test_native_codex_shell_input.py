@@ -1,13 +1,13 @@
 """Web shell commands run through Codex's shell RPC, not as prompts."""
 
 import shutil
-import time
 import uuid
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
 
 from .test_message_render_parity import _ASSISTANT, _USER, _WORKING, _ensure_chat_view, _send
@@ -38,10 +38,12 @@ def _shell_inputs(client: httpx.Client, session_id: str) -> list[str]:
 
 @pytest.mark.nightly
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("warmup", [False, True], ids=["first-message", "existing-session"])
 def test_web_shell_input_runs_in_codex_shell_not_as_prompt(
     page: Page,
     native_codex_mock_session: tuple[str, str],
     mock_llm_server_url: str,
+    warmup: bool,
 ) -> None:
     base_url, session_id = native_codex_mock_session
     marker = f"shell-{uuid.uuid4().hex[:8]}"
@@ -55,21 +57,27 @@ def test_web_shell_input_runs_in_codex_shell_not_as_prompt(
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _ensure_chat_view(page)
-    _send(page, "Hello")
-    expect(page.locator(_ASSISTANT, has_text=leaked).first).to_be_visible(timeout=90_000)
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+    if warmup:
+        _send(page, "Hello")
+        expect(page.locator(_ASSISTANT, has_text=leaked).first).to_be_visible(timeout=90_000)
+        expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
 
     _send(page, f"!echo {marker}")
 
     expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(1, timeout=60_000)
     with httpx.Client(base_url=base_url, timeout=15) as client:
-        deadline = time.monotonic() + 60
-        while _shell_inputs(client, session_id) != [f"echo {marker}"]:
-            assert time.monotonic() < deadline, _shell_inputs(client, session_id)
-            time.sleep(1)
+        poll_until(
+            lambda: _shell_inputs(client, session_id) == [f"echo {marker}"],
+            timeout_s=60,
+            interval_s=1,
+        )
         snapshot = client.get(f"/v1/sessions/{session_id}")
         snapshot.raise_for_status()
         assert snapshot.json()["pending_inputs"] == []
     expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+    output = page.locator('[data-testid="terminal-command-card"][data-terminal-kind="output"]')
+    expect(output).to_have_count(1, timeout=60_000)
+    output.click()
+    expect(page.get_by_text(marker, exact=True)).to_be_visible(timeout=10_000)
     # The shell command never reached the model as a prompt.
-    assert page.locator(_ASSISTANT, has_text=leaked).count() == 1
+    assert page.locator(_ASSISTANT, has_text=leaked).count() == int(warmup)

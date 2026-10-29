@@ -139,6 +139,21 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     assert updated.cwd == str(tmp_path)
 
 
+def test_repeated_shell_event_preserves_auxiliary_turn_classification(tmp_path: Path) -> None:
+    """Duplicate started events and resume echoes must leave agent steering enabled."""
+    _seed_active_turn(tmp_path, "turn_agent")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "shell_request")
+    for _ in range(2):
+        codex_native_bridge.record_user_shell_turn(tmp_path, "thread_test", "turn_agent")
+        updated = read_bridge_state(tmp_path)
+        assert updated is not None
+        assert updated.active_turn_id == "turn_agent"
+        assert updated.pending_shell_command_id is None
+        assert updated.active_shell_turn_id is None
+
+
 @pytest.mark.parametrize(
     ("contents", "status"),
     [

@@ -38,6 +38,8 @@ from omnigent.harnesses.codex_native.bridge import (
     CodexStartupFailure,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
+    clear_pending_shell_command,
+    mark_shell_command_pending,
     mcp_startup_waiting_detail,
     mirror_applied_codex_settings,
     read_bridge_startup_error,
@@ -459,6 +461,13 @@ async def _steer_codex_turn(
 # turn before the injection lock is released.
 _SHELL_TURN_WAIT_SECONDS = 2.0
 _SHELL_TURN_POLL_SECONDS = 0.05
+_SHELL_COMPLETION_WAIT_SECONDS = 60.0
+_CODEX_SHELL_WAIT_FAILURE = CodexStartupFailure(
+    message="Codex is still running a shell command, so this message was not delivered.",
+    code="codex_shell_busy",
+    title="Shell command is still running",
+    remediation="Wait for the shell command to finish, then send the message again.",
+)
 
 
 async def _run_codex_shell_command(
@@ -469,21 +478,25 @@ async def _run_codex_shell_command(
     command: str,
 ) -> None:
     """Run a web ``!command`` in the thread's shell, inside any active turn."""
-    await _native_delivery_request(
-        client,
-        "thread/shellCommand",
-        {"threadId": state.thread_id, "command": command},
-        state,
-        bridge_dir=bridge_dir,
-    )
-    if state.active_turn_id is None:
-        # The ack carries no turn id, so hold the injection lock until the
-        # forwarder records the shell's turn/started; otherwise a follow-up
-        # message could read an idle bridge and double-start.
-        turn_id = await _wait_for_shell_turn(bridge_dir, thread_id=state.thread_id)
-        _logger.info("Codex native ran user shell command: turn_id=%s", turn_id)
-        return
-    _logger.info("Codex native ran user shell command in active turn")
+    state = await _wait_for_shell_completion(bridge_dir, state)
+    request_id = uuid.uuid4().hex
+    if not mark_shell_command_pending(bridge_dir, state, request_id):
+        raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
+    try:
+        await _native_delivery_request(
+            client,
+            "thread/shellCommand",
+            {"threadId": state.thread_id, "command": command},
+            state,
+            bridge_dir=bridge_dir,
+        )
+    except (CodexAppServerResponseError, _CodexNativeInputUndelivered):
+        clear_pending_shell_command(bridge_dir, request_id)
+        raise
+    # The persisted pending marker also protects a later executor if its
+    # forwarder has not observed the command when this bounded wait ends.
+    turn_id = await _wait_for_shell_turn(bridge_dir, thread_id=state.thread_id)
+    _logger.info("Codex native ran user shell command: turn_id=%s", turn_id)
 
 
 async def _wait_for_shell_turn(bridge_dir: Path, *, thread_id: str) -> str | None:
@@ -501,11 +514,39 @@ async def _wait_for_shell_turn(bridge_dir: Path, *, thread_id: str) -> str | Non
         if (
             current is not None
             and current.thread_id == thread_id
-            and current.active_turn_id is not None
+            and current.pending_shell_command_id is None
         ):
             return current.active_turn_id
         await asyncio.sleep(_SHELL_TURN_POLL_SECONDS)
     return None
+
+
+async def _wait_for_shell_completion(
+    bridge_dir: Path, state: CodexNativeBridgeState
+) -> CodexNativeBridgeState:
+    """Retain prompts until a standalone shell turn can no longer swallow steering."""
+    deadline = asyncio.get_running_loop().time() + _SHELL_COMPLETION_WAIT_SECONDS
+    while True:
+        current = read_bridge_state(bridge_dir)
+        if (
+            current is None
+            or current.session_id != state.session_id
+            or current.thread_id != state.thread_id
+            or current.socket_path != state.socket_path
+        ):
+            raise _CodexNativeInputUndelivered(
+                CodexStartupFailure(
+                    message="Codex native session changed while waiting for the shell command; "
+                    "this message was not delivered.",
+                    remediation="Send the message again in the current session.",
+                )
+            )
+        if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
+            return current
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
+        await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, remaining))
 
 
 async def _inject_codex_turn(
@@ -516,7 +557,8 @@ async def _inject_codex_turn(
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
 ) -> None:
-    """Retain explicitly refused input while an active compaction settles."""
+    """Retain input while a standalone shell or explicitly refused compaction settles."""
+    state = await _wait_for_shell_completion(bridge_dir, state)
     try:
         await _inject_codex_turn_once(
             client,
@@ -692,6 +734,10 @@ class CodexNativeExecutor(Executor):
         """:returns: ``True`` because active turns accept ``turn/steer``."""
         return True
 
+    def supports_multimodal_live_message_queue(self) -> bool:
+        """:returns: ``True`` to preserve attachments and text provenance when steering."""
+        return True
+
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
         Steer an active native Codex turn.
@@ -719,7 +765,7 @@ class CodexNativeExecutor(Executor):
             if client is None:
                 return False
             try:
-                shell_command = _shell_command_from_input_items(input_items)
+                shell_command = _shell_command_from_content(content)
                 if shell_command is not None:
                     await _run_codex_shell_command(
                         client, bridge_dir=self._bridge_dir, state=state, command=shell_command
@@ -989,7 +1035,7 @@ class CodexNativeExecutor(Executor):
                 else:
                     try:
                         shell_command = (
-                            _shell_command_from_input_items(input_items)
+                            _shell_command_from_content(latest_user_content)
                             if goal_objective is None
                             else None
                         )
@@ -1185,22 +1231,26 @@ def _latest_user_content(messages: list[Message]) -> object:
     return None
 
 
-def _shell_command_from_input_items(input_items: list[dict[str, object]]) -> str | None:
+def _shell_command_from_content(content: object) -> str | None:
     """
     Return the command of a lone shell-mode text input.
 
-    :param input_items: Codex input items, e.g. ``[{"type": "text", "text": "!ls -la"}]``.
+    :param content: Original user content, before attachments are decoded to text.
     :returns: The command without its ``!`` prefix, e.g. ``"ls -la"``, or ``None``
         when the input is a prompt (including ``!!`` and attachment-bearing input).
         Only the surrounding whitespace and trailing newlines are dropped: a
         trailing escaped space or a heredoc body is part of the command.
     """
-    if len(input_items) != 1 or input_items[0].get("type") != "text":
+    if isinstance(content, list):
+        if len(content) != 1:
+            return None
+        block = _json_object(content[0])
+        if block is None or block.get("type") not in {"input_text", "text"}:
+            return None
+        content = block.get("text")
+    if not isinstance(content, str):
         return None
-    text = input_items[0].get("text")
-    if not isinstance(text, str):
-        return None
-    text = text.lstrip()
+    text = content.lstrip()
     if not text.startswith("!") or text.startswith("!!"):
         return None
     command = text[1:].lstrip().rstrip("\r\n")

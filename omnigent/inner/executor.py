@@ -728,6 +728,10 @@ class Executor:
         """Whether ``enqueue_session_message()`` is expected to work during a running turn."""
         return False
 
+    def supports_multimodal_live_message_queue(self) -> bool:
+        """Whether live queued messages accept content blocks instead of only plain text."""
+        return False
+
     def supports_tool_boundary_interrupt(self) -> bool:
         """Whether queued user input can be applied by interrupting after a tool boundary."""
         return False

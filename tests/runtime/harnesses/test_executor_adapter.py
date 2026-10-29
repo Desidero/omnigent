@@ -2220,9 +2220,14 @@ async def test_executor_adapter_forwards_model_override_to_config() -> None:
 class _AcceptingInjectionExecutor:
     """Inner executor stub whose enqueue_session_message always accepts."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, multimodal: bool = False) -> None:
         """Record every (session_key, text) the adapter forwards."""
         self.received: list[tuple[str, Any]] = []
+        self.multimodal = multimodal
+
+    def supports_multimodal_live_message_queue(self) -> bool:
+        """Report whether this executor accepts content blocks."""
+        return self.multimodal
 
     async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
         """Accept the injection and record it.
@@ -2277,7 +2282,41 @@ class _OneInjectionCtx:
 
 
 @pytest.mark.asyncio
-async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
+@pytest.mark.parametrize(
+    ("input_value", "multimodal", "expected_content"),
+    [
+        ("steer me", False, "steer me"),
+        ([{"type": "input_text", "text": "steer me"}], True, "steer me"),
+        (
+            [{"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}],
+            True,
+            [{"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}],
+        ),
+        (
+            [
+                {"type": "input_text", "text": "!echo inspect this"},
+                {"type": "input_file", "filename": "note.txt", "file_data": "aGVsbG8="},
+            ],
+            True,
+            [
+                {"type": "input_text", "text": "!echo inspect this"},
+                {"type": "input_file", "filename": "note.txt", "file_data": "aGVsbG8="},
+            ],
+        ),
+        (
+            [
+                {"type": "input_text", "text": "inspect this"},
+                {"type": "input_file", "filename": "note.txt", "file_data": "aGVsbG8="},
+            ],
+            False,
+            "inspect this",
+        ),
+    ],
+    ids=["plain-text", "text-block", "image-only", "bang-with-file", "text-only-executor"],
+)
+async def test_watch_injections_emits_consumed_marker_on_accept(
+    input_value: str | list[dict[str, Any]], multimodal: bool, expected_content: Any
+) -> None:
     """An accepted mid-turn injection echoes an injection.consumed marker.
 
     The runner stamps an ``injection_id`` on a forwarded mid-turn message;
@@ -2293,10 +2332,10 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
 
-    executor = _AcceptingInjectionExecutor()
+    executor = _AcceptingInjectionExecutor(multimodal=multimodal)
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
     ctx = _OneInjectionCtx(
-        CreateResponseRequest(model="m", input="steer me", injection_id="inj_x")
+        CreateResponseRequest(model="m", input=input_value, injection_id="inj_x")
     )
 
     task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
@@ -2312,7 +2351,7 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
 
     # The injection text reached the inner executor under the adapter's
     # session key.
-    assert executor.received == [("sk", "steer me")]
+    assert executor.received == [("sk", expected_content)]
     # Exactly one injection.consumed marker, echoing the correlation id.
     # If 0, the runner would never drop the buffered copy → duplication.
     assert len(ctx.emitted) == 1, f"expected one consumed marker, got {ctx.emitted!r}"
@@ -2331,6 +2370,10 @@ class _ScriptedInjectionExecutor:
         :param outcome: ``True``/``False`` to return, or an exception to raise.
         """
         self.outcome = outcome
+
+    def supports_multimodal_live_message_queue(self) -> bool:
+        """Keep this delivery-outcome stub on the plain-text path."""
+        return False
 
     async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
         """Return or raise the scripted outcome.

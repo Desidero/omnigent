@@ -55,6 +55,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
+    record_user_shell_turn,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -2898,12 +2899,17 @@ async def _subscribe_until_ready_inner(
         if bridge_state is not None and bridge_state.thread_id == thread_id
         else None
     )
+    shell_pending = (
+        bridge_state is not None
+        and bridge_state.thread_id == thread_id
+        and bridge_state.pending_shell_command_id is not None
+    )
     saw_not_ready = False
     while True:
         received_live_items = client.is_subscribed_to_thread(thread_id)
         try:
             params: _JsonObject = {"threadId": thread_id}
-            if not saw_not_ready and replay_from_turn_id is None:
+            if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
                 params["excludeTurns"] = True
             response = await client.request("thread/resume", params)
         except asyncio.CancelledError:
@@ -3084,7 +3090,12 @@ async def _replay_resume_response(
                     session_id=session_id,
                     bridge_dir=bridge_dir,
                     event={
-                        "method": "item/completed",
+                        "method": (
+                            "item/started"
+                            if _user_shell_command(item) is not None
+                            and item.get("status") == "inProgress"
+                            else "item/completed"
+                        ),
                         "params": {
                             "threadId": thread_id,
                             "turnId": turn_id,
@@ -3178,6 +3189,12 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
+        items = turn.get("items")
+        if state.pending_shell_command_id is not None and isinstance(items, list):
+            if any(
+                isinstance(item, dict) and _user_shell_command(item) is not None for item in items
+            ):
+                record_user_shell_turn(bridge_dir, thread_id, turn_id)
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
@@ -3309,6 +3326,13 @@ async def _handle_event(
         return
     event_state = forwarder_state
     event_bridge_dir = bridge_dir if not is_child else None
+    if method == "item/started" and event_bridge_dir is not None:
+        item = params.get("item")
+        if isinstance(item, dict) and _user_shell_command(item) is not None:
+            thread_id = _thread_id_from_params(params)
+            turn_id = _turn_id_from_payload(params)
+            if thread_id is not None and turn_id is not None:
+                record_user_shell_turn(event_bridge_dir, thread_id, turn_id)
     child_usage_baseline: _UsageTotals | None = None
     if is_child and forwarder_state is not None:
         child_thread_id = _thread_id_from_params(params)
