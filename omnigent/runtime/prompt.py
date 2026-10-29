@@ -15,6 +15,7 @@ from omnigent.entities import (
     NativeToolData,
 )
 from omnigent.inner.native_attachments import expand_framework_notices
+from omnigent.link_rules import LinkRule, describe_link_syntax, enabled_link_rules
 from omnigent.runtime.chat_features import ChatFeature, chat_feature_instructions
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import (
@@ -96,6 +97,24 @@ ITEM_LABEL_INSTRUCTION = (
 )
 
 
+def link_rule_instructions(rules: Sequence[LinkRule]) -> list[str]:
+    """The chat-links instruction for the user's enabled link rules.
+
+    The chat UI links these references (web/src/lib/linkRules.ts) wherever
+    they appear as plain text, so agents should write them bare.
+
+    :param rules: The user's link rules, saved or default.
+    :returns: One instruction naming each enabled rule's syntax, or none.
+    """
+    syntaxes = [describe_link_syntax(rule) for rule in enabled_link_rules(rules)]
+    if not syntaxes:
+        return []
+    return [
+        "Chat links: the chat UI turns these references into links when they "
+        "appear as plain text, not inside code or a markdown link: " + "; ".join(syntaxes) + "."
+    ]
+
+
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.
@@ -129,19 +148,26 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
 def native_startup_instructions(
     author_instructions: str | None,
     chat_features: Iterable[ChatFeature],
+    link_rules: Sequence[LinkRule] = (),
 ) -> str | None:
     """Author instructions plus the framework text a native launch channel carries.
 
     Native harnesses take instructions once, at launch, so only framework
-    instructions that hold for every turn of the session belong here.
+    instructions that hold for every turn of the session belong here. A link
+    rule changed later reaches the agent on its next launch.
 
     :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
     :param chat_features: The session's enabled chat features.
+    :param link_rules: The user's chat link rules at launch.
     :returns: The combined text, or ``None`` when there is nothing to send.
     """
     return append_framework_instructions(
         author_instructions,
-        [ITEM_LABEL_INSTRUCTION, *chat_feature_instructions(chat_features)],
+        [
+            ITEM_LABEL_INSTRUCTION,
+            *chat_feature_instructions(chat_features),
+            *link_rule_instructions(link_rules),
+        ],
     )
 
 

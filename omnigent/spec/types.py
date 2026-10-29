@@ -890,6 +890,7 @@ class ToolGroupsConfig:
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param link_rules: ``sys_link_rules``, for the user's chat link rules.
     """
 
     browser: bool = True
@@ -897,6 +898,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    link_rules: bool = True
 
 
 @dataclass

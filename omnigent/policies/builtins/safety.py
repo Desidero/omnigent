@@ -464,6 +464,43 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+# The chat link-rule tool. Its rules run in every viewer's browser, so the
+# builder injects ``ask_on_link_rule_change`` and exempts it from the fast path.
+LINK_RULE_APPROVAL_TOOLS: frozenset[str] = frozenset({"sys_link_rules"})
+
+
+def ask_on_link_rule_change(event: PolicyEvent) -> PolicyResponse:
+    """ASK for user approval before an agent changes a chat link rule.
+
+    Matches ``event["target"]`` like :func:`ask_on_scheduled_task_change`.
+    Listing the rules (``action: "list"``) is not gated.
+
+    :param event: Policy event dict.
+    :returns: ASK for an add, update or remove; ALLOW otherwise.
+    """
+    if event.get("type") != "tool_call" or event.get("target") not in LINK_RULE_APPROVAL_TOOLS:
+        return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    if not isinstance(args, dict):
+        args = {}
+    action = args.get("action")
+    if action == "list":
+        return _ALLOW
+    name = _clip(str(args.get("name") or "(unnamed)"))
+    fields = [
+        f"{key}={_clip(str(args[key]))}"
+        for key in ("new_name", "kind", "pattern", "url", "enabled")
+        if key in args
+    ]
+    detail = f" ({', '.join(fields)})" if fields else ""
+    verb = action if action in ("add", "update", "remove") else "change"
+    return {
+        "result": "ASK",
+        "reason": f"Agent wants to {verb} chat link rule {name!r}{detail}. Approve?",
+    }
+
+
 # ── Skill blocking ──────────────────────────────────────────────────────────
 
 

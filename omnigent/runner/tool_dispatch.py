@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.link_rules import LinkRuleError, validate_link_rules
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -442,6 +443,10 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
+# Priority 5l.2: Chat link rules — the runner proxies the Omnigent server's
+# /v1/link-rules endpoints, which validate every rule.
+_LINK_RULE_TOOLS = frozenset({"sys_link_rules"})
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -495,6 +500,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _LINK_RULE_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -905,6 +911,7 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _LINK_RULE_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -5111,6 +5118,118 @@ async def _execute_scheduled_task_tool(
     return json.dumps(resp.json())
 
 
+_LINK_RULE_FIELDS = ("kind", "pattern", "url", "enabled")
+
+
+def _changed_link_rules(rules: list[_JsonObject], args: _JsonObject) -> list[_JsonObject] | str:
+    """Apply one add/update/remove to the rule list, or explain why it can't apply.
+
+    :param rules: The rules in effect, as ``GET /v1/link-rules`` returns them.
+    :param args: The tool arguments; ``action`` is ``add``, ``update`` or ``remove``.
+    :returns: The new list, or an error message.
+    """
+    action = args.get("action")
+    name = args.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return f"{action} needs the rule's name"
+    folded = name.strip().casefold()
+    index = next(
+        (at for at, rule in enumerate(rules) if str(rule.get("name", "")).casefold() == folded),
+        None,
+    )
+    if action == "add":
+        if index is not None:
+            return f"a rule named {name.strip()!r} already exists; use update"
+        added: _JsonObject = {"name": name.strip(), "kind": "url", "enabled": True}
+        added.update({key: args[key] for key in _LINK_RULE_FIELDS if key in args})
+        return [*rules, added]
+    if index is None:
+        names = ", ".join(repr(rule.get("name")) for rule in rules) or "none"
+        return f"no rule named {name.strip()!r} (rules: {names})"
+    if action == "remove":
+        return [rule for at, rule in enumerate(rules) if at != index]
+    changed = {**rules[index]}
+    changed.update({key: args[key] for key in _LINK_RULE_FIELDS if key in args})
+    if isinstance(args.get("new_name"), str):
+        changed["name"] = args["new_name"]
+    return [changed if at == index else rule for at, rule in enumerate(rules)]
+
+
+async def _execute_link_rules_tool(
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Runner-local handler for ``sys_link_rules``.
+
+    Lists the rules, or reads them, applies one change, checks the result with
+    the server's validator and writes the whole list back with the version it
+    read, so a concurrent edit is refused instead of overwritten.
+
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :param server_client: HTTP client pointed at the Omnigent server; ``None``
+        returns an error string.
+    :returns: Tool output JSON string.
+    """
+    tool = "sys_link_rules"
+    if server_client is None:
+        return json.dumps({"error": f"{tool} requires server access"})
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool}: malformed JSON arguments"})
+    action = args.get("action")
+    if action not in ("list", "add", "update", "remove"):
+        return json.dumps({"error": f"{tool}: action must be list, add, update or remove"})
+    try:
+        current = await server_client.get("/v1/link-rules", timeout=30.0)
+        if current.status_code >= 400:
+            return json.dumps(
+                {"error": f"server returned {current.status_code}", "details": current.text[:500]}
+            )
+        state = current.json()
+        rules = [
+            {key: value for key, value in rule.items() if value is not None}
+            for rule in state.get("rules", [])
+        ]
+        if action == "list":
+            return json.dumps({"saved": state.get("saved"), "rules": rules})
+        if not state.get("supported"):
+            return json.dumps(
+                {"error": "saving link rules needs shared preferences enabled on the server"}
+            )
+        changed = _changed_link_rules(rules, args)
+        if isinstance(changed, str):
+            return json.dumps({"error": f"{tool}: {changed}"})
+        try:
+            validate_link_rules(changed)
+        except LinkRuleError as exc:
+            return json.dumps({"error": f"{tool}: {exc}"})
+        resp = await server_client.put(
+            "/v1/link-rules",
+            json={"rules": changed, "expected_version": state.get("version", 0)},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool} failed: {exc}"})
+    if resp.status_code == 409:
+        return json.dumps({"error": f"{tool}: the rules changed meanwhile; list them and retry"})
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        )
+    saved = resp.json()
+    return json.dumps(
+        {
+            "saved": saved.get("saved"),
+            "rules": [
+                {key: value for key, value in rule.items() if value is not None}
+                for rule in saved.get("rules", [])
+            ],
+        }
+    )
+
+
 @dataclass
 class _ParsedTitle:
     """
@@ -7384,6 +7503,8 @@ async def execute_tool(
                 arguments,
                 server_client=server_client,
             )
+        elif tool_name in _LINK_RULE_TOOLS:
+            output = await _execute_link_rules_tool(arguments, server_client=server_client)
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
                 tool_name,

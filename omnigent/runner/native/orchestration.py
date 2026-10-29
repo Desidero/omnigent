@@ -69,6 +69,7 @@ from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
+from omnigent.link_rules import LinkRule
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -80,6 +81,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native.native_dispatch import resolve_hook
+from omnigent.native.native_terminal import fetch_link_rules
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
@@ -5636,6 +5638,7 @@ async def _auto_create_codex_terminal(
                 native_startup_instructions(
                     _native_startup_raw_instructions_from_spec(agent_spec),
                     launch_config.chat_features,
+                    await _launch_link_rules(server_client),
                 ),
                 _codex_routing_note,
             ]
@@ -7526,6 +7529,17 @@ def _session_init_chat_features(
     if session_init is None or "chat_features" not in session_init.snapshot.model_fields_set:
         return DEFAULT_CHAT_FEATURES
     return chat_features_from_wire(getattr(session_init.snapshot, "chat_features", None))
+
+
+async def _launch_link_rules(
+    server_client: httpx.AsyncClient | None,
+) -> tuple[LinkRule, ...]:
+    """The user's chat link rules for a native launch; none without a server.
+
+    :param server_client: The runner's client to the Omnigent server, or ``None``.
+    :returns: The rules in effect, or ``()`` when they can't be read.
+    """
+    return () if server_client is None else await fetch_link_rules(server_client)
 
 
 def _native_startup_raw_instructions_from_spec(
@@ -9603,6 +9617,7 @@ async def _auto_create_claude_terminal(
                 native_startup_instructions(
                     _native_startup_raw_instructions_from_spec(agent_spec),
                     launch_metadata.chat_features,
+                    await _launch_link_rules(server_client),
                 ),
                 routed_spawn_note,
             ]

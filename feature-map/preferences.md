@@ -30,7 +30,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
 - `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
   the `link_rules` shared preference, validated on save and served with the
   defaults by `GET`/`PUT /v1/link-rules`, edited in Settings → General → Chat
-  links and applied to every chat message.
+  links and applied to every chat message. Agents change them with
+  `sys_link_rules` after the user approves, and are told the active syntaxes.
 
 - `configuration-copy`: review, save, show and import model defaults, harness
   selection/arguments and launcher plugin opt-outs; preserve local-only values.
@@ -99,6 +100,18 @@ cd web && npx vitest run src/lib/linkRules.test.ts \
   src/components/blocks/ChatMarkdown.linkRules.test.tsx \
   src/components/chat/LinkRulesScope.test.ts \
   src/pages/settings/LinkRulesSettingsGroup.test.tsx
+```
+
+**Agents and link rules:** in a session, ask the agent to add a rule (for
+example "link BST-123 to https://jira.example.com/browse/BST-123"). The
+`sys_link_rules` call waits on an approval card naming the rule; approve it and
+check the rule appears in Settings → General → Chat links and that `BST-7` in
+a later message renders as a link. Deny it and check nothing changed. Ask the
+agent to list the rules: that call is not gated. Component coverage:
+
+```sh
+uv run --no-sync pytest tests/runner/test_link_rules_tool_dispatch.py \
+  tests/runtime/test_prompt.py -k "link_rule" tests/test_native_terminal.py --reruns 0 -q
 ```
 
 **Shared scope controls:** the CLI and UI do not yet offer automatic following,

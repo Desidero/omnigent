@@ -426,3 +426,29 @@ async def test_fetch_session_chat_features(
 
     assert features == expected
     assert paths == ["/v1/sessions/conv%2Fabc"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload", "expected"),
+    [
+        (200, {"rules": [{"name": "GitHub", "kind": "github", "url": None}]}, ("GitHub",)),
+        (404, {"detail": "Not Found"}, ()),
+        (200, {"rules": [{"name": "x", "kind": "url", "pattern": "/(a+)+/"}]}, ()),
+        (200, {"rules": "nope"}, ()),
+    ],
+)
+async def test_fetch_link_rules(
+    status_code: int, payload: dict[str, object], expected: tuple[str, ...]
+) -> None:
+    """The caller's rules feed a launch's instructions; any failed read means none."""
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/link-rules"
+        return httpx.Response(status_code, json=payload)
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(_handler)
+    ) as client:
+        rules = await native_terminal.fetch_link_rules(client)
+
+    assert tuple(rule.name for rule in rules) == expected

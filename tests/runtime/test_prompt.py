@@ -2,12 +2,14 @@
 
 import json
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
+from omnigent.link_rules import DEFAULT_LINK_RULES
 from omnigent.runner.subagent_work import (
     _format_subagent_wake_notice,
 )
@@ -22,6 +24,7 @@ from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
     history_to_input_items,
+    link_rule_instructions,
     native_startup_instructions,
     raw_author_instructions,
 )
@@ -458,6 +461,35 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
     result = build_instructions_nullable(spec, None, [])
     assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+
+
+def test_link_rule_instructions_name_each_enabled_syntax() -> None:
+    """The chat-links instruction lists only enabled rules, and none means no text."""
+    [instruction] = link_rule_instructions(DEFAULT_LINK_RULES)
+    assert "`#123` or `owner/repo#123`" in instruction
+    assert "`session:<session id>`" in instruction
+    assert "ABC-123" not in instruction  # the Jira example is off by default
+    assert "not inside code" in instruction
+    assert link_rule_instructions(()) == []
+    disabled = [replace(rule, enabled=False) for rule in DEFAULT_LINK_RULES]
+    assert link_rule_instructions(disabled) == []
+
+
+def test_native_startup_instructions_carry_link_rules_last() -> None:
+    """A native launch appends the chat-links instruction after the other framework text."""
+    text = native_startup_instructions("Agent prompt", frozenset(), DEFAULT_LINK_RULES)
+    assert text is not None
+    assert text.startswith(f"Agent prompt\n\n{ITEM_LABEL_INSTRUCTION}")
+    assert text.endswith(link_rule_instructions(DEFAULT_LINK_RULES)[0])
+
+
+def test_build_instructions_takes_link_rules_as_framework_text() -> None:
+    """SDK turns pass the per-turn chat-links instruction as framework text."""
+    spec = _spec("Author.")
+    [instruction] = link_rule_instructions(DEFAULT_LINK_RULES)
+    assert build_instructions(spec, None, [], framework_instructions=[instruction]).endswith(
+        instruction
+    )
 
 
 def test_native_startup_instructions_append_item_labels_after_author_text() -> None:

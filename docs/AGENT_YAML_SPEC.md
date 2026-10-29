@@ -905,6 +905,7 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  link_rules: false       # sys_link_rules (chat link rules)
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values

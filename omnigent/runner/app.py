@@ -70,12 +70,14 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.link_rules import LinkRule
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
+from omnigent.native.native_terminal import fetch_link_rules
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals, pr_reports
 from omnigent.runner import subagent_work as _subagent_work
@@ -207,6 +209,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
+    link_rule_instructions,
     raw_author_instructions,
 )
 from omnigent.server.schemas import (
@@ -221,6 +224,8 @@ _logger = logging.getLogger(__name__)
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
+# How long a turn's chat-links instruction reuses the last read of the rules.
+_LINK_RULES_CACHE_TTL_S = 60.0
 
 
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
@@ -1313,6 +1318,8 @@ def create_runner_app(
     # session_id → enabled chat features, seeded from the session-init snapshot
     # and refreshed by every forwarded turn body, so a PATCH applies next turn.
     _session_chat_features: dict[str, frozenset[ChatFeature]] = {}
+    # (fetched at, rules): the user's chat link rules, re-read after a TTL.
+    _link_rules_cache: list[tuple[float, tuple[LinkRule, ...]]] = []
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -5109,6 +5116,18 @@ def create_runner_app(
         """
         return _resolve_turn_chat_features(_session_chat_features, conv, msg_body)
 
+    async def _turn_link_rule_instructions() -> list[str]:
+        """The chat-links instruction for this turn, from rules cached briefly.
+
+        Rules are per user and a runner serves one user, so one cache entry
+        covers every session; a saved change reaches the next turn after
+        :data:`_LINK_RULES_CACHE_TTL_S`.
+        """
+        now = time.monotonic()
+        if not _link_rules_cache or now - _link_rules_cache[0][0] > _LINK_RULES_CACHE_TTL_S:
+            _link_rules_cache[:] = [(now, await fetch_link_rules(server_client))]
+        return link_rule_instructions(_link_rules_cache[0][1])
+
     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
         """Reasoning block to forward on a turn, or ``None`` when unset.
 
@@ -5233,12 +5252,14 @@ def create_runner_app(
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
             _bg_chat_features = _turn_chat_features(conv, msg_body)
+            _bg_link_rules = await _turn_link_rule_instructions()
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
                     chat_features=_bg_chat_features,
+                    framework_instructions=_bg_link_rules,
                 )
             else:
                 instructions = build_instructions(
@@ -5246,6 +5267,7 @@ def create_runner_app(
                     _raw_per_request_instructions,
                     [],
                     chat_features=_bg_chat_features,
+                    framework_instructions=_bg_link_rules,
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -5920,6 +5942,7 @@ def create_runner_app(
                         _per_req_instr = cast(str | None, body.get("instructions"))
                         _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
                         _ds_chat_features = _turn_chat_features(conv_id, body)
+                        _ds_link_rules = await _turn_link_rule_instructions()
                         _ic_ds = InstructionComposition(
                             authored_present=_authored_ds,
                             composed=build_instructions_nullable(
@@ -5927,6 +5950,7 @@ def create_runner_app(
                                 _per_req_instr,
                                 [],
                                 chat_features=_ds_chat_features,
+                                framework_instructions=_ds_link_rules,
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
@@ -5942,6 +5966,7 @@ def create_runner_app(
                                     _per_req_instr,
                                     [],
                                     chat_features=_ds_chat_features,
+                                    framework_instructions=_ds_link_rules,
                                 ),
                             }
                         if _authored_ds and harness_name:

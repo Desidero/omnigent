@@ -30,7 +30,10 @@ from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
-from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
+from omnigent.policies.builtins.safety import (
+    LINK_RULE_APPROVAL_TOOLS,
+    SCHEDULED_TASK_APPROVAL_TOOLS,
+)
 from omnigent.policies.function import resolve_function_policy
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -96,10 +99,21 @@ _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
     ),
 )
 
+# Chat link rules run in every viewer's browser: each change asks first.
+_ASK_ON_LINK_RULE_CHANGE_SPEC = FunctionPolicySpec(
+    name="__ask_on_link_rule_change",
+    on=None,
+    function=FunctionRef(
+        path="omnigent.policies.builtins.safety.ask_on_link_rule_change",
+        arguments=None,
+    ),
+)
+
 # Appended to every engine after the session, agent, and admin policies.
 _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
     _ASK_ON_ADD_POLICY_SPEC,
     _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC,
+    _ASK_ON_LINK_RULE_CHANGE_SPEC,
 )
 
 # Bounded cache of ``conversation_id -> session owner``. The owner
@@ -437,10 +451,12 @@ def any_policies_apply(
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
     # The engine unconditionally injects _REQUIRED_APPROVAL_SPECS, so their
-    # TOOL_CALL events must always reach it: never fast-path sys_add_policy
-    # or the scheduled-task mutation tools.
+    # TOOL_CALL events must always reach it: never fast-path sys_add_policy,
+    # the scheduled-task mutation tools or the link-rule tool.
     if phase == Phase.TOOL_CALL and (
-        tool_name == "sys_add_policy" or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
+        tool_name == "sys_add_policy"
+        or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
+        or tool_name in LINK_RULE_APPROVAL_TOOLS
     ):
         return True
     if spec.guardrails and spec.guardrails.policies:

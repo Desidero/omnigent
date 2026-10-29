@@ -121,3 +121,39 @@ config); without them the defaults apply and can't be changed.
   a version check.
 - The [shared preferences API](shared-preferences-api.md) reads and writes the
   same value, with its conflict handling.
+
+## Agents
+
+### The `sys_link_rules` tool
+
+Agents can read and change the rules with `sys_link_rules`:
+
+| `action` | Arguments | Effect |
+| --- | --- | --- |
+| `list` | none | Returns the rules in effect and whether they are saved |
+| `add` | `name`, then `kind` (default `url`), `pattern`, `url`, `enabled` (default true) | Appends a rule |
+| `update` | `name`, then any of `new_name`, `kind`, `pattern`, `url`, `enabled` | Changes one rule |
+| `remove` | `name` | Deletes one rule |
+
+Names match case-insensitively. The tool checks the changed list with the
+server's validator before saving it, and saves it with the version it read, so
+a change made meanwhile from Settings is refused rather than overwritten.
+
+Every `add`, `update` and `remove` parks on an approval prompt in the session,
+showing the rule's name, pattern and URL, even when no other policy applies
+(the built-in `__ask_on_link_rule_change` policy, like the one for scheduled
+tasks). `list` is not gated. Agents get the tool unless their spec sets
+`tool_groups.link_rules: false` ([agent YAML](AGENT_YAML_SPEC.md#tool-groups)),
+and native Claude and Codex sessions get it through the tool relay.
+
+### What agents are told
+
+Agents are told which references the chat links, so they write them as plain
+text instead of code: one short framework instruction listing each enabled
+rule's syntax, such as `` `#123` or `owner/repo#123` `` and `` `ABC-123`
+(Jira) ``. With every rule off there is no instruction.
+
+A rule saved mid-session renders in the chat right away. SDK harnesses read
+the rules again for a later turn (the runner keeps them for up to a minute).
+Native Claude and Codex sessions get their instructions once, at launch, so
+they see a changed rule in their prompt only after their next launch.
