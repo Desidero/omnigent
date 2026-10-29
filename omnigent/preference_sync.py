@@ -113,9 +113,15 @@ class PreferenceMutation(ProtocolModel):
         if len(self.model_dump_json(include={"value"}).encode()) > MAX_VALUE_BYTES:
             raise ValueError("encoded preference value envelope exceeds 8192 bytes")
         if self.value is not None:
+            key = self.key.as_key()
             value = tuple(self.value) if isinstance(self.value, list) else self.value
-            PreferenceLayer(
-                PreferenceScope.SHARED, self.identity.as_identity(), {self.key.as_key(): value}
+            layer = PreferenceLayer(
+                PreferenceScope.SHARED, self.identity.as_identity(), {key: value}
+            )
+            # Store the canonical form, e.g. link rules as compact JSON.
+            canonical = layer.values[key]
+            object.__setattr__(
+                self, "value", list(canonical) if isinstance(canonical, tuple) else canonical
             )
         if len(self.resolves) != len(set(self.resolves)):
             raise ValueError("conflict IDs must be unique")
