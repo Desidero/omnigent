@@ -27,6 +27,9 @@ local; automatic client sync and shared/machine scope controls remain deferred.
 - `chat-features-default`: the chat features new sessions start with, saved as
   the `chat_features` shared preference from Settings → General and read by the
   server when it creates a session.
+- `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
+  the `link_rules` shared preference, validated on save and served with the
+  defaults by `GET`/`PUT /v1/link-rules`.
 
 - `configuration-copy`: review, save, show and import model defaults, harness
   selection/arguments and launcher plugin opt-outs; preserve local-only values.
@@ -76,6 +79,12 @@ each, and resolves them on save. Without `shared_preferences_authority_id` the
 switches are disabled with a note, and new sessions get every feature. The
 new-chat agent menu and the session configure menu set one session's features
 on any server.
+
+**Chat link rules API:** `GET /v1/link-rules` returns the rules in effect;
+`PUT /v1/link-rules` with `expected_version` replaces them (`rules: null`
+restores the defaults). Covered by `tests/test_link_rules.py` (pattern and URL
+checks) and `tests/server/routes/test_link_rules.py` (per-user storage, stale
+versions, rejected rules, a server without shared preferences).
 
 **Shared scope controls:** the CLI and UI do not yet offer automatic following,
 saving machine overrides, removing a machine override,

@@ -118,9 +118,11 @@ class PreferenceMutation(ProtocolModel):
             layer = PreferenceLayer(
                 PreferenceScope.SHARED, self.identity.as_identity(), {key: value}
             )
-            if isinstance(canonical := layer.values[key], tuple):
-                # Store the canonical form, e.g. a chat-feature set's sorted unique keys.
-                object.__setattr__(self, "value", list(canonical))
+            # Store the canonical form, e.g. a chat-feature set's sorted unique keys.
+            canonical = layer.values[key]
+            object.__setattr__(
+                self, "value", list(canonical) if isinstance(canonical, tuple) else canonical
+            )
         if len(self.resolves) != len(set(self.resolves)):
             raise ValueError("conflict IDs must be unique")
         return self

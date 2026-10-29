@@ -129,6 +129,7 @@ from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import (
     create_chat_features_router,
+    create_link_rules_router,
     create_preferences_router,
 )
 from omnigent.server.routes.projects import create_projects_router
@@ -3865,6 +3866,11 @@ def create_app(
         create_chat_features_router(auth_provider),
         prefix="/v1",
         tags=["chat-features"],
+    )
+    app.include_router(
+        create_link_rules_router(preference_store, auth_provider, policy=preference_policy),
+        prefix="/v1",
+        tags=["link-rules"],
     )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───

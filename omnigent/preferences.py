@@ -13,6 +13,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypeAlias
 
+from omnigent.link_rules import encode_link_rules, parse_link_rules_json
+
 
 class PreferenceScope(StrEnum):
     BUILTIN = "builtin"
@@ -64,6 +66,7 @@ class PreferenceKind(StrEnum):
     HARNESS_ARGS = "harness_args"
     PLUGIN = "plugin"
     CHAT_FEATURES = "chat_features"
+    LINK_RULES = "link_rules"
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,8 @@ class PreferenceKey:
             raise ValueError("the harness preference key must be 'default'")
         if self.kind == PreferenceKind.CHAT_FEATURES and self.name != "default":
             raise ValueError("the chat_features preference key must be 'default'")
+        if self.kind == PreferenceKind.LINK_RULES and self.name != "default":
+            raise ValueError("the link_rules preference key must be 'default'")
         if self.kind == PreferenceKind.HARNESS_ARGS:
             from omnigent.harness_aliases import canonicalize_harness
 
@@ -101,9 +106,12 @@ PreferenceValue: TypeAlias = str | bool | tuple[str, ...]
 
 
 def normalize_preference_value(key: PreferenceKey, value: PreferenceValue) -> PreferenceValue:
-    """Canonical form of ``value``: a chat-feature set is unique keys in sorted order."""
+    """Canonical form of ``value``: a chat-feature set is unique keys in sorted order,
+    link rules are compact JSON with trimmed names."""
     if key.kind == PreferenceKind.CHAT_FEATURES and isinstance(value, tuple):
         return tuple(sorted(set(value)))
+    if key.kind == PreferenceKind.LINK_RULES and isinstance(value, str):
+        return encode_link_rules(parse_link_rules_json(value))
     return value
 
 
@@ -123,6 +131,12 @@ def _validate_value(key: PreferenceKey, value: PreferenceValue) -> None:
             isinstance(feature, str) and feature and feature == feature.strip()
             for feature in value
         )
+    elif key.kind == PreferenceKind.LINK_RULES:
+        if not isinstance(value, str):
+            raise ValueError("link_rules must be a JSON array of rules, as a string")
+        # LinkRuleError is a ValueError naming the rule and field at fault.
+        parse_link_rules_json(value)
+        valid = True
     else:
         valid = isinstance(value, str) and bool(value.strip())
     if not valid:

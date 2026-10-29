@@ -1544,6 +1544,42 @@ Updated clients preserve later bubbles when that older server's receipt arrives.
 
 ---
 
+## Chat Link Rules (`/v1/link-rules`)
+
+The caller's [chat link rules](../../docs/chat-link-rules.md): short references
+in chat messages that the web UI renders as links. They are stored as the
+`link_rules` shared preference, so saving needs shared preferences on the
+server (`shared_preferences_authority_id`); reading always works.
+
+### Get Link Rules
+
+```
+GET /v1/link-rules
+-> 200 {
+  "supported": true,          // false: no shared preferences, rules are read-only
+  "saved": false,             // false: the defaults apply
+  "version": 0,               // send back as expected_version
+  "rules": [{"name": "GitHub", "kind": "github", "pattern": "", "url": null, "enabled": true}, ...],
+  "defaults": [...]
+}
+```
+
+### Replace Link Rules
+
+```
+PUT /v1/link-rules
+{"rules": [{"name": "Jira", "kind": "url", "pattern": "BST-{num}",
+            "url": "https://jira.example.com/browse/BST-{num}", "enabled": true}],
+ "expected_version": 1}
+-> 200 (same shape as GET)
+```
+
+`rules` is the whole list; `null` removes the saved rules so the defaults apply.
+Returns 422 with the rule and field at fault when a rule fails validation, and
+409 when `expected_version` is stale or the server has no shared preferences.
+
+---
+
 ## Not Yet
 
 - `PUT /api/agents/{id}` — update agent (new bundle)

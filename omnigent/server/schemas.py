@@ -5334,6 +5334,47 @@ class ChatFeatureCatalogResponse(BaseModel):
     available: list[ChatFeatureOption]
 
 
+class LinkRuleModel(BaseModel):
+    """One chat link rule; see ``docs/chat-link-rules.md``."""
+
+    name: str = Field(description="Unique display name, e.g. 'Jira'.")
+    kind: Literal["url", "github", "session"]
+    pattern: str = Field(
+        default="",
+        description="url kind: a short form like 'BST-{num}' or a raw '/regex/'; "
+        "empty for github and session.",
+    )
+    url: str | None = Field(
+        default=None,
+        description="url kind: the http(s) link template, e.g. "
+        "'https://jira.example.com/browse/BST-{num}'.",
+    )
+    enabled: bool = True
+
+
+class LinkRulesResponse(BaseModel):
+    """The caller's chat link rules."""
+
+    supported: bool = Field(
+        description="False when the server has no shared preferences, so rules can't be saved."
+    )
+    saved: bool = Field(description="False when the defaults apply because nothing is saved.")
+    version: int = Field(description="Send back as expected_version when saving; 0 if unsaved.")
+    rules: list[LinkRuleModel] = Field(description="The rules in effect, saved or default.")
+    defaults: list[LinkRuleModel]
+
+
+class LinkRulesUpdateRequest(BaseModel):
+    """Replace the caller's link rules, or reset them with ``rules: null``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rules: list[dict[str, Any]] | None = Field(
+        description="The full rule list; null removes the saved rules so the defaults apply."
+    )
+    expected_version: int = Field(ge=0, description="The version the edit replaces.")
+
+
 # ── Projects ──────────────────────────────────────────────────────
 
 
