@@ -1,7 +1,8 @@
 // Project settings dialog: edits the stored defaults (`config`) the new-session
 // composer prefills (host, workspace, agent, worktree and base branch, and a model
-// and effort for native harnesses), plus default labels the server stamps on new
-// sessions at creation. An unset field stores no key.
+// and effort for native harnesses), shown with the project's last start applied,
+// plus default labels the server stamps on new sessions at creation. An unset
+// field stores no key.
 
 import { ChevronDownIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -41,6 +42,11 @@ import {
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import {
+  clearProjectLaunchDefaults,
+  projectConfigWithLaunch,
+  readProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { labelRecordFromUnknown, labelsEqual } from "@/lib/sessionLabels";
 import { AgentHarnessPicker } from "./NewChatDialog";
@@ -101,13 +107,22 @@ export function ProjectSettingsDialog({
   // fetch succeeds. A label-only folder (no id) has nothing to load, so it's
   // never in this state.
   const loadFailed = projectId !== null && isError;
+  // The project's last start fills the fields, as it does the composer, until
+  // the stored settings are edited after it; saving makes it the stored settings.
+  const launch = useMemo(
+    () =>
+      open && projectId !== null && stored !== undefined
+        ? readProjectLaunchDefaults(projectId, stored)
+        : null,
+    [open, projectId, stored],
+  );
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
   // Pin the stored default agent into discovery so an already-configured
   // session-scoped agent (archived / paginated out of the scan) still
   // resolves here — matching what the composer's prefill will see.
-  const { data: agents } = useAvailableAgents({
-    pinnedAgentIds: stored?.agent_id != null ? [stored.agent_id] : [],
+  const { data: agents, isPlaceholderData: agentsArePlaceholder } = useAvailableAgents({
+    pinnedAgentIds: [stored?.agent_id, launch?.agentId].filter((id): id is string => id != null),
   });
   const info = useServerInfo();
   // Sandbox is only a real default when the server can provision managed
@@ -194,7 +209,7 @@ export function ProjectSettingsDialog({
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
-    const c: ProjectConfig = stored ?? {};
+    const c: ProjectConfig = projectConfigWithLaunch(stored ?? {}, launch);
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
@@ -206,7 +221,7 @@ export function ProjectSettingsDialog({
     // The server stores config untyped, so ignore a malformed effort.
     setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
     setWorkspaceOpen(false);
-  }, [open, stored, loadFailed]);
+  }, [open, stored, loadFailed, launch]);
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -222,9 +237,16 @@ export function ProjectSettingsDialog({
         ? { ...labels, [pendingLabel.key]: pendingLabel.value }
         : labels;
     if (labelsToSave !== labels) setLabels(labelsToSave);
-    // Preserve config keys owned by other dialogs, then replace only the fields
-    // this form edits.
-    const config: ProjectConfig = { ...(stored ?? {}) };
+    // A last-start agent that no longer exists saves as the stored agent, even
+    // before the fallback effect below has re-rendered the field.
+    const savedAgentId = launchAgentGone ? (stored?.agent_id ?? null) : agentId;
+    // Preserve keys owned by other dialogs and replace only this form's fields,
+    // starting from what the fields were filled in with when saving that agent,
+    // so an agent still resolving keeps its own model and effort (agentUnresolved).
+    const seeded = projectConfigWithLaunch(stored ?? {}, launch);
+    const config: ProjectConfig = {
+      ...(savedAgentId === (seeded.agent_id ?? null) ? seeded : (stored ?? {})),
+    };
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
     // A workspace is host-relative and only meaningful with a concrete host —
@@ -234,7 +256,7 @@ export function ProjectSettingsDialog({
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
     else delete config.workspace;
-    if (agentId) config.agent_id = agentId;
+    if (savedAgentId) config.agent_id = savedAgentId;
     else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;
     // while it matches, leave the key unset so the project keeps inheriting
@@ -263,7 +285,14 @@ export function ProjectSettingsDialog({
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
-      { onSuccess: () => onOpenChange(false) },
+      {
+        onSuccess: () => {
+          // The saved settings replace the last start, even when they match the
+          // settings it was recorded against.
+          if (projectId !== null) clearProjectLaunchDefaults(projectId);
+          onOpenChange(false);
+        },
+      },
     );
   };
 
@@ -292,6 +321,20 @@ export function ProjectSettingsDialog({
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
   const agentLabel = selectedAgent ? selectedAgent.display_name : "No default";
+  // Like the composer, fall back to the stored agent when the last start's agent
+  // no longer exists, while the field still holds it.
+  const launchAgentGone =
+    launch?.agentId != null &&
+    agentId === launch.agentId &&
+    agents !== undefined &&
+    !agentsArePlaceholder &&
+    selectedAgent === null;
+  useEffect(() => {
+    if (!launchAgentGone) return;
+    setAgentId(stored?.agent_id ?? null);
+    setModel(stored?.model ?? NONE);
+    setEffort(typeof stored?.effort === "string" && stored.effort ? stored.effort : NONE);
+  }, [launchAgentGone, stored]);
   // Model default is offered for harnesses whose create call carries a model
   // override — the declared modelPicker capability, plus Codex, whose picker
   // is host-resolved rather than capability-flagged (mirrors the composer's
@@ -387,6 +430,11 @@ export function ProjectSettingsDialog({
             Defaults for new sessions in <span className="font-medium">{projectName}</span>. Each is
             a starting point you can change per session; leave a field blank for no default.
           </DialogDescription>
+          {launch !== null && (
+            <p className="text-muted-foreground text-sm" data-testid="project-settings-last-start">
+              Filled in from the last session you started in {projectName}.
+            </p>
+          )}
         </DialogHeader>
         <form
           id="project-settings-form"
