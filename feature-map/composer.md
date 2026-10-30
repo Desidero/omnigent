@@ -383,6 +383,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   after its current step in the timestamp row. The note stays visible, with
   truncation, on desktop and touch until the agent reads the message, while the
   row's timestamp and actions keep their hover reveal on desktop.
+- `queue-combine`: with two or more adjacent combinable messages queued, the
+  queue strip's header offers **Combine** (merge them into one message, texts
+  joined by a blank line, attachments kept) and, where rows can be steered,
+  **Send all** (combine, then steer the queue). `!` commands, `/`-led messages,
+  Codex `$` skills, failed sends and item-comment messages stay separate and in
+  place. Side-chat strips have the same actions.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
@@ -534,6 +540,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Hover one of your sent messages and click Edit and resend (pencil) to copy
   its text into the message box, revise, and send it as a new message.
   Attachments stay on the original message.
+- While the agent is working, queue two or three plain messages (one with an
+  attachment) and a `!git status`; the strip's header shows "N queued" with
+  **Combine** and **Send all**. Combine merges the plain messages into the
+  first one's row, leaving `!git status` on its own; Send all sends the
+  combined message and the rest into the running turn.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.
 - With a native session's host offline, send a message; it waits in the queue
@@ -1189,6 +1200,16 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   verifies their visibility without hover in the mobile layout, and
   `test_steering_explanation_stays_visible_on_desktop` keeps the notice visible
   without hover on desktop.
+- **`queue-combine`:** component coverage in
+  `web/src/pages/QueuedMessagesStrip.test.tsx`, the merge rules in
+  `web/src/lib/messageQueue.test.ts` and the store action in
+  `web/src/store/chatStore.test.ts`; no browser-level coverage. Manually, on a
+  desktop and a phone-sized viewport: hold a turn open, queue `one`, `two`
+  with an attachment, `!pwd` and `three`, `four`; Combine should leave three
+  rows (`one` + `two` with the attachment, `!pwd`, `three` + `four`), and Edit
+  on the first should restore both texts and the file. Repeat and use Send
+  all: the messages reach the turn in that order. With the host offline, Send
+  all is disabled and Combine still works.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
