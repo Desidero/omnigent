@@ -4,7 +4,7 @@ Date: Thu, 15 Oct 2026 09:22:44 +0000
 Subject: [PATCH] fix(web): keep toasts below the iOS status bar and Dynamic
  Island
 
-Carried on custom until our upstream PR for this lands (not opened yet).
+Carried on custom until upstream PR #11390 merges.
 
 Toasts render top-center with sonner's fixed 16px/24px top gap, so in the
 iOS app they sat under the status bar and Dynamic Island and could not be
@@ -13,29 +13,88 @@ with --omnigent-inset-bottom; give the top edge the matching
 --omnigent-inset-top. Desktop and Android without a top inset keep
 sonner's default gaps.
 
+The Toaster's top and bottom offsets are built in toasterOffsets(), next to
+updateOverlayToastOffset(), with unit tests, as in
+https://github.com/omnigent-ai/omnigent/pull/11390.
+
 Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Docs: none (layout fix: toasts clear the iOS status bar and Dynamic Island; nothing to configure)
 ---
- web/src/shell/AppShell.tsx | 3 +++
- 1 file changed, 3 insertions(+)
+ web/src/lib/updateOverlayInset.test.ts | 12 +++++++++++-
+ web/src/lib/updateOverlayInset.ts      |  9 +++++++++
+ web/src/shell/AppShell.tsx             | 12 +++---------
+ 3 files changed, 23 insertions(+), 10 deletions(-)
 
+diff --git a/web/src/lib/updateOverlayInset.test.ts b/web/src/lib/updateOverlayInset.test.ts
+index cb8c4578e739639ceb97b579b9d84f23a51b0744..957e78c66f9c2f4ccbde88c6e2da3ac366183def 100644
+--- a/web/src/lib/updateOverlayInset.test.ts
++++ b/web/src/lib/updateOverlayInset.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { updateOverlayToastOffset } from "./updateOverlayInset";
++import { toasterOffsets, updateOverlayToastOffset } from "./updateOverlayInset";
+ 
+ describe("updateOverlayToastOffset", () => {
+   it("uses only the normal safe-area offset while the overlay is hidden", () => {
+@@ -17,3 +17,13 @@ describe("updateOverlayToastOffset", () => {
+     expect(updateOverlayToastOffset(-20)).toContain("+ 0px");
+   });
+ });
++
++describe("toasterOffsets", () => {
++  it("keeps top toasts below the native status bar inset", () => {
++    const { offset, mobileOffset } = toasterOffsets(0);
++    expect(offset.top).toBe("calc(24px + var(--omnigent-inset-top))");
++    expect(mobileOffset.top).toBe("calc(16px + var(--omnigent-inset-top))");
++    expect(offset.bottom).toBe(updateOverlayToastOffset(0));
++    expect(mobileOffset.bottom).toBe(updateOverlayToastOffset(0));
++  });
++});
+diff --git a/web/src/lib/updateOverlayInset.ts b/web/src/lib/updateOverlayInset.ts
+index 617011ca1cd1c664efef170da633903abd7b07f1..65eb3ff5801310755b1ace9226370615ace01437 100644
+--- a/web/src/lib/updateOverlayInset.ts
++++ b/web/src/lib/updateOverlayInset.ts
+@@ -3,3 +3,12 @@ export function updateOverlayToastOffset(height: number): string {
+   const overlayInset = normalized > 0 ? normalized + 12 : 0;
+   return `calc(1rem + var(--omnigent-inset-bottom) + ${overlayInset}px)`;
+ }
++
++/** Toaster offsets: top clears the native status bar / Dynamic Island, bottom the update overlay. */
++export function toasterOffsets(updateOverlayHeight: number) {
++  const bottom = updateOverlayToastOffset(updateOverlayHeight);
++  return {
++    offset: { top: "calc(24px + var(--omnigent-inset-top))", right: "1rem", bottom },
++    mobileOffset: { top: "calc(16px + var(--omnigent-inset-top))", right: "1rem", bottom },
++  };
++}
 diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
-index f4ec7bbe4cd773229c324713c45b8082e5b73032..26b79f4895477f1d679bc55255d3bc2864cb4a16 100644
+index f4ec7bbe4cd773229c324713c45b8082e5b73032..8b81b85704dce1681b8979db06df3a9b98aa6915 100644
 --- a/web/src/shell/AppShell.tsx
 +++ b/web/src/shell/AppShell.tsx
-@@ -2892,11 +2892,14 @@ function AppShellImpl() {
+@@ -62,7 +62,7 @@ import {
+   writeDefaultWorkspacePanelOpen,
+ } from "@/lib/workspacePanelPreferences";
+ import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
+-import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
++import { toasterOffsets } from "@/lib/updateOverlayInset";
+ import {
+   type DefaultWorkspaceTab,
+   isDefaultWorkspaceTab,
+@@ -2892,14 +2892,8 @@ function AppShellImpl() {
            <Toaster
              position="top-center"
              visibleToasts={100}
-+            // Top toasts start below the iOS status bar / Dynamic Island.
-             offset={{
-+              top: "calc(24px + var(--omnigent-inset-top))",
-               right: "1rem",
-               bottom: updateOverlayToastOffset(updateOverlayHeight),
-             }}
-             mobileOffset={{
-+              top: "calc(16px + var(--omnigent-inset-top))",
-               right: "1rem",
-               bottom: updateOverlayToastOffset(updateOverlayHeight),
-             }}
+-            offset={{
+-              right: "1rem",
+-              bottom: updateOverlayToastOffset(updateOverlayHeight),
+-            }}
+-            mobileOffset={{
+-              right: "1rem",
+-              bottom: updateOverlayToastOffset(updateOverlayHeight),
+-            }}
++            // Keep top toasts below the native status bar / Dynamic Island.
++            {...toasterOffsets(updateOverlayHeight)}
+           />
+         </ForkDialogContextProvider>
+       </TerminalFirstContextProvider>

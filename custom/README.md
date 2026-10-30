@@ -24,7 +24,7 @@ are dropped from the series.
 | Path | What |
 | --- | --- |
 | `custom/BASE` | The upstream commit the series applies to. The branch merges upstream up to exactly this commit. |
-| `custom/series` | The patches in apply order, grouped into named series (`# series: <name>`). A `# needs: <name>` line means that series expects another one first. |
+| `custom/series` | The patches in apply order, grouped into named series (`# series: <name>`), one block per series. A `# needs: <name>` line means that series expects another one first, and it comes earlier in the file. |
 | `custom/patches/*.patch` | `git format-patch` files, one per commit, named `<series>--<subject>.patch`. |
 | `custom/proposals/<series>/` | The draft upstream PR description (`PR.md`), a draft issue where useful (`issue.md`), and `evidence/` (screenshots and logs to attach). `_reviews/` and `_watch/` hold review notes and drafts for upstream threads we only follow. |
 | `custom/scripts/` | Build, export, check, refresh and the upstream-workflow switch (below). |
@@ -79,8 +79,9 @@ scripts default to the clone they are checked out in; `--repo` or
    everywhere (fixed committer, committer date = author date), so the branch
    matches what CI builds and what `custom` holds.
 2. **Change it** like any branch: add commits, amend or `git rebase -i` the
-   patch you are fixing (keep fixups squashed into the patch they fix), drop
-   a patch that landed upstream. Develop a fix headed upstream on a
+   patch you are fixing (keep fixups squashed into the patch they fix, and
+   each series' commits together, after the series it needs), drop a patch
+   that landed upstream. Develop a fix headed upstream on a
    contribution branch cut from `upstream/main`, never from `custom`, and
    cherry-pick it here. Try it with the repo's tests, or install the pull
    request's build (below).
@@ -91,9 +92,10 @@ scripts default to the clone they are checked out in; `--repo` or
    with a warning, so move it in `custom/series` if it belongs elsewhere and
    run the export again. `# needs:` lines and other comments in a series are
    kept. `BASE` must not move here; moving it is a [refresh](#refreshing-the-base).
-4. **Check**: `custom/scripts/check.sh --custom work/<topic>` applies the
-   series in a throwaway worktree, runs the [docs rule](#docs-rule), a quick
-   sanity check (no conflict markers, changed Python and JSON parse) and
+4. **Check**: `custom/scripts/check.sh --custom work/<topic>` checks that
+   each series is one block that comes after every series it needs, applies
+   the series in a throwaway worktree, runs the [docs rule](#docs-rule), a
+   quick sanity check (no conflict markers, changed Python and JSON parse) and
    confirms the result has exactly your branch's tree. After committing,
    `custom/scripts/check-tree.sh` confirms the [tree rule](#the-tree-rule).
 5. **Open a pull request into `patches`**, from a branch named
@@ -149,12 +151,30 @@ needs a person anyway.
 git am -3 $(custom/scripts/series-files.sh --needs toast-safe-area)
 ```
 
-`series-files.sh` prints a series' files in apply order (a `(continued)`
-fixup after the patch it fixes, which a shell glob gets wrong) and, with
-`--needs`, the series it needs first; `--all` prints the whole series. If
+`series-files.sh` prints a series' files in apply order (a shell glob of
+`<series>--*.patch` sorts them by name instead) and, with `--needs`, the
+series it needs first; `--all` prints the whole series. If
 your branch is ahead of `BASE` and a patch conflicts, `-3` falls back to a
 three-way merge; resolve it and `git am --continue`. `git config
 rerere.enabled true` means you resolve each conflict only once.
+
+### Building a set of features
+
+Each series is one feature, and any set of them builds:
+
+```bash
+custom/scripts/build-custom.sh --only link-rules,toast-safe-area work/mine
+custom/scripts/series-files.sh --only link-rules,toast-safe-area   # just list the files
+```
+
+`--only` takes series names, comma-separated (or repeat the option), adds
+every series they need, recursively, and always `custom-docs-index`, and keeps
+the order of `custom/series`; it prints each series it added and why. In the
+built tree, the index (`docs/custom/README.md`) keeps only the sections of the
+series that were built. `series-files.sh --only ... --names` prints the chosen
+series instead of their files. A `# needs:` line also covers a series that
+only conflicts without another one (two rows added next to each other in the
+same table, say), so that every set applies.
 
 ## What CI does
 

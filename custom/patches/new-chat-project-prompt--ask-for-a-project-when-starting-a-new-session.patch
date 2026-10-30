@@ -19,36 +19,50 @@ the route the per-project pencil already uses. Modified clicks on the
 links still open the composer in a new tab, and Settings › General ›
 Sessions has a switch to turn the prompt off.
 
+The project step is offered while the project list is still loading and
+closes for the plain composer when the list fails or comes back empty; a
+stale session fetch error stays hidden on it. E2E tests that click New
+session and expect the composer turn the prompt off
+(omnigent:new-chat-project-prompt=off), and a dedicated E2E drives the
+picker's No project and project rows. Matches
+https://github.com/omnigent-ai/omnigent/pull/11397.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 (cherry picked from commit 1401d53cc127a9668163e508b749c5c49c43e99c)
 ---
- feature-map/composer.md                       | 10 +++
- web/src/hooks/useNewChatProjectPrompt.ts      | 15 ++++
- web/src/hooks/useNewSessionHotkey.test.tsx    | 10 +++
- web/src/hooks/useNewSessionHotkey.ts          | 13 ++-
- .../newChatProjectPromptPreferences.test.ts   | 24 ++++++
- .../lib/newChatProjectPromptPreferences.ts    | 26 ++++++
- web/src/pages/SettingsPage.tsx                | 40 +++++++++
- web/src/shell/AppShell.test.tsx               | 50 ++++++++++-
- web/src/shell/AppShell.tsx                    | 38 +++++++--
- web/src/shell/CommandPalette.test.tsx         | 48 +++++++++++
- web/src/shell/CommandPalette.tsx              | 82 +++++++++++++------
- web/src/shell/Sidebar.test.tsx                | 26 +++++-
- web/src/shell/Sidebar.tsx                     | 20 +++++
- 13 files changed, 368 insertions(+), 34 deletions(-)
+ feature-map/composer.md                       |  10 ++
+ tests/e2e_ui/conftest.py                      |  10 ++
+ tests/e2e_ui/sessions/test_command_palette.py |  44 ++++++++
+ .../test_initial_prompt_session_switch.py     |   3 +
+ .../test_sidebar_pinned_project_collapse.py   |   5 +
+ .../start_session/test_start_session.py       |   4 +
+ web/src/hooks/useNewChatProjectPrompt.ts      |  17 +++
+ web/src/hooks/useNewSessionHotkey.test.tsx    |  10 ++
+ web/src/hooks/useNewSessionHotkey.ts          |  13 ++-
+ .../newChatProjectPromptPreferences.test.ts   |  24 ++++
+ .../lib/newChatProjectPromptPreferences.ts    |  26 +++++
+ web/src/pages/SettingsPage.test.tsx           |  18 +++
+ web/src/pages/SettingsPage.tsx                |  40 +++++++
+ web/src/shell/AppShell.test.tsx               | 103 +++++++++++++++++-
+ web/src/shell/AppShell.tsx                    |  38 ++++++-
+ web/src/shell/CommandPalette.test.tsx         |  71 ++++++++++++
+ web/src/shell/CommandPalette.tsx              | 103 +++++++++++++-----
+ web/src/shell/Sidebar.test.tsx                |  26 ++++-
+ web/src/shell/Sidebar.tsx                     |  20 ++++
+ 19 files changed, 546 insertions(+), 39 deletions(-)
  create mode 100644 web/src/hooks/useNewChatProjectPrompt.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.test.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.ts
 
 diff --git a/feature-map/composer.md b/feature-map/composer.md
-index 4ee40c731c59ee50b52fa32122050adf5d62c652..1844cb4165e5ab893bd8afc0584e3c971f128e35 100644
+index 91f3e75609ebba8e4e9bb654cac6f047e7941386..a34e301ded64503dc0f042b9326a4ab81d48d3e9 100644
 --- a/feature-map/composer.md
 +++ b/feature-map/composer.md
-@@ -163,6 +163,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
- - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
-   opens and focuses the new-session composer in browsers. Native shells retain
-   ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
+@@ -164,6 +164,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+   `project`, `new omni` and `omni` all find it. Choosing a row opens the
+   new-session composer with that project's defaults. The rows are hidden while
+   the query is empty and absent from the sessions-only switcher.
 +- `new-session-project-prompt`: when projects exist, the hotkey, the sidebar's
 +  New session links, and the palette's New chat first ask for a project (or No
 +  project), then open the composer with its defaults. Settings › General ›
@@ -56,10 +70,10 @@ index 4ee40c731c59ee50b52fa32122050adf5d62c652..1844cb4165e5ab893bd8afc0584e3c97
  - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
    can be steered into the running turn. Side-chat composers queue and steer the
    same way, with their own queue strip.
-@@ -303,6 +307,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
- - With the browser app focused, press ⌘+Shift+O (macOS) or
-   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
-   composer.
+@@ -302,6 +306,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+ - Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
+   **New chat in <project>** to open the new-session composer with that
+   project's host, workspace and agent prefilled.
 +- With at least one project, press the hotkey or click New session (also from
 +  the mobile drawer): a "Start a new session in…" picker opens. Type part of a
 +  project name and press Enter to land on `/?project=<name>` with its defaults;
@@ -69,12 +83,168 @@ index 4ee40c731c59ee50b52fa32122050adf5d62c652..1844cb4165e5ab893bd8afc0584e3c97
  - Hover the model/effort pill to see the tooltip.
  - Hover the host chip to see the selected host or sandbox and its connection.
  - Pick a harness, then open its configuration for model, effort (Codex, Claude,
+diff --git a/tests/e2e_ui/conftest.py b/tests/e2e_ui/conftest.py
+index 51f253c6bbf0813b6c559fd06ca16eb4a872791f..8400dfcab76a0cbb03b0d4526730da697727b9b5 100644
+--- a/tests/e2e_ui/conftest.py
++++ b/tests/e2e_ui/conftest.py
+@@ -222,6 +222,16 @@ def open_previewable_files_in_preview(page: Page) -> None:
+     )
+ 
+ 
++# Turns off the "Start a new session in…" project picker, which otherwise
++# opens in front of the composer whenever the shared server holds a project.
++# Install it with ``page.add_init_script`` before ``page.goto`` in any test that
++# starts a session through the New session link, button, or hotkey and expects
++# the plain composer; the picker's own test leaves it out.
++DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT = (
++    'window.localStorage.setItem("omnigent:new-chat-project-prompt", "off");'
++)
++
++
+ # Populated by live_server for fixtures that need the server PID or runner ID.
+ _server_state: dict[str, object] = ServerState()
+ 
+diff --git a/tests/e2e_ui/sessions/test_command_palette.py b/tests/e2e_ui/sessions/test_command_palette.py
+index 6361569442b1b943177d6dc40ad10c56ece8f1c7..8799ddccf0f8f6a1a6d1580ab5fc664f260e4058 100644
+--- a/tests/e2e_ui/sessions/test_command_palette.py
++++ b/tests/e2e_ui/sessions/test_command_palette.py
+@@ -34,6 +34,7 @@ from __future__ import annotations
+ 
+ import re
+ import sys
++import uuid
+ 
+ import httpx
+ from playwright.sync_api import Page, expect
+@@ -99,6 +100,49 @@ def test_command_palette_opens_and_switches_session(
+     expect(page.get_by_test_id("command-palette-input")).to_have_count(0)
+ 
+ 
++def test_new_session_asks_for_a_project_first(
++    page: Page,
++    seeded_session: tuple[str, str],
++) -> None:
++    """With a project present, "New session" opens the project picker first.
++
++    The picker is on by default (``omnigent:new-chat-project-prompt`` unset), so
++    this test is the one place that leaves the preference alone: the sidebar's
++    New session link opens the palette on its "Start a new session in…" step,
++    "No project" opens the plain composer, and a project opens ``/?project=``.
++    """
++    base_url, session_id = seeded_session
++    project = f"e2e-pick-{uuid.uuid4().hex[:6]}"
++    resp = httpx.patch(
++        f"{base_url}/v1/sessions/{session_id}",
++        json={"labels": {"omni_project": project}},
++        timeout=10.0,
++    )
++    resp.raise_for_status()
++
++    page.goto(f"{base_url}/c/{session_id}")
++    new_session_link = page.get_by_role("link", name=re.compile(r"New session", re.IGNORECASE))
++    picker_input = page.get_by_placeholder("Start a new session in…")
++    picker = page.get_by_role("dialog")
++
++    new_session_link.first.click()
++    expect(picker_input).to_be_visible(timeout=30_000)
++    expect(picker.get_by_text("No project", exact=True)).to_be_visible()
++    expect(picker.get_by_text(project, exact=True)).to_be_visible()
++    # The route has not changed: the picker sits in front of the open session.
++    expect(page).to_have_url(f"{base_url}/c/{session_id}")
++
++    picker.get_by_text("No project", exact=True).click()
++    expect(page).to_have_url(re.compile(r"/$"))
++    expect(picker_input).to_have_count(0)
++
++    new_session_link.first.click()
++    expect(picker_input).to_be_visible()
++    picker.get_by_text(project, exact=True).click()
++    expect(page).to_have_url(re.compile(rf"/\?project={re.escape(project)}$"))
++    expect(picker_input).to_have_count(0)
++
++
+ def test_command_palette_chord_with_a_terminal_focused(
+     page: Page,
+     terminal_session: tuple[str, str],
+diff --git a/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py b/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py
+index 553f4a7aa2b005783a3df9409f315bba254cf915..b1d5b2fc07e16590d7ecbd1ff65d04e5b0ad05c2 100644
+--- a/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py
++++ b/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py
+@@ -47,6 +47,7 @@ from playwright.async_api import Route, async_playwright
+ 
+ from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+ from tests._helpers.polling import poll_until_async
++from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT
+ from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+ 
+ # Unique sentinels so each POST body is unambiguously identifiable.
+@@ -167,6 +168,8 @@ async def _drive_initial_prompt_switch(base_url: str, session_a: str, session_b:
+                 else:
+                     await route.continue_()
+ 
++            # The shared server may hold projects; keep New session on the composer.
++            await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+             await page.route("**/v1/sessions/*/events", handle_events)
+             await page.route("**/v1/hosts", handle_hosts)
+             await stub_empty_host_picker_data(page, "host_e2e")
+diff --git a/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py b/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py
+index 24af6f89b958eaade91c30e0fa90a2c422202aab..e8ac4372f6093514d8b294ec999bb9d2db8f7cfd 100644
+--- a/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py
++++ b/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py
+@@ -23,6 +23,8 @@ import uuid
+ import httpx
+ from playwright.sync_api import Locator, Page, expect
+ 
++from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT
++
+ 
+ def _set_title(base_url: str, session_id: str, title: str) -> None:
+     """Give a session a unique title so its row is easy to spot in a shared
+@@ -88,6 +90,9 @@ def test_click_pinned_project_session_keeps_project_collapsed(
+     _file_into_project(base_url, session_a, project)
+     _file_into_project(base_url, session_b, project)
+ 
++    # This test files sessions into a project; New session must still open the
++    # composer rather than the project picker.
++    page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+     page.goto(f"{base_url}/c/{session_a}")
+ 
+     row_a = _row(page, session_a)
+diff --git a/tests/e2e_ui/start_session/test_start_session.py b/tests/e2e_ui/start_session/test_start_session.py
+index 1ce8502cb14d02cf961aabdf338173db352d2415..aa84653011f86e7eb8c22b147c7dbedb28e9acff 100644
+--- a/tests/e2e_ui/start_session/test_start_session.py
++++ b/tests/e2e_ui/start_session/test_start_session.py
+@@ -56,6 +56,7 @@ from playwright.async_api import Request, Route, async_playwright, expect
+ from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+ from tests._helpers.picker_routes import OWN_AGENTS
+ from tests._helpers.polling import poll_until_async
++from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT
+ from tests.e2e_ui.start_session.helpers import (
+     commit_landing_workspace_picker,
+     open_landing_workspace_picker,
+@@ -365,6 +366,8 @@ async def _register_common_routes(
+         else:
+             await route.continue_()
+ 
++    # The shared server may hold projects; keep New session on the plain composer.
++    await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+     await page.route("**/v1/hosts", handle_hosts)
+     # Fake hosts have no backend probes; tests with catalogs or git repos override these.
+     await page.route(
+@@ -1107,6 +1110,7 @@ async def _drive_landing_clears_after_navigating_away(
+ 
+             page.on("response", note_create_response)
+ 
++            await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+             await page.add_init_script(
+                 f"""window.localStorage.setItem(
+                     "omnigent:recent-workspaces",
 diff --git a/web/src/hooks/useNewChatProjectPrompt.ts b/web/src/hooks/useNewChatProjectPrompt.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..fe3b25a9a2cfa682651404d9daac5aa4a42a8982
+index 0000000000000000000000000000000000000000..76e9364623e4a6b759da58725766cec3630fc15f
 --- /dev/null
 +++ b/web/src/hooks/useNewChatProjectPrompt.ts
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,17 @@
 +import { useCallback } from "react";
 +
 +import { useProjects } from "@/hooks/useConversations";
@@ -82,13 +252,15 @@ index 0000000000000000000000000000000000000000..fe3b25a9a2cfa682651404d9daac5aa4
 +
 +/**
 + * Returns a check for whether starting a new session should first ask for a
-+ * project: at least one project exists and the prompt isn't turned off in
-+ * Settings. The preference is read at call time so a toggle applies at once.
++ * project: the project list may hold one and the prompt isn't turned off in
++ * Settings. Until the list resolves it counts as "may": the picker lists
++ * projects as they arrive and steps aside if none do (see `CommandPalette`).
++ * The preference is read at call time so a toggle applies at once.
 + */
 +export function useShouldPromptForProject(): () => boolean {
-+  const { data: projects = [] } = useProjects();
-+  const hasProjects = projects.length > 0;
-+  return useCallback(() => hasProjects && readNewChatProjectPromptEnabled(), [hasProjects]);
++  const { data: projects } = useProjects();
++  const mayHaveProjects = projects === undefined || projects.length > 0;
++  return useCallback(() => mayHaveProjects && readNewChatProjectPromptEnabled(), [mayHaveProjects]);
 +}
 diff --git a/web/src/hooks/useNewSessionHotkey.test.tsx b/web/src/hooks/useNewSessionHotkey.test.tsx
 index c523107a1d8267cc63eb3a901c8d176e8654306d..02438760b7df927e82b94ed4d283b2f9672f5351 100644
@@ -205,6 +377,49 @@ index 0000000000000000000000000000000000000000..31f7346e420d2527e45b3d4bc4c61858
 +    // localStorage failures should not make Settings unusable.
 +  }
 +}
+diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
+index d599ff4d3016d0b95c376c3de41fac61cc19ef71..fc2ae99e8ac7fc45f9d73538e83b47da5e0b79f4 100644
+--- a/web/src/pages/SettingsPage.test.tsx
++++ b/web/src/pages/SettingsPage.test.tsx
+@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ import type { Conversation } from "@/hooks/useConversations";
+ import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
++import { NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY } from "@/lib/newChatProjectPromptPreferences";
+ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+ import * as host from "@/lib/host";
+ import {
+@@ -338,6 +339,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
+ describe("SettingsPage", () => {
+   beforeEach(() => {
+     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
++    localStorage.removeItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY);
+   });
+ 
+   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
+@@ -376,6 +378,22 @@ describe("SettingsPage", () => {
+     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+   });
+ 
++  it("renders the new-session project prompt enabled by default", async () => {
++    renderPage("/settings/general");
++
++    expect(await screen.findByTestId("new-chat-project-prompt-toggle")).toBeChecked();
++  });
++
++  it("persists turning the new-session project prompt off", async () => {
++    renderPage("/settings/general");
++    const toggle = await screen.findByTestId("new-chat-project-prompt-toggle");
++
++    fireEvent.click(toggle);
++
++    expect(toggle).not.toBeChecked();
++    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("off");
++  });
++
+   it("asks before terminal copying by default and explains the scope", () => {
+     renderPage("/settings/general");
+     const select = screen.getByTestId("terminal-clipboard-preference-select");
 diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
 index f4fd137f921549944e91195f0fe26840db074ec0..376eeba24c8387a0f965729e42883a3b3ad37ae7 100644
 --- a/web/src/pages/SettingsPage.tsx
@@ -271,9 +486,18 @@ index f4fd137f921549944e91195f0fe26840db074ec0..376eeba24c8387a0f965729e42883a3b
          <SettingsGroup title="Terminal" testId="settings-group-terminal">
            <TerminalClipboardControl />
 diff --git a/web/src/shell/AppShell.test.tsx b/web/src/shell/AppShell.test.tsx
-index d4e61e823302ef86a0ada4563dc043df6819eb37..839bd3e97caed5ae35c6b327679362d733df2927 100644
+index d4e61e823302ef86a0ada4563dc043df6819eb37..c7abdad8cf6461fa41dae989d5f8ceb873044a51 100644
 --- a/web/src/shell/AppShell.test.tsx
 +++ b/web/src/shell/AppShell.test.tsx
+@@ -12,7 +12,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
+ import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
+ import type * as SessionsApiModule from "@/lib/sessionsApi";
+ 
+-import { useCallback, useState } from "react";
++import { useCallback, useState, useSyncExternalStore } from "react";
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import {
 @@ -268,7 +268,8 @@ vi.mock("./TerminalsPanel", () => ({
    ),
  }));
@@ -284,10 +508,34 @@ index d4e61e823302ef86a0ada4563dc043df6819eb37..839bd3e97caed5ae35c6b327679362d7
  import { useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
  
  const useConvMock = vi.mocked(useConversations);
-@@ -5922,4 +5923,51 @@ describe("new-session browser shortcut", () => {
+@@ -5922,4 +5923,102 @@ describe("new-session browser shortcut", () => {
      expect(screen.getByText("New session route")).toBeInTheDocument();
      setEmbedRoot(null);
    });
++
++  function pressNewSession() {
++    mockConversations([{ id: "conv_abc", permission_level: null }]);
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    render(
++      shellTree(
++        client,
++        "/c/conv_abc",
++        <>
++          <Route index element={<p>New session route</p>} />
++          <Route path="c/:conversationId" element={<p>Session route</p>} />
++        </>,
++        <AppShell />,
++      ),
++    );
++    fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
++  }
++
++  function restoreNoProjects() {
++    vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
++      typeof useProjects
++    >);
++    localStorage.clear();
++  }
 +
 +  describe("with projects", () => {
 +    beforeEach(() => {
@@ -295,29 +543,7 @@ index d4e61e823302ef86a0ada4563dc043df6819eb37..839bd3e97caed5ae35c6b327679362d7
 +        data: [{ id: "p1", name: "omnigent" }],
 +      } as unknown as ReturnType<typeof useProjects>);
 +    });
-+    afterEach(() => {
-+      vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
-+        typeof useProjects
-+      >);
-+      localStorage.clear();
-+    });
-+
-+    function pressNewSession() {
-+      mockConversations([{ id: "conv_abc", permission_level: null }]);
-+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-+      render(
-+        shellTree(
-+          client,
-+          "/c/conv_abc",
-+          <>
-+            <Route index element={<p>New session route</p>} />
-+            <Route path="c/:conversationId" element={<p>Session route</p>} />
-+          </>,
-+          <AppShell />,
-+        ),
-+      );
-+      fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
-+    }
++    afterEach(restoreNoProjects);
 +
 +    it("asks for a project before opening the composer", () => {
 +      pressNewSession();
@@ -335,9 +561,58 @@ index d4e61e823302ef86a0ada4563dc043df6819eb37..839bd3e97caed5ae35c6b327679362d7
 +      expect(screen.getByText("New session route")).toBeInTheDocument();
 +    });
 +  });
++
++  describe("while the project list is still loading", () => {
++    interface ProjectsQuery {
++      data?: { id: string; name: string }[];
++      isSuccess?: boolean;
++    }
++    let projectsQuery: ProjectsQuery = {};
++    const subscribers = new Set<() => void>();
++    beforeEach(() => {
++      projectsQuery = {};
++      vi.mocked(useProjects).mockImplementation(
++        () =>
++          useSyncExternalStore(
++            (onChange) => {
++              subscribers.add(onChange);
++              return () => subscribers.delete(onChange);
++            },
++            () => projectsQuery,
++          ) as unknown as ReturnType<typeof useProjects>,
++      );
++    });
++    afterEach(() => {
++      subscribers.clear();
++      restoreNoProjects();
++    });
++
++    function resolveProjects(next: ProjectsQuery) {
++      projectsQuery = next;
++      act(() => subscribers.forEach((notify) => notify()));
++    }
++
++    it("asks for a project, then steps aside when the list resolves empty", () => {
++      pressNewSession();
++      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
++      expect(screen.queryByText("New session route")).toBeNull();
++
++      resolveProjects({ data: [], isSuccess: true });
++      expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
++      expect(screen.getByText("New session route")).toBeInTheDocument();
++    });
++
++    it("lists the projects once they arrive", () => {
++      pressNewSession();
++      resolveProjects({ data: [{ id: "p1", name: "omnigent" }], isSuccess: true });
++      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
++      expect(screen.getByText("omnigent")).toBeInTheDocument();
++      expect(screen.queryByText("New session route")).toBeNull();
++    });
++  });
  });
 diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
-index 26b79f4895477f1d679bc55255d3bc2864cb4a16..729782522e6a18255c32a8c9a7ae257ad3584c21 100644
+index 8b81b85704dce1681b8979db06df3a9b98aa6915..7da2f0f6e773614e0c86a656673f768ce542e01d 100644
 --- a/web/src/shell/AppShell.tsx
 +++ b/web/src/shell/AppShell.tsx
 @@ -15,7 +15,14 @@ import {
@@ -435,10 +710,10 @@ index 26b79f4895477f1d679bc55255d3bc2864cb4a16..729782522e6a18255c32a8c9a7ae257a
              onOpenChange={setCommandPaletteOpen}
              onToggleLeftSidebar={toggleLeftSidebar}
 diff --git a/web/src/shell/CommandPalette.test.tsx b/web/src/shell/CommandPalette.test.tsx
-index 9dce42759835b2a81c8ff215bb114b32b0367559..5a2f75dd707f3208a1b505b980c58c2f8c70a10a 100644
+index bc3d54989785bc89d5545f8bfad288fbccd21248..3d7512271a7728156bf906c1688f43b17592ac4a 100644
 --- a/web/src/shell/CommandPalette.test.tsx
 +++ b/web/src/shell/CommandPalette.test.tsx
-@@ -422,6 +422,15 @@ describe("CommandPalette — new chat in project", () => {
+@@ -440,6 +440,15 @@ describe("CommandPalette — new chat in project", () => {
      expect(navigate).toHaveBeenCalledWith("/?project=home%20lab");
    });
  
@@ -454,7 +729,7 @@ index 9dce42759835b2a81c8ff215bb114b32b0367559..5a2f75dd707f3208a1b505b980c58c2f
    it("omits project rows in the sessions-only switcher", () => {
      renderPalette({ sessionsOnly: true });
      fireEvent.change(screen.getByTestId("command-palette-input"), {
-@@ -431,6 +440,45 @@ describe("CommandPalette — new chat in project", () => {
+@@ -449,6 +458,68 @@ describe("CommandPalette — new chat in project", () => {
    });
  });
  
@@ -495,13 +770,36 @@ index 9dce42759835b2a81c8ff215bb114b32b0367559..5a2f75dd707f3208a1b505b980c58c2f
 +    expect(onOpenChange).toHaveBeenCalledWith(false);
 +    expect(navigate).toHaveBeenCalledWith(path);
 +  });
++
++  it.each([
++    ["", "/"],
++    ["lab", "/?project=home%20lab"],
++  ])("opens the first row with Enter after typing %j", (typed, path) => {
++    const { onOpenChange } = renderPalette({ projectStep: true });
++    const input = screen.getByTestId("command-palette-input");
++    if (typed) fireEvent.change(input, { target: { value: typed } });
++    fireEvent.keyDown(input, { key: "Enter" });
++    expect(navigate).toHaveBeenCalledWith(path);
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++  });
++
++  it("hides a stale session-load error", () => {
++    useConversations.mockReturnValue({ isError: true, isFetching: false, refetch: vi.fn() });
++    renderPalette({ projectStep: true });
++    expect(screen.queryByText("Couldn't load sessions.")).toBeNull();
++    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
++      "No project",
++      "🔥omnigent",
++      "home lab",
++    ]);
++  });
 +});
 +
  describe("CommandPalette — input", () => {
    it("uses the sessions-first placeholder", () => {
      renderPalette();
 diff --git a/web/src/shell/CommandPalette.tsx b/web/src/shell/CommandPalette.tsx
-index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa434829b39b 100644
+index 2d416f3d3e305a488807ea5013517bb291e2c91c..7a4605e35a99b72541db90f7fa09aef71a47fad7 100644
 --- a/web/src/shell/CommandPalette.tsx
 +++ b/web/src/shell/CommandPalette.tsx
 @@ -2,12 +2,16 @@
@@ -573,7 +871,7 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
        },
        {
          id: "go-inbox",
-@@ -206,37 +227,36 @@ export function CommandPalette({
+@@ -206,37 +227,46 @@ export function CommandPalette({
          run: onToggleRightSidebar,
        },
      ],
@@ -593,24 +891,35 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
 -  }, [actions, query, sessionsOnly]);
 +  }, [actions, query, sessionsOnly, projectStep]);
  
-   const { data: projects = [] } = useProjects();
-   // Every typed word must appear in the row label, so "new omni" and "omni"
--  // both reach "New chat in omnigent".
-+  // both reach "New chat in omnigent". The project step lists every project
-+  // until the user types, and matches names only.
+-  const { data: projects = [] } = useProjects();
++  const { data: projects = [], isSuccess: projectsLoaded, isError: projectsFailed } = useProjects();
+   // Every typed word must appear in the row label or the group heading, so
+-  // "new omni", "omni" and "project" all reach "New chat in omnigent".
++  // "new omni", "omni" and "project" all reach "New chat in omnigent". The
++  // project step lists every project until the user types, and matches names only.
    const filteredProjects = useMemo(() => {
 -    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
 -    if (sessionsOnly || words.length === 0) return [];
 -    return projects.filter((project) => {
--      const label = `new chat in ${project.name}`.toLowerCase();
+-      const label = `new chat in project ${project.name}`.toLowerCase();
 -      return words.every((word) => label.includes(word));
 -    });
 -  }, [projects, query, sessionsOnly]);
 +    if (projectStep) return projects.filter((project) => matchesEveryWord(project.name, query));
 +    if (sessionsOnly || query.trim() === "") return [];
-+    return projects.filter((project) => matchesEveryWord(`new chat in ${project.name}`, query));
++    return projects.filter((project) =>
++      matchesEveryWord(`new chat in project ${project.name}`, query),
++    );
 +  }, [projects, query, sessionsOnly, projectStep]);
 +  const showNoProject = projectStep && matchesEveryWord("no project", query);
++  // The project step may open before the list resolves. Nothing to choose
++  // from means the plain composer, as if the prompt had never been offered.
++  const noProjectToOffer = projectsFailed || (projectsLoaded && projects.length === 0);
++  useEffect(() => {
++    if (!open || !projectStep || !noProjectToOffer) return;
++    onOpenChange(false);
++    navigate("/");
++  }, [open, projectStep, noProjectToOffer, onOpenChange, navigate]);
  
    const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
 -    useConversations("", false, { enabled: open });
@@ -623,7 +932,7 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
    // Wait briefly for server info so a supporting server never gets the mixed
    // request; if it stalls, fall back to that request rather than never searching.
    const serverInfoLoading = serverInfo === "loading";
-@@ -286,6 +306,8 @@ export function CommandPalette({
+@@ -286,6 +316,8 @@ export function CommandPalette({
    ]);
  
    const sessions = useMemo(() => {
@@ -632,7 +941,7 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
      if (searching) return paletteSessions(titleSearch.data?.pages ?? []);
      const out = paletteSessions(data?.pages ?? []);
      if (sessionsOnly) {
-@@ -297,7 +319,7 @@ export function CommandPalette({
+@@ -297,7 +329,7 @@ export function CommandPalette({
      }
      // The full first page would push Actions below the fold.
      return out.slice(0, IDLE_SESSION_LIMIT);
@@ -641,7 +950,23 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
    // Excludes title matches again in case a rename moved a session between the
    // two groups' requests: cmdk needs each item value to be unique.
    const contentSessions = useMemo(
-@@ -347,10 +369,16 @@ export function CommandPalette({
+@@ -309,9 +341,12 @@ export function CommandPalette({
+   );
+   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
+   const searchGroups = [titleSearch, contentSearch];
+-  const loadError = searching
+-    ? searchGroups.some((group) => group.isError)
+-    : isError || isFetchNextPageError;
++  // The project step never reads sessions, so a stale fetch error stays hidden.
++  const loadError = projectStep
++    ? false
++    : searching
++      ? searchGroups.some((group) => group.isError)
++      : isError || isFetchNextPageError;
+   const loadMoreError = searching
+     ? searchGroups.some((group) => group.isFetchNextPageError)
+     : isFetchNextPageError;
+@@ -347,10 +382,16 @@ export function CommandPalette({
      if (!userMovedSelection.current) setSelectedValue(firstItemValue);
    }, [firstItemValue, open, debouncedQuery]);
  
@@ -662,7 +987,7 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
  
    const runAction = (action: ActionCommand): void => {
      close();
-@@ -359,7 +387,7 @@ export function CommandPalette({
+@@ -359,7 +400,7 @@ export function CommandPalette({
  
    const newChatInProject = (name: string): void => {
      close();
@@ -671,7 +996,7 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
    };
  
    const goToSession = (id: string): void => {
-@@ -563,8 +591,14 @@ export function CommandPalette({
+@@ -563,8 +604,14 @@ export function CommandPalette({
                  })}
                </CommandGroup>
              )}
@@ -688,7 +1013,7 @@ index 45a1611e7e506d60765ca669f6f680bd9a04595b..14b6ee83888a8c761bf7363dddbafa43
                  {filteredProjects.map((project) => (
                    <CommandItem
                      key={project.name}
-@@ -572,7 +606,9 @@ export function CommandPalette({
+@@ -572,7 +619,9 @@ export function CommandPalette({
                      onSelect={() => newChatInProject(project.name)}
                    >
                      <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
