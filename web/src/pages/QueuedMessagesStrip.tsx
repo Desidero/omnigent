@@ -18,12 +18,13 @@ import {
   ClockIcon,
   GripVerticalIcon,
   ImageIcon,
+  MergeIcon,
   PaperclipIcon,
   PencilIcon,
   XIcon,
 } from "lucide-react";
 
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 
 import { ARROW_UP_KEY, KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
@@ -32,6 +33,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
 import { attachmentFilename } from "@/lib/attachments";
+import { canCombineQueue } from "@/lib/messageQueue";
 import { summarizeItemCommentMessage } from "@/lib/itemComments";
 import { cn } from "@/lib/utils";
 
@@ -40,6 +42,10 @@ const ACTION_BUTTON_CLASS =
   "shrink-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:size-11";
 
 const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+
+/** Queue-wide actions: compact text buttons whose hit area reaches 44px on touch. */
+const QUEUE_ACTION_BUTTON_CLASS =
+  "relative h-6 px-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:h-8 max-md:after:absolute max-md:after:inset-x-0 max-md:after:-inset-y-1.5";
 
 /**
  * Keep the dragged row vertical and inside the scrolling list, which would
@@ -87,6 +93,15 @@ interface QueuedMessagesStripProps {
    * shows the ↑ hint; omit when the composer holds text, since ↑ then edits nothing.
    */
   arrowUpRecallQueueId?: string;
+  /**
+   * Merge the queue's combinable messages into one. Shown only while at least
+   * two adjacent messages can combine (see `canCombineQueue`).
+   */
+  onCombine?: () => void;
+  /** Combine, then send the queue now. Shown with Combine when `onSteer` is set. */
+  onSendAll?: () => void;
+  /** The harness's skill prefix, so `$skill` messages on Codex stay separate. */
+  skillPrefix?: "/" | "$";
   /**
    * Layout class aligning the strip with the composer surface it docks
    * onto (its tuck only hides behind a surface at least as wide, so match
@@ -300,7 +315,8 @@ function QueuedRow({
  *
  * Each row can be steered (sent now), edited (pulled back into the composer),
  * deleted, or — when `onReorder` is provided — dragged by its grip to reorder
- * the queue (drains FIFO, so order is the send order).
+ * the queue (drains FIFO, so order is the send order). A header offers
+ * Combine (and Send all, when steering is available) while messages can merge.
  */
 export function QueuedMessagesStrip({
   messages,
@@ -309,8 +325,12 @@ export function QueuedMessagesStrip({
   onSteer,
   onReorder,
   arrowUpRecallQueueId,
+  onCombine,
+  onSendAll,
+  skillPrefix,
   widthClassName,
 }: QueuedMessagesStripProps) {
+  const listRef = useRef<HTMLDivElement>(null);
   // Pointer sensors use activation constraints so pressing the grip does not
   // accidentally start a drag. KeyboardSensor keeps reordering operable
   // without a mouse or touch input.
@@ -336,6 +356,8 @@ export function QueuedMessagesStrip({
   };
 
   const steerBlocked = messages.some((m) => m.waitingForHost);
+  const showCombine = onCombine !== undefined && canCombineQueue(messages, { skillPrefix });
+  const showSendAll = showCombine && onSteer !== undefined && onSendAll !== undefined;
   const rows = messages.map((message) => (
     <QueuedRow
       key={message.queueId}
@@ -360,12 +382,54 @@ export function QueuedMessagesStrip({
         widthClassName,
       )}
     >
+      {showCombine && (
+        <div
+          role="group"
+          aria-label="Queue actions"
+          className="flex items-center justify-between gap-2 pb-1 max-md:pb-1.5"
+        >
+          <span className="text-xs text-muted-foreground">{messages.length} queued</span>
+          <span className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              aria-label="Combine queued messages"
+              className={QUEUE_ACTION_BUTTON_CLASS}
+              onClick={() => {
+                onCombine();
+                // The button may go away; keep focus in the strip.
+                listRef.current?.focus({ preventScroll: true });
+              }}
+            >
+              <MergeIcon className="size-3.5" aria-hidden="true" />
+              Combine
+            </Button>
+            {showSendAll && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                aria-label="Send all queued messages now"
+                className={QUEUE_ACTION_BUTTON_CLASS}
+                disabled={steerBlocked}
+                onClick={onSendAll}
+              >
+                <ArrowUpIcon className="size-3.5" aria-hidden="true" />
+                Send all
+              </Button>
+            )}
+          </span>
+        </div>
+      )}
       {/* Cap the list height and scroll when the queue is long, so a big
           backlog never pushes the composer off-screen. ~5 rows tall. */}
       <div
+        ref={listRef}
         role="list"
         aria-label="Queued messages"
-        className="flex max-h-32 flex-col gap-1 overflow-y-auto overscroll-contain"
+        tabIndex={-1}
+        className="flex max-h-32 outline-none flex-col gap-1 overflow-y-auto overscroll-contain"
       >
         {onReorder === undefined ? (
           rows
