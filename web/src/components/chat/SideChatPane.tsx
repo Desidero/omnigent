@@ -931,6 +931,7 @@ function SideChatComposer({
   const steerMessage = useChatStore((s) => s.steerMessage);
   const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  const combineQueuedMessages = useChatStore((s) => s.combineQueuedMessages);
   const allQueuedMessages = useChatStore((s) => s.queuedMessages);
   const queuedMessages = useMemo(
     () => allQueuedMessages.filter((message) => message.conversationId === childId),
@@ -1550,6 +1551,13 @@ function SideChatComposer({
                   }
             }
             onReorder={reorderQueuedMessage}
+            skillPrefix={skillPrefix}
+            onCombine={() => combineQueuedMessages(childId, { skillPrefix })}
+            onSendAll={() => {
+              if (settingsSavePending()) return;
+              combineQueuedMessages(childId, { skillPrefix });
+              steerAllQueuedMessages(childId);
+            }}
             widthClassName="mx-3 w-auto"
           />
         </TooltipProvider>
