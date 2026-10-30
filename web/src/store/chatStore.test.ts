@@ -17404,6 +17404,54 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("acks a combined message sent with Send all when reconnect backfills its item", async () => {
+    const id = "conv_combined_gap";
+    const before = userMessage("combined_pre", "before the gap");
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      boundAgentId: "agent_xyz",
+      status: "streaming",
+      sessionStatus: "running",
+      blocks: itemsToBlocks([before]),
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: id, stableId: "a".repeat(32) },
+        { queueId: "q_2", text: "second", conversationId: id, stableId: "b".repeat(32) },
+      ],
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+
+    useChatStore.getState().combineQueuedMessages(id);
+    const mergedId = useChatStore.getState().queuedMessages[0]!.stableId!;
+    useChatStore.getState().steerAllQueuedMessages(id);
+    await drainAsync(4);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+
+    // The server holds one item, under the merged message's id; the originals' ids are gone.
+    const committed = { ...userMessage("combined_gap", "first\n\nsecond"), id: mergedId };
+    seedSessionItems(id, [before, committed]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, mergedId]);
+    expect(state.failedSendDraft).toBeNull();
+    expect(peekQueuedSends(id)).toEqual([]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   /** The card a send leaves when its POST gets no answer. */
   function unansweredSendCard(send: NonNullable<ErrorBlock["unansweredSend"]>): ErrorBlock {
     return {
@@ -23297,6 +23345,60 @@ describe("chatStore — client-side message queue", () => {
     ]);
   });
 
+  it("combineQueuedMessages merges one conversation's queue in place with a fresh id", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: "conv_abc", stableId: "s1" },
+        { queueId: "q_x", text: "elsewhere", conversationId: "conv_other", stableId: "sx" },
+        { queueId: "q_2", text: "second", conversationId: "conv_abc", stableId: "s2" },
+        { queueId: "q_3", text: "!ls", conversationId: "conv_abc", stableId: "s3" },
+        { queueId: "q_y", text: "also elsewhere", conversationId: "conv_other" },
+      ],
+    });
+
+    useChatStore.getState().combineQueuedMessages("conv_abc");
+    const queue = useChatStore.getState().queuedMessages;
+    expect(queue.map((m) => [m.queueId, m.text])).toEqual([
+      ["q_1", "first\n\nsecond"],
+      ["q_x", "elsewhere"],
+      ["q_3", "!ls"],
+      ["q_y", "also elsewhere"],
+    ]);
+    expect(queue[0]!.stableId).toMatch(/^[0-9a-f]{32}$/);
+    expect(queue[2]!.stableId).toBe("s3");
+    // Another conversation's entry is left as it was, even without a stableId.
+    expect(queue[3]!.stableId).toBeUndefined();
+
+    // Nothing left to combine: no state churn.
+    useChatStore.getState().combineQueuedMessages("conv_abc");
+    expect(useChatStore.getState().queuedMessages).toBe(queue);
+  });
+
+  it("sends a combined message once, under its new id", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      send: sendSpy,
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: "conv_abc", stableId: "s1" },
+        { queueId: "q_2", text: "second", conversationId: "conv_abc", stableId: "s2" },
+        { queueId: "q_3", text: "!ls", conversationId: "conv_abc", stableId: "s3" },
+      ],
+    });
+
+    useChatStore.getState().combineQueuedMessages("conv_abc");
+    const mergedId = useChatStore.getState().queuedMessages[0]!.stableId;
+    useChatStore.getState().steerAllQueuedMessages("conv_abc");
+
+    expect(["s1", "s2"]).not.toContain(mergedId);
+    expect(sendSpy.mock.calls.map((call) => [call[0], call[3].stableId])).toEqual([
+      ["first\n\nsecond", mergedId],
+      ["!ls", "s3"],
+    ]);
+  });
+
   it("reorderQueuedMessage no-ops for a missing id or a self move", () => {
     const initial = [
       { queueId: "q_1", text: "first", conversationId: "conv_abc" },
@@ -25546,6 +25648,28 @@ describe("a send cut off by a reload", () => {
     vi.mocked(getCurrentUserId).mockReturnValue(null);
     useChatStore.getState().enqueueMessage("and the formatter");
     expect(peekQueuedSends("conv_queue")).toEqual([]);
+  });
+
+  it("keeps one record of a combined message, so a reconnect or reload hands nothing back", async () => {
+    seedSession("conv_reload", []);
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_1", text: "run the linter", conversationId: "conv_reload", stableId: "s1" },
+        { queueId: "q_2", text: "then tsc", conversationId: "conv_reload", stableId: "s2" },
+      ],
+    });
+    expect(peekQueuedSends("conv_reload").map((send) => send.stableId)).toEqual(["s1", "s2"]);
+
+    useChatStore.getState().combineQueuedMessages("conv_reload");
+
+    const [merged] = useChatStore.getState().queuedMessages;
+    expect(peekQueuedSends("conv_reload")).toEqual([
+      { stableId: merged!.stableId, text: "run the linter\n\nthen tsc", authorId: "user_a" },
+    ]);
+    // Loading the session again restores nothing: the originals' records are gone.
+    await useChatStore.getState().switchTo("conv_reload");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().queuedMessages).toEqual([merged]);
   });
 
   it("doesn't keep a side chat's queue, which its composer can't take back", () => {

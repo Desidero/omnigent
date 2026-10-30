@@ -2,6 +2,7 @@
 // listing messages queued while the agent is busy. It's a pure prop-driven
 // component (no store access), so we exercise it with plain props.
 
+import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -361,6 +362,87 @@ describe("QueuedMessagesStrip", () => {
       expect(button, name).toHaveClass("max-md:size-11");
       expect(button.querySelector("svg"), name).toHaveClass("max-md:size-4");
     }
+  });
+
+  // Ahead of the drag tests, whose dnd-kit sensors can swallow a later click.
+  describe("queue actions", () => {
+    const renderStrip = (
+      messages: QueuedMessage[],
+      props: Partial<ComponentProps<typeof QueuedMessagesStrip>> = {},
+    ) =>
+      render(
+        <TooltipProvider>
+          <QueuedMessagesStrip
+            messages={messages}
+            onDelete={vi.fn()}
+            onEdit={vi.fn()}
+            onCombine={vi.fn()}
+            {...props}
+          />
+        </TooltipProvider>,
+      );
+
+    it("offers Combine and Send all once two messages can merge, and runs them", () => {
+      const onCombine = vi.fn();
+      const onSendAll = vi.fn();
+      renderStrip([msg("q_1", "first"), msg("q_2", "second")], {
+        onCombine,
+        onSendAll,
+        onSteer: vi.fn(),
+      });
+      expect(screen.getByRole("group", { name: "Queue actions" })).toHaveTextContent("2 queued");
+      const combine = screen.getByRole("button", { name: "Combine queued messages" });
+      fireEvent.click(combine);
+      expect(onCombine).toHaveBeenCalledTimes(1);
+      // Focus stays in the strip rather than falling to the page.
+      expect(screen.getByRole("list", { name: "Queued messages" })).toHaveFocus();
+      fireEvent.click(screen.getByRole("button", { name: "Send all queued messages now" }));
+      expect(onSendAll).toHaveBeenCalledTimes(1);
+    });
+
+    it("hides both actions with fewer than two adjacent combinable messages", () => {
+      renderStrip([msg("q_1", "only")], { onSendAll: vi.fn(), onSteer: vi.fn() });
+      expect(screen.queryByRole("group", { name: "Queue actions" })).toBeNull();
+      cleanup();
+      renderStrip([msg("q_1", "a"), msg("q_2", "!git status"), msg("q_3", "/compact")], {
+        onSendAll: vi.fn(),
+        onSteer: vi.fn(),
+      });
+      expect(screen.queryByRole("button", { name: "Combine queued messages" })).toBeNull();
+      cleanup();
+      // Codex reads `$name` as a skill.
+      renderStrip([msg("q_1", "a"), msg("q_2", "$review")], { skillPrefix: "$" });
+      expect(screen.queryByRole("button", { name: "Combine queued messages" })).toBeNull();
+    });
+
+    it("shows Send all only where rows can be steered, disabled while waiting for the host", () => {
+      renderStrip([msg("q_1", "a"), msg("q_2", "b")], { onSendAll: vi.fn() });
+      expect(screen.getByRole("button", { name: "Combine queued messages" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Send all queued messages now" })).toBeNull();
+      cleanup();
+      renderStrip([msg("q_1", "a"), { ...msg("q_2", "b"), waitingForHost: true }], {
+        onSendAll: vi.fn(),
+        onSteer: vi.fn(),
+      });
+      expect(screen.getByRole("button", { name: "Combine queued messages" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Send all queued messages now" })).toBeDisabled();
+    });
+
+    it("keeps the actions keyboard-operable with a 44px touch hit area", () => {
+      const onCombine = vi.fn();
+      renderStrip([msg("q_1", "a"), msg("q_2", "b")], {
+        onCombine,
+        onSendAll: vi.fn(),
+        onSteer: vi.fn(),
+      });
+      for (const name of ["Combine queued messages", "Send all queued messages now"]) {
+        const button = screen.getByRole("button", { name });
+        expect(button.tagName, name).toBe("BUTTON");
+        expect(button, name).toHaveAttribute("type", "button");
+        // 32px tall on phones plus 6px of hit area above and below.
+        expect(button, name).toHaveClass("max-md:h-8", "max-md:after:-inset-y-1.5");
+      }
+    });
   });
 
   it("shows a drag handle per row only when onReorder is provided", () => {
