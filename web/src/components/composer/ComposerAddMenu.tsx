@@ -41,6 +41,7 @@ export function ComposerAddMenu({
   showPlan = true,
   planDisabled = false,
   planLabel,
+  planUnavailableReason = "This harness does not support plan mode",
   testIdPrefix = "composer",
   onPlan,
   planActive,
@@ -61,6 +62,7 @@ export function ComposerAddMenu({
   showPlan?: boolean;
   planDisabled?: boolean;
   planLabel?: string;
+  planUnavailableReason?: string;
   testIdPrefix?: string;
   onPlan?: () => void;
   planActive: boolean;
@@ -219,7 +221,7 @@ export function ComposerAddMenu({
                       aria-label={planLabel}
                       disabled={!onPlan || planDisabled}
                       onSelect={onPlan}
-                      title={onPlan ? undefined : "This harness does not support plan mode"}
+                      title={onPlan ? undefined : planUnavailableReason}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <LightbulbIcon className="size-3.5" />
