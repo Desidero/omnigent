@@ -397,6 +397,7 @@ request carries it, and the series holds a copy until it merges).
 | `app-error-boundary` | A rendering error shows the error, its stack and a Reload button instead of a blank window. | proposed |
 | `jump-to-latest` | A labelled Jump-to-latest pill, outside the scroll fade, that counts new replies landing below a reader who scrolled up. | proposed |
 | `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. Needs `chat-features` and `chat-item-comments`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
+| `queue-combine` | The queue strip's Combine merges the messages queued behind a running turn into one (texts joined by a blank line, attachments kept), and Send all combines and steers them; `!` commands, `/`-led messages, Codex `$` skills, failed sends and item-comment messages stay separate. Needs `chat-item-comments`. | proposed (related issues [#10986](https://github.com/omnigent-ai/omnigent/issues/10986), [#4426](https://github.com/omnigent-ai/omnigent/issues/4426), [#8326](https://github.com/omnigent-ai/omnigent/issues/8326)) |
 | `custom-docs-index` | `docs/custom/README.md`, the index of the series: what each changes, how to turn it on, and where its docs are. | custom only |
 
 
