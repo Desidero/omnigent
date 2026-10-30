@@ -27,8 +27,9 @@ def parse_series(path: Path) -> dict[str, dict]:
     current = None
     for line in path.read_text().splitlines():
         if line.startswith("# series: "):
-            current = line.split(": ", 1)[1].strip()
-            series[current] = {"needs": [], "patches": []}
+            # A legacy "<name> (continued)" block joins its series.
+            current = line.split(": ", 1)[1].split()[0]
+            series.setdefault(current, {"needs": [], "patches": []})
         elif line.startswith("# needs: ") and current:
             series[current]["needs"].append(line.split(": ", 1)[1].strip())
         elif line.endswith(".patch") and current:

@@ -17,8 +17,12 @@ Server:
   non-string entries are skipped, and the merged labels still pass the
   reserved-label checks. Imports into a project get them too. Labels apply
   only at creation, not when a session is moved into a project later.
-- A create with apply_project_labels: false takes its labels as the
-  final set, so a default removed for one session isn't added back.
+- A null label on create leaves a project default off the new session,
+  so a default removed for one session isn't added back.
+- Malformed label keys are rejected with a 400 before the write. PATCH
+  applies deletes and upserts in one store transaction
+  (set_labels(delete_keys=...)), and is_internal_label_key() is shared by
+  project defaults and the store.
 
 Web:
 - A Labels section in the session info popover lists user labels and,
@@ -38,45 +42,55 @@ Web:
 - The new-session composer's "+" menu gains Labels, opening the same
   editor for the session about to be created, with or without a project.
   A project's defaults are filled in, marked "from project", and
-  removable for that session only. The labels show as chips in the
-  composer and go with the create request.
+  removable for that session only; a removed default is sent as a null
+  label. The labels show as chips in the composer, stay in the composer
+  draft, and go with the create request.
+- An edit still in progress is taken when a label dialog saves or closes,
+  and Save stays in view while the label dialogs scroll.
 - The list-cache overlay is shared by title, archive and label updates.
+
+Matches https://github.com/omnigent-ai/omnigent/pull/11398 (server) and
+https://github.com/omnigent-ai/omnigent/pull/11399 (web).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 (cherry picked from commit f0c4dfa6e1d6acc3b386c7f3582fee2c233454ba)
 ---
- feature-map/sessions.md                       |  27 +
+ feature-map/sessions.md                       |  27 ++
  omnigent/db/db_models.py                      |   4 +-
- omnigent/server/API.md                        |  11 +-
- .../routes/_session_create_validation.py      |  42 ++
- omnigent/server/routes/_sessions/helpers.py   |   2 +-
+ omnigent/server/API.md                        |  10 +-
+ .../routes/_session_create_validation.py      |  49 +++
+ omnigent/server/routes/_sessions/helpers.py   |  28 +-
+ .../server/routes/_sessions/orchestration.py  |   9 +-
  omnigent/server/routes/imports.py             |   2 +
- .../server/routes/sessions/routes_core.py     |  34 +-
- omnigent/server/schemas.py                    |  13 +-
+ .../server/routes/sessions/routes_core.py     |  49 ++-
+ omnigent/server/schemas.py                    |  23 +-
+ .../stores/conversation_store/__init__.py     |  25 +-
+ .../conversation_store/sqlalchemy_store.py    |  28 +-
  omnigent/util/cost_plan.py                    |   2 +-
  openapi.json                                  |  11 +-
- ...test_session_create_project_consistency.py | 117 +++-
+ ...test_session_create_project_consistency.py | 147 +++++++-
  .../routes/test_sessions_cost_labels.py       |  31 +-
- tests/server/routes/test_sessions_crud.py     |  70 +-
- web/src/components/AgentInfo.test.tsx         | 127 ++++
+ tests/server/routes/test_sessions_crud.py     | 130 ++++++-
+ tests/stores/test_conversation_labels.py      |  62 +++-
+ web/src/components/AgentInfo.test.tsx         | 127 +++++++
  web/src/components/AgentInfo.tsx              |  38 +-
- web/src/components/LabelEditor.tsx            | 323 ++++++++++
+ web/src/components/LabelEditor.tsx            | 335 ++++++++++++++++++
  .../components/composer/ComposerAddMenu.tsx   |  32 +-
- .../components/composer/NewSessionLabels.tsx  | 116 ++++
- web/src/hooks/useSessionLabels.ts             |  51 ++
+ .../components/composer/NewSessionLabels.tsx  | 121 +++++++
+ web/src/hooks/useSessionLabels.ts             |  63 ++++
  web/src/lib/projectsApi.ts                    |   9 +-
- web/src/lib/sessionLabels.test.ts             | 111 ++++
- web/src/lib/sessionLabels.ts                  |  92 +++
- web/src/lib/sessionListCache.test.ts          |  29 +
- web/src/lib/sessionListCache.ts               | 103 +--
- web/src/lib/sessionsApi.ts                    |  10 +-
- .../NewChatDialog.projectCreate.test.tsx      |  43 +-
+ web/src/lib/sessionLabels.test.ts             | 109 ++++++
+ web/src/lib/sessionLabels.ts                  |  90 +++++
+ web/src/lib/sessionListCache.test.ts          |  29 ++
+ web/src/lib/sessionListCache.ts               | 103 +++---
+ web/src/lib/sessionsApi.ts                    |  12 +-
+ .../NewChatDialog.projectCreate.test.tsx      |  89 ++++-
  web/src/shell/NewChatDialog.test.tsx          |  19 +
- web/src/shell/NewChatDialog.tsx               |  37 +-
- web/src/shell/ProjectSettingsDialog.test.tsx  | 162 ++++-
- web/src/shell/ProjectSettingsDialog.tsx       | 601 ++++++++++--------
- 30 files changed, 1911 insertions(+), 358 deletions(-)
+ web/src/shell/NewChatDialog.tsx               |  49 ++-
+ web/src/shell/ProjectSettingsDialog.test.tsx  | 194 +++++++++-
+ web/src/shell/ProjectSettingsDialog.tsx       | 117 ++++--
+ 34 files changed, 2030 insertions(+), 143 deletions(-)
  create mode 100644 web/src/components/LabelEditor.tsx
  create mode 100644 web/src/components/composer/NewSessionLabels.tsx
  create mode 100644 web/src/hooks/useSessionLabels.ts
@@ -84,7 +98,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/sessionLabels.ts
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index e502b65f42e4be5cf1e2ae2f6d8b6649ce55bed5..8746259e7f5dddcf475f7d2025d11f58eac50555 100644
+index e502b65f42e4be5cf1e2ae2f6d8b6649ce55bed5..b2da8f61cdb075dc09128991c976a28b9606652e 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
 @@ -62,6 +62,12 @@ the header menu), and each place is a separate entry point.
@@ -107,7 +121,7 @@ index e502b65f42e4be5cf1e2ae2f6d8b6649ce55bed5..8746259e7f5dddcf475f7d2025d11f58
 +**Labels:** open a session and hover or click the header's info icon (on
 +mobile, the header menu's Agent info). The Labels section offers Add label and,
 +per label, edit and remove. A view-only collaborator sees the labels without
-+controls. For defaults, open a project folder's three-dot menu → Project
++controls, and no section at all when there are none. For defaults, open a project folder's three-dot menu → Project
 +settings → Default labels, save, then start a session in that project. Closing
 +the dialog with unsaved label changes warns once before discarding them. Before
 +a session exists, the new-session composer's "+" menu → Labels opens the same
@@ -158,24 +172,23 @@ index da0b4c401c42378ddf3bb9094ea4cc322ec952be..340b3f7bcbf7323c463dd85037627575
      updated_at: Mapped[int] = mapped_column(Integer)
  
 diff --git a/omnigent/server/API.md b/omnigent/server/API.md
-index c7434f9d43ff09fe9694ab3798b9c74ed2345c4b..fce98096e30ac99fa3ae4c541346d51ce8bd3b8a 100644
+index c7434f9d43ff09fe9694ab3798b9c74ed2345c4b..5ad8129103297f79f1ec7c40596a1b37a8e8314f 100644
 --- a/omnigent/server/API.md
 +++ b/omnigent/server/API.md
-@@ -691,6 +691,13 @@ already uploaded or registered an agent. The response is the full
+@@ -691,6 +691,12 @@ already uploaded or registered an agent. The response is the full
      `PATCH /v1/sessions/{id}` (last-write-wins). See
      `designs/NATIVE_RUNNER_SERVER_LAUNCH.md`.
  
-+  apply_project_labels (boolean, default true)
-+    A create with `project_id` merges the project's default labels (the
-+    project config's `labels`) under `labels`, and the request's labels
-+    win. `false` takes `labels` as the final set, so a default removed
-+    for this one session is not added back. Labels apply only at
-+    creation, not when a session moves into a project later.
++  A create with `project_id` merges the project's default labels (the
++  project config's `labels`) under the request's `labels`, and the
++  request's labels win. A `null` request value leaves that default off
++  the new session. Labels apply only at creation, not when a session
++  moves into a project later.
 +
  400 Bad Request - invalid terminal_launch_args (count / length bounds)
  404 Not Found - no agent with that id
  409 Conflict - a managed create's host_id names an existing host, or
-@@ -886,7 +893,9 @@ Request body:
+@@ -886,7 +892,9 @@ Request body:
      Session title update. `null` leaves the title unchanged.
  
    labels (object, optional)
@@ -187,10 +200,10 @@ index c7434f9d43ff09fe9694ab3798b9c74ed2345c4b..fce98096e30ac99fa3ae4c541346d51c
    reasoning_effort (string or null, optional)
      Per-session reasoning-effort hint. Accepted metadata values are
 diff --git a/omnigent/server/routes/_session_create_validation.py b/omnigent/server/routes/_session_create_validation.py
-index 10d06fbc8043489ce904777c842034c26a7026d7..2aa10e28b7791505e9828d6b835a8b79addc07c2 100644
+index 10d06fbc8043489ce904777c842034c26a7026d7..f0a5a4d74ed067ae24f9b4aee3f2a0a69d978232 100644
 --- a/omnigent/server/routes/_session_create_validation.py
 +++ b/omnigent/server/routes/_session_create_validation.py
-@@ -10,19 +10,23 @@ from __future__ import annotations
+@@ -10,17 +10,20 @@ from __future__ import annotations
  
  import asyncio
  import logging
@@ -207,21 +220,14 @@ index 10d06fbc8043489ce904777c842034c26a7026d7..2aa10e28b7791505e9828d6b835a8b79
  from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
  from omnigent.server.routes._auth_helpers import require_access
  from omnigent.stores import AgentStore, ConversationStore, PermissionStore
-+from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
++from omnigent.stores.conversation_store import is_internal_label_key
  from omnigent.stores.host_store import host_is_live
  from omnigent.stores.project_store import ProjectStore
-+from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
  from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
- 
- _logger = logging.getLogger(__name__)
-@@ -36,6 +40,35 @@ class ProjectCreateResolution:
+@@ -36,6 +39,48 @@ class ProjectCreateResolution:
      project_id: str | None = None
  
  
-+# Label namespaces written by Omnigent itself, never by a project default.
-+_INTERNAL_LABEL_PREFIXES = ("omnigent.", COST_CONTROL_LABEL_NAMESPACE)
-+
-+
 +def project_default_labels(config: Mapping[str, Any]) -> dict[str, str]:
 +    """Return the user labels a project's opaque config stamps on new sessions.
 +
@@ -242,35 +248,79 @@ index 10d06fbc8043489ce904777c842034c26a7026d7..2aa10e28b7791505e9828d6b835a8b79
 +        and isinstance(value, str)
 +        and 0 < len(key) <= LABEL_KEY_MAX_LEN
 +        and len(value) <= LABEL_VALUE_MAX_LEN
-+        and key != PROJECT_LABEL_KEY
-+        and not key.startswith(_INTERNAL_LABEL_PREFIXES)
++        and not is_internal_label_key(key)
 +    }
++
++
++def create_labels(body: Any, project_defaults: Mapping[str, str] | None = None) -> dict[str, str]:
++    """Return a create body's labels with the project's defaults under them.
++
++    A ``null`` request value leaves that default off the new session, mirroring
++    the ``null`` delete on PATCH; for any other key it is simply ignored, so
++    after :func:`resolve_project_session_create` the result is the body's own
++    labels, typed without the nulls it dropped.
++
++    :param body: A session-create body, e.g. one with ``labels={"team": None}``.
++    :param project_defaults: The project's usable default labels, if any.
++    """
++    merged: dict[str, str | None] = {
++        **(project_defaults or {}),
++        **(getattr(body, "labels", None) or {}),
++    }
++    return {key: value for key, value in merged.items() if value is not None}
 +
 +
  async def resolve_project_session_create(
      *,
      body: Any,
-@@ -68,6 +101,15 @@ async def resolve_project_session_create(
+@@ -53,6 +98,8 @@ async def resolve_project_session_create(
+     if "project_id" not in fields_set or project_id is None:
+         if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
+             raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
++        if "labels" in body.__class__.model_fields:
++            body = body.model_copy(update={"labels": create_labels(body)})
+         return ProjectCreateResolution(body=body)
+     if project_store is None:
+         raise OmnigentError(
+@@ -68,6 +115,8 @@ async def resolve_project_session_create(
      for field in ("agent_id", "workspace", "git"):
          if field not in fields_set and field in config and field in body.__class__.model_fields:
              updates[field] = config[field]
-+    # Project labels sit under the request's own labels, which win on conflict,
-+    # unless the client says its labels are already the final set.
-+    default_labels = project_default_labels(config)
-+    if (
-+        default_labels
-+        and "labels" in body.__class__.model_fields
-+        and getattr(body, "apply_project_labels", True)
-+    ):
-+        updates["labels"] = {**default_labels, **(getattr(body, "labels", None) or {})}
++    if "labels" in body.__class__.model_fields:
++        updates["labels"] = create_labels(body, project_default_labels(config))
      resolved_data = body.model_dump()
      resolved_data.update(updates)
      # Re-validate project hints because config is intentionally stored as
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index 3d0bc77340162f9c0ffc1c0ece3de828c7186971..19273f386102ca8fb036f8329fc0b3a206dd2a70 100644
+index 3d0bc77340162f9c0ffc1c0ece3de828c7186971..da69db660fefc46781ae7aef9b1d495d0fdbd8fa 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -10838,7 +10838,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
+@@ -43,6 +43,7 @@ from pydantic import ValidationError
+ from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
+ 
+ from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
++from omnigent.db.db_models import LABEL_KEY_MAX_LEN
+ from omnigent.db.utils import generate_task_id
+ from omnigent.db.workspace_cache import WorkspaceScopedCache
+ from omnigent.debug_logging import debug_event, runner_log_scope
+@@ -142,6 +143,7 @@ from omnigent.server.routes._auth_helpers import (
+ )
+ from omnigent.server.routes._host_worktree import CreatedWorktree
+ from omnigent.server.routes._session_create_validation import (
++    create_labels,
+     validate_existing_host_workspace,
+ )
+ 
+@@ -10815,7 +10817,7 @@ def _repl_terminal_ui_labels(
+     return {_CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
+ 
+ 
+-def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
++def _reject_reserved_cost_control_label_seed(labels: Mapping[str, str | None]) -> None:
+     """
+     Reject a session-create body that seeds policy-owned labels.
+ 
+@@ -10838,7 +10840,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
          )
  
  
@@ -279,24 +329,136 @@ index 3d0bc77340162f9c0ffc1c0ece3de828c7186971..19273f386102ca8fb036f8329fc0b3a2
      """
      Reject a client-supplied label map that touches server-internal keys.
  
+@@ -10942,6 +10944,24 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+         )
+ 
+ 
++def _reject_malformed_label_keys(labels: Mapping[str, str | None] | None) -> None:
++    """
++    Reject an empty label key or one wider than the ``conversation_labels.key``
++    column, which PostgreSQL would otherwise refuse mid-write.
++
++    :param labels: The client-supplied label mapping, or ``None``.
++    :raises OmnigentError: 400 on a malformed key.
++    """
++    for key in labels or ():
++        if not key:
++            raise OmnigentError("label keys must not be empty", code=ErrorCode.INVALID_INPUT)
++        if len(key) > LABEL_KEY_MAX_LEN:
++            raise OmnigentError(
++                f"label key {key[:LABEL_KEY_MAX_LEN]!r}… exceeds {LABEL_KEY_MAX_LEN} characters",
++                code=ErrorCode.INVALID_INPUT,
++            )
++
++
+ def _require_cost_control_label_authority(
+     *,
+     reserved_keys: Sequence[str],
+@@ -11041,7 +11061,7 @@ def _persist_stored_session_bundle(
+             agent_bundle_location=agent_bundle_location,
+             agent_description=agent_description,
+             title=metadata.title,
+-            labels=metadata.labels,
++            labels=create_labels(metadata),
+             reasoning_effort=metadata.reasoning_effort,
+             workspace=metadata.workspace,
+             terminal_launch_args=metadata.terminal_launch_args,
+@@ -11127,7 +11147,7 @@ def _persist_session_for_uploaded_agent(
+             terminal_launch_args=metadata.terminal_launch_args,
+             project_id=metadata.project_id,
+             inference_snapshot=inference_snapshot,
+-            labels=metadata.labels,
++            labels=create_labels(metadata),
+             reasoning_effort=metadata.reasoning_effort,
+             model_override=inference_model,
+         )
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 8f356e0b76a11cf02ca2e2273929c55e2010c157..b30f63596eafb242617082c4ee8f5077bb3f5d9e 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -334,6 +334,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _query_host_runner_status,
+     _read_state_entry,
+     _record_daily_cost,
++    _reject_malformed_label_keys,
+     _reject_reserved_cost_control_label_seed,
+     _reject_server_reserved_label_seed,
+     _relay_persist,
+@@ -11323,6 +11324,11 @@ async def _create_session_from_existing_agent(
+         resolve_project_session_create,
+     )
+ 
++    # Checked before the project merge: a null (a default left off this
++    # session) for a reserved key is rejected like a set would be.
++    _reject_malformed_label_keys(body.labels)
++    _reject_reserved_cost_control_label_seed(body.labels)
++    _reject_server_reserved_label_seed(body.labels)
+     project_resolution = await resolve_project_session_create(
+         body=body,
+         user_id=user_id,
+@@ -11332,9 +11338,6 @@ async def _create_session_from_existing_agent(
+     creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+     assert body.agent_id is not None
+ 
+-    _reject_reserved_cost_control_label_seed(body.labels)
+-    _reject_server_reserved_label_seed(body.labels)
+-
+     agent = await validate_session_agent(
+         user_id=user_id,
+         agent_id=body.agent_id,
 diff --git a/omnigent/server/routes/imports.py b/omnigent/server/routes/imports.py
-index 8535ae950adb7f380358ce0aac17cd4661074f71..18bf827d9fccdb98da762e9f272236efd63f23e2 100644
+index 8535ae950adb7f380358ce0aac17cd4661074f71..79f6a2d762514748706b4801891949fbed55829a 100644
 --- a/omnigent/server/routes/imports.py
 +++ b/omnigent/server/routes/imports.py
 @@ -433,6 +433,8 @@ def create_imports_router(
              )
              await asyncio.to_thread(conversation_store.append, conversation.id, items)
              labels = {
-+                # Project default labels resolved for an import into a project.
++                # Project defaults, when the import names a project.
 +                **resolved_create.body.labels,
                  **native_agent.presentation_labels,
                  IMPORT_SOURCE_LABEL_KEY: source,
                  IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index 1a77d78ed2c13914f10028780f28eea1659dd155..d72041855bb333d75c67089307d8fe98710c9fcf 100644
+index 1a77d78ed2c13914f10028780f28eea1659dd155..1db15b1a1b315771187239c9d5a8d943283b55d7 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -2944,11 +2944,12 @@ def register_core_routes(
+@@ -158,6 +158,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _publish_permission_mode,
+     _publish_sandbox_status,
+     _publish_terminal_pending,
++    _reject_malformed_label_keys,
+     _reject_reserved_cost_control_label_seed,
+     _reject_server_reserved_label_seed,
+     _require_codex_approval_mode_forward,
+@@ -1306,6 +1307,9 @@ def register_core_routes(
+             parent_session_id=parsed_metadata.parent_session_id,
+             host_type=parsed_metadata.host_type,
+         )
++        _reject_malformed_label_keys(parsed_metadata.labels)
++        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
++        _reject_server_reserved_label_seed(parsed_metadata.labels)
+         from omnigent.server.routes._session_create_validation import (
+             resolve_project_session_create,
+         )
+@@ -1321,8 +1325,6 @@ def register_core_routes(
+             parent_session_id=parsed_metadata.parent_session_id,
+             host_type=parsed_metadata.host_type,
+         )
+-        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+-        _reject_server_reserved_label_seed(parsed_metadata.labels)
+ 
+         inherited_runner_id: str | None = None
+         parent_conv = None
+@@ -2830,6 +2832,7 @@ def register_core_routes(
+                     code=ErrorCode.FORBIDDEN,
+                 )
+         if body.labels:
++            _reject_malformed_label_keys(body.labels)
+             _reject_server_reserved_label_seed(body.labels)
+             # Advisor-owned cost_control.* labels are written only by the
+             # session's bound runner; gate them on runner proof BEFORE any
+@@ -2944,11 +2947,12 @@ def register_core_routes(
                      code=ErrorCode.INVALID_INPUT,
                  )
              requested_codex_approval_mode = body.approval_mode
@@ -311,7 +473,7 @@ index 1a77d78ed2c13914f10028780f28eea1659dd155..d72041855bb333d75c67089307d8fe98
          if PINNED_LABEL_KEY in labels_to_set:
              labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
          if requested_codex_collaboration_mode is not None:
-@@ -3582,30 +3583,29 @@ def register_core_routes(
+@@ -3582,30 +3586,37 @@ def register_core_routes(
                  _approval_result,
              )
              labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
@@ -334,9 +496,17 @@ index 1a77d78ed2c13914f10028780f28eea1659dd155..d72041855bb333d75c67089307d8fe98
 -            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
 +                labels_to_set[_clear_key] = None
 +        labels_to_upsert = {k: v for k, v in labels_to_set.items() if v is not None}
-+        for _delete_key in (k for k, v in labels_to_set.items() if v is None):
-+            await asyncio.to_thread(conversation_store.delete_label, session_id, _delete_key)
-+        if labels_to_upsert:
++        labels_to_delete = [k for k, v in labels_to_set.items() if v is None]
++        # One store transaction, so a failed upsert does not leave the deletes
++        # behind and a concurrent reader never sees a half-applied edit.
++        if labels_to_delete:
++            await asyncio.to_thread(
++                conversation_store.set_labels,
++                session_id,
++                labels_to_upsert,
++                delete_keys=labels_to_delete,
++            )
++        elif labels_to_upsert:
 +            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_upsert)
          # Only when the switch was forwarded: a silent PATCH writes no label,
          # and an unconfirmed mode must not reach the picker.
@@ -357,45 +527,50 @@ index 1a77d78ed2c13914f10028780f28eea1659dd155..d72041855bb333d75c67089307d8fe98
          # Archiving means "get this out of my way", which contradicts a pin
          # ("keep it at the top"), so drop the archiver's own pin — otherwise the
 diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
-index 02479c47e396a5fd927f37d63e4e104471199d77..08881f9c96a07c38b0870ae1dbda31f79fd2e5a4 100644
+index 02479c47e396a5fd927f37d63e4e104471199d77..283cc69a36051a11046c7069e73a1afee19a72ce 100644
 --- a/omnigent/server/schemas.py
 +++ b/omnigent/server/schemas.py
-@@ -1673,6 +1673,9 @@ class _SessionCreateRequestBase(BaseModel):
-         real message after the create returns. ``None`` everywhere else,
-         including the bundle-agent auto path, which routes on the first
-         message event instead.
-+    :param apply_project_labels: Whether a ``project_id`` create adds the
-+        project's default labels under ``labels``. ``False`` when ``labels``
-+        is already the final set, e.g. a default removed for this session.
-     """
- 
-     inference_configuration_revision: str | None = None
-@@ -1686,6 +1689,7 @@ class _SessionCreateRequestBase(BaseModel):
+@@ -1531,7 +1531,9 @@ class _SessionCreateRequestBase(BaseModel):
+         single user ``"message"``.
+     :param title: Optional human-readable title for the session,
+         e.g. ``"debugging auth flow"``.
+-    :param labels: Initial guardrails labels to set on the session.
++    :param labels: Initial guardrails labels to set on the session. In a
++        project, its default labels fill in under these; a ``null`` value
++        leaves that default off the new session.
+     :param parent_session_id: Parent session for sub-agent spawns.
+         When set, the server inherits the parent's ``runner_id``
+         affinity and sets ``parent_conversation_id`` on the child
+@@ -1685,7 +1687,7 @@ class _SessionCreateRequestBase(BaseModel):
+     initial_input: SessionStartupInput | None = None
      mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
      title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
-     labels: dict[str, str] = Field(default_factory=dict)
-+    apply_project_labels: bool = True
+-    labels: dict[str, str] = Field(default_factory=dict)
++    labels: dict[str, str | None] = Field(default_factory=dict)
      parent_session_id: str | None = None
      sub_agent_name: str | None = None
      host_type: Literal["external", "managed"] = "external"
-@@ -1920,6 +1924,8 @@ class SessionCreateMetadata(BaseModel):
-         provision on ``host_type: "managed"`` (one of the server's
-         ``sandbox_providers``); ``None`` takes the server's first. Only
-         valid with ``host_type: "managed"``.
-+    :param apply_project_labels: Same as on the JSON create: ``False`` skips
-+        the project's default labels because ``labels`` is the final set.
-     """
+@@ -1879,7 +1881,9 @@ class SessionCreateMetadata(BaseModel):
+     :param title: Optional human-readable title for the session,
+         e.g. ``"debugging auth flow"``.
+     :param labels: Initial guardrails labels to set on the
+-        session. Empty dict (the default) starts with no labels.
++        session. Empty dict (the default) starts with no labels. In a
++        project, its default labels fill in under these; a ``null``
++        value leaves that default off the new session.
+     :param reasoning_effort: Optional per-session reasoning-effort
+         hint. Accepted metadata values are ``"none"``,
+         ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
+@@ -1928,7 +1932,7 @@ class SessionCreateMetadata(BaseModel):
  
-     inference_configuration_revision: str | None = None
-@@ -1929,6 +1935,7 @@ class SessionCreateMetadata(BaseModel):
      title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
      project_id: str | None = None
-     labels: dict[str, str] = Field(default_factory=dict)
-+    apply_project_labels: bool = True
+-    labels: dict[str, str] = Field(default_factory=dict)
++    labels: dict[str, str | None] = Field(default_factory=dict)
      reasoning_effort: str | None = None
      host_id: str | None = None
      workspace: str | None = None
-@@ -2500,7 +2507,9 @@ class UpdateSessionRequest(BaseModel):
+@@ -2500,7 +2504,9 @@ class UpdateSessionRequest(BaseModel):
      :param title: New title, e.g. ``"debugging auth flow"``.
          ``None`` leaves unchanged.
      :param labels: Guardrails labels to upsert. Merges with existing
@@ -406,7 +581,7 @@ index 02479c47e396a5fd927f37d63e4e104471199d77..08881f9c96a07c38b0870ae1dbda31f7
      :param reasoning_effort: Per-session reasoning-effort hint.
          Accepted metadata values are ``"none"``, ``"minimal"``,
          ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
-@@ -2602,7 +2611,7 @@ class UpdateSessionRequest(BaseModel):
+@@ -2602,7 +2608,7 @@ class UpdateSessionRequest(BaseModel):
  
      runner_id: str | None = None
      title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -415,6 +590,155 @@ index 02479c47e396a5fd927f37d63e4e104471199d77..08881f9c96a07c38b0870ae1dbda31f7
      reasoning_effort: str | None = None
      model_override: str | None = None
      collaboration_mode: str | None = None
+@@ -5327,7 +5333,10 @@ class ProjectObject(BaseModel):
+         workspace, harness, model, reasoning effort, git base-branch, …). Empty
+         when the project stores no defaults. The key vocabulary is owned by the
+         client; the server persists and returns it whole. Values are hints the
+-        new-chat dialog pre-fills, not enforced requirements.
++        new-chat dialog pre-fills, not enforced requirements, except that
++        session create reads ``agent_id``, ``workspace``, ``git`` and
++        ``labels`` (default labels, e.g. ``{"team": "ml"}``) from it. They are
++        not validated on write; a malformed entry is skipped at create time.
+     """
+ 
+     id: str
+diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
+index d0e9a1c500462ed351416e8f47d4c25c68e74c2c..a2eea1255ccdd28e7c5bba51382119d09bc120c1 100644
+--- a/omnigent/stores/conversation_store/__init__.py
++++ b/omnigent/stores/conversation_store/__init__.py
+@@ -4,7 +4,7 @@ import hashlib
+ import math
+ import time
+ from abc import ABC, abstractmethod
+-from collections.abc import Mapping
++from collections.abc import Iterable, Mapping
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, TypedDict
+ 
+@@ -16,6 +16,7 @@ from omnigent.entities import (
+     PagedList,
+ )
+ from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
++from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
+ 
+ # Pending inputs share the item store, but are not harness transcript history yet.
+ PENDING_INPUT_RESPONSE_ID = "pending_input"
+@@ -87,6 +88,20 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
+ # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
+ PROJECT_LABEL_KEY = "omni_project"
+ 
++# Label namespaces Omnigent writes for itself (pins, wrappers, cost telemetry).
++INTERNAL_LABEL_PREFIXES = ("omnigent.", COST_CONTROL_LABEL_NAMESPACE)
++
++
++def is_internal_label_key(key: str) -> bool:
++    """
++    Whether a label key is Omnigent's own bookkeeping rather than a user label.
++
++    :param key: A ``conversation_labels`` key, e.g. ``"omnigent.pinned"``.
++    :returns: ``True`` for ``omni_project`` and keys under ``omnigent.`` or
++        ``cost_control.``; ``False`` for a user label such as ``"team"``.
++    """
++    return key == PROJECT_LABEL_KEY or key.startswith(INTERNAL_LABEL_PREFIXES)
++
+ 
+ class DailyCostState(TypedDict):
+     """Daily cost state record returned by list_daily_cost_states.
+@@ -1244,12 +1259,17 @@ class ConversationStore(ABC):
+         conversation_id: str,
+         updates: dict[str, str],
+         updated_at: int | None = None,
++        *,
++        delete_keys: Iterable[str] = (),
+     ) -> None:
+         """
+         Upsert guardrails labels on a conversation.
+ 
+         Atomic batched UPSERT: either every key in *updates*
+         lands, or none of them do (matches POLICIES.md §6.3).
++        Keys in *delete_keys* are removed in the same
++        transaction, before the upsert, so a mixed edit (a
++        ``null`` and a value in one PATCH) is all-or-nothing.
+         Overwrites existing rows for the same keys;
+         non-mentioned keys are left untouched. The caller is
+         responsible for schema validation (``values`` /
+@@ -1280,6 +1300,9 @@ class ConversationStore(ABC):
+             audit trails aligned with the enforcement site
+             rather than wall-clock drift between evaluate()
+             and the actual DB write.
++        :param delete_keys: Label keys to delete first, e.g.
++            ``["team"]``; missing keys are ignored. Empty by
++            default.
+         """
+         ...
+ 
+diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
+index 958f1b2082113f5bceab9cc8551a89e9441c14bd..0e3377ff1814f4595f66f233c231d713180a79d0 100644
+--- a/omnigent/stores/conversation_store/sqlalchemy_store.py
++++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
+-from collections.abc import Mapping
++from collections.abc import Iterable, Mapping
+ from contextlib import suppress
+ from pathlib import PureWindowsPath
+ from typing import Any, Protocol, cast
+@@ -1547,6 +1547,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+         conversation_id: str,
+         updates: dict[str, str],
+         updated_at: int | None = None,
++        *,
++        delete_keys: Iterable[str] = (),
+     ) -> None:
+         """
+         Upsert guardrails labels on a conversation.
+@@ -1556,25 +1558,39 @@ class SqlAlchemyConversationStore(ConversationStore):
+         path dispatches to ``INSERT ... ON CONFLICT`` on
+         SQLite / PostgreSQL; other dialects fall back to
+         SELECT-then-INSERT/UPDATE inside the same transaction.
+-        Empty updates is a no-op.
++        *delete_keys* are removed first, in that transaction.
++        Empty updates and no deletes is a no-op.
+ 
+         :param conversation_id: The conversation to update,
+             e.g. ``"conv_abc123"``.
+         :param updates: Mapping from label key to new value.
+-            Example: ``{"integrity": "0"}``. Empty dict
+-            returns immediately without opening a transaction.
++            Example: ``{"integrity": "0"}``. Empty dict with
++            no *delete_keys* returns immediately without
++            opening a transaction.
+         :param updated_at: Caller-supplied timestamp
+             (``None`` → current wall-clock). See the abstract
+             method docstring for why callers may want to
+             pass their own.
++        :param delete_keys: Label keys to delete before the
++            upsert, e.g. ``["team"]``; missing keys are ignored.
+         """
+-        if not updates:
++        stable_deletes = tuple(delete_keys)
++        if not updates and not stable_deletes:
+             return
+         stamp = updated_at if updated_at is not None else now_epoch()
+         stable_updates = dict(updates)
+ 
+         def write(session: Session) -> None:
+-            _upsert_labels(session, conversation_id, stable_updates, stamp)
++            if stable_deletes:
++                session.execute(
++                    delete(SqlConversationLabel).where(
++                        SqlConversationLabel.workspace_id == current_workspace_id(),
++                        SqlConversationLabel.conversation_id == conversation_id,
++                        SqlConversationLabel.key.in_(stable_deletes),
++                    )
++                )
++            if stable_updates:
++                _upsert_labels(session, conversation_id, stable_updates, stamp)
+ 
+         run_write_transaction(self._conv_session_immediate, "set_labels", write)
+ 
 diff --git a/omnigent/util/cost_plan.py b/omnigent/util/cost_plan.py
 index 20aaadf64e88f0250355cf57f8bec965caeccc54..9482e5654c1c3bc31d2eaa303a1620484387c999 100644
 --- a/omnigent/util/cost_plan.py
@@ -458,7 +782,7 @@ index 98bddd24fb0bb4adf98e267d4d2df35897809e26..af8f9a530ac9bbb30057c6e1cd1c94f0
            },
            "model_override": {
 diff --git a/tests/server/routes/test_session_create_project_consistency.py b/tests/server/routes/test_session_create_project_consistency.py
-index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd900078431d4f 100644
+index d8d4f642f72c16100017a36386c3fed6e5aee94b..a3183bb4500ef1821fc38692eb9da7bc5b95d6d0 100644
 --- a/tests/server/routes/test_session_create_project_consistency.py
 +++ b/tests/server/routes/test_session_create_project_consistency.py
 @@ -2,6 +2,7 @@
@@ -469,7 +793,7 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
  from collections.abc import AsyncIterator
  from pathlib import Path
  
-@@ -126,6 +127,85 @@ async def test_explicit_values_are_not_overridden(
+@@ -126,6 +127,115 @@ async def test_explicit_values_are_not_overridden(
      assert response.json()["workspace"] == "/work/project/subdir"
  
  
@@ -507,11 +831,12 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
 +    assert "k" * 129 not in labels
 +
 +
-+async def test_final_request_labels_skip_project_labels(
++async def test_null_request_label_leaves_project_default_off(
 +    project_create_client: httpx.AsyncClient,
 +) -> None:
-+    """A create whose labels are already the final set keeps a default removed
-+    for this session off it, and still applies the project's other defaults."""
++    """A ``null`` request label leaves that project default off the new session
++    (mirroring the ``null`` delete on PATCH), the other defaults still apply,
++    and a ``null`` for a key the project doesn't default is ignored."""
 +    project_id = await _project(
 +        project_create_client,
 +        {"agent_id": CUSTOM_AGENT_ID, "labels": {"team": "ml", "env": "dev"}},
@@ -520,8 +845,7 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
 +        "/v1/sessions",
 +        json={
 +            "project_id": project_id,
-+            "labels": {"env": "dev", "owner": "me"},
-+            "apply_project_labels": False,
++            "labels": {"team": None, "owner": "me", "never-set": None},
 +        },
 +        headers=_headers(),
 +    )
@@ -532,6 +856,36 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
 +    assert body["labels"]["env"] == "dev"
 +    assert body["labels"]["owner"] == "me"
 +    assert "team" not in body["labels"]
++    assert "never-set" not in body["labels"]
++
++
++async def test_null_label_without_project_is_ignored(
++    project_create_client: httpx.AsyncClient,
++) -> None:
++    response = await project_create_client.post(
++        "/v1/sessions",
++        json={"agent_id": CUSTOM_AGENT_ID, "labels": {"team": None, "owner": "me"}},
++        headers=_headers(),
++    )
++    assert response.status_code == 201, response.text
++    assert response.json()["labels"]["owner"] == "me"
++    assert "team" not in response.json()["labels"]
++
++
++@pytest.mark.parametrize("reserved_key", ["omnigent.archived_at", "cost_control.plan"])
++async def test_null_reserved_label_on_create_is_rejected(
++    project_create_client: httpx.AsyncClient,
++    reserved_key: str,
++) -> None:
++    """A ``null`` for a reserved key is rejected like setting it, even though
++    there is nothing to delete yet."""
++    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
++    response = await project_create_client.post(
++        "/v1/sessions",
++        json={"project_id": project_id, "labels": {reserved_key: None}},
++        headers=_headers(),
++    )
++    assert response.status_code == 400, response.text
 +
 +
 +@pytest.mark.parametrize("malformed_labels", ["team=ml", ["team"], None])
@@ -555,7 +909,7 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
  async def test_explicit_null_is_not_defaulted(
      project_create_client: httpx.AsyncClient,
  ) -> None:
-@@ -442,7 +522,9 @@ async def test_git_default_fill_with_differing_workspace(db_uri: str) -> None:
+@@ -442,7 +552,9 @@ async def test_git_default_fill_with_differing_workspace(db_uri: str) -> None:
  async def test_multipart_create_defaults_workspace_and_files_atomically(
      project_create_client: httpx.AsyncClient,
  ) -> None:
@@ -566,20 +920,20 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
      response = await project_create_client.post(
          "/v1/sessions",
          data={"metadata": f'{{"project_id":"{project_id}"}}'},
-@@ -462,6 +544,34 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
+@@ -462,6 +574,34 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
      assert session.status_code == 200, session.text
      assert session.json()["workspace"] == "/work/upload"
      assert session.json()["project_id"] == project_id
 +    assert session.json()["labels"]["team"] == "ml"
 +
 +
-+async def test_multipart_final_labels_skip_project_labels(
++async def test_multipart_null_label_leaves_project_default_off(
 +    project_create_client: httpx.AsyncClient,
 +) -> None:
 +    project_id = await _project(
 +        project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
 +    )
-+    metadata = {"project_id": project_id, "labels": {"env": "dev"}, "apply_project_labels": False}
++    metadata = {"project_id": project_id, "labels": {"env": "dev", "team": None}}
 +    response = await project_create_client.post(
 +        "/v1/sessions",
 +        data={"metadata": json.dumps(metadata)},
@@ -601,7 +955,7 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
  
  
  async def test_multipart_malformed_project_config_is_structured_400(
-@@ -536,7 +646,9 @@ async def test_import_with_project_defaults_workspace_and_files_session(
+@@ -536,7 +676,9 @@ async def test_import_with_project_defaults_workspace_and_files_session(
  ) -> None:
      """An import naming a project consumes the resolver's decisions for real."""
      _seed_claude_import_agent(db_uri)
@@ -612,7 +966,7 @@ index d8d4f642f72c16100017a36386c3fed6e5aee94b..a0d1ea0dfa3cf720f3c3ee5ed6bd9000
      response = await project_create_client.post(
          "/v1/imports",
          json=_import_payload("project-import-1", project_id=project_id),
-@@ -549,6 +661,7 @@ async def test_import_with_project_defaults_workspace_and_files_session(
+@@ -549,6 +691,7 @@ async def test_import_with_project_defaults_workspace_and_files_session(
      assert session.status_code == 200, session.text
      assert session.json()["workspace"] == "/work/import"
      assert session.json()["project_id"] == project_id
@@ -678,7 +1032,7 @@ index 5d0f7e4efd1edc33406ebf250458de874f78d2a4..a4918748fcd0d7ae95ca6800c26d0c3a
  
  # ── PATCH: the bound runner's write keeps working ────────────────────────────
 diff --git a/tests/server/routes/test_sessions_crud.py b/tests/server/routes/test_sessions_crud.py
-index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..50d0f39e2b6aa47d9b98cfbde1f817628adef589 100644
+index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..426c10c6fbe6791f0d2c75c131fdce762782e05b 100644
 --- a/tests/server/routes/test_sessions_crud.py
 +++ b/tests/server/routes/test_sessions_crud.py
 @@ -570,19 +570,22 @@ async def test_patch_session_sets_project_label(
@@ -707,7 +1061,7 @@ index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..50d0f39e2b6aa47d9b98cfbde1f81762
          headers={"Content-Type": "application/json"},
      )
      assert resp.status_code == 200
-@@ -592,6 +595,67 @@ async def test_patch_session_empty_project_removes_label(
+@@ -592,18 +595,133 @@ async def test_patch_session_empty_project_removes_label(
      assert "omni_project" not in conv.labels
  
  
@@ -738,6 +1092,37 @@ index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..50d0f39e2b6aa47d9b98cfbde1f81762
 +    assert "never-set" not in conv.labels
 +    assert conv.labels["env"] == "prod"
 +    assert conv.labels["owner"] == "ana"
++
++
++async def test_patch_session_mixed_label_edit_is_atomic(
++    client: httpx.AsyncClient,
++    session_id: str,
++    db_uri: str,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A PATCH that deletes one label and sets another applies both or
++    neither: when the upsert fails, the deleted label survives."""
++    from omnigent.stores.conversation_store import sqlalchemy_store
++
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    conv_store.set_labels(session_id, {"team": "ml"})
++
++    def failing_upsert(*args: object, **kwargs: object) -> None:
++        raise RuntimeError("upsert refused")
++
++    monkeypatch.setattr(sqlalchemy_store, "_upsert_prepared_labels", failing_upsert)
++    # The test transport re-raises the handler's exception instead of a 500.
++    with pytest.raises(RuntimeError, match="upsert refused"):
++        await client.patch(
++            f"/v1/sessions/{session_id}",
++            json={"labels": {"team": None, "env": "prod"}},
++            headers={"Content-Type": "application/json"},
++        )
++
++    conv = conv_store.get_conversation(session_id)
++    assert conv is not None
++    assert conv.labels["team"] == "ml"
++    assert "env" not in conv.labels
 +
 +
 +@pytest.mark.parametrize(
@@ -772,9 +1157,142 @@ index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..50d0f39e2b6aa47d9b98cfbde1f81762
 +    assert conv.labels[reserved_key] == "server-written"
 +
 +
++@pytest.mark.parametrize("bad_key", ["", "k" * 129])
++async def test_patch_rejects_malformed_label_key(
++    client: httpx.AsyncClient,
++    session_id: str,
++    db_uri: str,
++    bad_key: str,
++) -> None:
++    """An empty or over-width key is a 400 before any write, not a database
++    error mid-request."""
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    resp = await client.patch(
++        f"/v1/sessions/{session_id}",
++        json={"labels": {bad_key: "x", "team": "ml"}},
++        headers={"Content-Type": "application/json"},
++    )
++    assert resp.status_code == 400, resp.text
++    conv = conv_store.get_conversation(session_id)
++    assert conv is not None
++    assert "team" not in conv.labels
++
++
  # ── Pinned session label (omnigent.pinned) ───────────────────────────
  
  
++@pytest.mark.parametrize("unpin_value", ["", None])
+ async def test_patch_session_pins_and_unpins(
+     client: httpx.AsyncClient,
+     session_id: str,
+     db_uri: str,
++    unpin_value: str | None,
+ ) -> None:
+     """PATCH with the canonical ``labels: {"omnigent.pinned": <pin-time>}`` pins
+     the session for the CALLER: the server rewrites it to the per-user key
+     ``omnigent.pinned.<user>`` in storage (so it doesn't pin for others), and an
+-    empty value deletes that per-user key (unpin)."""
++    empty value (or ``null``) deletes that per-user key (unpin)."""
+     from omnigent.stores.conversation_store import pinned_label_key
+ 
+     conv_store = SqlAlchemyConversationStore(db_uri)
+@@ -624,10 +742,10 @@ async def test_patch_session_pins_and_unpins(
+     # …but the response collapses it back to the canonical key for the caller.
+     assert resp.json()["labels"].get("omnigent.pinned") == "1721760000000"
+ 
+-    # Unpin: empty string clears the per-user key.
++    # Unpin: an empty string or null clears the per-user key.
+     resp = await client.patch(
+         f"/v1/sessions/{session_id}",
+-        json={"labels": {"omnigent.pinned": ""}},
++        json={"labels": {"omnigent.pinned": unpin_value}},
+         headers={"Content-Type": "application/json"},
+     )
+     assert resp.status_code == 200
+diff --git a/tests/stores/test_conversation_labels.py b/tests/stores/test_conversation_labels.py
+index 0a9631a037afc264a3466baaab1333920753e170..f8840329dcd48aea7b03f9e61298b1b82176e983 100644
+--- a/tests/stores/test_conversation_labels.py
++++ b/tests/stores/test_conversation_labels.py
+@@ -17,7 +17,7 @@ from omnigent.entities import (
+     MessageData,
+     NewConversationItem,
+ )
+-from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
++from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY, is_internal_label_key
+ from omnigent.stores.conversation_store.sqlalchemy_store import (
+     SqlAlchemyConversationStore,
+ )
+@@ -151,6 +151,46 @@ def test_set_labels_many_keys_atomic(
+ # ── Survival across conversation_items churn ───────────
+ 
+ 
++def test_set_labels_deletes_keys_in_the_same_write(
++    conversation_store: SqlAlchemyConversationStore,
++) -> None:
++    """``delete_keys`` removes labels alongside the upsert; a missing key is
++    ignored and unmentioned keys stay."""
++    conv = conversation_store.create_conversation()
++    conversation_store.set_labels(conv.id, {"team": "ml", "env": "dev", "owner": "ana"})
++    conversation_store.set_labels(conv.id, {"env": "prod"}, delete_keys=["team", "never-set"])
++    got = conversation_store.get_conversation(conv.id)
++    assert got is not None
++    assert got.labels == {"env": "prod", "owner": "ana"}
++
++    conversation_store.set_labels(conv.id, {}, delete_keys=["owner"])
++    got = conversation_store.get_conversation(conv.id)
++    assert got is not None
++    assert got.labels == {"env": "prod"}
++
++
++def test_set_labels_rolls_back_deletes_when_the_upsert_fails(
++    conversation_store: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A delete and an upsert share one transaction: when the upsert raises,
++    the deleted label is still there afterwards."""
++    from omnigent.stores.conversation_store import sqlalchemy_store
++
++    conv = conversation_store.create_conversation()
++    conversation_store.set_labels(conv.id, {"team": "ml"})
++
++    def failing_upsert(*args: object, **kwargs: object) -> None:
++        raise RuntimeError("upsert refused")
++
++    monkeypatch.setattr(sqlalchemy_store, "_upsert_prepared_labels", failing_upsert)
++    with pytest.raises(RuntimeError, match="upsert refused"):
++        conversation_store.set_labels(conv.id, {"env": "prod"}, delete_keys=["team"])
++    got = conversation_store.get_conversation(conv.id)
++    assert got is not None
++    assert got.labels == {"team": "ml"}
++
++
+ def test_labels_survive_item_appends(
+     conversation_store: SqlAlchemyConversationStore,
+ ) -> None:
+@@ -489,3 +529,23 @@ def test_fork_does_not_inherit_archived_at_label(
+     forked = conversation_store.get_conversation(fork.id)
+     assert forked is not None
+     assert ARCHIVED_AT_LABEL_KEY not in forked.labels
++
++
++# ── Internal vs user label keys ────────────────────────
++
++
++@pytest.mark.parametrize(
++    ("key", "internal"),
++    [
++        ("omni_project", True),
++        ("omnigent.pinned.bob@example.com", True),
++        ("omnigent.archived_at", True),
++        ("cost_control.plan", True),
++        ("team", False),
++        ("omnigent", False),
++        ("omni_projects", False),
++    ],
++)
++def test_is_internal_label_key(key: str, internal: bool) -> None:
++    """Omnigent-owned keys are hidden from, and rejected for, user editing."""
++    assert is_internal_label_key(key) is internal
 diff --git a/web/src/components/AgentInfo.test.tsx b/web/src/components/AgentInfo.test.tsx
 index 85e2d8a328881c1ea446d6ec376abc4d8e126d88..1de38bf3ec01934836bc4f980be08d78b0de888f 100644
 --- a/web/src/components/AgentInfo.test.tsx
@@ -999,10 +1517,10 @@ index f529af34f62978b4b06f00ff1b331e134901d426..29585c317cb1c237287243fcb0039a5d
          servers={servers}
 diff --git a/web/src/components/LabelEditor.tsx b/web/src/components/LabelEditor.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..2636747097485a1a26698649007e74d1be875772
+index 0000000000000000000000000000000000000000..097f99f52a64089a74bbd97d2a2745cf893afe8f
 --- /dev/null
 +++ b/web/src/components/LabelEditor.tsx
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,335 @@
 +// Key/value editor for user labels ("tags"), shared by the session info
 +// popover (each change PATCHes the session) and the project settings dialog
 +// (changes edit a draft saved with the dialog). Internal labels are hidden.
@@ -1016,15 +1534,16 @@ index 0000000000000000000000000000000000000000..2636747097485a1a26698649007e74d1
 +import { Input } from "@/components/ui/input";
 +import { labelValidationError, userLabelEntries } from "@/lib/sessionLabels";
 +
-+/** What {@link LabelEditorHandle.takePendingLabel} found in the add row. */
++/** What {@link LabelEditorHandle.takePendingLabel} found in the add or edit row. */
 +export type PendingLabel =
 +  { status: "none" } | { status: "valid"; key: string; value: string } | { status: "invalid" };
 +
-+/** Lets a parent that saves in bulk collect a label typed but not yet added. */
++/** Lets a parent that saves in bulk collect a label typed but not yet committed. */
 +export interface LabelEditorHandle {
 +  /**
-+   * Take the add row's label: a valid one is cleared from the row for the
-+   * caller to save, and an invalid one shows its inline message.
++   * Take the label in the add row or the edit in progress: a valid one is
++   * cleared from its row for the caller to save, and an invalid one shows its
++   * inline message.
 +   */
 +  takePendingLabel: () => PendingLabel;
 +}
@@ -1152,6 +1671,17 @@ index 0000000000000000000000000000000000000000..2636747097485a1a26698649007e74d1
 +
 +  useImperativeHandle(handleRef, () => ({
 +    takePendingLabel: () => {
++      if (editingKey !== null) {
++        const value = editValue.trim();
++        const invalid = labelValidationError(editingKey, value);
++        if (invalid) {
++          setError(invalid);
++          return { status: "invalid" };
++        }
++        setError(null);
++        setEditingKey(null);
++        return { status: "valid", key: editingKey, value };
++      }
 +      if (!adding || (!newKey.trim() && !newValue.trim())) return { status: "none" };
 +      const label = validateNew();
 +      if (!label) return { status: "invalid" };
@@ -1410,10 +1940,10 @@ index 836481c1ee2aacafac22e33f5aa33afb8e2e896f..75fb0ce52e3130de93fc32f9f5e2efda
                        onSelect={(event) => {
 diff --git a/web/src/components/composer/NewSessionLabels.tsx b/web/src/components/composer/NewSessionLabels.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..83c4352ade094e4a811b5510cf7331cebd9c5477
+index 0000000000000000000000000000000000000000..e6cbe4a7b483f1734a5106dbf9ce4a094c01eb58
 --- /dev/null
 +++ b/web/src/components/composer/NewSessionLabels.tsx
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,121 @@
 +// Labels for a session not created yet: chips in the new-session composer and
 +// the editor the composer's "+" menu opens. Project defaults come pre-filled.
 +
@@ -1476,7 +2006,7 @@ index 0000000000000000000000000000000000000000..83c4352ade094e4a811b5510cf7331ce
 +  );
 +}
 +
-+/** Edit the new session's labels; a valid label left in the add row is kept on close. */
++/** Edit the new session's labels; a valid label left in the add or edit row is kept on close. */
 +export function NewSessionLabelsDialog({
 +  open,
 +  onOpenChange,
@@ -1503,7 +2033,10 @@ index 0000000000000000000000000000000000000000..83c4352ade094e4a811b5510cf7331ce
 +  };
 +  return (
 +    <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(true) : close())}>
-+      <DialogContent className="sm:max-w-md" data-testid="new-session-labels-dialog">
++      <DialogContent
++        className="flex max-h-[85vh] flex-col sm:max-w-md"
++        data-testid="new-session-labels-dialog"
++      >
 +        <DialogHeader>
 +          <DialogTitle>Labels</DialogTitle>
 +          <DialogDescription>
@@ -1512,15 +2045,17 @@ index 0000000000000000000000000000000000000000..83c4352ade094e4a811b5510cf7331ce
 +              : "Added to the new session."}
 +          </DialogDescription>
 +        </DialogHeader>
-+        <LabelEditor
-+          labels={labels}
-+          onSet={onSet}
-+          onRemove={onRemove}
-+          emptyText="No labels"
-+          testIdPrefix="new-session-labels-editor"
-+          handleRef={editorRef}
-+          rowNote={(key, value) => (projectDefaults[key] === value ? "from project" : null)}
-+        />
++        <div className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1">
++          <LabelEditor
++            labels={labels}
++            onSet={onSet}
++            onRemove={onRemove}
++            emptyText="No labels"
++            testIdPrefix="new-session-labels-editor"
++            handleRef={editorRef}
++            rowNote={(key, value) => (projectDefaults[key] === value ? "from project" : null)}
++          />
++        </div>
 +        <DialogFooter className="border-t-0 bg-transparent">
 +          <Button type="button" onClick={close} data-testid="new-session-labels-done">
 +            Done
@@ -1532,11 +2067,11 @@ index 0000000000000000000000000000000000000000..83c4352ade094e4a811b5510cf7331ce
 +}
 diff --git a/web/src/hooks/useSessionLabels.ts b/web/src/hooks/useSessionLabels.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..ba3e84ac2150b3f620cd527cccb7ff8f94ff39e2
+index 0000000000000000000000000000000000000000..564a5d965120a7644f5cdc9b959a337d62ff02c7
 --- /dev/null
 +++ b/web/src/hooks/useSessionLabels.ts
-@@ -0,0 +1,51 @@
-+import { useEffect, useMemo, useState } from "react";
+@@ -0,0 +1,63 @@
++import { useEffect, useMemo, useRef, useState } from "react";
 +import { useMutation, useQueryClient } from "@tanstack/react-query";
 +import { newSessionLabels } from "@/lib/sessionLabels";
 +import { overlayLabelsIntoCaches } from "@/lib/sessionListCache";
@@ -1565,11 +2100,21 @@ index 0000000000000000000000000000000000000000..ba3e84ac2150b3f620cd527cccb7ff8f
 + * session's edits. Removing a default only leaves it off this session.
 + *
 + * @param projectDefaults - The selected project's default labels, `{}` without one.
-+ * @param projectName - The selected project; switching it forgets removed defaults.
++ * @param projectName - The selected project; switching it forgets the removed
++ *   defaults (they belonged to the old project) but keeps added labels.
++ * @param initialEdits - Edits to start from, e.g. restored from a composer
++ *   draft: a value sets a label, `null` leaves a project default off.
 + */
-+export function useNewSessionLabels(projectDefaults: Record<string, string>, projectName: string) {
-+  const [edits, setEdits] = useState<Record<string, string | null>>({});
++export function useNewSessionLabels(
++  projectDefaults: Record<string, string>,
++  projectName: string,
++  initialEdits: Record<string, string | null> = {},
++) {
++  const [edits, setEdits] = useState<Record<string, string | null>>(() => initialEdits);
++  const editedProject = useRef(projectName);
 +  useEffect(() => {
++    if (editedProject.current === projectName) return;
++    editedProject.current = projectName;
 +    setEdits((prev) => Object.fromEntries(Object.entries(prev).filter(([, v]) => v !== null)));
 +  }, [projectName]);
 +  const resolved = useMemo(
@@ -1578,6 +2123,8 @@ index 0000000000000000000000000000000000000000..ba3e84ac2150b3f620cd527cccb7ff8f
 +  );
 +  return {
 +    ...resolved,
++    /** The raw edits, for a draft to restore later. */
++    edits,
 +    setLabel: (key: string, value: string) => setEdits((prev) => ({ ...prev, [key]: value })),
 +    removeLabel: (key: string) =>
 +      setEdits((prev) => {
@@ -1616,10 +2163,10 @@ index afa9435b64a7299b2c6a3799cc4ae0e39d346e72..029c46f046f88681fd21fa905afeac42
  /** A first-class project. Mirrors the `ProjectObject` response shape. */
 diff --git a/web/src/lib/sessionLabels.test.ts b/web/src/lib/sessionLabels.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..6315a1216077ad90d89d6830bb26dd0d9a8578d1
+index 0000000000000000000000000000000000000000..73219fbbd1e7e6370794f091b303c8c02a2cf255
 --- /dev/null
 +++ b/web/src/lib/sessionLabels.test.ts
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,109 @@
 +import { describe, expect, it } from "vitest";
 +import {
 +  LABEL_KEY_MAX_LENGTH,
@@ -1710,17 +2257,15 @@ index 0000000000000000000000000000000000000000..6315a1216077ad90d89d6830bb26dd0d
 +  it("layers this session's edits over the project defaults", () => {
 +    expect(newSessionLabels({ team: "ml" }, { env: "dev", team: "infra" })).toEqual({
 +      labels: { team: "infra", env: "dev" },
-+      applyProjectLabels: true,
++      requestLabels: { team: "infra", env: "dev" },
 +    });
 +  });
 +
-+  it("turns the server merge off once a project default is removed", () => {
++  it("sends a removed project default as null so the server leaves it off", () => {
 +    expect(newSessionLabels({ team: "ml", env: "dev" }, { team: null })).toEqual({
 +      labels: { env: "dev" },
-+      applyProjectLabels: false,
++      requestLabels: { team: null, env: "dev" },
 +    });
-+    // A removal for a key the current project doesn't default is moot.
-+    expect(newSessionLabels({}, { team: null }).applyProjectLabels).toBe(true);
 +  });
 +});
 +
@@ -1733,10 +2278,10 @@ index 0000000000000000000000000000000000000000..6315a1216077ad90d89d6830bb26dd0d
 +});
 diff --git a/web/src/lib/sessionLabels.ts b/web/src/lib/sessionLabels.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..27ddff8e09be661e0e38f06a3a95bae337829eaf
+index 0000000000000000000000000000000000000000..3d0966183ad66c0aa896bbe234d1aa380280ff91
 --- /dev/null
 +++ b/web/src/lib/sessionLabels.ts
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,90 @@
 +// User-facing session labels ("tags"): which `conversation_labels` keys a
 +// person may see and edit, and the limits the server's label columns impose.
 +
@@ -1750,7 +2295,7 @@ index 0000000000000000000000000000000000000000..27ddff8e09be661e0e38f06a3a95bae3
 +/** Namespaces Omnigent writes for its own bookkeeping (pins, wrappers, cost). */
 +const INTERNAL_LABEL_PREFIXES = ["omnigent.", "cost_control."] as const;
 +
-+/** Whether a label key is framework-owned rather than a user label. */
++/** Whether a label key is framework-owned rather than a user label; mirrors the server's `is_internal_label_key`. */
 +export function isInternalLabelKey(key: string): boolean {
 +  return (
 +    key === PROJECT_LABEL_KEY || INTERNAL_LABEL_PREFIXES.some((prefix) => key.startsWith(prefix))
@@ -1807,21 +2352,19 @@ index 0000000000000000000000000000000000000000..27ddff8e09be661e0e38f06a3a95bae3
 +
 +/**
 + * A new session's labels: the project's defaults with this session's edits on
-+ * top, where a `null` edit leaves that default off this session.
-+ * `applyProjectLabels` is false once a default was removed, so the server
-+ * takes `labels` as the final set instead of adding the defaults back.
++ * top, where a `null` edit leaves that default off this session. `labels` is
++ * what the session will start with; `requestLabels` keeps the `null`s so the
++ * create request tells the server which defaults to leave off.
 + */
 +export function newSessionLabels(
 +  projectDefaults: Record<string, string>,
 +  edits: Record<string, string | null>,
-+): { labels: Record<string, string>; applyProjectLabels: boolean } {
++): { labels: Record<string, string>; requestLabels: Record<string, string | null> } {
++  const requestLabels = { ...projectDefaults, ...edits };
 +  const labels = Object.fromEntries(
-+    Object.entries({ ...projectDefaults, ...edits }).filter(
-+      (entry): entry is [string, string] => entry[1] !== null,
-+    ),
++    Object.entries(requestLabels).filter((entry): entry is [string, string] => entry[1] !== null),
 +  );
-+  const removedDefault = Object.keys(projectDefaults).some((key) => edits[key] === null);
-+  return { labels, applyProjectLabels: !removedDefault };
++  return { labels, requestLabels };
 +}
 +
 +/** Whether two label maps hold the same entries. */
@@ -2008,14 +2551,16 @@ index 61975b2f0323d865fc1d781742d20449fee0b28b..552d71030dc06a8dff67755bd9bebab2
 +  queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
 +}
 diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
-index ea757a3965fb9877a5508d8ddcbcd03d4dbdf834..a225516fe8787135c92b5186926a05c69eb6e332 100644
+index ea757a3965fb9877a5508d8ddcbcd03d4dbdf834..478f067dc08b90b6bb2ff606ee1af027c8bc108c 100644
 --- a/web/src/lib/sessionsApi.ts
 +++ b/web/src/lib/sessionsApi.ts
-@@ -748,6 +748,7 @@ export async function createBundledSession(
+@@ -747,7 +747,8 @@ export async function createBundledSession(
+     host_type?: string;
      workspace?: string;
      project_id?: string;
-     labels?: Record<string, string>;
-+    apply_project_labels?: boolean;
+-    labels?: Record<string, string>;
++    /** Initial labels; a `null` value leaves that project default off the session. */
++    labels?: Record<string, string | null>;
      terminal_launch_args?: string[];
      git?: { branch_name: string; base_branch?: string };
      mcp_registry_services?: string[];
@@ -2045,7 +2590,7 @@ index ea757a3965fb9877a5508d8ddcbcd03d4dbdf834..a225516fe8787135c92b5186926a05c6
    }
    if (updates.silent) {
 diff --git a/web/src/shell/NewChatDialog.projectCreate.test.tsx b/web/src/shell/NewChatDialog.projectCreate.test.tsx
-index b580b49ce8efeb18525b797bb019f157c31fcbb1..4f21243da6f334c6f4d263dc89eba5ec27f874bb 100644
+index b580b49ce8efeb18525b797bb019f157c31fcbb1..53b4a3a4f3a648698baa1225957e2b2550b4fc5d 100644
 --- a/web/src/shell/NewChatDialog.projectCreate.test.tsx
 +++ b/web/src/shell/NewChatDialog.projectCreate.test.tsx
 @@ -36,7 +36,7 @@ import type * as ToastModule from "@/components/ui/toast";
@@ -2057,11 +2602,11 @@ index b580b49ce8efeb18525b797bb019f157c31fcbb1..4f21243da6f334c6f4d263dc89eba5ec
  import type { ReactNode } from "react";
  
  import { authenticatedFetch } from "@/lib/identity";
-@@ -523,6 +523,47 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
+@@ -523,6 +523,93 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
      expect("agent_id" in body).toBe(false);
    });
  
-+  it("pre-fills the project's default labels and leaves the server merge on", async () => {
++  it("pre-fills the project's default labels into the create", async () => {
 +    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
 +    renderLanding();
 +    await waitFor(() =>
@@ -2071,10 +2616,9 @@ index b580b49ce8efeb18525b797bb019f157c31fcbb1..4f21243da6f334c6f4d263dc89eba5ec
 +    const body = await submitAndReadBody();
 +    expect(body.project_id).toBe("proj_alpha");
 +    expect((body.labels as Record<string, string>).team).toBe("ml");
-+    expect("apply_project_labels" in body).toBe(false);
 +  });
 +
-+  it("sends the final labels without a removed project default", async () => {
++  it("sends a removed project default as null", async () => {
 +    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml", env: "dev" } });
 +    renderLanding();
 +    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
@@ -2095,11 +2639,58 @@ index b580b49ce8efeb18525b797bb019f157c31fcbb1..4f21243da6f334c6f4d263dc89eba5ec
 +    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
 +
 +    const body = await submitAndReadBody();
-+    const labels = body.labels as Record<string, string>;
++    const labels = body.labels as Record<string, string | null>;
 +    expect(labels.env).toBe("dev");
 +    expect(labels.owner).toBe("me");
-+    expect(labels.team).toBeUndefined();
-+    expect(body.apply_project_labels).toBe(false);
++    expect(labels.team).toBeNull();
++  });
++
++  it("keeps an edit still in progress when Done is clicked", async () => {
++    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
++    renderLanding();
++    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
++    fireEvent.click(screen.getByRole("button", { name: "Edit labels (team: ml)" }));
++    const dialog = await screen.findByTestId("new-session-labels-dialog");
++    fireEvent.click(within(dialog).getByRole("button", { name: "Edit label team" }));
++    fireEvent.change(within(dialog).getByLabelText("Value for label team"), {
++      target: { value: "infra" },
++    });
++    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
++    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
++    expect(screen.getByTestId("new-session-label-chips")).toHaveTextContent("team: infra");
++
++    const body = await submitAndReadBody();
++    expect((body.labels as Record<string, string>).team).toBe("infra");
++  });
++
++  it("restores label edits with the composer draft", async () => {
++    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
++    const first = renderLanding();
++    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
++    fireEvent.click(screen.getByRole("button", { name: "Edit labels (team: ml)" }));
++    const dialog = await screen.findByTestId("new-session-labels-dialog");
++    fireEvent.click(within(dialog).getByRole("button", { name: "Remove label team" }));
++    await waitFor(() => expect(dialog).not.toHaveTextContent("team:"));
++    fireEvent.click(within(dialog).getByRole("button", { name: "Add label" }));
++    fireEvent.change(within(dialog).getByLabelText("New label key"), {
++      target: { value: "env" },
++    });
++    fireEvent.change(within(dialog).getByLabelText("New label value"), {
++      target: { value: "dev" },
++    });
++    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
++    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
++    first.unmount();
++
++    renderLanding();
++    const chips = await screen.findByTestId("new-session-label-chips");
++    expect(chips).toHaveTextContent("env: dev");
++    expect(chips).not.toHaveTextContent("team:");
++
++    const body = await submitAndReadBody();
++    const labels = body.labels as Record<string, string | null>;
++    expect(labels.env).toBe("dev");
++    expect(labels.team).toBeNull();
 +  });
 +
    it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
@@ -2136,7 +2727,7 @@ index 01eac5b7ec630f1d5e6d897c93bc5570999e04a4..e9400b81365926157903508be5dfc9ec
      const onPlan = vi.fn();
      render(
 diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
-index 8fba969e357a73383d4913f6ac8699960a265452..026e087729e86061f07f78dd11304940b9603211 100644
+index 8fba969e357a73383d4913f6ac8699960a265452..7fe329efa4bfb837502c2eb4d45666aabd299229 100644
 --- a/web/src/shell/NewChatDialog.tsx
 +++ b/web/src/shell/NewChatDialog.tsx
 @@ -58,6 +58,12 @@ import {
@@ -2152,7 +2743,29 @@ index 8fba969e357a73383d4913f6ac8699960a265452..026e087729e86061f07f78dd11304940
  import { useQuery, useQueryClient } from "@tanstack/react-query";
  import {
    MonitorCloudIcon,
-@@ -2672,6 +2678,13 @@ export function NewChatLandingScreen() {
+@@ -2199,6 +2205,9 @@ interface LandingDraft {
+   // neither turns an untouched seed into an "explicit" value nor the reverse.
+   agentFromConfig: boolean;
+   workspaceFromConfig: boolean;
++  // The new session's label edits: a value sets a label, `null` leaves a
++  // project default off.
++  labelEdits: Record<string, string | null>;
+ }
+ 
+ let landingDraft: LandingDraft | null = null;
+@@ -2393,6 +2402,11 @@ export function NewChatLandingScreen() {
+           // the other visit's workspace — drop the marker with it so the
+           // seed/retract machinery starts clean for this visit.
+           autoSeededBranch: "",
++          // Added labels come along; a removed default belonged to the other
++          // project.
++          labelEdits: Object.fromEntries(
++            Object.entries(landingDraft.labelEdits).filter(([, value]) => value !== null),
++          ),
+         };
+ 
+   const [message, setMessage] = useState<string>(() =>
+@@ -2672,6 +2686,17 @@ export function NewChatLandingScreen() {
    // Pre-filled from the `?project=` param so the sidebar's per-project
    // "new session" pencil lands here with the project already selected.
    const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
@@ -2161,37 +2774,46 @@ index 8fba969e357a73383d4913f6ac8699960a265452..026e087729e86061f07f78dd11304940
 +    () => projectDefaultLabels(storedProjectConfig),
 +    [storedProjectConfig],
 +  );
-+  const sessionLabels = useNewSessionLabels(projectLabelDefaults, selectedProject);
++  const sessionLabels = useNewSessionLabels(
++    projectLabelDefaults,
++    selectedProject,
++    restoredDraft?.labelEdits,
++  );
 +  const [labelsDialogOpen, setLabelsDialogOpen] = useState(false);
    // The landing screen stays mounted while the `?project=` param changes (e.g.
    // clicking a different project's pencil), so the lazy initializer above won't
    // re-run — sync the selection to the param whenever it changes.
-@@ -5897,7 +5910,10 @@ export function NewChatLandingScreen() {
+@@ -2827,6 +2852,7 @@ export function NewChatLandingScreen() {
+     costControlMode,
+     agentFromConfig: agentFromConfigRef.current,
+     workspaceFromConfig: workspaceFromConfigRef.current,
++    labelEdits: sessionLabels.edits,
+   };
+   useEffect(() => {
+     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
+@@ -5897,7 +5923,9 @@ export function NewChatLandingScreen() {
        if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
          // Custom agents upload their bundle with the session, then launch on the host below.
          const bundle = await buildAgentBundle(pendingAgent);
 -        const metadata: Record<string, unknown> = { labels: createLabels };
 +        const metadata: Record<string, unknown> = {
-+          labels: { ...sessionLabels.labels, ...createLabels },
++          labels: { ...sessionLabels.requestLabels, ...createLabels },
 +        };
-+        if (!sessionLabels.applyProjectLabels) metadata.apply_project_labels = false;
          if (mcpServicesForLaunch.length) {
            metadata.mcp_registry_services = mcpServicesForLaunch;
          }
-@@ -6029,9 +6045,12 @@ export function NewChatLandingScreen() {
+@@ -6028,7 +6056,10 @@ export function NewChatLandingScreen() {
+           // placeholder, so the placeholder's wrapper labels, launch args and
            // model would all describe a CLI the router may not pick. The
            // server stamps the routed wrapper's labels once it has rebound.
++          // A removed project default rides along as null so the server
++          // leaves it off this session.
            labels: {
-+            ...sessionLabels.labels,
++            ...sessionLabels.requestLabels,
              ...(smartRoutingHarnessSelected ? {} : createLabels),
              [CLIENT_CREATE_TOKEN_LABEL]: createToken,
            },
-+          // The labels above already leave out a project default removed here.
-+          ...(sessionLabels.applyProjectLabels ? {} : { apply_project_labels: false }),
-           // Permission / approval / cursor mode → CLI flag pair, persisted as
-           // terminal_launch_args. Omitted for the default and non-native agents.
-           terminal_launch_args: smartRoutingHarnessSelected
-@@ -7042,6 +7061,11 @@ export function NewChatLandingScreen() {
+@@ -7042,6 +7073,11 @@ export function NewChatLandingScreen() {
                  delivered as an "[Attached: <path>]" marker prepended to the
                  first message at create time. */}
                      <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
@@ -2203,7 +2825,7 @@ index 8fba969e357a73383d4913f6ac8699960a265452..026e087729e86061f07f78dd11304940
                      {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                      <ComposerAttachments files={files} onRemove={removeFile} />
                      {/* Rejected-attachment feedback: unsupported type or too large */}
-@@ -7076,6 +7100,8 @@ export function NewChatLandingScreen() {
+@@ -7076,6 +7112,8 @@ export function NewChatLandingScreen() {
                            (supportsPermissionMode && permissionMode === "plan") ||
                            (supportsCursorMode && cursorExecMode === "plan")
                          }
@@ -2212,7 +2834,7 @@ index 8fba969e357a73383d4913f6ac8699960a265452..026e087729e86061f07f78dd11304940
                          projects={projectList ?? []}
                          onProjectSelect={(name) => {
                            const params = new URLSearchParams(searchParams);
-@@ -7815,6 +7841,15 @@ export function NewChatLandingScreen() {
+@@ -7815,6 +7853,15 @@ export function NewChatLandingScreen() {
              : undefined
          }
        />
@@ -2229,7 +2851,7 @@ index 8fba969e357a73383d4913f6ac8699960a265452..026e087729e86061f07f78dd11304940
    );
  }
 diff --git a/web/src/shell/ProjectSettingsDialog.test.tsx b/web/src/shell/ProjectSettingsDialog.test.tsx
-index 210ce85da6db5e101b077516f74807d6fa69269b..141cc56680b67aa329ca1a49e9a87d3efac15aa5 100644
+index 210ce85da6db5e101b077516f74807d6fa69269b..9163516fe36595f7a828b018e764d5bf8e56bc16 100644
 --- a/web/src/shell/ProjectSettingsDialog.test.tsx
 +++ b/web/src/shell/ProjectSettingsDialog.test.tsx
 @@ -1,4 +1,4 @@
@@ -2255,7 +2877,7 @@ index 210ce85da6db5e101b077516f74807d6fa69269b..141cc56680b67aa329ca1a49e9a87d3e
            projectId={projectId}
            projectName="Work"
          />
-@@ -212,6 +212,162 @@ describe("ProjectSettingsDialog", () => {
+@@ -212,6 +212,192 @@ describe("ProjectSettingsDialog", () => {
      await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
    });
  
@@ -2360,6 +2982,49 @@ index 210ce85da6db5e101b077516f74807d6fa69269b..141cc56680b67aa329ca1a49e9a87d3e
 +    );
 +  });
 +
++  it("saves an edit still in progress when Save is clicked", async () => {
++    getProjectMock.mockResolvedValue({
++      id: "p_1",
++      name: "Work",
++      config: { labels: { team: "ml" } },
++    });
++    renderDialog();
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Edit label team" }));
++    fireEvent.change(within(editor).getByLabelText("Value for label team"), {
++      target: { value: "infra" },
++    });
++    fireEvent.click(screen.getByTestId("project-settings-save"));
++
++    await waitFor(() =>
++      expect(updateMock).toHaveBeenCalledWith("p_1", { labels: { team: "infra" } }),
++    );
++  });
++
++  it("blocks Save while an edit in progress is invalid", async () => {
++    getProjectMock.mockResolvedValue({
++      id: "p_1",
++      name: "Work",
++      config: { labels: { team: "ml" } },
++    });
++    renderDialog();
++    const editor = screen.getByTestId("project-settings-labels-editor");
++    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
++
++    fireEvent.click(within(editor).getByRole("button", { name: "Edit label team" }));
++    fireEvent.change(within(editor).getByLabelText("Value for label team"), {
++      target: { value: "v".repeat(257) },
++    });
++    fireEvent.click(screen.getByTestId("project-settings-save"));
++
++    expect(await within(editor).findByRole("alert")).toHaveTextContent(
++      "Value must be 256 characters or fewer.",
++    );
++    expect(updateMock).not.toHaveBeenCalled();
++  });
++
 +  it.each([
 +    ["a duplicate key", "team", '"team" already exists. Edit it instead.'],
 +    ["a key over the column width", "k".repeat(129), "Key must be 128 characters or fewer."],
@@ -2380,19 +3045,6 @@ index 210ce85da6db5e101b077516f74807d6fa69269b..141cc56680b67aa329ca1a49e9a87d3e
 +    expect(await within(editor).findByRole("alert")).toHaveTextContent(message);
 +    expect(within(editor).getByLabelText("New label key")).toHaveValue(key);
 +    expect(updateMock).not.toHaveBeenCalled();
-+  });
-+
-+  it("scrolls the fields and keeps Save outside the scroll region on short windows", async () => {
-+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
-+    renderDialog();
-+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
-+
-+    const body = screen.getByTestId("project-settings-body");
-+    expect(body).toHaveClass("min-h-0", "overflow-y-auto", "px-1", "-mx-1");
-+    expect(body).toContainElement(screen.getByTestId("project-settings-labels"));
-+    expect(body).not.toContainElement(screen.getByTestId("project-settings-save"));
-+    const content = body.closest('[data-slot="dialog-content"]');
-+    expect(content).toHaveClass("max-h-[85dvh]", "grid-rows-[auto_1fr_auto]");
 +  });
 +
 +  it("rejects a reserved default label key inline", async () => {
@@ -2418,8 +3070,17 @@ index 210ce85da6db5e101b077516f74807d6fa69269b..141cc56680b67aa329ca1a49e9a87d3e
    it("hides the sandbox option when managed sandboxes are disabled", async () => {
      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
      renderDialog();
+@@ -295,7 +481,7 @@ describe("ProjectSettingsDialog", () => {
+     expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(true);
+ 
+     // Even if a submit is forced, onSubmit bails — no clearing PATCH is sent.
+-    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
++    fireEvent.submit((screen.getByTestId("project-settings-save") as HTMLButtonElement).form!);
+     expect(updateMock).not.toHaveBeenCalled();
+   });
+ 
 diff --git a/web/src/shell/ProjectSettingsDialog.tsx b/web/src/shell/ProjectSettingsDialog.tsx
-index 5a8530d7108a6010f5d98c0119ddbe96d9bc59a2..1b4f712fef06bc58ab1e8f44ffe1fbfef0647d41 100644
+index 5a8530d7108a6010f5d98c0119ddbe96d9bc59a2..fc5a6f881c8322524ac61834be9cf3dc8a12bdd2 100644
 --- a/web/src/shell/ProjectSettingsDialog.tsx
 +++ b/web/src/shell/ProjectSettingsDialog.tsx
 @@ -1,11 +1,13 @@
@@ -2500,7 +3161,7 @@ index 5a8530d7108a6010f5d98c0119ddbe96d9bc59a2..1b4f712fef06bc58ab1e8f44ffe1fbfe
  
      updateConfig.mutate(
        { id: projectId, name: projectName, config },
-@@ -366,10 +396,12 @@ export function ProjectSettingsDialog({
+@@ -366,10 +396,10 @@ export function ProjectSettingsDialog({
    const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
  
    return (
@@ -2509,609 +3170,110 @@ index 5a8530d7108a6010f5d98c0119ddbe96d9bc59a2..1b4f712fef06bc58ab1e8f44ffe1fbfe
        <DialogContent
          onClick={(e) => e.stopPropagation()}
 -        className="sm:max-w-lg"
-+        // Capped to the viewport: the body scrolls while the header and the
-+        // Save/Cancel footer stay visible on short windows.
-+        className="sm:max-w-lg max-h-[85dvh] grid-rows-[auto_1fr_auto]"
++        className="flex max-h-[85vh] flex-col sm:max-w-lg"
          // Keep a nested dropdown's dismiss (pick an option, or click the modal
          // body while it's open) from closing the whole Dialog. See
          // `guardDialogDismiss`; real backdrop clicks and Escape still close.
-@@ -383,297 +415,338 @@ export function ProjectSettingsDialog({
+@@ -383,7 +413,11 @@ export function ProjectSettingsDialog({
              a starting point you can change per session; leave a field blank for no default.
            </DialogDescription>
          </DialogHeader>
 -        <form onSubmit={onSubmit} className="flex flex-col gap-4">
--          <Field label="Host" hint="Where new sessions run by default">
--            <Select
--              value={hostId}
--              onValueChange={setHostId}
--              onOpenChange={onDropdownOpenChange}
--              disabled={isLoading}
--            >
--              <SelectTrigger className="w-full" data-testid="project-settings-host">
--                <SelectValue placeholder="No default" />
--              </SelectTrigger>
--              <SelectContent>
--                <SelectItem value={NONE}>No default</SelectItem>
--                {managedSandboxesEnabled && (
--                  <SelectItem value={SANDBOX_HOST_CHOICE}>
--                    {sandboxOptionLabel(sandboxProvider)}
--                  </SelectItem>
--                )}
--                {onlineHosts.map((h) => (
--                  <SelectItem key={h.host_id} value={h.host_id}>
--                    {h.name}
--                  </SelectItem>
--                ))}
--                {storedHostMissing && (
--                  <SelectItem value={hostId}>
--                    {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
--                  </SelectItem>
--                )}
--              </SelectContent>
--            </Select>
--          </Field>
--
--          <Field
--            label="Working directory"
--            hint={
--              hostId === NONE
--                ? "Pick a host first"
--                : browsableHostId
--                  ? "Browse the host or type a path"
--                  : "Absolute path on the host"
--            }
--            htmlFor="project-settings-workspace"
--          >
--            {hostId === NONE ? (
--              // Mirror the new-session composer: the working directory can only
--              // be chosen once a host is selected (the file browser lists
--              // against a concrete host, and a path is host-relative anyway).
--              <p
--                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
--                data-testid="project-settings-workspace"
--              >
--                Pick a host first
--              </p>
--            ) : browsableHostId ? (
--              // Browsing uses the shared full-screen picker; navigation is
--              // provisional until the user confirms a folder.
--              <div
--                className="relative flex flex-col gap-1.5"
--                data-testid="project-settings-workspace"
--              >
--                <button
--                  type="button"
--                  onClick={() => setWorkspaceOpen(true)}
--                  aria-expanded={workspaceOpen}
--                  disabled={isLoading}
--                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
--                >
--                  <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
--                    {workspace || "Browse…"}
--                  </span>
--                  <ChevronDownIcon
--                    className={`size-4 shrink-0 opacity-50 transition-transform ${
--                      workspaceOpen ? "rotate-180" : ""
--                    }`}
--                  />
--                </button>
--                <WorkspacePickerDialog
--                  open={workspaceOpen}
--                  onOpenChange={setWorkspaceOpen}
--                  hostId={browsableHostId}
--                  initialPath={workspace}
--                  onConfirm={setWorkspace}
--                />
--              </div>
--            ) : (
--              // A host is picked but not browsable (sandbox / offline stored
--              // host) — fall back to typing an absolute path.
--              <input
--                id="project-settings-workspace"
--                data-testid="project-settings-workspace"
--                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
--                placeholder="/path/to/repo"
--                value={workspace}
--                onChange={(e) => setWorkspace(e.target.value)}
--                disabled={isLoading}
--              />
--            )}
--          </Field>
--
--          <Field
--            label="Random worktree"
--            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
-+        <form onSubmit={onSubmit} className="contents">
-+          <div
-+            className="-mx-1 flex min-h-0 flex-col gap-4 overflow-y-auto px-1"
-+            data-testid="project-settings-body"
-           >
--            <div className="flex sm:justify-end">
--              <Switch
--                data-testid="project-settings-worktree"
--                checked={useWorktree}
--                onCheckedChange={setUseWorktree}
--                disabled={isLoading}
--              />
--            </div>
--          </Field>
--
--          {useWorktree && (
--            <Field
--              label="Base branch"
--              hint="Branch new worktrees fork from; blank uses the current branch"
--              htmlFor="project-settings-base-branch"
--            >
--              <input
--                id="project-settings-base-branch"
--                data-testid="project-settings-base-branch"
--                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
--                placeholder="e.g. main"
--                value={baseBranch}
--                onChange={(e) => setBaseBranch(e.target.value)}
--                disabled={isLoading}
--              />
--            </Field>
--          )}
--
--          <Field label="Agent" hint="Default agent / harness for new sessions">
--            <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
--              <AgentHarnessPicker
--                agentEntries={agentEntries}
--                harnessEntries={harnessEntries}
--                effectiveAgentId={agentId}
--                agentLabel={agentLabel}
--                hasAgents={agentList.length > 0}
--                host={warningHost}
--                onSelectAgent={(a) => {
--                  // A model default belongs to the picked harness's vocab —
--                  // don't carry an alias onto a different agent.
--                  if (a.id !== agentId) {
--                    setModel(NONE);
--                    setEffort(NONE);
--                  }
--                  setAgentId(a.id);
--                }}
--                pendingAgent={null}
--                pendingAgentId="__unused_pending_agent__"
--                onSelectPending={() => {}}
--                // No interactive create flow here, so hide the "Create custom
--                // agent" action and leave the handler inert.
--                onCreateCustomAgent={() => {}}
--                allowCreateCustomAgent={false}
--                sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
--                // Modal so the menu establishes its own scroll context and can
--                // scroll inside the Dialog's scroll-lock (a non-modal dropdown
--                // portals outside that lock and can't scroll). The dismiss
--                // guard on DialogContent keeps this modal dropdown's own close
--                // from bubbling up and closing the settings dialog.
--                dropdownModal
--                onOpenChange={onDropdownOpenChange}
--                // Bound the menu height so it scrolls inside the modal instead
--                // of running off the bottom; fixed width matches the composer.
--                contentClassName="max-h-80 w-80"
--                contentAlign="end"
--                // Fill the field column and match the sibling <Select> triggers
--                // (full width, bordered, h-8) so the control right-aligns with
--                // the host / effort dropdowns instead of floating mid-row.
--                triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
--                triggerLabelClassName="max-w-none text-ui"
--              />
--              {agentId && (
--                <Button
--                  type="button"
--                  variant="ghost"
--                  size="sm"
--                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
--                  onClick={() => {
--                    setAgentId(null);
--                    setModel(NONE);
--                    setEffort(NONE);
--                  }}
--                >
--                  Clear
--                </Button>
--              )}
--            </div>
--          </Field>
--
--          {supportsModelDefault && (
--            <Field
--              label="Model"
--              hint={
--                modelPickerEmpty
--                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
--                  : "Default model for new sessions with this agent"
--              }
--            >
-+            <Field label="Host" hint="Where new sessions run by default">
-               <Select
--                value={model}
--                onValueChange={selectModel}
-+                value={hostId}
-+                onValueChange={setHostId}
-                 onOpenChange={onDropdownOpenChange}
--                disabled={isLoading || modelPickerEmpty}
-+                disabled={isLoading}
-               >
--                <SelectTrigger className="w-full" data-testid="project-settings-model">
-+                <SelectTrigger className="w-full" data-testid="project-settings-host">
-                   <SelectValue placeholder="No default" />
-                 </SelectTrigger>
-                 <SelectContent>
-                   <SelectItem value={NONE}>No default</SelectItem>
--                  {modelOptions.map((m) => (
--                    <SelectItem key={m.id} value={m.id}>
--                      {m.label}
-+                  {managedSandboxesEnabled && (
-+                    <SelectItem value={SANDBOX_HOST_CHOICE}>
-+                      {sandboxOptionLabel(sandboxProvider)}
-+                    </SelectItem>
-+                  )}
-+                  {onlineHosts.map((h) => (
-+                    <SelectItem key={h.host_id} value={h.host_id}>
-+                      {h.name}
-                     </SelectItem>
-                   ))}
--                  {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
-+                  {storedHostMissing && (
-+                    <SelectItem value={hostId}>
-+                      {stored?.host_id === hostId ? `${hostId} (unavailable)` : hostId}
-+                    </SelectItem>
-+                  )}
-                 </SelectContent>
-               </Select>
-             </Field>
--          )}
++        <form
++          id="project-settings-form"
++          onSubmit={onSubmit}
++          className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1"
++        >
+           <Field label="Host" hint="Where new sessions run by default">
+             <Select
+               value={hostId}
+@@ -675,6 +709,42 @@ export function ProjectSettingsDialog({
+             </Select>
+           </Field>
  
--          {supportsEffortDefault && (
-             <Field
--              label="Effort"
-+              label="Working directory"
-               hint={
--                effortDropped
--                  ? `The saved effort (${normalizeEffortLabel(effort)}) isn't available for this model; saving clears it.`
--                  : effortPickerEmpty
--                    ? "Pick a model or connect a host to see effort levels."
--                    : "Default reasoning effort for new sessions with this agent"
-+                hostId === NONE
-+                  ? "Pick a host first"
-+                  : browsableHostId
-+                    ? "Browse the host or type a path"
-+                    : "Absolute path on the host"
-               }
-+              htmlFor="project-settings-workspace"
-             >
-+              {hostId === NONE ? (
-+                // Mirror the new-session composer: the working directory can only
-+                // be chosen once a host is selected (the file browser lists
-+                // against a concrete host, and a path is host-relative anyway).
-+                <p
-+                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
-+                  data-testid="project-settings-workspace"
-+                >
-+                  Pick a host first
-+                </p>
-+              ) : browsableHostId ? (
-+                // Browsing uses the shared full-screen picker; navigation is
-+                // provisional until the user confirms a folder.
-+                <div
-+                  className="relative flex flex-col gap-1.5"
-+                  data-testid="project-settings-workspace"
-+                >
-+                  <button
-+                    type="button"
-+                    onClick={() => setWorkspaceOpen(true)}
-+                    aria-expanded={workspaceOpen}
-+                    disabled={isLoading}
-+                    className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-+                  >
-+                    <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
-+                      {workspace || "Browse…"}
-+                    </span>
-+                    <ChevronDownIcon
-+                      className={`size-4 shrink-0 opacity-50 transition-transform ${
-+                        workspaceOpen ? "rotate-180" : ""
-+                      }`}
-+                    />
-+                  </button>
-+                  <WorkspacePickerDialog
-+                    open={workspaceOpen}
-+                    onOpenChange={setWorkspaceOpen}
-+                    hostId={browsableHostId}
-+                    initialPath={workspace}
-+                    onConfirm={setWorkspace}
-+                  />
-+                </div>
-+              ) : (
-+                // A host is picked but not browsable (sandbox / offline stored
-+                // host) — fall back to typing an absolute path.
-+                <input
-+                  id="project-settings-workspace"
-+                  data-testid="project-settings-workspace"
-+                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-+                  placeholder="/path/to/repo"
-+                  value={workspace}
-+                  onChange={(e) => setWorkspace(e.target.value)}
-+                  disabled={isLoading}
-+                />
-+              )}
-+            </Field>
-+
-+            <Field
-+              label="Random worktree"
-+              hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
-+            >
-+              <div className="flex sm:justify-end">
-+                <Switch
-+                  data-testid="project-settings-worktree"
-+                  checked={useWorktree}
-+                  onCheckedChange={setUseWorktree}
-+                  disabled={isLoading}
-+                />
-+              </div>
-+            </Field>
-+
-+            {useWorktree && (
-+              <Field
-+                label="Base branch"
-+                hint="Branch new worktrees fork from; blank uses the current branch"
-+                htmlFor="project-settings-base-branch"
-+              >
-+                <input
-+                  id="project-settings-base-branch"
-+                  data-testid="project-settings-base-branch"
-+                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-+                  placeholder="e.g. main"
-+                  value={baseBranch}
-+                  onChange={(e) => setBaseBranch(e.target.value)}
-+                  disabled={isLoading}
-+                />
-+              </Field>
-+            )}
-+
-+            <Field label="Agent" hint="Default agent / harness for new sessions">
-+              <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
-+                <AgentHarnessPicker
-+                  agentEntries={agentEntries}
-+                  harnessEntries={harnessEntries}
-+                  effectiveAgentId={agentId}
-+                  agentLabel={agentLabel}
-+                  hasAgents={agentList.length > 0}
-+                  host={warningHost}
-+                  onSelectAgent={(a) => {
-+                    // A model default belongs to the picked harness's vocab —
-+                    // don't carry an alias onto a different agent.
-+                    if (a.id !== agentId) {
-+                      setModel(NONE);
-+                      setEffort(NONE);
-+                    }
-+                    setAgentId(a.id);
-+                  }}
-+                  pendingAgent={null}
-+                  pendingAgentId="__unused_pending_agent__"
-+                  onSelectPending={() => {}}
-+                  // No interactive create flow here, so hide the "Create custom
-+                  // agent" action and leave the handler inert.
-+                  onCreateCustomAgent={() => {}}
-+                  allowCreateCustomAgent={false}
-+                  sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
-+                  // Modal so the menu establishes its own scroll context and can
-+                  // scroll inside the Dialog's scroll-lock (a non-modal dropdown
-+                  // portals outside that lock and can't scroll). The dismiss
-+                  // guard on DialogContent keeps this modal dropdown's own close
-+                  // from bubbling up and closing the settings dialog.
-+                  dropdownModal
-+                  onOpenChange={onDropdownOpenChange}
-+                  // Bound the menu height so it scrolls inside the modal instead
-+                  // of running off the bottom; fixed width matches the composer.
-+                  contentClassName="max-h-80 w-80"
-+                  contentAlign="end"
-+                  // Fill the field column and match the sibling <Select> triggers
-+                  // (full width, bordered, h-8) so the control right-aligns with
-+                  // the host / effort dropdowns instead of floating mid-row.
-+                  triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
-+                  triggerLabelClassName="max-w-none text-ui"
-+                />
-+                {agentId && (
-+                  <Button
-+                    type="button"
-+                    variant="ghost"
-+                    size="sm"
-+                    className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-+                    onClick={() => {
-+                      setAgentId(null);
-+                      setModel(NONE);
-+                      setEffort(NONE);
-+                    }}
-+                  >
-+                    Clear
-+                  </Button>
-+                )}
-+              </div>
-+            </Field>
-+
-+            {supportsModelDefault && (
-+              <Field
-+                label="Model"
-+                hint={
-+                  modelPickerEmpty
-+                    ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
-+                    : "Default model for new sessions with this agent"
-+                }
-+              >
-+                <Select
-+                  value={model}
-+                  onValueChange={selectModel}
-+                  onOpenChange={onDropdownOpenChange}
-+                  disabled={isLoading || modelPickerEmpty}
-+                >
-+                  <SelectTrigger className="w-full" data-testid="project-settings-model">
-+                    <SelectValue placeholder="No default" />
-+                  </SelectTrigger>
-+                  <SelectContent>
-+                    <SelectItem value={NONE}>No default</SelectItem>
-+                    {modelOptions.map((m) => (
-+                      <SelectItem key={m.id} value={m.id}>
-+                        {m.label}
-+                      </SelectItem>
-+                    ))}
-+                    {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
-+                  </SelectContent>
-+                </Select>
-+              </Field>
-+            )}
-+
-+            {supportsEffortDefault && (
-+              <Field
-+                label="Effort"
-+                hint={
-+                  effortDropped
-+                    ? `The saved effort (${normalizeEffortLabel(effort)}) isn't available for this model; saving clears it.`
-+                    : effortPickerEmpty
-+                      ? "Pick a model or connect a host to see effort levels."
-+                      : "Default reasoning effort for new sessions with this agent"
-+                }
-+              >
-+                <Select
-+                  value={effortValue}
-+                  onValueChange={setEffort}
-+                  onOpenChange={onDropdownOpenChange}
-+                  disabled={isLoading || effortPickerEmpty}
-+                >
-+                  <SelectTrigger className="w-full" data-testid="project-settings-effort">
-+                    <SelectValue placeholder="No default" />
-+                  </SelectTrigger>
-+                  <SelectContent>
-+                    <SelectItem value={NONE}>No default</SelectItem>
-+                    {(effortOptions ?? []).map((e) => (
-+                      <SelectItem key={e.value} value={e.value}>
-+                        {e.label}
-+                      </SelectItem>
-+                    ))}
-+                    {storedEffortMissing && (
-+                      <SelectItem value={effortValue}>{normalizeEffortLabel(effortValue)}</SelectItem>
-+                    )}
-+                  </SelectContent>
-+                </Select>
-+              </Field>
-+            )}
-+            <Field label="Account" hint={accountHint}>
-               <Select
--                value={effortValue}
--                onValueChange={setEffort}
-+                value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
-+                onValueChange={(v) => setProvider(v || NONE)}
-                 onOpenChange={onDropdownOpenChange}
--                disabled={isLoading || effortPickerEmpty}
-+                disabled={
-+                  isLoading ||
-+                  hostId === SANDBOX_HOST_CHOICE ||
-+                  (accountOptions.length === 0 && provider === NONE)
-+                }
-               >
--                <SelectTrigger className="w-full" data-testid="project-settings-effort">
-+                <SelectTrigger className="w-full" data-testid="project-settings-account">
-                   <SelectValue placeholder="No default" />
-                 </SelectTrigger>
-                 <SelectContent>
-                   <SelectItem value={NONE}>No default</SelectItem>
--                  {(effortOptions ?? []).map((e) => (
--                    <SelectItem key={e.value} value={e.value}>
--                      {e.label}
-+                  {accountOptions.map((p) => (
-+                    <SelectItem
-+                      key={p.name}
-+                      value={p.name}
-+                      disabled={!p.ready}
-+                      data-testid={`project-settings-account-${p.name}`}
-+                    >
-+                      {p.name}
-+                      {p.default ? " (host default)" : ""}
-+                      {p.ready ? "" : " · not signed in"}
-                     </SelectItem>
-                   ))}
--                  {storedEffortMissing && (
--                    <SelectItem value={effortValue}>{normalizeEffortLabel(effortValue)}</SelectItem>
--                  )}
-+                  {unlistedProviders.map((name) => (
-+                    <SelectItem key={name} value={name}>{`${name} (not listed here)`}</SelectItem>
-+                  ))}
-                 </SelectContent>
-               </Select>
-             </Field>
--          )}
--          <Field label="Account" hint={accountHint}>
--            <Select
--              value={hostId === SANDBOX_HOST_CHOICE ? NONE : provider}
--              onValueChange={(v) => setProvider(v || NONE)}
--              onOpenChange={onDropdownOpenChange}
--              disabled={
--                isLoading ||
--                hostId === SANDBOX_HOST_CHOICE ||
--                (accountOptions.length === 0 && provider === NONE)
--              }
--            >
--              <SelectTrigger className="w-full" data-testid="project-settings-account">
--                <SelectValue placeholder="No default" />
--              </SelectTrigger>
--              <SelectContent>
--                <SelectItem value={NONE}>No default</SelectItem>
--                {accountOptions.map((p) => (
--                  <SelectItem
--                    key={p.name}
--                    value={p.name}
--                    disabled={!p.ready}
--                    data-testid={`project-settings-account-${p.name}`}
--                  >
--                    {p.name}
--                    {p.default ? " (host default)" : ""}
--                    {p.ready ? "" : " · not signed in"}
--                  </SelectItem>
--                ))}
--                {unlistedProviders.map((name) => (
--                  <SelectItem key={name} value={name}>{`${name} (not listed here)`}</SelectItem>
--                ))}
--              </SelectContent>
--            </Select>
--          </Field>
-+
-+            <div className="flex flex-col gap-1.5" data-testid="project-settings-labels">
-+              <div className="flex flex-col">
-+                <span className="font-medium text-ui">Default labels</span>
-+                <span className="text-muted-foreground text-sm">
-+                  Added to sessions created in this project; a label set at creation wins. Moving an
-+                  existing session here doesn't add them.
-+                </span>
-+              </div>
-+              <LabelEditor
-+                labels={labels}
-+                disabled={isLoading || loadFailed}
-+                onSet={(key, value) => setLabels((prev) => ({ ...prev, [key]: value }))}
-+                onRemove={(key) =>
-+                  setLabels((prev) =>
-+                    Object.fromEntries(Object.entries(prev).filter(([k]) => k !== key)),
-+                  )
-+                }
-+                emptyText="No default labels"
-+                testIdPrefix="project-settings-labels-editor"
-+                handleRef={labelEditorRef}
-+              />
-+              {labelsDirty && (
-+                <p
-+                  className={
-+                    discardWarned ? "text-destructive text-sm" : "text-muted-foreground text-sm"
-+                  }
-+                  role={discardWarned ? "alert" : undefined}
-+                  data-testid="project-settings-labels-unsaved"
-+                >
-+                  {discardWarned
-+                    ? "Your label changes aren't saved. Save to keep them, or close again to discard them."
-+                    : "Unsaved. Save to apply these labels to new sessions."}
-+                </p>
-+              )}
++          <div className="flex flex-col gap-1.5" data-testid="project-settings-labels">
++            <div className="flex flex-col">
++              <span className="font-medium text-ui">Default labels</span>
++              <span className="text-muted-foreground text-sm">
++                Added to sessions created in this project; a label set at creation wins. Moving an
++                existing session here doesn't add them.
++              </span>
 +            </div>
++            <LabelEditor
++              labels={labels}
++              disabled={isLoading || loadFailed}
++              onSet={(key, value) => setLabels((prev) => ({ ...prev, [key]: value }))}
++              onRemove={(key) =>
++                setLabels((prev) =>
++                  Object.fromEntries(Object.entries(prev).filter(([k]) => k !== key)),
++                )
++              }
++              emptyText="No default labels"
++              testIdPrefix="project-settings-labels-editor"
++              handleRef={labelEditorRef}
++            />
++            {labelsDirty && (
++              <p
++                className={
++                  discardWarned ? "text-destructive text-sm" : "text-muted-foreground text-sm"
++                }
++                role={discardWarned ? "alert" : undefined}
++                data-testid="project-settings-labels-unsaved"
++              >
++                {discardWarned
++                  ? "Your label changes aren't saved. Save to keep them, or close again to discard them."
++                  : "Unsaved. Save to apply these labels to new sessions."}
++              </p>
++            )}
 +          </div>
- 
++
            {loadFailed && (
              <p
+               className="text-destructive text-ui"
+@@ -690,26 +760,27 @@ export function ProjectSettingsDialog({
+               {(updateConfig.error as Error).message}
+             </p>
+           )}
+-
+-          <DialogFooter className="border-t-0 bg-transparent">
+-            <Button
+-              type="button"
+-              variant="ghost"
+-              onClick={() => onOpenChange(false)}
+-              disabled={updateConfig.isPending}
+-            >
+-              Cancel
+-            </Button>
+-            <Button
+-              type="submit"
+-              data-testid="project-settings-save"
+-              loading={updateConfig.isPending}
+-              disabled={isLoading || loadFailed}
+-            >
+-              Save
+-            </Button>
+-          </DialogFooter>
+         </form>
++        {/* Outside the scrolling form so Save stays in view on a short window. */}
++        <DialogFooter className="border-t-0 bg-transparent">
++          <Button
++            type="button"
++            variant="ghost"
++            onClick={() => onOpenChange(false)}
++            disabled={updateConfig.isPending}
++          >
++            Cancel
++          </Button>
++          <Button
++            type="submit"
++            form="project-settings-form"
++            data-testid="project-settings-save"
++            loading={updateConfig.isPending}
++            disabled={isLoading || loadFailed}
++          >
++            Save
++          </Button>
++        </DialogFooter>
+       </DialogContent>
+     </Dialog>
+   );

@@ -157,5 +157,61 @@ class SeriesFiles(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
 
+class SeriesFilesOnly(unittest.TestCase):
+    SERIES = "\n".join(
+        [
+            "# header",
+            "",
+            "# series: a",
+            "a--one.patch",
+            "a--two.patch",
+            "# series: b",
+            "# needs: a",
+            "b--one.patch",
+            "# series: c",
+            "c--one.patch",
+            "# series: d",
+            "# needs: b",
+            "# needs: c",
+            "d--one.patch",
+            "# series: custom-docs-index",
+            "custom-docs-index--one.patch",
+            "",
+        ]
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        (root / "scripts").mkdir()
+        (root / "scripts" / "series-files.sh").write_bytes((SCRIPTS / "series-files.sh").read_bytes())
+        (root / "series").write_text(self.SERIES)
+        self.script = root / "scripts" / "series-files.sh"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_only_adds_needs_and_the_index_in_series_order(self):
+        result = run("bash", str(self.script), "--only", "d,c")
+        self.assertEqual(
+            [Path(line).name for line in result.stdout.splitlines()],
+            ["a--one.patch", "a--two.patch", "b--one.patch", "c--one.patch", "d--one.patch",
+             "custom-docs-index--one.patch"],
+        )
+        self.assertIn("added a (needed by b)", result.stderr)
+        self.assertIn("added b (needed by d)", result.stderr)
+        self.assertIn("added custom-docs-index (always included)", result.stderr)
+        self.assertNotIn("added c (", result.stderr)
+
+    def test_only_names_and_repeated_option(self):
+        result = run("bash", str(self.script), "--only", "c", "--only", "b", "--names")
+        self.assertEqual(result.stdout.splitlines(), ["a", "b", "c", "custom-docs-index"])
+
+    def test_only_unknown_series(self):
+        result = run("bash", str(self.script), "--only", "a,nope", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("no series named nope", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

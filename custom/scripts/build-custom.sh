@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build Omnigent with the series applied: BASE plus one commit per patch.
 #
-#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] [--force] <branch>
-#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] --worktree <dir>
+#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] [--only <series>,...] [--force] <branch>
+#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] [--only <series>,...] --worktree <dir>
 #
 # <branch>     create (or with --force, reset) this branch in the clone to the
 #              built result, e.g. a local working branch to develop on.
@@ -11,6 +11,10 @@
 #              the clone this script is checked out in).
 # --fetch URL  fetch BASE from URL first if the clone does not have it
 #              (default: https://github.com/omnigent-ai/omnigent.git).
+# --only LIST  build only these series (comma-separated, may repeat), plus
+#              every series they need and custom-docs-index, in series order
+#              (series-files.sh --only prints what it adds). The index commit
+#              drops the sections of the series left out.
 #
 # The build is reproducible: patches are applied with a fixed committer
 # ($CUSTOM_COMMITTER_NAME / $CUSTOM_COMMITTER_EMAIL, default the GitHub Actions
@@ -24,6 +28,8 @@ branch=""
 worktree=""
 force=0
 fetch_url="https://github.com/omnigent-ai/omnigent.git"
+only=()
+INDEX_PATH=docs/custom/README.md
 
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 
@@ -33,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --worktree) worktree="$2"; shift 2 ;;
     --fetch) fetch_url="$2"; shift 2 ;;
     --force) force=1; shift ;;
+    --only) [[ $# -ge 2 ]] || usage 2; only+=(--only "$2"); shift 2 ;;
     -h|--help) usage 0 ;;
     -*) echo "unknown option: $1" >&2; usage 2 ;;
     *) [[ -z "$branch" ]] || usage 2; branch="$1"; shift ;;
@@ -55,7 +62,15 @@ if [[ -n "$branch" ]] && git -C "$repo" rev-parse --verify --quiet "refs/heads/$
 fi
 
 base="$(tr -d '[:space:]' < "$here/BASE")"
-mapfile -t patches < <(grep -v -e '^#' -e '^[[:space:]]*$' "$here/series")
+left_out=()
+if [[ ${#only[@]} -gt 0 ]]; then
+  chosen="$("$here/scripts/series-files.sh" "${only[@]}" --names)" || exit 2
+  mapfile -t patches < <("$here/scripts/series-files.sh" "${only[@]}" 2>/dev/null | xargs -r -n1 basename)
+  mapfile -t left_out < <("$here/scripts/series-files.sh" --all --names | grep -vxF -f <(printf '%s\n' "$chosen"))
+  echo "building $(wc -l <<< "$chosen") series; leaving out ${#left_out[@]}" >&2
+else
+  mapfile -t patches < <(grep -v -e '^#' -e '^[[:space:]]*$' "$here/series")
+fi
 
 if ! git -C "$repo" rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
   echo "fetching BASE ${base:0:12} from $fetch_url" >&2
@@ -93,6 +108,19 @@ for patch in "${patches[@]}"; do
   applied=$((applied + 1))
 done
 rm -f "$work.err"
+
+# A partial build's index lists only the series it holds: drop the other
+# sections from the index commit, keeping the commit reproducible.
+if [[ ${#left_out[@]} -gt 0 && -f "$work/$INDEX_PATH" ]]; then
+  awk -v drop="${left_out[*]}" '
+    BEGIN { n = split(drop, list, " "); for (i = 1; i <= n; i++) skip[list[i]] = 1 }
+    /^## / { name = $2; dropping = (name in skip) }
+    !dropping { print }
+  ' "$work/$INDEX_PATH" > "$work.index"
+  mv "$work.index" "$work/$INDEX_PATH"
+  GIT_COMMITTER_DATE="$(git -C "$work" log -1 --format=%aD)" \
+    git "${am_config[@]}" -C "$work" commit --quiet --amend --no-edit -- "$INDEX_PATH"
+fi
 tip="$(git -C "$work" rev-parse HEAD)"
 
 if [[ -n "$branch" ]]; then
