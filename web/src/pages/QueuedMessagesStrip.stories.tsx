@@ -47,6 +47,20 @@ export const ReorderableWithSteer: Story = {
   },
 };
 
+export const CombineAndSendAll: Story = {
+  args: {
+    messages: [
+      message("queue-1", "Use the account's time zone for the cutoff."),
+      message("queue-2", "Also store the zone on each report row."),
+      message("queue-3", "!git status"),
+    ],
+    onSteer: () => undefined,
+    onReorder: () => undefined,
+    onCombine: () => undefined,
+    onSendAll: () => undefined,
+  },
+};
+
 export const LongBacklog: Story = {
   args: {
     messages: Array.from({ length: 12 }, (_, index) =>

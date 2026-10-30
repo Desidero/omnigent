@@ -2658,6 +2658,7 @@ function ComposerImpl(
   const steerMessage = useChatStore((s) => s.steerMessage);
   const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  const combineQueuedMessages = useChatStore((s) => s.combineQueuedMessages);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
   // carries no fresh idle transition) still sends instead of stranding. Hold
@@ -4311,6 +4312,16 @@ function ComposerImpl(
           }}
           onSteer={(queueId) => steerMessage(queueId)}
           onReorder={reorderQueuedMessage}
+          skillPrefix={skillPrefix}
+          onCombine={() => {
+            if (conversationId !== null) combineQueuedMessages(conversationId, { skillPrefix });
+          }}
+          onSendAll={() => {
+            if (conversationId === null) return;
+            combineQueuedMessages(conversationId, { skillPrefix });
+            // While unreachable the queue waits for the host, so nothing is steered.
+            if (!unreachable) steerAllQueuedMessages(conversationId);
+          }}
           widthClassName="mx-3 w-auto"
         />
         {/* Sub-agent context tray — peeks above the workspace bar; reserves

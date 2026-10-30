@@ -21213,6 +21213,36 @@ describe("chatStore — client-side message queue", () => {
     ]);
   });
 
+  it("combineQueuedMessages merges one conversation's queue in place with a fresh id", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: "conv_abc", stableId: "s1" },
+        { queueId: "q_x", text: "elsewhere", conversationId: "conv_other", stableId: "sx" },
+        { queueId: "q_2", text: "second", conversationId: "conv_abc", stableId: "s2" },
+        { queueId: "q_3", text: "!ls", conversationId: "conv_abc", stableId: "s3" },
+        { queueId: "q_y", text: "also elsewhere", conversationId: "conv_other" },
+      ],
+    });
+
+    useChatStore.getState().combineQueuedMessages("conv_abc");
+    const queue = useChatStore.getState().queuedMessages;
+    expect(queue.map((m) => [m.queueId, m.text])).toEqual([
+      ["q_1", "first\n\nsecond"],
+      ["q_x", "elsewhere"],
+      ["q_3", "!ls"],
+      ["q_y", "also elsewhere"],
+    ]);
+    expect(queue[0]!.stableId).toMatch(/^[0-9a-f]{32}$/);
+    expect(queue[2]!.stableId).toBe("s3");
+    // Another conversation's entry is left as it was, even without a stableId.
+    expect(queue[3]!.stableId).toBeUndefined();
+
+    // Nothing left to combine: no state churn.
+    useChatStore.getState().combineQueuedMessages("conv_abc");
+    expect(useChatStore.getState().queuedMessages).toBe(queue);
+  });
+
   it("reorderQueuedMessage no-ops for a missing id or a self move", () => {
     const initial = [
       { queueId: "q_1", text: "first", conversationId: "conv_abc" },

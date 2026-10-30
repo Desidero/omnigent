@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { buildItemCommentMessage } from "@/lib/itemComments";
+import { readComposerDraft, serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import type { QueuedMessage } from "@/store/chatStore";
-import { shouldQueueSend } from "./messageQueue";
+import {
+  canCombineQueue,
+  combinedQueue,
+  keepsQueuedMessageSeparate,
+  shouldQueueSend,
+} from "./messageQueue";
 
 describe("shouldQueueSend", () => {
   const q = (conversationId: string): QueuedMessage => ({
@@ -67,5 +74,120 @@ describe("shouldQueueSend", () => {
     // main-thread ordering guard.
     expect(shouldQueueSend("conv_a", "streaming", "running", [], false, true)).toBe(false);
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")], false, true)).toBe(false);
+  });
+});
+
+describe("combinedQueue", () => {
+  const queued = (queueId: string, text: string, extra: Partial<QueuedMessage> = {}) =>
+    ({ queueId, text, conversationId: "conv_a", stableId: `id_${queueId}`, ...extra }) as const;
+  const file = (name: string) => new File(["x"], name, { type: "text/plain" });
+
+  it("merges in queue order with a blank line, in the first message's place", () => {
+    const [merged, ...rest] = combinedQueue([
+      queued("q_1", "Use the account's zone."),
+      queued("q_2", "Also store it per row."),
+      queued("q_3", "Then rerun the export."),
+    ]);
+    expect(rest).toEqual([]);
+    expect(merged).toMatchObject({
+      queueId: "q_1",
+      conversationId: "conv_a",
+      text: "Use the account's zone.\n\nAlso store it per row.\n\nThen rerun the export.",
+    });
+    // A new submission: the store gives it a fresh idempotency id.
+    expect(merged!.stableId).toBeUndefined();
+  });
+
+  it("concatenates attachments and skips empty texts in the join", () => {
+    const [a, b, c] = [file("a.txt"), file("b.png"), file("c.csv")];
+    const [merged] = combinedQueue([
+      queued("q_1", "Compare these", { files: [a!] }),
+      queued("q_2", "  ", { files: [b!, c!] }),
+      queued("q_3", "and summarize"),
+    ]);
+    expect(merged!.text).toBe("Compare these\n\nand summarize");
+    expect(merged!.files).toEqual([a, b, c]);
+  });
+
+  it("keeps ! and / messages separate and in place, merging only runs between them", () => {
+    const result = combinedQueue([
+      queued("q_1", "first"),
+      queued("q_2", "second"),
+      queued("q_3", "!git status"),
+      queued("q_4", "third"),
+      queued("q_5", "  /compact", { command: "compact" }),
+      queued("q_6", "fourth"),
+      queued("q_7", "fifth"),
+      queued("q_8", "/review the diff"),
+    ]);
+    expect(result.map((m) => [m.queueId, m.text])).toEqual([
+      ["q_1", "first\n\nsecond"],
+      ["q_3", "!git status"],
+      ["q_4", "third"],
+      ["q_5", "  /compact"],
+      ["q_6", "fourth\n\nfifth"],
+      ["q_8", "/review the diff"],
+    ]);
+  });
+
+  it("keeps Codex $skill messages, failed sends and item-comment messages separate", () => {
+    const comments = buildItemCommentMessage([
+      { label: "Q2", title: "Cutoff", comments: [{ text: "Use UTC.", attachments: [] }] },
+    ]);
+    const skillPrefix = "$";
+    expect(keepsQueuedMessageSeparate(queued("q_1", "$review now"), { skillPrefix })).toBe(true);
+    expect(keepsQueuedMessageSeparate(queued("q_1", "$5 is fine"))).toBe(false);
+    expect(keepsQueuedMessageSeparate(queued("q_1", "x", { requiresRetry: true }))).toBe(true);
+    expect(keepsQueuedMessageSeparate(queued("q_1", comments))).toBe(true);
+    expect(keepsQueuedMessageSeparate(queued("q_1", "plain text"))).toBe(false);
+  });
+
+  it("does not merge across a change of agent", () => {
+    const result = combinedQueue([
+      queued("q_1", "a", { agentId: "agent_1" }),
+      queued("q_2", "b", { agentId: "agent_1" }),
+      queued("q_3", "c", { agentId: "agent_2" }),
+    ]);
+    expect(result.map((m) => [m.queueId, m.agentId, m.text])).toEqual([
+      ["q_1", "agent_1", "a\n\nb"],
+      ["q_3", "agent_2", "c"],
+    ]);
+  });
+
+  it("holds the merged message for the host when any part waits for it", () => {
+    const [merged] = combinedQueue([
+      queued("q_1", "a"),
+      queued("q_2", "b", { waitingForHost: true }),
+    ]);
+    expect(merged!.waitingForHost).toBe(true);
+  });
+
+  it("keeps reply quotes editable when the combined text still matches them", () => {
+    const reply: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "the cutoff is local" }],
+      text: "Why local?",
+    };
+    const [merged] = combinedQueue([
+      queued("q_1", "One more thing."),
+      queued("q_2", serializeReplyDraft(reply), { replyDraft: reply }),
+    ]);
+    expect(merged!.text).toBe("One more thing.\n\n> the cutoff is local\n\nWhy local?");
+    expect(readComposerDraft(merged)?.replyDraft).toEqual({
+      version: 1,
+      quotes: [{ before: "One more thing.", text: "the cutoff is local" }],
+      text: "Why local?",
+    });
+  });
+
+  it("changes nothing with fewer than two adjacent combinable messages", () => {
+    const lone = [queued("q_1", "only")];
+    expect(combinedQueue(lone)).toEqual(lone);
+    expect(canCombineQueue(lone)).toBe(false);
+    const split = [queued("q_1", "a"), queued("q_2", "/clear"), queued("q_3", "b")];
+    expect(combinedQueue(split)).toEqual(split);
+    expect(canCombineQueue(split)).toBe(false);
+    expect(canCombineQueue([])).toBe(false);
+    expect(canCombineQueue([queued("q_1", "a"), queued("q_2", "b")])).toBe(true);
   });
 });

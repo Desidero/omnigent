@@ -53,6 +53,25 @@ message is only sent to the server when it's flushed or steered.
 | **Steer** | POST it now (jump the queue) — deliver mid-turn where the harness supports it |
 | **Reorder** | client-side drag (grip handle) to reorder the queue within a conversation |
 
+### Queue-wide actions
+
+When at least two adjacent queued messages can be combined, the strip's header
+shows **Combine** and, where rows can be steered, **Send all**:
+
+| Action | Behavior |
+|--------|----------|
+| **Combine** | merge each run of adjacent combinable messages into one, in queue order: texts joined by a blank line, attachments concatenated. The merged message takes its run's first place and gets a new idempotency id. |
+| **Send all** | Combine, then steer the whole queue in order (the same send as the composer's steer-all shortcut) |
+
+Some messages are never combined and stay where they are: `!` shell commands,
+`/`-led messages (commands, skills, and paths the harness reads first), `$`
+skills on Codex, failed sends awaiting retry (the server may already hold
+them), and item-comment messages (their drafts are tracked by the exact text
+sent). Nothing moves across such a message, so Combine merges the runs on
+either side of it separately; a change of agent also starts a new run. The
+merge is a pure function over the queued messages (`combinedQueue` in
+`web/src/lib/messageQueue.ts`).
+
 ### Promote-to-bubble rule
 
 Promote a message from the strip into a normal chat bubble **as soon as it is

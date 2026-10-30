@@ -108,6 +108,7 @@ import type {
   StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
+import { combinedQueue, type CombineQueueOptions } from "@/lib/messageQueue";
 import { randomUUID } from "@/lib/randomUUID";
 import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
 import { describeSendFailure } from "@/lib/sendFailure";
@@ -1329,6 +1330,12 @@ export interface ChatActions {
    */
   reorderQueuedMessage: (queueId: string, beforeQueueId: string | null) => void;
   /**
+   * Merge each run of a conversation's adjacent combinable queued messages
+   * into one (the strip's Combine; see `combinedQueue`). The merged message
+   * gets a fresh `stableId`; other conversations' entries keep their places.
+   */
+  combineQueuedMessages: (conversationId: string, options?: CombineQueueOptions) => void;
+  /**
    * Send a queued message NOW instead of waiting for the idle flush (the
    * strip's per-row steer). Removes it from the queue and POSTs it: on an
    * SDK harness the server live-injects it into the running turn; the
@@ -2413,6 +2420,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         queuedMessages: s.queuedMessages.map((m) =>
           m.conversationId === conversationId ? reordered[next++]! : m,
         ),
+      };
+    });
+  },
+
+  combineQueuedMessages: (conversationId, options) => {
+    setActive((s) => {
+      const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
+      const combined = combinedQueue(own, options);
+      if (combined.length === own.length) return {};
+      const kept = new Map(
+        combined.map((m) => [
+          m.queueId,
+          m.stableId ? m : { ...m, stableId: randomUUID().replace(/-/g, "") },
+        ]),
+      );
+      return {
+        queuedMessages: s.queuedMessages.flatMap((m) => {
+          if (m.conversationId !== conversationId) return [m];
+          const next = kept.get(m.queueId);
+          return next === undefined ? [] : [next];
+        }),
       };
     });
   },
