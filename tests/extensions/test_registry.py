@@ -609,6 +609,44 @@ def test_rejects_slot_item_unknown_page(monkeypatch: pytest.MonkeyPatch) -> None
     assert "references unknown page" in registry.plugin_state().load_errors["review"]
 
 
+def test_rejects_extension_ids_under_the_reserved_core_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_entry_points(monkeypatch, _EntryPoint("core", _manifest("core.review")))
+
+    state = registry.plugin_state()
+
+    assert state.manifests == ()
+    assert "reserved 'core.' prefix" in state.load_errors["core"]
+
+
+@pytest.mark.parametrize(
+    ("slot", "kind"),
+    [
+        (SlotId.CHAT_HEADER_ACTIONS, SlotItemKind.ACTION),
+        (SlotId.COMPOSER_ACTIONS, SlotItemKind.ACTION),
+        (SlotId.SESSION_RIGHT_RAIL_TABS, SlotItemKind.TAB),
+        (SlotId.SETTINGS_SECTIONS, SlotItemKind.SECTION),
+    ],
+)
+def test_limits_items_per_extension_in_each_slot(slot: SlotId, kind: SlotItemKind) -> None:
+    limit = registry._SLOT_ITEM_LIMITS[slot]
+    items = tuple(
+        SlotItemContribution(
+            id=f"acme.review.item-{index}",
+            slot=slot,
+            kind=kind,
+            label=f"Item {index}",
+            page="acme.review.dashboard",
+        )
+        for index in range(limit + 1)
+    )
+
+    registry.validate_manifest(replace(_manifest(), slot_items=items[:limit]))
+    with pytest.raises(registry.ExtensionValidationError, match=f"the limit is {limit}"):
+        registry.validate_manifest(replace(_manifest(), slot_items=items))
+
+
 def test_rejects_activation_reference_to_unknown_contribution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

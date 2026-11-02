@@ -4,12 +4,15 @@ UI slots are stable semantic locations where Omnigent renders a small,
 declarative link to an extension-owned page. Extensions do not receive DOM,
 CSS-selector, React-component, or arbitrary HTML injection access.
 
-| Slot | Kind | Context |
-| --- | --- | --- |
-| `chat.header.actions` | `action` | Current `conversationId`, when present |
-| `composer.actions` | `action` | Current `conversationId` in an existing session |
-| `session.rightRail.tabs` | `tab` | Current `conversationId` |
-| `settings.sections` | `section` | No session context; stays inside the settings route family |
+| Slot | Kind | Limit | Context |
+| --- | --- | --- | --- |
+| `chat.header.actions` | `action` | 2 | Current `conversationId`, when present |
+| `composer.actions` | `action` | 2 | Current `conversationId` in an existing session |
+| `session.rightRail.tabs` | `tab` | 2 | Current `conversationId` |
+| `settings.sections` | `section` | 3 | No session context; stays inside the settings route family |
+
+The limit is per extension and slot; a manifest over it is rejected like any
+other invalid field.
 
 ```python
 from omnigent.extensions import SlotId, SlotItemContribution, SlotItemKind

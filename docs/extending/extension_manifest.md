@@ -70,14 +70,16 @@ def get_manifest() -> ExtensionManifest:
 ## Rules
 
 - IDs are lowercase, publisher-qualified, immutable, and globally collision
-  checked. Contribution IDs begin with the owning extension ID.
+  checked. Contribution IDs begin with the owning extension ID. The `core.`
+  prefix is reserved for Omnigent's own slot entries.
 - Page routes contain exactly one safe segment and are always namespaced.
 - The manifest distribution/version must match installed package metadata.
 - `requires_omnigent` is a PEP 440 release-line range.
 - Browser paths are fixed to `dist/extension.js` and optional
   `dist/extension.css` inside the entry point's verified import package.
 - Slot items use a supported slot/kind pairing, reference a page owned by the
-  same extension, and cannot reorder core UI. See
+  same extension, stay within each slot's per-extension limit, and cannot
+  reorder core UI. See
   [Extension UI slots](extension_ui_slots.md).
 - Built-ins are reserved. All community extensions participating in a collision
   are disabled deterministically.

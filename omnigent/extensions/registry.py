@@ -47,6 +47,8 @@ _SYMBOL_RE = _ASSET_SEGMENT_RE
 _ACTIVATION_EVENT_RE = re.compile(r"^(onPage|onCommand):(.+)$")
 _MAX_TEXT_LENGTH = 512
 _MAX_ASSET_DEPTH = 16
+#: Reserved for core's own slot entries, which the web app registers itself.
+RESERVED_CORE_ID_PREFIX = "core."
 
 
 class ExtensionValidationError(ValueError):
@@ -115,6 +117,11 @@ def _validate_extension_id(extension_id: str) -> None:
     if not _EXTENSION_ID_RE.fullmatch(extension_id):
         raise ExtensionValidationError(
             f"extension id {extension_id!r} must be a lowercase, publisher-qualified id"
+        )
+    # Contribution ids are namespaced under the extension id, so this covers them too.
+    if extension_id.startswith(RESERVED_CORE_ID_PREFIX):
+        raise ExtensionValidationError(
+            f"extension id {extension_id!r} uses the reserved {RESERVED_CORE_ID_PREFIX!r} prefix"
         )
 
 
@@ -195,6 +202,15 @@ _SLOT_KINDS = {
     SlotId.COMPOSER_ACTIONS: SlotItemKind.ACTION,
     SlotId.SESSION_RIGHT_RAIL_TABS: SlotItemKind.TAB,
     SlotId.SETTINGS_SECTIONS: SlotItemKind.SECTION,
+}
+
+# Most items one extension may place in each slot, so no single package
+# crowds a shared surface. The web app mirrors these values.
+_SLOT_ITEM_LIMITS = {
+    SlotId.CHAT_HEADER_ACTIONS: 2,
+    SlotId.COMPOSER_ACTIONS: 2,
+    SlotId.SESSION_RIGHT_RAIL_TABS: 2,
+    SlotId.SETTINGS_SECTIONS: 3,
 }
 
 
@@ -366,6 +382,13 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     navigation_ids = {navigation.id for navigation in manifest.primary_navigation}
     for item in manifest.slot_items:
         _validate_slot_item(manifest.id, item, page_ids=page_ids)
+    for slot, limit in _SLOT_ITEM_LIMITS.items():
+        count = sum(1 for item in manifest.slot_items if item.slot is slot)
+        if count > limit:
+            raise ExtensionValidationError(
+                f"extension {manifest.id!r} places {count} items in slot {slot.value!r}; "
+                f"the limit is {limit}"
+            )
     slot_item_ids = {item.id for item in manifest.slot_items}
 
     _reject_duplicates((page.id for page in manifest.pages), "page ids")
