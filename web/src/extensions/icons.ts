@@ -14,5 +14,6 @@ const ICONS: Record<string, LucideIcon> = {
 };
 
 export function extensionIcon(name: string | null): LucideIcon {
-  return ICONS[name ?? ""] ?? PuzzleIcon;
+  // Own keys only: manifest names like "constructor" must not reach Object.prototype.
+  return name !== null && Object.hasOwn(ICONS, name) ? ICONS[name] : PuzzleIcon;
 }
