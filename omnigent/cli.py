@@ -127,6 +127,7 @@ from omnigent.util.uuid import normalize_uuid
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.extensions.enablement import ExtensionEnablement
     from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
     from omnigent.inner.databricks_executor import _DatabricksBearerAuth
     from omnigent.install_ledger import InstallLedger
@@ -4752,6 +4753,7 @@ def server(
     import uvicorn
     import uvicorn.server
 
+    from omnigent.extensions.enablement import EXTENSIONS_CONFIG_KEY
     from omnigent.server.app import _ensure_default_agents, create_app
     from omnigent.server.auth import create_auth_provider
     from omnigent.server.server_config import (
@@ -4781,15 +4783,15 @@ def server(
                 "Invalid shared_preferences_authority_id: expected a nonempty string "
                 "of at most 128 characters without surrounding whitespace."
             ) from None
-    title_server_config = cfg
+    app_server_config = cfg
     if config_path is None:
+        # Without ``-c``, only these server-owned keys come from the user config.
         global_cfg = _load_global_config()
-        title_instructions = global_cfg.get(SESSION_TITLE_INSTRUCTIONS_KEY)
-        title_server_config = (
-            {SESSION_TITLE_INSTRUCTIONS_KEY: title_instructions}
-            if title_instructions is not None
-            else {}
-        )
+        app_server_config = {
+            key: global_cfg[key]
+            for key in (SESSION_TITLE_INSTRUCTIONS_KEY, EXTENSIONS_CONFIG_KEY)
+            if global_cfg.get(key) is not None
+        }
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:
@@ -5056,7 +5058,7 @@ def server(
         mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
-        server_config=title_server_config,
+        server_config=app_server_config,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
@@ -5505,16 +5507,34 @@ def extensions_cli() -> None:
     """Inspect extensions installed in this Python environment."""
 
 
+def _extension_enablement() -> ExtensionEnablement:
+    """Read UI slot enablement from the server config, reporting invalid entries."""
+    from omnigent.extensions.enablement import ExtensionConfigError, parse_extension_enablement
+    from omnigent.server.server_config import load_server_config
+
+    try:
+        enablement = parse_extension_enablement(load_server_config())
+    except ExtensionConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for key, error in sorted(enablement.errors.items()):
+        click.echo(f"ignored extensions config for {key}: {error}", err=True)
+    return enablement
+
+
 @extensions_cli.command("list")
 def extensions_list() -> None:
-    """List accepted extensions without resolving browser assets."""
+    """List accepted extensions and their enablement without resolving browser assets."""
     from omnigent.extensions import plugin_state
 
     state = plugin_state()
+    enablement = _extension_enablement()
     if not state.manifests:
         click.echo("No extensions installed.")
     for manifest in state.manifests:
-        click.echo(f"{manifest.id}\t{manifest.version}\t{manifest.display_name}")
+        click.echo(
+            f"{manifest.id}\t{manifest.version}\t{manifest.display_name}"
+            f"\t{enablement.describe(manifest.id)}"
+        )
     if state.load_errors:
         click.echo(f"{len(state.load_errors)} rejected extension entry point(s)", err=True)
 
@@ -5554,6 +5574,7 @@ def extensions_doctor(extension_id: str) -> None:
     click.echo(f"id: {manifest.id}")
     click.echo(f"distribution: {manifest.distribution} {manifest.version}")
     click.echo(f"extension API: {manifest.extension_api}")
+    click.echo(f"enablement: {_extension_enablement().describe(manifest.id)}")
     for item in manifest.slot_items:
         click.echo(f"UI slot: {item.slot.value} -> {item.page} ({item.label})")
     if manifest.entrypoints.browser is None:

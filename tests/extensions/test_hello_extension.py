@@ -17,6 +17,7 @@ from omnigent.extensions import (
     check_extension_package,
 )
 from omnigent.extensions.assets import ASSET_SCRIPT, ExtensionAssetError
+from omnigent.extensions.enablement import parse_extension_enablement
 from omnigent.server.routes.extension_assets import create_extension_assets_router
 from omnigent.server.routes.extensions import create_extensions_router
 
@@ -66,7 +67,13 @@ async def test_reference_extension_package_reaches_catalog_and_asset_route() -> 
 
     state = ExtensionPluginState(manifests=(manifest,))
     app.include_router(
-        create_extensions_router(state, bundles={manifest.id: bundle}),
+        create_extensions_router(
+            state,
+            bundles={manifest.id: bundle},
+            enablement=parse_extension_enablement(
+                {"extensions": {manifest.id: {"enabled": True}}}
+            ),
+        ),
         prefix="/v1",
     )
     app.include_router(

@@ -2371,6 +2371,9 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     config_home.mkdir()
     (config_home / "config.yaml").write_text(
         "session_title_instructions: Prefix titles with the current date.\n"
+        "extensions:\n"
+        "  omnigent.hello-page:\n"
+        "    enabled: true\n"
         "branding:\n"
         "  app_name: Must not leak into bare server config\n"
     )
@@ -2409,7 +2412,8 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
         {"test-tunnel-token-abc"}
     )
     assert captured["create_app_kwargs"]["server_config"] == {
-        "session_title_instructions": "Prefix titles with the current date."
+        "session_title_instructions": "Prefix titles with the current date.",
+        "extensions": {"omnigent.hello-page": {"enabled": True}},
     }
 
 

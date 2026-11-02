@@ -39,11 +39,41 @@ packages are not supported.
 ## Installation and diagnostics
 
 Declare an `omnigent.extensions` entry point, install the wheel in the server's
-Python environment, and restart the server. Installation implies enablement for
-V1; there is no separate enable switch.
+Python environment, and restart the server.
+
+Installing an extension serves its V1 pages, primary navigation and browser
+bundle. Its [UI slot](extension_ui_slots.md) items render only after an operator
+enables it in the server config:
+
+```yaml
+extensions:
+  omnigent.hello-page:
+    enabled: true
+```
+
+`omnigent server` reads the file passed to `-c`, otherwise
+`$OMNIGENT_CONFIG_HOME/config.yaml` (default `~/.omnigent/config.yaml`). The
+Docker image and `omni extensions list` read `$OMNIGENT_CONFIG`, otherwise
+`<data_dir>/config.yaml` (default `~/.omnigent/config.yaml`).
+
+| `extensions` section | V1 pages, navigation and bundle | Slot items |
+| --- | --- | --- |
+| absent | shown | not shown |
+| null (a bare `extensions:`) | shown | not shown |
+| `{}` | shown | not shown |
+| extension not listed | shown | not shown |
+| `enabled: false` | not shown | not shown |
+| `enabled: true` | shown | shown |
+
+A malformed section or an invalid entry counts as not listed and logs a warning
+at startup.
+`enabled` is the only setting this version accepts, until this section and the
+proposed backend-extension configuration share one parser: any other key under
+an extension stops the server with an error naming it. Restart the server after
+changing the section.
 
 ```bash
-omni extensions list
+omni extensions list    # status: enabled, or installed, not enabled
 omni extensions doctor publisher.extension
 ```
 

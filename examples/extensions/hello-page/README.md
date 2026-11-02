@@ -1,8 +1,10 @@
 # Hello Page extension
 
 Reference implementation of an Omnigent V1 browser extension. It contributes a
-primary-sidebar item and an isolated page, follows the host theme, navigates
-through the parent, and stores a visit count in extension-scoped IndexedDB.
+primary-sidebar item, an isolated page, and one link in each
+[UI slot](../../../docs/extending/extension_ui_slots.md). The page follows the
+host theme, navigates through the parent, and stores a visit count in
+extension-scoped IndexedDB.
 
 The generated `dist/extension.js` and `dist/extension.css` files are committed so
 the Python package is installable without Node.js. Rebuild them after changing
@@ -19,6 +21,14 @@ server so entry-point discovery runs again:
 ```bash
 uv pip install -e examples/extensions/hello-page
 uv run omnigent extensions doctor omnigent.hello-page
+```
+
+The slot links appear once the server config enables the extension:
+
+```yaml
+extensions:
+  omnigent.hello-page:
+    enabled: true
 ```
 
 For a faster local UI loop, point the explicit development override at the

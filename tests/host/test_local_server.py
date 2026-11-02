@@ -410,6 +410,45 @@ def test_server_config_signature_changes_with_session_title_instructions(
     assert sig_custom == local_server.server_config_signature()
 
 
+def test_server_config_signature_changes_with_extensions_section(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    config_path = config_home / "config.yaml"
+    config_path.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    sig_default = local_server.server_config_signature()
+
+    config_path.write_text("extensions:\n  omnigent.hello-page:\n    enabled: true\n")
+    sig_enabled = local_server.server_config_signature()
+
+    assert sig_default != sig_enabled
+    assert sig_enabled == local_server.server_config_signature()
+
+
+def test_server_config_signature_hashes_extensions_section_with_mixed_key_types(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A malformed section the parser ignores must not break the signature."""
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    config_path = config_home / "config.yaml"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    config_path.write_text("extensions:\n  omnigent.hello-page:\n    enabled: true\n")
+    sig_valid = local_server.server_config_signature()
+
+    config_path.write_text(
+        "extensions:\n  1:\n    enabled: true\n  omnigent.hello-page:\n    enabled: true\n"
+    )
+    sig_mixed = local_server.server_config_signature()
+
+    assert sig_mixed != sig_valid
+    assert sig_mixed == local_server.server_config_signature()
+
+
 def test_remote_daemon_signature_ignores_local_server_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

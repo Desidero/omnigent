@@ -28,6 +28,10 @@ SlotItemContribution(
 )
 ```
 
+Slot items render only for extensions the operator enables in the server
+config's `extensions` section; installation alone serves pages and navigation
+but no slot items. See [Extensions](extensions.md#installation-and-diagnostics).
+
 Every item references a page declared by the same extension. Core owns its
 placement, icon fallback, accessibility, responsive behavior, and routing.
 `order` sorts only among extension items in the same slot; it cannot reorder

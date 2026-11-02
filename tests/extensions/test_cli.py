@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from types import MappingProxyType
 
+import pytest
 from click.testing import CliRunner
 
 from omnigent.cli import cli
@@ -26,6 +27,13 @@ def _manifest() -> ExtensionManifest:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_server_config(monkeypatch, tmp_path) -> None:
+    config = tmp_path / "server.yaml"
+    config.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+
 def test_extensions_list(monkeypatch) -> None:
     monkeypatch.setattr(
         "omnigent.extensions.plugin_state",
@@ -35,7 +43,48 @@ def test_extensions_list(monkeypatch) -> None:
     result = CliRunner().invoke(cli, ["extensions", "list"])
 
     assert result.exit_code == 0
-    assert "acme.review\t1.0.0\tReview" in result.output
+    assert (
+        "acme.review\t1.0.0\tReview\tinstalled, not enabled (pages and navigation only)"
+        in result.output
+    )
+
+
+def test_extensions_list_reports_enablement_from_server_config(monkeypatch, tmp_path) -> None:
+    other = replace(_manifest(), id="acme.other", display_name="Other")
+    monkeypatch.setattr(
+        "omnigent.extensions.plugin_state",
+        lambda: ExtensionPluginState(manifests=(_manifest(), other)),
+    )
+    config = tmp_path / "enabled.yaml"
+    config.write_text(
+        "extensions:\n  acme.review: {enabled: true}\n  acme.other: {enabled: maybe}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    result = CliRunner().invoke(cli, ["extensions", "list"])
+
+    assert result.exit_code == 0
+    assert "acme.review\t1.0.0\tReview\tenabled" in result.output
+    assert "acme.other\t1.0.0\tOther\tinstalled, not enabled" in result.output
+    assert "ignored extensions config for acme.other: enabled must be true or false" in (
+        result.output
+    )
+
+
+def test_extensions_list_rejects_unsupported_settings(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "omnigent.extensions.plugin_state",
+        lambda: ExtensionPluginState(manifests=(_manifest(),)),
+    )
+    config = tmp_path / "pinned.yaml"
+    config.write_text("extensions:\n  acme.review: {enabled: true, version: '==1.0'}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    result = CliRunner().invoke(cli, ["extensions", "list"])
+
+    assert result.exit_code != 0
+    assert "unsupported setting(s) version" in result.output
 
 
 def test_extensions_doctor_reports_resolved_bundle(monkeypatch) -> None:
@@ -58,6 +107,7 @@ def test_extensions_doctor_reports_resolved_bundle(monkeypatch) -> None:
     result = CliRunner().invoke(cli, ["extensions", "doctor", manifest.id])
 
     assert result.exit_code == 0
+    assert "enablement: installed, not enabled (pages and navigation only)" in result.output
     assert f"browser bundle: ok ({'a' * 64})" in result.output
 
 

@@ -17,6 +17,7 @@ from omnigent.extensions import (
     SlotItemKind,
 )
 from omnigent.extensions.assets import ASSET_SCRIPT, ASSET_STYLES, ResolvedBundle
+from omnigent.extensions.enablement import ExtensionEnablement
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.permission_store import PermissionStore
@@ -117,6 +118,8 @@ class ExtensionDiagnosticsResponse(BaseModel):
 def _serialize_manifest(
     manifest: ExtensionManifest,
     bundle: ResolvedBundle | None = None,
+    *,
+    slots_enabled: bool = False,
 ) -> ExtensionResponse:
     """Convert a validated manifest into stable JSON-safe catalog metadata."""
     unavailable = manifest.entrypoints.browser is not None and bundle is None
@@ -143,9 +146,10 @@ def _serialize_manifest(
             for item in sorted(manifest.primary_navigation, key=lambda item: (item.order, item.id))
         ]
     )
+    # Slot items need explicit operator enablement, even for installed extensions.
     slot_items = (
         []
-        if unavailable
+        if unavailable or not slots_enabled
         else [
             ExtensionSlotItemResponse(
                 id=item.id,
@@ -220,12 +224,18 @@ def create_extensions_router(
     asset_errors: Mapping[str, str] | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    enablement: ExtensionEnablement | None = None,
 ) -> APIRouter:
     """Build the installed-extension catalog router, mounted under ``/v1``."""
     router = APIRouter()
     resolved_bundles = bundles or {}
+    resolved_enablement = enablement or ExtensionEnablement()
     catalog = tuple(
-        _serialize_manifest(manifest, resolved_bundles.get(manifest.id))
+        _serialize_manifest(
+            manifest,
+            resolved_bundles.get(manifest.id),
+            slots_enabled=resolved_enablement.allows_slots(manifest.id),
+        )
         for manifest in sorted(state.manifests, key=lambda item: item.id)
     )
     by_id = {item.id: item for item in catalog}
@@ -242,8 +252,10 @@ def create_extensions_router(
     async def list_extensions(request: Request) -> ExtensionListResponse:
         """List extensions installed and enabled when the server started.
 
-        V1 treats operator installation as enablement. Installing, removing, or
-        upgrading a package requires a server restart to refresh this snapshot.
+        Installed extensions serve pages and navigation unless the server
+        config's ``extensions`` section disables them; only enabled ones also
+        serve UI slot items. Changing packages or that section requires a server
+        restart to refresh this snapshot.
         """
         require_user(request, auth_provider)
         return ExtensionListResponse(data=list(catalog))

@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,6 +162,15 @@ def _resolve_effective_base_path() -> str:
     return _read_local_server_base_path()
 
 
+def _with_string_keys(value: object) -> object:
+    """Stringify mapping keys so ``json.dumps(sort_keys=True)`` accepts any config."""
+    if isinstance(value, Mapping):
+        return {str(key): _with_string_keys(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_with_string_keys(item) for item in value]
+    return value
+
+
 def server_config_signature(*, include_features: bool = True) -> str:
     """
     Compute a signature of the server-affecting config for one invocation.
@@ -178,7 +188,8 @@ def server_config_signature(*, include_features: bool = True) -> str:
       reconfigured in place;
     * the enabled release-feature set — features are snapshotted at boot; and
     * custom session-title instructions — title metadata is configured at boot;
-      and
+    * the user config's ``extensions`` section — extension enablement is read
+      at boot; and
     * the installed package version — a running server holds its code in
       memory, so after ``omni upgrade`` (or a manual ``uv tool upgrade``)
       the old process keeps serving pre-upgrade code until it is cycled.
@@ -211,10 +222,15 @@ def server_config_signature(*, include_features: bool = True) -> str:
     from omnigent.server.server_config import session_title_instructions
 
     title_instructions = None
+    extensions_config = None
     if include_features:
         from omnigent.config import load_global_config
+        from omnigent.extensions.enablement import EXTENSIONS_CONFIG_KEY
 
-        title_instructions = session_title_instructions(load_global_config())
+        global_config = load_global_config()
+        title_instructions = session_title_instructions(global_config)
+        # Hash the raw section, malformed entries included, so any edit respawns.
+        extensions_config = _with_string_keys(global_config.get(EXTENSIONS_CONFIG_KEY))
 
     try:
         version = importlib.metadata.version("omnigent")
@@ -229,11 +245,13 @@ def server_config_signature(*, include_features: bool = True) -> str:
         {
             "auth": resolve_auth_source(),
             "base_path": base_path,
+            "extensions": extensions_config,
             "features": (resolve_feature_flags().enabled_names() if include_features else ()),
             "session_title_instructions": title_instructions,
             "version": version,
         },
         sort_keys=True,
+        default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 

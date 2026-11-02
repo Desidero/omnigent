@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -89,9 +90,11 @@ def _build_app(
     extension_state: ExtensionPluginState | None = None,
     permission_store: SqlAlchemyPermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
+    server_config: dict[str, object] | None = None,
 ) -> FastAPI:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
+        server_config={} if server_config is None else server_config,
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
@@ -212,6 +215,9 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
         db_uri,
         tmp_path,
         extension_state=ExtensionPluginState(manifests=(zeta, alpha), load_errors={}),
+        server_config={
+            "extensions": {"acme.review": {"enabled": True}, "zeta.review": {"enabled": True}}
+        },
     )
 
     async with _client(app) as client:
@@ -238,6 +244,88 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
             "when": None,
         }
     ]
+
+
+def _slot_manifest(extension_id: str) -> ExtensionManifest:
+    manifest = replace(_manifest(extension_id), entrypoints=ExtensionEntrypoints())
+    return replace(
+        manifest,
+        slot_items=(
+            SlotItemContribution(
+                id=f"{extension_id}.header-action",
+                slot=SlotId.CHAT_HEADER_ACTIONS,
+                kind=SlotItemKind.ACTION,
+                label="Review",
+                page=manifest.pages[0].id,
+            ),
+        ),
+    )
+
+
+# The table in docs/extending/extensions.md. zeta.review is never listed.
+@pytest.mark.parametrize(
+    ("server_config", "acme"),
+    [
+        ({}, (1, 1, 0)),
+        ({"extensions": None}, (1, 1, 0)),
+        ({"extensions": {}}, (1, 1, 0)),
+        ({"extensions": {"acme.review": {"enabled": False}}}, None),
+        ({"extensions": {"acme.review": {"enabled": True}}}, (1, 1, 1)),
+    ],
+    ids=["absent", "null", "empty", "enabled-false", "enabled-true"],
+)
+async def test_operator_enablement_table(
+    db_uri: str,
+    tmp_path: Path,
+    server_config: dict[str, object],
+    acme: tuple[int, int, int] | None,
+) -> None:
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=ExtensionPluginState(
+            manifests=(_slot_manifest("acme.review"), _slot_manifest("zeta.review"))
+        ),
+        server_config=server_config,
+    )
+
+    async with _client(app) as client:
+        data = (await client.get("/v1/extensions")).json()["data"]
+        detail = await client.get("/v1/extensions/acme.review")
+
+    shown = {
+        item["id"]: (len(item["pages"]), len(item["primary_navigation"]), len(item["slot_items"]))
+        for item in data
+    }
+    expected = {"zeta.review": (1, 1, 0)} | ({} if acme is None else {"acme.review": acme})
+    assert shown == expected
+    assert detail.status_code == (404 if acme is None else 200)
+
+
+async def test_disabled_extension_bundle_is_not_served(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "package"
+    (package / "dist").mkdir(parents=True)
+    (package / "dist" / "extension.js").write_text("console.log('acme');\n", encoding="utf-8")
+    (package / "dist" / "extension.css").write_text("body {}\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_EXTENSION_DEV_BUNDLES", json.dumps({"acme.review": str(package)}))
+    state = ExtensionPluginState(manifests=(_manifest(),))
+
+    installed = _build_app(db_uri, tmp_path / "installed", extension_state=state)
+    async with _client(installed) as client:
+        catalog = (await client.get("/v1/extensions")).json()
+        script_url = catalog["data"][0]["browser"]["script_url"]
+        assert (await client.get(script_url)).status_code == 200
+
+    disabled = _build_app(
+        db_uri,
+        tmp_path / "disabled",
+        extension_state=state,
+        server_config={"extensions": {"acme.review": {"enabled": False}}},
+    )
+    async with _client(disabled) as client:
+        assert (await client.get(script_url)).status_code == 404
 
 
 async def test_extension_detail_and_unknown_id(catalog_app: FastAPI) -> None:

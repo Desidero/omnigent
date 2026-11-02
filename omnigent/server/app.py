@@ -61,6 +61,10 @@ from omnigent.extensions.assets import (
     build_asset_index,
     parse_dev_bundle_overrides,
 )
+from omnigent.extensions.enablement import (
+    apply_extension_enablement,
+    parse_extension_enablement,
+)
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -1821,7 +1825,14 @@ def create_app(
     )
     if isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
         scheduled_task_store.configure_dispatch(automations_v2_enabled)
-    resolved_extension_state = _resolve_extension_state(extension_state)
+    # Raises on unsupported settings so a misconfigured server fails to start.
+    extension_enablement = parse_extension_enablement(resolved_server_config)
+    for extension_key, extension_error in sorted(extension_enablement.errors.items()):
+        _logger.warning("extension config for %s is ignored: %s", extension_key, extension_error)
+    # Filter before resolving bundles so a disabled extension's assets are not served.
+    resolved_extension_state = apply_extension_enablement(
+        _resolve_extension_state(extension_state), extension_enablement
+    )
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
     # First-boot admin bootstrap for the accounts auth provider.
@@ -3844,6 +3855,7 @@ def create_app(
             asset_errors=extension_asset_errors,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            enablement=extension_enablement,
         ),
         prefix="/v1",
         tags=["extensions"],
