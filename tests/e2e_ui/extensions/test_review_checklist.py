@@ -2,8 +2,9 @@
 
 Reuses the packaged-install fixture from the UI-slot tests: the header action
 opens the checklist page for the invoking session, ticks persist in this
-browser, the composer action reaches the same ticks, and the settings section
-edits templates inside the settings layout.
+browser, the composer action reaches the same ticks, an archived session still
+loads by id, and the settings section edits templates inside the settings
+layout, listed after core's General entries.
 """
 
 from __future__ import annotations
@@ -95,11 +96,30 @@ def test_header_action_opens_the_checklist_for_the_invoking_session(
     ).to_be_checked()
 
 
+def test_review_page_reads_an_archived_session_by_id(page: Page, enabled_server: str) -> None:
+    session_id = create_user_session(enabled_server, headers={}, metadata={"title": "Old export"})
+    httpx.patch(
+        f"{enabled_server}/v1/sessions/{session_id}", json={"archived": True}, timeout=10.0
+    ).raise_for_status()
+
+    page.goto(f"{enabled_server}/extensions/{_EXTENSION_ID}/review?conversationId={session_id}")
+    frame = _checklist(page)
+    expect(frame.locator("#session-title")).to_have_text("Old export")
+    expect(frame.locator("#progress")).to_have_text("0 of 11 checked")
+
+
 def test_settings_section_edits_templates_inside_the_settings_layout(
     page: Page, enabled_server: str
 ) -> None:
     page.goto(f"{enabled_server}/settings/general")
-    page.get_by_test_id(f"extension-slot-settings-{_EXTENSION_ID}.settings").click()
+    link = page.get_by_test_id(f"extension-slot-settings-{_EXTENSION_ID}.settings")
+    expect(link).to_be_visible()
+    # Extension sections come after every core General entry, whatever their order.
+    last_core = page.get_by_test_id("settings-nav-import").bounding_box()
+    link_box = link.bounding_box()
+    assert last_core is not None and link_box is not None
+    assert link_box["y"] > last_core["y"]
+    link.click()
     expect(page).to_have_url(
         re.compile(rf"/settings/extensions/{re.escape(_EXTENSION_ID)}/templates$")
     )

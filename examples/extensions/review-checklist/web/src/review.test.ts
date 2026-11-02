@@ -66,16 +66,27 @@ function stubContext(options: {
       getCached: async () => null,
       listPage: async () => ({ sessions, nextCursor: null, hasMore: false }),
       listAll: async () => sessions,
-      pullRequest: async () => {
+      get: vi.fn(async (id: string) => sessions.find((session) => session.id === id) ?? null),
+      pullRequest: vi.fn(async () => {
         if (options.pullRequest instanceof Error) throw options.pullRequest;
         return options.pullRequest ?? null;
-      },
+      }),
     },
     projects: {
       list: async () => [{ id: "proj-1", name: "Storefront", icon: null }],
       create: async () => {
         throw new Error("not used");
       },
+    },
+    // The checklist keeps no session state of its own.
+    commands: {
+      invoke: async () => {
+        throw new Error("not used");
+      },
+    },
+    state: {
+      get: async () => null,
+      list: async () => ({ entries: [], nextAfter: null }),
     },
   };
   return { context, navigation };
@@ -125,11 +136,69 @@ describe("review page", () => {
     expect(root.querySelector("[data-testid=status-chip]")?.textContent).toContain("Running");
   });
 
-  it("says why the pull request lookup failed", async () => {
-    const { context } = stubContext({ conversationId: "conv-a", pullRequest: new Error("The session's host is offline") });
+  it("says a failed pull request lookup in plain words, without the host's message", async () => {
+    const failure = Object.assign(new Error("runner tunnel 502: upstream connect error"), { code: "Unavailable" });
+    const { context } = stubContext({ conversationId: "conv-a", pullRequest: failure });
     const root = await mount(context);
-    expect(root.querySelector("#pull-request")?.textContent).toBe(
-      "Couldn't check for a pull request: The session's host is offline",
+    const line = root.querySelector("#pull-request")?.textContent ?? "";
+    expect(line).toBe("Couldn't check for a pull request right now. The session's host may be offline; try Refresh.");
+    expect(line).not.toContain("502");
+  });
+
+  it("skips the pull request lookup when the session has no branch", async () => {
+    const { context } = stubContext({ conversationId: "conv-a", sessions: [summary({ gitBranch: null })] });
+    const root = await mount(context);
+    expect(root.querySelector("#pull-request")?.textContent).toBe("No branch to check for a pull request");
+    expect(context.sessions.pullRequest).not.toHaveBeenCalled();
+  });
+
+  it("keeps a session's template choice and ticks to that session", async () => {
+    const storage = memoryStorage();
+    const sessions = [summary(), summary({ id: "conv-b", title: "Fix login" })];
+    const first = stubContext({ conversationId: "conv-a", sessions, storage }).context;
+    let root = await mount(first);
+    const select = root.querySelector<HTMLSelectElement>("#template-select")!;
+    select.value = "builtin.pull-request-ready";
+    select.dispatchEvent(new Event("change"));
+    expect(root.querySelector("#template-source")?.textContent).toBe("From: Chosen for this session");
+    root.querySelector<HTMLInputElement>("input[type=checkbox]")!.click();
+    expect(root.querySelector("#progress")?.textContent).toBe("1 of 6 checked");
+    page!.dispose();
+    page = null;
+    await vi.waitFor(async () => expect(await storage.get("progress.v1")).toHaveProperty("conv-a"));
+
+    // Another session in the same project keeps the default and has no ticks.
+    root = await mount(stubContext({ conversationId: "conv-b", sessions, storage }).context);
+    expect(root.querySelector<HTMLSelectElement>("#template-select")?.value).toBe("builtin.agent-change-review");
+    expect(root.querySelector("#template-source")?.textContent).toBe("From: Your default");
+    expect(root.querySelector("#progress")?.textContent).toBe("0 of 11 checked");
+    page!.dispose();
+    page = null;
+
+    root = await mount(stubContext({ conversationId: "conv-a", sessions, storage }).context);
+    expect(root.querySelector<HTMLSelectElement>("#template-select")?.value).toBe("builtin.pull-request-ready");
+    expect(root.querySelector("#progress")?.textContent).toBe("1 of 6 checked");
+  });
+
+  it("reads the session by id, so one the list leaves out still loads", async () => {
+    const { context } = stubContext({
+      conversationId: "conv-child",
+      sessions: [summary({ id: "conv-child", title: "Sub-agent: run the tests" })],
+    });
+    const listAll = vi.spyOn(context.sessions, "listAll");
+    const root = await mount(context);
+    expect(context.sessions.get).toHaveBeenCalledWith("conv-child");
+    expect(listAll).not.toHaveBeenCalled();
+    expect(root.querySelector("#session-title")?.textContent).toBe("Sub-agent: run the tests");
+  });
+
+  it("says the session isn't available when the viewer can't read it", async () => {
+    const { context } = stubContext({ conversationId: "conv-hidden" });
+    document.body.innerHTML = '<div id="root"></div>';
+    const root = document.getElementById("root")!;
+    page = await mountReview(root, context);
+    expect(root.querySelector("#unavailable")?.textContent).toBe(
+      "This session isn't available here. It may have been deleted, or it isn't shared with you.",
     );
   });
 

@@ -2,27 +2,29 @@
 
 An example Omnigent browser extension (`omnigent.review-checklist`). It adds a
 review checklist beside a session, reached from the chat header or the
-composer, and a settings page for checklist templates. It uses only the
-[UI slots](../../../docs/extending/extension_ui_slots.md) and the V1
-[browser SDK](../../../docs/extending/browser_extensions.md); it has no server
-code.
+composer, and a settings page for checklist templates. It uses the
+[UI slots](../../../docs/extending/extension_ui_slots.md) and the
+[browser SDK](../../../docs/extending/browser_extensions.md), including
+`sessions.get`, which the session-row slot branch adds; it has no server code.
 
 | Slot | Item | Opens |
 | --- | --- | --- |
 | `chat.header.actions` | Review checklist | the review page, with the session's `conversationId` |
 | `composer.actions` | Review checklist | the same page, once the session exists |
-| `settings.sections` | Review checklists | the templates page, inside the settings layout |
+| `settings.sections` | Review checklists | the templates page, inside the settings layout, listed after core's General entries |
 
 ## What the pages do
 
 **Review page.** Shows which session it is reviewing (title, status, worktree
 branch, project, last update, session id) and the pull request filed from the
-session's branch, with **Open pull request** and **Open session** buttons. A
+session's branch, with **Open pull request** and **Open session** buttons
+(a session without a branch skips the lookup and says so). A
 banner says when the agent is still running, waiting for you, failed, or has an
 unread turn. Below that is the checklist: a template picker that says where its
 choice came from, the items as checkboxes, a live "N of M checked" count and
 **Uncheck all**. **Refresh** re-reads the session; the page also re-reads when
-the tab becomes visible again.
+the tab becomes visible again. It reads the session by id with `sessions.get`,
+so archived and sub-agent sessions work too, as long as you can read them.
 
 **Templates page.** Three read-only built-in templates (*Agent change review*,
 *Pull request ready*, *Research or answer session*) with **Duplicate to edit**;
@@ -59,10 +61,11 @@ session keep the last save.
 - Share checks or templates with anyone, or store anything on the server.
 - Check anything itself: it doesn't read the transcript, diff, tests or CI.
 - Change the session, its labels or the composer.
-- Show archived or sub-agent sessions; the V1 sessions API doesn't list them.
 - Update live: the SDK has no session subscription, so use **Refresh**.
 - Take operator-configured templates: to change the built-ins, edit
   `web/src/model.ts` and rebuild.
+- Follow the app's colour palette or Appearance font: the SDK passes only
+  light or dark, so the page mirrors core's default palette.
 - Copy to the clipboard or download a file: the sandbox allows neither, so
   export fills a text box to copy from.
 

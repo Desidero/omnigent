@@ -55,7 +55,7 @@ def get_manifest() -> ExtensionManifest:
                 kind=SlotItemKind.ACTION,
                 label="Review checklist",
                 page=_REVIEW_PAGE,
-                icon="search",
+                icon="list-checks",
             ),
             SlotItemContribution(
                 id=f"{_EXTENSION_ID}.composer-action",
@@ -63,7 +63,7 @@ def get_manifest() -> ExtensionManifest:
                 kind=SlotItemKind.ACTION,
                 label="Review checklist",
                 page=_REVIEW_PAGE,
-                icon="search",
+                icon="list-checks",
             ),
             SlotItemContribution(
                 id=f"{_EXTENSION_ID}.settings",
@@ -71,8 +71,7 @@ def get_manifest() -> ExtensionManifest:
                 kind=SlotItemKind.SECTION,
                 label="Review checklists",
                 page=_TEMPLATES_PAGE,
-                icon="search",
-                order=175,
+                icon="list-checks",
             ),
         ),
     )

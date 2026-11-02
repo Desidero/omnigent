@@ -4,7 +4,7 @@ import type {
   ExtensionPullRequest,
   ExtensionSessionSummary,
 } from "@omnigent/extension-sdk";
-import { button, confirmInline, el, errorMessage, renderKeepingFocus } from "./dom";
+import { button, confirmInline, el, renderKeepingFocus } from "./dom";
 import {
   allTemplates,
   checkedCount,
@@ -28,6 +28,7 @@ import {
 
 type Session = ExtensionSessionSummary;
 type PullRequestState =
+  | { kind: "no-branch" }
   | { kind: "loading" }
   | { kind: "done"; pr: ExtensionPullRequest | null }
   | { kind: "error"; message: string };
@@ -39,6 +40,16 @@ const STATUS: Record<Session["status"], { label: string; icon: string }> = {
   failed: { label: "Failed", icon: "✕" },
 };
 
+/** Plain words for a failed pull request lookup; never the host's raw message. */
+export function pullRequestErrorText(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (code === "Timeout") return "Couldn't check for a pull request: the lookup took too long. Try Refresh.";
+  if (code === "PermissionDenied") {
+    return "Couldn't check for a pull request: you don't have access to this session's repository.";
+  }
+  return "Couldn't check for a pull request right now. The session's host may be offline; try Refresh.";
+}
+
 export function bannerFor(session: Session): string | null {
   if (session.status === "running") {
     return "The agent is still working. The work may change before it finishes.";
@@ -49,15 +60,6 @@ export function bannerFor(session: Session): string | null {
   }
   if (session.unread) return "There's a finished turn you haven't read yet.";
   return null;
-}
-
-/** The SDK has no get-by-id: try the shell's cache, then walk the authoritative list. */
-export async function findSession(context: ExtensionContext, sessionId: string): Promise<Session | null> {
-  const cached = await context.sessions.getCached({ limit: 1000 }).catch(() => null);
-  const hit = cached?.find((session) => session.id === sessionId);
-  if (hit) return hit;
-  const all = await context.sessions.listAll({ pageLimit: 1000 });
-  return all.find((session) => session.id === sessionId) ?? null;
 }
 
 export interface ReviewPage {
@@ -123,8 +125,8 @@ export async function mountReview(
           }),
         ),
       );
-    } catch (error) {
-      container.replaceChildren(el("p", { class: "error" }, `Couldn't list sessions: ${errorMessage(error)}`));
+    } catch {
+      container.replaceChildren(el("p", { class: "error" }, "Couldn't list your recent sessions right now."));
     }
   };
 
@@ -144,10 +146,9 @@ export async function mountReview(
     fact("Session id", el("code", { id: "session-id" }, current.id));
 
     const prLine = el("p", { class: "pr", id: "pull-request" });
-    if (pullRequest.kind === "loading") prLine.append("Checking for a pull request…");
-    else if (pullRequest.kind === "error") {
-      prLine.append(`Couldn't check for a pull request: ${pullRequest.message}`);
-    }
+    if (pullRequest.kind === "no-branch") prLine.append("No branch to check for a pull request");
+    else if (pullRequest.kind === "loading") prLine.append("Checking for a pull request…");
+    else if (pullRequest.kind === "error") prLine.append(pullRequest.message);
     else if (!pullRequest.pr) prLine.append("No pull request found for this session's branch");
     else {
       const pr = pullRequest.pr;
@@ -277,14 +278,14 @@ export async function mountReview(
       if (!loaded) return [el("p", { class: "muted" }, "Loading session…")];
       if (loadError) {
         return [
-          el("p", { class: "error", role: "alert" }, `Couldn't load this session: ${loadError}`),
+          el("p", { class: "error", role: "alert" }, loadError),
           button("Try again", () => void refresh(), { "data-key": "refresh" }),
         ];
       }
       if (!session) {
         return [
           el("p", { class: "lead", id: "unavailable" },
-            "This session isn't available here. It may be archived, a sub-agent session, or not shared with you."),
+            "This session isn't available here. It may have been deleted, or it isn't shared with you."),
         ];
       }
       const banner = bannerFor(session);
@@ -300,11 +301,16 @@ export async function mountReview(
   };
 
   const loadPullRequest = async (current: Session) => {
+    if (!current.gitBranch) {
+      pullRequest = { kind: "no-branch" };
+      if (session?.id === current.id) render();
+      return;
+    }
     pullRequest = { kind: "loading" };
     try {
       pullRequest = { kind: "done", pr: await context.sessions.pullRequest(current.id) };
     } catch (error) {
-      pullRequest = { kind: "error", message: errorMessage(error) };
+      pullRequest = { kind: "error", message: pullRequestErrorText(error) };
     }
     if (session?.id === current.id) render();
   };
@@ -313,14 +319,14 @@ export async function mountReview(
     if (!sessionId) return render();
     try {
       const [found, projectList] = await Promise.all([
-        findSession(context, sessionId),
+        context.sessions.get(sessionId),
         context.projects.list().catch(() => projects),
       ]);
       session = found;
       projects = projectList;
       loadError = null;
-    } catch (error) {
-      loadError = errorMessage(error);
+    } catch {
+      loadError = "Couldn't load this session right now. Try again.";
     }
     loaded = true;
     render();
