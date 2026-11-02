@@ -272,6 +272,18 @@ describe("SettingsSidebarBody", () => {
     expect(onNavClick).toHaveBeenCalledOnce();
   });
 
+  it("lists extension sections at the end of the General group", () => {
+    renderBody({ extensions: [SETTINGS_EXTENSION] });
+
+    const general = screen.getByRole("heading", { name: "General" }).nextElementSibling;
+    const labels = Array.from(general?.querySelectorAll("a") ?? []).map((link) => link.textContent);
+    expect(labels.slice(-2)).toEqual(["Import sessions", "Acme settings"]);
+    expect(settingsNavGroups(false, false)[0]).toMatchObject({
+      title: "General",
+      slot: "settings.sections",
+    });
+  });
+
   it("uses the shared row geometry with normal-weight labels", () => {
     renderBody();
     const selected = screen.getByTestId("settings-nav-appearance");

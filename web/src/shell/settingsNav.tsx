@@ -33,7 +33,7 @@ import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
-import { ExtensionSlotHost } from "@/extensions/ExtensionSlot";
+import { ExtensionSlot } from "@/extensions/ExtensionSlot";
 
 export type SettingsSectionId =
   | "appearance"
@@ -83,6 +83,8 @@ interface SettingsNavItem {
 interface SettingsNavGroup {
   title: string;
   items: SettingsNavItem[];
+  /** Extension sections from this slot are listed after the group's own items. */
+  slot?: "settings.sections";
 }
 
 /**
@@ -132,7 +134,9 @@ export function settingsNavGroups(
     // on a deploy with sign-in.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
-  const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
+  const groups: SettingsNavGroup[] = [
+    { title: "General", items: general, slot: "settings.sections" },
+  ];
   if (customAgentsEnabled) {
     groups.push({
       title: "Customize",
@@ -299,53 +303,58 @@ export function SettingsSidebarBody({
         </Button>
       </div>
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
-        <ExtensionSlotHost slot="settings.sections" instance="settings" onNavigate={onNavClick}>
-          {groups.map((group) => (
-            <div key={group.title} className="flex flex-col">
-              <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
-                {group.title}
-              </h2>
-              <div className="mt-1 flex flex-col gap-px">
-                {group.items.map((item) => {
-                  const Icon = item.icon;
-                  const selected = !extensionSectionActive && section === item.id;
-                  return (
-                    <Button
-                      key={item.id}
-                      asChild
-                      variant="ghost"
-                      className={cn(
-                        SIDEBAR_ROW,
-                        "w-full justify-start border-0 font-normal",
-                        selected &&
-                          "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
-                        item.hideOnMobile && "max-md:hidden",
-                      )}
+        {groups.map((group) => (
+          <div key={group.title} className="flex flex-col">
+            <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
+              {group.title}
+            </h2>
+            <div className="mt-1 flex flex-col gap-px">
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                const selected = !extensionSectionActive && section === item.id;
+                return (
+                  <Button
+                    key={item.id}
+                    asChild
+                    variant="ghost"
+                    className={cn(
+                      SIDEBAR_ROW,
+                      "w-full justify-start border-0 font-normal",
+                      selected &&
+                        "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
+                      item.hideOnMobile && "max-md:hidden",
+                    )}
+                  >
+                    <Link
+                      to={`/settings/${item.id}`}
+                      onClick={onNavClick}
+                      data-testid={`settings-nav-${item.id}`}
+                      componentId={`settings.nav.${item.id}`}
+                      aria-current={selected ? "page" : undefined}
                     >
-                      <Link
-                        to={`/settings/${item.id}`}
-                        onClick={onNavClick}
-                        data-testid={`settings-nav-${item.id}`}
-                        componentId={`settings.nav.${item.id}`}
-                        aria-current={selected ? "page" : undefined}
-                      >
-                        <Icon
-                          className={cn(
-                            "ui-icon",
-                            selected
-                              ? "text-[var(--sidebar-active-foreground)]"
-                              : "text-muted-foreground",
-                          )}
-                        />
-                        {item.label}
-                      </Link>
-                    </Button>
-                  );
-                })}
-              </div>
+                      <Icon
+                        className={cn(
+                          "ui-icon",
+                          selected
+                            ? "text-[var(--sidebar-active-foreground)]"
+                            : "text-muted-foreground",
+                        )}
+                      />
+                      {item.label}
+                    </Link>
+                  </Button>
+                );
+              })}
+              {group.slot && (
+                <ExtensionSlot
+                  slot="settings.sections"
+                  instance="settings"
+                  onNavigate={onNavClick}
+                />
+              )}
             </div>
-          ))}
-        </ExtensionSlotHost>
+          </div>
+        ))}
       </nav>
     </>
   );

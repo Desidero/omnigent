@@ -35,7 +35,8 @@ but no slot items. See [Extensions](extensions.md#installation-and-diagnostics).
 Every item references a page declared by the same extension. Core owns its
 placement, icon fallback, accessibility, responsive behavior, and routing.
 `order` sorts only among extension items in the same slot; it cannot reorder
-core controls. `when` is reserved but not evaluated in V1.
+core controls. Settings sections are listed at the end of the General group,
+after core's entries. `when` is reserved but not evaluated in V1.
 
 Session-scoped links add `conversationId` to the parent route. The browser SDK
 exposes it after activation as `context.invocation.conversationId`; extension
