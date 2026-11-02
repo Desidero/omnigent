@@ -50,6 +50,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.extensions.labels import reject_undeclared_extension_labels
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
@@ -11528,6 +11529,7 @@ async def _create_session_from_existing_agent(
 
     _reject_reserved_cost_control_label_seed(body.labels)
     _reject_server_reserved_label_seed(body.labels)
+    reject_undeclared_extension_labels(body.labels, creating=True)
 
     agent = await validate_session_agent(
         user_id=user_id,

@@ -28,8 +28,11 @@ trusted Python package -> validated manifest -> server catalog
 - `pages`: one-segment routes under `/extensions/{extension_id}/{route}`.
 - `primary_navigation`: links rendered in the extension-owned slot between
   Inbox and Usage. `order` sorts only within that slot.
-- `slot_items`: core-rendered, page-backed links in four semantic UI locations.
-  See [Extension UI slots](extension_ui_slots.md).
+- `slot_items`: core-rendered, page-backed links in four semantic UI locations,
+  and label-bound items on sidebar session rows. See
+  [Extension UI slots](extension_ui_slots.md).
+- `labels`: ordinary session labels whose keys and values the extension
+  declares, for its session-row items.
 
 Command metadata, activation events, and `when` expressions are validated and
 reserved but are not executed or evaluated in V1. Arbitrary React components,

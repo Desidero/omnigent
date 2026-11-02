@@ -49,17 +49,42 @@ export interface ExtensionProjectSummary {
 }
 
 export type ExtensionSlotId =
-  "chat.header.actions" | "composer.actions" | "session.rightRail.tabs" | "settings.sections";
+  | "chat.header.actions"
+  | "composer.actions"
+  | "session.rightRail.tabs"
+  | "settings.sections"
+  | "session.row.decorations"
+  | "session.row.menu";
 
 export interface ExtensionSlotItem {
   id: string;
   slot: ExtensionSlotId;
-  kind: "action" | "tab" | "section";
+  kind: "action" | "tab" | "section" | "decoration" | "set-label";
   label: string;
-  page: string;
+  /** Set on page-backed kinds; session-row kinds bind a label instead. */
+  page: string | null;
   icon: string | null;
   order: number;
   when: string | null;
+  binding?: { source: "label"; key: string } | null;
+  /** A set-label item's clear entry, e.g. "Clear status". */
+  clear_label?: string | null;
+}
+
+export type ExtensionLabelTone = "neutral" | "info" | "success" | "warning" | "danger";
+
+export interface ExtensionLabelValue {
+  value: string;
+  label: string;
+  icon: string;
+  tone: ExtensionLabelTone;
+}
+
+/** An ordinary session label whose key and allowed values an extension declares. */
+export interface ExtensionLabelDeclaration {
+  key: string;
+  title: string;
+  values: ExtensionLabelValue[];
 }
 
 export interface ExtensionBrowserBundle {
@@ -82,6 +107,7 @@ export interface ExtensionCatalogItem {
   pages: ExtensionPage[];
   primary_navigation: ExtensionPrimaryNavigation[];
   slot_items: ExtensionSlotItem[];
+  labels?: ExtensionLabelDeclaration[];
   browser: ExtensionBrowserBundle;
 }
 

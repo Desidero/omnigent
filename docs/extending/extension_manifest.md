@@ -78,8 +78,11 @@ def get_manifest() -> ExtensionManifest:
 - Browser paths are fixed to `dist/extension.js` and optional
   `dist/extension.css` inside the entry point's verified import package.
 - Slot items use a supported slot/kind pairing, reference a page owned by the
-  same extension, stay within each slot's per-extension limit, and cannot
-  reorder core UI. See
+  same extension (or, for session-row kinds, bind one of its declared labels),
+  stay within each slot's per-extension limit, and cannot reorder core UI.
+- Declared `labels` use keys under `ext.<extension id>.`, approved icons and
+  known tones; a `set-label` item requires the `sessions.labels.write`
+  permission. See
   [Extension UI slots](extension_ui_slots.md).
 - Built-ins are reserved. All community extensions participating in a collision
   are disabled deterministically.

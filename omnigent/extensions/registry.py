@@ -22,6 +22,9 @@ from omnigent.extensions.api import (
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
+    LabelBinding,
+    LabelDeclaration,
+    LabelTone,
     PageContribution,
     PrimaryNavigationContribution,
     SlotId,
@@ -49,6 +52,31 @@ _MAX_TEXT_LENGTH = 512
 _MAX_ASSET_DEPTH = 16
 #: Reserved for core's own slot entries, which the web app registers itself.
 RESERVED_CORE_ID_PREFIX = "core."
+#: Declared session labels live under ``ext.<extension id>.<name>``.
+EXTENSION_LABEL_PREFIX = "ext."
+_LABEL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$")
+_LABEL_VALUE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+# The server's own label key and value caps.
+_MAX_LABEL_KEY_LENGTH = 128
+_MAX_LABEL_VALUE_LENGTH = 256
+_MAX_LABELS = 4
+_MAX_LABEL_VALUES = 12
+#: Icons the web app can draw; label values must use one, since the icon carries
+#: their meaning. The web app's ``icons.ts`` mirrors this set.
+APPROVED_ICONS = frozenset(
+    {
+        "circle-check",
+        "circle-ellipsis",
+        "dashboard",
+        "eye",
+        "list-checks",
+        "octagon-alert",
+        "panels-top-left",
+        "puzzle",
+        "search",
+        "square-parking",
+    }
+)
 
 
 class ExtensionValidationError(ValueError):
@@ -202,7 +230,11 @@ _SLOT_KINDS = {
     SlotId.COMPOSER_ACTIONS: SlotItemKind.ACTION,
     SlotId.SESSION_RIGHT_RAIL_TABS: SlotItemKind.TAB,
     SlotId.SETTINGS_SECTIONS: SlotItemKind.SECTION,
+    SlotId.SESSION_ROW_DECORATIONS: SlotItemKind.DECORATION,
+    SlotId.SESSION_ROW_MENU: SlotItemKind.SET_LABEL,
 }
+# Kinds core renders from a bound label rather than as a link to a page.
+_LABEL_BOUND_KINDS = frozenset({SlotItemKind.DECORATION, SlotItemKind.SET_LABEL})
 
 # Most items one extension may place in each slot, so no single package
 # crowds a shared surface. The web app mirrors these values.
@@ -211,7 +243,55 @@ _SLOT_ITEM_LIMITS = {
     SlotId.COMPOSER_ACTIONS: 2,
     SlotId.SESSION_RIGHT_RAIL_TABS: 2,
     SlotId.SETTINGS_SECTIONS: 3,
+    SlotId.SESSION_ROW_DECORATIONS: 1,
+    SlotId.SESSION_ROW_MENU: 1,
 }
+
+
+def extension_label_prefix(extension_id: str) -> str:
+    """Return the label-key prefix an extension's declared labels use."""
+    return f"{EXTENSION_LABEL_PREFIX}{extension_id}."
+
+
+def _validate_label(extension_id: str, label: LabelDeclaration) -> None:
+    if not isinstance(label, LabelDeclaration):
+        raise ExtensionValidationError("labels contains an invalid declaration type")
+    _require_text(label.key, "label key")
+    prefix = extension_label_prefix(extension_id)
+    name = label.key.removeprefix(prefix)
+    if (
+        name == label.key
+        or not _LABEL_NAME_RE.fullmatch(name)
+        or len(label.key) > _MAX_LABEL_KEY_LENGTH
+    ):
+        raise ExtensionValidationError(
+            f"label key {label.key!r} must be {prefix}<name>, with one lowercase name "
+            f"segment and at most {_MAX_LABEL_KEY_LENGTH} characters"
+        )
+    _require_text(label.title, f"label {label.key!r} title")
+    if not isinstance(label.values, tuple) or not 1 <= len(label.values) <= _MAX_LABEL_VALUES:
+        raise ExtensionValidationError(
+            f"label {label.key!r} values must be a tuple of 1 to {_MAX_LABEL_VALUES} values"
+        )
+    for value in label.values:
+        _require_text(value.value, f"label {label.key!r} value")
+        if (
+            not _LABEL_VALUE_RE.fullmatch(value.value)
+            or len(value.value) > _MAX_LABEL_VALUE_LENGTH
+        ):
+            raise ExtensionValidationError(
+                f"label {label.key!r} value {value.value!r} must be a lowercase slug"
+            )
+        _require_text(value.label, f"label {label.key!r} value {value.value!r} label")
+        if value.icon not in APPROVED_ICONS:
+            raise ExtensionValidationError(
+                f"label {label.key!r} value {value.value!r} uses unknown icon {value.icon!r}"
+            )
+        if not isinstance(value.tone, LabelTone):
+            raise ExtensionValidationError(
+                f"label {label.key!r} value {value.value!r} uses an unsupported tone"
+            )
+    _reject_duplicates((value.value for value in label.values), f"label {label.key!r} values")
 
 
 def _validate_slot_item(
@@ -219,6 +299,7 @@ def _validate_slot_item(
     item: SlotItemContribution,
     *,
     page_ids: set[str],
+    label_keys: set[str],
 ) -> None:
     _validate_contribution_id(extension_id, item.id, "slot item")
     if not isinstance(item.slot, SlotId):
@@ -232,11 +313,30 @@ def _validate_slot_item(
             f"for slot {item.slot.value!r}"
         )
     _require_text(item.label, f"slot item {item.id!r} label")
-    _require_text(item.page, f"slot item {item.id!r} page")
-    if item.page not in page_ids:
-        raise ExtensionValidationError(
-            f"slot item {item.id!r} references unknown page {item.page!r}"
-        )
+    if item.kind in _LABEL_BOUND_KINDS:
+        if item.page is not None:
+            raise ExtensionValidationError(f"slot item {item.id!r} cannot reference a page")
+        if not isinstance(item.binding, LabelBinding) or item.binding.key not in label_keys:
+            raise ExtensionValidationError(
+                f"slot item {item.id!r} must bind a label its extension declares"
+            )
+        # Core draws these icons without a fallback, as it does label values.
+        if item.icon is not None and item.icon not in APPROVED_ICONS:
+            raise ExtensionValidationError(
+                f"slot item {item.id!r} uses unknown icon {item.icon!r}"
+            )
+    else:
+        if item.binding is not None:
+            raise ExtensionValidationError(f"slot item {item.id!r} cannot bind a label")
+        _require_text(item.page, f"slot item {item.id!r} page")
+        if item.page not in page_ids:
+            raise ExtensionValidationError(
+                f"slot item {item.id!r} references unknown page {item.page!r}"
+            )
+    if item.clear_label is not None:
+        if item.kind is not SlotItemKind.SET_LABEL:
+            raise ExtensionValidationError(f"slot item {item.id!r} cannot set clear_label")
+        _require_text(item.clear_label, f"slot item {item.id!r} clear_label")
     if item.icon is not None:
         _require_symbol(item.icon, f"slot item {item.id!r} icon")
     if item.when is not None:
@@ -270,6 +370,7 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
         "pages",
         "primary_navigation",
         "slot_items",
+        "labels",
         "commands",
         "activation_events",
     ):
@@ -375,13 +476,30 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     for command in manifest.commands:
         _validate_command(manifest.id, command)
 
+    if len(manifest.labels) > _MAX_LABELS:
+        raise ExtensionValidationError(
+            f"extension {manifest.id!r} declares more than {_MAX_LABELS} labels"
+        )
+    for label in manifest.labels:
+        _validate_label(manifest.id, label)
+    _reject_duplicates((label.key for label in manifest.labels), "label keys")
+    label_keys = {label.key for label in manifest.labels}
+    if (
+        any(item.kind is SlotItemKind.SET_LABEL for item in manifest.slot_items)
+        and ExtensionPermission.SESSIONS_LABELS_WRITE not in manifest.permissions
+    ):
+        raise ExtensionValidationError(
+            f"extension {manifest.id!r} has a set-label item but does not request "
+            f"{ExtensionPermission.SESSIONS_LABELS_WRITE.value!r}"
+        )
+
     page_ids = {page.id for page in manifest.pages}
     command_ids = {command.id for command in manifest.commands}
     for navigation in manifest.primary_navigation:
         _validate_navigation(manifest.id, navigation, page_ids=page_ids)
     navigation_ids = {navigation.id for navigation in manifest.primary_navigation}
     for item in manifest.slot_items:
-        _validate_slot_item(manifest.id, item, page_ids=page_ids)
+        _validate_slot_item(manifest.id, item, page_ids=page_ids, label_keys=label_keys)
     for slot, limit in _SLOT_ITEM_LIMITS.items():
         count = sum(1 for item in manifest.slot_items if item.slot is slot)
         if count > limit:

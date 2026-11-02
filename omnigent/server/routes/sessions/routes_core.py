@@ -46,6 +46,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.extensions.labels import active_label_policy, reject_undeclared_extension_labels
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
@@ -1317,6 +1318,7 @@ def register_core_routes(
         )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
+        reject_undeclared_extension_labels(parsed_metadata.labels, creating=True)
 
         inherited_runner_id: str | None = None
         parent_conv = None
@@ -2850,6 +2852,7 @@ def register_core_routes(
                 )
         if body.labels:
             _reject_server_reserved_label_seed(body.labels)
+            reject_undeclared_extension_labels(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
@@ -3692,7 +3695,15 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        # Extension-declared labels clear the same way.
+        _declared_extension_keys = [
+            key for key in labels_to_set if active_label_policy().declares(key)
+        ]
+        for _clear_key in (
+            PROJECT_LABEL_KEY,
+            pinned_label_key(user_id),
+            *_declared_extension_keys,
+        ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
@@ -4108,6 +4119,8 @@ def register_core_routes(
             dropped_label_keys_set.update(
                 key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
             )
+        # A copied extension label its declaration no longer accepts stays behind.
+        dropped_label_keys_set.update(active_label_policy().rejected_keys(source.labels))
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always

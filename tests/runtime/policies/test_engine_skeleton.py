@@ -21,8 +21,18 @@ test modules.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
+from omnigent.extensions import (
+    EXTENSION_API_VERSION,
+    ExtensionManifest,
+    LabelDeclaration,
+    LabelValue,
+)
+from omnigent.extensions import labels as extension_labels
+from omnigent.extensions.labels import ExtensionLabelPolicy
 from omnigent.policies.types import EvaluationContext
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import (
@@ -121,6 +131,39 @@ def test_apply_label_writes_persists_and_updates_cache(
     conv = conversation_store.get_conversation(engine.conversation_id)
     assert conv is not None
     assert conv.labels == {"integrity": "0"}
+
+
+def test_apply_label_writes_keeps_extension_labels_to_their_declaration(
+    engine: PolicyEngine,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A policy can't write an installed extension's label outside its
+    declaration; an empty value deletes a declared label."""
+    key = "ext.acme.status.status"
+    manifest = ExtensionManifest(
+        id="acme.status",
+        display_name="Status",
+        distribution="acme-status",
+        version="1.0.0",
+        requires_omnigent=">=0.1",
+        extension_api=EXTENSION_API_VERSION,
+        labels=(LabelDeclaration(key, "Status", (LabelValue("done", "Done", "circle-check"),)),),
+    )
+    monkeypatch.setattr(extension_labels, "_active_policy", ExtensionLabelPolicy([manifest]))
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.runtime.policies.engine"):
+        engine.apply_label_writes({key: "done", "ext.acme.status.other": "x", "team": "ml"})
+    assert "ext.acme.status.other" in caplog.text
+    engine.apply_label_writes({key: "bogus"})
+    assert engine.labels == {key: "done", "team": "ml"}
+
+    engine.apply_label_writes({key: ""})
+    assert engine.labels == {"team": "ml"}
+    conv = conversation_store.get_conversation(engine.conversation_id)
+    assert conv is not None
+    assert conv.labels == {"team": "ml"}
 
 
 def test_apply_label_writes_empty_dict_is_noop(

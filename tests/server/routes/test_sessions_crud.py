@@ -18,9 +18,18 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.extensions import (
+    EXTENSION_API_VERSION,
+    ExtensionManifest,
+    LabelDeclaration,
+    LabelValue,
+)
+from omnigent.extensions import labels as extension_labels
+from omnigent.extensions.labels import ExtensionLabelPolicy
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
 from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
@@ -834,6 +843,133 @@ async def test_patch_rejects_client_supplied_archived_at_label(
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
     assert ARCHIVED_AT_LABEL_KEY not in conv.labels
+
+
+# ── Extension-declared labels (ext.<extension id>.<name>) ────────────
+
+_STATUS_KEY = "ext.acme.status.status"
+
+
+@pytest.fixture
+def status_label(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve an extension that declares ``_STATUS_KEY`` with the value ``blocked``.
+
+    Depends on ``app`` because building the app installs its own policy.
+    """
+    monkeypatch.setattr(
+        extension_labels,
+        "_active_policy",
+        ExtensionLabelPolicy(
+            [
+                ExtensionManifest(
+                    id="acme.status",
+                    display_name="Status",
+                    distribution="acme-status",
+                    version="1.0.0",
+                    requires_omnigent=">=0.1",
+                    extension_api=EXTENSION_API_VERSION,
+                    labels=(
+                        LabelDeclaration(
+                            key=_STATUS_KEY,
+                            title="Status",
+                            values=(LabelValue("blocked", "Blocked", "octagon-alert"),),
+                        ),
+                    ),
+                )
+            ]
+        ),
+    )
+
+
+async def test_patch_declared_extension_label_sets_and_empty_value_deletes(
+    status_label: None, client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """A declared value is stored; an empty value deletes the label, like a project clear."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {_STATUS_KEY: "blocked"}}
+    )
+    assert resp.status_code == 200
+    assert conv_store.get_conversation(session_id).labels[_STATUS_KEY] == "blocked"
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"labels": {_STATUS_KEY: ""}})
+    assert resp.status_code == 200
+    assert _STATUS_KEY not in conv_store.get_conversation(session_id).labels
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [{_STATUS_KEY: "bogus"}, {"ext.acme.status.priority": "high"}],
+    ids=["undeclared-value", "undeclared-key"],
+)
+async def test_patch_and_create_reject_writes_outside_the_declaration(
+    status_label: None,
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    labels: dict[str, str],
+) -> None:
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {"team": "ml", **labels}}
+    )
+    assert resp.status_code == 400
+    assert "ext.acme.status" in resp.json()["error"]["message"]
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert "team" not in conv.labels
+
+    agent = await create_test_agent(client, name="ext-label-agent")
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"], "labels": labels})
+    assert resp.status_code == 400
+    assert "ext.acme.status" in resp.json()["error"]["message"]
+
+
+async def test_create_omits_declared_labels_with_an_empty_value(
+    status_label: None, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    agent = await create_test_agent(client, name="ext-label-create")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": {_STATUS_KEY: "", "team": "ml"}},
+    )
+    assert resp.status_code == 201, resp.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert _STATUS_KEY not in conv.labels
+    assert conv.labels["team"] == "ml"
+
+
+async def test_patch_keeps_unowned_ext_keys_as_ordinary_labels(
+    status_label: None, client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {"ext.other.note": ""}}
+    )
+    assert resp.status_code == 200
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels["ext.other.note"] == ""
+
+
+async def test_fork_leaves_behind_labels_the_declaration_no_longer_accepts(
+    status_label: None, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client, name="ext-label-fork")
+    source = (await client.post("/v1/sessions", json={"agent_id": agent["id"]})).json()["id"]
+    # Written before the extension's declaration dropped this value.
+    store.set_labels(source, {_STATUS_KEY: "retired", "team": "ml"})
+
+    fork = await client.post(f"/v1/sessions/{source}/fork", json={})
+
+    assert fork.status_code == 201, fork.text
+    labels = store.get_conversation(fork.json()["id"]).labels
+    assert _STATUS_KEY not in labels
+    assert labels["team"] == "ml"
 
 
 async def test_list_sessions_pinned_filter(

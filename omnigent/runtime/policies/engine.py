@@ -13,9 +13,11 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any
 
+from omnigent.extensions.labels import active_label_policy
 from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 from omnigent.policies.base import Policy
 from omnigent.policies.function import FunctionPolicy
@@ -30,6 +32,8 @@ from omnigent.spec.types import (
     StateUpdateAction,
 )
 from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+
+_logger = logging.getLogger(__name__)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -528,7 +532,9 @@ class PolicyEngine:
           the new value is not in it.
 
         Keys with no ``LabelDef`` are set freely (omnigent
-        parity — "unschema'd labels set freely"). The engine
+        parity — "unschema'd labels set freely"), except keys in an
+        installed extension's ``ext.<id>.`` namespace, which must match
+        its declaration. The engine
         applies the filtered dict in a single UPSERT through
         the store so either every surviving write lands or
         none do.
@@ -541,6 +547,29 @@ class PolicyEngine:
         if not set_labels:
             return
         filtered = self._filter_schema_valid(set_labels)
+        # Extension-declared labels accept only their declared values here too;
+        # an empty value deletes one, as a client PATCH does.
+        extension_labels = active_label_policy()
+        rejected = extension_labels.rejected_keys(filtered)
+        if rejected:
+            _logger.debug(
+                "dropping policy label writes outside their extension declaration on %s: %s",
+                self._conversation_id,
+                ", ".join(sorted(rejected)),
+            )
+        cleared = [
+            key
+            for key, value in filtered.items()
+            if value == "" and extension_labels.declares(key) and key not in rejected
+        ]
+        for key in cleared:
+            self._store.delete_label(self._conversation_id, key)
+            self._labels.pop(key, None)
+        filtered = {
+            key: value
+            for key, value in filtered.items()
+            if key not in rejected and key not in cleared
+        }
         if not filtered:
             return
         self._store.set_labels(self._conversation_id, filtered)

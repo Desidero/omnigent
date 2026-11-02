@@ -17,12 +17,17 @@ from omnigent.extensions import (
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
+    LabelBinding,
+    LabelDeclaration,
+    LabelTone,
+    LabelValue,
     PageContribution,
     PrimaryNavigationContribution,
     SlotId,
     SlotItemContribution,
     SlotItemKind,
 )
+from omnigent.extensions.labels import active_label_policy
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
@@ -153,6 +158,7 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
                 "pages": [],
                 "primary_navigation": [],
                 "slot_items": [],
+                "labels": [],
                 "browser": {
                     "declared": True,
                     "has_styles": True,
@@ -242,6 +248,8 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
             "icon": None,
             "order": 500,
             "when": None,
+            "binding": None,
+            "clear_label": None,
         }
     ]
 
@@ -300,6 +308,83 @@ async def test_operator_enablement_table(
     expected = {"zeta.review": (1, 1, 0)} | ({} if acme is None else {"acme.review": acme})
     assert shown == expected
     assert detail.status_code == (404 if acme is None else 200)
+
+
+def _label_manifest(extension_id: str) -> ExtensionManifest:
+    key = f"ext.{extension_id}.status"
+    return replace(
+        _manifest(extension_id),
+        entrypoints=ExtensionEntrypoints(),
+        pages=(),
+        primary_navigation=(),
+        activation_events=(),
+        permissions=frozenset({ExtensionPermission.SESSIONS_LABELS_WRITE}),
+        labels=(
+            LabelDeclaration(
+                key=key,
+                title="Status",
+                values=(
+                    LabelValue("blocked", "Blocked", "octagon-alert", LabelTone.DANGER),
+                    LabelValue("done", "Done", "circle-check", LabelTone.SUCCESS),
+                ),
+            ),
+        ),
+        slot_items=(
+            SlotItemContribution(
+                id=f"{extension_id}.menu",
+                slot=SlotId.SESSION_ROW_MENU,
+                kind=SlotItemKind.SET_LABEL,
+                label="Status",
+                binding=LabelBinding(key),
+            ),
+        ),
+    )
+
+
+async def test_catalog_serves_labels_and_bindings_and_the_app_enforces_them(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=ExtensionPluginState(manifests=(_label_manifest("acme.status"),)),
+        server_config={"extensions": {"acme.status": {"enabled": True}}},
+    )
+
+    async with _client(app) as client:
+        (item,) = (await client.get("/v1/extensions")).json()["data"]
+
+    assert item["labels"] == [
+        {
+            "key": "ext.acme.status.status",
+            "title": "Status",
+            "values": [
+                {
+                    "value": "blocked",
+                    "label": "Blocked",
+                    "icon": "octagon-alert",
+                    "tone": "danger",
+                },
+                {"value": "done", "label": "Done", "icon": "circle-check", "tone": "success"},
+            ],
+        }
+    ]
+    (menu,) = item["slot_items"]
+    assert menu["page"] is None
+    assert menu["binding"] == {"source": "label", "key": "ext.acme.status.status"}
+    assert menu["clear_label"] is None
+    assert active_label_policy().declares("ext.acme.status.status")
+
+
+async def test_disabled_extension_declares_no_labels(db_uri: str, tmp_path: Path) -> None:
+    _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=ExtensionPluginState(manifests=(_label_manifest("acme.status"),)),
+        server_config={"extensions": {"acme.status": {"enabled": False}}},
+    )
+
+    assert not active_label_policy().declares("ext.acme.status.status")
 
 
 async def test_disabled_extension_bundle_is_not_served(

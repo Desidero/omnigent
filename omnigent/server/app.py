@@ -65,6 +65,7 @@ from omnigent.extensions.enablement import (
     apply_extension_enablement,
     parse_extension_enablement,
 )
+from omnigent.extensions.labels import ExtensionLabelPolicy, set_active_label_policy
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -2325,6 +2326,8 @@ def create_app(
     app.state.branding_snapshot = branding_snapshot
     app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
+    # Every session-label write path checks extension-declared keys against this.
+    set_active_label_policy(ExtensionLabelPolicy(resolved_extension_state.manifests))
     app.state.harness_install = app_harness_install
     app.state.automations = True if automations is None else automations
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled

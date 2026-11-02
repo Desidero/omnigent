@@ -151,6 +151,7 @@ def test_extension_permission_values_include_read_only_sessions() -> None:
         "navigation",
         "projects.read",
         "projects.write",
+        "sessions.labels.write",
         "sessions.read",
         "storage.user",
     }

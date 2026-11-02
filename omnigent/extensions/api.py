@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Literal
 
 EXTENSION_API_VERSION = 1
 
@@ -20,6 +21,8 @@ class SlotId(StrEnum):
     COMPOSER_ACTIONS = "composer.actions"
     SESSION_RIGHT_RAIL_TABS = "session.rightRail.tabs"
     SETTINGS_SECTIONS = "settings.sections"
+    SESSION_ROW_DECORATIONS = "session.row.decorations"
+    SESSION_ROW_MENU = "session.row.menu"
 
 
 class SlotItemKind(StrEnum):
@@ -28,6 +31,8 @@ class SlotItemKind(StrEnum):
     ACTION = "action"
     TAB = "tab"
     SECTION = "section"
+    DECORATION = "decoration"
+    SET_LABEL = "set-label"
 
 
 class ExtensionPermission(StrEnum):
@@ -37,7 +42,18 @@ class ExtensionPermission(StrEnum):
     PROJECTS_READ = "projects.read"
     PROJECTS_WRITE = "projects.write"
     SESSIONS_READ = "sessions.read"
+    SESSIONS_LABELS_WRITE = "sessions.labels.write"
     STORAGE_USER = "storage.user"
+
+
+class LabelTone(StrEnum):
+    """Named colour tone core maps to its own status theme tokens."""
+
+    NEUTRAL = "neutral"
+    INFO = "info"
+    SUCCESS = "success"
+    WARNING = "warning"
+    DANGER = "danger"
 
 
 @dataclass(frozen=True)
@@ -71,17 +87,55 @@ class PrimaryNavigationContribution:
 
 
 @dataclass(frozen=True)
+class LabelValue:
+    """One allowed value of a declared session label, with its presentation."""
+
+    value: str
+    label: str
+    icon: str
+    tone: LabelTone = LabelTone.NEUTRAL
+
+
+@dataclass(frozen=True)
+class LabelDeclaration:
+    """An ordinary session label whose key and values an extension declares.
+
+    The key is ``ext.<extension id>.<name>``. Anyone who may edit the session
+    may change it; the server only accepts the declared values.
+    """
+
+    key: str
+    title: str
+    values: tuple[LabelValue, ...]
+
+
+@dataclass(frozen=True)
+class LabelBinding:
+    """Binds a session-row slot item to a declared label of the same extension."""
+
+    key: str
+    source: Literal["label"] = "label"
+
+
+@dataclass(frozen=True)
 class SlotItemContribution:
-    """A core-rendered link from a semantic UI slot to an extension page."""
+    """A core-rendered slot item: a link to an extension page, or a bound label.
+
+    Page-backed kinds (action, tab, section) set ``page``; session-row kinds
+    (decoration, set-label, row) set ``binding`` instead.
+    """
 
     id: str
     slot: SlotId
     kind: SlotItemKind
     label: str
-    page: str
+    page: str | None = None
     icon: str | None = None
     order: int = 500
     when: str | None = None
+    binding: LabelBinding | None = None
+    #: A set-label item's clear entry, e.g. ``"Clear status"``; core shows "Clear" without it.
+    clear_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +162,7 @@ class ExtensionManifest:
     pages: tuple[PageContribution, ...] = ()
     primary_navigation: tuple[PrimaryNavigationContribution, ...] = ()
     slot_items: tuple[SlotItemContribution, ...] = ()
+    labels: tuple[LabelDeclaration, ...] = ()
     commands: tuple[CommandContribution, ...] = ()
 
 

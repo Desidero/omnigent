@@ -13,6 +13,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions import (
     ExtensionManifest,
     ExtensionPluginState,
+    LabelTone,
     SlotId,
     SlotItemKind,
 )
@@ -43,17 +44,43 @@ class ExtensionPrimaryNavigationResponse(BaseModel):
     when: str | None
 
 
+class ExtensionLabelBindingResponse(BaseModel):
+    """The declared label a session-row slot item renders."""
+
+    source: Literal["label"]
+    key: str
+
+
 class ExtensionSlotItemResponse(BaseModel):
-    """One core-rendered link contributed to a semantic UI slot."""
+    """One core-rendered item contributed to a semantic UI slot."""
 
     id: str
     slot: SlotId
     kind: SlotItemKind
     label: str
-    page: str
+    page: str | None
     icon: str | None
     order: int
     when: str | None
+    binding: ExtensionLabelBindingResponse | None
+    clear_label: str | None
+
+
+class ExtensionLabelValueResponse(BaseModel):
+    """One allowed value of a declared label, with its presentation."""
+
+    value: str
+    label: str
+    icon: str
+    tone: LabelTone
+
+
+class ExtensionLabelResponse(BaseModel):
+    """A session label an extension declares, with its allowed values in order."""
+
+    key: str
+    title: str
+    values: list[ExtensionLabelValueResponse]
 
 
 class ExtensionBrowserBundleResponse(BaseModel):
@@ -80,6 +107,7 @@ class ExtensionResponse(BaseModel):
     pages: list[ExtensionPageResponse]
     primary_navigation: list[ExtensionPrimaryNavigationResponse]
     slot_items: list[ExtensionSlotItemResponse]
+    labels: list[ExtensionLabelResponse]
     browser: ExtensionBrowserBundleResponse
 
 
@@ -160,6 +188,12 @@ def _serialize_manifest(
                 icon=item.icon,
                 order=item.order,
                 when=item.when,
+                binding=(
+                    ExtensionLabelBindingResponse(source=item.binding.source, key=item.binding.key)
+                    if item.binding is not None
+                    else None
+                ),
+                clear_label=item.clear_label,
             )
             for item in sorted(
                 manifest.slot_items,
@@ -178,6 +212,20 @@ def _serialize_manifest(
         pages=pages,
         primary_navigation=navigation,
         slot_items=slot_items,
+        # Served whatever the slot switch says: the server enforces them either way.
+        labels=[
+            ExtensionLabelResponse(
+                key=label.key,
+                title=label.title,
+                values=[
+                    ExtensionLabelValueResponse(
+                        value=value.value, label=value.label, icon=value.icon, tone=value.tone
+                    )
+                    for value in label.values
+                ],
+            )
+            for label in manifest.labels
+        ],
         browser=ExtensionBrowserBundleResponse(
             declared=manifest.entrypoints.browser is not None,
             has_styles=manifest.entrypoints.browser_css is not None,
