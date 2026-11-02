@@ -253,6 +253,9 @@ then continue from Chat or Terminal.
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
 session), archive or unarchive, and delete.
+An enabled extension can add a label badge next to the "Shared with you" icon
+and a set-label submenu after mark as unread or read, for viewers with edit
+access ([Extension UI slots](../docs/extending/extension_ui_slots.md#session-rows)).
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.

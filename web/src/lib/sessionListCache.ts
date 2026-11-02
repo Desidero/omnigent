@@ -600,3 +600,40 @@ export function overlayArchivedIntoCaches(
     old ? { ...old, archived } : old,
   );
 }
+
+/**
+ * Set or, for an empty value, remove one label on every cached copy of a
+ * session's row, leaving its other labels as each cache holds them.
+ */
+export function overlayLabelIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  key: string,
+  value: string,
+): void {
+  const update = (labels: Record<string, string> | null | undefined) => {
+    const others = Object.entries(labels ?? {}).filter(([name]) => name !== key);
+    return Object.fromEntries(value === "" ? others : [...others, [key, value]]);
+  };
+  for (const [queryKey, filtersFor] of [
+    [["conversations"], filtersFromConversationQueryKey],
+    [["project-sessions"], filtersFromProjectQueryKey],
+  ] as const) {
+    for (const [cacheKey, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey,
+    })) {
+      const row = data?.pages.flatMap((page) => page.data).find((conv) => conv.id === id);
+      if (!row) continue;
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        new Map([[id, { id, labels: update(row.labels) }]]),
+        filtersFor(cacheKey),
+        undefined,
+      );
+      if (next !== data) queryClient.setQueryData(cacheKey, next);
+    }
+  }
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, labels: update(old.labels) } : old,
+  );
+}

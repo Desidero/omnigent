@@ -73,9 +73,9 @@ import {
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
+  TagIcon,
   Trash2Icon,
   UserRoundIcon,
-  UsersIcon,
   WalletIcon,
   XIcon,
   type LucideIcon,
@@ -239,6 +239,16 @@ import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigat
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
+import { approvedExtensionIcon } from "@/extensions/icons";
+import { useSetSessionLabel } from "@/extensions/sessionLabels";
+import { isEditorLevel } from "@/lib/permissionsApi";
+import {
+  CORE_SESSION_ROW_DECORATIONS,
+  CORE_SESSION_ROW_MENU,
+  labelToneClass,
+  useSessionRowEntries,
+  type SessionRowLabel,
+} from "@/shell/sessionRowSlots";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
 import { NewProjectButton } from "./NewProjectButton";
 import { SessionImportStatus } from "./SessionImportStatus";
@@ -4154,6 +4164,9 @@ interface MenuItemProps {
   "aria-describedby"?: string;
   textValue?: string;
   variant?: "default" | "destructive";
+  // Value lists set `menuitemradio` with `aria-checked` on the current value.
+  role?: "menuitem" | "menuitemradio";
+  "aria-checked"?: boolean;
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
   "data-testid"?: string;
@@ -4189,6 +4202,51 @@ const contextBundle: MenuComponents = {
   SubContent: ContextMenuSubContent,
 };
 
+// One declared label's values as radio items, then Clear. Values render as text.
+function SessionRowLabelValues({
+  components: C,
+  entry,
+  labels,
+  onSelect,
+}: {
+  components: MenuComponents;
+  entry: SessionRowLabel;
+  labels: Record<string, string> | null | undefined;
+  onSelect: (value: string) => void;
+}) {
+  const stored = labels && Object.hasOwn(labels, entry.label.key) ? labels[entry.label.key] : "";
+  return (
+    <>
+      {entry.label.values.map((value) => {
+        const Icon = approvedExtensionIcon(value.icon);
+        const checked = entry.value?.value === value.value;
+        return (
+          <C.Item
+            key={value.value}
+            role="menuitemradio"
+            aria-checked={checked}
+            textValue={value.label}
+            data-testid={`session-row-label-${entry.item.id}-${value.value}`}
+            onSelect={() => onSelect(value.value)}
+          >
+            {Icon && <Icon aria-hidden className={cn("size-3.5", labelToneClass(value.tone))} />}
+            <span className="flex-1 truncate">{value.label}</span>
+            {checked && <CheckMarkIcon aria-hidden className="size-3.5 shrink-0 text-primary" />}
+          </C.Item>
+        );
+      })}
+      <C.Separator />
+      <C.Item
+        disabled={stored === ""}
+        data-testid={`session-row-label-${entry.item.id}-clear`}
+        onSelect={() => onSelect("")}
+      >
+        {entry.item.clear_label ?? "Clear"}
+      </C.Item>
+    </>
+  );
+}
+
 /**
  * The conversation row's action menu body — authored once and rendered under
  * both the kebab {@link DropdownMenu} and the row's right-click {@link ContextMenu}
@@ -4208,6 +4266,7 @@ function ConversationMenuItems({
   isSingleUser,
   canStop,
   canMarkUnread,
+  canEditLabels,
   currentProject,
   onTogglePinned,
   onMarkUnread,
@@ -4239,6 +4298,8 @@ function ConversationMenuItems({
   // Whether "Mark as unread" applies: any row not already showing the
   // unread dot (the active thread and running sessions included).
   canMarkUnread: boolean;
+  // EDIT access or above: the server's gate for label writes, so viewers get no set-label menus.
+  canEditLabels: boolean;
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
   onMarkUnread: () => void;
@@ -4283,7 +4344,22 @@ function ConversationMenuItems({
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
-  const [view, setView] = useState<"main" | "projects">("main");
+  // "label:<item id>" is an extension set-label item's value list.
+  const [view, setView] = useState<"main" | "projects" | `label:${string}`>("main");
+  const setLabel = useSetSessionLabel();
+  const handleLabelSelect = (entry: SessionRowLabel, value: string) => {
+    setMenuOpen(false);
+    setLabel.mutate({ sessionId: conversation.id, label: entry.label, value });
+  };
+  // Set-label items need edit access, the server's gate for the write.
+  const rowMenuEntries = useSessionRowEntries(
+    "session.row.menu",
+    CORE_SESSION_ROW_MENU,
+    conversation.labels,
+    { isOwner, canMarkUnread },
+    () => canEditLabels,
+  );
+  const coreActions = { markUnread: onMarkUnread, markRead: onMarkRead };
 
   // The project pick / create / remove flow — shared verbatim by the desktop
   // side-flyout submenu and the mobile in-place sub-view so both behave
@@ -4308,6 +4384,35 @@ function ConversationMenuItems({
   // "Back" row flips `view` without closing the menu or navigating). Reachable
   // only via the mobile project item below, which sits behind the same
   // `isOwner` gate.
+  const mobileLabelMenu = isMobile
+    ? rowMenuEntries.find((row) => row.source === "extension" && view === `label:${row.id}`)
+    : undefined;
+  if (mobileLabelMenu?.source === "extension") {
+    const entry = mobileLabelMenu.entry;
+    return (
+      <>
+        <C.Item
+          data-testid="session-row-label-back"
+          className="whitespace-nowrap"
+          onSelect={(e) => {
+            e.preventDefault();
+            setView("main");
+          }}
+        >
+          <ChevronLeftIcon className="size-3.5" />
+          Back
+        </C.Item>
+        <C.Separator />
+        <SessionRowLabelValues
+          components={C}
+          entry={entry}
+          labels={conversation.labels}
+          onSelect={(value) => handleLabelSelect(entry, value)}
+        />
+      </>
+    );
+  }
+
   if (isMobile && view === "projects") {
     return (
       <>
@@ -4437,31 +4542,65 @@ function ConversationMenuItems({
           the pink dot so a session can be flagged to revisit (including the
           one you're currently viewing); a row already showing the dot offers
           the reverse, "Mark as read", which clears it. */}
-      {canMarkUnread ? (
-        <C.Item
-          className="mobile-touch-target"
-          data-testid="mark-unread-conversation"
-          onSelect={() => {
-            onMarkUnread();
-            setMenuOpen(false);
-          }}
-        >
-          <MailIcon className="size-3.5" />
-          Mark as unread
-        </C.Item>
-      ) : (
-        <C.Item
-          className="mobile-touch-target"
-          data-testid="mark-read-conversation"
-          onSelect={() => {
-            onMarkRead();
-            setMenuOpen(false);
-          }}
-        >
-          <MailOpenIcon className="size-3.5" />
-          Mark as read
-        </C.Item>
-      )}
+      {/* Core's read-state pair, then extension set-label items, from one
+          resolver. On mobile a set-label item swaps the menu body to its
+          value list, like "Move session". */}
+      {rowMenuEntries.map((row) => {
+        if (row.source === "core") {
+          const { entry } = row;
+          return (
+            <C.Item
+              key={row.id}
+              data-testid={entry.testId}
+              onSelect={() => {
+                coreActions[entry.action]();
+                setMenuOpen(false);
+              }}
+            >
+              <entry.icon className="size-3.5" />
+              {entry.label}
+            </C.Item>
+          );
+        }
+        const { entry } = row;
+        const Icon =
+          approvedExtensionIcon(entry.value?.icon ?? null) ??
+          approvedExtensionIcon(entry.item.icon) ??
+          TagIcon;
+        const triggerContent = (
+          <>
+            <Icon className="size-3.5" />
+            {entry.item.label}
+          </>
+        );
+        return isMobile ? (
+          <C.Item
+            key={row.id}
+            data-testid={`session-row-menu-${row.id}`}
+            className="whitespace-nowrap"
+            onSelect={(e) => {
+              e.preventDefault();
+              setView(`label:${row.id}`);
+            }}
+          >
+            {triggerContent}
+          </C.Item>
+        ) : (
+          <C.Sub key={row.id}>
+            <C.SubTrigger data-testid={`session-row-menu-${row.id}`} className="whitespace-nowrap">
+              {triggerContent}
+            </C.SubTrigger>
+            <C.SubContent className="min-w-44">
+              <SessionRowLabelValues
+                components={C}
+                entry={entry}
+                labels={conversation.labels}
+                onSelect={(value) => handleLabelSelect(entry, value)}
+              />
+            </C.SubContent>
+          </C.Sub>
+        );
+      })}
       {/* The keyboard path for drag-to-reorder within the session's list. */}
       {reorder &&
         (["up", "down"] as const).map((direction) => {
@@ -4937,6 +5076,19 @@ function SessionTooltipContent({
   );
 }
 
+// One 24px decoration slot; Shared and extension badges share the row's indicator area.
+const ROW_DECORATION_CLASS = "inline-flex h-5 w-6 shrink-0 items-center justify-center";
+// Core's Shared entry plus at most two extension badges.
+const MAX_ROW_DECORATIONS = 3;
+// Title padding by trailing indicator and decoration count: the first decoration
+// also clears the indicator's gap, each further one adds its 24px.
+const ROW_DECORATION_RESERVE = {
+  awaiting: ["pr-29", "pr-36", "pr-42", "pr-48"],
+  updated: ["pr-11", "pr-18", "pr-24", "pr-30"],
+  indicator: ["pr-8", "pr-14", "pr-20", "pr-26"],
+  none: ["pr-2", "pr-8", "pr-14", "pr-20"],
+} as const;
+
 // Max gap between the first click and the dblclick of one double-click.
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
@@ -5158,12 +5310,19 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
-  const showSharedIndicator = !isOwner;
+  // Row decorations: core's "Shared with you", then extension label badges.
+  const decorations = useSessionRowEntries(
+    "session.row.decorations",
+    CORE_SESSION_ROW_DECORATIONS,
+    conversation.labels,
+    { isOwner, canMarkUnread },
+    (entry) => entry.value !== null && approvedExtensionIcon(entry.value.icon) !== null,
+  );
+  const decorationCount = decorations.length;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -5387,6 +5546,7 @@ function ConversationRowImpl({
     isSingleUser,
     canStop,
     canMarkUnread,
+    canEditLabels: isEditorLevel(conversation.permission_level ?? null),
     currentProject,
     onTogglePinned,
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
@@ -5424,19 +5584,15 @@ function ConversationRowImpl({
         // reserves only what the badge needs — the same width desktop uses at
         // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? showSharedIndicator
-              ? "pr-36"
-              : "pr-29"
-            : showUpdated
-              ? showSharedIndicator
-                ? "pr-18"
-                : "pr-11"
-              : hasSessionIndicator && showSharedIndicator
-                ? "pr-14"
-                : hasTrailingIndicator
-                  ? "pr-8"
-                  : "pr-2"),
+          ROW_DECORATION_RESERVE[
+            sessionState?.kind === "awaiting"
+              ? "awaiting"
+              : showUpdated
+                ? "updated"
+                : hasSessionIndicator
+                  ? "indicator"
+                  : "none"
+          ][Math.min(decorationCount, MAX_ROW_DECORATIONS)],
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -5677,18 +5833,45 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
-      {!selectionMode && showSharedIndicator && (
+      {!selectionMode && decorationCount > 0 && (
         <span
-          role="img"
-          aria-label="Shared session"
-          title="Shared with you"
+          data-testid="session-row-decorations"
           className={cn(
-            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            "-translate-y-1/2 pointer-events-none absolute inline-flex items-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
             overlayTop,
             hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
           )}
         >
-          <UsersIcon className="size-3.5" aria-hidden="true" />
+          {decorations.map((row) => {
+            const { name, title, Icon, iconClassName, testId } =
+              row.source === "core"
+                ? {
+                    name: row.entry.label,
+                    title: row.entry.title ?? row.entry.label,
+                    Icon: row.entry.icon,
+                    iconClassName: undefined,
+                    testId: row.entry.testId,
+                  }
+                : {
+                    name: `${row.entry.item.label}: ${row.entry.value?.label}`,
+                    title: `${row.entry.item.label}: ${row.entry.value?.label}`,
+                    Icon: approvedExtensionIcon(row.entry.value?.icon ?? null) ?? TagIcon,
+                    iconClassName: labelToneClass(row.entry.value?.tone ?? ""),
+                    testId: `session-row-decoration-${row.id}`,
+                  };
+            return (
+              <span
+                key={row.id}
+                role="img"
+                aria-label={name}
+                title={title}
+                data-testid={testId}
+                className={ROW_DECORATION_CLASS}
+              >
+                <Icon className={cn("size-3.5", iconClassName)} aria-hidden="true" />
+              </span>
+            );
+          })}
         </span>
       )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex

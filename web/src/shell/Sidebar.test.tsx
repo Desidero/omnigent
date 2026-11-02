@@ -433,7 +433,8 @@ describe("Sidebar session list", () => {
       const indicator = within(sharedRow).getByRole("img", { name: "Shared session" });
       expect(indicator).toHaveAttribute("title", "Shared with you");
       expect(indicator).toHaveClass("w-6", "justify-center");
-      expect(indicator).toHaveClass("absolute", "right-1");
+      // Positioned by the row's decorations group, which it leads.
+      expect(indicator.parentElement).toHaveClass("absolute", "right-1");
       expect(
         within(screen.getByText("private_session").closest("li")!).queryByRole("img"),
       ).toBeNull();
@@ -451,7 +452,9 @@ describe("Sidebar session list", () => {
     selectSessionFilter("all");
 
     const row = screen.getByText("shared_running").closest("li")!;
-    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-8");
+    expect(within(row).getByRole("img", { name: "Shared session" }).parentElement).toHaveClass(
+      "right-8",
+    );
     expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
   });
 
