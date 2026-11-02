@@ -54,14 +54,17 @@ Available V1 methods:
   such as a pull request) with the `navigation` permission;
 - `theme.getCurrent` and `theme.subscribe`;
 - `storage.user.get`, `set`, and `delete` with the `storage.user` permission;
-- `sessions.getCached`, `sessions.listPage`, the SDK's `sessions.listAll` helper, and
-  `sessions.pullRequest` (the PR filed from a session's branch, via the same
-  GitHub lookup as the shell's GitHub tab) with the `sessions.read` permission;
+- `sessions.getCached`, `sessions.listPage`, the SDK's `sessions.listAll` helper,
+  `sessions.get` (one session by ID), and `sessions.pullRequest` (the PR filed
+  from a session's branch, via the same GitHub lookup as the shell's GitHub tab)
+  with the `sessions.read` permission;
 - `projects.list` with the `projects.read` permission and `projects.create`
   with the `projects.write` permission.
 
-The sessions API exposes only top-level, non-archived sessions the current user
-can already read. Because operator-installed extension bundles are trusted code,
+The session list exposes only top-level, non-archived sessions the current user
+can already read. `sessions.get(id)` reads one session through the viewer's own
+access, including archived and sub-agent sessions, and returns `null` for a
+session the viewer can't read; it doesn't return the transcript. Because operator-installed extension bundles are trusted code,
 requesting `sessions.read` grants access to session titles and absolute working
 directory paths visible to that user. Summaries contain ID, title, status, an `unread` flag (a finished turn the
 current user has not viewed yet, using the sidebar's unread rule), a

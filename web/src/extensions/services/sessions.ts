@@ -109,7 +109,7 @@ function optionalBoundedString(value: unknown, field: string, maximum: number): 
   return value.slice(0, maximum);
 }
 
-function projectSession(value: unknown): ExtensionSessionSummary {
+export function projectSession(value: unknown): ExtensionSessionSummary {
   const row = plainObject(value);
   if (!row) throw new ExtensionHostServiceError("HostError", "Session row is malformed");
   const { id, status, created_at: createdAt, updated_at: updatedAt } = row;
@@ -299,4 +299,58 @@ export async function listSessionPage(
     throw new ExtensionHostServiceError("HostError", "Malformed session list response");
   }
   return projectSessionPage(payload, request.limit);
+}
+
+/**
+ * Read one session through `GET /v1/sessions/{id}` as the viewer, without its
+ * transcript. Returns null when the viewer can't see it or it doesn't exist.
+ */
+export async function getSessionSummary(
+  params: unknown,
+  signal: AbortSignal,
+): Promise<ExtensionSessionSummary | null> {
+  if (signal.aborted) throw new DOMException("Host operation cancelled", "AbortError");
+  const sessionId = plainObject(params)?.sessionId;
+  if (typeof sessionId !== "string" || !sessionId || sessionId.length > SESSION_ID_MAX_LENGTH) {
+    throw new ExtensionHostServiceError("InvalidParams", "sessionId is invalid");
+  }
+  const query = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+    include_usage: "false",
+  });
+  let response: Response;
+  try {
+    response = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}?${query}`, {
+      signal,
+    });
+  } catch (error) {
+    if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+      throw error;
+    }
+    throw new ExtensionHostServiceError("HostError", "Session request failed");
+  }
+  // Either way the viewer cannot read it.
+  if (response.status === 403 || response.status === 404) return null;
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new ExtensionHostServiceError("PermissionDenied", "Session access was denied");
+    }
+    throw new ExtensionHostServiceError(
+      response.status >= 500 ? "Unavailable" : "HostError",
+      `Session request failed (${response.status})`,
+    );
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    if (signal.aborted) throw error;
+    throw new ExtensionHostServiceError("HostError", "Malformed session response");
+  }
+  const row = plainObject(payload);
+  // A snapshot may omit updated_at before its first persisted change.
+  return projectSession(
+    row && row.updated_at == null ? { ...row, updated_at: row.created_at } : row,
+  );
 }

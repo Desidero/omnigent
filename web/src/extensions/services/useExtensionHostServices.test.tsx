@@ -34,7 +34,13 @@ const extension: ExtensionCatalogItem = {
   version: "1.0.0",
   extension_api: 1,
   status: "enabled",
-  permissions: ["navigation", "projects.read", "projects.write", "sessions.read", "storage.user"],
+  permissions: [
+    "navigation",
+    "projects.read",
+    "projects.write",
+    "sessions.read",
+    "storage.user",
+  ],
   pages: [
     {
       id: "acme.review.dashboard",
@@ -153,6 +159,53 @@ describe("useExtensionHostServices", () => {
       nextCursor: null,
       hasMore: false,
     });
+  });
+
+  it("reads one session by id as the viewer, without its transcript", async () => {
+    authenticatedFetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "conv_1",
+            agent_id: "agent",
+            title: "Archived child",
+            status: "idle",
+            created_at: 1,
+            updated_at: null,
+            archived: true,
+            parent_session_id: "conv_0",
+            labels: { hidden: "yes" },
+            items: [],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response("{}", { status: 404 }));
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+
+    await expect(
+      result.current.methods["sessions.get"]?.({ sessionId: "conv_1" }, signal()),
+    ).resolves.toEqual({
+      id: "conv_1",
+      title: "Archived child",
+      status: "idle",
+      titleProvisional: false,
+      unread: false,
+      workspace: null,
+      gitBranch: null,
+      projectId: null,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    expect(authenticatedFetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1?include_items=false&include_liveness=false&include_usage=false",
+    );
+    await expect(
+      result.current.methods["sessions.get"]?.({ sessionId: "conv_gone" }, signal()),
+    ).resolves.toBeNull();
+    await expect(
+      result.current.methods["sessions.get"]?.({ sessionId: "" }, signal()),
+    ).rejects.toThrow("sessionId is invalid");
   });
 
   it("exposes a cached preview separately from canonical session pages", async () => {
@@ -518,6 +571,7 @@ describe("useExtensionHostServices", () => {
 
     expect(result.current.methods["sessions.getCached"]).toBeUndefined();
     expect(result.current.methods["sessions.listPage"]).toBeUndefined();
+    expect(result.current.methods["sessions.get"]).toBeUndefined();
     expect(result.current.methods["projects.list"]).toBeUndefined();
     expect(result.current.methods["projects.create"]).toBeUndefined();
     expect(result.current.methods["navigation.openSession"]).toBeDefined();

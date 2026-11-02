@@ -92,6 +92,8 @@ export interface ExtensionContext {
     listAll(options?: {
       pageLimit?: number;
     }): Promise<ExtensionSessionSummary[]>;
+    /** One session the viewer can read, archived or sub-agent included; null otherwise. */
+    get(sessionId: string): Promise<ExtensionSessionSummary | null>;
     /** The pull request filed from a session's branch, if any. */
     pullRequest(sessionId: string): Promise<ExtensionPullRequest | null>;
   };
@@ -289,6 +291,8 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
           (code, message) => new ExtensionApiError(code, message),
         );
       },
+      get: (sessionId) =>
+        request<ExtensionSessionSummary | null>("sessions.get", { sessionId }),
       pullRequest: (sessionId) =>
         request<ExtensionPullRequest | null>("sessions.pullRequest", {
           sessionId,

@@ -22,7 +22,12 @@ import {
   listProjectSummaries,
   parseCreateProjectParams,
 } from "./projects";
-import { cachedSessionSummaries, listSessionPage, SessionReadLimiter } from "./sessions";
+import {
+  cachedSessionSummaries,
+  getSessionSummary,
+  listSessionPage,
+  SessionReadLimiter,
+} from "./sessions";
 import {
   ExtensionStorageError,
   ExtensionStorageWriteLimiter,
@@ -180,6 +185,8 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
       },
       "sessions.listPage": (params: unknown, signal: AbortSignal) =>
         sessionListLimiter.run(signal, () => listSessionPage(params, signal)),
+      "sessions.get": (params: unknown, signal: AbortSignal) =>
+        sessionListLimiter.run(signal, () => getSessionSummary(params, signal)),
       "sessions.pullRequest": (params: unknown, signal: AbortSignal) =>
         pullRequestLimiter.run(signal, async (): Promise<ExtensionPullRequest | null> => {
           const sessionId = objectParams(params).sessionId;
