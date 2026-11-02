@@ -17,7 +17,9 @@ describe("extension slot host mounts", () => {
 
   it("threads session, surface, and mobile navigation context at the host sites", () => {
     expect(source("shell/ChatHeader.tsx")).toContain("context={{ conversationId }}");
-    expect(source("pages/ChatPage.tsx")).toContain("context={{ conversationId }}");
+    expect(source("pages/ChatPage.tsx")).toContain(
+      "context={{ conversationId: composerSessionId }}",
+    );
     expect(source("shell/WorkspacePanel.tsx")).toContain("context={{ conversationId }}");
     expect(source("shell/settingsNav.tsx")).toContain("onNavigate={onNavClick}");
   });

@@ -32,14 +32,17 @@ core controls. `when` is reserved but not evaluated in V1.
 
 Session-scoped links add `conversationId` to the parent route. The browser SDK
 exposes it after activation as `context.invocation.conversationId`; extension
-code never reads the parent URL directly.
+code never reads the parent URL directly. The value comes from the URL, so treat
+it as a hint, not a grant: read the session through the permission-checked SDK,
+which applies the viewer's own access. The composer slot passes it only once the
+session exists.
 
 Settings items route through `/settings/extensions/{extension}/{page}`, so the
 settings sidebar remains visible. Action and rail items route through the normal
 `/extensions/{extension}/{page}` namespace. On mobile, settings and action links
 use the owning surface's normal close/navigation behavior.
 
-A rail contribution is intentionally a page link styled alongside the rail
-controls, not a fake ARIA tab and not persisted as a `RightRailTab`. Inline rich
+A rail contribution is intentionally a page link pinned with the Workspace
+panel's trailing controls, not a fake ARIA tab and not persisted as a `RightRailTab`. Inline rich
 rail panels require a future contribution contract with explicit lifecycle and
 persistence semantics.

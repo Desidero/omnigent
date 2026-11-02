@@ -110,6 +110,16 @@ describe("ExtensionSlot", () => {
     expect(container.innerHTML).toBe('<button type="button">Core action</button>');
   });
 
+  it("renders an empty slot without a router", () => {
+    const { container } = render(
+      <ExtensionCatalogProvider extensions={[]}>
+        <ExtensionSlot slot="chat.header.actions" />
+      </ExtensionCatalogProvider>,
+    );
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it.each([
     ["chat.header.actions", "acme.review.header", "/extensions/acme.review/review"],
     ["composer.actions", "acme.review.composer", "/extensions/acme.review/review"],

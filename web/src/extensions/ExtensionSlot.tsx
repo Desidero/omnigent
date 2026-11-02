@@ -7,7 +7,7 @@ import { SIDEBAR_ROW } from "@/shell/sidebarStyles";
 import { useExtensions } from "./ExtensionProvider";
 import { extensionIcon } from "./icons";
 import { resolveExtensionPageFromPath } from "./catalog";
-import { resolveSlotItems } from "./slots";
+import { resolveSlotItems, type ResolvedSlotItem } from "./slots";
 import type { ExtensionSlotId } from "./types";
 
 export interface ExtensionSlotProps {
@@ -29,11 +29,23 @@ export function ExtensionSlotHost({
   );
 }
 
-export function ExtensionSlot({ slot, context, instance, onNavigate }: ExtensionSlotProps) {
+export function ExtensionSlot(props: ExtensionSlotProps) {
+  const entries = resolveSlotItems(useExtensions(), props.slot);
+  // An empty slot stays dormant: no routing hooks, nothing rendered.
+  if (entries.length === 0) return null;
+  return <ExtensionSlotLinks {...props} entries={entries} />;
+}
+
+function ExtensionSlotLinks({
+  slot,
+  context,
+  instance,
+  onNavigate,
+  entries,
+}: ExtensionSlotProps & { entries: ResolvedSlotItem[] }) {
   const extensions = useExtensions();
   const location = useLocation();
   const activePageId = resolveExtensionPageFromPath(extensions, location.pathname)?.page.id;
-  const entries = resolveSlotItems(extensions, slot);
   return entries.map(({ extension, item, page }) => {
     const Icon = extensionIcon(item.icon);
     const basePath =
@@ -102,7 +114,17 @@ export function ExtensionSlot({ slot, context, instance, onNavigate }: Extension
     return (
       <Tooltip key={item.id}>
         <TooltipTrigger asChild>
-          <Button asChild variant="ghost" size="icon" className="size-9 md:size-8">
+          {/* Match the neighbouring core controls: header icons or the composer mic. */}
+          <Button
+            asChild
+            variant="ghost"
+            size={slot === "chat.header.actions" ? "icon-xs" : "icon"}
+            className={
+              slot === "chat.header.actions"
+                ? "border-none text-muted-foreground hover:text-foreground"
+                : "size-8 md:size-7"
+            }
+          >
             <Link
               to={to}
               onClick={onNavigate}

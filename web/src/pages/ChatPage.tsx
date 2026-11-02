@@ -4340,7 +4340,7 @@ function ComposerImpl(
               </div>
               <ExtensionSlotHost
                 slot="composer.actions"
-                context={{ conversationId }}
+                context={{ conversationId: composerSessionId }}
                 instance="chat-composer"
               >
                 <ComposerMicButton
