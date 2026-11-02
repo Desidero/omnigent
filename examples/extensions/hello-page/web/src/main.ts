@@ -13,6 +13,7 @@ function render(context: ExtensionContext, visits: number): void {
         <h1>Hello from an isolated page</h1>
         <p>This UI runs in an opaque-origin iframe and uses only the permission-checked host API.</p>
         <p class="visits">Opened <strong>${visits}</strong> time${visits === 1 ? "" : "s"} in this browser.</p>
+        <p class="invocation" hidden>Opened from session <code id="session-id"></code></p>
         <div class="actions">
           <button id="new-session" type="button">New session</button>
           <button id="self" type="button">Open this page</button>
@@ -20,6 +21,12 @@ function render(context: ExtensionContext, visits: number): void {
         <output id="status" aria-live="polite"></output>
       </section>
     </main>`;
+  // The session id comes from the parent URL: show it as text, never as HTML.
+  const conversationId = context.invocation.conversationId;
+  if (conversationId) {
+    root.querySelector<HTMLElement>("#session-id")!.textContent = conversationId;
+    root.querySelector<HTMLElement>(".invocation")!.hidden = false;
+  }
   const status = root.querySelector<HTMLOutputElement>("#status")!;
   root.querySelector<HTMLButtonElement>("#new-session")!.addEventListener("click", () => {
     void context.navigation.openNewSession().catch((error: unknown) => {

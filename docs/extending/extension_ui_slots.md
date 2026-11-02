@@ -32,7 +32,8 @@ core controls. `when` is reserved but not evaluated in V1.
 
 Session-scoped links add `conversationId` to the parent route. The browser SDK
 exposes it after activation as `context.invocation.conversationId`; extension
-code never reads the parent URL directly. The value comes from the URL, so treat
+code never reads the parent URL directly. On hosts without slots,
+`context.invocation` is empty. The value comes from the URL, so treat
 it as a hint, not a grant: read the session through the permission-checked SDK,
 which applies the viewer's own access. The composer slot passes it only once the
 session exists.

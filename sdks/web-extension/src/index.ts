@@ -11,6 +11,7 @@ import {
   type ExtensionReadyMessage,
   type ExtensionRequestMessage,
   type ExtensionResponseMessage,
+  readInvocationContext,
 } from "./protocol";
 import {
   drainSessionPages,
@@ -307,21 +308,20 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
       return;
     if (!event.data || typeof event.data !== "object") return;
     const init = event.data as ExtensionInitMessage;
+    const context = readInvocationContext(init.context);
     if (
       init.source !== EXTENSION_RPC_SOURCE ||
       init.type !== "init" ||
       !matchesIdentity(init, identity) ||
       !Array.isArray(init.capabilities) ||
       !init.capabilities.every((item) => typeof item === "string") ||
-      !init.context ||
-      typeof init.context !== "object" ||
-      !Object.values(init.context).every((item) => typeof item === "string")
+      context === null
     ) {
       return;
     }
     port = event.ports[0];
     grantedCapabilities = new Set(init.capabilities);
-    invocationContext = Object.freeze({ ...init.context });
+    invocationContext = context;
     active = true;
     window.removeEventListener("message", handleInit);
     port.onmessage = (portEvent: MessageEvent<unknown>) => {

@@ -13,7 +13,17 @@ export interface ExtensionInitMessage extends ExtensionIdentity {
   source: typeof EXTENSION_RPC_SOURCE;
   type: "init";
   capabilities: string[];
-  context: Record<string, string>;
+  /** Invocation context, such as `conversationId`; hosts without slots omit it. */
+  context?: Record<string, string>;
+}
+
+/** Read an init message's invocation context, or `null` when it is malformed. */
+export function readInvocationContext(value: unknown): Readonly<Record<string, string>> | null {
+  if (value === undefined) return Object.freeze({});
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (!entries.every(([, item]) => typeof item === "string")) return null;
+  return Object.freeze(Object.fromEntries(entries) as Record<string, string>);
 }
 
 export interface ExtensionReadyMessage extends ExtensionIdentity {
