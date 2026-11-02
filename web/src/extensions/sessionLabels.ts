@@ -5,21 +5,53 @@ import { overlayLabelIntoCaches } from "@/lib/sessionListCache";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { ExtensionLabelDeclaration } from "./types";
 
+// Under the extension SDK's 10s request timeout, so a page's call and the
+// host's write give up together.
 export const LABEL_WRITE_TIMEOUT_MS = 8_000;
+
+// Aborts on the caller's signal or after the timeout. Built by hand because
+// `AbortSignal.any` is newer than the browsers the app supports.
+function writeSignal(signal?: AbortSignal): { signal: AbortSignal; done: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("Label write timed out", "TimeoutError")),
+    LABEL_WRITE_TIMEOUT_MS,
+  );
+  const forward = () => controller.abort(signal?.reason);
+  if (signal?.aborted) forward();
+  signal?.addEventListener("abort", forward, { once: true });
+  return {
+    signal: controller.signal,
+    done: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", forward);
+    },
+  };
+}
 
 /**
  * Write one declared label through `PATCH /v1/sessions/{id}` as the viewer.
  * An empty value clears it: the server deletes declared labels on "".
  */
-export async function writeSessionLabel(id: string, key: string, value: string): Promise<void> {
-  const response = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ labels: { [key]: value } }),
-    // A hung request would otherwise hold back every later write to this key.
-    signal: AbortSignal.timeout(LABEL_WRITE_TIMEOUT_MS),
-  });
-  if (!response.ok) throw await apiErrorFromResponse(response);
+export async function writeSessionLabel(
+  id: string,
+  key: string,
+  value: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  // A hung request would otherwise hold back every later write to this key.
+  const abort = writeSignal(signal);
+  try {
+    const response = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ labels: { [key]: value } }),
+      signal: abort.signal,
+    });
+    if (!response.ok) throw await apiErrorFromResponse(response);
+  } finally {
+    abort.done();
+  }
 }
 
 async function readSessionLabel(id: string, key: string): Promise<string> {
@@ -31,7 +63,8 @@ async function readSessionLabel(id: string, key: string): Promise<string> {
   return labels && Object.hasOwn(labels, key) ? labels[key] : "";
 }
 
-// Writes to one session's key run in order, so the server keeps the last one sent.
+// Writes to one session's key, from the row menu or an extension page, run in
+// order, so the server keeps the last one sent.
 interface LabelWrites {
   tail: Promise<void>;
   latest: number;
@@ -50,6 +83,7 @@ export async function writeSessionLabelOptimistically(
   sessionId: string,
   key: string,
   value: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const slot = JSON.stringify([sessionId, key]);
   const writes = labelWrites.get(slot) ?? {
@@ -61,7 +95,7 @@ export async function writeSessionLabelOptimistically(
   writes.latest = write;
   labelWrites.set(slot, writes);
   overlayLabelIntoCaches(queryClient, sessionId, key, value);
-  const request = writes.tail.then(() => writeSessionLabel(sessionId, key, value));
+  const request = writes.tail.then(() => writeSessionLabel(sessionId, key, value, signal));
   writes.tail = request.then(
     () => undefined,
     () => undefined,

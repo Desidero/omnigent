@@ -58,6 +58,9 @@ Available V1 methods:
   `sessions.get` (one session by ID), and `sessions.pullRequest` (the PR filed
   from a session's branch, via the same GitHub lookup as the shell's GitHub tab)
   with the `sessions.read` permission;
+- `sessions.labels.set(sessionId, key, value)` and `sessions.labels.clear(sessionId, key)`
+  with the `sessions.labels.write` permission, for the extension's own
+  [declared labels](extension_ui_slots.md#declared-labels) only;
 - `projects.list` with the `projects.read` permission and `projects.create`
   with the `projects.write` permission.
 

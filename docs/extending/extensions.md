@@ -32,7 +32,7 @@ trusted Python package -> validated manifest -> server catalog
   and label-bound items on sidebar session rows. See
   [Extension UI slots](extension_ui_slots.md).
 - `labels`: ordinary session labels whose keys and values the extension
-  declares, for its session-row items.
+  declares, for its session-row items and its pages to write.
 
 Command metadata, activation events, and `when` expressions are validated and
 reserved but are not executed or evaluated in V1. Arbitrary React components,

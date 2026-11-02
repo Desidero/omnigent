@@ -38,6 +38,7 @@ const extension: ExtensionCatalogItem = {
     "navigation",
     "projects.read",
     "projects.write",
+    "sessions.labels.write",
     "sessions.read",
     "storage.user",
   ],
@@ -51,6 +52,13 @@ const extension: ExtensionCatalogItem = {
   ],
   primary_navigation: [],
   slot_items: [],
+  labels: [
+    {
+      key: "ext.acme.review.status",
+      title: "Status",
+      values: [{ value: "done", label: "Done", icon: "circle-check", tone: "success" }],
+    },
+  ],
   browser: {
     declared: true,
     has_styles: false,
@@ -206,6 +214,81 @@ describe("useExtensionHostServices", () => {
     await expect(
       result.current.methods["sessions.get"]?.({ sessionId: "" }, signal()),
     ).rejects.toThrow("sessionId is invalid");
+  });
+
+  it("writes and clears only its own declared labels, then repaints the cached row", async () => {
+    const row = { id: "conv_1", title: "One", labels: { team: "ml" }, updated_at: 1 };
+    queryClient.setQueryData(["conversations", "", true], {
+      pages: [{ data: [row], has_more: false }],
+      pageParams: [undefined],
+    });
+    authenticatedFetchMock.mockImplementation(async () => new Response("{}", { status: 200 }));
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+    const set = result.current.methods["sessions.labels.set"]!;
+    const clear = result.current.methods["sessions.labels.clear"]!;
+
+    expect(() =>
+      set({ sessionId: "conv_1", key: "ext.other.status", value: "done" }, signal()),
+    ).toThrow("Label is not declared by extension");
+    expect(() =>
+      set({ sessionId: "conv_1", key: "ext.acme.review.status", value: "bogus" }, signal()),
+    ).toThrow("Value is not declared for this label");
+
+    await set({ sessionId: "conv_1", key: "ext.acme.review.status", value: "done" }, signal());
+    const [url, init] = authenticatedFetchMock.mock.calls[0];
+    expect(url).toBe("/v1/sessions/conv_1");
+    expect(init).toMatchObject({
+      method: "PATCH",
+      body: JSON.stringify({ labels: { "ext.acme.review.status": "done" } }),
+    });
+    const cached = () =>
+      queryClient.getQueryData<{ pages: { data: { labels: Record<string, string> }[] }[] }>([
+        "conversations",
+        "",
+        true,
+      ])?.pages[0].data[0].labels;
+    expect(cached()).toEqual({ team: "ml", "ext.acme.review.status": "done" });
+
+    await clear({ sessionId: "conv_1", key: "ext.acme.review.status" }, signal());
+    expect(authenticatedFetchMock.mock.calls[1][1].body).toBe(
+      JSON.stringify({ labels: { "ext.acme.review.status": "" } }),
+    );
+    expect(cached()).toEqual({ team: "ml" });
+  });
+
+  it("maps a denied label write to PermissionDenied", async () => {
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: { message: "no" } }), { status: 403 }),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+
+    await expect(
+      result.current.methods["sessions.labels.clear"]?.(
+        { sessionId: "conv_1", key: "ext.acme.review.status" },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: "PermissionDenied" });
+  });
+
+  it("aborts the label write when the page cancels the call", async () => {
+    authenticatedFetchMock.mockImplementation(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => {
+          if (init?.method !== "PATCH") resolve(new Response('{"labels": {}}'));
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+    const controller = new AbortController();
+
+    const write = result.current.methods["sessions.labels.set"]?.(
+      { sessionId: "conv_1", key: "ext.acme.review.status", value: "done" },
+      controller.signal,
+    );
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalled());
+    controller.abort();
+
+    await expect(write).rejects.toBeDefined();
   });
 
   it("exposes a cached preview separately from canonical session pages", async () => {
@@ -572,6 +655,7 @@ describe("useExtensionHostServices", () => {
     expect(result.current.methods["sessions.getCached"]).toBeUndefined();
     expect(result.current.methods["sessions.listPage"]).toBeUndefined();
     expect(result.current.methods["sessions.get"]).toBeUndefined();
+    expect(result.current.methods["sessions.labels.set"]).toBeUndefined();
     expect(result.current.methods["projects.list"]).toBeUndefined();
     expect(result.current.methods["projects.create"]).toBeUndefined();
     expect(result.current.methods["navigation.openSession"]).toBeDefined();

@@ -14,6 +14,8 @@ export const HOST_METHOD_PERMISSIONS = {
   "sessions.listPage": "sessions.read",
   "sessions.get": "sessions.read",
   "sessions.pullRequest": "sessions.read",
+  "sessions.labels.set": "sessions.labels.write",
+  "sessions.labels.clear": "sessions.labels.write",
   "projects.list": "projects.read",
   "projects.create": "projects.write",
 } as const satisfies Record<string, string | null>;
