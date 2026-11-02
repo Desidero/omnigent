@@ -45,6 +45,7 @@ def _item(slot: SlotId, kind: SlotItemKind, **changes: object) -> SlotItemContri
 _ROW_ITEMS = (
     _item(SlotId.SESSION_ROW_DECORATIONS, SlotItemKind.DECORATION),
     _item(SlotId.SESSION_ROW_MENU, SlotItemKind.SET_LABEL),
+    _item(SlotId.SESSION_ROW_HOVER, SlotItemKind.ROW),
 )
 
 

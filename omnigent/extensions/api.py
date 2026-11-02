@@ -23,6 +23,7 @@ class SlotId(StrEnum):
     SETTINGS_SECTIONS = "settings.sections"
     SESSION_ROW_DECORATIONS = "session.row.decorations"
     SESSION_ROW_MENU = "session.row.menu"
+    SESSION_ROW_HOVER = "session.row.hover"
 
 
 class SlotItemKind(StrEnum):
@@ -33,6 +34,7 @@ class SlotItemKind(StrEnum):
     SECTION = "section"
     DECORATION = "decoration"
     SET_LABEL = "set-label"
+    ROW = "row"
 
 
 class ExtensionPermission(StrEnum):

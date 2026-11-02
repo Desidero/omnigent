@@ -247,6 +247,7 @@ import {
   CORE_SESSION_ROW_MENU,
   labelToneClass,
   useSessionRowEntries,
+  useSessionRowLabels,
   type SessionRowLabel,
 } from "@/shell/sessionRowSlots";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -4858,11 +4859,13 @@ function SessionMetaLine({
 function SessionTooltipDetail({
   label,
   icon: Icon,
+  iconClassName = "text-muted-foreground",
   testId,
   children,
 }: {
   label: string;
   icon: LucideIcon;
+  iconClassName?: string;
   testId: string;
   children: ReactNode;
 }) {
@@ -4870,7 +4873,7 @@ function SessionTooltipDetail({
     <div data-testid={testId} className="flex items-center justify-between gap-3 text-sm">
       <span className="shrink-0 text-muted-foreground">{label}</span>
       <span className="flex min-w-0 items-center gap-1.5">
-        <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        <Icon aria-hidden className={cn("size-3.5 shrink-0", iconClassName)} />
         <span className="truncate">{children}</span>
       </span>
     </div>
@@ -4915,7 +4918,10 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
   // The stored state may be old while the host is offline; say how old.
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
-  if (createdBy === null && repo === null && prNumber === null && branch === null) return null;
+  const labelRows = useSessionRowLabels("session.row.hover", conversation.labels);
+  const hasLabelRows = labelRows.some((entry) => entry.value !== null);
+  if (createdBy === null && repo === null && prNumber === null && branch === null && !hasLabelRows)
+    return null;
   return (
     <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">
       {createdBy !== null && (
@@ -4948,8 +4954,40 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
           {branch}
         </SessionTooltipDetail>
       )}
+      {labelRows.map(({ item, value }) =>
+        value === null ? null : (
+          <SessionTooltipDetail
+            key={item.id}
+            label={item.label}
+            icon={approvedExtensionIcon(value.icon) ?? TagIcon}
+            iconClassName={labelToneClass(value.tone)}
+            testId={`session-tooltip-${item.id}`}
+          >
+            {value.label}
+          </SessionTooltipDetail>
+        ),
+      )}
     </div>
   );
+}
+
+// Extension hover rows in the tooltip before the sidebar_grouping_ui flag.
+function LegacySessionTooltipLabelRows({ conversation }: { conversation: Conversation }) {
+  const labelRows = useSessionRowLabels("session.row.hover", conversation.labels);
+  return labelRows.map(({ item, value }) => {
+    if (value === null) return null;
+    const Icon = approvedExtensionIcon(value.icon) ?? TagIcon;
+    return (
+      <p
+        key={item.id}
+        data-testid={`session-tooltip-${item.id}`}
+        className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+      >
+        <Icon aria-hidden className={cn("size-3.5 shrink-0", labelToneClass(value.tone))} />
+        <span className="truncate">{`${item.label}: ${value.label}`}</span>
+      </p>
+    );
+  });
 }
 
 // Brand-color glyphs for harnesses ComposerAgentIcon draws in mono. Claude and Codex
@@ -5003,6 +5041,7 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      <LegacySessionTooltipLabelRows conversation={conversation} />
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );

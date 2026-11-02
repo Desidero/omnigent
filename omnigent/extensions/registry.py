@@ -232,9 +232,10 @@ _SLOT_KINDS = {
     SlotId.SETTINGS_SECTIONS: SlotItemKind.SECTION,
     SlotId.SESSION_ROW_DECORATIONS: SlotItemKind.DECORATION,
     SlotId.SESSION_ROW_MENU: SlotItemKind.SET_LABEL,
+    SlotId.SESSION_ROW_HOVER: SlotItemKind.ROW,
 }
 # Kinds core renders from a bound label rather than as a link to a page.
-_LABEL_BOUND_KINDS = frozenset({SlotItemKind.DECORATION, SlotItemKind.SET_LABEL})
+_LABEL_BOUND_KINDS = frozenset({SlotItemKind.DECORATION, SlotItemKind.SET_LABEL, SlotItemKind.ROW})
 
 # Most items one extension may place in each slot, so no single package
 # crowds a shared surface. The web app mirrors these values.
@@ -245,6 +246,7 @@ _SLOT_ITEM_LIMITS = {
     SlotId.SETTINGS_SECTIONS: 3,
     SlotId.SESSION_ROW_DECORATIONS: 1,
     SlotId.SESSION_ROW_MENU: 1,
+    SlotId.SESSION_ROW_HOVER: 1,
 }
 
 

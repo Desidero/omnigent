@@ -54,12 +54,13 @@ export type ExtensionSlotId =
   | "session.rightRail.tabs"
   | "settings.sections"
   | "session.row.decorations"
-  | "session.row.menu";
+  | "session.row.menu"
+  | "session.row.hover";
 
 export interface ExtensionSlotItem {
   id: string;
   slot: ExtensionSlotId;
-  kind: "action" | "tab" | "section" | "decoration" | "set-label";
+  kind: "action" | "tab" | "section" | "decoration" | "set-label" | "row";
   label: string;
   /** Set on page-backed kinds; session-row kinds bind a label instead. */
   page: string | null;

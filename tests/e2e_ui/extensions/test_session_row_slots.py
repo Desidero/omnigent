@@ -1,18 +1,19 @@
 """Session-row slots from a packaged, manifest-only extension through a real server.
 
-The test package declares a status label and binds a row badge and a row-menu
-submenu to it. It reuses the packaged-install fixture from
+The test package declares a status label and binds a row badge, a row-menu
+submenu and a tooltip row to it. It reuses the packaged-install fixture from
 the page-slot tests; no extension code runs in the browser.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, Locator, Page, expect
+from playwright.sync_api import Browser, Locator, Page, Route, expect
 
 from tests._helpers.extensions import extension_server, install_extension_packages
 from tests._helpers.polling import poll_until
@@ -61,6 +62,16 @@ def _set_status_from_kebab(page: Page, session_id: str, status: str) -> None:
     page.get_by_test_id(_value(status)).click()
 
 
+def _show_grouping_tooltip(page: Page) -> None:
+    def serve_info(route: Route) -> None:
+        response = route.fetch()
+        info = response.json()
+        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": True}
+        route.fulfill(response=response, json=info)
+
+    page.route("**/v1/info", serve_info)
+
+
 def test_installed_but_not_enabled_adds_nothing_to_rows(
     page: Page, built_spa: None, status_packages: Path, tmp_path: Path
 ) -> None:
@@ -106,6 +117,13 @@ def test_set_check_and_clear_status_from_the_row_menu(page: Page, enabled_server
     page.keyboard.press("Enter")
     expect(row.get_by_role("img", name="Status: Done")).to_be_visible()
 
+    # The legacy tooltip lists the value as text.
+    page.mouse.move(0, 0)
+    row.locator("a").first.hover()
+    expect(page.get_by_test_id(f"session-tooltip-{_EXTENSION_ID}.hover")).to_have_text(
+        "Status: Done"
+    )
+
     page.reload()
     expect(_row(page, session_id).get_by_role("img", name="Status: Done")).to_be_visible()
 
@@ -115,6 +133,22 @@ def test_set_check_and_clear_status_from_the_row_menu(page: Page, enabled_server
     page.reload()
     expect(_row(page, session_id)).to_be_visible()
     expect(_row(page, session_id).get_by_test_id("session-row-decorations")).to_have_count(0)
+
+
+def test_grouping_tooltip_lists_the_status_row(page: Page, enabled_server: str) -> None:
+    session_id = create_user_session(enabled_server, headers={}, metadata={"title": "Hover row"})
+    httpx.patch(
+        f"{enabled_server}/v1/sessions/{session_id}",
+        json={"labels": {_KEY: "needs-review"}},
+        timeout=10,
+    ).raise_for_status()
+    _show_grouping_tooltip(page)
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(enabled_server)
+
+    _row(page, session_id).locator("a").first.hover()
+    detail = page.get_by_test_id(f"session-tooltip-{_EXTENSION_ID}.hover")
+    expect(detail).to_have_text(re.compile(r"^Status\s*Needs review$"))
 
 
 def test_phone_menu_swaps_to_the_value_list(page: Page, enabled_server: str) -> None:

@@ -13,6 +13,7 @@ CSS-selector, React-component, or arbitrary HTML injection access.
 | `settings.sections` | `section` | 3 | No session context; stays inside the settings route family |
 | `session.row.decorations` | `decoration` | 1 | A sidebar session row; binds a declared label |
 | `session.row.menu` | `set-label` | 1 | A sidebar session row; binds a declared label |
+| `session.row.hover` | `row` | 1 | A sidebar session row; binds a declared label |
 
 The limit is per extension and slot; a manifest over it is rejected like any
 other invalid field.
@@ -62,7 +63,7 @@ persistence semantics.
 
 ## Session rows
 
-The `session.row.*` slots render on every session row in the sidebar.
+The three `session.row.*` slots render on every session row in the sidebar.
 Their items have no page and run no extension code: each binds a label the
 extension declares, and core draws it from the manifest.
 
@@ -70,6 +71,7 @@ extension declares, and core draws it from the manifest.
 | --- | --- |
 | `decoration` | The current value's icon, in its tone, after core's "Shared with you" icon. Its accessible name and tooltip are `<item label>: <value label>`. |
 | `set-label` | A submenu in the row's menu and right-click menu, after core's Mark as read / Mark as unread, listing the declared values (the current one checked) and a clear entry (`clear_label`, or "Clear"). On phones it replaces the menu body, with a Back row. |
+| `row` | A `<item label>: <value label>` line in the row's tooltip, in the tooltip of either `sidebar_grouping_ui` state. Tooltips are desktop-only, so phones show the value through the badge alone. |
 
 Nothing renders for an absent, empty or undeclared value. A row shows items from
 at most two extensions per slot. An item's `icon`, if set, must be an approved
@@ -83,7 +85,7 @@ carry a visibility check the web app evaluates; extension items don't, and
 
 The set-label menu needs the `sessions.labels.write` permission and appears only
 to viewers with edit access to the session (owners, editors and managers). Viewers
-with read access see decorations but no menu.
+with read access see decorations and tooltip rows but no menu.
 
 ```python
 from omnigent.extensions import (
@@ -155,4 +157,4 @@ declares, not extension-owned state:
 - Writes go through `PATCH /v1/sessions/{id}` as the viewer, so the session's
   normal edit check applies. Anyone with edit access can also change the label
   through the API or CLI, and it stays when the extension is disabled or
-  uninstalled; only its badge and menu stop rendering.
+  uninstalled; only its badge, menu and tooltip row stop rendering.

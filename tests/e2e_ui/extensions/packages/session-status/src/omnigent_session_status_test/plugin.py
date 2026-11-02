@@ -1,4 +1,4 @@
-"""A status label shown as a row badge and set from the row menu."""
+"""A status label shown as a row badge, set from the row menu, and listed in the tooltip."""
 
 from omnigent.extensions import (
     EXTENSION_API_VERSION,
@@ -56,6 +56,13 @@ def get_manifest() -> ExtensionManifest:
                 label="Status",
                 binding=binding,
                 clear_label="Clear status",
+            ),
+            SlotItemContribution(
+                id=f"{_EXTENSION_ID}.hover",
+                slot=SlotId.SESSION_ROW_HOVER,
+                kind=SlotItemKind.ROW,
+                label="Status",
+                binding=binding,
             ),
         ),
     )
