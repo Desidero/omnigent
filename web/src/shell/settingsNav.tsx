@@ -10,20 +10,14 @@ import { useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
-  BlocksIcon,
   BotIcon,
   DownloadIcon,
-  GitBranchIcon,
-  KeyboardIcon,
-  PaletteIcon,
-  PlugIcon,
-  SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
   TerminalIcon,
-  UserCogIcon,
   UsersIcon,
   VectorSquareIcon,
+  type LucideIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -33,6 +27,7 @@ import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { visibleCoreSettingsSections } from "@/extensions/coreSlotEntries";
 import { ExtensionSlot } from "@/extensions/ExtensionSlot";
 
 export type SettingsSectionId =
@@ -75,7 +70,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
 interface SettingsNavItem {
   id: SettingsSectionId;
   label: string;
-  icon: typeof PaletteIcon;
+  icon: LucideIcon;
   /** Hide this item on mobile (e.g. keyboard shortcuts on a touch device). */
   hideOnMobile?: boolean;
 }
@@ -110,30 +105,18 @@ export function settingsNavGroups(
     label: "Harnesses",
     icon: VectorSquareIcon,
   };
-  const general: SettingsNavItem[] = [
-    { id: "general", label: "General", icon: SettingsIcon },
-    { id: "appearance", label: "Appearance", icon: PaletteIcon },
-    { id: "git", label: "Git", icon: GitBranchIcon },
-    { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
-    { id: "import", label: "Import sessions", icon: DownloadIcon },
-  ];
-  if (!customAgentsEnabled) general.splice(2, 0, harnesses);
-  // Provider credentials and MCP accounts have separate settings pages.
-  if (integrationsEnabled) {
-    general.splice(2, 0, {
-      id: "integrations",
-      label: "Sandbox Integrations",
-      icon: BlocksIcon,
-    });
-  }
-  if (mcpEnabled) {
-    general.splice(2, 0, { id: "mcp", label: "MCP", icon: PlugIcon });
-  }
-  if (hasAuthSession) {
-    // Account leads the group when present — it's the most-visited section
-    // on a deploy with sign-in.
-    general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
-  }
+  // General is core's entry set in the settings.sections slot (coreSlotEntries).
+  const general: SettingsNavItem[] = visibleCoreSettingsSections({
+    hasAuthSession,
+    integrationsEnabled,
+    mcpEnabled,
+    customAgentsEnabled,
+  }).map((entry) => ({
+    id: entry.component,
+    label: entry.label,
+    icon: entry.icon,
+    ...(entry.hideOnMobile ? { hideOnMobile: true } : {}),
+  }));
   const groups: SettingsNavGroup[] = [
     { title: "General", items: general, slot: "settings.sections" },
   ];

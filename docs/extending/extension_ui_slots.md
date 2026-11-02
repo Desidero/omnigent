@@ -38,6 +38,11 @@ placement, icon fallback, accessibility, responsive behavior, and routing.
 core controls. Settings sections are listed at the end of the General group,
 after core's entries. `when` is reserved but not evaluated in V1.
 
+Core's General entries are registered in the same slot by the web app, as
+`core.settings.*` entries with the same shape as extension items. They render
+without the extension catalog, so a catalog failure removes only extension
+items. The `core.` prefix is reserved for them.
+
 Session-scoped links add `conversationId` to the parent route. The browser SDK
 exposes it after activation as `context.invocation.conversationId`; extension
 code never reads the parent URL directly. On hosts without slots,

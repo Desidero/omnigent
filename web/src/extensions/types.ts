@@ -51,10 +51,12 @@ export interface ExtensionProjectSummary {
 export type ExtensionSlotId =
   "chat.header.actions" | "composer.actions" | "session.rightRail.tabs" | "settings.sections";
 
+export type ExtensionSlotKind = "action" | "tab" | "section";
+
 export interface ExtensionSlotItem {
   id: string;
   slot: ExtensionSlotId;
-  kind: "action" | "tab" | "section";
+  kind: ExtensionSlotKind;
   label: string;
   page: string;
   icon: string | null;
