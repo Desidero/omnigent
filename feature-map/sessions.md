@@ -1069,6 +1069,14 @@ plain `uv run pytest`, which starts a private server for the test.
   (`POST /v1/projects`), file six or more sessions into it with
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
+- **Extension UI slots (browser, `tests/e2e_ui` on its own):**
+  `tests/e2e_ui/extensions/test_extension_ui_slots.py` installs the hello-page
+  reference extension as a wheel and checks that its slot items appear only
+  after the operator enables it, that the chat header action opens its page
+  with the session's id, and that its settings section joins General while
+  core settings survive a failed extension catalog. Unit coverage:
+  `web/src/extensions/ExtensionSlot.test.tsx` and
+  `web/src/shell/settingsNav.test.tsx`.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
