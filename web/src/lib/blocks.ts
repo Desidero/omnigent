@@ -1,4 +1,4 @@
-import type { AssistantMessagePhase } from "./conversationItems";
+import type { AssistantMessagePhase, MessageOrigin } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -46,6 +46,8 @@ export interface BlockContext {
   responseId: string;
   itemId: string | null;
   createdBy?: string;
+  /** The automation that sent a user message, when the server did. */
+  origin?: MessageOrigin;
   /** Server-side creation time (unix epoch seconds), when the item came
    *  from history hydration. A DIFFERENT clock from `timestamp` (page-
    *  relative `performance.now()` seconds, live streaming only) — never

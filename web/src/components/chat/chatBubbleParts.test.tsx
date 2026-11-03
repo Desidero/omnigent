@@ -210,6 +210,54 @@ describe("message navigation highlight", () => {
   });
 });
 
+describe("UserBubble automation chip", () => {
+  it("labels a server automation message and drops its framework header", () => {
+    render(
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "user_wake",
+          content: [
+            {
+              type: "input_text",
+              text: "[Automation: Goal loop · on behalf of alice@example.com]\n\nPR #7 failed CI",
+            },
+          ],
+          origin: {
+            kind: "automation",
+            source: "ext:acme.goal-loop",
+            on_behalf_of: "alice@example.com",
+            label: "Goal loop",
+          },
+        }}
+        isLastAssistant={false}
+      />,
+    );
+
+    const chip = screen.getByTestId("message-automation-chip");
+    expect(chip).toHaveTextContent("Automation · Goal loop");
+    expect(chip).toHaveTextContent("on behalf of alice@example.com");
+    expect(screen.getByTestId("message-bubble")).not.toHaveTextContent("[Automation:");
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("PR #7 failed CI");
+  });
+
+  it("leaves a typed message that looks like the header alone", () => {
+    render(
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "user_typed",
+          content: [{ type: "input_text", text: "[Automation: not really]\nhello" }],
+        }}
+        isLastAssistant={false}
+      />,
+    );
+
+    expect(screen.queryByTestId("message-automation-chip")).toBeNull();
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("[Automation: not really]");
+  });
+});
+
 describe("UserBubble literal text", () => {
   it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
     "keeps indented bullets as siblings after stripping %j",

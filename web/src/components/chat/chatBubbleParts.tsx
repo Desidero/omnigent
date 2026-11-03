@@ -14,6 +14,7 @@ import {
 } from "react";
 import {
   ArrowUpIcon,
+  BotIcon,
   CheckIcon,
   ClockIcon,
   CopyIcon,
@@ -65,6 +66,7 @@ import {
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import type { MessageOrigin } from "@/lib/conversationItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
@@ -738,6 +740,32 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
+// The server's one-line framework header on an automation message, which the
+// chip replaces in the bubble: "[Automation: Goal loop · on behalf of alice]".
+const AUTOMATION_HEADER_RE = /^\[Automation: [^\]\n]*\]\n*/;
+
+/** The bubble text without the automation header the chip already shows. */
+export function withoutAutomationHeader(text: string): string {
+  return text.replace(AUTOMATION_HEADER_RE, "");
+}
+
+function AutomationChip({ origin }: { origin: MessageOrigin }) {
+  const name = origin.label ?? origin.source;
+  return (
+    <div
+      className="mb-1 flex max-w-full items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] leading-4 text-muted-foreground"
+      data-testid="message-automation-chip"
+      title={origin.source}
+    >
+      <BotIcon size={12} aria-hidden className="shrink-0" />
+      <span className="shrink-0">Automation · {name}</span>
+      {origin.on_behalf_of && (
+        <span className="min-w-0 truncate">· on behalf of {origin.on_behalf_of}</span>
+      )}
+    </div>
+  );
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
@@ -750,7 +778,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
   const isShellCommand = bubble.shellCommand !== undefined;
-  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const userText = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const text = bubble.origin ? withoutAutomationHeader(userText) : userText;
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
@@ -790,6 +819,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
+        {bubble.origin && <AutomationChip origin={bubble.origin} />}
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
             immediately left of the right-aligned bubble. */}
         <div className="flex w-fit max-w-full items-center gap-1.5">

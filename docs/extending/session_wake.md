@@ -84,7 +84,9 @@ The message text starts with one framework line, for example
 `[Automation: Goal loop · on behalf of alice@example.com]`, so the model does
 not take it as typed by a person. The stored item is attributed to the session
 owner and carries `origin: {kind: "automation", source, on_behalf_of, label}`
-(see [the Sessions API](../../omnigent/server/API.md)).
+(see [the Sessions API](../../omnigent/server/API.md)). The web shows an
+**Automation · <label>** chip above the bubble, followed by "on behalf of" the
+enabler, and hides the header line the chip replaces.
 
 ## Never mid-turn
 
