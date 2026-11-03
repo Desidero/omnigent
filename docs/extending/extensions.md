@@ -29,8 +29,9 @@ trusted Python package -> validated manifest -> server catalog
 - `primary_navigation`: links rendered in the extension-owned slot between
   Inbox and Usage. `order` sorts only within that slot.
 
-Command metadata, activation events, and `when` expressions are validated and
-reserved but are not executed or evaluated in V1. Arbitrary React components,
+Activation events and `when` expressions are validated and reserved but are not
+evaluated in V1. Commands with a `SetState` or `ClearState` action run on the
+server; see [Extension session state](extension_state.md). Arbitrary React components,
 DOM selectors, FastAPI routers, runner tools, and user-installed marketplace
 packages are not supported.
 

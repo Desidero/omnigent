@@ -530,6 +530,15 @@ Fields:
     covering non-host-launched sessions. The in-memory cache is read at
     snapshot time so a client connecting mid-spin-up still sees the spinner.
 
+  published_fields (object, default `{}`)
+    Published state fields of enabled extensions, keyed by extension id
+    then key, e.g. `{"acme.review": {"status": "blocked"}}`. Also on list
+    items. The same values appear in `labels` as read-only
+    `ext.<extension id>.<key>` labels; other labels under the prefix of an
+    installed extension that declares published fields are not returned. Clients cannot write `ext.` labels
+    (`PATCH` and create return `400`). See
+    [Extension session state](../../docs/extending/extension_state.md).
+
 ### Create Session
 
 Two request shapes are accepted.
@@ -1527,6 +1536,28 @@ Updated clients preserve later bubbles when that older server's receipt arrives.
    -> stream emits both response.incomplete (reason:user_interrupt)
       and session.interrupted, then session.status:idle
 ```
+
+### Extension Session State
+
+Installed, operator-enabled extensions can keep state about a session and
+run declared commands on it
+([Extension session state](../../docs/extending/extension_state.md)):
+
+```text
+GET  /v1/sessions/{id}/extensions/{extension_id}/state?after=&limit=
+GET  /v1/sessions/{id}/extensions/{extension_id}/state/{key}
+POST /v1/sessions/{id}/extensions/{extension_id}/commands/{command_id}
+     {"arguments": {"status": "blocked"}, "expected_version": 0}
+-> 200 {"object": "extension_command_result", "command": "acme.review.set-status",
+        "key": "status", "entry": {"key": "status", "value": "blocked", "version": 1, ...},
+        "deleted": false, "published_fields": {"acme.review": {"status": "blocked"}}}
+```
+
+Reads return only keys whose declared visibility the caller's share level
+allows (`readers`/`published` at read, `editors` at edit; `service` keys
+never). Commands need their declared access (edit by default). `404` for an
+unknown or disabled extension, `409` for a version conflict or a key quota.
+`updated_by` is `null` for callers without edit access.
 
 ---
 

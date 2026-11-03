@@ -61,6 +61,10 @@ from omnigent.extensions.assets import (
     build_asset_index,
     parse_dev_bundle_overrides,
 )
+from omnigent.extensions.published_fields import (
+    build_published_field_view,
+    configure_published_fields,
+)
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -96,6 +100,7 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
+from omnigent.server.extension_state import ExtensionStateService
 from omnigent.server.feature_flags import (
     Feature,
     FeatureFlags,
@@ -122,6 +127,7 @@ from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
+from omnigent.server.routes.extension_state import create_extension_state_router
 from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
@@ -1592,6 +1598,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    extension_is_enabled: Callable[[str], bool] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1710,6 +1717,9 @@ def create_app(
     :param feature_flags: Optional immutable release-feature snapshot.
         When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
         enabled set once at application construction.
+    :param extension_is_enabled: The operator's persistent enablement of an
+        extension id, which gates extension session state, commands and
+        published fields. ``None`` enables none of them.
     :param extension_state: Optional pre-resolved installed-extension registry.
         When omitted, entry points are discovered once at application
         construction and the process-cached state is reused thereafter.
@@ -1823,6 +1833,12 @@ def create_app(
         scheduled_task_store.configure_dispatch(automations_v2_enabled)
     resolved_extension_state = _resolve_extension_state(extension_state)
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
+    extension_state_enabled = extension_is_enabled or (lambda _extension_id: False)
+    configure_published_fields(
+        build_published_field_view(
+            resolved_extension_state.manifests, is_enabled=extension_state_enabled
+        )
+    )
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -3842,6 +3858,20 @@ def create_app(
             resolved_extension_state,
             bundles=extension_bundles,
             asset_errors=extension_asset_errors,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
+    )
+    app.include_router(
+        create_extension_state_router(
+            ExtensionStateService(
+                resolved_extension_state,
+                is_enabled=extension_state_enabled,
+                store=conversation_store,
+            ),
+            conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
         ),
