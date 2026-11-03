@@ -3284,6 +3284,77 @@ class SqlAlchemyConversationStore(ConversationStore):
             entries = [self._state_entry(row) for row in rows[:limit]]
         return entries, entries[-1].key if len(rows) > limit else None
 
+    def list_extension_state_sessions(
+        self,
+        extension_id: str,
+        *,
+        key_prefix: str | None = None,
+        after: tuple[int, str] | None = None,
+        limit: int = 100,
+    ) -> list[tuple[int, str]]:
+        """Page sessions holding an extension's state; see :class:`ConversationStore`.
+
+        Reads the extension's rows in ``(workspace, session)`` index order and
+        deduplicates here: ``DISTINCT`` keeps CockroachDB from stopping early.
+        The first read takes two rows per session still wanted; later reads
+        size themselves by the keys per session seen so far (at most
+        ``MAX_STATE_KEYS``), so a page usually takes one or two reads. Each
+        next read starts after the last session seen, so its other keys are
+        skipped; it reads the rest of that workspace, then later workspaces.
+        """
+        validate_extension_id(extension_id)
+        if not 1 <= limit <= _STATE_LIST_MAX_LIMIT:
+            raise ValueError(f"limit must be from 1 to {_STATE_LIST_MAX_LIMIT}")
+        state = SqlExtensionSessionState
+        filters: list[ColumnElement[bool]] = [state.extension_id == extension_id]
+        if key_prefix is not None:
+            filters.append(state.key.startswith(key_prefix, autoescape=True))
+        found: list[tuple[int, str]] = []
+        cursor = after
+        rest_of_workspace = True
+        # Keys per session in sessions read whole, to size the next read.
+        whole_rows = whole_sessions = 0
+        rows_per_session = 1
+        with self._conv_session("list_extension_state_sessions") as session:
+            while len(found) < limit:
+                chunk = min(rows_per_session + 1, MAX_STATE_KEYS) * (limit - len(found))
+                bounds: list[ColumnElement[bool]] = []
+                if cursor is not None and rest_of_workspace:
+                    bounds = [state.workspace_id == cursor[0], state.conversation_id > cursor[1]]
+                elif cursor is not None:
+                    bounds = [state.workspace_id > cursor[0]]
+                rows = session.execute(
+                    select(state.workspace_id, state.conversation_id)
+                    .where(*filters, *bounds)
+                    .order_by(state.workspace_id, state.conversation_id)
+                    .limit(chunk)
+                ).all()
+                runs: list[int] = []
+                last: tuple[int, str] | None = None
+                for workspace_id, conversation_id in rows:
+                    pair = (int(workspace_id), str(conversation_id))
+                    if pair != last:
+                        last = pair
+                        runs.append(0)
+                        if len(found) < limit:
+                            found.append(pair)
+                    runs[-1] += 1
+                # A full read may have cut its last session short.
+                whole = runs[:-1] if len(rows) == chunk else runs
+                whole_rows += sum(whole)
+                whole_sessions += len(whole)
+                rows_per_session = (
+                    -(-whole_rows // whole_sessions) if whole_sessions else MAX_STATE_KEYS
+                )
+                if len(rows) == chunk:
+                    cursor, rest_of_workspace = found[-1], True
+                elif cursor is not None and rest_of_workspace:
+                    # This workspace is done; later workspaces come next.
+                    cursor, rest_of_workspace = (found[-1] if rows else cursor), False
+                else:
+                    break
+        return found
+
     def _put_extension_state(
         self,
         conversation_id: str,

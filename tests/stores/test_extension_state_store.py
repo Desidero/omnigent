@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import uuid
 from collections.abc import Callable
 from typing import Any
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import event, insert, select, update
 
 from omnigent.db.db_models import (
     SqlConversationLabel,
@@ -211,6 +212,155 @@ def test_workspaces_are_isolated(conversation_store: SqlAlchemyConversationStore
     with workspace_scope(7):
         stored = conversation_store.get_extension_state(conv.id, _EXT, "k")
         assert stored is not None and stored.value == b"seven"
+
+
+def _walk_sessions(
+    store: SqlAlchemyConversationStore, *, limit: int, key_prefix: str | None = None
+) -> list[list[tuple[int, str]]]:
+    """Every page in order; fails instead of looping if the cursor stops advancing."""
+    pages: list[list[tuple[int, str]]] = []
+    for _ in range(100):
+        page = store.list_extension_state_sessions(
+            _EXT, key_prefix=key_prefix, after=pages[-1][-1] if pages else None, limit=limit
+        )
+        if not page:
+            return pages
+        assert not pages or page[0] > pages[-1][-1], "the cursor did not advance"
+        pages.append(page)
+    raise AssertionError("paging did not finish within 100 pages")
+
+
+def _seed_dense_sessions(
+    store: SqlAlchemyConversationStore, sessions: int, keys: int
+) -> list[tuple[int, str]]:
+    """Insert state rows directly: ``sessions`` sessions of ``keys`` keys each."""
+    ids = sorted(uuid.uuid4().hex for _ in range(sessions))
+    rows = [
+        {
+            "workspace_id": 0,
+            "conversation_id": conv_id,
+            "extension_id": _EXT,
+            "key": f"k{index:02d}",
+            "value": b"\x01v",
+            "version": 1,
+            "updated_at": 1,
+            "updated_by": None,
+        }
+        for conv_id in ids
+        for index in range(keys)
+    ]
+    with store._conv_engine.begin() as connection:
+        connection.execute(insert(SqlExtensionSessionState.__table__), rows)
+    return [(0, conv_id) for conv_id in ids]
+
+
+@pytest.mark.parametrize("keys", [2, 13, 64])
+def test_a_page_of_dense_sessions_takes_two_reads(
+    conversation_store: SqlAlchemyConversationStore, keys: int
+) -> None:
+    holders = _seed_dense_sessions(conversation_store, 45, keys)
+    statements: list[str] = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        if "extension_session_state" in statement:
+            statements.append(statement)
+
+    pages: list[list[tuple[int, str]]] = []
+    reads: list[int] = []
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", capture)
+    try:
+        for _ in range(3):
+            before = len(statements)
+            pages.append(
+                conversation_store.list_extension_state_sessions(
+                    _EXT, after=pages[-1][-1] if pages else None, limit=20
+                )
+            )
+            reads.append(len(statements) - before)
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", capture)
+
+    assert [pair for page in pages for pair in page] == holders
+    # Full pages take at most two reads; the last also finds the end.
+    assert reads[0] <= 2 and reads[1] <= 2 and reads[2] <= 3, reads
+
+
+def test_sessions_with_state_page_across_workspaces(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    holders: list[tuple[int, str]] = []
+    for workspace_id in (8, 7):
+        with workspace_scope(workspace_id):
+            for key in ("goal.a", "goal.b", "other"):
+                conv = conversation_store.create_conversation()
+                _put(conversation_store, conv.id, key, b"v")
+                if key == "goal.a":
+                    # Two matching keys still list the session once.
+                    _put(conversation_store, conv.id, "goal.c", b"v")
+                if key.startswith("goal"):
+                    holders.append((workspace_id, conv.id))
+            conversation_store._put_extension_state(
+                conversation_store.create_conversation().id, "acme.other", "goal", b"v", max_keys=1
+            )
+
+    found = [
+        pair
+        for page in _walk_sessions(conversation_store, limit=1, key_prefix="goal")
+        for pair in page
+    ]
+
+    assert found == sorted(holders)
+    assert len(conversation_store.list_extension_state_sessions(_EXT)) == 6
+    with pytest.raises(ValueError, match="limit"):
+        conversation_store.list_extension_state_sessions(_EXT, limit=0)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 7])
+def test_sessions_with_many_keys_page_exactly(
+    conversation_store: SqlAlchemyConversationStore, limit: int
+) -> None:
+    holders: list[tuple[int, str]] = []
+    for workspace_id, key_counts in ((4, (64, 1, 3)), (5, (2, 64)), (6, (1,))):
+        with workspace_scope(workspace_id):
+            for count in key_counts:
+                conv_id = conversation_store.create_conversation().id
+                for index in range(count):
+                    _put(conversation_store, conv_id, f"k{index:02d}", b"v")
+                holders.append((workspace_id, conv_id))
+
+    pages = _walk_sessions(conversation_store, limit=limit)
+
+    assert [pair for page in pages for pair in page] == sorted(holders)
+    assert all(len(page) == limit for page in pages[:-1])
+
+
+def test_sessions_with_state_reads_index_ranges(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Each page is at most two range reads on the extension's rows: no OR, no DISTINCT."""
+    with workspace_scope(3):
+        conv = conversation_store.create_conversation()
+        _put(conversation_store, conv.id, "goal", b"v")
+    statements: list[str] = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        if "extension_session_state" in statement:
+            statements.append(" ".join(statement.split()))
+
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", capture)
+    try:
+        page = conversation_store.list_extension_state_sessions(_EXT, after=(3, "0" * 32), limit=5)
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", capture)
+
+    assert page == [(3, conv.id)]
+    assert 1 <= len(statements) <= 2
+    for statement in statements:
+        assert " OR " not in statement.upper()
+        # CockroachDB reads the extension's whole span under DISTINCT ... LIMIT.
+        assert "DISTINCT" not in statement.upper()
+        assert "extension_session_state.extension_id = " in statement
+        assert "LIMIT" in statement.upper()
 
 
 def test_published_value_is_mirrored_as_a_label(
