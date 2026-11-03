@@ -44,6 +44,7 @@ V1; there is no separate enable switch.
 ```bash
 omni extensions list
 omni extensions doctor publisher.extension
+omni extensions legacy-labels <database URL>   # ext. labels from before core reserved them
 ```
 
 A broken extension does not stop healthy extensions or the server. Public

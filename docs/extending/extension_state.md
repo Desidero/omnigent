@@ -34,6 +34,48 @@ under the prefix of an installed extension that declares published fields
 are hidden (see below). Nothing else changes unless such an extension is
 installed; `ext.` labels are read-only either way.
 
+### Labels no extension state backs
+
+Users and policies could once write any label, including ones starting
+with `ext.`, and an uninstalled extension leaves its last mirrored values
+behind. Under an installed extension's prefix such labels are hidden;
+elsewhere they stay visible but can no longer be changed. To find, rename or
+delete them:
+
+```bash
+omni extensions legacy-labels <database URL>                           # report
+omni extensions legacy-labels <database URL> --extension acme.review   # one prefix
+omni extensions legacy-labels <database URL> --rename --commit         # ext.x -> ext-x
+omni extensions legacy-labels <database URL> --delete --commit --yes 12
+```
+
+When uninstalling an extension, remove its session state and everything it
+published once its package is gone:
+
+```bash
+omni extensions legacy-labels <database URL> --extension acme.review --include-state --delete
+omni extensions legacy-labels <database URL> --extension acme.review --include-state \
+  --delete --commit --yes <count from the dry run>
+```
+
+`--include-state` refuses an extension that is still installed. It deletes the
+extension's state rows in every session and workspace, in bounded batches
+along the per-extension index, then the labels under its prefix, mirrors
+included. Without it, labels a state row still backs are kept.
+
+Pass the database that holds session labels (the conversation database
+when it is configured separately), back it up, and run it with the server
+stopped, or limited with `--extension` to an extension that is not
+installed. The command never creates or migrates tables; it stops if the
+database lacks them, and warns if it holds no sessions (the wrong database in a
+split deployment). It reads every label once in bounded batches, across
+workspaces, and leaves labels that mirror extension state with the same
+value alone. It also matches spellings a case- or accent-insensitive
+collation equates with `ext.` (`EXT.`, `éxt.`), and compares rename targets
+the same way: a rename onto a label the session already has in any
+spelling, or two labels renaming onto one, is skipped and reported.
+`--delete --commit` needs `--yes` with the count the dry run listed.
+
 ## Limits
 
 - At most 64 keys per extension per session. A write that would add a 65th
