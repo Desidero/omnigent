@@ -85,6 +85,7 @@ def block_reason(
     harness: str | None,
     turn_active: bool,
     awaiting_turn_end: bool = False,
+    composer_blocker: str | None = None,
     queued: bool,
     approval_pending: bool,
     pane_status: str | None,
@@ -95,6 +96,8 @@ def block_reason(
 
     :param harness: The session's harness, e.g. ``"claude-native"``.
     :param turn_active: The runner is delivering a turn.
+    :param composer_blocker: Why the terminal's composer isn't free (a draft,
+        shell mode, unreadable), when the runner reads it (codex-native).
     :param awaiting_turn_end: The runner delivered a message to the terminal
         and has seen no idle or failed edge since; a terminal's own status can
         lag the prompt it just accepted.
@@ -117,6 +120,8 @@ def block_reason(
         return "running"
     if person_active:
         return "person"
+    if composer_blocker is not None:
+        return f"composer {composer_blocker}"
     if harness not in VERIFIED_NATIVE_HARNESSES and screen_active is not False:
         # Pane output is the only turn evidence these harnesses give.
         return "screen"

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import (
+    ClaudeComposerBusy,
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
     ClaudeTerminalDialog,
@@ -23,6 +24,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.native.next_turn import NEXT_TURN_BUSY_CODE, next_turn_delivery
 
 _REFUSAL = "Answer the pending Claude question or permission request before sending a message."
 _NOT_CLEARED = (
@@ -51,15 +53,20 @@ class _Pane:
         self.pending_polls = pending_polls
         self.dialog_polls = 0
         self.delivered: list[str] = []
+        self.keep_draft: list[bool] = []
+        self.draft_appears = False
         self.deliveries = 0
         self.polls = 0
         self.repaints = 0
         self.kills = 0
 
     def inject_user_message(
-        self, bridge_dir: Path, *, content: str, timeout_s: float = 30.0
+        self, bridge_dir: Path, *, content: str, timeout_s: float = 30.0, keep_draft: bool = False
     ) -> None:
         del bridge_dir, timeout_s
+        self.keep_draft.append(keep_draft)
+        if keep_draft and self.draft_appears:
+            raise ClaudeComposerBusy("Claude's input box is not free (draft)")
         self.deliveries += 1
         if self.refusals:
             refusal = self.refusals.pop(0)
@@ -439,3 +446,73 @@ async def test_a_terminal_dialog_that_awaits_no_answer_is_reported_at_once(
     assert events[0].undelivered is True
     assert pane.deliveries == 1
     assert pane.polls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", [None, "running", "draft", "prompt"])
+async def test_next_turn_only_message_is_refused_while_claude_is_busy(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blocker: str | None
+) -> None:
+    """A session wake is typed only into an idle, empty input box; else the runner holds it."""
+    pane.refusals = []
+    monkeypatch.setattr(claude_native_executor, "next_turn_blocker", lambda _: blocker)
+
+    with next_turn_delivery("next_turn_only"):
+        events = await _run(tmp_path)
+
+    if blocker is None:
+        assert events == [TurnComplete(response=None)]
+        assert pane.delivered == ["hello from the web"]
+    else:
+        [error] = events
+        assert isinstance(error, ExecutorError)
+        assert error.code == NEXT_TURN_BUSY_CODE
+        assert error.undelivered is True
+        assert pane.deliveries == 0
+        assert pane.kills == 0
+
+
+@pytest.mark.asyncio
+async def test_wake_is_typed_without_clearing_and_refused_if_a_draft_appears(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pane.refusals = []
+    monkeypatch.setattr(claude_native_executor, "next_turn_blocker", lambda _: None)
+
+    with next_turn_delivery("next_turn_only"):
+        delivered = await _run(tmp_path)
+        pane.draft_appears = True
+        refused = await _run(tmp_path)
+
+    assert delivered == [TurnComplete(response=None)]
+    assert pane.keep_draft == [True, True]
+    [error] = refused
+    assert isinstance(error, ExecutorError) and error.code == NEXT_TURN_BUSY_CODE
+    assert pane.delivered == ["hello from the web"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        ClaudeTerminalDialog(_DIALOG, awaits_answer=True),
+        True,
+        ClaudeComposerNotCleared("Claude Code's input box did not read clear"),
+    ],
+    ids=["terminal-dialog", "pending-question", "box-not-clear"],
+)
+async def test_a_wake_is_refused_back_to_the_runner_instead_of_held(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refusal: bool | Exception
+) -> None:
+    """The executor's own hold is for a person's message; a wake goes back to the runner."""
+    pane.refusals = [refusal]
+    monkeypatch.setattr(claude_native_executor, "next_turn_blocker", lambda _: None)
+
+    with next_turn_delivery("next_turn_only"):
+        events = await _run(tmp_path)
+
+    [error] = events
+    assert isinstance(error, ExecutorError) and error.code == NEXT_TURN_BUSY_CODE
+    assert error.undelivered is True
+    assert pane.polls == 0, "a wake must not wait in the executor"
+    assert pane.delivered == []

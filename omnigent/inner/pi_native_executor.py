@@ -25,6 +25,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.native.next_turn import delivery_is_next_turn_only
 
 
 class PiNativeExecutor(Executor):
@@ -113,7 +114,9 @@ class PiNativeExecutor(Executor):
             await asyncio.to_thread(self._refresh_auth_headers)
             if model:
                 enqueue_model_change(self._bridge_dir, model)
-            enqueue_user_message(self._bridge_dir, text)
+            enqueue_user_message(
+                self._bridge_dir, text, next_turn_only=delivery_is_next_turn_only()
+            )
         yield TurnComplete(response=None)
 
     def _refresh_auth_headers(self) -> None:

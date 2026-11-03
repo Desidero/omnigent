@@ -215,7 +215,7 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return bool(config) and (Path(config).parent / _INPUT_READY_FILE).is_file()
 
 
-def enqueue_user_message(bridge_dir: Path, content: str) -> str:
+def enqueue_user_message(bridge_dir: Path, content: str, *, next_turn_only: bool = False) -> str:
     """
     Queue a web-originated user message for the resident Pi extension.
 
@@ -225,6 +225,8 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
 
     :param bridge_dir: Native Pi bridge directory.
     :param content: Plain text user message.
+    :param next_turn_only: The extension keeps the message queued while Pi
+        runs a turn and then starts a turn with it, never steering it in.
     :returns: Opaque message id.
     """
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -234,6 +236,8 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
         "content": content,
         "created_at": time.time(),
     }
+    if next_turn_only:
+        payload["next_turn_only"] = True
     _enqueue_payload(bridge_dir, message_id, payload)
     return message_id
 

@@ -727,8 +727,73 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   }
 }
 
+// A session wake (next_turn_only) never steers into a running turn: it stays in
+// the inbox until the agent loop ends, then starts a turn of its own.
+async function testNextTurnOnlyWaitsForTheTurnToEnd() {
+  const h = makeHarness();
+  const sent = [];
+  h.pi.sendUserMessage = (content, options) => sent.push({ content, options });
+  const ctx = makeCtx({ idle: false });
+  await h.handlers.session_start({}, ctx);
+  await h.handlers.agent_start({}, ctx);
+  const wake = path.join(h.inboxDir, "msg-1-wake.json");
+  fs.writeFileSync(
+    wake,
+    JSON.stringify({ id: "w1", type: "user_message", content: "wake", next_turn_only: true }),
+  );
+  fs.writeFileSync(
+    path.join(h.inboxDir, "msg-2-typed.json"),
+    JSON.stringify({ id: "t1", type: "user_message", content: "typed" }),
+  );
+  await sleep(400);
+  assert(
+    "a typed message still steers while the wake waits",
+    sent.length === 1 && sent[0].content === "typed" && sent[0].options.deliverAs === "steer" &&
+      fs.existsSync(wake),
+    JSON.stringify(sent),
+  );
+
+  ctx.isIdle = () => true;
+  await h.handlers.agent_end({ messages: [] }, ctx);
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(wake) && Date.now() < deadline) await sleep(20);
+  assert(
+    "the wake starts the next turn as a follow-up",
+    sent.length === 2 && sent[1].content === "wake" && sent[1].options.deliverAs === "followUp",
+    JSON.stringify(sent),
+  );
+}
+
+// Stopping Pi drops session wakes still waiting in the inbox; a typed
+// message queued alongside is left for normal delivery.
+async function testInterruptDropsWaitingWakes() {
+  const h = makeHarness();
+  const sent = [];
+  h.pi.sendUserMessage = (content, options) => sent.push({ content, options });
+  const ctx = makeCtx({ idle: false });
+  await h.handlers.session_start({}, ctx);
+  await h.handlers.agent_start({}, ctx);
+  const wake = path.join(h.inboxDir, "msg-1-wake.json");
+  fs.writeFileSync(
+    wake,
+    JSON.stringify({ id: "w2", type: "user_message", content: "wake", next_turn_only: true }),
+  );
+  await sleep(300);
+  await deliverInterrupt(h);
+  ctx.isIdle = () => true;
+  await h.handlers.agent_end({ messages: [] }, ctx);
+  await sleep(400);
+  assert(
+    "an interrupt drops a waiting wake instead of starting it afterwards",
+    !fs.existsSync(wake) && sent.length === 0,
+    JSON.stringify(sent),
+  );
+}
+
 (async () => {
   try {
+    await testInterruptDropsWaitingWakes();
+    await testNextTurnOnlyWaitsForTheTurnToEnd();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();

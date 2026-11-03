@@ -4858,11 +4858,19 @@ def create_runner_app(
 
         person_active = False
         screen_active: bool | None = None
+        composer_blocker: str | None = None
+        harness = _session_harness_name(session_id)
         terminals = getattr(resource_registry, "terminal_registry", None)
         if terminals is not None and hasattr(terminals, "native_panes"):
             for conv_id, name, socket_path in terminals.native_panes():
                 if conv_id != session_id:
                     continue
+                if harness == _CODEX_NATIVE_HARNESS and composer_blocker is None:
+                    # Codex delivers through its app-server, which the pane's
+                    # draft doesn't block, so the runner reads the composer.
+                    composer_blocker = await asyncio.to_thread(
+                        _codex_wake_composer_blocker, str(socket_path), "main"
+                    )
                 instance = terminals.get(conv_id, name, "main")
                 if instance is not None:
                     person_active = person_active or instance.client_interaction_within(
@@ -4877,7 +4885,8 @@ def create_runner_app(
                 if input_at is not None and time.time() - input_at < _NEXT_TURN_QUIET_WINDOW_S:
                     person_active = True
         return block_reason(
-            harness=_session_harness_name(session_id),
+            harness=harness,
+            composer_blocker=composer_blocker,
             awaiting_turn_end=_awaiting_native_turn_end(session_id),
             turn_active=not draining
             and (
@@ -4890,6 +4899,14 @@ def create_runner_app(
             person_active=person_active,
             screen_active=screen_active,
         )
+
+    def _codex_wake_composer_blocker(socket_path: str, tmux_target: str) -> str | None:
+        from omnigent.harnesses.codex_native.bridge import (
+            capture_styled_pane,
+            codex_wake_composer_blocker,
+        )
+
+        return codex_wake_composer_blocker(capture_styled_pane(socket_path, tmux_target))
 
     async def _release_next_turn_input(session_id: str, body: dict[str, Any]) -> None:
         """Queue a held message for the ordered drain, which checks the session again."""

@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import stat
 import sys
@@ -114,6 +115,122 @@ def _codex_composer_interactive(pane: str) -> bool:
         composer_text = row[len(_CODEX_COMPOSER_GLYPH) :].strip()
         return composer_text not in _CODEX_DISABLED_COMPOSER_TEXT
     return False
+
+
+_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+_OTHER_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07]*\x07|.)")
+
+
+def _sgr_dim(params: str, dim: bool) -> bool:
+    """Apply one SGR sequence's parameters to the faint (dim) state.
+
+    Colour arguments (``38;5;n``, ``38;2;r;g;b`` and the ``48``/``58``
+    forms) are skipped, so a palette index ``2`` is not mistaken for faint.
+    """
+    codes = (params or "0").split(";")
+    index = 0
+    while index < len(codes):
+        code = codes[index]
+        if code in ("38", "48", "58"):
+            mode = codes[index + 1] if index + 1 < len(codes) else ""
+            index += 3 if mode == "5" else 5 if mode == "2" else 2
+            continue
+        if code in ("", "0", "22"):
+            dim = False
+        elif code == "2":
+            dim = True
+        index += 1
+    return dim
+
+
+def _styled_cells(line: str) -> list[tuple[str, bool]]:
+    """Split a ``capture-pane -e`` row into ``(character, dimmed)`` cells."""
+    cells: list[tuple[str, bool]] = []
+    dim = False
+    index = 0
+    while index < len(line):
+        sgr = _SGR_RE.match(line, index)
+        if sgr is not None:
+            dim = _sgr_dim(sgr.group(1), dim)
+            index = sgr.end()
+            continue
+        other = _OTHER_ESCAPE_RE.match(line, index)
+        if other is not None and line[index] == "\x1b":
+            index = other.end()
+            continue
+        cells.append((line[index], dim))
+        index += 1
+    return cells
+
+
+def codex_wake_composer_blocker(styled_pane: str) -> str | None:
+    """Why Codex's composer can't take a session wake now, or ``None``.
+
+    Codex renders its composer as the last row led by ``›``; an empty one
+    shows a dimmed placeholder (e.g. ``Ask Codex to do anything``) while a
+    person's draft is in normal weight. Only a composer read with no text, or
+    only dimmed placeholder text, and nothing between it and the footer, is
+    free.
+    Shell mode (``!``), an overlay or an unreadable pane all block.
+
+    :param styled_pane: Pane text captured with escapes (``capture-pane -e``).
+    :returns: ``"draft"``, ``"disabled"``, ``"unreadable"`` or ``None``.
+    """
+    rows = styled_pane.splitlines()
+    for index in range(len(rows) - 1, -1, -1):
+        cells = _styled_cells(rows[index])
+        plain = "".join(char for char, _dim in cells)
+        if not plain.lstrip().startswith(_CODEX_COMPOSER_GLYPH):
+            continue
+        start = plain.index(_CODEX_COMPOSER_GLYPH) + len(_CODEX_COMPOSER_GLYPH)
+        text_cells = [cell for cell in cells[start:] if not cell[0].isspace()]
+        text = plain[start:].strip()
+        if text in _CODEX_DISABLED_COMPOSER_TEXT:
+            return "disabled"
+        if any(not dim for _char, dim in text_cells):
+            return "draft"
+        # A draft's further lines (blank ones included) sit between the
+        # composer row and the footer, the last block of non-blank rows.
+        for row in rows[index + 1 : _codex_footer_start(rows, index)]:
+            if any(not char.isspace() for char, _dim in _styled_cells(row)):
+                return "draft"
+        return None
+    return "unreadable"
+
+
+def _codex_footer_start(rows: list[str], composer_index: int) -> int:
+    """Index of the footer: the last block of non-blank rows below the composer.
+
+    :returns: ``len(rows)`` when that block is the composer's own (no footer).
+    """
+    plain = ["".join(char for char, _dim in _styled_cells(row)).strip() for row in rows]
+    end = len(plain)
+    while end > composer_index + 1 and not plain[end - 1]:
+        end -= 1
+    start = end
+    while start > composer_index + 1 and plain[start - 1]:
+        start -= 1
+    if start == composer_index + 1 and end > start:
+        # The rows run straight on from the composer: draft lines, no footer.
+        return len(rows)
+    return start
+
+
+def capture_styled_pane(socket_path: str, tmux_target: str) -> str:
+    """Capture a pane with its styling escapes; ``""`` when the capture fails."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "capture-pane", "-e", "-p", "-t", tmux_target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
 
 
 def codex_terminal_interactive(bridge_dir: Path, pane: str) -> bool:

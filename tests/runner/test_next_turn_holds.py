@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -498,6 +499,46 @@ async def test_taking_back_a_wake_leaves_other_queued_messages(
 
     assert response.json() == {"dropped": 1}
     assert app.state.session_message_buffers[sid] == [typed]
+
+
+class _OnePane:
+    """A terminal registry holding one native pane for a session."""
+
+    def __init__(self, session_id: str, name: str) -> None:
+        self._pane = (session_id, name, Path("/nonexistent/tmux.sock"))
+
+    def native_panes(self) -> list[tuple[str, str, Path]]:
+        return [self._pane]
+
+    def get(self, *_args: Any) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_codex_wake_waits_while_a_draft_sits_in_the_composer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex takes turns over its app-server, so the runner reads the pane's composer."""
+    harness = _scripted_harness()
+    app = _native_app(harness, monkeypatch, name="codex-native")
+    sid = uuid.uuid4().hex
+    registry = app.state.session_resource_registry
+    panes = _OnePane(sid, "codex")
+    monkeypatch.setattr(type(registry), "terminal_registry", property(lambda _self: panes))
+    pane = {"text": "\x1b[1m›\x1b[0m Reply with exactly: DRAFT\n\n  footer"}
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge.capture_styled_pane",
+        lambda *_args: pane["text"],
+    )
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        held = await client.post(f"/v1/sessions/{sid}/events", json=_wake())
+        assert held.json()["status"] == "held"
+        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- no send in window
+        assert harness.posted_bodies == []
+
+        pane["text"] = "\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n  footer"
+        await poll_until_async(lambda: len(harness.posted_bodies) == 1, timeout_s=budget(5))
 
 
 @pytest.mark.asyncio

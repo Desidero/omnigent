@@ -748,6 +748,10 @@ class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
 
+class ClaudeComposerBusy(RuntimeError):
+    """A message that must not disturb a draft found the input box in use; nothing was typed."""
+
+
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
@@ -4375,6 +4379,7 @@ def inject_user_message(
     *,
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    keep_draft: bool = False,
 ) -> None:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
@@ -4429,6 +4434,8 @@ def inject_user_message(
         terminal's process is verifiably alive but still booting (see
         :func:`_wait_for_claude_prompt_ready`), so a slow host connect
         delivers the message late instead of dropping it.
+    :param keep_draft: For a message that must not disturb the person (a
+        session wake): never dismiss a surface or clear a draft; refuse instead.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
@@ -4436,6 +4443,8 @@ def inject_user_message(
         after repeated submit Enters (message not delivered).
     :raises ClaudeInputBoxOccupied: If the input box stays in shell mode or the
         prompt-history search after the reclaim; nothing was typed.
+    :raises ClaudeComposerBusy: With ``keep_draft``, when the input box is not
+        positively empty just before pasting; nothing was typed.
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
@@ -4443,8 +4452,12 @@ def inject_user_message(
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
-    surface = _restore_occupied_input(
-        info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
+    surface = (
+        None
+        if keep_draft
+        else _restore_occupied_input(
+            info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
+        )
     )
     if surface is not None and surface != _OVERLAY_SURFACE:
         # An overlay may be launcher output the readiness gate waits through; a
@@ -4488,7 +4501,14 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=injected_text,
+        needle=needle,
+        keep_draft=keep_draft,
+    )
     if rejection_needle is None:
         return
     if not _unknown_command_rejection_appeared(
@@ -4513,6 +4533,7 @@ def inject_user_message(
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
+        keep_draft=keep_draft,
     )
 
 
@@ -4523,6 +4544,7 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
+    keep_draft: bool = False,
 ) -> None:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
@@ -4556,9 +4578,16 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first, or the paste lands inside the person's draft and
-    # Enter submits both together.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if keep_draft:
+        # Never clear a person's draft for this message: refuse unless the box
+        # is still empty, so the paste can't join anything.
+        blocker = wake_composer_blocker(_capture_pane(socket_path, tmux_target))
+        if blocker is not None:
+            raise ClaudeComposerBusy(f"Claude's input box is not free ({blocker})")
+    else:
+        # Clear stale text first, or the paste lands inside the person's draft
+        # and Enter submits both together.
+        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -6218,6 +6247,118 @@ def _raise_if_user_prompt_pending(
     if _user_prompt_visible(pane):
         delivery_diagnostics.record_pending_prompt("visible_prompt")
         raise ClaudeUserPromptPending(message, nothing_typed=nothing_typed)
+
+
+# Claude Code dims a suggestion such as ``Try "fix lint errors"`` into an empty
+# input box; a pane capture can't tell it from typed text by color.
+_EMPTY_COMPOSER_HINT_PREFIX = 'Try "'
+
+
+def wake_composer_blocker(pane: str) -> str | None:
+    """Why a pane's input box can't take a next-turn-only message, or ``None``.
+
+    Only a box read whole (both rules on screen) and empty, or showing Claude's
+    own suggestion, is free. A draft, any surface occupying the box (shell mode,
+    the prompt-history search, an overlay, a draft taller than the terminal) or
+    a box that can't be read all block: a wake never clears or dismisses what a
+    person left there.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``"surface"``, ``"draft"``, ``"unreadable"`` or ``None``.
+    """
+    if not pane.strip():
+        return "unreadable"
+    if _occupying_surface(pane) is not None:
+        return "surface"
+    box = _composer_box(pane)
+    if box is None or not box.framed:
+        return "unreadable"
+    if any(row.strip() for row in box.rows[1:]):
+        return "draft"
+    text = box.rows[0].strip()[1:].strip()
+    if text and not text.startswith(_EMPTY_COMPOSER_HINT_PREFIX):
+        return "draft"
+    return None
+
+
+def _tmux_pane_pid(socket_path: str, tmux_target: str) -> int | None:
+    """The pid of the process the pane runs (``claude`` on the omnigent launch path)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    fields = proc.stdout.split() if proc.returncode == 0 else []
+    return int(fields[0]) if fields and fields[0].isdigit() else None
+
+
+def _claude_reports_turn(bridge_dir: Path, socket_path: str, tmux_target: str) -> bool:
+    """Whether Claude's own status file says a turn (or a dialog) is running.
+
+    Looks the file up by every live process the registry names for the
+    session and by the pane's pid, so a long turn whose file has not been
+    rewritten lately is still found.
+    """
+    from omnigent.harnesses.claude_native.status_file import (
+        RUNNING,
+        read_session_status,
+        resolve_status_file,
+        session_pids,
+    )
+
+    claude_session_id = read_claude_session_id(bridge_dir)
+    pids = session_pids(claude_session_id) if claude_session_id is not None else []
+    pane_pid = _tmux_pane_pid(socket_path, tmux_target)
+    for pid in dict.fromkeys([*pids, *([pane_pid] if pane_pid is not None else [])]):
+        path = resolve_status_file(pane_pid=pid, expected_session_id=claude_session_id)
+        status = read_session_status(path) if path is not None else None
+        if status is not None and status.runner_status == RUNNING:
+            return True
+    return False
+
+
+def next_turn_blocker(bridge_dir: Path) -> str | None:
+    """Why Claude can't take a message as a turn of its own right now, or ``None``.
+
+    Read under the executor's injection lock just before a next-turn-only
+    message would be typed: a pending question, a dialog only the terminal
+    shows (:func:`terminal_dialog_pending`), a running turn (Claude's own status
+    file) or anything but a positively empty input box keeps it waiting. A box
+    hidden by stray output is repainted once and read again. A wake never waits
+    inside the executor for any of these, as a person's message does; the
+    runner holds it instead.
+
+    :param bridge_dir: The session's native bridge directory.
+    :returns: ``"prompt"``, ``"dialog"``, ``"running"``, a
+        :func:`wake_composer_blocker` reason, ``"unreadable"`` when the
+        terminal isn't advertised, or ``None``.
+    """
+    if has_pending_user_prompt(bridge_dir):
+        return "prompt"
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return "unreadable"
+    if _claude_reports_turn(bridge_dir, socket_path, tmux_target):
+        return "running"
+    pane = _capture_pane(socket_path, tmux_target)
+    if _terminal_dialog_headline(pane) is not None:
+        return "dialog"
+    blocker = wake_composer_blocker(pane)
+    if blocker == "unreadable" and _request_claude_repaint(socket_path, tmux_target, bridge_dir):
+        # Output another process printed over the box hides it; a repaint (as
+        # the human path uses) restores the real box without touching a draft.
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        blocker = wake_composer_blocker(_capture_pane(socket_path, tmux_target))
+    return blocker
 
 
 def has_pending_user_prompt(bridge_dir: Path) -> bool:
