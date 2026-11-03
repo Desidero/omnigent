@@ -17,7 +17,6 @@ import logging
 from dataclasses import replace
 from typing import Any
 
-from omnigent.extensions.labels import active_label_policy
 from omnigent.extensions.published_fields import published_field_view
 from omnigent.extensions.state_keys import is_extension_label
 from omnigent.llms.context_window import ModelPricing, compute_llm_cost
@@ -578,9 +577,8 @@ class PolicyEngine:
           the new value is not in it.
 
         Keys with no ``LabelDef`` are set freely (omnigent
-        parity — "unschema'd labels set freely"), except keys in an
-        installed extension's ``ext.<id>.`` namespace, which must match
-        its declaration. The engine
+        parity — "unschema'd labels set freely"), except keys in the
+        core-owned ``ext.`` namespace, which are always dropped. The engine
         applies the filtered dict in a single UPSERT through
         the store so either every surviving write lands or
         none do.
@@ -593,29 +591,6 @@ class PolicyEngine:
         if not set_labels:
             return
         filtered = self._filter_schema_valid(set_labels)
-        # Extension-declared labels accept only their declared values here too;
-        # an empty value deletes one, as a client PATCH does.
-        extension_labels = active_label_policy()
-        rejected = extension_labels.rejected_keys(filtered)
-        if rejected:
-            _logger.debug(
-                "dropping policy label writes outside their extension declaration on %s: %s",
-                self._conversation_id,
-                ", ".join(sorted(rejected)),
-            )
-        cleared = [
-            key
-            for key, value in filtered.items()
-            if value == "" and extension_labels.declares(key) and key not in rejected
-        ]
-        for key in cleared:
-            self._store.delete_label(self._conversation_id, key)
-            self._labels.pop(key, None)
-        filtered = {
-            key: value
-            for key, value in filtered.items()
-            if key not in rejected and key not in cleared
-        }
         if not filtered:
             return
         try:

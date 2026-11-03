@@ -203,7 +203,9 @@ class ExtensionStateService:
         ``max_length``, as for commands.
 
         :raises ExtensionStateUnavailableError: The extension is not enabled.
-        :raises ValueError: The value does not fit the key's declaration.
+        :raises ValueError: The value does not fit the key's declaration, or
+            the key's published field lists its values and this is not one of
+            them.
         """
         manifest = self.manifest(extension_id)
         declared = field_for(manifest.state, key)
@@ -215,6 +217,14 @@ class ExtensionStateService:
             if len(text) > (declared.max_length or 0):
                 raise ValueError(
                     f"value for published field {key!r} is longer than {declared.max_length}"
+                )
+        # Session rows show only listed values, so server code writes only those.
+        if declared is not None and declared.values:
+            if value.decode("utf-8", errors="replace") not in {
+                item.value for item in declared.values
+            }:
+                raise ValueError(
+                    f"value is not one of the values declared for field {declared.key!r}"
                 )
         return self._store._put_extension_state(
             conversation_id,

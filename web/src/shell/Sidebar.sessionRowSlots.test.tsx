@@ -1,6 +1,7 @@
 // Session-row slots in the sidebar: core's Shared decoration and read-state
-// pair, plus an extension's label badge and set-label menu, gated on the
-// viewer's edit access. Only the data hooks and the network are mocked.
+// pair, plus an extension's published-field badge and command menu, with
+// commands disabled for viewers who lack their access. Only the data hooks
+// and the network are mocked.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -30,18 +31,18 @@ vi.mock("@/components/ui/toast", async (importOriginal) => ({
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
-import type { ExtensionCatalogItem, ExtensionSlotItem } from "@/extensions/types";
+import type { ExtensionCatalogItem, ExtensionCommand, ExtensionSlotItem } from "@/extensions/types";
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { Sidebar } from "./Sidebar";
 
-const KEY = "ext.acme.status.status";
+const EXT = "acme.status";
 
 function rowItem(id: string, slot: ExtensionSlotItem["slot"], kind: ExtensionSlotItem["kind"]) {
   return {
-    id: `acme.status.${id}`,
+    id: `${EXT}.${id}`,
     slot,
     kind,
     label: "Status",
@@ -49,37 +50,70 @@ function rowItem(id: string, slot: ExtensionSlotItem["slot"], kind: ExtensionSlo
     icon: null,
     order: 500,
     when: null,
-    binding: { source: "label" as const, key: KEY },
   };
 }
 
+const SET: ExtensionCommand = {
+  id: `${EXT}.set`,
+  title: "Set status",
+  arguments: [{ name: "status", choices: ["blocked", "done"], pattern: null, max_length: 64 }],
+  required_access: "edit",
+  confirm: null,
+  action: { type: "set_state", field: "status", value: "{status}" },
+};
+const CLEAR: ExtensionCommand = {
+  id: `${EXT}.clear`,
+  title: "Clear status",
+  arguments: [],
+  required_access: "edit",
+  confirm: null,
+  action: { type: "clear_state", field: "status", value: null },
+};
+
 const STATUS_EXTENSION: ExtensionCatalogItem = {
   object: "extension",
-  id: "acme.status",
+  id: EXT,
   display_name: "Status",
   distribution: "acme-status",
   version: "1.0.0",
   extension_api: 1,
   status: "enabled",
-  permissions: ["sessions.labels.write"],
+  permissions: [],
   pages: [],
   primary_navigation: [],
   slot_items: [
-    rowItem("badge", "session.row.decorations", "decoration"),
-    { ...rowItem("menu", "session.row.menu", "set-label"), clear_label: "Clear status" },
-  ],
-  labels: [
     {
-      key: KEY,
-      title: "Status",
+      ...rowItem("badge", "session.row.decorations", "decoration"),
+      binding: { source: "published_field", key: "status" },
+    },
+    {
+      ...rowItem("menu", "session.row.menu", "command"),
+      command: SET.id,
+      clear_command: CLEAR.id,
+    },
+  ],
+  state_fields: [
+    {
+      key: "status",
+      visibility: "published",
+      max_length: 16,
       values: [
         { value: "blocked", label: "Blocked", icon: "octagon-alert", tone: "danger" },
         { value: "done", label: "Done", icon: "circle-check", tone: "success" },
       ],
     },
   ],
+  commands: [SET, CLEAR],
   browser: { declared: false, has_styles: false, digest: null, script_url: null, style_url: null },
 };
+
+function withCommands(...commands: ExtensionCommand[]): ExtensionCatalogItem {
+  return { ...STATUS_EXTENSION, commands };
+}
+
+function status(value: string): Partial<Conversation> {
+  return { published_fields: { [EXT]: { status: value } } };
+}
 
 function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   return {
@@ -122,10 +156,24 @@ function showAllSessions() {
   fireEvent.click(screen.getByTestId("session-filter-all"));
 }
 
-function patches(): [string, RequestInit][] {
+function posts(): [string, RequestInit][] {
   return authenticatedFetchMock.mock.calls.filter(
     (call): call is [string, RequestInit] =>
-      (call[1] as RequestInit | undefined)?.method === "PATCH",
+      (call[1] as RequestInit | undefined)?.method === "POST",
+  );
+}
+
+function commandResponse(value: string | null): Response {
+  return new Response(
+    JSON.stringify({
+      object: "extension_command_result",
+      command: SET.id,
+      key: "status",
+      entry: null,
+      deleted: value === null,
+      published_fields: value === null ? {} : { [EXT]: { status: value } },
+    }),
+    { status: 200 },
   );
 }
 
@@ -135,9 +183,7 @@ function row(id: string): HTMLElement {
 
 function openStatusMenu(id: string) {
   fireEvent.pointerDown(within(row(id)).getByTestId("conversation-actions"), { button: 0 });
-  fireEvent.keyDown(screen.getByTestId("session-row-menu-acme.status.menu"), {
-    key: "ArrowRight",
-  });
+  fireEvent.keyDown(screen.getByTestId(`session-row-menu-${EXT}.menu`), { key: "ArrowRight" });
 }
 
 beforeEach(() => {
@@ -148,12 +194,12 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("session-row decorations", () => {
-  it("follows core's Shared entry with the declared value as text and icon", () => {
+  it("follows core's Shared entry with the published value as text and icon", () => {
     renderSidebar([
       conv("shared_row", {
         owner: "other@example.com",
         permission_level: 1,
-        labels: { [KEY]: "blocked" },
+        ...status("blocked"),
       }),
     ]);
     showAllSessions();
@@ -168,71 +214,91 @@ describe("session-row decorations", () => {
     expect(screen.getByRole("link", { name: /shared_row/ })).toHaveClass("pr-14");
   });
 
-  it.each<Record<string, string>>([
+  it.each<Partial<Conversation>>([
     {},
-    { [KEY]: "" },
-    { [KEY]: "bogus" },
-    { [KEY]: "constructor" },
-  ])("renders nothing for an absent, empty or undeclared value: %j", (labels) => {
-    renderSidebar([conv("own_row", { labels })]);
+    status(""),
+    status("bogus"),
+    status("constructor"),
+    { published_fields: { "acme.other": { status: "done" } } },
+    // A label alone is not a published field.
+    { labels: { [`ext.${EXT}.status`]: "done" } },
+  ])("renders nothing for an absent, empty or unlisted value: %j", (partial) => {
+    renderSidebar([conv("own_row", partial)]);
     expect(within(row("own_row")).queryByTestId("session-row-decorations")).toBeNull();
   });
 
   it("renders no extension items without the catalog", () => {
-    renderSidebar([conv("own_row", { labels: { [KEY]: "done" } })], []);
+    renderSidebar([conv("own_row", status("done"))], []);
     expect(within(row("own_row")).queryByRole("img")).toBeNull();
   });
 });
 
 describe("session-row menu", () => {
-  it("lists declared values after core's read-state entry and writes the choice", async () => {
-    authenticatedFetchMock.mockResolvedValue(new Response("{}", { status: 200 }));
-    renderSidebar([conv("own_row", { labels: { [KEY]: "blocked" } })]);
+  it("lists the command's choices after core's read-state entry and runs one", async () => {
+    authenticatedFetchMock.mockResolvedValue(commandResponse("done"));
+    renderSidebar([conv("own_row", status("blocked"))]);
 
     openStatusMenu("own_row");
     const items = screen.getAllByRole("menuitem").map((item) => item.dataset.testid);
     expect(items.indexOf("mark-unread-conversation")).toBeLessThan(
-      items.indexOf("session-row-menu-acme.status.menu"),
+      items.indexOf(`session-row-menu-${EXT}.menu`),
     );
-    const blocked = screen.getByTestId("session-row-label-acme.status.menu-blocked");
+    const blocked = screen.getByTestId(`session-row-command-${EXT}.menu-blocked`);
     expect(blocked).toHaveAttribute("role", "menuitemradio");
     expect(blocked).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByTestId("session-row-label-acme.status.menu-done")).toHaveAttribute(
+    expect(screen.getByTestId(`session-row-command-${EXT}.menu-done`)).toHaveAttribute(
       "aria-checked",
       "false",
     );
-    // Value icons carry their tone; Clear uses the item's own wording.
+    // Choices carry their field value's tone; the clear entry is its command's title.
     expect(blocked.querySelector("svg")).toHaveClass("text-status-red!");
-    expect(screen.getByTestId("session-row-label-acme.status.menu-clear")).toHaveTextContent(
+    expect(screen.getByTestId(`session-row-command-${EXT}.menu-clear`)).toHaveTextContent(
       "Clear status",
     );
 
-    fireEvent.click(screen.getByTestId("session-row-label-acme.status.menu-done"));
-    await waitFor(() => expect(patches()).toHaveLength(1));
-    expect(patches()[0][0]).toBe("/v1/sessions/own_row");
-    expect(patches()[0][1].body).toBe(JSON.stringify({ labels: { [KEY]: "done" } }));
+    fireEvent.click(screen.getByTestId(`session-row-command-${EXT}.menu-done`));
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe(`/v1/sessions/own_row/extensions/${EXT}/commands/${SET.id}`);
+    expect(posts()[0][1].body).toBe(JSON.stringify({ arguments: { status: "done" } }));
   });
 
-  it("clears with an empty value, and Clear is disabled with nothing set", async () => {
-    authenticatedFetchMock.mockResolvedValue(new Response("{}", { status: 200 }));
-    renderSidebar([conv("set_row", { labels: { [KEY]: "done" } }), conv("unset_row")]);
+  it("runs the clear command, which is disabled with nothing set", async () => {
+    authenticatedFetchMock.mockResolvedValue(commandResponse(null));
+    renderSidebar([conv("unset_row")]);
 
     openStatusMenu("unset_row");
-    expect(screen.getByTestId("session-row-label-acme.status.menu-clear")).toHaveAttribute(
+    expect(screen.getByTestId(`session-row-command-${EXT}.menu-clear`)).toHaveAttribute(
       "aria-disabled",
       "true",
     );
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     cleanup();
 
-    renderSidebar([conv("set_row", { labels: { [KEY]: "done" } })]);
+    renderSidebar([conv("set_row", status("done"))]);
     openStatusMenu("set_row");
-    fireEvent.click(screen.getByTestId("session-row-label-acme.status.menu-clear"));
-    await waitFor(() => expect(patches()).toHaveLength(1));
-    expect(patches()[0][1].body).toBe(JSON.stringify({ labels: { [KEY]: "" } }));
+    fireEvent.click(screen.getByTestId(`session-row-command-${EXT}.menu-clear`));
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe(`/v1/sessions/set_row/extensions/${EXT}/commands/${CLEAR.id}`);
+    expect(posts()[0][1].body).toBe(JSON.stringify({ arguments: {} }));
   });
 
-  it("toasts when the server refuses the write", async () => {
+  it("asks first when the command declares a confirm prompt", async () => {
+    authenticatedFetchMock.mockResolvedValue(commandResponse("done"));
+    renderSidebar(
+      [conv("own_row")],
+      [withCommands({ ...SET, confirm: "Mark this session done?" }, CLEAR)],
+    );
+
+    openStatusMenu("own_row");
+    fireEvent.click(screen.getByTestId(`session-row-command-${EXT}.menu-done`));
+    expect(await screen.findByText("Mark this session done?")).toBeInTheDocument();
+    expect(posts()).toHaveLength(0);
+
+    fireEvent.click(screen.getByTestId("extension-command-confirm"));
+    await waitFor(() => expect(posts()).toHaveLength(1));
+  });
+
+  it("toasts when the server refuses the command", async () => {
     authenticatedFetchMock.mockImplementation(
       async () =>
         new Response(JSON.stringify({ error: { message: "Access denied" } }), { status: 403 }),
@@ -240,23 +306,23 @@ describe("session-row menu", () => {
     renderSidebar([conv("own_row")]);
 
     openStatusMenu("own_row");
-    fireEvent.click(screen.getByTestId("session-row-label-acme.status.menu-blocked"));
+    fireEvent.click(screen.getByTestId(`session-row-command-${EXT}.menu-blocked`));
 
     await waitFor(() =>
-      expect(showToastMock).toHaveBeenCalledWith("Couldn't update Status: Access denied"),
+      expect(showToastMock).toHaveBeenCalledWith("Couldn't run Set status: Access denied"),
     );
   });
 
   it.each([
-    [1, false],
-    [2, true],
-    [3, true],
-  ])("offers the menu to a sharee at level %s: %s", (level, offered) => {
+    [1, true],
+    [2, false],
+    [3, false],
+  ])("disables edit commands for a sharee at level %s: %s", (level, disabled) => {
     renderSidebar([
       conv("shared_row", {
         owner: "other@example.com",
         permission_level: level,
-        labels: { [KEY]: "done" },
+        ...status("done"),
       }),
     ]);
     showAllSessions();
@@ -264,16 +330,39 @@ describe("session-row menu", () => {
     expect(within(row("shared_row")).getByRole("img", { name: "Status: Done" })).toBeTruthy();
 
     fireEvent.contextMenu(screen.getByRole("link", { name: /shared_row/ }));
-    expect(screen.queryByTestId("session-row-menu-acme.status.menu") !== null).toBe(offered);
+    const trigger = screen.getByTestId(`session-row-menu-${EXT}.menu`);
+    expect(trigger.getAttribute("aria-disabled") === "true").toBe(disabled);
   });
 
-  it("drops a set-label item whose extension lacks the write permission", () => {
-    renderSidebar([conv("own_row")], [{ ...STATUS_EXTENSION, permissions: [] }]);
+  it("runs a command without arguments as a plain entry, open to readers when it says so", async () => {
+    authenticatedFetchMock.mockResolvedValue(commandResponse(null));
+    const stop = { ...CLEAR, id: `${EXT}.stop`, title: "Stop", required_access: "read" as const };
+    renderSidebar(
+      [conv("shared_row", { owner: "other@example.com", permission_level: 1 })],
+      [
+        {
+          ...withCommands(stop),
+          slot_items: [{ ...rowItem("menu", "session.row.menu", "command"), command: stop.id }],
+        },
+      ],
+    );
+    showAllSessions();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /shared_row/ }));
+    const entry = screen.getByTestId(`session-row-menu-${EXT}.menu`);
+    expect(entry).not.toHaveAttribute("aria-disabled");
+    fireEvent.click(entry);
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe(`/v1/sessions/shared_row/extensions/${EXT}/commands/${stop.id}`);
+  });
+
+  it("drops an item whose command the catalog doesn't list", () => {
+    renderSidebar([conv("own_row")], [withCommands(CLEAR)]);
 
     fireEvent.pointerDown(within(row("own_row")).getByTestId("conversation-actions"), {
       button: 0,
     });
     expect(screen.getByTestId("mark-unread-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("session-row-menu-acme.status.menu")).toBeNull();
+    expect(screen.queryByTestId(`session-row-menu-${EXT}.menu`)).toBeNull();
   });
 });

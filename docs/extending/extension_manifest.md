@@ -78,12 +78,9 @@ def get_manifest() -> ExtensionManifest:
 - Browser paths are fixed to `dist/extension.js` and optional
   `dist/extension.css` inside the entry point's verified import package.
 - Slot items use a supported slot/kind pairing, reference a page owned by the
-  same extension (or, for session-row kinds, bind one of its declared labels),
-  stay within each slot's per-extension limit, and cannot reorder core UI.
-- Declared `labels` use keys under `ext.<extension id>.`, approved icons and
-  known tones; a `set-label` item requires the `sessions.labels.write`
-  permission. See
-  [Extension UI slots](extension_ui_slots.md).
+  same extension (session-row items bind one of its published fields or name
+  one of its commands instead), stay within each slot's per-extension limit,
+  and cannot reorder core UI. See [Extension UI slots](extension_ui_slots.md).
 - Built-ins are reserved. All community extensions participating in a collision
   are disabled deterministically.
 - One invalid field rejects the whole extension; one rejected extension does not
@@ -165,6 +162,11 @@ commands = (
   extension's server code.
 - `confirm` is a prompt for clients to show before running the command; the
   server does not enforce it.
+- A published field may list its `values` (1 to 12): a lowercase slug within
+  `max_length`, a display label, an approved icon and a tone each, which
+  session-row badges need. Commands may then write only listed values (a
+  listed literal, or a single `{argument}` whose `choices` are all listed), and
+  the extension's server code is held to the list too.
 
 See [Extension session state](extension_state.md) for storage limits, access
 rules and the HTTP API.

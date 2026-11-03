@@ -96,14 +96,6 @@ export interface ExtensionContext {
     get(sessionId: string): Promise<ExtensionSessionSummary | null>;
     /** The pull request filed from a session's branch, if any. */
     pullRequest(sessionId: string): Promise<ExtensionPullRequest | null>;
-    /**
-     * Ordinary session labels this extension declares, written as the viewer.
-     * The server applies the viewer's edit access and the declared values.
-     */
-    labels: {
-      set(sessionId: string, key: string, value: string): Promise<void>;
-      clear(sessionId: string, key: string): Promise<void>;
-    };
   };
   projects: {
     list(): Promise<ExtensionProjectSummary[]>;
@@ -305,14 +297,6 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
         request<ExtensionPullRequest | null>("sessions.pullRequest", {
           sessionId,
         }),
-      labels: {
-        async set(sessionId, key, value) {
-          await request("sessions.labels.set", { sessionId, key, value });
-        },
-        async clear(sessionId, key) {
-          await request("sessions.labels.clear", { sessionId, key });
-        },
-      },
     },
     projects: {
       list: () => request<ExtensionProjectSummary[]>("projects.list", {}),

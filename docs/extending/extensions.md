@@ -29,14 +29,17 @@ trusted Python package -> validated manifest -> server catalog
 - `primary_navigation`: links rendered in the extension-owned slot between
   Inbox and Usage. `order` sorts only within that slot.
 - `slot_items`: core-rendered, page-backed links in four semantic UI locations,
-  and label-bound items on sidebar session rows. See
-  [Extension UI slots](extension_ui_slots.md).
-- `labels`: ordinary session labels whose keys and values the extension
-  declares, for its session-row items and its pages to write.
+  and items on sidebar session rows that show a published state field or run
+  a command. See [Extension UI slots](extension_ui_slots.md).
+- `state` and `commands`: what the extension keeps about a session, who may
+  read it, and the commands users run to change it. Published fields are
+  mirrored as read-only `ext.<extension id>.<key>` labels; nothing else,
+  pages included, writes `ext.` labels. See
+  [Extension session state](extension_state.md).
 
 Activation events and `when` expressions are validated and reserved but are not
 evaluated in V1. Commands with a `SetState` or `ClearState` action run on the
-server; see [Extension session state](extension_state.md). Arbitrary React components,
+server. Arbitrary React components,
 DOM selectors, FastAPI routers, runner tools, and user-installed marketplace
 packages are not supported.
 

@@ -1,8 +1,9 @@
 # Extension UI slots
 
 UI slots are stable semantic locations where Omnigent renders a small,
-declarative item: a link to an extension-owned page, or a session-row item bound
-to a label the extension declares. Extensions do not receive DOM,
+declarative item: a link to an extension-owned page, or a session-row item that
+shows one of the extension's published state fields or runs one of its
+commands. Extensions do not receive DOM,
 CSS-selector, React-component, or arbitrary HTML injection access.
 
 | Slot | Kind | Limit | Context |
@@ -11,9 +12,9 @@ CSS-selector, React-component, or arbitrary HTML injection access.
 | `composer.actions` | `action` | 2 | Current `conversationId` in an existing session |
 | `session.rightRail.tabs` | `tab` | 2 | Current `conversationId` |
 | `settings.sections` | `section` | 3 | No session context; stays inside the settings route family |
-| `session.row.decorations` | `decoration` | 1 | A sidebar session row; binds a declared label |
-| `session.row.menu` | `set-label` | 1 | A sidebar session row; binds a declared label |
-| `session.row.hover` | `row` | 1 | A sidebar session row; binds a declared label |
+| `session.row.decorations` | `decoration` | 1 | A sidebar session row; binds a published field |
+| `session.row.menu` | `command` | 1 | A sidebar session row; names a command |
+| `session.row.hover` | `row` | 1 | A sidebar session row; binds a published field |
 
 The limit is per extension and slot; a manifest over it is rejected like any
 other invalid field.
@@ -64,18 +65,26 @@ persistence semantics.
 ## Session rows
 
 The three `session.row.*` slots render on every session row in the sidebar.
-Their items have no page and run no extension code: each binds a label the
-extension declares, and core draws it from the manifest.
+Their items have no page and run no extension code: core draws them from the
+manifest and the session's `published_fields`, and runs the extension's
+declared commands through the server. See
+[Extension session state](extension_state.md) for fields and commands.
 
 | Kind | What core renders |
 | --- | --- |
-| `decoration` | The current value's icon, in its tone, after core's "Shared with you" icon. Its accessible name and tooltip are `<item label>: <value label>`. |
-| `set-label` | A submenu in the row's menu and right-click menu, after core's Mark as read / Mark as unread, listing the declared values (the current one checked) and a clear entry (`clear_label`, or "Clear"). On phones it replaces the menu body, with a Back row. |
-| `row` | A `<item label>: <value label>` line in the row's tooltip, in the tooltip of either `sidebar_grouping_ui` state. Tooltips are desktop-only, so phones show the value through the badge alone. |
+| `decoration` | The bound field's current value as its listed icon, in its tone, after core's "Shared with you" icon. Its accessible name and tooltip are `<item label>: <value label>`. The field must list its `values`. |
+| `command` | An entry in the row's menu and right-click menu, after core's Mark as read / Mark as unread. A command without arguments is a plain entry that runs it. A command with one `choices` argument opens a submenu of the choices, then `clear_command`'s title if set; on phones it replaces the menu body, with a Back row. |
+| `row` | A `<item label>: <value>` line in the row's tooltip, in the tooltip of either `sidebar_grouping_ui` state: the value's listed label and icon, or the field's text when it lists no values. Tooltips are desktop-only, so phones show the value through the badge alone. |
 
-Nothing renders for an absent, empty or undeclared value. A row shows items from
-at most two extensions per slot. An item's `icon`, if set, must be an approved
-icon; core draws these without a fallback.
+Nothing renders for an absent or empty field, and a badge shows nothing for an
+unlisted value. A row shows items from at most two extensions per slot. An
+item's `icon`, if set, must be an approved icon; core draws these without a
+fallback.
+
+When a command writes the bare argument (`value="{status}"`) to a published
+field that lists its values, its choices show those values' labels, icons and
+tones, and the current one is checked; the clear entry is disabled while the
+field is unset. Otherwise choices show as their text.
 
 Core's own entries in these slots ("Shared with you", and the Mark as read /
 Mark as unread pair) go through the same resolver as extension items: core's
@@ -83,36 +92,58 @@ entries first, then extension items, each by `order` and then id. Core entries
 carry a visibility check the web app evaluates; extension items don't, and
 `when` stays unevaluated.
 
-The set-label menu needs the `sessions.labels.write` permission and appears only
-to viewers with edit access to the session (owners, editors and managers). Viewers
-with read access see decorations and tooltip rows but no menu.
+Commands run as the viewer. Every viewer sees the menu entry, but it is
+disabled for viewers without the command's `required_access` (edit by
+default), and the server refuses them anyway. A sub-agent session's access can
+come from its parent session, so core leaves its entries enabled and lets the
+server decide. A command's `confirm` text is
+shown in a dialog before it runs; the server does not enforce it. The command's
+response carries the session's published fields, so the row repaints at once;
+other open clients show the change when the session-updates stream next sends
+the row, or on their next fetch of the list.
 
 ```python
 from omnigent.extensions import (
-    ExtensionPermission,
-    LabelBinding,
-    LabelDeclaration,
-    LabelTone,
-    LabelValue,
+    ClearState,
+    CommandArgument,
+    CommandContribution,
+    FieldBinding,
+    FieldTone,
+    FieldValue,
+    SetState,
     SlotId,
     SlotItemContribution,
     SlotItemKind,
+    StateContribution,
+    StateField,
+    StateVisibility,
 )
-
-STATUS = "ext.acme.status.status"
 
 ExtensionManifest(
     id="acme.status",
     # ...
-    permissions=frozenset({ExtensionPermission.SESSIONS_LABELS_WRITE}),
-    labels=(
-        LabelDeclaration(
-            key=STATUS,
-            title="Status",
-            values=(
-                LabelValue("blocked", "Blocked", "octagon-alert", LabelTone.DANGER),
-                LabelValue("done", "Done", "circle-check", LabelTone.SUCCESS),
+    state=StateContribution(
+        fields=(
+            StateField(
+                "status",
+                StateVisibility.PUBLISHED,
+                max_length=16,
+                values=(
+                    FieldValue("blocked", "Blocked", "octagon-alert", FieldTone.DANGER),
+                    FieldValue("done", "Done", "circle-check", FieldTone.SUCCESS),
+                ),
             ),
+        ),
+    ),
+    commands=(
+        CommandContribution(
+            id="acme.status.set",
+            title="Set status",
+            action=SetState(key="status", value="{status}"),
+            arguments=(CommandArgument("status", choices=("blocked", "done")),),
+        ),
+        CommandContribution(
+            id="acme.status.clear", title="Clear status", action=ClearState("status")
         ),
     ),
     slot_items=(
@@ -121,40 +152,54 @@ ExtensionManifest(
             slot=SlotId.SESSION_ROW_DECORATIONS,
             kind=SlotItemKind.DECORATION,
             label="Status",
-            binding=LabelBinding(STATUS),
+            binding=FieldBinding("status"),
         ),
         SlotItemContribution(
             id="acme.status.menu",
             slot=SlotId.SESSION_ROW_MENU,
-            kind=SlotItemKind.SET_LABEL,
+            kind=SlotItemKind.COMMAND,
             label="Status",
-            binding=LabelBinding(STATUS),
+            command="acme.status.set",
+            clear_command="acme.status.clear",
         ),
     ),
 )
 ```
 
-## Declared labels
+Field values use approved icons (`circle-check`, `circle-ellipsis`,
+`dashboard`, `eye`, `list-checks`, `octagon-alert`, `panels-top-left`,
+`puzzle`, `search`, `square-parking`), since the icon carries the value's
+meaning, and tones (`neutral`, `info`, `success`, `warning`, `danger`) that
+map to core's status colours, so values never rely on colour alone.
 
-A declared label is an ordinary session label whose key and values an extension
-declares, not extension-owned state:
+Published fields are extension state, not ordinary labels: their
+`ext.<extension id>.<key>` mirrors are read-only, and only the extension's
+commands (or its server code) change them. They stop rendering, and are hidden
+from responses and policies, while the extension is installed but not
+enabled.
 
-- The key is `ext.<extension id>.<name>`, with one lowercase name segment and at
-  most 128 characters. An extension declares at most four labels.
-- Each label lists 1 to 12 values. A value is a lowercase slug with a display
-  label, an icon and a tone. Icons come from the approved set (`circle-check`,
-  `circle-ellipsis`, `dashboard`, `eye`, `list-checks`, `octagon-alert`,
-  `panels-top-left`, `puzzle`, `search`, `square-parking`), since the icon
-  carries the value's meaning. Tones (`neutral`, `info`, `success`, `warning`,
-  `danger`) map to core's status colours, so values never rely on colour alone.
-- The server only accepts declared values under an installed extension's
-  `ext.<extension id>.` prefix. `PATCH /v1/sessions/{id}` and session creation
-  reject an undeclared key or value; policy label writes drop one, like other
-  invalid policy writes; a fork leaves behind copied labels the declaration no
-  longer accepts. An empty value deletes the label, as it does for the project
-  label. Keys under `ext.` whose extension isn't installed, or is turned off,
-  stay ordinary labels.
-- Writes go through `PATCH /v1/sessions/{id}` as the viewer, so the session's
-  normal edit check applies. Anyone with edit access can also change the label
-  through the API or CLI, and it stays when the extension is disabled or
-  uninstalled; only its badge, menu and tooltip row stop rendering.
+## Migrating from declared labels
+
+An earlier, unreleased version of the session-row slots let extensions declare
+page-writable labels under `ext.<extension id>.`. That prefix now belongs to
+core's read-only mirrors of published fields, so those manifests no longer
+load; the load error points here. To move one over:
+
+- Replace each `LabelDeclaration(key="ext.<id>.<name>", values=(LabelValue(...), ...))`
+  in `labels=` with a published `StateField("<name>", StateVisibility.PUBLISHED,
+  max_length=..., values=(FieldValue(...), ...))` in `state=`. `LabelTone` is now
+  `FieldTone`.
+- Replace `LabelBinding(key)` with `FieldBinding("<name>")` on decorations and
+  hover rows.
+- Replace a `SlotItemKind.SET_LABEL` menu item with `SlotItemKind.COMMAND`,
+  naming a `SetState("<name>", "{<argument>}")` command with one `choices`
+  argument, and a `ClearState("<name>")` command as `clear_command` in place of
+  `clear_label`.
+- Drop `ExtensionPermission.SESSIONS_LABELS_WRITE`. Pages that called
+  `sessions.labels.set` or `clear` call `commands.invoke` instead.
+- Enable the extension in the server config; state needs operator enablement.
+
+Labels written under the old scheme stay in the database but are hidden once
+the extension declares published fields, because no state row backs them.
+Find, rename or delete them with `omni extensions legacy-labels` (see
+[Extension session state](extension_state.md#labels-no-extension-state-backs)).

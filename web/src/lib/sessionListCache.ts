@@ -123,7 +123,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels" || key === "pull_request") {
+    if (key === "labels" || key === "pull_request" || key === "published_fields") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);
@@ -602,19 +602,16 @@ export function overlayArchivedIntoCaches(
 }
 
 /**
- * Set or, for an empty value, remove one label on every cached copy of a
- * session's row, leaving its other labels as each cache holds them.
+ * Replace one session's published extension fields on every cached copy of
+ * its row (the sidebar lists, project folders and the pin backfill), e.g.
+ * after a command returns them. Rows outside the caches pick them up on the
+ * next fetch.
  */
-export function overlayLabelIntoCaches(
+export function overlayPublishedFieldsIntoCaches(
   queryClient: QueryClient,
   id: string,
-  key: string,
-  value: string,
+  publishedFields: Record<string, Record<string, string>>,
 ): void {
-  const update = (labels: Record<string, string> | null | undefined) => {
-    const others = Object.entries(labels ?? {}).filter(([name]) => name !== key);
-    return Object.fromEntries(value === "" ? others : [...others, [key, value]]);
-  };
   for (const [queryKey, filtersFor] of [
     [["conversations"], filtersFromConversationQueryKey],
     [["project-sessions"], filtersFromProjectQueryKey],
@@ -622,11 +619,10 @@ export function overlayLabelIntoCaches(
     for (const [cacheKey, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
       queryKey,
     })) {
-      const row = data?.pages.flatMap((page) => page.data).find((conv) => conv.id === id);
-      if (!row) continue;
+      if (!data?.pages.some((page) => page.data.some((conv) => conv.id === id))) continue;
       const { data: next } = mergeItemsIntoPages(
         data,
-        new Map([[id, { id, labels: update(row.labels) }]]),
+        new Map([[id, { id, published_fields: publishedFields }]]),
         filtersFor(cacheKey),
         undefined,
       );
@@ -634,6 +630,6 @@ export function overlayLabelIntoCaches(
     }
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-    old ? { ...old, labels: update(old.labels) } : old,
+    old ? { ...old, published_fields: publishedFields } : old,
   );
 }

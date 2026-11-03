@@ -20,6 +20,7 @@ from omnigent.extensions import (
     CommandContribution,
     ExtensionManifest,
     ExtensionPluginState,
+    FieldValue,
     SetState,
     StateContribution,
     StateField,
@@ -55,7 +56,15 @@ def _manifest() -> ExtensionManifest:
         extension_api=EXTENSION_API_VERSION,
         state=StateContribution(
             fields=(
-                StateField("status", StateVisibility.PUBLISHED, max_length=16),
+                StateField(
+                    "status",
+                    StateVisibility.PUBLISHED,
+                    max_length=16,
+                    values=(
+                        FieldValue("blocked", "Blocked", "octagon-alert"),
+                        FieldValue("done", "Done", "circle-check"),
+                    ),
+                ),
                 StateField("pr:*", StateVisibility.READERS, max_keys=3),
                 StateField("pr:0", StateVisibility.EDITORS),
                 StateField("draft", StateVisibility.EDITORS),
@@ -460,3 +469,16 @@ async def test_server_writes_honour_the_published_field_declaration(server: _Ser
     assert server.store.get_extension_state(server.session_id, _EXT, "status") is None
     session = (await server.get(_READER, "")).json()
     assert session["published_fields"] == {}
+
+
+def test_server_writes_keep_to_a_published_fields_values(server: _Server) -> None:
+    service = _service(server)
+
+    # Non-UTF-8 bytes are refused earlier, by the published field's text rule.
+    with pytest.raises(ValueError, match="not one of the values declared for field 'status'"):
+        service.write_state(server.session_id, _EXT, "status", b"maybe")
+    assert server.store.get_extension_state(server.session_id, _EXT, "status") is None
+
+    service.write_state(server.session_id, _EXT, "status", b"done")
+    entry = server.store.get_extension_state(server.session_id, _EXT, "status")
+    assert entry is not None and entry.value == b"done"

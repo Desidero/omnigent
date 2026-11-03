@@ -22,7 +22,6 @@ import {
   listProjectSummaries,
   parseCreateProjectParams,
 } from "./projects";
-import { parseLabelWrite, writeExtensionLabel } from "./labels";
 import {
   cachedSessionSummaries,
   getSessionSummary,
@@ -94,8 +93,6 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
   const sessionListLimiter = useMemo(() => new SessionReadLimiter(), []);
   const pullRequestLimiter = useMemo(() => new SessionReadLimiter(), []);
-  // Spaces label writes the same way, one at a time.
-  const labelWriteLimiter = useMemo(() => new SessionReadLimiter(), []);
   // External URLs the host has handed to this extension; the only ones it may open.
   const externalUrlsRef = useRef(new Set<string>());
 
@@ -235,14 +232,6 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           externalUrlsRef.current.add(pr.url);
           return { number: pr.number, title: pr.title.slice(0, 256), state: pr.state, url: pr.url };
         }),
-      "sessions.labels.set": (params: unknown, signal: AbortSignal) => {
-        const write = parseLabelWrite(extension, params, false);
-        return labelWriteLimiter.run(signal, () => writeExtensionLabel(queryClient, write, signal));
-      },
-      "sessions.labels.clear": (params: unknown, signal: AbortSignal) => {
-        const write = parseLabelWrite(extension, params, true);
-        return labelWriteLimiter.run(signal, () => writeExtensionLabel(queryClient, write, signal));
-      },
       "projects.list": (_params: unknown, signal: AbortSignal) => {
         throwIfAborted(signal);
         return cachedProjectSummaries(queryClient) ?? listProjectSummaries();
@@ -259,7 +248,6 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
     return grantedHostMethods(extension, implementations);
   }, [
     extension,
-    labelWriteLimiter,
     navigate,
     pullRequestLimiter,
     queryClient,

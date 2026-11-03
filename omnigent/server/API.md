@@ -891,10 +891,9 @@ Request body:
     Session title update. `null` leaves the title unchanged.
 
   labels (object, optional)
-    Labels to merge into the existing session labels. Keys under an
-    installed extension's `ext.<extension id>.` prefix must be ones it
-    declares, with a declared value (400 otherwise); an empty value
-    deletes such a label.
+    Labels to merge into the existing session labels. Keys under `ext.`
+    are read-only mirrors of extensions' published fields (400); change
+    them through the extension's commands.
 
   reasoning_effort (string or null, optional)
     Per-session reasoning-effort hint. Accepted metadata values are

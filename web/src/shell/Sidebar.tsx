@@ -240,15 +240,20 @@ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { approvedExtensionIcon } from "@/extensions/icons";
-import { useSetSessionLabel } from "@/extensions/sessionLabels";
-import { isEditorLevel } from "@/lib/permissionsApi";
+import {
+  canRunCommand,
+  useRunExtensionCommand,
+  type CommandInvocation,
+} from "@/extensions/sessionCommands";
+import type { ExtensionCommand } from "@/extensions/types";
 import {
   CORE_SESSION_ROW_DECORATIONS,
   CORE_SESSION_ROW_MENU,
-  labelToneClass,
-  useSessionRowEntries,
-  useSessionRowLabels,
-  type SessionRowLabel,
+  fieldToneClass,
+  resolveSessionRowEntries,
+  useSessionRowCommands,
+  useSessionRowFields,
+  type SessionRowCommand,
 } from "@/shell/sessionRowSlots";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
 import { NewProjectButton } from "./NewProjectButton";
@@ -4180,6 +4185,7 @@ interface MenuComponents {
   SubTrigger: ComponentType<{
     children?: ReactNode;
     className?: string;
+    disabled?: boolean;
     "data-testid"?: string;
   }>;
   SubContent: ComponentType<{ children?: ReactNode; className?: string }>;
@@ -4203,47 +4209,65 @@ const contextBundle: MenuComponents = {
   SubContent: ContextMenuSubContent,
 };
 
-// One declared label's values as radio items, then Clear. Values render as text.
-function SessionRowLabelValues({
+// A row-menu item's choices as radio items, then its clear command. Values render as text.
+function SessionRowCommandChoices({
   components: C,
   entry,
-  labels,
-  onSelect,
+  permissionLevel,
+  rowSession,
+  onRun,
 }: {
   components: MenuComponents;
-  entry: SessionRowLabel;
-  labels: Record<string, string> | null | undefined;
-  onSelect: (value: string) => void;
+  entry: SessionRowCommand;
+  permissionLevel: number | null;
+  rowSession: { parentSessionId?: string | null };
+  onRun: (command: ExtensionCommand, args: Record<string, string>) => void;
 }) {
-  const stored = labels && Object.hasOwn(labels, entry.label.key) ? labels[entry.label.key] : "";
+  const argument = entry.command.arguments[0];
+  const allowed = canRunCommand(entry.command, permissionLevel, rowSession);
   return (
     <>
-      {entry.label.values.map((value) => {
-        const Icon = approvedExtensionIcon(value.icon);
-        const checked = entry.value?.value === value.value;
+      {(entry.choices ?? []).map((choice) => {
+        const Icon = approvedExtensionIcon(choice.presentation?.icon ?? null);
+        const label = choice.presentation?.label ?? choice.argument;
+        const checked = entry.field !== null && entry.current === choice.argument;
         return (
           <C.Item
-            key={value.value}
+            key={choice.argument}
             role="menuitemradio"
             aria-checked={checked}
-            textValue={value.label}
-            data-testid={`session-row-label-${entry.item.id}-${value.value}`}
-            onSelect={() => onSelect(value.value)}
+            disabled={!allowed}
+            textValue={label}
+            data-testid={`session-row-command-${entry.item.id}-${choice.argument}`}
+            onSelect={() => onRun(entry.command, { [argument.name]: choice.argument })}
           >
-            {Icon && <Icon aria-hidden className={cn("size-3.5", labelToneClass(value.tone))} />}
-            <span className="flex-1 truncate">{value.label}</span>
+            {Icon && (
+              <Icon
+                aria-hidden
+                className={cn("size-3.5", fieldToneClass(choice.presentation?.tone ?? ""))}
+              />
+            )}
+            <span className="flex-1 truncate">{label}</span>
             {checked && <CheckMarkIcon aria-hidden className="size-3.5 shrink-0 text-primary" />}
           </C.Item>
         );
       })}
-      <C.Separator />
-      <C.Item
-        disabled={stored === ""}
-        data-testid={`session-row-label-${entry.item.id}-clear`}
-        onSelect={() => onSelect("")}
-      >
-        {entry.item.clear_label ?? "Clear"}
-      </C.Item>
+      {entry.clear && (
+        <>
+          <C.Separator />
+          <C.Item
+            // Nothing to clear when the tracked field is unset.
+            disabled={
+              !canRunCommand(entry.clear, permissionLevel, rowSession) ||
+              (entry.field !== null && entry.current === null)
+            }
+            data-testid={`session-row-command-${entry.item.id}-clear`}
+            onSelect={() => entry.clear && onRun(entry.clear, {})}
+          >
+            {entry.clear.title}
+          </C.Item>
+        </>
+      )}
     </>
   );
 }
@@ -4267,11 +4291,11 @@ function ConversationMenuItems({
   isSingleUser,
   canStop,
   canMarkUnread,
-  canEditLabels,
   currentProject,
   onTogglePinned,
   onMarkUnread,
   onMarkRead,
+  onRunCommand,
   onProjectAssigned,
   moveToProject,
   setShareOpen,
@@ -4299,12 +4323,12 @@ function ConversationMenuItems({
   // Whether "Mark as unread" applies: any row not already showing the
   // unread dot (the active thread and running sessions included).
   canMarkUnread: boolean;
-  // EDIT access or above: the server's gate for label writes, so viewers get no set-label menus.
-  canEditLabels: boolean;
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
   onMarkUnread: () => void;
   onMarkRead: () => void;
+  // Runs an extension command, after its confirm prompt when it declares one.
+  onRunCommand: (invocation: CommandInvocation) => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
   setShareOpen: (open: boolean) => void;
@@ -4345,20 +4369,28 @@ function ConversationMenuItems({
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
-  // "label:<item id>" is an extension set-label item's value list.
-  const [view, setView] = useState<"main" | "projects" | `label:${string}`>("main");
-  const setLabel = useSetSessionLabel();
-  const handleLabelSelect = (entry: SessionRowLabel, value: string) => {
+  // "command:<item id>" is an extension row-menu item's list of choices.
+  const [view, setView] = useState<"main" | "projects" | `command:${string}`>("main");
+  const permissionLevel = conversation.permission_level ?? null;
+  const rowSession = { parentSessionId: conversation.parent_session_id };
+  const handleCommand = (
+    entry: SessionRowCommand,
+    command: ExtensionCommand,
+    args: Record<string, string>,
+  ) => {
     setMenuOpen(false);
-    setLabel.mutate({ sessionId: conversation.id, label: entry.label, value });
+    onRunCommand({
+      sessionId: conversation.id,
+      extensionId: entry.extension.id,
+      command,
+      arguments: args,
+    });
   };
-  // Set-label items need edit access, the server's gate for the write.
-  const rowMenuEntries = useSessionRowEntries(
-    "session.row.menu",
+  // Viewers without a command's access see it disabled; the server checks again.
+  const rowMenuEntries = resolveSessionRowEntries(
     CORE_SESSION_ROW_MENU,
-    conversation.labels,
+    useSessionRowCommands(conversation.published_fields),
     { isOwner, canMarkUnread },
-    () => canEditLabels,
   );
   const coreActions = { markUnread: onMarkUnread, markRead: onMarkRead };
 
@@ -4385,15 +4417,15 @@ function ConversationMenuItems({
   // "Back" row flips `view` without closing the menu or navigating). Reachable
   // only via the mobile project item below, which sits behind the same
   // `isOwner` gate.
-  const mobileLabelMenu = isMobile
-    ? rowMenuEntries.find((row) => row.source === "extension" && view === `label:${row.id}`)
+  const mobileCommandMenu = isMobile
+    ? rowMenuEntries.find((row) => row.source === "extension" && view === `command:${row.id}`)
     : undefined;
-  if (mobileLabelMenu?.source === "extension") {
-    const entry = mobileLabelMenu.entry;
+  if (mobileCommandMenu?.source === "extension") {
+    const entry = mobileCommandMenu.entry;
     return (
       <>
         <C.Item
-          data-testid="session-row-label-back"
+          data-testid="session-row-command-back"
           className="whitespace-nowrap"
           onSelect={(e) => {
             e.preventDefault();
@@ -4404,11 +4436,12 @@ function ConversationMenuItems({
           Back
         </C.Item>
         <C.Separator />
-        <SessionRowLabelValues
+        <SessionRowCommandChoices
           components={C}
           entry={entry}
-          labels={conversation.labels}
-          onSelect={(value) => handleLabelSelect(entry, value)}
+          permissionLevel={permissionLevel}
+          rowSession={rowSession}
+          onRun={(command, args) => handleCommand(entry, command, args)}
         />
       </>
     );
@@ -4543,9 +4576,9 @@ function ConversationMenuItems({
           the pink dot so a session can be flagged to revisit (including the
           one you're currently viewing); a row already showing the dot offers
           the reverse, "Mark as read", which clears it. */}
-      {/* Core's read-state pair, then extension set-label items, from one
-          resolver. On mobile a set-label item swaps the menu body to its
-          value list, like "Move session". */}
+      {/* Core's read-state pair, then extension command items, from one
+          resolver. On mobile an item with choices swaps the menu body to
+          them, like "Move session". */}
       {rowMenuEntries.map((row) => {
         if (row.source === "core") {
           const { entry } = row;
@@ -4564,8 +4597,9 @@ function ConversationMenuItems({
           );
         }
         const { entry } = row;
+        const current = entry.choices?.find((choice) => choice.argument === entry.current);
         const Icon =
-          approvedExtensionIcon(entry.value?.icon ?? null) ??
+          approvedExtensionIcon(current?.presentation?.icon ?? null) ??
           approvedExtensionIcon(entry.item.icon) ??
           TagIcon;
         const triggerContent = (
@@ -4574,29 +4608,52 @@ function ConversationMenuItems({
             {entry.item.label}
           </>
         );
+        if (entry.choices === null) {
+          return (
+            <C.Item
+              key={row.id}
+              data-testid={`session-row-menu-${row.id}`}
+              className="whitespace-nowrap"
+              disabled={!canRunCommand(entry.command, permissionLevel, rowSession)}
+              onSelect={() => handleCommand(entry, entry.command, {})}
+            >
+              {triggerContent}
+            </C.Item>
+          );
+        }
+        // A viewer who can run neither the command nor its clear gets nothing to open.
+        const disabled =
+          !canRunCommand(entry.command, permissionLevel, rowSession) &&
+          !(entry.clear && canRunCommand(entry.clear, permissionLevel, rowSession));
         return isMobile ? (
           <C.Item
             key={row.id}
             data-testid={`session-row-menu-${row.id}`}
             className="whitespace-nowrap"
+            disabled={disabled}
             onSelect={(e) => {
               e.preventDefault();
-              setView(`label:${row.id}`);
+              setView(`command:${row.id}`);
             }}
           >
             {triggerContent}
           </C.Item>
         ) : (
           <C.Sub key={row.id}>
-            <C.SubTrigger data-testid={`session-row-menu-${row.id}`} className="whitespace-nowrap">
+            <C.SubTrigger
+              data-testid={`session-row-menu-${row.id}`}
+              className="whitespace-nowrap"
+              disabled={disabled}
+            >
               {triggerContent}
             </C.SubTrigger>
             <C.SubContent className="min-w-44">
-              <SessionRowLabelValues
+              <SessionRowCommandChoices
                 components={C}
                 entry={entry}
-                labels={conversation.labels}
-                onSelect={(value) => handleLabelSelect(entry, value)}
+                permissionLevel={permissionLevel}
+                rowSession={rowSession}
+                onRun={(command, args) => handleCommand(entry, command, args)}
               />
             </C.SubContent>
           </C.Sub>
@@ -4918,8 +4975,8 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
   // The stored state may be old while the host is offline; say how old.
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
-  const labelRows = useSessionRowLabels("session.row.hover", conversation.labels);
-  const hasLabelRows = labelRows.some((entry) => entry.value !== null);
+  const fieldRows = useSessionRowFields("session.row.hover", conversation.published_fields);
+  const hasLabelRows = fieldRows.some((entry) => entry.text !== null);
   if (createdBy === null && repo === null && prNumber === null && branch === null && !hasLabelRows)
     return null;
   return (
@@ -4954,16 +5011,16 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
           {branch}
         </SessionTooltipDetail>
       )}
-      {labelRows.map(({ item, value }) =>
-        value === null ? null : (
+      {fieldRows.map(({ item, text, value }) =>
+        text === null ? null : (
           <SessionTooltipDetail
             key={item.id}
             label={item.label}
-            icon={approvedExtensionIcon(value.icon) ?? TagIcon}
-            iconClassName={labelToneClass(value.tone)}
+            icon={approvedExtensionIcon(value?.icon ?? null) ?? TagIcon}
+            iconClassName={fieldToneClass(value?.tone ?? "")}
             testId={`session-tooltip-${item.id}`}
           >
-            {value.label}
+            {value?.label ?? text}
           </SessionTooltipDetail>
         ),
       )}
@@ -4973,18 +5030,18 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
 
 // Extension hover rows in the tooltip before the sidebar_grouping_ui flag.
 function LegacySessionTooltipLabelRows({ conversation }: { conversation: Conversation }) {
-  const labelRows = useSessionRowLabels("session.row.hover", conversation.labels);
-  return labelRows.map(({ item, value }) => {
-    if (value === null) return null;
-    const Icon = approvedExtensionIcon(value.icon) ?? TagIcon;
+  const fieldRows = useSessionRowFields("session.row.hover", conversation.published_fields);
+  return fieldRows.map(({ item, text, value }) => {
+    if (text === null) return null;
+    const Icon = approvedExtensionIcon(value?.icon ?? null) ?? TagIcon;
     return (
       <p
         key={item.id}
         data-testid={`session-tooltip-${item.id}`}
         className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
       >
-        <Icon aria-hidden className={cn("size-3.5 shrink-0", labelToneClass(value.tone))} />
-        <span className="truncate">{`${item.label}: ${value.label}`}</span>
+        <Icon aria-hidden className={cn("size-3.5 shrink-0", fieldToneClass(value?.tone ?? ""))} />
+        <span className="truncate">{`${item.label}: ${value?.label ?? text}`}</span>
       </p>
     );
   });
@@ -5223,6 +5280,9 @@ function ConversationRowImpl({
   }, [isEditing, conversation.id, reportRowEditing]);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
+  // An extension command waiting on its declared confirm prompt.
+  const [pendingCommand, setPendingCommand] = useState<CommandInvocation | null>(null);
+  const runCommand = useRunExtensionCommand();
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
@@ -5349,13 +5409,13 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
-  // Row decorations: core's "Shared with you", then extension label badges.
-  const decorations = useSessionRowEntries(
-    "session.row.decorations",
+  // Row decorations: core's "Shared with you", then extension field badges.
+  const decorations = resolveSessionRowEntries(
     CORE_SESSION_ROW_DECORATIONS,
-    conversation.labels,
+    useSessionRowFields("session.row.decorations", conversation.published_fields).filter(
+      (entry) => entry.value !== null && approvedExtensionIcon(entry.value.icon) !== null,
+    ),
     { isOwner, canMarkUnread },
-    (entry) => entry.value !== null && approvedExtensionIcon(entry.value.icon) !== null,
   );
   const decorationCount = decorations.length;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
@@ -5585,11 +5645,14 @@ function ConversationRowImpl({
     isSingleUser,
     canStop,
     canMarkUnread,
-    canEditLabels: isEditorLevel(conversation.permission_level ?? null),
     currentProject,
     onTogglePinned,
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
     onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
+    onRunCommand: (invocation: CommandInvocation) => {
+      if (invocation.command.confirm) setPendingCommand(invocation);
+      else runCommand.mutate(invocation);
+    },
     onProjectAssigned,
     moveToProject,
     setShareOpen,
@@ -5895,7 +5958,7 @@ function ConversationRowImpl({
                     name: `${row.entry.item.label}: ${row.entry.value?.label}`,
                     title: `${row.entry.item.label}: ${row.entry.value?.label}`,
                     Icon: approvedExtensionIcon(row.entry.value?.icon ?? null) ?? TagIcon,
-                    iconClassName: labelToneClass(row.entry.value?.tone ?? ""),
+                    iconClassName: fieldToneClass(row.entry.value?.tone ?? ""),
                     testId: `session-row-decoration-${row.id}`,
                   };
             return (
@@ -6195,6 +6258,38 @@ function ConversationRowImpl({
                 componentId="sidebar.conversation.leave"
               >
                 Leave
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        )}
+      </Dialog>
+      <Dialog
+        open={pendingCommand !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingCommand(null);
+        }}
+      >
+        {pendingCommand && (
+          <DialogContent onClick={(e) => e.stopPropagation()}>
+            <DialogHeader>
+              <DialogTitle>{pendingCommand.command.title}</DialogTitle>
+              {/* Extension text, rendered as text. */}
+              <DialogDescription>{pendingCommand.command.confirm}</DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button type="button" variant="ghost" onClick={() => setPendingCommand(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                data-testid="extension-command-confirm"
+                onClick={() => {
+                  runCommand.mutate(pendingCommand);
+                  setPendingCommand(null);
+                }}
+                componentId="sidebar.conversation.extension-command"
+              >
+                {pendingCommand.command.title}
               </Button>
             </DialogFooter>
           </DialogContent>

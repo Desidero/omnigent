@@ -18,7 +18,8 @@ the header menu), and each place is a separate entry point.
   and publishes up to three read-only fields, shown as `published_fields` and
   `ext.<extension id>.<key>` labels on the session. Users change it only
   through the extension's commands, with the share level each command needs;
-  readers never see `service` state. No UI uses it yet; drive it over HTTP.
+  readers never see `service` state. Session-row badges, tooltip lines and
+  row-menu entries show and change it (see below).
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
@@ -258,9 +259,11 @@ then continue from Chat or Terminal.
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
 session), archive or unarchive, and delete.
-An enabled extension can add a label badge next to the "Shared with you" icon,
-a set-label submenu after mark as unread or read (for viewers with edit
-access), and a tooltip line ([Extension UI slots](../docs/extending/extension_ui_slots.md#session-rows)).
+An enabled extension can add a badge for one of its published fields next to
+the "Shared with you" icon, a command entry or submenu after mark as unread or
+read (disabled for viewers without the command's access, with the command's
+confirm dialog first when it declares one), and a tooltip line
+([Extension UI slots](../docs/extending/extension_ui_slots.md#session-rows)).
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
@@ -1093,6 +1096,13 @@ plain `uv run pytest`, which starts a private server for the test.
   concurrent writes and session deletion, is in
   `tests/stores/test_extension_state_store.py`; run it with
   `OMNIGENT_TEST_DB_URI` set to cover Postgres, CockroachDB or MySQL.
+- **Extension session-row items (browser, `tests/e2e_ui` on its own):**
+  `tests/e2e_ui/extensions/test_session_row_slots.py` installs a manifest-only
+  status extension, sets a status from the row menu, checks the badge, the
+  tooltip line, the phone menu, a read-only sharee's disabled entry and the
+  server's 403, and that deleting the session deletes its state. Unit
+  coverage: `web/src/shell/Sidebar.sessionRowSlots.test.tsx` and
+  `web/src/extensions/sessionCommands.test.ts`.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and

@@ -166,5 +166,6 @@ There is no route that writes state directly: browsers change state only
 through declared commands. Server code acting for an extension writes it
 through `ExtensionStateService.write_state` and `clear_state`
 (`omnigent.server.extension_state`), which mirror published keys as the
-manifest says and hold a published key to the same UTF-8 and `max_length`
-rules as commands.
+manifest says, hold a published key to the same UTF-8 and `max_length` rules
+as commands, and refuse (`ValueError`) a value a published field doesn't list
+when it lists its `values`.

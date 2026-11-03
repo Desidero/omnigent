@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,21 +14,27 @@ from fastapi import FastAPI
 import omnigent.server.app as app_module
 from omnigent.extensions import (
     EXTENSION_API_VERSION,
+    ClearState,
+    CommandAccess,
+    CommandArgument,
+    CommandContribution,
     ExtensionEntrypoints,
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
-    LabelBinding,
-    LabelDeclaration,
-    LabelTone,
-    LabelValue,
+    FieldBinding,
+    FieldTone,
+    FieldValue,
     PageContribution,
     PrimaryNavigationContribution,
+    SetState,
     SlotId,
     SlotItemContribution,
     SlotItemKind,
+    StateContribution,
+    StateField,
+    StateVisibility,
 )
-from omnigent.extensions.labels import active_label_policy
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
@@ -96,6 +103,7 @@ def _build_app(
     permission_store: SqlAlchemyPermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
     server_config: dict[str, object] | None = None,
+    extension_is_enabled: Callable[[str], bool] | None = None,
 ) -> FastAPI:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
@@ -108,6 +116,7 @@ def _build_app(
         permission_store=permission_store,
         auth_provider=auth_provider,
         extension_state=extension_state,
+        extension_is_enabled=extension_is_enabled,
     )
 
 
@@ -158,7 +167,8 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
                 "pages": [],
                 "primary_navigation": [],
                 "slot_items": [],
-                "labels": [],
+                "state_fields": [],
+                "commands": [],
                 "browser": {
                     "declared": True,
                     "has_styles": True,
@@ -169,7 +179,7 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
             }
         ],
     }
-    assert "commands" not in response.text
+    assert "activation_events" not in response.text
     assert "dist/extension.js" not in response.text
     assert "extension import failed" not in response.text
 
@@ -249,7 +259,8 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
             "order": 500,
             "when": None,
             "binding": None,
-            "clear_label": None,
+            "command": None,
+            "clear_command": None,
         }
     ]
 
@@ -310,54 +321,80 @@ async def test_operator_enablement_table(
     assert detail.status_code == (404 if acme is None else 200)
 
 
-def _label_manifest(extension_id: str) -> ExtensionManifest:
-    key = f"ext.{extension_id}.status"
+def _status_manifest(extension_id: str) -> ExtensionManifest:
     return replace(
         _manifest(extension_id),
         entrypoints=ExtensionEntrypoints(),
         pages=(),
         primary_navigation=(),
         activation_events=(),
-        permissions=frozenset({ExtensionPermission.SESSIONS_LABELS_WRITE}),
-        labels=(
-            LabelDeclaration(
-                key=key,
-                title="Status",
-                values=(
-                    LabelValue("blocked", "Blocked", "octagon-alert", LabelTone.DANGER),
-                    LabelValue("done", "Done", "circle-check", LabelTone.SUCCESS),
+        state=StateContribution(
+            fields=(
+                StateField(
+                    "status",
+                    StateVisibility.PUBLISHED,
+                    max_length=16,
+                    values=(
+                        FieldValue("blocked", "Blocked", "octagon-alert", FieldTone.DANGER),
+                        FieldValue("done", "Done", "circle-check", FieldTone.SUCCESS),
+                    ),
                 ),
+                StateField("secret"),
+                StateField("draft", StateVisibility.EDITORS),
+            )
+        ),
+        commands=(
+            CommandContribution(
+                id=f"{extension_id}.set",
+                title="Set status",
+                action=SetState(key="status", value="{status}"),
+                arguments=(CommandArgument("status", choices=("blocked", "done")),),
+                confirm="Change the status?",
             ),
+            CommandContribution(
+                id=f"{extension_id}.clear",
+                title="Clear status",
+                action=ClearState(key="status"),
+                required_access=CommandAccess.READ,
+            ),
+            CommandContribution(id=f"{extension_id}.reserved", title="Reserved"),
         ),
         slot_items=(
             SlotItemContribution(
                 id=f"{extension_id}.menu",
                 slot=SlotId.SESSION_ROW_MENU,
-                kind=SlotItemKind.SET_LABEL,
+                kind=SlotItemKind.COMMAND,
                 label="Status",
-                binding=LabelBinding(key),
+                command=f"{extension_id}.set",
+                clear_command=f"{extension_id}.clear",
+            ),
+            SlotItemContribution(
+                id=f"{extension_id}.badge",
+                slot=SlotId.SESSION_ROW_DECORATIONS,
+                kind=SlotItemKind.DECORATION,
+                label="Status",
+                binding=FieldBinding("status"),
             ),
         ),
     )
 
 
-async def test_catalog_serves_labels_and_bindings_and_the_app_enforces_them(
-    db_uri: str, tmp_path: Path
-) -> None:
+async def test_catalog_serves_fields_commands_and_bindings(db_uri: str, tmp_path: Path) -> None:
     app = _build_app(
         db_uri,
         tmp_path,
-        extension_state=ExtensionPluginState(manifests=(_label_manifest("acme.status"),)),
+        extension_state=ExtensionPluginState(manifests=(_status_manifest("acme.status"),)),
         server_config={"extensions": {"acme.status": {"enabled": True}}},
     )
 
     async with _client(app) as client:
         (item,) = (await client.get("/v1/extensions")).json()["data"]
 
-    assert item["labels"] == [
+    assert item["state_fields"] == [
         {
-            "key": "ext.acme.status.status",
-            "title": "Status",
+            "key": "status",
+            "visibility": "published",
+            "max_length": 16,
             "values": [
                 {
                     "value": "blocked",
@@ -367,24 +404,74 @@ async def test_catalog_serves_labels_and_bindings_and_the_app_enforces_them(
                 },
                 {"value": "done", "label": "Done", "icon": "circle-check", "tone": "success"},
             ],
-        }
+        },
     ]
-    (menu,) = item["slot_items"]
-    assert menu["page"] is None
-    assert menu["binding"] == {"source": "label", "key": "ext.acme.status.status"}
-    assert menu["clear_label"] is None
-    assert active_label_policy().declares("ext.acme.status.status")
-
-
-async def test_disabled_extension_declares_no_labels(db_uri: str, tmp_path: Path) -> None:
-    _build_app(
-        db_uri,
-        tmp_path,
-        extension_state=ExtensionPluginState(manifests=(_label_manifest("acme.status"),)),
-        server_config={"extensions": {"acme.status": {"enabled": False}}},
+    # Reserved commands without an action can't run, so the catalog leaves them out.
+    assert item["commands"] == [
+        {
+            "id": "acme.status.set",
+            "title": "Set status",
+            "arguments": [
+                {
+                    "name": "status",
+                    "choices": ["blocked", "done"],
+                    "pattern": None,
+                    "max_length": 64,
+                }
+            ],
+            "required_access": "edit",
+            "confirm": "Change the status?",
+            "action": {"type": "set_state", "field": "status", "value": "{status}"},
+        },
+        {
+            "id": "acme.status.clear",
+            "title": "Clear status",
+            "arguments": [],
+            "required_access": "read",
+            "confirm": None,
+            "action": {"type": "clear_state", "field": "status", "value": None},
+        },
+    ]
+    badge, menu = item["slot_items"]
+    assert badge["binding"] == {"source": "published_field", "key": "status"}
+    assert (menu["page"], menu["command"], menu["clear_command"]) == (
+        None,
+        "acme.status.set",
+        "acme.status.clear",
     )
 
-    assert not active_label_policy().declares("ext.acme.status.status")
+
+async def test_catalog_follows_the_state_predicate_for_state_and_commands(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=ExtensionPluginState(manifests=(_status_manifest("acme.status"),)),
+        server_config={"extensions": {"acme.status": {"enabled": True}}},
+        # The server would refuse the commands, so the catalog doesn't offer them.
+        extension_is_enabled=lambda _extension_id: False,
+    )
+
+    async with _client(app) as client:
+        (item,) = (await client.get("/v1/extensions")).json()["data"]
+
+    assert (item["state_fields"], item["commands"]) == ([], [])
+
+
+async def test_catalog_lists_no_state_or_commands_until_enabled(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=ExtensionPluginState(manifests=(_status_manifest("acme.status"),)),
+    )
+
+    async with _client(app) as client:
+        (item,) = (await client.get("/v1/extensions")).json()["data"]
+
+    assert (item["state_fields"], item["commands"], item["slot_items"]) == ([], [], [])
 
 
 async def test_disabled_extension_bundle_is_not_served(

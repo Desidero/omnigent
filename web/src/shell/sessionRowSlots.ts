@@ -5,11 +5,20 @@ import { useMemo } from "react";
 import { MailIcon, MailOpenIcon, UsersIcon, type LucideIcon } from "lucide-react";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import {
-  declaredLabelValue,
-  resolveLabelSlotItems,
-  type ResolvedLabelSlotItem,
+  listedFieldValue,
+  publishedFieldText,
+  resolveCommandSlotItems,
+  resolveFieldSlotItems,
+  type ResolvedCommandSlotItem,
+  type ResolvedFieldSlotItem,
 } from "@/extensions/slots";
-import type { ExtensionLabelTone, ExtensionLabelValue, ExtensionSlotId } from "@/extensions/types";
+import type {
+  ExtensionFieldTone,
+  ExtensionFieldValue,
+  ExtensionSlotId,
+  ExtensionSlotItem,
+  PublishedFields,
+} from "@/extensions/types";
 
 export interface SessionRowContext {
   isOwner: boolean;
@@ -72,7 +81,7 @@ export const CORE_SESSION_ROW_MENU: readonly CoreSessionRowMenuEntry[] = [
 export const MAX_EXTENSION_ROW_ITEMS = 2;
 
 // Important, so menu items' muted icon colour doesn't override the tone.
-const LABEL_TONE_CLASSES: Record<ExtensionLabelTone, string> = {
+const FIELD_TONE_CLASSES: Record<ExtensionFieldTone, string> = {
   neutral: "text-status-gray!",
   info: "text-status-blue!",
   success: "text-status-green!",
@@ -80,36 +89,68 @@ const LABEL_TONE_CLASSES: Record<ExtensionLabelTone, string> = {
   danger: "text-status-red!",
 };
 
-export function labelToneClass(tone: string): string {
-  return Object.hasOwn(LABEL_TONE_CLASSES, tone)
-    ? LABEL_TONE_CLASSES[tone as ExtensionLabelTone]
-    : LABEL_TONE_CLASSES.neutral;
+export function fieldToneClass(tone: string): string {
+  return Object.hasOwn(FIELD_TONE_CLASSES, tone)
+    ? FIELD_TONE_CLASSES[tone as ExtensionFieldTone]
+    : FIELD_TONE_CLASSES.neutral;
 }
 
-export interface SessionRowLabel extends ResolvedLabelSlotItem {
-  /** The row's current declared value; null when absent, empty or unknown. */
-  value: ExtensionLabelValue | null;
+export interface SessionRowField extends ResolvedFieldSlotItem {
+  /** The row's published text; null when absent or empty. */
+  text: string | null;
+  /** The listed value it matches; null when absent, empty or unlisted. */
+  value: ExtensionFieldValue | null;
 }
 
-/** Extension items in one session-row slot, with the row's current values. */
-export function useSessionRowLabels(
+export interface SessionRowCommand extends ResolvedCommandSlotItem {
+  /** The choice the row's published field holds now, if the choices track one. */
+  current: string | null;
+}
+
+/** Field-bound items in one session-row slot, with the row's current values. */
+export function useSessionRowFields(
   slot: ExtensionSlotId,
-  labels: Record<string, string> | null | undefined,
-): SessionRowLabel[] {
+  publishedFields: PublishedFields | null | undefined,
+): SessionRowField[] {
   const extensions = useExtensions();
   const items = useMemo(
-    () => resolveLabelSlotItems(extensions, slot).slice(0, MAX_EXTENSION_ROW_ITEMS),
+    () => resolveFieldSlotItems(extensions, slot).slice(0, MAX_EXTENSION_ROW_ITEMS),
     [extensions, slot],
   );
   return useMemo(
-    () => items.map((entry) => ({ ...entry, value: declaredLabelValue(entry.label, labels) })),
-    [items, labels],
+    () =>
+      items.map((entry) => {
+        const text = publishedFieldText(publishedFields, entry.extension.id, entry.field.key);
+        return { ...entry, text, value: listedFieldValue(entry.field, text) };
+      }),
+    [items, publishedFields],
   );
 }
 
-export type SessionRowEntry<Core extends CoreSessionRowEntry> =
+/** Row-menu items, with the choice each row currently holds. */
+export function useSessionRowCommands(
+  publishedFields: PublishedFields | null | undefined,
+): SessionRowCommand[] {
+  const extensions = useExtensions();
+  const items = useMemo(
+    () => resolveCommandSlotItems(extensions, "session.row.menu").slice(0, MAX_EXTENSION_ROW_ITEMS),
+    [extensions],
+  );
+  return useMemo(
+    () =>
+      items.map((entry) => ({
+        ...entry,
+        current: entry.field
+          ? publishedFieldText(publishedFields, entry.extension.id, entry.field.key)
+          : null,
+      })),
+    [items, publishedFields],
+  );
+}
+
+export type SessionRowEntry<Core extends CoreSessionRowEntry, Extension> =
   | { source: "core"; id: string; entry: Core }
-  | { source: "extension"; id: string; entry: SessionRowLabel };
+  | { source: "extension"; id: string; entry: Extension };
 
 function byOrder(left: { order: number; id: string }, right: { order: number; id: string }) {
   return left.order - right.order || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
@@ -120,11 +161,14 @@ function byOrder(left: { order: number; id: string }, right: { order: number; id
  * items, each by (order, id). Only core entries carry a visibility check;
  * an extension item shows whenever its slot does.
  */
-export function resolveSessionRowEntries<Core extends CoreSessionRowEntry>(
+export function resolveSessionRowEntries<
+  Core extends CoreSessionRowEntry,
+  Extension extends { item: ExtensionSlotItem },
+>(
   core: readonly Core[],
-  extension: readonly SessionRowLabel[],
+  extension: readonly Extension[],
   context: SessionRowContext,
-): SessionRowEntry<Core>[] {
+): SessionRowEntry<Core, Extension>[] {
   return [
     ...core
       .filter((entry) => entry.isVisible?.(context) ?? true)
@@ -139,20 +183,4 @@ export function resolveSessionRowEntries<Core extends CoreSessionRowEntry>(
       )
       .map((entry) => ({ source: "extension" as const, id: entry.item.id, entry })),
   ];
-}
-
-/**
- * A slot's resolved entries for one row. `showExtension` is the surface's own
- * rule for extension items (a value to show, or edit access), not a predicate
- * the extension supplies.
- */
-export function useSessionRowEntries<Core extends CoreSessionRowEntry>(
-  slot: ExtensionSlotId,
-  core: readonly Core[],
-  labels: Record<string, string> | null | undefined,
-  context: SessionRowContext,
-  showExtension: (entry: SessionRowLabel) => boolean,
-): SessionRowEntry<Core>[] {
-  const extension = useSessionRowLabels(slot, labels);
-  return resolveSessionRowEntries(core, extension.filter(showExtension), context);
 }

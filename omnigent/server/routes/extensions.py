@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions import (
+    CommandAccess,
+    CommandContribution,
     ExtensionManifest,
     ExtensionPluginState,
-    LabelTone,
+    FieldTone,
+    SetState,
     SlotId,
     SlotItemKind,
+    StateContribution,
+    StateVisibility,
 )
 from omnigent.extensions.assets import ASSET_SCRIPT, ASSET_STYLES, ResolvedBundle
 from omnigent.extensions.enablement import ExtensionEnablement
+from omnigent.extensions.state_fields import pinned_field
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.permission_store import PermissionStore
@@ -44,10 +50,10 @@ class ExtensionPrimaryNavigationResponse(BaseModel):
     when: str | None
 
 
-class ExtensionLabelBindingResponse(BaseModel):
-    """The declared label a session-row slot item renders."""
+class ExtensionFieldBindingResponse(BaseModel):
+    """The published state field a session-row slot item renders."""
 
-    source: Literal["label"]
+    source: Literal["published_field"]
     key: str
 
 
@@ -62,25 +68,63 @@ class ExtensionSlotItemResponse(BaseModel):
     icon: str | None
     order: int
     when: str | None
-    binding: ExtensionLabelBindingResponse | None
-    clear_label: str | None
+    binding: ExtensionFieldBindingResponse | None
+    command: str | None = Field(
+        description="The command a session.row.menu item runs, or whose choices it lists."
+    )
+    clear_command: str | None = Field(
+        description="A no-argument command listed after a menu item's choices."
+    )
 
 
-class ExtensionLabelValueResponse(BaseModel):
-    """One allowed value of a declared label, with its presentation."""
+class ExtensionFieldValueResponse(BaseModel):
+    """One value of a published field, with its presentation."""
 
     value: str
     label: str
     icon: str
-    tone: LabelTone
+    tone: FieldTone
 
 
-class ExtensionLabelResponse(BaseModel):
-    """A session label an extension declares, with its allowed values in order."""
+class ExtensionStateFieldResponse(BaseModel):
+    """A declared state key, or key prefix ending in ``*``, and who may read it."""
 
     key: str
+    visibility: StateVisibility
+    max_length: int | None
+    values: list[ExtensionFieldValueResponse]
+
+
+class ExtensionCommandArgumentResponse(BaseModel):
+    """One argument a command takes: one of ``choices``, or a full match of ``pattern``."""
+
+    name: str
+    choices: list[str]
+    pattern: str | None
+    max_length: int
+
+
+class ExtensionCommandActionResponse(BaseModel):
+    """What a command does to the extension's session state."""
+
+    type: Literal["set_state", "clear_state"]
+    field: str = Field(description="The declared state field the command writes.")
+    value: str | None = Field(
+        description="A set_state command's value template; `{name}` is an argument."
+    )
+
+
+class ExtensionDeclaredCommandResponse(BaseModel):
+    """A command users can run on a session through its commands route."""
+
+    id: str
     title: str
-    values: list[ExtensionLabelValueResponse]
+    arguments: list[ExtensionCommandArgumentResponse]
+    required_access: CommandAccess
+    confirm: str | None = Field(
+        description="A prompt clients show before running it; the server does not enforce it."
+    )
+    action: ExtensionCommandActionResponse
 
 
 class ExtensionBrowserBundleResponse(BaseModel):
@@ -107,7 +151,12 @@ class ExtensionResponse(BaseModel):
     pages: list[ExtensionPageResponse]
     primary_navigation: list[ExtensionPrimaryNavigationResponse]
     slot_items: list[ExtensionSlotItemResponse]
-    labels: list[ExtensionLabelResponse]
+    state_fields: list[ExtensionStateFieldResponse] = Field(
+        description="Published state fields; empty unless the extension's state is enabled."
+    )
+    commands: list[ExtensionDeclaredCommandResponse] = Field(
+        description="Commands with an action; empty unless the extension's state is enabled."
+    )
     browser: ExtensionBrowserBundleResponse
 
 
@@ -143,11 +192,70 @@ class ExtensionDiagnosticsResponse(BaseModel):
     asset_errors: list[ExtensionAssetErrorResponse]
 
 
+def _serialize_command(
+    command: CommandContribution, state: StateContribution | None
+) -> ExtensionDeclaredCommandResponse | None:
+    action = command.action
+    if action is None:
+        return None
+    target = pinned_field(state, action.key)
+    if target is None:  # Validated manifests always pin a field.
+        return None
+    return ExtensionDeclaredCommandResponse(
+        id=command.id,
+        title=command.title,
+        arguments=[
+            ExtensionCommandArgumentResponse(
+                name=argument.name,
+                choices=list(argument.choices),
+                pattern=argument.pattern,
+                max_length=argument.max_length,
+            )
+            for argument in command.arguments
+        ],
+        required_access=command.required_access,
+        confirm=command.confirm,
+        action=ExtensionCommandActionResponse(
+            type="set_state" if isinstance(action, SetState) else "clear_state",
+            field=target.key,
+            value=action.value if isinstance(action, SetState) else None,
+        ),
+    )
+
+
+def _serialize_state(
+    manifest: ExtensionManifest,
+) -> tuple[list[ExtensionStateFieldResponse], list[ExtensionDeclaredCommandResponse]]:
+    fields = [
+        ExtensionStateFieldResponse(
+            key=field.key,
+            visibility=field.visibility,
+            max_length=field.max_length,
+            values=[
+                ExtensionFieldValueResponse(
+                    value=value.value, label=value.label, icon=value.icon, tone=value.tone
+                )
+                for value in field.values
+            ],
+        )
+        for field in (manifest.state.fields if manifest.state is not None else ())
+        # Clients render only published fields; a page knows its own manifest.
+        if field.visibility is StateVisibility.PUBLISHED
+    ]
+    commands = [
+        serialized
+        for command in manifest.commands
+        if (serialized := _serialize_command(command, manifest.state)) is not None
+    ]
+    return fields, commands
+
+
 def _serialize_manifest(
     manifest: ExtensionManifest,
     bundle: ResolvedBundle | None = None,
     *,
     slots_enabled: bool = False,
+    state_enabled: bool = False,
 ) -> ExtensionResponse:
     """Convert a validated manifest into stable JSON-safe catalog metadata."""
     unavailable = manifest.entrypoints.browser is not None and bundle is None
@@ -189,11 +297,12 @@ def _serialize_manifest(
                 order=item.order,
                 when=item.when,
                 binding=(
-                    ExtensionLabelBindingResponse(source=item.binding.source, key=item.binding.key)
+                    ExtensionFieldBindingResponse(source=item.binding.source, key=item.binding.key)
                     if item.binding is not None
                     else None
                 ),
-                clear_label=item.clear_label,
+                command=item.command,
+                clear_command=item.clear_command,
             )
             for item in sorted(
                 manifest.slot_items,
@@ -201,6 +310,8 @@ def _serialize_manifest(
             )
         ]
     )
+    # The same switch as the state routes, so the catalog offers only what runs.
+    state_fields, commands = _serialize_state(manifest) if state_enabled else ([], [])
     return ExtensionResponse(
         id=manifest.id,
         display_name=manifest.display_name,
@@ -212,20 +323,8 @@ def _serialize_manifest(
         pages=pages,
         primary_navigation=navigation,
         slot_items=slot_items,
-        # Served whatever the slot switch says: the server enforces them either way.
-        labels=[
-            ExtensionLabelResponse(
-                key=label.key,
-                title=label.title,
-                values=[
-                    ExtensionLabelValueResponse(
-                        value=value.value, label=value.label, icon=value.icon, tone=value.tone
-                    )
-                    for value in label.values
-                ],
-            )
-            for label in manifest.labels
-        ],
+        state_fields=state_fields,
+        commands=commands,
         browser=ExtensionBrowserBundleResponse(
             declared=manifest.entrypoints.browser is not None,
             has_styles=manifest.entrypoints.browser_css is not None,
@@ -273,8 +372,13 @@ def create_extensions_router(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     enablement: ExtensionEnablement | None = None,
+    state_enabled: Callable[[str], bool] | None = None,
 ) -> APIRouter:
-    """Build the installed-extension catalog router, mounted under ``/v1``."""
+    """Build the installed-extension catalog router, mounted under ``/v1``.
+
+    :param state_enabled: The predicate that gates extension state and
+        commands on the server; defaults to the slot enablement.
+    """
     router = APIRouter()
     resolved_bundles = bundles or {}
     resolved_enablement = enablement or ExtensionEnablement()
@@ -283,6 +387,7 @@ def create_extensions_router(
             manifest,
             resolved_bundles.get(manifest.id),
             slots_enabled=resolved_enablement.allows_slots(manifest.id),
+            state_enabled=(state_enabled or resolved_enablement.allows_slots)(manifest.id),
         )
         for manifest in sorted(state.manifests, key=lambda item: item.id)
     )

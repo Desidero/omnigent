@@ -26,9 +26,8 @@ from omnigent.extensions.api import (
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
-    LabelBinding,
-    LabelDeclaration,
-    LabelTone,
+    FieldBinding,
+    FieldTone,
     PageContribution,
     PrimaryNavigationContribution,
     SetState,
@@ -43,7 +42,6 @@ from omnigent.extensions.state_fields import pinned_field
 from omnigent.extensions.state_keys import (
     COMMAND_STATE_KEYS,
     EXTENSION_ID_RE,
-    EXTENSION_LABEL_PREFIX,
     MAX_PUBLISHED_FIELDS,
     PUBLISHED_FIELD_KEY_RE,
     PUBLISHED_VALUE_MAX_LENGTH,
@@ -73,14 +71,9 @@ _MAX_TEXT_LENGTH = 512
 _MAX_ASSET_DEPTH = 16
 #: Reserved for core's own slot entries, which the web app registers itself.
 RESERVED_CORE_ID_PREFIX = "core."
-_LABEL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$")
-_LABEL_VALUE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
-# The server's own label key and value caps.
-_MAX_LABEL_KEY_LENGTH = 128
-_MAX_LABEL_VALUE_LENGTH = 256
-_MAX_LABELS = 4
-_MAX_LABEL_VALUES = 12
-#: Icons the web app can draw; label values must use one, since the icon carries
+_FIELD_VALUE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_MAX_FIELD_VALUES = 12
+#: Icons the web app can draw; field values must use one, since the icon carries
 #: their meaning. The web app's ``icons.ts`` mirrors this set.
 APPROVED_ICONS = frozenset(
     {
@@ -103,6 +96,26 @@ _MAX_STATE_FIELDS = 32
 
 class ExtensionValidationError(ValueError):
     """An extension manifest is structurally invalid or incompatible."""
+
+
+# Names an extension written for page-writable declared labels still uses,
+# and the retired ``labels=`` / ``clear_label=`` keyword arguments.
+_RETIRED_LABEL_NAMES = re.compile(
+    r"\b(LabelDeclaration|LabelBinding|LabelValue|LabelTone|SET_LABEL|SESSIONS_LABELS_WRITE)\b"
+    r"|keyword argument '(labels|clear_label)'"
+)
+_LABEL_MIGRATION_HINT = (
+    "; declared labels became published state fields and commands, see "
+    "docs/extending/extension_ui_slots.md#migrating-from-declared-labels"
+)
+
+
+def _load_error_message(exc: Exception) -> str:
+    """The recorded load error, pointing manifests built on retired label names at the guide."""
+    message = str(exc)
+    if _RETIRED_LABEL_NAMES.search(message):
+        return message + _LABEL_MIGRATION_HINT
+    return message
 
 
 def _entry_point_distribution_name(entry_point: Any) -> str | None:
@@ -253,11 +266,12 @@ _SLOT_KINDS = {
     SlotId.SESSION_RIGHT_RAIL_TABS: SlotItemKind.TAB,
     SlotId.SETTINGS_SECTIONS: SlotItemKind.SECTION,
     SlotId.SESSION_ROW_DECORATIONS: SlotItemKind.DECORATION,
-    SlotId.SESSION_ROW_MENU: SlotItemKind.SET_LABEL,
+    SlotId.SESSION_ROW_MENU: SlotItemKind.COMMAND,
     SlotId.SESSION_ROW_HOVER: SlotItemKind.ROW,
 }
-# Kinds core renders from a bound label rather than as a link to a page.
-_LABEL_BOUND_KINDS = frozenset({SlotItemKind.DECORATION, SlotItemKind.SET_LABEL, SlotItemKind.ROW})
+# Kinds core renders from a published field rather than as a link to a page.
+_FIELD_BOUND_KINDS = frozenset({SlotItemKind.DECORATION, SlotItemKind.ROW})
+_PAGE_KINDS = frozenset({SlotItemKind.ACTION, SlotItemKind.TAB, SlotItemKind.SECTION})
 
 # Most items one extension may place in each slot, so no single package
 # crowds a shared surface. The web app mirrors these values.
@@ -272,50 +286,56 @@ _SLOT_ITEM_LIMITS = {
 }
 
 
-def extension_label_prefix(extension_id: str) -> str:
-    """Return the label-key prefix an extension's declared labels use."""
-    return f"{EXTENSION_LABEL_PREFIX}{extension_id}."
+def _published_fields(state: StateContribution | None) -> dict[str, StateField]:
+    fields = state.fields if state is not None else ()
+    return {item.key: item for item in fields if item.visibility is StateVisibility.PUBLISHED}
 
 
-def _validate_label(extension_id: str, label: LabelDeclaration) -> None:
-    if not isinstance(label, LabelDeclaration):
-        raise ExtensionValidationError("labels contains an invalid declaration type")
-    _require_text(label.key, "label key")
-    prefix = extension_label_prefix(extension_id)
-    name = label.key.removeprefix(prefix)
-    if (
-        name == label.key
-        or not _LABEL_NAME_RE.fullmatch(name)
-        or len(label.key) > _MAX_LABEL_KEY_LENGTH
-    ):
+def _validate_field_binding(item: SlotItemContribution, published: dict[str, StateField]) -> None:
+    binding = item.binding
+    if not isinstance(binding, FieldBinding) or binding.source != "published_field":
         raise ExtensionValidationError(
-            f"label key {label.key!r} must be {prefix}<name>, with one lowercase name "
-            f"segment and at most {_MAX_LABEL_KEY_LENGTH} characters"
+            f"slot item {item.id!r} must bind a published field of its extension"
         )
-    _require_text(label.title, f"label {label.key!r} title")
-    if not isinstance(label.values, tuple) or not 1 <= len(label.values) <= _MAX_LABEL_VALUES:
+    target = published.get(binding.key)
+    if target is None:
         raise ExtensionValidationError(
-            f"label {label.key!r} values must be a tuple of 1 to {_MAX_LABEL_VALUES} values"
+            f"slot item {item.id!r} binds {binding.key!r}, which is not a published field "
+            "of its extension"
         )
-    for value in label.values:
-        _require_text(value.value, f"label {label.key!r} value")
-        if (
-            not _LABEL_VALUE_RE.fullmatch(value.value)
-            or len(value.value) > _MAX_LABEL_VALUE_LENGTH
-        ):
-            raise ExtensionValidationError(
-                f"label {label.key!r} value {value.value!r} must be a lowercase slug"
-            )
-        _require_text(value.label, f"label {label.key!r} value {value.value!r} label")
-        if value.icon not in APPROVED_ICONS:
-            raise ExtensionValidationError(
-                f"label {label.key!r} value {value.value!r} uses unknown icon {value.icon!r}"
-            )
-        if not isinstance(value.tone, LabelTone):
-            raise ExtensionValidationError(
-                f"label {label.key!r} value {value.value!r} uses an unsupported tone"
-            )
-    _reject_duplicates((value.value for value in label.values), f"label {label.key!r} values")
+    # A badge is an icon, so its field must say which icon each value shows.
+    if item.kind is SlotItemKind.DECORATION and not target.values:
+        raise ExtensionValidationError(
+            f"slot item {item.id!r} binds field {binding.key!r}, which declares no values"
+        )
+
+
+def _validate_menu_commands(
+    item: SlotItemContribution, commands: dict[str, CommandContribution]
+) -> None:
+    command = commands.get(item.command) if isinstance(item.command, str) else None
+    if command is None or command.action is None:
+        raise ExtensionValidationError(
+            f"slot item {item.id!r} must name a command of its extension that has an action"
+        )
+    lists_choices = len(command.arguments) == 1 and bool(command.arguments[0].choices)
+    if command.arguments and not lists_choices:
+        raise ExtensionValidationError(
+            f"slot item {item.id!r} command {command.id!r} must take no arguments, or one "
+            "argument with choices"
+        )
+    if item.clear_command is None:
+        return
+    if not lists_choices:
+        raise ExtensionValidationError(
+            f"slot item {item.id!r} sets clear_command, but its command lists no choices"
+        )
+    clear = commands.get(item.clear_command) if isinstance(item.clear_command, str) else None
+    if clear is None or clear.action is None or clear.arguments:
+        raise ExtensionValidationError(
+            f"slot item {item.id!r} clear_command must name a command of its extension "
+            "that has an action and no arguments"
+        )
 
 
 def _validate_slot_item(
@@ -323,7 +343,8 @@ def _validate_slot_item(
     item: SlotItemContribution,
     *,
     page_ids: set[str],
-    label_keys: set[str],
+    published: dict[str, StateField],
+    commands: dict[str, CommandContribution],
 ) -> None:
     _validate_contribution_id(extension_id, item.id, "slot item")
     if not isinstance(item.slot, SlotId):
@@ -337,36 +358,65 @@ def _validate_slot_item(
             f"for slot {item.slot.value!r}"
         )
     _require_text(item.label, f"slot item {item.id!r} label")
-    if item.kind in _LABEL_BOUND_KINDS:
-        if item.page is not None:
-            raise ExtensionValidationError(f"slot item {item.id!r} cannot reference a page")
-        if not isinstance(item.binding, LabelBinding) or item.binding.key not in label_keys:
-            raise ExtensionValidationError(
-                f"slot item {item.id!r} must bind a label its extension declares"
-            )
-        # Core draws these icons without a fallback, as it does label values.
-        if item.icon is not None and item.icon not in APPROVED_ICONS:
-            raise ExtensionValidationError(
-                f"slot item {item.id!r} uses unknown icon {item.icon!r}"
-            )
-    else:
-        if item.binding is not None:
-            raise ExtensionValidationError(f"slot item {item.id!r} cannot bind a label")
+    if item.kind in _FIELD_BOUND_KINDS:
+        _validate_field_binding(item, published)
+    elif item.binding is not None:
+        raise ExtensionValidationError(f"slot item {item.id!r} cannot bind a field")
+    if item.kind is SlotItemKind.COMMAND:
+        _validate_menu_commands(item, commands)
+    elif item.command is not None or item.clear_command is not None:
+        raise ExtensionValidationError(f"slot item {item.id!r} cannot name a command")
+    if item.kind in _PAGE_KINDS:
         _require_text(item.page, f"slot item {item.id!r} page")
         if item.page not in page_ids:
             raise ExtensionValidationError(
                 f"slot item {item.id!r} references unknown page {item.page!r}"
             )
-    if item.clear_label is not None:
-        if item.kind is not SlotItemKind.SET_LABEL:
-            raise ExtensionValidationError(f"slot item {item.id!r} cannot set clear_label")
-        _require_text(item.clear_label, f"slot item {item.id!r} clear_label")
+    elif item.page is not None:
+        raise ExtensionValidationError(f"slot item {item.id!r} cannot reference a page")
+    # Core draws session-row icons without a fallback, as it does field values.
+    if item.kind not in _PAGE_KINDS and item.icon is not None and item.icon not in APPROVED_ICONS:
+        raise ExtensionValidationError(f"slot item {item.id!r} uses unknown icon {item.icon!r}")
     if item.icon is not None:
         _require_symbol(item.icon, f"slot item {item.id!r} icon")
     if item.when is not None:
         _require_text(item.when, f"slot item {item.id!r} when")
     if isinstance(item.order, bool) or not isinstance(item.order, int):
         raise ExtensionValidationError(f"slot item {item.id!r} order must be an integer")
+
+
+def _validate_field_values(field_decl: StateField) -> None:
+    key = field_decl.key
+    if not isinstance(field_decl.values, tuple):
+        raise ExtensionValidationError(f"state field {key!r} values must be a tuple")
+    if not field_decl.values:
+        return
+    if field_decl.visibility is not StateVisibility.PUBLISHED:
+        raise ExtensionValidationError(
+            f"state field {key!r}: values apply only to published fields"
+        )
+    if len(field_decl.values) > _MAX_FIELD_VALUES:
+        raise ExtensionValidationError(
+            f"published state field {key!r} lists more than {_MAX_FIELD_VALUES} values"
+        )
+    for value in field_decl.values:
+        _require_text(value.value, f"field {key!r} value")
+        if not _FIELD_VALUE_RE.fullmatch(value.value) or len(value.value) > (
+            field_decl.max_length or 0
+        ):
+            raise ExtensionValidationError(
+                f"field {key!r} value {value.value!r} must be a lowercase slug within max_length"
+            )
+        _require_text(value.label, f"field {key!r} value {value.value!r} label")
+        if value.icon not in APPROVED_ICONS:
+            raise ExtensionValidationError(
+                f"field {key!r} value {value.value!r} uses unknown icon {value.icon!r}"
+            )
+        if not isinstance(value.tone, FieldTone):
+            raise ExtensionValidationError(
+                f"field {key!r} value {value.value!r} uses an unsupported tone"
+            )
+    _reject_duplicates((value.value for value in field_decl.values), f"field {key!r} values")
 
 
 def _validate_state_field(extension_id: str, field_decl: StateField) -> None:
@@ -404,7 +454,9 @@ def _validate_state_field(extension_id: str, field_decl: StateField) -> None:
                 f"published state field {key!r} needs max_length from 1 to "
                 f"{PUBLISHED_VALUE_MAX_LENGTH}"
             )
+        _validate_field_values(field_decl)
         return
+    _validate_field_values(field_decl)
     if field_decl.max_length is not None:
         raise ExtensionValidationError(
             f"state field {key!r}: max_length applies only to published fields"
@@ -564,6 +616,26 @@ def _validate_command_action(
         raise ExtensionValidationError(
             f"command {command.id!r} value exceeds published field {target.key!r} max_length"
         )
+    if isinstance(action, SetState) and target.values:
+        _validate_listed_value(command, action, target)
+
+
+def _validate_listed_value(
+    command: CommandContribution, action: SetState, target: StateField
+) -> None:
+    """A command may write only a listed value to a field that lists its values."""
+    listed = {value.value for value in target.values}
+    argument = next(
+        (item for item in command.arguments if action.value == f"{{{item.name}}}"), None
+    )
+    if argument is not None and argument.choices and set(argument.choices) <= listed:
+        return
+    if action.value in listed:
+        return
+    raise ExtensionValidationError(
+        f"command {command.id!r} must write one of field {target.key!r}'s values: a listed "
+        "literal, or a single {argument} whose choices are all listed"
+    )
 
 
 def _validate_command(
@@ -620,7 +692,6 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
         "pages",
         "primary_navigation",
         "slot_items",
-        "labels",
         "commands",
         "activation_events",
     ):
@@ -728,30 +799,21 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     for command in manifest.commands:
         _validate_command(manifest.id, command, manifest.state)
 
-    if len(manifest.labels) > _MAX_LABELS:
-        raise ExtensionValidationError(
-            f"extension {manifest.id!r} declares more than {_MAX_LABELS} labels"
-        )
-    for label in manifest.labels:
-        _validate_label(manifest.id, label)
-    _reject_duplicates((label.key for label in manifest.labels), "label keys")
-    label_keys = {label.key for label in manifest.labels}
-    if (
-        any(item.kind is SlotItemKind.SET_LABEL for item in manifest.slot_items)
-        and ExtensionPermission.SESSIONS_LABELS_WRITE not in manifest.permissions
-    ):
-        raise ExtensionValidationError(
-            f"extension {manifest.id!r} has a set-label item but does not request "
-            f"{ExtensionPermission.SESSIONS_LABELS_WRITE.value!r}"
-        )
-
     page_ids = {page.id for page in manifest.pages}
     command_ids = {command.id for command in manifest.commands}
     for navigation in manifest.primary_navigation:
         _validate_navigation(manifest.id, navigation, page_ids=page_ids)
     navigation_ids = {navigation.id for navigation in manifest.primary_navigation}
+    published = _published_fields(manifest.state)
+    commands_by_id = {command.id: command for command in manifest.commands}
     for item in manifest.slot_items:
-        _validate_slot_item(manifest.id, item, page_ids=page_ids, label_keys=label_keys)
+        _validate_slot_item(
+            manifest.id,
+            item,
+            page_ids=page_ids,
+            published=published,
+            commands=commands_by_id,
+        )
     for slot, limit in _SLOT_ITEM_LIMITS.items():
         count = sum(1 for item in manifest.slot_items if item.slot is slot)
         if count > limit:
@@ -891,7 +953,7 @@ def _load_community_manifests() -> tuple[
         # Entry points are an external package boundary: one plugin may raise
         # any exception, and must not prevent healthy extensions from loading.
         except Exception as exc:
-            errors[key] = str(exc)
+            errors[key] = _load_error_message(exc)
             _logger.warning(
                 "could not load extension entry point %s (%s)",
                 key,

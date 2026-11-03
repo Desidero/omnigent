@@ -153,6 +153,21 @@ describe("mergeItemsIntoPages", () => {
     expect(after!.pages[0].data[0].pull_request?.state).toBe("MERGED");
   });
 
+  it("compares published extension fields by value", () => {
+    const fields = { "acme.status": { status: "blocked" } };
+    const before = data([conv("a", { published_fields: fields })]);
+    const same = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", published_fields: { "acme.status": { status: "blocked" } } }],
+    ]);
+    const changed = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", published_fields: { "acme.status": { status: "done" } } }],
+    ]);
+
+    expect(mergeItemsIntoPages(before, same, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(before);
+    const { data: after } = mergeItemsIntoPages(before, changed, DEFAULT_FILTERS, NO_ACTIVE);
+    expect(after!.pages[0].data[0].published_fields).toEqual({ "acme.status": { status: "done" } });
+  });
+
   it("does not report ids absent from any page (structural additions)", () => {
     const before = data([conv("a")]);
     const items = new Map<string, SessionListWireItem>([

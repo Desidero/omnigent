@@ -151,7 +151,6 @@ def test_extension_permission_values_include_read_only_sessions() -> None:
         "navigation",
         "projects.read",
         "projects.write",
-        "sessions.labels.write",
         "sessions.read",
         "storage.user",
     }
@@ -312,6 +311,36 @@ def test_records_raising_entry_point(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert state.manifests == ()
     assert state.load_errors["broken"] == "extension import failed"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("cannot import name 'LabelDeclaration' from 'omnigent.extensions'"),
+        TypeError("ExtensionManifest.__init__() got an unexpected keyword argument 'labels'"),
+        AttributeError("type object 'SlotItemKind' has no attribute 'SET_LABEL'"),
+    ],
+)
+def test_points_declared_label_manifests_at_the_migration_guide(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def outdated() -> ExtensionManifest:
+        raise error
+
+    _install_entry_points(monkeypatch, _EntryPoint("outdated", outdated))
+
+    message = registry.plugin_state().load_errors["outdated"]
+    assert message.startswith(str(error))
+    assert "extension_ui_slots.md#migrating-from-declared-labels" in message
+
+
+def test_mentions_of_labels_alone_get_no_migration_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken() -> ExtensionManifest:
+        raise RuntimeError("could not read the session labels")
+
+    _install_entry_points(monkeypatch, _EntryPoint("broken", broken))
+
+    assert registry.plugin_state().load_errors["broken"] == "could not read the session labels"
 
 
 @pytest.mark.parametrize(

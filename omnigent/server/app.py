@@ -65,7 +65,6 @@ from omnigent.extensions.enablement import (
     apply_extension_enablement,
     parse_extension_enablement,
 )
-from omnigent.extensions.labels import ExtensionLabelPolicy, set_active_label_policy
 from omnigent.extensions.published_fields import (
     build_published_field_view,
     configure_published_fields,
@@ -2351,8 +2350,6 @@ def create_app(
     app.state.branding_snapshot = branding_snapshot
     app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
-    # Every session-label write path checks extension-declared keys against this.
-    set_active_label_policy(ExtensionLabelPolicy(resolved_extension_state.manifests))
     app.state.harness_install = app_harness_install
     app.state.automations = True if automations is None else automations
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
@@ -3884,6 +3881,7 @@ def create_app(
             auth_provider=auth_provider,
             permission_store=permission_store,
             enablement=extension_enablement,
+            state_enabled=extension_state_enabled,
         ),
         prefix="/v1",
         tags=["extensions"],

@@ -160,6 +160,8 @@ export interface Conversation {
   created_at: number;
   updated_at: number;
   labels: Record<string, string>;
+  /** Enabled extensions' published state fields, by extension id then key. */
+  published_fields?: Record<string, Record<string, string>>;
   permission_level: number | null;
   owner?: string | null;
   runner_id?: string | null;
@@ -507,6 +509,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     created_at: wire.created_at,
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
+    published_fields: wire.published_fields ?? {},
     permission_level: wire.permission_level ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,

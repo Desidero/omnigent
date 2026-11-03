@@ -60,33 +60,59 @@ export type ExtensionSlotId =
 export interface ExtensionSlotItem {
   id: string;
   slot: ExtensionSlotId;
-  kind: "action" | "tab" | "section" | "decoration" | "set-label" | "row";
+  kind: "action" | "tab" | "section" | "decoration" | "command" | "row";
   label: string;
-  /** Set on page-backed kinds; session-row kinds bind a label instead. */
+  /** Set on page-backed kinds; session-row kinds bind a field or name a command instead. */
   page: string | null;
   icon: string | null;
   order: number;
   when: string | null;
-  binding?: { source: "label"; key: string } | null;
-  /** A set-label item's clear entry, e.g. "Clear status". */
-  clear_label?: string | null;
+  /** The published state field a decoration or hover row shows. */
+  binding?: { source: "published_field"; key: string } | null;
+  /** The command a row-menu item runs, or whose single `choices` argument it lists. */
+  command?: string | null;
+  /** A no-argument command listed after a row-menu item's choices, e.g. "Clear status". */
+  clear_command?: string | null;
 }
 
-export type ExtensionLabelTone = "neutral" | "info" | "success" | "warning" | "danger";
+export type ExtensionFieldTone = "neutral" | "info" | "success" | "warning" | "danger";
 
-export interface ExtensionLabelValue {
+/** One listed value of a published field, with how session rows show it. */
+export interface ExtensionFieldValue {
   value: string;
   label: string;
   icon: string;
-  tone: ExtensionLabelTone;
+  tone: ExtensionFieldTone;
 }
 
-/** An ordinary session label whose key and allowed values an extension declares. */
-export interface ExtensionLabelDeclaration {
+/** A declared state key (or `prefix*`) and who may read it. */
+export interface ExtensionStateField {
   key: string;
-  title: string;
-  values: ExtensionLabelValue[];
+  visibility: "service" | "editors" | "readers" | "published";
+  max_length: number | null;
+  values: ExtensionFieldValue[];
 }
+
+export interface ExtensionCommandArgument {
+  name: string;
+  choices: string[];
+  pattern: string | null;
+  max_length: number;
+}
+
+/** A command users run on a session; the server checks `required_access`. */
+export interface ExtensionCommand {
+  id: string;
+  title: string;
+  arguments: ExtensionCommandArgument[];
+  required_access: "read" | "edit";
+  /** Shown before running; the server does not enforce it. */
+  confirm: string | null;
+  action: { type: "set_state" | "clear_state"; field: string; value: string | null };
+}
+
+/** Enabled extensions' published fields on a session, by extension id then key. */
+export type PublishedFields = Record<string, Record<string, string>>;
 
 export interface ExtensionBrowserBundle {
   declared: boolean;
@@ -108,7 +134,9 @@ export interface ExtensionCatalogItem {
   pages: ExtensionPage[];
   primary_navigation: ExtensionPrimaryNavigation[];
   slot_items: ExtensionSlotItem[];
-  labels?: ExtensionLabelDeclaration[];
+  /** Published fields only; absent from servers without extension state, empty until enabled. */
+  state_fields?: ExtensionStateField[];
+  commands?: ExtensionCommand[];
   browser: ExtensionBrowserBundle;
 }
 

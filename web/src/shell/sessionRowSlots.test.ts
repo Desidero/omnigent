@@ -4,26 +4,36 @@ import {
   CORE_SESSION_ROW_DECORATIONS,
   CORE_SESSION_ROW_MENU,
   resolveSessionRowEntries,
-  type SessionRowLabel,
+  type SessionRowCommand,
 } from "./sessionRowSlots";
 
-function extensionItem(id: string, order: number): SessionRowLabel {
+function extensionItem(id: string, order: number): SessionRowCommand {
   const item: ExtensionSlotItem = {
     id,
     slot: "session.row.menu",
-    kind: "set-label",
+    kind: "command",
     label: id,
     page: null,
     icon: null,
     order,
     when: "never",
-    binding: { source: "label", key: `ext.${id}` },
+    command: `${id}.run`,
   };
   return {
     extension: {} as ExtensionCatalogItem,
     item,
-    label: { key: `ext.${id}`, title: id, values: [] },
-    value: null,
+    command: {
+      id: `${id}.run`,
+      title: id,
+      arguments: [],
+      required_access: "edit",
+      confirm: null,
+      action: { type: "clear_state", field: "status", value: null },
+    },
+    choices: null,
+    clear: null,
+    field: null,
+    current: null,
   };
 }
 

@@ -26,7 +26,7 @@ const ICONS: Record<string, LucideIcon> = {
   "square-parking": SquareParkingIcon,
 };
 
-/** An approved icon, or null; for declared label items, which have no fallback. */
+/** An approved icon, or null; for session-row items and field values, which have no fallback. */
 export function approvedExtensionIcon(name: string | null): LucideIcon | null {
   // Own keys only: manifest names like "constructor" must not reach Object.prototype.
   return name !== null && Object.hasOwn(ICONS, name) ? ICONS[name] : null;

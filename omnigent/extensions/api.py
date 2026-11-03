@@ -33,7 +33,7 @@ class SlotItemKind(StrEnum):
     TAB = "tab"
     SECTION = "section"
     DECORATION = "decoration"
-    SET_LABEL = "set-label"
+    COMMAND = "command"
     ROW = "row"
 
 
@@ -44,11 +44,10 @@ class ExtensionPermission(StrEnum):
     PROJECTS_READ = "projects.read"
     PROJECTS_WRITE = "projects.write"
     SESSIONS_READ = "sessions.read"
-    SESSIONS_LABELS_WRITE = "sessions.labels.write"
     STORAGE_USER = "storage.user"
 
 
-class LabelTone(StrEnum):
+class FieldTone(StrEnum):
     """Named colour tone core maps to its own status theme tokens."""
 
     NEUTRAL = "neutral"
@@ -105,6 +104,16 @@ class CommandAccess(StrEnum):
 
 
 @dataclass(frozen=True)
+class FieldValue:
+    """One value of a published field, with how core shows it on session rows."""
+
+    value: str
+    label: str
+    icon: str
+    tone: FieldTone = FieldTone.NEUTRAL
+
+
+@dataclass(frozen=True)
 class StateField:
     """Declares who can read one session state key, or a family of keys.
 
@@ -114,13 +123,16 @@ class StateField:
     ``max_length`` characters; core mirrors them as read-only
     ``ext.<extension id>.<key>`` session labels. ``max_keys`` caps how many
     keys of a prefix family commands may create on one session (16 when
-    unset); the extension's own server code is not limited by it.
+    unset); the extension's own server code is not limited by it. A
+    published field may list its ``values`` with their presentation, which
+    session-row decorations need.
     """
 
     key: str
     visibility: StateVisibility = StateVisibility.SERVICE
     max_length: int | None = None
     max_keys: int | None = None
+    values: tuple[FieldValue, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -160,42 +172,20 @@ class ClearState:
 
 
 @dataclass(frozen=True)
-class LabelValue:
-    """One allowed value of a declared session label, with its presentation."""
-
-    value: str
-    label: str
-    icon: str
-    tone: LabelTone = LabelTone.NEUTRAL
-
-
-@dataclass(frozen=True)
-class LabelDeclaration:
-    """An ordinary session label whose key and values an extension declares.
-
-    The key is ``ext.<extension id>.<name>``. Anyone who may edit the session
-    may change it; the server only accepts the declared values.
-    """
+class FieldBinding:
+    """Binds a session-row slot item to a published state field of the same extension."""
 
     key: str
-    title: str
-    values: tuple[LabelValue, ...]
-
-
-@dataclass(frozen=True)
-class LabelBinding:
-    """Binds a session-row slot item to a declared label of the same extension."""
-
-    key: str
-    source: Literal["label"] = "label"
+    source: Literal["published_field"] = "published_field"
 
 
 @dataclass(frozen=True)
 class SlotItemContribution:
-    """A core-rendered slot item: a link to an extension page, or a bound label.
+    """A core-rendered slot item: a link to an extension page, a bound field, or a command.
 
-    Page-backed kinds (action, tab, section) set ``page``; session-row kinds
-    (decoration, set-label, row) set ``binding`` instead.
+    Page-backed kinds (action, tab, section) set ``page``. Decorations and
+    hover rows (decoration, row) set ``binding`` to a published field. Row
+    menu items (command) set ``command``, and optionally ``clear_command``.
     """
 
     id: str
@@ -206,9 +196,11 @@ class SlotItemContribution:
     icon: str | None = None
     order: int = 500
     when: str | None = None
-    binding: LabelBinding | None = None
-    #: A set-label item's clear entry, e.g. ``"Clear status"``; core shows "Clear" without it.
-    clear_label: str | None = None
+    binding: FieldBinding | None = None
+    #: The command a row-menu item runs, or whose single ``choices`` argument it lists.
+    command: str | None = None
+    #: A no-argument command listed last in a row-menu item's choices, e.g. "Clear status".
+    clear_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -249,7 +241,6 @@ class ExtensionManifest:
     pages: tuple[PageContribution, ...] = ()
     primary_navigation: tuple[PrimaryNavigationContribution, ...] = ()
     slot_items: tuple[SlotItemContribution, ...] = ()
-    labels: tuple[LabelDeclaration, ...] = ()
     commands: tuple[CommandContribution, ...] = ()
     state: StateContribution | None = None
 
