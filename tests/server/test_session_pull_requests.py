@@ -303,3 +303,79 @@ def test_only_a_completed_turn_notifies_the_refresher(monkeypatch: pytest.Monkey
     helpers._publish_status(session, "waiting")
     helpers._publish_status(session, "idle", persist_live_status=False)
     assert notified == [session]
+
+
+# Each case: the edges published in order, as (status, persist_live_status,
+# turn_completed), and whether the last one refreshes the session's PRs.
+_TURN_END_EDGES = [
+    ([("running", True, False), ("idle", True, False)], True),
+    ([("waiting", True, False), ("idle", True, False)], True),
+    ([("running", True, False), ("waiting", True, False), ("idle", True, False)], True),
+    ([("running", True, False), ("idle", False, False)], False),
+    ([("idle", True, False)], False),
+    ([("idle", True, False), ("idle", True, False)], False),
+    ([("running", True, False), ("failed", True, False)], False),
+    ([("running", True, False), ("failed", True, False), ("idle", True, False)], False),
+    ([("running", True, False), ("failed", True, False), ("idle", True, True)], False),
+    ([("failed", True, False), ("running", True, False), ("idle", True, True)], True),
+]
+
+
+@pytest.mark.parametrize(
+    ("edges", "refreshes"),
+    _TURN_END_EDGES,
+    ids=[
+        "running-to-idle",
+        "waiting-to-idle",
+        "running-waiting-idle",
+        "stop-or-archive",
+        "first-idle",
+        "idle-to-idle",
+        "running-to-failed",
+        "failed-stays-sticky",
+        "confirmed-completion-after-failed",
+        "new-turn-after-failed",
+    ],
+)
+def test_turn_end_refresh_follows_the_published_edge(
+    monkeypatch: pytest.MonkeyPatch,
+    edges: list[tuple[str, bool, bool]],
+    refreshes: bool,
+) -> None:
+    notified: list[str] = []
+    monkeypatch.setattr(server_prs, "notify_turn_end", notified.append)
+    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *_: None)
+    session = "c0ffee00c0ffee00c0ffee00c0ffee01"
+    monkeypatch.delitem(helpers._session_status_cache, session, raising=False)
+
+    for status, persist, completed in edges[:-1]:
+        helpers._publish_status(
+            session, status, persist_live_status=persist, turn_completed=completed
+        )
+    assert notified == []
+    status, persist, completed = edges[-1]
+    helpers._publish_status(session, status, persist_live_status=persist, turn_completed=completed)
+    assert notified == ([session] if refreshes else [])
+
+
+async def test_turn_end_refresh_runs_in_the_publishing_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[tuple[int, str]] = []
+
+    async def refresh(session_id: str) -> None:
+        started.append((current_workspace_id(), session_id))
+
+    refresher = server_prs.PullRequestRefresher(turn_end_delay_s=0)
+    refresher.bind(refresh)
+    monkeypatch.setattr(server_prs, "_installed", refresher)
+    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *_: None)
+    monkeypatch.delitem(helpers._session_status_cache, SESSION, raising=False)
+
+    with workspace_scope(7):
+        helpers._publish_status(SESSION, "running")
+        helpers._publish_status(SESSION, "idle")
+    while refresher._running:
+        await asyncio.gather(*refresher._running.values())
+    assert started == [(7, SESSION)]
+    await refresher.aclose()
