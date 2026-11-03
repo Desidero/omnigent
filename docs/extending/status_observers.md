@@ -62,3 +62,42 @@ session's stored pull requests once (see
 [Pull request providers](../git-pull-requests.md)). Stops, archives and
 failures don't refresh. Listed sessions are still refreshed when stale, so a
 missed edge only delays a refresh.
+
+## Extension observers
+
+Extensions receive the same observations, best-effort, through
+`omnigent.server.extension_status_observers.ExtensionStatusObservers`. V1
+offers extensions no way to subscribe yet; server-side extension activation
+will call `subscribe(extension_id, callback)` on their behalf, on the server's
+event loop.
+
+- **Who receives them.** Only extensions that are installed and enabled by the
+  operator, as the server's `is_enabled` check reports. It runs inline on every
+  status edge for every subscriber, so it must be a constant-time, in-memory
+  lookup. It is checked when an extension subscribes and again before each
+  observation is queued, so a disabled extension stops receiving them.
+- **Async only.** A callback must be an `async def`; `subscribe` rejects any
+  other callable with a `TypeError`. Callbacks run on the server's event loop,
+  one at a time per extension.
+- **Context.** Each callback runs in a copy of the publisher's context, so
+  `current_workspace_id()` is the session's workspace.
+- **Timeout.** A callback is cancelled after 10 seconds by default. One that
+  ignores the cancellation keeps its place until it returns, so the extension's
+  later observations wait behind it (and are dropped once the backlog is
+  full); it never runs alongside another of the same extension's callbacks.
+- **Bounded backlog.** Each extension may have at most 256 observations queued
+  or running. Beyond that, new observations are dropped.
+- **Counted, not quarantined.** Deliveries, failures, timeouts and drops are
+  counted per extension (`stats()`), and the first of each kind is logged as a
+  warning. None of them disables the extension.
+
+Because observations can be dropped, an extension that acts on them must also
+reconcile on its own schedule; treat an observation as a hint to check sooner.
+
+### Shutdown
+
+At shutdown, `aclose()` stops new deliveries and waits at most a bounded time
+(2 seconds by default) for queued observations. Whatever is still queued or
+running then is cancelled, abandoned and counted. This bounds how long the
+application waits, not how long a callback runs: one that ignores cancellation
+can keep running until the event loop closes.
