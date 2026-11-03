@@ -393,7 +393,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
-from omnigent.server.server_messages import NEXT_TURN_ONLY
+from omnigent.server.server_messages import AUTOMATION_HEADER_PREFIX, NEXT_TURN_ONLY
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
@@ -3160,7 +3160,13 @@ async def _persist_external_conversation_item_unlocked(
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
         if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
-            drained = pending_inputs.resolve_oldest(session_id, hold=True)
+            # Text without the automation header isn't a held session wake: pass
+            # over wakes so a person's reformatted message behind one settles.
+            drained = pending_inputs.resolve_oldest(
+                session_id,
+                hold=True,
+                skip_automation=not text.lstrip().startswith(AUTOMATION_HEADER_PREFIX),
+            )
             if drained is not None:
                 match_method = "fifo_fallback"
                 # The mirror's true owner may be any entry still queued, so none
@@ -3247,6 +3253,12 @@ async def _persist_external_conversation_item_unlocked(
         )
         raise
     persisted = persisted_items[len(skipped_new_items)]
+    if not persisted.deduplicated and drained is not None and drained.origin is not None:
+        # Keyed on the queued input, not the text: a FIFO settlement also
+        # resolves the wake's queued input.
+        from omnigent.server import session_wake
+
+        session_wake.note_persisted(session_id, drained.pending_id)
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user

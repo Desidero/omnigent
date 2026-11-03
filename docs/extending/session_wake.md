@@ -1,0 +1,98 @@
+# Session wake
+
+Server-side automation, such as a goal loop that watches a session's pull
+requests, sometimes needs to hand an idle agent a message: "PR #7 failed CI".
+The session wake service does that the same way on every harness. It waits
+until the session is idle, posts the message as the session owner with a
+visible automation label, and never steers it into a turn that is running.
+
+The service is `app.state.session_wake`
+(`omnigent.server.session_wake.SessionWakeService`). V1 has no HTTP route:
+core modules call it directly, and server-side extension activation will bind
+it to an extension's id.
+
+## Requesting a wake
+
+```python
+from omnigent.server.session_wake import WakeRequest
+
+outcome = await app.state.session_wake.request(
+    WakeRequest(
+        session_id=session_id,
+        source="ext:acme.goal-loop",  # or "core:<name>"
+        on_behalf_of=user_id,  # who turned the automation on
+        text="PR #7: the test job failed on the head commit.",
+        dedupe_key=digest_of_events,
+        evidence_key=digest_of_goal_state,
+        max_wakes=10,
+        label="Goal loop",
+    )
+)
+```
+
+`request` returns one of:
+
+| Outcome | Meaning |
+| --- | --- |
+| `queued` | The wake is pending and goes out at the session's next idle moment. It replaced any wake this source had pending for the session. |
+| `merged` | With `merge=True`, the text was appended to the pending wake's. |
+| `duplicate` | `dedupe_key` equals the last delivered wake's, or the pending one's. Nothing changed. |
+| `budget_spent` | This source already delivered `max_wakes` wakes (at most 50) to the session. |
+| `not_authorized` | The source is disabled, or `on_behalf_of` lacks EDIT on the session or its account generation is no longer valid. |
+
+`cancel(session_id, source)` drops a pending wake. `status(session_id, source)`
+returns whether one is pending, the wakes delivered, the budget, failures in a
+row, seconds until the next wake may go out, and why the source was last
+stopped. `add_stop_listener(callback)` is called with
+`(session_id, source, reason)` when a pending wake is dropped at delivery time:
+`not_authorized`, `undeliverable`, `budget_spent` or `session_gone`. A caller
+such as a goal loop stops and posts a note then.
+
+`on_behalf_of`'s account generation is taken from the caller's context by
+default. Background callers pass the generation they saved when the user
+turned the automation on as `generation`.
+
+## When a wake is delivered
+
+- **Only at idle.** An `idle` or `failed` status edge (a
+  [core status observer](status_observers.md)) triggers delivery, and a retry
+  every 15 seconds covers missed edges and sessions that were already idle. A
+  wake is not sent while this server replica sees the session `running`,
+  `waiting` or still starting, and only by the replica the session's host is
+  connected to.
+- **Authorization at every delivery.** Just before sending, the service checks
+  again that the source is enabled, that `on_behalf_of` still has EDIT and that
+  their account generation is still valid. If not, the wake is dropped and stop
+  listeners hear `not_authorized`. A source `ext:<id>` is enabled only when the
+  operator enabled extension `<id>` (`create_app(extension_is_enabled=...)`);
+  `core:` sources always are.
+- **As the session owner.** The message is posted inside the owner's account
+  scope through the normal message path, so input policies apply as to a typed
+  message. A policy denial counts as a failed delivery.
+- **Pacing.** Wakes from one source to one session are at least 2 minutes
+  apart. While consecutive wakes carry the same `evidence_key` (the agent took a
+  turn and nothing it waits on moved) the gap doubles, up to 30 minutes.
+  5 failed deliveries in a row stop the source with `undeliverable`.
+- **State is per replica, in memory.** A server restart loses a pending wake
+  and the counters; counters of a source with nothing pending are forgotten
+  after 6 hours. Keep the automation's own state as the source of truth and
+  request again when it reconciles.
+
+## What the agent and the people see
+
+The message text starts with one framework line, for example
+`[Automation: Goal loop · on behalf of alice@example.com]`, so the model does
+not take it as typed by a person. The stored item is attributed to the session
+owner and carries `origin: {kind: "automation", source, on_behalf_of, label}`
+(see [the Sessions API](../../omnigent/server/API.md)).
+
+## Never mid-turn
+
+The server's idle check can be stale: a person can start a turn in a native
+terminal, or a queued message can start one, between the check and the
+delivery. So the message carries `delivery: "next_turn_only"`, and the decisive
+check happens where turns start, in the runner and the harness:
+
+- **SDK harnesses.** The runner runs one turn at a time. A wake that arrives
+  mid-turn waits in the runner's queue for the next turn and is never injected
+  into the running one.

@@ -303,6 +303,7 @@ from omnigent.server.server_messages import (
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_wake import WakeStop
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
@@ -1298,6 +1299,17 @@ def register_events_routes(
                     conv, agent_store=agent_store, agent_cache=agent_cache
                 ),
             )
+        if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE) and isinstance(request, Request):
+            # Ending the work also ends automation waiting to restart it. An
+            # orchestrating agent (sys_cancel_task) calls with its runner's token.
+            session_wake = getattr(request.app.state, "session_wake", None)
+            if session_wake is not None:
+                by_agent = bool((request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip())
+                session_wake.stop_session(
+                    session_id,
+                    WakeStop.STOPPED_BY_AGENT if by_agent else WakeStop.STOPPED_BY_USER,
+                    live_status=conv.live_status,
+                )
         # For item types, validate the data payload shape against
         # the item-type's discriminator class. The control types
         # (interrupt, approval) bypass the item-persist path and have

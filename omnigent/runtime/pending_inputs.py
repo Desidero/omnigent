@@ -653,7 +653,9 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         return _drained_input(entry) if entry is not None else None
 
 
-def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
+def resolve_oldest(
+    conversation_id: str, *, hold: bool = False, skip_automation: bool = False
+) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
 
@@ -681,6 +683,8 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
     :param hold: Keep the entry in place, marked held, instead of removing it;
         the caller settles it with :func:`release` once the persist landed or
         :func:`restore` if it did not. Entries already held are skipped.
+    :param skip_automation: Pass over server automation messages (entries
+        with an ``origin``), for mirrored text that isn't one.
     :returns: The drained :class:`DrainedInput`, or ``None`` when no
         entry was pending, or only held or interrupted ones remain.
     """
@@ -691,7 +695,13 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
             return None
         # Insertion order = FIFO; the first live, unheld key is the oldest entry.
         oldest_id = next(
-            (pid for pid, entry in entries.items() if not entry.held and not entry.interrupted),
+            (
+                pid
+                for pid, entry in entries.items()
+                if not entry.held
+                and not entry.interrupted
+                and not (skip_automation and entry.origin is not None)
+            ),
             None,
         )
         if oldest_id is None:
@@ -949,6 +959,20 @@ def resolve_matching_text(
             skipped=lost,
             uncertain=uncertain,
         )
+
+
+def is_pending(conversation_id: str, pending_id: str) -> bool:
+    """
+    Report whether one queued input still waits for its terminal to record it.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The entry's id, e.g. ``"pending_a1b2c3"``.
+    :returns: ``False`` once it was drained, expired or cancelled by an interrupt.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return entry is not None and not entry.interrupted
 
 
 def has_pending(conversation_id: str) -> bool:

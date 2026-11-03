@@ -63,6 +63,10 @@ session's stored pull requests once (see
 failures don't refresh. Listed sessions are still refreshed when stale, so a
 missed edge only delays a refresh.
 
+The second is the [session wake](session_wake.md) service: an `idle` or
+`failed` edge prompts it to deliver the session's pending wakes. It also
+retries on a timer, so a missed edge only delays a wake.
+
 ## Extension observers
 
 Extensions receive the same observations, best-effort, through

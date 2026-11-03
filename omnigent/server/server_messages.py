@@ -25,6 +25,13 @@ from starlette.datastructures import Headers
 from omnigent.errors import ErrorCode, OmnigentError
 
 NEXT_TURN_ONLY: Literal["next_turn_only"] = "next_turn_only"
+# Runner control event: drop a queued next-turn-only input by ``pending_id``
+# (a Stop overtook the post that queued it).
+DROP_NEXT_TURN_INPUT = "drop_next_turn_input"
+
+
+# A wake's text starts with this one-line framework header.
+AUTOMATION_HEADER_PREFIX = "[Automation: "
 
 
 @dataclass(frozen=True)

@@ -1150,7 +1150,7 @@ uncertainty, including entries that expired while persistence was in flight.
 A later mirror cannot report a possibly recorded input as definitely undelivered.
 
 **Server-originated messages carry `origin`.** The server itself can send a
-user message into a session, for example a session wake.
+user message into a session, for example a [session wake](../../docs/extending/session_wake.md).
 Such a message item carries
 `origin: {kind: "automation", source, on_behalf_of?, label?}`, where `source` is
 `core:<name>` or `ext:<extension id>` and `on_behalf_of` is the user who turned

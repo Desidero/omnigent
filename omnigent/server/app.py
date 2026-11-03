@@ -165,6 +165,7 @@ from omnigent.server.server_config import (
     RESTRICT_TO_AGENT_NAMES_KEY,
     PickerCuration,
 )
+from omnigent.server.session_wake import SessionWakeService, build_session_wake
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1592,6 +1593,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    extension_is_enabled: Callable[[str], bool] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1641,6 +1643,8 @@ def create_app(
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
+    :param extension_is_enabled: Whether the operator enabled an extension id;
+        an ``ext:`` session-wake source needs it. ``None`` enables none.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -2191,12 +2195,15 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        session_wake: SessionWakeService = app_inst.state.session_wake
+        await session_wake.start()
         try:
             with monitor_event_loop():
                 yield
         finally:
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
+            await session_wake.aclose()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
                 with suppress(asyncio.CancelledError):
@@ -2273,6 +2280,14 @@ def create_app(
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
     app.state.runner_tunnel_tokens = runner_tunnel_tokens
+    build_session_wake(
+        app,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        host_registry=host_registry,
+        extension_is_enabled=extension_is_enabled,
+    )
 
     def _admit_host_launch(
         host_id: str,

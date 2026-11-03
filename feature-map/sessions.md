@@ -347,6 +347,13 @@ A turn's end refreshes the stored summary even if nobody has the session open:
 merge a linked PR elsewhere, let a turn finish without opening Pull Requests,
 wait about ten seconds, then stop the host; the summary shows it merged.
 
+**Session wake (server automation):** no UI starts one yet; server code calls
+`app.state.session_wake.request(...)` (see `docs/extending/session_wake.md`).
+On a throwaway local server, request a `core:` wake for an idle session from a
+Python shell attached to the app, or through a test: the message arrives once,
+as the session owner, prefixed `[Automation: …]`. Request one while a turn runs:
+nothing is sent until the turn ends, then it arrives as the next turn.
+
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
 cards. Choosing Canvas in the sidebar returns to the selected board.
