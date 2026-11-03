@@ -1,10 +1,11 @@
 # Database Schema Design
 
-This doc covers four core tables: agents, files, conversations,
-conversation_items. They are part of a larger schema — 17 tables in all, also
-including conversation labels, comments, policies, session permissions,
-conversation metadata, projects, hosts, users, and scheduled tasks. No model
-sets an explicit schema, so every table lives in the default one.
+This doc covers five tables: agents, files, conversations, conversation_items
+and extension_session_state. They are part of a larger schema — 20 tables in
+all, also including conversation labels, comments, policies, session
+permissions, conversation metadata, projects, hosts, users, and scheduled
+tasks. No model sets an explicit schema, so every table lives in the default
+one.
 
 Schema is managed by Alembic migrations in `alembic/`. SQLAlchemy models live
 in `omnigent/db/db_models.py`, which is the source of truth for the full table
@@ -101,6 +102,41 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 **function_call_output:** `{"call_id": "call_001", "output": "{...}"}`
 
 **reasoning:** `{"summary": [...], "content": null, "encrypted_content": null}`
+
+---
+
+## extension_session_state
+
+Small key/value state an extension keeps about one session, stored beside
+`conversation_labels` so a state write and a label update can share a
+transaction. Owning state by session only is a scope choice: a generic table
+with nullable typed subject columns (session, project, user) is the
+alternative if another owner needs state.
+
+| Column | Type | Notes |
+|---|---|---|
+| workspace_id | BigInteger PK | No server default |
+| conversation_id | Uuid16 PK | The owning session (no DB FK) |
+| extension_id | String(128) PK | Publisher-qualified id, e.g. `acme.pr-watch`; `utf8mb4_bin` on MySQL |
+| key | String(128) PK | Unique within the extension; `utf8mb4_bin` on MySQL |
+| value | LargeBinary NOT NULL | Opaque bytes; at most 16,383 (`ck_extension_session_state_value_size`) |
+| version | BigInteger NOT NULL | Compare-and-set counter: insert 1, update `WHERE version = <read>` |
+| updated_at | BigInteger NOT NULL | Unix epoch seconds of the last write |
+| updated_by | String(128) | User whose action made the last write; NULL for the extension's own writes. Attribution, not history |
+
+**Indexes:** the primary key, whose `(workspace_id, conversation_id)` prefix
+serves per-session reads and deletion, and
+`ix_extension_session_state_extension (extension_id, workspace_id,
+conversation_id, key)`, which serves per-extension work across sessions and
+workspaces (enumerating an extension's state; purging it on uninstall) as a
+range on `extension_id`, ordered by the full primary key for paging.
+
+**Deletion:** no DB cascade. Application code must delete a deleted session
+subtree's rows by that prefix; batching is the store's choice.
+
+**Writers:** bind `value` as bytes and check its byte length before writing
+(SQLite's `length()` counts characters if text is stored). Reject keys with
+trailing whitespace: `utf8mb4_bin` ignores trailing spaces when comparing.
 
 ---
 
