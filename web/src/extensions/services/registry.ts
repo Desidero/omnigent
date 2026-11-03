@@ -14,6 +14,10 @@ export const HOST_METHOD_PERMISSIONS = {
   "sessions.listPage": "sessions.read",
   "sessions.get": "sessions.read",
   "sessions.pullRequest": "sessions.read",
+  // A page's own commands and state; the server applies the viewer's access.
+  "commands.invoke": null,
+  "state.get": null,
+  "state.list": null,
   "projects.list": "projects.read",
   "projects.create": "projects.write",
 } as const satisfies Record<string, string | null>;

@@ -11,7 +11,9 @@ export function ExtensionPageHost({
   invocationContext?: Readonly<Record<string, string>>;
 }) {
   const refresh = useRefreshExtensions();
-  const { methods, events } = useExtensionHostServices(resolved.extension);
+  const { methods, events } = useExtensionHostServices(resolved.extension, {
+    sessionId: invocationContext?.conversationId,
+  });
   return (
     <ExtensionViewHost
       extension={resolved.extension}

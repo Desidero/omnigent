@@ -41,12 +41,43 @@ export interface ExtensionProjectSummary {
   icon: string | null;
 }
 
+/** One key of the extension's own session state, as the viewer may read it. */
+export interface ExtensionStateEntry {
+  key: string;
+  /** UTF-8 text, or null for other bytes. */
+  value: string | null;
+  version: number;
+  updatedAt: number;
+  /** Who wrote it; null unless the viewer has edit access. */
+  updatedBy: string | null;
+}
+
+export interface ExtensionStatePage {
+  entries: ExtensionStateEntry[];
+  /** Pass as `after` for the next page; null on the last page. */
+  nextAfter: string | null;
+}
+
+export interface ExtensionCommandOutcome {
+  key: string;
+  /** The written entry; null after a ClearState command. */
+  entry: ExtensionStateEntry | null;
+  deleted: boolean;
+  /** This extension's published fields on the session afterwards. */
+  publishedFields: Record<string, string>;
+}
+
+export interface SessionOption {
+  /** Defaults to the session the page was opened for (`invocation.conversationId`). */
+  sessionId?: string;
+}
+
 export class ExtensionApiError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-  ) {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
     super(message);
+    this.code = code;
     this.name = "ExtensionApiError";
   }
 }
@@ -100,6 +131,24 @@ export interface ExtensionContext {
   projects: {
     list(): Promise<ExtensionProjectSummary[]>;
     create(options: { name: string }): Promise<ExtensionProjectSummary>;
+  };
+  /** The extension's declared commands, run on a session as the viewer. */
+  commands: {
+    invoke(
+      commandId: string,
+      args?: Record<string, string>,
+      options?: SessionOption & { expectedVersion?: number },
+    ): Promise<ExtensionCommandOutcome>;
+  };
+  /**
+   * The extension's own session state, read as the viewer: only keys its
+   * manifest makes readable to them, never `service` keys.
+   */
+  state: {
+    get(key: string, options?: SessionOption): Promise<ExtensionStateEntry | null>;
+    list(
+      options?: SessionOption & { after?: string | null; limit?: number },
+    ): Promise<ExtensionStatePage>;
   };
 }
 
@@ -207,6 +256,17 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
     });
   };
 
+  const sessionFor = (options?: SessionOption): string => {
+    const sessionId = options?.sessionId ?? invocationContext.conversationId;
+    if (!sessionId) {
+      throw new ExtensionApiError(
+        "InvalidParams",
+        "No session: pass sessionId or open the page for a session",
+      );
+    }
+    return sessionId;
+  };
+
   const createContext = (): ExtensionContext => ({
     extensionId: identity.extensionId,
     pageId: identity.pageId,
@@ -304,6 +364,33 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
         request<ExtensionProjectSummary>("projects.create", {
           name: options.name,
         }),
+    },
+    commands: {
+      async invoke(commandId, args, options) {
+        return request<ExtensionCommandOutcome>("commands.invoke", {
+          sessionId: sessionFor(options),
+          commandId,
+          arguments: args ?? {},
+          ...(options?.expectedVersion === undefined
+            ? {}
+            : { expectedVersion: options.expectedVersion }),
+        });
+      },
+    },
+    state: {
+      async get(key, options) {
+        return request<ExtensionStateEntry | null>("state.get", {
+          sessionId: sessionFor(options),
+          key,
+        });
+      },
+      async list(options) {
+        return request<ExtensionStatePage>("state.list", {
+          sessionId: sessionFor(options),
+          after: options?.after ?? null,
+          ...(options?.limit === undefined ? {} : { limit: options.limit }),
+        });
+      },
     },
   });
 

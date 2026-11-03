@@ -146,6 +146,37 @@ write records the caller in `updated_by` and in the server log. `confirm` is
 for clients to show before running the command; the server does not check
 that anyone confirmed.
 
+## In the browser
+
+An extension's page uses its own state through the browser SDK, always as
+the viewer: the page is not the extension, and anyone who can open it can
+call it. `sessionId` defaults to the session the page was opened for
+(`context.invocation.conversationId`); without one, calls fail with
+`InvalidParams`. Naming another session needs the `sessions.read`
+permission, as `sessions.get` does; otherwise calls fail with
+`PermissionDenied`. The same holds for `navigation.openPage` with a
+`conversationId` other than the page's own.
+
+```ts
+const watched = await context.state.list(); // { entries, nextAfter }
+const one = await context.state.get("pr:7"); // entry or null
+const outcome = await context.commands.invoke("acme.review.watch", { pr: "7" });
+outcome.publishedFields; // this extension's published fields afterwards
+```
+
+- `state.get` and `state.list` return only keys the viewer may read
+  (`readers` and `published`, plus `editors` for editors); `service` keys and
+  unset keys read as `null` or are left out. Entries carry `key`, `value`
+  (text or `null`), `version`, `updatedAt` and `updatedBy` (editors only).
+  `list` takes `limit` 1-50 (default 20) and may return fewer entries than
+  that while `nextAfter` is set, to keep each reply within the message size.
+- `commands.invoke` runs one of the extension's declared commands with the
+  viewer's access, in order with core's own runs on that session. It
+  rejects with `PermissionDenied` (access), `InvalidParams` (arguments),
+  `Conflict` (`expectedVersion` or quota) or `NotFound`. Session rows repaint
+  from its result. Core does not show a command's `confirm` for page calls;
+  pages ask first themselves.
+
 ## HTTP API
 
 All routes are under `/v1/sessions/{session_id}/extensions/{extension_id}`

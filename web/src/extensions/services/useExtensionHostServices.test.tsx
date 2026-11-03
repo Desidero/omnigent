@@ -45,6 +45,16 @@ const extension: ExtensionCatalogItem = {
   ],
   primary_navigation: [],
   slot_items: [],
+  commands: [
+    {
+      id: "acme.review.watch",
+      title: "Watch",
+      arguments: [{ name: "pr", choices: [], pattern: "[0-9]+", max_length: 8 }],
+      required_access: "read",
+      confirm: null,
+      action: { type: "set_state", field: "pr:*", value: "watching" },
+    },
+  ],
   browser: {
     declared: true,
     has_styles: false,
@@ -559,6 +569,218 @@ describe("useExtensionHostServices", () => {
     invalidate.mockRestore();
   });
 
+  it("runs only its own declared commands and repaints the cached row", async () => {
+    queryClient.setQueryData(["conversations", "", true], {
+      pages: [
+        { data: [{ id: "conv_1", title: "One", labels: {}, updated_at: 1 }], has_more: false },
+      ],
+      pageParams: [undefined],
+    });
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          object: "extension_command_result",
+          command: "acme.review.watch",
+          key: "pr:7",
+          entry: { key: "pr:7", value: "watching", version: 1, updated_at: 5, updated_by: null },
+          deleted: false,
+          published_fields: { "acme.review": { count: "1" }, "acme.other": { x: "y" } },
+        }),
+      ),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+    const invoke = result.current.methods["commands.invoke"]!;
+
+    expect(() =>
+      invoke({ sessionId: "conv_1", commandId: "acme.other.watch", arguments: {} }, signal()),
+    ).toThrow("Command is not declared by extension");
+    expect(() =>
+      invoke(
+        { sessionId: "conv_1", commandId: "acme.review.watch", arguments: { pr: 7 } },
+        signal(),
+      ),
+    ).toThrow("arguments must map names to strings");
+
+    await expect(
+      invoke(
+        { sessionId: "conv_1", commandId: "acme.review.watch", arguments: { pr: "7" } },
+        signal(),
+      ),
+    ).resolves.toEqual({
+      key: "pr:7",
+      entry: { key: "pr:7", value: "watching", version: 1, updatedAt: 5, updatedBy: null },
+      deleted: false,
+      // Only its own extension's fields.
+      publishedFields: { count: "1" },
+    });
+    const [url, init] = authenticatedFetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_1/extensions/acme.review/commands/acme.review.watch");
+    expect(JSON.parse(String(init.body))).toEqual({ arguments: { pr: "7" } });
+    expect(
+      queryClient.getQueryData<{ pages: { data: { published_fields?: unknown }[] }[] }>([
+        "conversations",
+        "",
+        true,
+      ])?.pages[0].data[0].published_fields,
+    ).toEqual({ "acme.review": { count: "1" }, "acme.other": { x: "y" } });
+  });
+
+  it("needs sessions.read to reopen its page for another session", () => {
+    const ownOnly = {
+      ...extension,
+      permissions: extension.permissions.filter((item) => item !== "sessions.read"),
+    };
+    const { result } = renderHook(
+      () => useExtensionHostServices(ownOnly, { sessionId: "conv_1" }),
+      { wrapper },
+    );
+    const openPage = result.current.methods["navigation.openPage"]!;
+
+    // Reopening for another session would hand the page that session's state.
+    expect(() =>
+      openPage({ pageId: "acme.review.dashboard", params: { conversationId: "conv_2" } }, signal()),
+    ).toThrow("sessions.read");
+    expect(navigate).not.toHaveBeenCalled();
+    openPage({ pageId: "acme.review.dashboard", params: { conversationId: "conv_1" } }, signal());
+    openPage({ pageId: "acme.review.dashboard", params: { tab: "one" } }, signal());
+    expect(navigate).toHaveBeenCalledTimes(2);
+
+    const { result: reader } = renderHook(
+      () => useExtensionHostServices(extension, { sessionId: "conv_1" }),
+      { wrapper },
+    );
+    reader.current.methods["navigation.openPage"]!(
+      { pageId: "acme.review.dashboard", params: { conversationId: "conv_2" } },
+      signal(),
+    );
+    expect(navigate).toHaveBeenLastCalledWith({
+      pathname: "/extensions/acme.review/dashboard",
+      search: "?conversationId=conv_2",
+    });
+  });
+
+  it("needs sessions.read to use state on a session other than the page's own", async () => {
+    authenticatedFetchMock.mockImplementation(async () => new Response("{}", { status: 404 }));
+    const ownOnly = {
+      ...extension,
+      permissions: extension.permissions.filter((item) => item !== "sessions.read"),
+    };
+    const { result } = renderHook(
+      () => useExtensionHostServices(ownOnly, { sessionId: "conv_1" }),
+      { wrapper },
+    );
+    const methods = result.current.methods;
+
+    await expect(
+      methods["state.get"]?.({ sessionId: "conv_1", key: "k" }, signal()),
+    ).resolves.toBeNull();
+    const others = [
+      ["state.get", { sessionId: "conv_2", key: "k" }],
+      ["state.list", { sessionId: "conv_2" }],
+      [
+        "commands.invoke",
+        { sessionId: "conv_2", commandId: "acme.review.watch", arguments: { pr: "1" } },
+      ],
+    ] as const;
+    const outcomes = await Promise.allSettled(
+      others.map(([method, params]) =>
+        Promise.resolve().then((): unknown => methods[method]?.(params, signal())),
+      ),
+    );
+    for (const outcome of outcomes) {
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        reason: { code: "PermissionDenied" },
+      });
+    }
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+
+    // With sessions.read, any session the viewer can read.
+    const { result: reader } = renderHook(
+      () => useExtensionHostServices(extension, { sessionId: "conv_1" }),
+      { wrapper },
+    );
+    await expect(
+      reader.current.methods["state.get"]?.({ sessionId: "conv_2", key: "k" }, signal()),
+    ).resolves.toBeNull();
+  });
+
+  it("maps a refused command to PermissionDenied", async () => {
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: { message: "needs more access" } }), { status: 403 }),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+
+    await expect(
+      result.current.methods["commands.invoke"]?.(
+        { sessionId: "conv_1", commandId: "acme.review.watch", arguments: { pr: "1" } },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: "PermissionDenied", message: "needs more access" });
+  });
+
+  it("reads its own state as the viewer, with unreadable keys as null", async () => {
+    authenticatedFetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            key: "pr:7",
+            value: "watching",
+            value_base64: "d2F0Y2hpbmc=",
+            version: 2,
+            updated_at: 9,
+            updated_by: "editor@example.com",
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(new Response("{}", { status: 404 }));
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+    const get = result.current.methods["state.get"]!;
+
+    await expect(get({ sessionId: "conv_1", key: "pr:7" }, signal())).resolves.toEqual({
+      key: "pr:7",
+      value: "watching",
+      version: 2,
+      updatedAt: 9,
+      updatedBy: "editor@example.com",
+    });
+    expect(authenticatedFetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/extensions/acme.review/state/pr%3A7",
+    );
+    await expect(get({ sessionId: "conv_1", key: "secret" }, signal())).resolves.toBeNull();
+    await expect(get({ sessionId: "conv_1", key: "" }, signal())).rejects.toThrow("key is invalid");
+  });
+
+  it("lists state in pages that fit one RPC message", async () => {
+    const big = "x".repeat(12_000);
+    const entry = (key: string) => ({
+      key,
+      value: big,
+      value_base64: "",
+      version: 1,
+      updated_at: 1,
+      updated_by: null,
+    });
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ data: ["a", "b", "c", "d"].map(entry), next_after: null })),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+
+    const page = (await result.current.methods["state.list"]?.(
+      { sessionId: "conv_1", after: null, limit: 4 },
+      signal(),
+    )) as { entries: { key: string }[]; nextAfter: string | null };
+
+    expect(authenticatedFetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/extensions/acme.review/state?limit=4",
+    );
+    expect(page.entries.map((item) => item.key)).toEqual(["a", "b"]);
+    expect(page.nextAfter).toBe("b");
+    await expect(
+      result.current.methods["state.list"]?.({ sessionId: "conv_1", limit: 51 }, signal()),
+    ).rejects.toThrow("limit must be an integer from 1 to 50");
+  });
+
   it("keeps sessions methods absent for existing extension permissions", () => {
     const existing = { ...extension, permissions: ["navigation", "storage.user"] };
     const { result } = renderHook(() => useExtensionHostServices(existing), { wrapper });
@@ -570,6 +792,9 @@ describe("useExtensionHostServices", () => {
     expect(result.current.methods["projects.create"]).toBeUndefined();
     expect(result.current.methods["navigation.openSession"]).toBeDefined();
     expect(result.current.methods["storage.user.get"]).toBeDefined();
+    // A page's own commands and state need no permission.
+    expect(result.current.methods["commands.invoke"]).toBeDefined();
+    expect(result.current.methods["state.list"]).toBeDefined();
   });
 
   it("omits methods whose permissions were not granted", () => {
@@ -577,6 +802,9 @@ describe("useExtensionHostServices", () => {
     const { result } = renderHook(() => useExtensionHostServices(denied), { wrapper });
 
     expect(Object.keys(result.current.methods).sort()).toEqual([
+      "commands.invoke",
+      "state.get",
+      "state.list",
       "theme.getCurrent",
       "theme.subscribe",
     ]);

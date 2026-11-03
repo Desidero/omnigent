@@ -28,6 +28,7 @@ import {
   listSessionPage,
   SessionReadLimiter,
 } from "./sessions";
+import { invokeCommand, listStateEntries, parseCommandInvoke, readStateEntry } from "./state";
 import {
   ExtensionStorageError,
   ExtensionStorageWriteLimiter,
@@ -85,7 +86,11 @@ function pageSearch(value: unknown): string {
   return serialized ? `?${serialized}` : "";
 }
 
-export function useExtensionHostServices(extension: ExtensionCatalogItem) {
+export function useExtensionHostServices(
+  extension: ExtensionCatalogItem,
+  pageContext: { sessionId?: string | null } = {},
+) {
+  const pageSessionId = pageContext.sessionId ?? null;
   const navigate = useNavigate();
   const theme = useResolvedThemeMode();
   const queryClient = useQueryClient();
@@ -93,6 +98,8 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
   const sessionListLimiter = useMemo(() => new SessionReadLimiter(), []);
   const pullRequestLimiter = useMemo(() => new SessionReadLimiter(), []);
+  // Paces a page's commands and state reads, one at a time.
+  const stateLimiter = useMemo(() => new SessionReadLimiter(), []);
   // External URLs the host has handed to this extension; the only ones it may open.
   const externalUrlsRef = useRef(new Set<string>());
 
@@ -108,6 +115,22 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
         const page = extension.pages.find((item) => item.id === pageId);
         if (!page) {
           throw new ExtensionHostServiceError("PermissionDenied", "Page is not owned by extension");
+        }
+        // The page's session scopes its state calls; moving it to another
+        // session is a session read, like naming one in those calls.
+        const nextSessionId =
+          input.params && typeof input.params === "object"
+            ? (input.params as Record<string, unknown>).conversationId
+            : undefined;
+        if (
+          nextSessionId !== undefined &&
+          nextSessionId !== pageSessionId &&
+          !extension.permissions.includes("sessions.read")
+        ) {
+          throw new ExtensionHostServiceError(
+            "PermissionDenied",
+            "Opening the page for another session needs the sessions.read permission",
+          );
         }
         navigate({
           pathname: `/extensions/${extension.id}/${page.route}`,
@@ -232,6 +255,18 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           externalUrlsRef.current.add(pr.url);
           return { number: pr.number, title: pr.title.slice(0, 256), state: pr.state, url: pr.url };
         }),
+      "commands.invoke": (params: unknown, signal: AbortSignal) => {
+        const invocation = parseCommandInvoke({ extension, pageSessionId }, params);
+        return stateLimiter.run(signal, () => invokeCommand(queryClient, invocation, signal));
+      },
+      "state.get": (params: unknown, signal: AbortSignal) =>
+        stateLimiter.run(signal, () =>
+          readStateEntry({ extension, pageSessionId }, params, signal),
+        ),
+      "state.list": (params: unknown, signal: AbortSignal) =>
+        stateLimiter.run(signal, () =>
+          listStateEntries({ extension, pageSessionId }, params, signal),
+        ),
       "projects.list": (_params: unknown, signal: AbortSignal) => {
         throwIfAborted(signal);
         return cachedProjectSummaries(queryClient) ?? listProjectSummaries();
@@ -249,9 +284,11 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   }, [
     extension,
     navigate,
+    pageSessionId,
     pullRequestLimiter,
     queryClient,
     sessionListLimiter,
+    stateLimiter,
     storedPullRequests,
     theme,
     writeLimiter,

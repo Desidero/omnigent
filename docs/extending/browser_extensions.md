@@ -59,7 +59,14 @@ Available V1 methods:
   from a session's branch, via the same GitHub lookup as the shell's GitHub tab)
   with the `sessions.read` permission;
 - `projects.list` with the `projects.read` permission and `projects.create`
-  with the `projects.write` permission.
+  with the `projects.write` permission;
+- `commands.invoke(commandId, args?, {sessionId?, expectedVersion?})`,
+  `state.get(key, {sessionId?})` and `state.list({sessionId?, after?, limit?})`
+  for the extension's own [session state](extension_state.md#in-the-browser),
+  with no permission on the page's own session (the manifest's declarations
+  and the viewer's access decide what they can do); naming another
+  `sessionId`, or reopening a page with `openPage(id, {conversationId})` for
+  another session, needs `sessions.read`.
 
 The session list exposes only top-level, non-archived sessions the current user
 can already read. `sessions.get(id)` reads one session through the viewer's own

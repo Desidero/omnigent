@@ -1105,6 +1105,12 @@ plain `uv run pytest`, which starts a private server for the test.
   server's 403, and that deleting the session deletes its state. Unit
   coverage: `web/src/shell/Sidebar.sessionRowSlots.test.tsx` and
   `web/src/extensions/sessionCommands.test.ts`.
+- **Extension pages using state (browser, `tests/e2e_ui` on its own):**
+  `tests/e2e_ui/extensions/test_extension_state_page.py` opens a test
+  extension's page in its iframe, runs commands and reads state through the
+  SDK as the viewer (a read-only sharee runs only read commands), and checks
+  the header action labelled by a published field. Its bundle is built from
+  the package's `web/` with the `vite build` command in its config.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
