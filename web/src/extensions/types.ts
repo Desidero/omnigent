@@ -73,6 +73,8 @@ export interface ExtensionSlotItem {
   command?: string | null;
   /** A no-argument command listed after a row-menu item's choices, e.g. "Clear status". */
   clear_command?: string | null;
+  /** A published field whose value, when set, a header or composer action shows as its label. */
+  label_field?: string | null;
 }
 
 export type ExtensionFieldTone = "neutral" | "info" | "success" | "warning" | "danger";

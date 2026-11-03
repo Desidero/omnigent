@@ -17,7 +17,10 @@ import {
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  SESSION_PUBLISHED_FIELDS_KEY,
+  type ConversationsInfiniteData,
+} from "@/lib/sessionListCache";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -302,6 +305,34 @@ describe("SessionUpdatesProvider comments fingerprint", () => {
     // Zero comments-key invalidations proves an unchanged fingerprint is
     // inert; a call here means every row change would refetch comments.
     expect(commentsCalls).toEqual([]);
+  });
+});
+
+describe("SessionUpdatesProvider published fields", () => {
+  it("refreshes a session's published fields that an action label reads", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a", "conv_b"]);
+    client.setQueryData([SESSION_PUBLISHED_FIELDS_KEY, "conv_a"], {
+      "acme.goals": { summary: "Watching 1 PR" },
+    });
+    renderProvider(client, ["/"]);
+
+    // A server-side write reaches clients through the session's changed frame.
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: ["conv_a", "conv_b"].map((id) => ({
+          ...conv(id),
+          published_fields: { "acme.goals": { summary: "Watching 2 PRs" } },
+        })),
+      }),
+    );
+
+    expect(client.getQueryData([SESSION_PUBLISHED_FIELDS_KEY, "conv_a"])).toEqual({
+      "acme.goals": { summary: "Watching 2 PRs" },
+    });
+    // Sessions nobody reads a label for get no cache entry.
+    expect(client.getQueryData([SESSION_PUBLISHED_FIELDS_KEY, "conv_b"])).toBeUndefined();
   });
 });
 

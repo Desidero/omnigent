@@ -201,6 +201,8 @@ class SlotItemContribution:
     command: str | None = None
     #: A no-argument command listed last in a row-menu item's choices, e.g. "Clear status".
     clear_command: str | None = None
+    #: A published field whose value, when set, a header or composer action shows as its label.
+    label_field: str | None = None
 
 
 @dataclass(frozen=True)

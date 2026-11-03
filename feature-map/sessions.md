@@ -19,7 +19,9 @@ the header menu), and each place is a separate entry point.
   `ext.<extension id>.<key>` labels on the session. Users change it only
   through the extension's commands, with the share level each command needs;
   readers never see `service` state. Session-row badges, tooltip lines and
-  row-menu entries show and change it (see below).
+  row-menu entries show and change it (see below), and a chat-header or
+  composer action can show a field as its label (`label_field`, e.g.
+  "Watching 2 PRs"; unit test `web/src/extensions/ExtensionSlot.test.tsx`).
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned

@@ -1,7 +1,17 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import type { MouseEvent } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
+import type * as Identity from "@/lib/identity";
+
+const { authenticatedFetchMock } = vi.hoisted(() => ({ authenticatedFetchMock: vi.fn() }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof Identity>()),
+  authenticatedFetch: authenticatedFetchMock,
+}));
+
+import { overlayPublishedFieldsIntoCaches } from "@/lib/sessionListCache";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ExtensionCatalogProvider } from "./ExtensionProvider";
 import { ExtensionSlot, ExtensionSlotHost } from "./ExtensionSlot";
@@ -151,5 +161,61 @@ describe("ExtensionSlot", () => {
     expect(link).toHaveAttribute("aria-current", "page");
     fireEvent.click(link);
     expect(onNavigate).toHaveBeenCalledOnce();
+  });
+});
+
+describe("label_field", () => {
+  const labelled: ExtensionCatalogItem = {
+    ...extension,
+    slot_items: extension.slot_items.map((item) =>
+      item.slot === "composer.actions" ? { ...item, label_field: "summary" } : item,
+    ),
+  };
+
+  function renderLabelled(queryClient: QueryClient, conversationId?: string) {
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <ExtensionCatalogProvider extensions={[labelled]}>
+          <TooltipProvider>
+            <MemoryRouter>
+              <ExtensionSlot slot="composer.actions" context={{ conversationId }} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </ExtensionCatalogProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("shows the session's published value as the action's label, and repaints after a command", async () => {
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ published_fields: { "acme.review": { summary: "Watching 2 PRs" } } }),
+      ),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderLabelled(queryClient, "conv_1");
+
+    const link = await screen.findByRole("link", { name: "Composer review: Watching 2 PRs" });
+    expect(link).toHaveTextContent("Watching 2 PRs");
+    expect(String(authenticatedFetchMock.mock.calls[0][0])).toMatch(
+      /^\/v1\/sessions\/conv_1\?include_items=false/,
+    );
+
+    act(() =>
+      overlayPublishedFieldsIntoCaches(queryClient, "conv_1", {
+        "acme.review": { summary: "Watching 3 PRs" },
+      }),
+    );
+    expect(
+      await screen.findByRole("link", { name: "Composer review: Watching 3 PRs" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the icon-only action, and reads nothing, without a session", () => {
+    authenticatedFetchMock.mockReset();
+    renderLabelled(new QueryClient());
+
+    expect(screen.getByRole("link", { name: "Composer review" })).toHaveTextContent("");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 });

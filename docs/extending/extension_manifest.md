@@ -80,7 +80,9 @@ def get_manifest() -> ExtensionManifest:
 - Slot items use a supported slot/kind pairing, reference a page owned by the
   same extension (session-row items bind one of its published fields or name
   one of its commands instead), stay within each slot's per-extension limit,
-  and cannot reorder core UI. See [Extension UI slots](extension_ui_slots.md).
+  and cannot reorder core UI. Only header and composer actions may set
+  `label_field`, which must name one of the extension's published fields. See
+  [Extension UI slots](extension_ui_slots.md).
 - Built-ins are reserved. All community extensions participating in a collision
   are disabled deterministically.
 - One invalid field rejects the whole extension; one rejected extension does not

@@ -38,6 +38,7 @@ import {
   nullsToUndefined,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
+  SESSION_PUBLISHED_FIELDS_KEY,
 } from "@/lib/sessionListCache";
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
@@ -417,6 +418,14 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             activeIdRef.current,
             getCurrentUserId(),
           );
+          // Extension state written on the server (not by this client's
+          // commands) reaches action labels that read a session's fields.
+          for (const item of frame.items) {
+            const key = [SESSION_PUBLISHED_FIELDS_KEY, item.id];
+            if (item.published_fields && queryClient.getQueryData(key) !== undefined) {
+              queryClient.setQueryData(key, item.published_fields);
+            }
+          }
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas
           // (archive/search/connected filters) and updated_at resorting need

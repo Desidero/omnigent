@@ -272,6 +272,8 @@ _SLOT_KINDS = {
 # Kinds core renders from a published field rather than as a link to a page.
 _FIELD_BOUND_KINDS = frozenset({SlotItemKind.DECORATION, SlotItemKind.ROW})
 _PAGE_KINDS = frozenset({SlotItemKind.ACTION, SlotItemKind.TAB, SlotItemKind.SECTION})
+# Session-scoped actions that may show a published field as their label.
+_LABEL_FIELD_SLOTS = frozenset({SlotId.CHAT_HEADER_ACTIONS, SlotId.COMPOSER_ACTIONS})
 
 # Most items one extension may place in each slot, so no single package
 # crowds a shared surface. The web app mirrors these values.
@@ -366,6 +368,16 @@ def _validate_slot_item(
         _validate_menu_commands(item, commands)
     elif item.command is not None or item.clear_command is not None:
         raise ExtensionValidationError(f"slot item {item.id!r} cannot name a command")
+    if item.label_field is not None:
+        if item.slot not in _LABEL_FIELD_SLOTS:
+            raise ExtensionValidationError(
+                f"slot item {item.id!r}: label_field applies only to header and composer actions"
+            )
+        if not isinstance(item.label_field, str) or item.label_field not in published:
+            raise ExtensionValidationError(
+                f"slot item {item.id!r} label_field {item.label_field!r} is not a published "
+                "field of its extension"
+            )
     if item.kind in _PAGE_KINDS:
         _require_text(item.page, f"slot item {item.id!r} page")
         if item.page not in page_ids:

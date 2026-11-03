@@ -261,6 +261,7 @@ async def test_catalog_order_is_stable(db_uri: str, tmp_path: Path) -> None:
             "binding": None,
             "command": None,
             "clear_command": None,
+            "label_field": None,
         }
     ]
 

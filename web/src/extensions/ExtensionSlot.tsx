@@ -7,8 +7,9 @@ import { SIDEBAR_ROW } from "@/shell/sidebarStyles";
 import { useExtensions } from "./ExtensionProvider";
 import { extensionIcon } from "./icons";
 import { resolveExtensionPageFromPath } from "./catalog";
-import { resolveSlotItems, type ResolvedSlotItem } from "./slots";
-import type { ExtensionSlotId } from "./types";
+import { useSessionPublishedFields } from "./publishedFields";
+import { publishedFieldText, resolveSlotItems, type ResolvedSlotItem } from "./slots";
+import type { ExtensionSlotId, PublishedFields } from "./types";
 
 export interface ExtensionSlotProps {
   slot: ExtensionSlotId;
@@ -36,13 +37,34 @@ export function ExtensionSlot(props: ExtensionSlotProps) {
   return <ExtensionSlotLinks {...props} entries={entries} />;
 }
 
-function ExtensionSlotLinks({
+type SlotLinksProps = ExtensionSlotProps & { entries: ResolvedSlotItem[] };
+
+function ExtensionSlotLinks(props: SlotLinksProps) {
+  // Only session actions that show a published field cost a session read.
+  const labelled =
+    (props.slot === "chat.header.actions" || props.slot === "composer.actions") &&
+    Boolean(props.context?.conversationId) &&
+    props.entries.some(({ item }) => item.label_field);
+  return labelled ? (
+    <LabelledSlotLinks {...props} />
+  ) : (
+    <SlotLinkList {...props} publishedFields={null} />
+  );
+}
+
+function LabelledSlotLinks(props: SlotLinksProps) {
+  const publishedFields = useSessionPublishedFields(props.context?.conversationId);
+  return <SlotLinkList {...props} publishedFields={publishedFields ?? null} />;
+}
+
+function SlotLinkList({
   slot,
+  onNavigate,
   context,
   instance,
-  onNavigate,
   entries,
-}: ExtensionSlotProps & { entries: ResolvedSlotItem[] }) {
+  publishedFields,
+}: SlotLinksProps & { publishedFields: PublishedFields | null }) {
   const extensions = useExtensions();
   const location = useLocation();
   const activePageId = resolveExtensionPageFromPath(extensions, location.pathname)?.page.id;
@@ -111,6 +133,10 @@ function ExtensionSlotLinks({
         </Tooltip>
       );
     }
+    const fieldLabel = item.label_field
+      ? publishedFieldText(publishedFields, extension.id, item.label_field)
+      : null;
+    const header = slot === "chat.header.actions";
     return (
       <Tooltip key={item.id}>
         <TooltipTrigger asChild>
@@ -118,22 +144,26 @@ function ExtensionSlotLinks({
           <Button
             asChild
             variant="ghost"
-            size={slot === "chat.header.actions" ? "icon-xs" : "icon"}
-            className={
-              slot === "chat.header.actions"
+            size={fieldLabel ? (header ? "xs" : "sm") : header ? "icon-xs" : "icon"}
+            className={cn(
+              header
                 ? "border-none text-muted-foreground hover:text-foreground"
-                : "size-8 md:size-7"
-            }
+                : "size-8 md:size-7",
+              fieldLabel && "size-auto h-6 max-w-48 text-muted-foreground hover:text-foreground",
+              fieldLabel && !header && "h-8 md:h-7",
+            )}
           >
             <Link
               to={to}
               onClick={onNavigate}
-              aria-label={item.label}
+              aria-label={fieldLabel ? `${item.label}: ${fieldLabel}` : item.label}
               aria-current={active ? "page" : undefined}
               data-testid={testId}
               componentId={`extension.slot.${instance ? `${instance}.` : ""}${item.id}`}
             >
               <Icon className="size-4" />
+              {/* Extension text, rendered as text. */}
+              {fieldLabel && <span className="truncate">{fieldLabel}</span>}
             </Link>
           </Button>
         </TooltipTrigger>

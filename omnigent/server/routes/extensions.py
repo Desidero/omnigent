@@ -75,6 +75,12 @@ class ExtensionSlotItemResponse(BaseModel):
     clear_command: str | None = Field(
         description="A no-argument command listed after a menu item's choices."
     )
+    label_field: str | None = Field(
+        description=(
+            "A published field whose value, when set, a header or composer action "
+            "shows as its label."
+        )
+    )
 
 
 class ExtensionFieldValueResponse(BaseModel):
@@ -303,6 +309,7 @@ def _serialize_manifest(
                 ),
                 command=item.command,
                 clear_command=item.clear_command,
+                label_field=item.label_field,
             )
             for item in sorted(
                 manifest.slot_items,

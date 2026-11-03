@@ -601,6 +601,9 @@ export function overlayArchivedIntoCaches(
   );
 }
 
+/** Query key prefix of one session's published fields, read by header and composer actions. */
+export const SESSION_PUBLISHED_FIELDS_KEY = "session-published-fields";
+
 /**
  * Replace one session's published extension fields on every cached copy of
  * its row (the sidebar lists, project folders and the pin backfill), e.g.
@@ -632,4 +635,5 @@ export function overlayPublishedFieldsIntoCaches(
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, published_fields: publishedFields } : old,
   );
+  queryClient.setQueryData([SESSION_PUBLISHED_FIELDS_KEY, id], publishedFields);
 }

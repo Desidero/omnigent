@@ -11,10 +11,12 @@ from omnigent.extensions import (
     ClearState,
     CommandArgument,
     CommandContribution,
+    ExtensionEntrypoints,
     ExtensionManifest,
     FieldBinding,
     FieldTone,
     FieldValue,
+    PageContribution,
     SetState,
     SlotId,
     SlotItemContribution,
@@ -199,3 +201,36 @@ def test_page_backed_items_cannot_bind_a_field_or_name_a_command() -> None:
     ):
         with pytest.raises(ExtensionValidationError, match=message):
             validate_manifest(_manifest(slot_items=(replace(action, **changes),)))
+
+
+def _page_manifest(action: SlotItemContribution) -> ExtensionManifest:
+    page = PageContribution(id=f"{_ID}.goals", title="Goals", route="goals", view="goals")
+    return _manifest(
+        entrypoints=ExtensionEntrypoints(browser="dist/extension.js"),
+        pages=(page,),
+        slot_items=(action,),
+    )
+
+
+def test_actions_may_take_their_label_from_a_published_field() -> None:
+    action = SlotItemContribution(
+        id=f"{_ID}.watching",
+        slot=SlotId.COMPOSER_ACTIONS,
+        kind=SlotItemKind.ACTION,
+        label="Goals",
+        page=f"{_ID}.goals",
+        label_field="count",
+    )
+    validate_manifest(_page_manifest(action))
+    validate_manifest(_page_manifest(replace(action, slot=SlotId.CHAT_HEADER_ACTIONS)))
+
+    with pytest.raises(ExtensionValidationError, match="not a published field"):
+        validate_manifest(_page_manifest(replace(action, label_field="note")))
+    with pytest.raises(ExtensionValidationError, match="only to header and composer actions"):
+        validate_manifest(
+            _page_manifest(
+                replace(action, slot=SlotId.SETTINGS_SECTIONS, kind=SlotItemKind.SECTION)
+            )
+        )
+    with pytest.raises(ExtensionValidationError, match="only to header and composer actions"):
+        validate_manifest(_manifest(slot_items=(replace(_HOVER, label_field="count"),)))

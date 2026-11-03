@@ -52,6 +52,30 @@ it as a hint, not a grant: read the session through the permission-checked SDK,
 which applies the viewer's own access. The composer slot passes it only once the
 session exists.
 
+A header or composer action can show one of its extension's published fields
+as a visible label, such as "Watching 2 PRs", by naming it as `label_field`:
+
+```python
+SlotItemContribution(
+    id="acme.goals.composer",
+    slot=SlotId.COMPOSER_ACTIONS,
+    kind=SlotItemKind.ACTION,
+    label="Goals",
+    page="acme.goals.page",
+    icon="list-checks",
+    label_field="summary",
+)
+```
+
+While the session's field is set, the button shows the icon and the field's
+text (truncated), with `<label>: <text>` as its accessible name and `label` as
+its tooltip; otherwise it stays an icon button. The extension writes the whole
+text, so it can pluralize. Core reads the field with the viewer's access when
+the action renders, repaints it after a command from this browser or when the
+session-updates stream sends the session's row, and otherwise refetches it when
+the action next mounts once it is 30 seconds old. The
+new-session composer has no session, so it always shows the icon.
+
 Settings items route through `/settings/extensions/{extension}/{page}`, so the
 settings sidebar remains visible. Action and rail items route through the normal
 `/extensions/{extension}/{page}` namespace. On mobile, settings and action links
