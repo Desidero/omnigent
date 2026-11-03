@@ -1162,6 +1162,9 @@ class CreateResponseRequest(BaseModel):
     input_enqueued_at_ms: int | None = None
     # Runner-validated authorization for one delivery, separate from user content/history.
     authorized_native_shell_command: str | None = None
+    # ``"next_turn_only"``: a server automation message that must not join a
+    # running turn (see ``omnigent.native.next_turn``).
+    delivery: Literal["next_turn_only"] | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None

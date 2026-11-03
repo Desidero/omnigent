@@ -96,3 +96,15 @@ check happens where turns start, in the runner and the harness:
 - **SDK harnesses.** The runner runs one turn at a time. A wake that arrives
   mid-turn waits in the runner's queue for the next turn and is never injected
   into the running one.
+- **Native harnesses.** A native turn is typed into the agent's own terminal
+  or app, and the runner's delivery returns as soon as the input is typed. So
+  the runner holds a next-turn-only message while it sees a turn of its own, a
+  queued message, a pending approval, the terminal's own `running` or
+  `waiting` status, or a keypress in the terminal within the last 5 seconds.
+  Messages people send are not held behind it. A waiter checks every second
+  and releases the message through the runner's ordered queue, which checks
+  again. Stop, interrupt and delete drop held messages.
+- **The harness has the last word.** The harness checks once more under its
+  own injection lock, just before typing. If it is busy it refuses with
+  `next_turn_busy`, and the runner holds the message again instead of failing
+  the turn.

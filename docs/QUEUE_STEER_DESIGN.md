@@ -101,6 +101,12 @@ honestly: *"send now; the agent folds it into current work if it can"* — which
 exactly how native type-ahead already feels. Do **not** promise deterministic
 mid-turn for the unverified natives.
 
+**Server automation never steers.** A message the server sends for automation
+(a [session wake](extending/session_wake.md)) carries
+`delivery: "next_turn_only"`. The runner never injects it into a running SDK
+turn and holds it for native harnesses until the terminal is idle, so it always
+starts a turn of its own.
+
 **Steer is not interrupt.** In every case above, steer *does not cancel* the
 running turn — the message is folded in at the agent's next natural breakpoint
 (after the current tool/step completes), the same feel as steering native Claude

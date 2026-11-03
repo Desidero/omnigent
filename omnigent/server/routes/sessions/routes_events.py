@@ -57,6 +57,7 @@ from omnigent.host.frames import (
 )
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
+from omnigent.native.next_turn import NEXT_TURN_ONLY
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
@@ -295,7 +296,6 @@ from omnigent.server.schemas import (
     SessionEventInput,
 )
 from omnigent.server.server_messages import (
-    NEXT_TURN_ONLY,
     ServerEventContext,
     ServerMessageDispatch,
     SessionNotReadyError,

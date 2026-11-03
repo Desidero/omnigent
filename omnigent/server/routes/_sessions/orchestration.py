@@ -87,6 +87,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.next_turn import NEXT_TURN_ONLY
 from omnigent.onboarding.provider_config import harness_owns_its_credential
 from omnigent.policies.types import (
     ElicitationRequest,
@@ -393,7 +394,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
-from omnigent.server.server_messages import AUTOMATION_HEADER_PREFIX, NEXT_TURN_ONLY
+from omnigent.server.server_messages import AUTOMATION_HEADER_PREFIX
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,

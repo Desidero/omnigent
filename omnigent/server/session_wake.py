@@ -64,13 +64,9 @@ from omnigent.db.account_authority import (
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.entities.conversation import MESSAGE_ORIGIN_SOURCE_PATTERN
 from omnigent.errors import OmnigentError
+from omnigent.native.next_turn import DROP_NEXT_TURN_INPUT, NEXT_TURN_ONLY
 from omnigent.server import session_status_observers
-from omnigent.server.server_messages import (
-    AUTOMATION_HEADER_PREFIX,
-    DROP_NEXT_TURN_INPUT,
-    NEXT_TURN_ONLY,
-    SessionNotReadyError,
-)
+from omnigent.server.server_messages import AUTOMATION_HEADER_PREFIX, SessionNotReadyError
 
 _logger = logging.getLogger(__name__)
 
