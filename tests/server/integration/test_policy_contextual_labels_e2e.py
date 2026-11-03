@@ -19,6 +19,7 @@ pipeline without subprocesses or real LLM calls.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -490,6 +491,36 @@ async def test_a_disabled_extensions_fields_fail_closed(
         )
         _publish_status(db_uri, session_id, "blocked")
 
+        body = await _evaluate(client, session_id)
+    finally:
+        configure_published_fields(PublishedFieldView())
+
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert "unavailable" in body["reason"]
+
+
+async def test_an_operator_disabled_extensions_fields_fail_closed(
+    client: httpx.AsyncClient, db_uri: str, tmp_path: Path
+) -> None:
+    """``enabled: false`` turns an extension off but keeps its prefix governed."""
+    from tests.server.routes.test_extension_state_routes import _server
+
+    session_id = await _create_policy_session(
+        client,
+        {
+            "condition": {_STATUS_LABEL: "blocked"},
+            "function": {"path": f"{__name__}._deny_all_tool_calls"},
+        },
+    )
+    _publish_status(db_uri, session_id, "done")
+    # Building a server whose config turns the installed extension off installs
+    # the process-wide published-field view that policies read.
+    await _server(
+        db_uri,
+        tmp_path / "off",
+        server_config={"extensions": {_STATUS_EXTENSION: {"enabled": False}}},
+    )
+    try:
         body = await _evaluate(client, session_id)
     finally:
         configure_published_fields(PublishedFieldView())

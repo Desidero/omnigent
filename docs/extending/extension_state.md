@@ -26,13 +26,22 @@ enabled extensions get state, commands and published fields. Enablement is
 persistent configuration, never runtime health: a replica whose extension
 failed to activate still shows the same published fields as the others.
 
-Enablement comes from the server config's `extensions` section
-(`extensions: {<extension id>: {enabled: true}}`), which the UI slots
-feature adds; the server passes it to `create_app(extension_is_enabled=...)`.
-Without that feature, nothing is enabled: no field is published, and labels
-under the prefix of an installed extension that declares published fields
-are hidden (see below). Nothing else changes unless such an extension is
-installed; `ext.` labels are read-only either way.
+Enablement comes from the server config's `extensions` section, the same
+switch that turns on an extension's UI slot items:
+
+```yaml
+extensions:
+  acme.status:
+    enabled: true
+```
+
+An extension that is not listed, or is listed with `enabled: false`, gets no
+state: no field is published, and labels under the prefix of an installed
+extension that declares published fields are hidden (see below). Nothing
+else changes unless such an extension is installed; `ext.` labels are
+read-only either way. Embedders that build the app themselves can pass
+their own predicate as `create_app(extension_is_enabled=...)`, which
+replaces the config.
 
 ### Labels no extension state backs
 

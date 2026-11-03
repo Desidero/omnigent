@@ -1724,7 +1724,8 @@ def create_app(
         enabled set once at application construction.
     :param extension_is_enabled: The operator's persistent enablement of an
         extension id, which gates extension session state, commands and
-        published fields. ``None`` enables none of them.
+        published fields. ``None`` uses the server config's
+        ``extensions.<id>.enabled: true``, the switch that turns on UI slots.
     :param extension_state: Optional pre-resolved installed-extension registry.
         When omitted, entry points are discovered once at application
         construction and the process-cached state is reused thereafter.
@@ -1840,15 +1841,23 @@ def create_app(
     extension_enablement = parse_extension_enablement(resolved_server_config)
     for extension_key, extension_error in sorted(extension_enablement.errors.items()):
         _logger.warning("extension config for %s is ignored: %s", extension_key, extension_error)
+    installed_extension_state = _resolve_extension_state(extension_state)
     # Filter before resolving bundles so a disabled extension's assets are not served.
     resolved_extension_state = apply_extension_enablement(
-        _resolve_extension_state(extension_state), extension_enablement
+        installed_extension_state, extension_enablement
     )
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
-    extension_state_enabled = extension_is_enabled or (lambda _extension_id: False)
+    # The operator's config decides unless the caller passes its own predicate.
+    extension_state_enabled = (
+        extension_is_enabled
+        if extension_is_enabled is not None
+        else extension_enablement.allows_slots
+    )
+    # State sees every installed extension, so a turned-off one's ``ext.<id>.``
+    # labels stay governed (hidden, and unreadable to policies), not ordinary.
     configure_published_fields(
         build_published_field_view(
-            resolved_extension_state.manifests, is_enabled=extension_state_enabled
+            installed_extension_state.manifests, is_enabled=extension_state_enabled
         )
     )
 
@@ -3882,7 +3891,7 @@ def create_app(
     app.include_router(
         create_extension_state_router(
             ExtensionStateService(
-                resolved_extension_state,
+                installed_extension_state,
                 is_enabled=extension_state_enabled,
                 store=conversation_store,
             ),

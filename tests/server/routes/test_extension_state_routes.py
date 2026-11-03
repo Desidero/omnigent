@@ -149,6 +149,7 @@ async def _server(
     *,
     enabled: bool = True,
     installed: bool = True,
+    server_config: dict[str, object] | None = None,
 ) -> _Server:
     permission_store = SqlAlchemyPermissionStore(db_uri)
     for user in (_OWNER, _EDITOR, _READER):
@@ -164,7 +165,13 @@ async def _server(
         permission_store=permission_store,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         extension_state=ExtensionPluginState(manifests=(_manifest(),) if installed else ()),
-        extension_is_enabled=lambda extension_id: enabled and extension_id == _EXT,
+        server_config={} if server_config is None else server_config,
+        # A server config stands in for the predicate, as at server startup.
+        extension_is_enabled=(
+            (lambda extension_id: enabled and extension_id == _EXT)
+            if server_config is None
+            else None
+        ),
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -292,6 +299,61 @@ async def test_disabled_extension_publishes_nothing(db_uri: str, tmp_path: Path)
     session = (await uninstalled.get(_OWNER, "")).json()
     # Once uninstalled, the last value is an ordinary, read-only label.
     assert session["labels"][f"ext.{_EXT}.status"] == "done"
+
+
+@pytest.mark.parametrize(
+    ("server_config", "expected_status"),
+    [
+        ({"extensions": {_EXT: {"enabled": True}}}, 200),
+        ({}, 404),
+        ({"extensions": {_EXT: {"enabled": False}}}, 404),
+    ],
+)
+async def test_operator_config_enables_state_without_a_predicate(
+    db_uri: str,
+    tmp_path: Path,
+    server_config: dict[str, object],
+    expected_status: int,
+) -> None:
+    server = await _server(db_uri, tmp_path, server_config=server_config)
+
+    response = await server.command(_OWNER, "set", status="done")
+
+    assert response.status_code == expected_status, response.text
+    session = (await server.get(_READER, "")).json()
+    expected = {_EXT: {"status": "done"}} if expected_status == 200 else {}
+    assert session["published_fields"] == expected
+    if expected_status != 200:
+        # An installed extension's prefix stays governed, even when turned off.
+        _write_raw_label(server, f"ext.{_EXT}.status", "done")
+        session = (await server.get(_READER, "")).json()
+        assert f"ext.{_EXT}.status" not in session["labels"]
+
+
+async def test_an_explicit_predicate_overrides_the_operator_config(
+    db_uri: str, tmp_path: Path
+) -> None:
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    permission_store.ensure_user(_OWNER)
+    store = SqlAlchemyConversationStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        permission_store=permission_store,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        extension_state=ExtensionPluginState(manifests=(_manifest(),)),
+        server_config={"extensions": {_EXT: {"enabled": True}}},
+        extension_is_enabled=lambda _extension_id: False,
+    )
+    server = _Server(app=app, store=store, session_id="")
+    async with server.client(_OWNER) as client:
+        server.session_id = (await create_test_agent(client, user=_OWNER))["_session_id"]
+
+    assert (await server.command(_OWNER, "set", status="done")).status_code == 404
 
 
 async def test_patch_refuses_keys_the_database_equates_with_a_mirror(server: _Server) -> None:
