@@ -46,6 +46,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import (
     FunctionCallData,
     FunctionCallOutputData,
+    MessageOrigin,
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
@@ -392,6 +393,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.server_messages import NEXT_TURN_ONLY
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
@@ -3175,6 +3177,14 @@ async def _persist_external_conversation_item_unlocked(
                 and match_method != "fifo_fallback"
             ):
                 item = item.model_copy(update={"created_by": drained.created_by})
+            if drained.origin is not None and match_method != "fifo_fallback":
+                item = item.model_copy(
+                    update={
+                        "data": item.data.model_copy(
+                            update={"origin": MessageOrigin.model_validate(drained.origin)}
+                        )
+                    }
+                )
             # A web client that sends stable_id gets store-level idempotency:
             # use it directly as the item id so the append is a no-op on retry.
             # source_id from the forwarder takes precedence when both are set.
@@ -3224,7 +3234,7 @@ async def _persist_external_conversation_item_unlocked(
         pending_background_title = prepare_background_session_title(
             coordinator=background_title_coordinator,
             conversation=conv,
-            event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+            event=SessionEventInput(type=item.type, data=item.data.model_dump(exclude={"origin"})),
             enabled=enabled and (drained is None or drained.background_titles_enabled),
         )
         persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
@@ -6451,6 +6461,14 @@ async def _forward_native_subagent_terminal_failure(
     _require_external_status_forward(session_id, "failed", runner_result)
 
 
+def _message_origin(body: SessionEventInput) -> dict[str, Any] | None:
+    """Return the validated server-set origin of a message event, if any."""
+    raw = body.data.get("origin")
+    if raw is None:
+        return None
+    return MessageOrigin.model_validate(raw).model_dump(exclude_none=True)
+
+
 def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
@@ -6507,6 +6525,9 @@ def _build_native_terminal_message_event(
     raw_stable_id = body.data.get("stable_id")
     if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id):
         event["stable_id"] = raw_stable_id
+    if body.data.get("delivery") == NEXT_TURN_ONLY:
+        # Only the server sets it; the runner never steers this message into a turn.
+        event["delivery"] = NEXT_TURN_ONLY
     event.update(input_attributes(input_delivery))
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
@@ -8268,6 +8289,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                origin=_message_origin(body),
             )
             if queues_message
             else None
@@ -10502,6 +10524,7 @@ async def _evaluate_input_policy(
         content=request_content,
         tool_name=None,
         actor=actor,
+        origin=_message_origin(body),
     )
     engine, result = await _evaluate_policy_with_fresh_engine(
         session_id, spec, conversation_store, conv, ctx

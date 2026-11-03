@@ -215,6 +215,11 @@ class EvaluationContext:
         policies should skip only explicit ``False`` to preserve those
         callers. The relay skips empty and whitespace-only segments.
         Surfaced as ``event["context"]["turn_final"]``.
+    :param origin: On ``REQUEST``, the automation that sent a user message
+        the server posted on its own initiative (a session wake), shaped
+        ``{"kind": "automation", "source": "ext:<id>", "on_behalf_of":
+        "<user>", "label": "<name>"}``. ``None`` for a message a person or
+        agent sent. Surfaced as ``event["context"]["origin"]``.
     """
 
     phase: Phase
@@ -233,6 +238,7 @@ class EvaluationContext:
     conversation_id: str | None = None
     conversation_title: str | None = None
     turn_final: bool | None = None
+    origin: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)

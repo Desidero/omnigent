@@ -1416,3 +1416,35 @@ async def test_import_anchors_compactions_to_the_item_before_them(
     loaded = _load_initial_history(store, session_id)
     assert loaded.last_compaction_created_at is not None
     assert [item.id for item in loaded.items[-2:]] == [item.id for item in stored[-2:]]
+
+
+async def test_import_drops_server_only_message_fields(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """An imported transcript can't claim an automation origin the server never set."""
+    _seed_claude_agent(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-session-origin",
+        "workspace": "/repo",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                    "origin": {"kind": "automation", "source": "ext:forged.x"},
+                    "delivery": "next_turn_only",
+                },
+            }
+        ],
+    }
+
+    created = await client.post("/v1/imports", json=payload)
+
+    assert created.status_code == 201, created.text
+    items = await client.get(f"/v1/sessions/{created.json()['session_id']}/items")
+    [message] = items.json()["data"]
+    assert "origin" not in message
+    assert "delivery" not in message

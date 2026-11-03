@@ -28,7 +28,7 @@ from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
-from omnigent.server.schemas import SessionCreateRequest
+from omnigent.server.schemas import SERVER_ONLY_MESSAGE_FIELDS, SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -69,9 +69,16 @@ class ImportItemInput(BaseModel):
     data: dict[str, object]
 
     def to_item(self) -> NewConversationItem:
-        """Validate the type-specific payload and return a new item entity."""
+        """Validate the type-specific payload and return a new item entity.
+
+        Server-only message fields (``origin``, ``delivery``) are dropped: the
+        server cannot vouch for an imported automation attribution.
+        """
+        payload = {
+            key: value for key, value in self.data.items() if key not in SERVER_ONLY_MESSAGE_FIELDS
+        }
         try:
-            data = parse_item_data(self.type, self.data)
+            data = parse_item_data(self.type, payload)
             return NewConversationItem(type=self.type, response_id=self.response_id, data=data)
         except (TypeError, ValueError) as exc:
             raise OmnigentError(

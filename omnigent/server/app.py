@@ -3781,6 +3781,9 @@ def create_app(
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
             ),
+            register_server_message=lambda handler: setattr(
+                app.state, "server_message_dispatch", handler
+            ),
         ),
         prefix="/v1",
         tags=["sessions"],

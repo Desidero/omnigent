@@ -561,6 +561,24 @@ The relay skips empty and whitespace-only segments: a turn that ends with a tool
 call and no trailing text has no final response-policy invocation. `turn_final`
 describes the current evaluation; it does not guarantee one callback per turn.
 
+### Messages sent by automation
+
+A message the server sends for an automation (a
+[session wake](extending/session_wake.md)) is posted as the session owner, so
+`event["context"]["actor"]` names the owner, not the person who turned the
+automation on. `input` policies see the automation in
+`event["context"]["origin"]`: `{"kind": "automation", "source": "ext:<id>",
+"on_behalf_of": "<user>", "label": "<name>"}`. It is `None` for messages a
+person or agent sent.
+
+```python
+def no_automation_after_hours(event):
+    origin = event["context"]["origin"]
+    if event["type"] == "input" and origin is not None and after_hours():
+        return {"result": "DENY", "reason": f"{origin['source']} may not wake agents now"}
+    return {"result": "ALLOW"}
+```
+
 ### Factory form
 
 For policies that need configuration, write a factory -- a function that accepts parameters and returns the actual evaluator:

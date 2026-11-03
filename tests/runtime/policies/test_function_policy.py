@@ -1418,3 +1418,15 @@ async def test_engine_conversation_title_none_when_untitled(
     engine = _build_engine(conversation_store, [policy])
     await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
     assert captured["conversation_title"] is None
+
+
+def test_build_event_carries_automation_origin() -> None:
+    """A wake is posted as the session owner; policies see the automation behind it."""
+    origin = {"kind": "automation", "source": "ext:acme.goal-loop", "on_behalf_of": "bob"}
+
+    assert (
+        _build_event(EvaluationContext(phase=Phase.REQUEST, content="hi"))["context"]["origin"]
+        is None
+    )
+    event = _build_event(EvaluationContext(phase=Phase.REQUEST, content="hi", origin=origin))
+    assert event["context"]["origin"] == origin

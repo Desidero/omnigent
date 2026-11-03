@@ -109,7 +109,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -233,6 +233,7 @@ class DrainedInput:
         hidden and settles quietly as an uncertain entry.
     :param uncertain: Whether a positional drain may already have mirrored
         this entry. Restore must preserve that evidence even after eviction.
+    :param origin: The automation that sent this message, when the server did.
     """
 
     pending_id: str
@@ -241,6 +242,7 @@ class DrainedInput:
     stable_id: str | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
+    origin: dict[str, Any] | None = None
     # Reconstructed entries without original delivery metadata must remain unknown.
     input_enqueued_at_ms: int | None = None
     delivery_attempt_id: str | None = None
@@ -307,6 +309,7 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param origin: The automation that sent this message, when the server did.
     """
 
     pending_id: str
@@ -314,6 +317,7 @@ class _Entry:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    origin: dict[str, Any] | None = None
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
@@ -376,6 +380,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    origin: Mapping[str, Any] | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -399,6 +404,9 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param origin: The automation that sent a server-originated message (see
+        :class:`~omnigent.entities.conversation.MessageOrigin`), applied to the
+        mirrored item like ``created_by``; ``None`` for a person's message.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -422,6 +430,7 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            origin=dict(origin) if origin is not None else None,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -785,6 +794,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
+        origin=copy.deepcopy(drained.origin),
         uncertain=drained.uncertain,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
         delivery_attempt_id=drained.delivery_attempt_id,
@@ -996,6 +1006,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
+                **({"origin": copy.deepcopy(entry.origin)} if entry.origin is not None else {}),
             }
             for entry in entries.values()
             if not entry.interrupted
@@ -1011,6 +1022,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
+        origin=copy.deepcopy(entry.origin),
         uncertain=entry.uncertain,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,
         delivery_attempt_id=entry.delivery_attempt_id,

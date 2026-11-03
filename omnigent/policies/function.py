@@ -236,6 +236,9 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
             # hook so policies can tailor messages to it. ``None`` when
             # unstamped (web / API).
             "harness": ctx.harness,
+            # The automation behind a server-sent message (session wake);
+            # ``None`` for a message a person or agent sent.
+            "origin": dict(ctx.origin) if ctx.origin else None,
             # Conversation labels (engine hot cache), empty when unpopulated.
             "labels": dict(ctx.labels) if ctx.labels is not None else {},
             # Subtree-scoped cumulative cost (this conversation + its

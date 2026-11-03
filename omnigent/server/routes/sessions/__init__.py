@@ -823,6 +823,7 @@ def create_sessions_router(
     pull_request_refresher: PullRequestRefresher | None = None,
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
+    register_server_message: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
@@ -1003,6 +1004,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        register_server_message=register_server_message,
     )
 
     register_permissions_routes(

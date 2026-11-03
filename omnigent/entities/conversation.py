@@ -294,6 +294,29 @@ class StartupInputOptions(BaseModel):
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
 _MAX_MESSAGE_PHASE_LENGTH = 64
 
+# ``core:<name>`` for server features, ``ext:<extension id>`` for extensions.
+MESSAGE_ORIGIN_SOURCE_PATTERN = r"^(core|ext):[a-z0-9][a-z0-9._-]{0,63}$"
+
+
+class MessageOrigin(BaseModel):
+    """
+    Who started a user message that no person typed.
+
+    Only the server sets it (see :mod:`omnigent.server.session_wake`); the
+    session events route rejects a client-supplied value.
+
+    :param kind: Always ``"automation"`` today.
+    :param source: The automation, e.g. ``"ext:acme.goal-loop"``.
+    :param on_behalf_of: The user who turned the automation on, e.g.
+        ``"alice@example.com"``; ``None`` in single-user mode.
+    :param label: Short display name, e.g. ``"Goal loop"``.
+    """
+
+    kind: Literal["automation"] = "automation"
+    source: str = Field(pattern=MESSAGE_ORIGIN_SOURCE_PATTERN)
+    on_behalf_of: str | None = Field(default=None, max_length=256)
+    label: str | None = Field(default=None, max_length=64)
+
 
 class MessageData(BaseModel):
     """
@@ -323,6 +346,8 @@ class MessageData(BaseModel):
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
         Stored as given so clients can act on values added later; ``None``
         when unset, not a string, or longer than 64 characters.
+    :param origin: Set on a user message the server sent for an automation,
+        e.g. a session wake; ``None`` for messages a person or agent sent.
     """
 
     role: Literal["user", "assistant"]
@@ -338,6 +363,7 @@ class MessageData(BaseModel):
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    origin: MessageOrigin | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("content")
     @classmethod
@@ -367,6 +393,8 @@ class MessageData(BaseModel):
             raise ValueError("assistant messages require 'agent'")
         if self.role == "user" and self.phase is not None:
             raise ValueError("user messages cannot carry 'phase'")
+        if self.role == "assistant" and self.origin is not None:
+            raise ValueError("assistant messages cannot carry 'origin'")
         return self
 
 
