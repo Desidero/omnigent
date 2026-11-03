@@ -91,5 +91,60 @@ check_extension_package(
 )
 ```
 
-`activation_events`, `when`, and command records are reserved metadata only in
-V1. Do not rely on them until a later API explicitly documents execution.
+`activation_events` and `when` are reserved metadata only in V1. Do not rely on
+them until a later API explicitly documents execution.
+
+## Session state and commands
+
+`state` declares the keys an extension keeps about a session and who may read
+them; a command with a `SetState` or `ClearState` action writes them on the
+server for users with enough access to the session:
+
+```python
+from omnigent.extensions import (
+    CommandArgument,
+    CommandContribution,
+    SetState,
+    StateContribution,
+    StateField,
+    StateVisibility,
+)
+
+state = StateContribution(
+    fields=(
+        StateField("status", StateVisibility.PUBLISHED, max_length=32),
+        StateField("pr:*", StateVisibility.READERS),
+    ),
+)
+commands = (
+    CommandContribution(
+        id="acme.review.set-status",
+        title="Set status",
+        action=SetState(key="status", value="{status}"),
+        arguments=(CommandArgument("status", choices=("blocked", "done")),),
+    ),
+)
+```
+
+- Keys are 1-128 characters from letters, digits and `._:=+/@-`. A field key
+  ending in `*` declares every key with that prefix.
+- Visibility is `service` (the default for undeclared keys: server code only),
+  `editors`, `readers`, or `published`. Published fields are exact lowercase
+  keys of UTF-8 text up to `max_length` (at most 256) characters; at most three
+  per extension, and `ext.<extension id>.<key>` must fit in 128 characters.
+- Command arguments need `choices` or a full-match `pattern`, and every
+  declared argument must appear in the key or value template. Commands without
+  an action stay reserved metadata.
+- A command's key template writes to exactly one declared field: an exact key,
+  or a `prefix*` field whose prefix is literal text before the first
+  placeholder (`pr:{pr}` under `pr:*`, never `{name}`). A bound key that
+  another declaration covers is refused. Writing a `service` field needs
+  `writes_service_state=True` on the command.
+- Commands create at most `max_keys` keys under one prefix field (16 by
+  default) and 48 keys per extension in total, leaving room for the
+  extension's server code.
+- `confirm` is a prompt for clients to show before running the command; the
+  server does not enforce it.
+
+See [Extension session state](extension_state.md) for storage limits, access
+rules and the HTTP API.

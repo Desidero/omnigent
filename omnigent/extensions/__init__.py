@@ -2,6 +2,9 @@
 
 from omnigent.extensions.api import (
     EXTENSION_API_VERSION,
+    ClearState,
+    CommandAccess,
+    CommandArgument,
     CommandContribution,
     ExtensionEntrypoints,
     ExtensionManifest,
@@ -9,6 +12,10 @@ from omnigent.extensions.api import (
     ExtensionPluginState,
     PageContribution,
     PrimaryNavigationContribution,
+    SetState,
+    StateContribution,
+    StateField,
+    StateVisibility,
 )
 from omnigent.extensions.conformance import check_extension_package
 from omnigent.extensions.registry import (
@@ -25,6 +32,9 @@ __all__ = [
     "ENTRY_POINT_GROUP",
     "EXTENSION_API_VERSION",
     "SUPPORTED_EXTENSION_API_VERSIONS",
+    "ClearState",
+    "CommandAccess",
+    "CommandArgument",
     "CommandContribution",
     "ExtensionEntrypoints",
     "ExtensionManifest",
@@ -33,6 +43,10 @@ __all__ = [
     "ExtensionValidationError",
     "PageContribution",
     "PrimaryNavigationContribution",
+    "SetState",
+    "StateContribution",
+    "StateField",
+    "StateVisibility",
     "check_extension_package",
     "extension_manifest",
     "extension_manifests",
