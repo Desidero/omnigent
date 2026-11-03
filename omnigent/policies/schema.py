@@ -201,6 +201,11 @@ class EventContext(TypedDict, total=False):
         labels, e.g. ``{"cost_control.plan": "{...}"}``. Populated by
         the server-side engine; empty on paths that don't carry labels
         (the runner-local gate). Read via ``event["context"]["labels"]``.
+        ``ext.*`` labels appear only for available published fields.
+    :param published_fields: Every available published field of an
+        enabled extension, ``{extension_id: {key: value or None}}``; a
+        field missing here is unavailable. Read through
+        :func:`omnigent.policies.published_fields.require_published_field`.
     :param conversation_id: The conversation this event belongs to.
         Injected by the engine, which already owns this identity.
         Read via ``event["context"]["conversation_id"]``.
@@ -227,6 +232,7 @@ class EventContext(TypedDict, total=False):
     model: str | None
     harness: str | None
     labels: dict[str, str]
+    published_fields: dict[str, dict[str, str | None]]
     # ``str | None``: the value is ``ctx.conversation_id``, injected by the
     # engine. ``None`` only in contexts with no engine.
     conversation_id: str | None

@@ -623,6 +623,51 @@ def block_domains(blocked_domains: list[str]) -> callable:
 
 `state_updates` supports four actions: `"set"`, `"increment"`, `"delete"`, `"append"`.
 
+### Extension published fields
+
+Enabled extensions can publish up to three read-only fields per session (see
+[Extension session state](extending/extension_state.md)). Policies see them as
+labels named `ext.<extension id>.<key>` in `event["context"]["labels"]` and in
+`condition:` gates, and grouped by extension in
+`event["context"]["published_fields"]`, where a field with no value is `null`.
+
+Core owns the `ext.<extension id>.` prefix of every installed extension that
+declares published fields. A label there is readable only when the extension is
+enabled and the label is a declared published field that the extension's state
+backs with the same value; a disabled extension's labels are all unreadable. Reading anything else under the prefix must not
+quietly look like "unset", so:
+
+- A policy whose `condition:` names such a label **denies**, with a reason
+  naming it, instead of being skipped.
+- In a function policy, looking such a label up in `event["context"]["labels"]`
+  (`[]`, `.get()` or `in`) raises, and the engine turns that into a deny.
+  Only lookups are checked: copying or iterating the mapping
+  (`dict(labels)`, `.items()`, `{**labels}`, serializing it) yields only
+  readable labels, so a missing key there looks unset. Look fields up by key,
+  or use `require_published_field`.
+- `require_published_field` reads a field and raises when it is unavailable,
+  including when its extension is not enabled:
+
+  ```python
+  from omnigent.policies.published_fields import require_published_field
+
+  def hold_while_blocked(event):
+      if require_published_field(event, "acme.review", "status") == "blocked":
+          return {"result": "DENY", "reason": "Review is blocked."}
+      return {"result": "ALLOW"}
+  ```
+
+A published field that is merely unset is absent from `labels` and `null` in
+`published_fields`. A `condition:` can only match values, so it cannot express
+"unset"; use a function policy for that. Labels under the prefix of an
+extension that is no longer installed are ordinary labels: policies read their
+last values like any other label, and `require_published_field` reports them
+unavailable.
+
+Policies cannot write `ext.` labels (such writes are dropped). Agent specs
+cannot declare labels under a governed prefix; other `ext.` declarations load,
+but their initial values are not written.
+
 ### Making policies discoverable
 
 To make custom policies appear in the UI, export a `POLICY_REGISTRY` list from your module:

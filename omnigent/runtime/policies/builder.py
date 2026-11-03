@@ -29,6 +29,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+from omnigent.extensions.state_keys import is_extension_label
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
@@ -899,6 +900,9 @@ def build_policy_engine(
         conversation_id=conversation_id,
         conversation_title=conv.title if conv is not None else None,
         initial_labels=initial_labels,
+        verified_extension_labels=(
+            conv.verified_extension_labels if conv is not None else frozenset()
+        ),
         initial_session_state=initial_session_state,
         initial_usage=initial_usage,
         initial_subtree_usage=initial_subtree_usage,
@@ -1157,8 +1161,12 @@ def _seed_and_load_labels(
     to_seed = {
         key: ldef.initial
         for key, ldef in label_defs.items()
-        if ldef.initial is not None and key not in existing
+        if ldef.initial is not None and key not in existing and not is_extension_label(key)
     }
+    skipped = sorted(key for key in label_defs if is_extension_label(key))
+    if skipped:
+        # Only core writes ``ext.`` labels; a declaration can't seed one.
+        _logger.warning("not seeding read-only labels %s", ", ".join(skipped))
     if to_seed:
         conversation_store.set_labels(conversation_id, to_seed)
         # Re-read to pick up the freshly seeded values plus any

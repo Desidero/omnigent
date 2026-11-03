@@ -194,6 +194,10 @@ class EvaluationContext:
         label state via ``event["context"]["labels"]``. ``None`` means
         "not populated" (runner-local gate, test contexts) — policies
         must treat that the same as an empty mapping.
+    :param published_fields: Available published fields of enabled
+        extensions, ``{extension_id: {key: value or None}}``. Injected
+        with ``labels``; ``None`` means not populated, so every field is
+        unavailable.
     :param llm_client: An :class:`~omnigent.policies.types.PolicyLLMClient`
         instance configured with the server-level LLM credentials.
         Available to function policy callables via
@@ -229,6 +233,7 @@ class EvaluationContext:
     model: str | None = None
     harness: str | None = None
     labels: dict[str, str] | None = None
+    published_fields: dict[str, dict[str, str | None]] | None = None
     llm_client: PolicyLLMClient | None = None
     conversation_id: str | None = None
     conversation_title: str | None = None

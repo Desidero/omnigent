@@ -22,6 +22,7 @@ from pydantic import (
 )
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.extensions.published_fields import published_field_view
 from omnigent.inner.datamodel import (
     DEFAULT_BASIC_USERNAME,
     CredentialProxyEntry,
@@ -3475,6 +3476,12 @@ def _parse_label_defs(
         )
     defs: dict[str, LabelDef] = {}
     for key, entry in raw.items():
+        if published_field_view().governs(str(key)):
+            raise OmnigentError(
+                f"guardrails.labels.{key}: labels under an installed extension's 'ext.' "
+                "prefix mirror its published state and cannot be declared",
+                code=ErrorCode.INVALID_INPUT,
+            )
         defs[str(key)] = _parse_single_label_def(str(key), entry)
     return defs
 

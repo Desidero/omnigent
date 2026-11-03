@@ -237,7 +237,13 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
             # unstamped (web / API).
             "harness": ctx.harness,
             # Conversation labels (engine hot cache), empty when unpopulated.
-            "labels": dict(ctx.labels) if ctx.labels is not None else {},
+            # A copy that keeps the engine's checks (see PolicyLabels).
+            "labels": ctx.labels.copy() if ctx.labels is not None else {},
+            # Available published extension fields; absent ones are unavailable.
+            "published_fields": {
+                extension_id: dict(fields)
+                for extension_id, fields in (ctx.published_fields or {}).items()
+            },
             # Subtree-scoped cumulative cost (this conversation + its
             # descendants only), injected by the engine only when a
             # subagent_cost_budget policy is present; empty dict otherwise.

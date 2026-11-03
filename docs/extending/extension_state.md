@@ -81,6 +81,8 @@ responses and unreadable to policies (its row is kept). Labels under other
 `ext.` prefixes, including those of an uninstalled extension, stay visible
 as ordinary read-only labels; `published_fields` lists only enabled
 extensions.
+A policy that depends on a published field fails closed while it is
+unavailable; see [Policies](../POLICIES.md#extension-published-fields).
 
 ## Commands
 
