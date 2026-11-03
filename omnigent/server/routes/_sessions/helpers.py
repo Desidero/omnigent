@@ -73,6 +73,7 @@ from omnigent.errors import (
     category_for_code,
     restart_on_stale_cursor,
 )
+from omnigent.extensions.published_fields import published_field_view
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
@@ -10768,6 +10769,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         raise OmnigentError(
             "Sandbox profile labels are server-owned", code=ErrorCode.INVALID_INPUT
         )
+    from omnigent.extensions.state_keys import is_extension_label
+
+    if any(is_extension_label(key) for key in labels):
+        raise OmnigentError(
+            "'ext.' labels are read-only mirrors of extension state; "
+            "change them through the extension's commands",
+            code=ErrorCode.INVALID_INPUT,
+        )
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
     if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):
@@ -11352,7 +11361,13 @@ def _child_session_summary_from_conversation(
     # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
     # defensively so a shared child's summary can never expose another viewer's
     # pin key. No collapse-to-canonical here: there's no pin to surface.
-    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    raw_labels = {
+        k: v
+        for k, v in published_field_view()
+        .visible_labels(conv.labels, conv.verified_extension_labels)
+        .items()
+        if not k.startswith(f"{PINNED_LABEL_KEY}.")
+    }
     labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None

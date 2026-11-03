@@ -2027,6 +2027,17 @@ class CreatedSessionResponse(BaseModel):
     agent_name: str
 
 
+_SESSION_LABELS_DESCRIPTION = (
+    "Session labels. Keys starting with `ext.` are read-only: only core writes them. "
+    "Under an installed extension's `ext.<extension id>.` prefix, only published state "
+    "fields of an enabled extension are returned."
+)
+_PUBLISHED_FIELDS_DESCRIPTION = (
+    "Published state fields of enabled extensions, by extension id then key. The same "
+    "values appear in `labels` as `ext.<extension id>.<key>`."
+)
+
+
 class SessionLabelsResponse(BaseModel):
     """
     Lightweight response body for ``GET /v1/sessions/{id}/labels``.
@@ -2037,7 +2048,7 @@ class SessionLabelsResponse(BaseModel):
     """
 
     id: str
-    labels: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict, description=_SESSION_LABELS_DESCRIPTION)
 
 
 # Stages of a managed-sandbox launch, in pipeline order: the sandbox
@@ -2199,6 +2210,8 @@ class SessionResponse(BaseModel):
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
         when no labels have been written.
+    :param published_fields: Enabled extensions' published state
+        fields, ``{extension_id: {key: value}}``.
     :param runner_id: Runner currently bound to this session, e.g.
         ``"runner_abc123"``. ``None`` until a client binds one via
         ``PATCH /v1/sessions/{id}``.
@@ -2433,7 +2446,10 @@ class SessionResponse(BaseModel):
     created_at: int
     updated_at: int | None = None
     title: str | None = None
-    labels: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict, description=_SESSION_LABELS_DESCRIPTION)
+    published_fields: dict[str, dict[str, str]] = Field(
+        default_factory=dict, description=_PUBLISHED_FIELDS_DESCRIPTION
+    )
     runner_id: str | None = None
     host_id: str | None = None
     # Derived from the parent runner's live handshake, never persisted on the child.
@@ -3077,6 +3093,8 @@ class SessionListItem(BaseModel):
     :param updated_at: Unix epoch seconds of last update.
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
+    :param published_fields: Enabled extensions' published state
+        fields, ``{extension_id: {key: value}}``.
     :param runner_id: Runner currently bound to the session.
     :param host_id: Host that launched the runner for this session.
     :param runner_online: Strict runner liveness — ``True`` iff a
@@ -3175,7 +3193,10 @@ class SessionListItem(BaseModel):
     created_at: int
     updated_at: int
     title: str | None = None
-    labels: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict, description=_SESSION_LABELS_DESCRIPTION)
+    published_fields: dict[str, dict[str, str]] = Field(
+        default_factory=dict, description=_PUBLISHED_FIELDS_DESCRIPTION
+    )
     runner_id: str | None = None
     host_id: str | None = None
     runner_online: bool | None = None

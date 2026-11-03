@@ -18,9 +18,12 @@ from dataclasses import replace
 from typing import Any
 
 from omnigent.extensions.labels import active_label_policy
+from omnigent.extensions.published_fields import published_field_view
+from omnigent.extensions.state_keys import is_extension_label
 from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 from omnigent.policies.base import Policy
 from omnigent.policies.function import FunctionPolicy
+from omnigent.policies.published_fields import PolicyLabels
 from omnigent.policies.schema import AUTOMATIC_RUNTIME_STATE_KEYS, is_reserved_state_key
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
@@ -129,6 +132,7 @@ class PolicyEngine:
         conversation_store: ConversationStore,
         root_conversation_id: str | None = None,
         llm_client: Any = None,
+        verified_extension_labels: frozenset[str] = frozenset(),
     ) -> None:
         self.policies = policies
         self.label_defs = label_defs
@@ -140,7 +144,19 @@ class PolicyEngine:
         # approving once covers the whole tree — a sub-agent runs as its own
         # conversation. Defaults to ``conversation_id`` for a top-level session.
         self._root_conversation_id = root_conversation_id or conversation_id
-        self._labels = dict(initial_labels)
+        # Under an enabled extension's ``ext.<id>.`` prefix only verified
+        # published fields count; other ``ext.*`` labels are ordinary labels.
+        self._published_fields = published_field_view()
+        self._verified_extension_labels = verified_extension_labels
+        self._labels = self._published_fields.visible_labels(
+            initial_labels, verified_extension_labels
+        )
+        # Governed labels that exist but were hidden: reading them fails closed.
+        self._hidden_labels = frozenset(
+            key
+            for key in initial_labels
+            if self._published_fields.governs(key) and key not in self._labels
+        )
         self._session_state: dict[str, Any] = dict(initial_session_state or {})
         self._usage: dict[str, float] = dict(
             initial_usage
@@ -377,6 +393,19 @@ class PolicyEngine:
         ctx = self._inject_conversation_title(ctx)
 
         for policy in self.policies:
+            unavailable = self._unavailable_condition_fields(policy.spec, ctx)
+            if unavailable:
+                # An unreadable field must not silently lift the policy's restriction.
+                return self._compose_deny(
+                    policy.spec.name,
+                    f"policy {policy.spec.name!r} requires published field(s) "
+                    f"{', '.join(unavailable)}, which are unavailable "
+                    "(not a published field, or not backed by extension state)",
+                    accumulated,
+                    accumulated_state,
+                    deciding_policy_workspace_id=getattr(policy.spec, "workspace_id", None),
+                    read_only=read_only,
+                )
             if not self._should_fire(policy.spec, ctx):
                 continue
             result = await _dispatch_policy(policy, ctx, context)
@@ -489,6 +518,23 @@ class PolicyEngine:
             deciding_policy_workspace_id=deciding_policy_workspace_id,
         )
 
+    def _unavailable_condition_fields(self, spec: PolicySpec, ctx: EvaluationContext) -> list[str]:
+        """Labels this policy's ``condition`` names that policies may not read.
+
+        Only policies whose phase selector matches the event count.
+        """
+        if not spec.condition:
+            return []
+        if spec.on is not None and not any(sel.matches(ctx) for sel in spec.on):
+            return []
+        return sorted(key for key in spec.condition if self._unreadable_label(key))
+
+    def _unreadable_label(self, key: str) -> bool:
+        """Under an enabled extension's prefix: not a published field, or hidden."""
+        return self._published_fields.governs(key) and (
+            not self._published_fields.is_available(key) or key in self._hidden_labels
+        )
+
     def _should_fire(
         self,
         spec: PolicySpec,
@@ -572,7 +618,13 @@ class PolicyEngine:
         }
         if not filtered:
             return
-        self._store.set_labels(self._conversation_id, filtered)
+        try:
+            self._store.set_labels(self._conversation_id, filtered)
+        except ValueError as exc:
+            # The store refused a read-only key (e.g. one the database collates
+            # onto an ``ext.`` mirror); like other invalid writes, drop them.
+            _logger.warning("dropping policy label writes %s: %s", sorted(filtered), exc)
+            return
         self._labels.update(filtered)
 
     def apply_state_updates(self, updates: list[StateUpdate], *, approved: bool = False) -> None:
@@ -912,9 +964,17 @@ class PolicyEngine:
         :param ctx: Original :class:`EvaluationContext` from the
             caller.
         :returns: A new :class:`EvaluationContext` with ``labels`` set
-            to a defensive copy of the hot cache.
+            to a defensive copy of the hot cache, which raises
+            :class:`PublishedFieldUnavailableError` when a policy reads a
+            label it may not (see :class:`PolicyLabels`).
         """
-        return replace(ctx, labels=dict(self._labels))
+        return replace(
+            ctx,
+            labels=PolicyLabels(self._labels, unreadable=self._unreadable_label),
+            published_fields=self._published_fields.policy_fields(
+                self._labels, self._verified_extension_labels
+            ),
+        )
 
     def _inject_llm_client(self, ctx: EvaluationContext) -> EvaluationContext:
         """
@@ -996,10 +1056,14 @@ class PolicyEngine:
         :param set_labels: Caller's requested writes.
         :returns: Subset of *set_labels* that pass every
             applicable schema check. Keys with no LabelDef
-            pass through unchanged.
+            pass through unchanged; ``ext.*`` keys are always dropped.
         """
         result: dict[str, str] = {}
         for key, value in set_labels.items():
+            if is_extension_label(key):
+                # Only core mirrors extension state into ``ext.*`` labels.
+                _logger.warning("dropping policy write to read-only label %r", key)
+                continue
             ldef = self.label_defs.get(key)
             if ldef is None:
                 result[key] = value

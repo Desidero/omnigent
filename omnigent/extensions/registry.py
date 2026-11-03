@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import re
+import string
 import threading
 from collections import defaultdict
 from collections.abc import Iterable
@@ -17,6 +18,9 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent.extensions.api import (
     EXTENSION_API_VERSION,
+    ClearState,
+    CommandAccess,
+    CommandArgument,
     CommandContribution,
     ExtensionEntrypoints,
     ExtensionManifest,
@@ -27,9 +31,26 @@ from omnigent.extensions.api import (
     LabelTone,
     PageContribution,
     PrimaryNavigationContribution,
+    SetState,
     SlotId,
     SlotItemContribution,
     SlotItemKind,
+    StateContribution,
+    StateField,
+    StateVisibility,
+)
+from omnigent.extensions.state_fields import pinned_field
+from omnigent.extensions.state_keys import (
+    COMMAND_STATE_KEYS,
+    EXTENSION_ID_RE,
+    EXTENSION_LABEL_PREFIX,
+    MAX_PUBLISHED_FIELDS,
+    PUBLISHED_FIELD_KEY_RE,
+    PUBLISHED_VALUE_MAX_LENGTH,
+    STATE_KEY_MAX_LENGTH,
+    STATE_KEY_PREFIX_RE,
+    STATE_KEY_RE,
+    published_label_key,
 )
 from omnigent.version import VERSION
 
@@ -42,7 +63,7 @@ _state_condition = threading.Condition()
 _building_thread_id: int | None = None
 
 _ID_SEGMENT = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
-_EXTENSION_ID_RE = re.compile(rf"^{_ID_SEGMENT}(?:\.{_ID_SEGMENT})+$")
+_EXTENSION_ID_RE = EXTENSION_ID_RE
 _CONTRIBUTION_ID_RE = re.compile(rf"^{_ID_SEGMENT}(?:[.-]{_ID_SEGMENT})+$")
 _ROUTE_SEGMENT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$")
 _ASSET_SEGMENT_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
@@ -52,8 +73,6 @@ _MAX_TEXT_LENGTH = 512
 _MAX_ASSET_DEPTH = 16
 #: Reserved for core's own slot entries, which the web app registers itself.
 RESERVED_CORE_ID_PREFIX = "core."
-#: Declared session labels live under ``ext.<extension id>.<name>``.
-EXTENSION_LABEL_PREFIX = "ext."
 _LABEL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$")
 _LABEL_VALUE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 # The server's own label key and value caps.
@@ -77,6 +96,9 @@ APPROVED_ICONS = frozenset(
         "square-parking",
     }
 )
+_ARGUMENT_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_MAX_ARGUMENT_LENGTH = 256
+_MAX_STATE_FIELDS = 32
 
 
 class ExtensionValidationError(ValueError):
@@ -347,9 +369,235 @@ def _validate_slot_item(
         raise ExtensionValidationError(f"slot item {item.id!r} order must be an integer")
 
 
-def _validate_command(extension_id: str, command: CommandContribution) -> None:
+def _validate_state_field(extension_id: str, field_decl: StateField) -> None:
+    if not isinstance(field_decl, StateField):
+        raise ExtensionValidationError("state fields must be StateField values")
+    if not isinstance(field_decl.visibility, StateVisibility):
+        raise ExtensionValidationError(
+            f"state field {field_decl.key!r} has unsupported visibility {field_decl.visibility!r}"
+        )
+    key = field_decl.key
+    if not isinstance(key, str):
+        raise ExtensionValidationError("state field keys must be strings")
+    if field_decl.visibility is StateVisibility.PUBLISHED:
+        if not PUBLISHED_FIELD_KEY_RE.fullmatch(key):
+            raise ExtensionValidationError(
+                f"published state field {key!r} must be an exact lowercase key"
+            )
+        if len(published_label_key(extension_id, key)) > STATE_KEY_MAX_LENGTH:
+            raise ExtensionValidationError(
+                f"published state field {key!r} makes label "
+                f"{published_label_key(extension_id, key)!r} longer than "
+                f"{STATE_KEY_MAX_LENGTH} characters"
+            )
+        if field_decl.max_keys is not None:
+            raise ExtensionValidationError(
+                f"published state field {key!r}: max_keys applies only to prefix fields"
+            )
+        max_length = field_decl.max_length
+        if (
+            isinstance(max_length, bool)
+            or not isinstance(max_length, int)
+            or not 1 <= max_length <= PUBLISHED_VALUE_MAX_LENGTH
+        ):
+            raise ExtensionValidationError(
+                f"published state field {key!r} needs max_length from 1 to "
+                f"{PUBLISHED_VALUE_MAX_LENGTH}"
+            )
+        return
+    if field_decl.max_length is not None:
+        raise ExtensionValidationError(
+            f"state field {key!r}: max_length applies only to published fields"
+        )
+    prefix = key.removesuffix("*")
+    pattern = STATE_KEY_PREFIX_RE if key.endswith("*") else STATE_KEY_RE
+    if not pattern.fullmatch(prefix):
+        raise ExtensionValidationError(
+            f"state field {key!r} must be a state key, or a key prefix ending in '*'"
+        )
+    max_keys = field_decl.max_keys
+    if max_keys is not None and (
+        not key.endswith("*")
+        or isinstance(max_keys, bool)
+        or not isinstance(max_keys, int)
+        or not 1 <= max_keys <= COMMAND_STATE_KEYS
+    ):
+        raise ExtensionValidationError(
+            f"state field {key!r}: max_keys applies only to prefix fields and must be "
+            f"from 1 to {COMMAND_STATE_KEYS}"
+        )
+
+
+def _validate_state(extension_id: str, state: StateContribution) -> None:
+    if not isinstance(state, StateContribution):
+        raise ExtensionValidationError("state must be a StateContribution")
+    if not isinstance(state.fields, tuple):
+        raise ExtensionValidationError("state fields must be a tuple")
+    if len(state.fields) > _MAX_STATE_FIELDS:
+        raise ExtensionValidationError(f"state declares more than {_MAX_STATE_FIELDS} fields")
+    for field_decl in state.fields:
+        _validate_state_field(extension_id, field_decl)
+    _reject_duplicates((field_decl.key for field_decl in state.fields), "state field keys")
+    published = [
+        field_decl
+        for field_decl in state.fields
+        if field_decl.visibility is StateVisibility.PUBLISHED
+    ]
+    if len(published) > MAX_PUBLISHED_FIELDS:
+        raise ExtensionValidationError(
+            f"state declares more than {MAX_PUBLISHED_FIELDS} published fields"
+        )
+
+
+def _template_fields(template: str, description: str) -> tuple[list[str], set[str]]:
+    """Split a ``{argument}`` template into its literal parts and argument names."""
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise ExtensionValidationError(f"{description} is not a valid template: {exc}") from exc
+    literals: list[str] = []
+    names: set[str] = set()
+    for literal, name, format_spec, conversion in parsed:
+        literals.append(literal)
+        if name is None:
+            continue
+        if format_spec or conversion or not _ARGUMENT_NAME_RE.fullmatch(name):
+            raise ExtensionValidationError(
+                f"{description} placeholders must be plain {{argument}} names"
+            )
+        names.add(name)
+    return literals, names
+
+
+def _validate_argument(command_id: str, argument: CommandArgument) -> None:
+    if not isinstance(argument, CommandArgument):
+        raise ExtensionValidationError(
+            f"command {command_id!r} arguments must be CommandArgument values"
+        )
+    if not isinstance(argument.name, str) or not _ARGUMENT_NAME_RE.fullmatch(argument.name):
+        raise ExtensionValidationError(
+            f"command {command_id!r} argument {argument.name!r} must be a lowercase name"
+        )
+    label = f"command {command_id!r} argument {argument.name!r}"
+    if (
+        isinstance(argument.max_length, bool)
+        or not isinstance(argument.max_length, int)
+        or not 1 <= argument.max_length <= _MAX_ARGUMENT_LENGTH
+    ):
+        raise ExtensionValidationError(
+            f"{label} max_length must be from 1 to {_MAX_ARGUMENT_LENGTH}"
+        )
+    if not isinstance(argument.choices, tuple):
+        raise ExtensionValidationError(f"{label} choices must be a tuple")
+    for choice in argument.choices:
+        _require_text(choice, f"{label} choice")
+        if len(choice) > argument.max_length:
+            raise ExtensionValidationError(f"{label} choice {choice!r} exceeds max_length")
+    _reject_duplicates(argument.choices, f"{label} choices")
+    if argument.pattern is not None:
+        _require_text(argument.pattern, f"{label} pattern")
+        try:
+            re.compile(argument.pattern)
+        except re.error as exc:
+            raise ExtensionValidationError(f"{label} pattern is invalid: {exc}") from exc
+    if not argument.choices and argument.pattern is None:
+        raise ExtensionValidationError(f"{label} needs choices or a pattern")
+
+
+def _validate_command_action(
+    command: CommandContribution,
+    state: StateContribution | None,
+) -> None:
+    action = command.action
+    argument_names = {argument.name for argument in command.arguments}
+    if not isinstance(action, (SetState, ClearState)):
+        raise ExtensionValidationError(
+            f"command {command.id!r} action must be SetState, ClearState or None"
+        )
+    if not isinstance(action.key, str):
+        raise ExtensionValidationError(f"command {command.id!r} key must be a string")
+    _, used = _template_fields(action.key, f"command {command.id!r} key")
+    # Each argument value is checked again once bound; a one-letter stand-in
+    # checks the template's literal characters.
+    if not STATE_KEY_RE.fullmatch(action.key.format(**dict.fromkeys(used, "x"))):
+        raise ExtensionValidationError(
+            f"command {command.id!r} key {action.key!r} is not a valid state key template"
+        )
+    target = pinned_field(state, action.key)
+    if target is None:
+        raise ExtensionValidationError(
+            f"command {command.id!r} key {action.key!r} must start with a declared state "
+            "key, or a declared prefix before any placeholder"
+        )
+    if (target.visibility is StateVisibility.SERVICE) != command.writes_service_state:
+        raise ExtensionValidationError(
+            f"command {command.id!r} writes {target.visibility.value} field {target.key!r}: "
+            "writes_service_state must be set exactly when the field is service-only"
+        )
+    value_names: set[str] = set()
+    if isinstance(action, SetState):
+        if not isinstance(action.value, str):
+            raise ExtensionValidationError(f"command {command.id!r} value must be a string")
+        if action.value and not action.value.isprintable():
+            raise ExtensionValidationError(
+                f"command {command.id!r} value contains non-printable characters"
+            )
+        _, value_names = _template_fields(action.value, f"command {command.id!r} value")
+        used |= value_names
+    unknown = used - argument_names
+    if unknown:
+        raise ExtensionValidationError(
+            f"command {command.id!r} uses undeclared arguments: {', '.join(sorted(unknown))}"
+        )
+    unused = argument_names - used
+    if unused:
+        raise ExtensionValidationError(
+            f"command {command.id!r} declares unused arguments: {', '.join(sorted(unused))}"
+        )
+    if (
+        isinstance(action, SetState)
+        and target.visibility is StateVisibility.PUBLISHED
+        and not value_names
+        and target.max_length is not None
+        and len(action.value) > target.max_length
+    ):
+        raise ExtensionValidationError(
+            f"command {command.id!r} value exceeds published field {target.key!r} max_length"
+        )
+
+
+def _validate_command(
+    extension_id: str,
+    command: CommandContribution,
+    state: StateContribution | None = None,
+) -> None:
     _validate_contribution_id(extension_id, command.id, "command")
     _require_text(command.title, f"command {command.id!r} title")
+    if not isinstance(command.arguments, tuple):
+        raise ExtensionValidationError(f"command {command.id!r} arguments must be a tuple")
+    if not isinstance(command.writes_service_state, bool):
+        raise ExtensionValidationError(
+            f"command {command.id!r} writes_service_state must be a boolean"
+        )
+    if not isinstance(command.required_access, CommandAccess):
+        raise ExtensionValidationError(
+            f"command {command.id!r} required_access must be a CommandAccess"
+        )
+    if command.confirm is not None:
+        _require_text(command.confirm, f"command {command.id!r} confirm")
+    for argument in command.arguments:
+        _validate_argument(command.id, argument)
+    _reject_duplicates(
+        (argument.name for argument in command.arguments),
+        f"command {command.id!r} argument names",
+    )
+    if command.action is None:
+        if command.arguments:
+            raise ExtensionValidationError(
+                f"command {command.id!r} declares arguments but no action"
+            )
+        return
+    _validate_command_action(command, state)
 
 
 def _reject_duplicates(values: Iterable[str], kind: str) -> None:
@@ -475,8 +723,10 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
 
     for page in manifest.pages:
         _validate_page(manifest.id, page)
+    if manifest.state is not None:
+        _validate_state(manifest.id, manifest.state)
     for command in manifest.commands:
-        _validate_command(manifest.id, command)
+        _validate_command(manifest.id, command, manifest.state)
 
     if len(manifest.labels) > _MAX_LABELS:
         raise ExtensionValidationError(

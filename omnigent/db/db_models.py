@@ -98,8 +98,9 @@ class OmnigentBase(DeclarativeBase):
 class ConversationBase(DeclarativeBase):
     """Declarative base for the conversation tables.
 
-    Covers ``conversations``, ``conversation_items``, and
-    ``conversation_labels`` — the user-facing conversation surface
+    Covers ``conversations``, ``conversation_items``,
+    ``conversation_labels`` and ``extension_session_state`` — the
+    user-facing conversation surface
     (the Agent-Platform-side tables). Kept under their own ``metadata``
     so they can be created and, when ``conversation_storage_location``
     is configured, hosted on a separate physical database from the
@@ -1049,6 +1050,89 @@ class SqlConversationLabel(ConversationBase):
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[str] = mapped_column(String(LABEL_VALUE_MAX_LEN))
     updated_at: Mapped[int] = mapped_column(Integer)
+
+
+# Largest stored ``extension_session_state.value``, in bytes, including any
+# envelope the store adds. Below the 16 KiB per-value limit for new columns.
+EXTENSION_STATE_VALUE_MAX_BYTES = 16383
+# MySQL's default collation would fold case and accents in these key columns.
+_BINARY_COLLATED_KEY = String(128).with_variant(
+    MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+)
+
+
+class SqlExtensionSessionState(ConversationBase):
+    """
+    SQLAlchemy model for the ``extension_session_state`` table.
+
+    Small key/value state that an installed extension keeps about one
+    session, e.g. which pull request a watcher follows. One row per
+    (session, extension, key). It lives beside ``conversation_labels`` so a
+    state write and a label update can commit in one transaction.
+
+    Only sessions can own state. That is a scope choice for the first
+    consumer, not a constraint of the schema rules: a generic table keyed by
+    owner kind with nullable typed subject columns (session, project, user)
+    would also work, and can be added when a non-session owner needs it.
+
+    There is no foreign key to ``conversations`` and no database cascade:
+    application code must delete a deleted session subtree's rows by the
+    ``(workspace_id, conversation_id)`` primary-key prefix.
+
+    The primary key serves per-session reads. The secondary index
+    ``ix_extension_session_state_extension`` (extension first, then the full
+    primary key) serves per-extension work across sessions and workspaces:
+    enumerating an extension's state and purging it on uninstall.
+
+    ``extension_id`` and ``key`` compare case- and accent-sensitively on
+    every engine (``utf8mb4_bin`` on MySQL). That collation ignores
+    trailing spaces, so writers must reject keys with trailing whitespace.
+
+    :param conversation_id: The session that owns the row.
+    :param extension_id: Publisher-qualified extension id, e.g.
+        ``"acme.pr-watch"``.
+    :param key: Extension-chosen key, unique within the extension.
+    :param value: Opaque bytes the database never inspects or filters; at
+        most :data:`EXTENSION_STATE_VALUE_MAX_BYTES`, enforced by a CHECK.
+        Writers must bind ``bytes`` and check the byte length themselves:
+        SQLite's ``length()`` counts characters if text is stored.
+    :param version: Compare-and-set counter. Writers insert ``1`` and
+        update with ``WHERE version = <read version>``, incrementing it.
+    :param updated_at: Unix epoch seconds of the last write.
+    :param updated_by: User id whose action made the last write, or
+        ``None`` when the extension wrote on its own. Attribution of the
+        latest write only, not an audit history.
+    """
+
+    __tablename__ = "extension_session_state"
+
+    # No server default: application code always supplies the workspace.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    extension_id: Mapped[str] = mapped_column(_BINARY_COLLATED_KEY, primary_key=True)
+    key: Mapped[str] = mapped_column(_BINARY_COLLATED_KEY, primary_key=True)
+    value: Mapped[bytes] = mapped_column(
+        LargeBinary(EXTENSION_STATE_VALUE_MAX_BYTES), nullable=False
+    )
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            f"length(value) <= {EXTENSION_STATE_VALUE_MAX_BYTES}",
+            name="ck_extension_session_state_value_size",
+        ),
+        Index(
+            "ix_extension_session_state_extension",
+            "extension_id",
+            "workspace_id",
+            "conversation_id",
+            "key",
+        ),
+    )
 
 
 class SqlComment(OmnigentBase):

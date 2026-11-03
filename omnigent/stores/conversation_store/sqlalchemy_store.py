@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
@@ -35,6 +35,7 @@ from omnigent.db.account_authority import AccountAuthority, require_active_accou
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    EXTENSION_STATE_VALUE_MAX_BYTES,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -42,6 +43,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlExtensionSessionState,
     SqlHost,
     SqlPolicy,
     SqlProject,
@@ -88,6 +90,17 @@ from omnigent.entities import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
+from omnigent.extensions.state_keys import (
+    EXTENSION_LABEL_PREFIX,
+    MAX_STATE_KEYS,
+    STATE_KEY_MAX_LENGTH,
+    fold_label_key,
+    is_extension_label,
+    published_label_key,
+    validate_extension_id,
+    validate_state_address,
+    validate_state_key,
+)
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -109,6 +122,10 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    ExtensionStateConflictError,
+    ExtensionStateEntry,
+    ExtensionStateFormatError,
+    ExtensionStateQuotaError,
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
@@ -135,6 +152,16 @@ from omnigent.stores.sandbox_profile_store import (
 _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+# First byte of every stored extension state value: plaintext, format 1. A
+# later format (e.g. encrypted) gets its own byte, so readers can tell them
+# apart without parsing the payload.
+_STATE_ENVELOPE_PLAINTEXT_V1 = b"\x01"
+_STATE_VALUE_MAX_BYTES = EXTENSION_STATE_VALUE_MAX_BYTES - len(_STATE_ENVELOPE_PLAINTEXT_V1)
+_STATE_LIST_MAX_LIMIT = 100
+# A deleted subtree's state rows go in batches: this many sessions per
+# statement, and this many rows per DELETE.
+_STATE_DELETE_SESSION_CHUNK = 500
+_STATE_DELETE_ROW_BATCH = 1000
 _RUNNER_BINDING_LIMIT = 200
 _RUNNER_HOST_LOOKUP_LIMIT = 10_000
 
@@ -230,6 +257,7 @@ def _to_conversation(
     row: SqlConversation,
     meta: SqlConversationMetadata | None = None,
     labels: dict[str, str] | None = None,
+    verified_extension_labels: frozenset[str] = frozenset(),
 ) -> Conversation:
     """
     Convert a :class:`SqlConversation` ORM row (plus optional metadata) to a
@@ -238,6 +266,11 @@ def _to_conversation(
     The agent binding (``agent_id``) and per-session overrides live on the
     conversation row itself — the latter packed in the ``session_overrides``
     JSON blob, unpacked here via :func:`_decode_session_overrides`.
+
+    ``verified_extension_labels`` comes from :func:`_verified_extension_labels`
+    on every path whose result reaches a response or a policy. Paths that leave
+    it empty: session creation and forks (they can't carry ``ext.`` labels),
+    and the runner reconnect listing (internal, never shown).
 
     :param row: The SQLAlchemy ORM row to convert.
     :param meta: Optional metadata row from
@@ -273,6 +306,7 @@ def _to_conversation(
         runner_id=meta.runner_id if meta else None,
         host_id=meta.host_id if meta else None,
         labels=labels if labels is not None else {},
+        verified_extension_labels=verified_extension_labels,
         session_state=session_state,
         session_usage=session_usage,
         session_todos=session_todos,
@@ -481,9 +515,28 @@ def _created_session_from_rows(
     )
 
 
+def _reject_extension_labels(keys: Iterable[str]) -> None:
+    """Refuse a label write into the ``ext.`` namespace that only the mirror writes."""
+    reserved = sorted(key for key in keys if is_extension_label(key))
+    if reserved:
+        raise ValueError(
+            f"labels {', '.join(repr(key) for key in reserved)} are read-only: "
+            "'ext.' labels mirror extension state"
+        )
+
+
+def _published_label_key_checked(extension_id: str, key: str) -> str:
+    """The mirror label of a published key, refusing one too long for the key column."""
+    label_key = published_label_key(extension_id, key)
+    if len(label_key) > STATE_KEY_MAX_LENGTH:
+        raise ValueError(f"label {label_key!r} is longer than {STATE_KEY_MAX_LENGTH} characters")
+    return label_key
+
+
 def _prepare_label_updates(updates: dict[str, str]) -> dict[str, str]:
     """Return the exact label values accepted by the persistence schema."""
     reject_profile_labels(updates)
+    _reject_extension_labels(updates)
     # Clamp by characters, matching PostgreSQL ``VARCHAR(n)`` semantics.
     return {key: value[:LABEL_VALUE_MAX_LEN] for key, value in updates.items()}
 
@@ -553,6 +606,19 @@ def _upsert_prepared_labels(
             SqlConversationLabel,
             (current_workspace_id(), row["conversation_id"], row["key"]),
         )
+        if existing is not None and existing.key != row["key"]:
+            # A case- or accent-insensitive collation matched another spelling.
+            if is_extension_label(row["key"]):
+                # The mirror must be stored under its exact key.
+                session.delete(existing)
+                session.flush()
+                existing = None
+            elif is_extension_label(existing.key):
+                # The database treats this key as a mirror label; let it decide.
+                raise ValueError(
+                    f"label {row['key']!r} is read-only: the database treats it as "
+                    f"{existing.key!r}"
+                )
         if existing is None:
             session.add(SqlConversationLabel(**row))
         else:
@@ -605,6 +671,141 @@ def _dialect_upsert_labels(
         },
     )
     session.execute(stmt)
+
+
+def _strip_state_envelope(key: str, stored: bytes) -> bytes:
+    """The extension's bytes from a stored state value."""
+    if not stored.startswith(_STATE_ENVELOPE_PLAINTEXT_V1):
+        raise ExtensionStateFormatError(
+            f"extension state key {key!r} has an unknown storage format"
+        )
+    return stored[len(_STATE_ENVELOPE_PLAINTEXT_V1) :]
+
+
+def _verified_extension_labels(
+    session: Session, labels_by_conv: Mapping[str, dict[str, str]]
+) -> dict[str, frozenset[str]]:
+    """Find the ``ext.*`` labels a state row backs with the same value.
+
+    One statement reads each candidate label together with its state row, so
+    a concurrent write (which changes both in one transaction) can't make
+    them disagree; the label values in ``labels_by_conv`` are updated to
+    that consistent read. None runs when no session has an ``ext.`` label.
+    Values are compared here, never filtered on in SQL.
+    """
+    candidates: dict[tuple[str, str, str], str] = {}
+    for conversation_id, labels in labels_by_conv.items():
+        for label_key in labels:
+            if not label_key.startswith(EXTENSION_LABEL_PREFIX):
+                continue
+            extension_id, _, key = label_key.removeprefix(EXTENSION_LABEL_PREFIX).rpartition(".")
+            if extension_id and key:
+                candidates[(conversation_id, extension_id, key)] = label_key
+    if not candidates:
+        return {}
+    state, label = SqlExtensionSessionState, SqlConversationLabel
+    with query_name_scope("omnigent.conversation_store.select_published_state_values"):
+        rows = session.execute(
+            select(
+                state.conversation_id,
+                state.extension_id,
+                state.key,
+                state.value,
+                label.key,
+                label.value,
+            )
+            .join(
+                label,
+                and_(
+                    label.workspace_id == state.workspace_id,
+                    label.conversation_id == state.conversation_id,
+                ),
+            )
+            .where(
+                state.workspace_id == current_workspace_id(),
+                tuple_(state.conversation_id, state.extension_id, state.key).in_(list(candidates)),
+                label.key.in_(sorted(set(candidates.values()))),
+            )
+        ).all()
+    verified: dict[str, set[str]] = {}
+    for conversation_id, extension_id, key, stored, label_key, value in rows:
+        # A case-insensitive collation can also return other spellings.
+        if candidates.get((conversation_id, extension_id, key)) != label_key:
+            continue
+        if bytes(stored) == _STATE_ENVELOPE_PLAINTEXT_V1 + value.encode("utf-8"):
+            verified.setdefault(conversation_id, set()).add(label_key)
+            labels_by_conv[conversation_id][label_key] = value
+    return {conversation_id: frozenset(keys) for conversation_id, keys in verified.items()}
+
+
+def _fetch_labels_verified(
+    session: Session, conversation_id: str
+) -> tuple[dict[str, str], frozenset[str]]:
+    """A session's labels plus the ``ext.*`` ones extension state backs."""
+    labels = _fetch_labels(session, conversation_id)
+    verified = _verified_extension_labels(session, {conversation_id: labels})
+    return labels, verified.get(conversation_id, frozenset())
+
+
+def _delete_label_variants(session: Session, conversation_id: str, label_key: str) -> None:
+    """Delete labels that a case- or accent-insensitive collation equates with ``label_key``.
+
+    Such a label could predate the ``ext.`` reservation. On MySQL the
+    mirror's upsert would land in that row and keep its spelling, so the
+    exact mirror key is written fresh instead.
+    """
+    folded = fold_label_key(label_key)
+    variants = [
+        key
+        for key in _fetch_labels(session, conversation_id)
+        if key != label_key and fold_label_key(key) == folded
+    ]
+    if variants:
+        session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key.in_(variants),
+            )
+        )
+
+
+def _delete_extension_state_rows(session: Session, conversation_ids: list[str]) -> None:
+    """Delete the extension state of deleted sessions in bounded batches."""
+    for start in range(0, len(conversation_ids), _STATE_DELETE_SESSION_CHUNK):
+        chunk = conversation_ids[start : start + _STATE_DELETE_SESSION_CHUNK]
+        while True:
+            with query_name_scope("omnigent.conversation_store.select_extension_state_batch"):
+                batch = session.execute(
+                    select(
+                        SqlExtensionSessionState.conversation_id,
+                        SqlExtensionSessionState.extension_id,
+                        SqlExtensionSessionState.key,
+                    )
+                    .where(
+                        SqlExtensionSessionState.workspace_id == current_workspace_id(),
+                        SqlExtensionSessionState.conversation_id.in_(chunk),
+                    )
+                    .limit(_STATE_DELETE_ROW_BATCH)
+                    # A locking read sees rows committed after this transaction's
+                    # snapshot (MySQL's REPEATABLE READ would miss them).
+                    .with_for_update()
+                ).all()
+            if not batch:
+                break
+            with query_name_scope("omnigent.conversation_store.delete_extension_state_batch"):
+                session.execute(
+                    delete(SqlExtensionSessionState).where(
+                        SqlExtensionSessionState.workspace_id == current_workspace_id(),
+                        tuple_(
+                            SqlExtensionSessionState.conversation_id,
+                            SqlExtensionSessionState.extension_id,
+                            SqlExtensionSessionState.key,
+                        ).in_([tuple(row) for row in batch]),
+                    )
+                )
+            if len(batch) < _STATE_DELETE_ROW_BATCH:
+                break
 
 
 def _fetch_labels(
@@ -1272,7 +1473,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row is None:
                 return None
             meta = self._get_meta(conversation_id)
-            return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
+            labels = _fetch_labels(session, conversation_id)
+            verified = _verified_extension_labels(session, {conversation_id: labels})
+            return _to_conversation(row, meta, labels, verified.get(conversation_id, frozenset()))
 
     def find_conversation_by_external_session_id(
         self,
@@ -1478,6 +1681,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # too — _to_conversation reads ORM columns, which would raise
             # DetachedInstanceError once the session closes.
             labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
+            verified_by_conv = _verified_extension_labels(session, labels_by_conv)
         meta_rows: list[SqlConversationMetadata] = []
         if rows:
             row_ids = [r.id for r in rows]
@@ -1498,6 +1702,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 row,
                 meta_by_id.get(row.id),
                 labels_by_conv.get(row.id, {}),
+                verified_by_conv.get(row.id, frozenset()),
             )
             for row in rows
         }
@@ -2980,16 +3185,262 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> None:
-            session.execute(
-                delete(SqlConversationLabel).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == conversation_id,
-                    SqlConversationLabel.key == key,
-                )
+            row_filter = (
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == key,
             )
+            # A case- or accent-insensitive collation may match a mirror label.
+            # Lock what matches, so no mirror can appear before the DELETE.
+            statement = select(SqlConversationLabel.key).where(*row_filter)
+            if self._supports_for_update:
+                statement = statement.with_for_update()
+            matched = session.execute(statement).scalars()
+            mirrors = [found for found in matched if found != key and is_extension_label(found)]
+            if mirrors:
+                raise ValueError(
+                    f"label {key!r} is read-only: the database treats it as {mirrors[0]!r}"
+                )
+            session.execute(delete(SqlConversationLabel).where(*row_filter))
 
         reject_profile_labels({key: ""})
+        _reject_extension_labels((key,))
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
+
+    def _lock_existing_conversation(self, session: Session, conversation_id: str) -> None:
+        """Lock a conversation row for this transaction, failing when it is gone.
+
+        SQLite needs no row lock: the immediate session already holds the
+        database write lock.
+        """
+        statement = select(SqlConversation.id).where(
+            SqlConversation.workspace_id == current_workspace_id(),
+            SqlConversation.id == conversation_id,
+        )
+        if self._supports_for_update:
+            statement = statement.with_for_update()
+        if session.execute(statement).first() is None:
+            raise ConversationNotFoundError(conversation_id)
+
+    @staticmethod
+    def _state_row_filter(
+        conversation_id: str, extension_id: str
+    ) -> tuple[ColumnElement[bool], ...]:
+        return (
+            SqlExtensionSessionState.workspace_id == current_workspace_id(),
+            SqlExtensionSessionState.conversation_id == conversation_id,
+            SqlExtensionSessionState.extension_id == extension_id,
+        )
+
+    @staticmethod
+    def _state_entry(row: Any) -> ExtensionStateEntry:
+        return ExtensionStateEntry(
+            key=row.key,
+            value=_strip_state_envelope(row.key, bytes(row.value)),
+            version=row.version,
+            updated_at=row.updated_at,
+            updated_by=row.updated_by,
+        )
+
+    def get_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        key: str,
+    ) -> ExtensionStateEntry | None:
+        """Read one extension state key; see :class:`ConversationStore`."""
+        validate_state_address(extension_id, key)
+        with self._conv_session("get_extension_state") as session:
+            row = session.execute(
+                select(SqlExtensionSessionState).where(
+                    *self._state_row_filter(conversation_id, extension_id),
+                    SqlExtensionSessionState.key == key,
+                )
+            ).scalar_one_or_none()
+            return None if row is None else self._state_entry(row)
+
+    def list_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 50,
+    ) -> tuple[list[ExtensionStateEntry], str | None]:
+        """List one extension's keys by key; see :class:`ConversationStore`."""
+        validate_extension_id(extension_id)
+        if after is not None:
+            validate_state_key(after)
+        if not 1 <= limit <= _STATE_LIST_MAX_LIMIT:
+            raise ValueError(f"limit must be from 1 to {_STATE_LIST_MAX_LIMIT}")
+        statement = select(SqlExtensionSessionState).where(
+            *self._state_row_filter(conversation_id, extension_id)
+        )
+        if after is not None:
+            statement = statement.where(SqlExtensionSessionState.key > after)
+        statement = statement.order_by(SqlExtensionSessionState.key).limit(limit + 1)
+        with self._conv_session("list_extension_state") as session:
+            rows = session.execute(statement).scalars().all()
+            entries = [self._state_entry(row) for row in rows[:limit]]
+        return entries, entries[-1].key if len(rows) > limit else None
+
+    def _put_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        key: str,
+        value: bytes,
+        *,
+        expected_version: int | None = None,
+        updated_by: str | None = None,
+        publish: bool = False,
+        max_keys: int,
+        family_prefix: str | None = None,
+        max_family_keys: int | None = None,
+    ) -> ExtensionStateEntry:
+        """Write one extension state key; see :class:`ConversationStore`."""
+        validate_state_address(extension_id, key)
+        if not isinstance(value, bytes):
+            raise TypeError("extension state values must be bytes")
+        if len(value) > _STATE_VALUE_MAX_BYTES:
+            raise ValueError(
+                f"state value is {len(value)} bytes; the limit is {_STATE_VALUE_MAX_BYTES}"
+            )
+        if expected_version is not None and expected_version < 0:
+            raise ValueError("expected_version must not be negative")
+        if (family_prefix is None) != (max_family_keys is None):
+            raise ValueError("family_prefix and max_family_keys go together")
+        # A hard ceiling: readers load every key of an extension in one page.
+        if not 1 <= max_keys <= MAX_STATE_KEYS or not 1 <= (max_family_keys or 1) <= max_keys:
+            raise ValueError(f"max_keys must be from 1 to {MAX_STATE_KEYS}")
+        mirrored: dict[str, str] = {}
+        if publish:
+            label_key = _published_label_key_checked(extension_id, key)
+            try:
+                text_value = value.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("a published state value must be UTF-8 text") from exc
+            if len(text_value) > LABEL_VALUE_MAX_LEN:
+                raise ValueError(
+                    f"a published state value is at most {LABEL_VALUE_MAX_LEN} characters"
+                )
+            if "\x00" in text_value:
+                raise ValueError("a published state value must not contain NUL characters")
+            mirrored[label_key] = text_value
+        stored = _STATE_ENVELOPE_PLAINTEXT_V1 + value
+        stamp = now_epoch()
+
+        def write(session: Session) -> ExtensionStateEntry:
+            self._lock_existing_conversation(session, conversation_id)
+            row_filter = (
+                *self._state_row_filter(conversation_id, extension_id),
+                SqlExtensionSessionState.key == key,
+            )
+            current = session.execute(
+                select(SqlExtensionSessionState.version).where(*row_filter)
+            ).scalar_one_or_none()
+            if expected_version is not None and (current or 0) != expected_version:
+                raise ExtensionStateConflictError(key, expected_version, current)
+            if current is None:
+                held = session.execute(
+                    select(SqlExtensionSessionState.key)
+                    .where(*self._state_row_filter(conversation_id, extension_id))
+                    .limit(max_keys)
+                ).all()
+                if len(held) >= max_keys:
+                    raise ExtensionStateQuotaError(
+                        f"extension {extension_id!r} already holds {max_keys} keys on this session"
+                    )
+                # Fewer than max_keys rows came back, so this is every key.
+                if family_prefix is not None and max_family_keys is not None:
+                    family = sum(1 for (held_key,) in held if held_key.startswith(family_prefix))
+                    if family >= max_family_keys:
+                        raise ExtensionStateQuotaError(
+                            f"extension {extension_id!r} already holds {max_family_keys} "
+                            f"keys starting with {family_prefix!r} on this session"
+                        )
+                version = 1
+                session.execute(
+                    insert(SqlExtensionSessionState).values(
+                        workspace_id=current_workspace_id(),
+                        conversation_id=conversation_id,
+                        extension_id=extension_id,
+                        key=key,
+                        value=stored,
+                        version=version,
+                        updated_at=stamp,
+                        updated_by=updated_by,
+                    )
+                )
+            else:
+                version = current + 1
+                result = cast(
+                    _RowCountResult,
+                    session.execute(
+                        update(SqlExtensionSessionState)
+                        .where(*row_filter, SqlExtensionSessionState.version == current)
+                        .values(
+                            value=stored,
+                            version=version,
+                            updated_at=stamp,
+                            updated_by=updated_by,
+                        )
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise ExtensionStateConflictError(key, current, None)
+            for label_key in mirrored:
+                _delete_label_variants(session, conversation_id, label_key)
+            if mirrored:
+                _upsert_prepared_labels(session, conversation_id, mirrored, stamp)
+            return ExtensionStateEntry(
+                key=key,
+                value=value,
+                version=version,
+                updated_at=stamp,
+                updated_by=updated_by,
+            )
+
+        return run_write_transaction(self._conv_session_immediate, "put_extension_state", write)
+
+    def _delete_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        key: str,
+        *,
+        expected_version: int | None = None,
+        publish: bool = False,
+    ) -> bool:
+        """Delete one extension state key; see :class:`ConversationStore`."""
+        validate_state_address(extension_id, key)
+
+        def write(session: Session) -> bool:
+            self._lock_existing_conversation(session, conversation_id)
+            row_filter = (
+                *self._state_row_filter(conversation_id, extension_id),
+                SqlExtensionSessionState.key == key,
+            )
+            current = session.execute(
+                select(SqlExtensionSessionState.version).where(*row_filter)
+            ).scalar_one_or_none()
+            if expected_version is not None and (current or 0) != expected_version:
+                raise ExtensionStateConflictError(key, expected_version, current)
+            if current is not None:
+                session.execute(delete(SqlExtensionSessionState).where(*row_filter))
+            if publish:
+                label_key = _published_label_key_checked(extension_id, key)
+                _delete_label_variants(session, conversation_id, label_key)
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key == label_key,
+                    )
+                )
+            return current is not None
+
+        return run_write_transaction(self._conv_session_immediate, "delete_extension_state", write)
 
     def list_conversations(
         self,
@@ -3438,6 +3889,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # query so the list-path is O(1) queries regardless of page size.
             # The agent binding + overrides ride on each conversation row.
             labels_by_conv = _fetch_labels_bulk(session, row_ids)
+            verified_by_conv = _verified_extension_labels(session, labels_by_conv)
             # On a content search, fetch a preview excerpt of the matching
             # chat text so the UI can show *where* each session matched (the
             # match is often invisible in the title). Title-only matches keep
@@ -3468,7 +3920,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # Access .id inside the session to avoid DetachedInstanceError.
                 meta_by_id = {m.id: m for m in meta_rows}
                 convs = [
-                    _to_conversation(r, meta_by_id.get(r.id), labels) for r, labels in ap_entities
+                    _to_conversation(
+                        r,
+                        meta_by_id.get(r.id),
+                        labels,
+                        verified_by_conv.get(r.id, frozenset()),
+                    )
+                    for r, labels in ap_entities
                 ]
         else:
             convs = []
@@ -3657,7 +4115,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # binding + per-session override blob) and Omnigent (metadata).
         def update_ap(
             ap_sess: Session,
-        ) -> tuple[SqlConversation, dict[str, str], bool, bool] | None:
+        ) -> tuple[SqlConversation, dict[str, str], frozenset[str], bool, bool] | None:
             row_query = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id(),
                 SqlConversation.id == conversation_id,
@@ -3747,8 +4205,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now
-            labels = _fetch_labels(ap_sess, conversation_id)
-            return row, labels, reasoning_effort_changed, model_override_changed
+            labels, verified = _fetch_labels_verified(ap_sess, conversation_id)
+            return row, labels, verified, reasoning_effort_changed, model_override_changed
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -3757,7 +4215,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return None
-        row, labels, reasoning_effort_changed, model_override_changed = ap_result
+        row, labels, verified, reasoning_effort_changed, model_override_changed = ap_result
         if terminal_launch_args is not None:
             recreated_metadata_kind = encode_conversation_kind(
                 "sub_agent" if row.parent_conversation_id else "default"
@@ -3793,7 +4251,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             meta = self._get_meta(conversation_id)
         return ConversationUpdateResult(
-            conversation=_to_conversation(row, meta, labels),
+            conversation=_to_conversation(row, meta, labels, verified),
             reasoning_effort_changed=reasoning_effort_changed,
             model_override_changed=model_override_changed,
         )
@@ -4245,8 +4703,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            labels = _fetch_labels(ap_sess, conversation_id)
-        return _to_conversation(ap_row, meta, labels)
+            labels, verified = _fetch_labels_verified(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels, verified)
 
     def clear_runner_id(
         self, conversation_id: str, *, expected_binding: Conversation | None = None
@@ -4286,8 +4744,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            labels = _fetch_labels(ap_sess, conversation_id)
-        return _to_conversation(ap_row, meta, labels)
+            labels, verified = _fetch_labels_verified(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels, verified)
 
     def clear_host_binding(
         self,
@@ -4349,8 +4807,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            labels = _fetch_labels(ap_sess, conversation_id)
-        return _to_conversation(ap_row, meta, labels)
+            labels, verified = _fetch_labels_verified(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels, verified)
 
     def list_runner_session_statuses(
         self, runner_id: str, *, after: str | None = None, limit: int = 200
@@ -4842,8 +5300,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            labels = _fetch_labels(ap_sess, conversation_id)
-        return _to_conversation(ap_row, meta, labels)
+            labels, verified = _fetch_labels_verified(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels, verified)
 
     def set_external_session_id(
         self,
@@ -4900,7 +5358,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             update_metadata,
         )
 
-        def update_ap(ap_sess: Session) -> tuple[SqlConversation, dict[str, str]]:
+        def update_ap(ap_sess: Session) -> tuple[SqlConversation, dict[str, str], frozenset[str]]:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is None:
                 raise ConversationNotFoundError(
@@ -4908,15 +5366,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if changed:
                 ap_row.updated_at = updated_at
-            labels = _fetch_labels(ap_sess, conversation_id)
-            return ap_row, labels
+            labels, verified = _fetch_labels_verified(ap_sess, conversation_id)
+            return ap_row, labels, verified
 
-        ap_row, labels = run_write_transaction(
+        ap_row, labels, verified = run_write_transaction(
             self._conv_session_immediate,
             "set_external_session_id_conversation",
             update_ap,
         )
-        return _to_conversation(ap_row, meta, labels)
+        return _to_conversation(ap_row, meta, labels, verified)
 
     def create_session_with_agent(
         self,
@@ -5664,6 +6122,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 key: value
                 for key, value in source_labels.items()
                 if not key.startswith(PROFILE_LABEL_PREFIX)
+                # Mirrors of the source's extension state; the fork has none.
+                and not is_extension_label(key)
                 if key
                 not in (
                     _INSTANCE_SCOPED_LABEL_KEYS
@@ -5943,6 +6403,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         all direct/indirect children), then deletes their items, labels,
         comments, policies, and session-permission rows before deleting
         the conversation rows themselves (children before parent).
+        Extension state goes in the same conversation-side transaction as
+        the items and labels, in bounded statements; like theirs, the
+        transaction's size grows with the subtree.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -5977,6 +6440,18 @@ class SqlAlchemyConversationStore(ConversationStore):
             subtree_ids = [
                 cast(str, result[0]) for result in ap_sess.execute(select(cte.c.id)).fetchall()
             ]
+            if self._supports_for_update:
+                # Writers that publish state lock their session's row before
+                # touching labels; lock the whole subtree first so they either
+                # finish before this delete or find the session gone.
+                ap_sess.execute(
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(subtree_ids),
+                    )
+                    .with_for_update()
+                )
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
@@ -5998,6 +6473,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             ap_sess.delete(row)
+            ap_sess.flush()
+            # After the conversation rows: a state writer locks its session's
+            # row first, so its insert is either visible here or never lands.
+            _delete_extension_state_rows(ap_sess, subtree_ids)
             return subtree_ids
 
         ap_result = run_write_transaction(

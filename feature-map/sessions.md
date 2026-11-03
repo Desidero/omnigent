@@ -14,6 +14,11 @@ the header menu), and each place is a separate entry point.
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
 - `pin`: pinned sessions move to their own section and back.
+- `extension-state`: an operator-enabled extension keeps state about a session
+  and publishes up to three read-only fields, shown as `published_fields` and
+  `ext.<extension id>.<key>` labels on the session. Users change it only
+  through the extension's commands, with the share level each command needs;
+  readers never see `service` state. No UI uses it yet; drive it over HTTP.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
@@ -1080,6 +1085,14 @@ plain `uv run pytest`, which starts a private server for the test.
   core settings survive a failed extension catalog. Unit coverage:
   `web/src/extensions/ExtensionSlot.test.tsx` and
   `web/src/shell/settingsNav.test.tsx`.
+- **`extension-state` (server integration, plain `uv run pytest`):**
+  `tests/server/routes/test_extension_state_routes.py` builds a real server
+  with an enabled test extension and drives commands, reads by share level,
+  paging, quotas, the disabled extension's unpublished fields and labels no
+  state backs. Store behavior, including
+  concurrent writes and session deletion, is in
+  `tests/stores/test_extension_state_store.py`; run it with
+  `OMNIGENT_TEST_DB_URI` set to cover Postgres, CockroachDB or MySQL.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and

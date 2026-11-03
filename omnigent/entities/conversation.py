@@ -87,6 +87,10 @@ class Conversation:
         survive conversation_items compaction by design
         (POLICIES.md §6.3) — the two tables are
         independent.
+    :param verified_extension_labels: The ``ext.*`` label keys in
+        ``labels`` that an extension state row backs with the same value,
+        i.e. genuine mirrors of a published field. Empty when the store
+        did not check (fail closed).
     :param session_state: Mutable per-conversation key/value
         store used by policy callables to accumulate state
         across turns (e.g. running counters, audit trails).
@@ -244,6 +248,7 @@ class Conversation:
     runner_id: str | None = None
     host_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    verified_extension_labels: frozenset[str] = frozenset()
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
     session_todos: list[dict[str, Any]] = field(default_factory=list)

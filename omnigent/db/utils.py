@@ -513,7 +513,7 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
 
 
 def _ensure_conversation_tables(engine: Engine) -> None:
-    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    """Create the conversation tables (``ConversationBase``) that are absent."""
     from omnigent.db.db_models import ConversationBase
 
     with query_name_scope("omnigent.database.ensure_conversation_schema"):

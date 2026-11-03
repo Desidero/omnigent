@@ -51,6 +51,7 @@ from omnigent.entities.conversation import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.extensions.labels import reject_undeclared_extension_labels
+from omnigent.extensions.published_fields import published_field_view
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
@@ -1148,7 +1149,11 @@ def _cancel_pending_archive_stop(session_id: str) -> None:
         task.cancel()
 
 
-def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
+def _labels_for_viewer(
+    labels: dict[str, str],
+    user_id: str | None,
+    verified_extension_labels: frozenset[str] = frozenset(),
+) -> dict[str, str]:
     """
     Collapse the dynamic-suffix label families to their canonical bare keys.
 
@@ -1167,9 +1172,14 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
 
     :param labels: The stored conversation labels.
     :param user_id: The requesting viewer, or ``None`` in single-user mode.
+    :param verified_extension_labels: The ``ext.*`` labels a state row backs
+        (``Conversation.verified_extension_labels``).
     :returns: A copy with the pin and sandbox-repo families collapsed to their
-        canonical bare keys.
+        canonical bare keys, and without labels under an enabled
+        extension's ``ext.<id>.`` prefix that are not verified published
+        fields.
     """
+    labels = published_field_view().visible_labels(labels, verified_extension_labels)
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
     repos = read_managed_repo_workspaces(labels)
@@ -1274,7 +1284,12 @@ def _build_session_list_item(
         title=title_without_closed_marker(conv.title),
         # Collapse per-user pin keys to the canonical bare key for this viewer
         # (never leak another user's pin key), then add the closed marker.
-        labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
+        labels=labels_with_closed_status(
+            _labels_for_viewer(conv.labels, user_id, conv.verified_extension_labels), conv.title
+        ),
+        published_fields=published_field_view().published_fields(
+            conv.labels, conv.verified_extension_labels
+        ),
         runner_id=conv.runner_id,
         host_id=conv.host_id,
         reasoning_effort=conv.reasoning_effort,
@@ -1496,7 +1511,9 @@ def _build_session_response(
         )
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
-    labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
+    labels = labels_with_closed_status(
+        _labels_for_viewer(conv.labels, viewer_id, conv.verified_extension_labels), conv.title
+    )
     # Restore terminal access for older custom native sessions. Child mirrors
     # can inherit the parent's harness without owning a terminal of their own.
     if conv.parent_conversation_id is None and (
@@ -1521,6 +1538,9 @@ def _build_session_response(
         updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
+        published_fields=published_field_view().published_fields(
+            conv.labels, conv.verified_extension_labels
+        ),
         sandbox_profile=public_profile(conv.labels),
         runner_id=conv.runner_id,
         host_id=conv.host_id,

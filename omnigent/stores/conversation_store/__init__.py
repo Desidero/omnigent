@@ -379,6 +379,48 @@ class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
 
 
+@dataclass(frozen=True)
+class ExtensionStateEntry:
+    """One extension's state value for one session key.
+
+    :param key: The extension-chosen key, e.g. ``"status"``.
+    :param value: The stored bytes, without the store's envelope.
+    :param version: Compare-and-set counter: 1 on insert, +1 per update.
+    :param updated_at: Unix epoch seconds of the last write.
+    :param updated_by: The user whose action made the last write, or ``None``
+        when the extension wrote on its own.
+    """
+
+    key: str
+    value: bytes
+    version: int
+    updated_at: int
+    updated_by: str | None
+
+
+class ExtensionStateConflictError(Exception):
+    """A state write's expected version did not match the stored row.
+
+    :param current_version: The stored version, or ``None`` when no row
+        exists.
+    """
+
+    def __init__(self, key: str, expected_version: int, current_version: int | None) -> None:
+        super().__init__(
+            f"state key {key!r} is at version {current_version or 0}, "
+            f"not the expected {expected_version}"
+        )
+        self.current_version = current_version
+
+
+class ExtensionStateQuotaError(Exception):
+    """A state write would give one extension too many keys on a session."""
+
+
+class ExtensionStateFormatError(RuntimeError):
+    """A stored state value has an envelope this server cannot read."""
+
+
 class NameAlreadyExistsError(Exception):
     """
     Raised by ``create_conversation`` when the requested
@@ -1301,6 +1343,130 @@ class ConversationStore(ABC):
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
         :param key: The label key to remove, e.g. ``"omni_project"``.
+        """
+        ...
+
+    @abstractmethod
+    def get_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        key: str,
+    ) -> ExtensionStateEntry | None:
+        """
+        Read one extension state key of a session.
+
+        :param conversation_id: The session, e.g. ``"conv_abc123"``.
+        :param extension_id: The owning extension, e.g. ``"acme.pr-watch"``.
+        :param key: The state key, e.g. ``"status"``.
+        :returns: The entry, or ``None`` when the key is not set.
+        :raises ValueError: The id or key is not valid state addressing.
+        """
+        ...
+
+    @abstractmethod
+    def list_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 50,
+    ) -> tuple[list[ExtensionStateEntry], str | None]:
+        """
+        List one extension's state keys on a session, in key order.
+
+        :param conversation_id: The session.
+        :param extension_id: The owning extension.
+        :param after: Return keys after this one (the previous page's
+            cursor), or ``None`` for the first page.
+        :param limit: Page size, from 1 to 100.
+        :returns: The page and the cursor of the next page, or ``None`` on
+            the last page.
+        """
+        ...
+
+    @abstractmethod
+    def _put_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        key: str,
+        value: bytes,
+        *,
+        expected_version: int | None = None,
+        updated_by: str | None = None,
+        publish: bool = False,
+        max_keys: int,
+        family_prefix: str | None = None,
+        max_family_keys: int | None = None,
+    ) -> ExtensionStateEntry:
+        """
+        Write one extension state key, optionally mirroring it as a label.
+
+        Internal: only
+        :class:`omnigent.server.extension_state.ExtensionStateService` calls
+        this, deriving ``publish`` and the quotas from the extension's
+        manifest, so no other caller can leave a mirror label out of step.
+
+        The write, the per-extension key quota and the mirrored label commit
+        in one transaction that holds the session's row lock, so concurrent
+        writers serialize and a concurrent session delete either removes the
+        new row or makes the write fail.
+
+        :param conversation_id: The session.
+        :param extension_id: The owning extension.
+        :param key: The state key.
+        :param value: The bytes to store. Too large a value is rejected,
+            never truncated.
+        :param expected_version: ``None`` writes unconditionally; ``0``
+            requires that the key is unset; any other value requires that
+            the stored version equals it.
+        :param updated_by: The user whose action caused the write, or
+            ``None`` when the extension writes on its own.
+        :param publish: Also set the read-only label
+            ``ext.<extension_id>.<key>`` to the value, which must then be
+            UTF-8 text short enough for a label.
+        :param max_keys: How many keys the extension may hold on the
+            session, at most 64; adding a key beyond it fails.
+        :param family_prefix: With ``max_family_keys``, also limit how many
+            keys starting with this prefix the extension may hold.
+        :param max_family_keys: The limit for ``family_prefix``.
+        :returns: The stored entry.
+        :raises ConversationNotFoundError: The session does not exist.
+        :raises ExtensionStateConflictError: ``expected_version`` did not
+            match.
+        :raises ExtensionStateQuotaError: The write would add a key beyond
+            ``max_keys``.
+        :raises ValueError: Invalid addressing, or a value that does not fit.
+        """
+        ...
+
+    @abstractmethod
+    def _delete_extension_state(
+        self,
+        conversation_id: str,
+        extension_id: str,
+        key: str,
+        *,
+        expected_version: int | None = None,
+        publish: bool = False,
+    ) -> bool:
+        """
+        Delete one extension state key, and its mirrored label when published.
+
+        Internal: only ``ExtensionStateService`` calls this.
+
+        :param conversation_id: The session.
+        :param extension_id: The owning extension.
+        :param key: The state key.
+        :param expected_version: ``None`` deletes unconditionally; otherwise
+            the stored version must equal it.
+        :param publish: Also delete the label ``ext.<extension_id>.<key>``.
+        :returns: Whether a row was deleted.
+        :raises ConversationNotFoundError: The session does not exist.
+        :raises ExtensionStateConflictError: ``expected_version`` did not
+            match.
         """
         ...
 

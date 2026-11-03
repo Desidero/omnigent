@@ -5593,6 +5593,204 @@ def extensions_doctor(extension_id: str) -> None:
     click.echo(f"browser bundle: ok ({bundle.digest}){suffix}")
 
 
+@extensions_cli.command("legacy-labels")
+@click.argument("url")
+@click.option(
+    "--rename", is_flag=True, help="Move each legacy label from ext.<rest> to ext-<rest>."
+)
+@click.option("--delete", is_flag=True, help="Delete each legacy label.")
+@click.option(
+    "--extension",
+    "extension_id",
+    default=None,
+    metavar="ID",
+    help="Only labels under ext.<ID>. (for example an extension that is not installed).",
+)
+@click.option(
+    "--commit",
+    is_flag=True,
+    default=False,
+    help="Apply --rename or --delete. Without it the command only reports.",
+)
+@click.option(
+    "--include-state",
+    is_flag=True,
+    default=False,
+    help="With --extension and --delete: also delete that uninstalled extension's state.",
+)
+@click.option(
+    "--yes",
+    "confirmed_count",
+    type=int,
+    default=None,
+    metavar="COUNT",
+    help="With --delete --commit: the number of labels the dry run listed.",
+)
+def extensions_legacy_labels(
+    url: str,
+    rename: bool,
+    delete: bool,
+    extension_id: str | None,
+    commit: bool,
+    include_state: bool,
+    confirmed_count: int | None,
+) -> None:
+    """Find session labels under ``ext.`` that no extension state backs.
+
+    Only core writes ``ext.`` labels now. Older ones, and the last values of
+    an uninstalled extension, stay behind: hidden under an installed
+    extension's prefix, read-only elsewhere. This lists every one (labels
+    that mirror extension state are left alone), and can rename or delete
+    them. Stop the server first, or limit the sweep with ``--extension`` to
+    an extension that is not installed. After uninstalling an extension,
+    ``--extension ID --include-state --delete`` also removes its session
+    state, and with it the mirrors that state backed.
+
+    URL is the SQLAlchemy URL of the database holding session labels (the
+    conversation database when it is configured separately). The command
+    never creates or migrates tables: it stops if the database lacks them.
+    The sweep reads every label once, in bounded batches.
+
+    \b
+    Examples:
+      omnigent extensions legacy-labels sqlite:////path/to/chat.db
+      omnigent extensions legacy-labels sqlite:////path/to/chat.db --rename --commit
+      omnigent extensions legacy-labels sqlite:////path/to/chat.db --delete --commit --yes 12
+    """
+    from omnigent.db.utils import _create_engine
+
+    if rename and delete:
+        raise click.UsageError("choose one of --rename and --delete")
+    if commit and not (rename or delete):
+        raise click.UsageError("--commit needs --rename or --delete")
+    if include_state:
+        from omnigent.extensions import registry
+
+        if extension_id is None or rename:
+            raise click.UsageError("--include-state needs --extension, and --delete to apply")
+        if registry.extension_manifest(extension_id) is not None:
+            raise click.UsageError(
+                f"{extension_id} is installed; uninstall it before deleting its state"
+            )
+    _require_existing_label_database(url)
+    # A plain engine: unlike the server's, it never creates or migrates tables.
+    engine = _create_engine(url)
+    try:
+        _run_legacy_label_sweep(
+            engine, rename, extension_id, commit, confirmed_count, include_state
+        )
+    finally:
+        engine.dispose()
+
+
+def _require_existing_label_database(db_uri: str) -> None:
+    """Refuse a SQLite URL whose file does not exist, before connecting creates it."""
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    try:
+        url = make_url(db_uri)
+    except ArgumentError as exc:
+        raise click.ClickException(f"Invalid database URL {db_uri!r}: {exc}") from exc
+    if url.get_backend_name() != "sqlite" or url.database in (None, "", ":memory:"):
+        return
+    if not Path(url.database).expanduser().exists():
+        raise click.ClickException(
+            f"No database at {url.database}; pass the URL of the database holding session labels"
+        )
+
+
+def _run_legacy_label_sweep(
+    engine: Any,
+    rename: bool,
+    extension_id: str | None,
+    commit: bool,
+    confirmed_count: int | None,
+    include_state: bool = False,
+) -> None:
+    """Check the tables exist, then report on or resolve legacy ``ext.`` labels."""
+    from sqlalchemy import inspect, text
+
+    from omnigent.server.legacy_extension_labels import (
+        LegacyLabelAction,
+        purge_extension_state,
+        sweep_legacy_extension_labels,
+    )
+
+    missing = [
+        table
+        for table in ("conversation_labels", "extension_session_state")
+        if not inspect(engine).has_table(table)
+    ]
+    if missing:
+        raise click.ClickException(
+            f"the database has no {', '.join(missing)} table; check that the URL names "
+            "the database holding session labels and that its schema is current"
+        )
+    with engine.connect() as connection:
+        has_sessions = (
+            inspect(engine).has_table("conversations")
+            and connection.execute(text("SELECT 1 FROM conversations LIMIT 1")).first() is not None
+        )
+    if not has_sessions:
+        click.echo(
+            "Warning: this database holds no sessions. With a separate conversation "
+            "database, pass that database's URL instead.",
+            err=True,
+        )
+
+    def show(address: tuple[int, str, str]) -> None:
+        workspace_id, conversation_id, key = address
+        click.echo(f"{workspace_id}\t{conversation_id}\t{key}")
+
+    state_rows = 0
+    if include_state and extension_id is not None:
+        state_rows = purge_extension_state(engine, extension_id)
+        click.echo(f"state rows of {extension_id}: {state_rows}")
+    if commit and not rename:
+        listed = state_rows + (
+            sweep_legacy_extension_labels(
+                engine, extension_id=extension_id, include_mirrors=include_state
+            ).found
+        )
+        if confirmed_count != listed:
+            raise click.UsageError(
+                f"{listed} labels and state rows would be deleted; review the dry run, "
+                f"then pass --yes {listed}"
+            )
+        if include_state and extension_id is not None:
+            purge_extension_state(engine, extension_id, remove=True)
+    action: LegacyLabelAction = "list"
+    if commit:
+        action = "rename" if rename else "delete"
+    report = sweep_legacy_extension_labels(
+        engine,
+        action=action,
+        extension_id=extension_id,
+        on_found=None if commit else show,
+        include_mirrors=include_state,
+    )
+    click.echo(f"legacy ext. labels: {report.found}")
+    if report.renamed or report.deleted:
+        click.echo(f"renamed: {report.renamed}, deleted: {report.deleted}")
+    if report.conflict_count:
+        click.echo(
+            f"{report.conflict_count} kept because the renamed label would clash, e.g.:",
+            err=True,
+        )
+        for workspace_id, conversation_id, key in report.conflicts:
+            click.echo(f"  {key} on {conversation_id} (workspace {workspace_id})", err=True)
+    if report.unresolved == 0 and (commit or not state_rows):
+        click.echo("No legacy labels remain.")
+    elif not commit:
+        click.echo(
+            "Dry run: add --rename, or --delete with --yes "
+            f"{state_rows + report.found}, and --commit to resolve them"
+        )
+    else:
+        raise click.ClickException(f"{report.unresolved} legacy labels remain")
+
+
 @cli.command("diagnose")
 @click.option(
     "--server",

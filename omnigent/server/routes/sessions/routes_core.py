@@ -1759,7 +1759,10 @@ def register_core_routes(
             id=conv.id,
             # Collapse per-user pin keys for this caller (never leak another
             # user's pin key to a native harness bridge).
-            labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
+            labels=labels_with_closed_status(
+                _labels_for_viewer(conv.labels, user_id, conv.verified_extension_labels),
+                conv.title,
+            ),
         )
 
     # ── GET /sessions ───────────────────────────────────────────
@@ -3708,7 +3711,11 @@ def register_core_routes(
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
-            await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+            try:
+                await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+            except ValueError as exc:
+                # E.g. a key the database collates onto a read-only ``ext.`` label.
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         # Only when the switch was forwarded: a silent PATCH writes no label,
         # and an unconfirmed mode must not reach the picker.
         if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:

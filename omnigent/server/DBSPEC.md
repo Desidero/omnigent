@@ -1,10 +1,11 @@
 # Database Schema Design
 
-This doc covers four core tables: agents, files, conversations,
-conversation_items. They are part of a larger schema — 17 tables in all, also
-including conversation labels, comments, policies, session permissions,
-conversation metadata, projects, hosts, users, and scheduled tasks. No model
-sets an explicit schema, so every table lives in the default one.
+This doc covers five tables: agents, files, conversations, conversation_items
+and extension_session_state. They are part of a larger schema — 20 tables in
+all, also including conversation labels, comments, policies, session
+permissions, conversation metadata, projects, hosts, users, and scheduled
+tasks. No model sets an explicit schema, so every table lives in the default
+one.
 
 Schema is managed by Alembic migrations in `alembic/`. SQLAlchemy models live
 in `omnigent/db/db_models.py`, which is the source of truth for the full table
@@ -101,6 +102,67 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 **function_call_output:** `{"call_id": "call_001", "output": "{...}"}`
 
 **reasoning:** `{"summary": [...], "content": null, "encrypted_content": null}`
+
+---
+
+## extension_session_state
+
+Small key/value state an extension keeps about one session, stored beside
+`conversation_labels` so a state write and a label update can share a
+transaction. Owning state by session only is a scope choice: a generic table
+with nullable typed subject columns (session, project, user) is the
+alternative if another owner needs state.
+
+| Column | Type | Notes |
+|---|---|---|
+| workspace_id | BigInteger PK | No server default |
+| conversation_id | Uuid16 PK | The owning session (no DB FK) |
+| extension_id | String(128) PK | Publisher-qualified id, e.g. `acme.pr-watch`; `utf8mb4_bin` on MySQL |
+| key | String(128) PK | Unique within the extension; `utf8mb4_bin` on MySQL |
+| value | LargeBinary NOT NULL | Opaque bytes; at most 16,383 (`ck_extension_session_state_value_size`) |
+| version | BigInteger NOT NULL | Compare-and-set counter: insert 1, update `WHERE version = <read>` |
+| updated_at | BigInteger NOT NULL | Unix epoch seconds of the last write |
+| updated_by | String(128) | User whose action made the last write; NULL for the extension's own writes. Attribution, not history |
+
+**Indexes:** the primary key, whose `(workspace_id, conversation_id)` prefix
+serves per-session reads and deletion, and
+`ix_extension_session_state_extension (extension_id, workspace_id,
+conversation_id, key)`, which serves per-extension work across sessions and
+workspaces (enumerating an extension's state; purging it on uninstall) as a
+range on `extension_id`, ordered by the full primary key for paging.
+
+**Deletion:** no DB cascade. `delete_conversation` first locks the subtree's
+`conversations` rows (`FOR UPDATE` where supported), then deletes the
+subtree's state rows by that prefix in the same transaction as the
+conversation rows, after them, in batches (500 sessions per statement, 1,000
+rows per `DELETE`, selected with a locking read).
+
+**Writers:** only `SqlAlchemyConversationStore`. Every write locks the owning
+`conversations` row first (`FOR UPDATE`; SQLite's immediate transaction),
+checks the session still exists, then applies the compare-and-set and the
+per-extension key quota. A published key's mirror label
+(`ext.<extension_id>.<key>` in `conversation_labels`) is written in the same
+transaction. `value` is stored as one envelope byte (`0x01`, plaintext
+format 1) followed by the extension's bytes, so the payload is at most 16,382
+bytes. Keys and extension ids are validated against patterns without
+whitespace, since `utf8mb4_bin` ignores trailing spaces when comparing.
+
+**`ext.` labels:** `conversation_labels` keys starting with `ext.` are written
+and deleted only by this mirror; every other label write path refuses them,
+and forks drop them. The check folds case, accents and ignorable characters,
+because MySQL's default collation compares `EXT.x` and `éxt.x` equal to
+`ext.x`; the mirror deletes such a variant row before writing its exact key.
+Folding can't predict every collation, so the database decides too: on the
+upsert fallback (MySQL) and in `delete_label`, a key the database matches to
+a different `ext.` row is refused. Reads mark an `ext.` label as verified only
+when a state row with the same value backs it
+(`Conversation.verified_extension_labels`): one statement per page of sessions
+reads each candidate label joined with its state row, so a concurrent write
+can't make them disagree; values are compared in Python, not in SQL.
+
+**Writers:** the store's `_put_extension_state` / `_delete_extension_state`
+are internal; only `ExtensionStateService` calls them, deriving the mirror
+and the quotas from the extension's manifest. `max_keys` is capped at 64.
 
 ---
 
