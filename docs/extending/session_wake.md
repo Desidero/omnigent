@@ -113,7 +113,7 @@ check happens where turns start, in the runner and the harness:
 
 | Harness | Final check, under the harness's injection lock | Status |
 | --- | --- | --- |
-| SDK harnesses | The runner runs one turn at a time; no live injection. | Verified (runner tests, mock-provider e2e) |
+| SDK harnesses | The runner runs one turn at a time; no live injection. | Verified (runner tests; server and runner integration test) |
 | `claude-native` | No pending question, permission prompt or dialog only the terminal shows (MCP approval, settings error, …); Claude's status file is not `busy`/`waiting`; the input box is empty (or shows only Claude's `Try "…"` suggestion). Nothing is typed, and the box is not cleared, until then. | Verified (unit tests; live check pending) |
 | `codex-native` | Codex core is asked which turn is active (a `turn/steer` probe that adds no input); the message only ever goes out as `turn/start`, never `turn/steer`. | Verified (unit tests; live check pending) |
 | `pi-native` | The resident extension leaves the message in its inbox while Pi's agent loop runs (`agent_start`…`agent_end`), then sends it as a follow-up that starts a turn; it never steers it. | Verified (extension tests; live check pending) |
