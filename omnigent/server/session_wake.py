@@ -760,6 +760,11 @@ def latest_turn_input_source(conversation_store: Any, session_id: str) -> str | 
     return None
 
 
+def served_here(host_id: str | None, host_registry: Any | None) -> bool:
+    """Whether this replica serves a session: its host, if any, is connected here."""
+    return host_registry is None or not host_id or host_registry.get(host_id) is not None
+
+
 def build_session_wake(
     app: Any,
     *,
@@ -805,7 +810,7 @@ def build_session_wake(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None or conv.archived or is_session_closed(conv.labels, conv.title):
             return "gone"
-        if host_registry is not None and conv.host_id and host_registry.get(conv.host_id) is None:
+        if not served_here(conv.host_id, host_registry):
             return "elsewhere"
         status = _session_status_cache.get(session_id) or conv.live_status
         if status in ("running", "waiting") or _session_is_starting(session_id):

@@ -72,9 +72,10 @@ retries on a timer, so a missed edge only delays a wake.
 Extensions receive the same observations, best-effort, through
 `omnigent.server.extension_status_observers.ExtensionStatusObservers`. The
 server builds one at startup (`app.state.extension_status_observers`) under the
-same operator enablement as extension state. V1 offers extensions no way to
-subscribe yet; server-side extension activation will call
-`subscribe(extension_id, callback)` on their behalf, on the server's event loop.
+same operator enablement as extension state. An activated extension subscribes
+with `ctx.subscribe_status(callback)` (see
+[Extension server activation](server_activation.md)), which calls
+`subscribe(extension_id, callback)` on its behalf, on the server's event loop.
 
 - **Who receives them.** Only extensions that are installed and enabled by the
   operator, as the server's `is_enabled` check reports. It runs inline on every

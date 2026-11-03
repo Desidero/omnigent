@@ -77,6 +77,9 @@ def get_manifest() -> ExtensionManifest:
 - `requires_omnigent` is a PEP 440 release-line range.
 - Browser paths are fixed to `dist/extension.js` and optional
   `dist/extension.css` inside the entry point's verified import package.
+- `entrypoints.server` (experimental) is `package.module:function`, an
+  `async def activate(ctx)` in that same package; see
+  [Extension server activation](server_activation.md).
 - Slot items use a supported slot/kind pairing, reference a page owned by the
   same extension (or, for session-row kinds, bind one of its declared labels),
   stay within each slot's per-extension limit, and cannot reorder core UI.

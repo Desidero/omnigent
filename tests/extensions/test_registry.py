@@ -326,6 +326,14 @@ def test_records_raising_entry_point(monkeypatch: pytest.MonkeyPatch) -> None:
         ({"extension_api": True}, "extension API"),
         ({"requires_omnigent": "definitely-not-a-range"}, "invalid Omnigent requirement"),
         ({"requires_omnigent": "<0"}, "requires Omnigent"),
+        (
+            {"entrypoints": ExtensionEntrypoints("dist/extension.js", server="acme.server")},
+            "server entrypoint",
+        ),
+        (
+            {"entrypoints": ExtensionEntrypoints("dist/extension.js", server="../x:activate")},
+            "server entrypoint",
+        ),
     ],
 )
 def test_rejects_invalid_manifest_fields(

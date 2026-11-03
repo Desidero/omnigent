@@ -67,6 +67,10 @@ idempotent:
 default. Background callers pass the generation they saved when the user
 turned the automation on as `generation`.
 
+An activated extension calls `ctx.wake.request(...)`, which fixes `source` to
+`ext:<its id>` and requires `generation`, and hears its stops through
+`ctx.wake.on_stop` (see [Extension server activation](server_activation.md)).
+
 ## When a wake is delivered
 
 - **Only at idle.** An `idle` or `failed` status edge that ends a turn (a

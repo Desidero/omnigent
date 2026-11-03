@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from typing import Literal
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Literal, cast
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -22,6 +22,9 @@ from omnigent.extensions.enablement import ExtensionEnablement
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.extension_activation import ActivationRecord
 
 
 class ExtensionPageResponse(BaseModel):
@@ -134,6 +137,17 @@ class ExtensionAssetErrorResponse(BaseModel):
     error: str
 
 
+ActivationStatus = Literal["active", "quarantined", "stopped"]
+
+
+class ExtensionActivationResponse(BaseModel):
+    """This server process's activation of one extension's server code (experimental)."""
+
+    extension_id: str
+    status: ActivationStatus
+    error: str | None = None
+
+
 class ExtensionDiagnosticsResponse(BaseModel):
     """Administrator view of accepted and rejected extensions."""
 
@@ -141,6 +155,7 @@ class ExtensionDiagnosticsResponse(BaseModel):
     extensions: list[ExtensionResponse]
     load_errors: list[ExtensionLoadErrorResponse]
     asset_errors: list[ExtensionAssetErrorResponse]
+    activations: list[ExtensionActivationResponse] = []
 
 
 def _serialize_manifest(
@@ -273,8 +288,12 @@ def create_extensions_router(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     enablement: ExtensionEnablement | None = None,
+    activations: Callable[[], Mapping[str, ActivationRecord]] | None = None,
 ) -> APIRouter:
-    """Build the installed-extension catalog router, mounted under ``/v1``."""
+    """Build the installed-extension catalog router, mounted under ``/v1``.
+
+    :param activations: This process's server-code activations, read per request.
+    """
     router = APIRouter()
     resolved_bundles = bundles or {}
     resolved_enablement = enablement or ExtensionEnablement()
@@ -312,12 +331,20 @@ def create_extensions_router(
     # as an extension identifier.
     @router.get("/extensions/diagnostics", response_model=ExtensionDiagnosticsResponse)
     async def extension_diagnostics(request: Request) -> ExtensionDiagnosticsResponse:
-        """Show accepted extensions and concise discovery failures to administrators."""
+        """Show accepted extensions, discovery failures and activations to administrators."""
         await _require_admin(request, auth_provider, permission_store)
         return ExtensionDiagnosticsResponse(
             extensions=list(catalog),
             load_errors=list(diagnostics),
             asset_errors=list(asset_diagnostics),
+            activations=[
+                ExtensionActivationResponse(
+                    extension_id=record.extension_id,
+                    status=cast(ActivationStatus, record.state.value),
+                    error=_diagnostic_message(record.error) if record.error else None,
+                )
+                for _, record in sorted((activations() if activations else {}).items())
+            ],
         )
 
     @router.get("/extensions/{extension_id}", response_model=ExtensionResponse)

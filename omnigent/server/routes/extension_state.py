@@ -16,10 +16,13 @@ from typing import Literal, TypeVar
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
+from omnigent.db.account_authority import account_generation
+from omnigent.db.db_models import current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions.published_fields import published_field_view
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.extension_state import (
+    CommandEvent,
     ExtensionCommandArgumentError,
     ExtensionStateAccessError,
     ExtensionStateService,
@@ -243,6 +246,19 @@ def create_extension_state_router(
                 level=level,
                 user_id=user_id,
                 expected_version=body.expected_version,
+            )
+        )
+        # Before answering, so the extension has recorded who turned it on.
+        await service.notify_command(
+            CommandEvent(
+                extension_id=extension_id,
+                session_id=session_id,
+                workspace_id=current_workspace_id(),
+                command_id=command_id,
+                key=result.key,
+                deleted=result.entry is None,
+                user_id=user_id,
+                generation=account_generation(user_id) if user_id is not None else None,
             )
         )
         conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)

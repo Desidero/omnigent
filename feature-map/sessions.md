@@ -366,6 +366,15 @@ web chat the bubble carries an **Automation · <label>** chip with "on behalf of
 session's still-pending wake shows as a plain queued bubble until the terminal
 records it.
 
+**Extension server code (experimental):** an operator-enabled extension whose
+manifest names `entrypoints.server` runs its `activate(ctx)` at server start
+(see `docs/extending/server_activation.md`). No UI shows it; check it as an
+administrator with `GET /v1/extensions/diagnostics`, whose `activations` list
+shows `active`, or `quarantined` with the error when `activate` raised. A
+quarantined extension's pages and state keep working and the server keeps
+serving. `omni extensions doctor <id>` imports the entrypoint without running
+it and says whether activation would quarantine it.
+
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
 cards. Choosing Canvas in the sidebar returns to the selected board.
@@ -1107,6 +1116,10 @@ plain `uv run pytest`, which starts a private server for the test.
   concurrent writes and session deletion, is in
   `tests/stores/test_extension_state_store.py`; run it with
   `OMNIGENT_TEST_DB_URI` set to cover Postgres, CockroachDB or MySQL.
+- **Extension server activation (server integration, plain `uv run pytest`):**
+  `tests/server/test_extension_activation.py` runs the real lifespan with a
+  fixture extension: enabled or not, quarantine, shutdown, and each `ctx`
+  surface against the real services.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and

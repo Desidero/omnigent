@@ -5539,6 +5539,27 @@ def extensions_list() -> None:
         click.echo(f"{len(state.load_errors)} rejected extension entry point(s)", err=True)
 
 
+def _doctor_server_entrypoint(manifest: Any, package: str | None, enabled: bool) -> None:
+    """Import an extension's server entrypoint without running it, as activation would."""
+    from omnigent.server.extension_activation import resolve_server_entrypoint
+
+    click.echo(f"server entrypoint: {manifest.entrypoints.server} (experimental)")
+    try:
+        resolve_server_entrypoint(manifest, package)
+    # Importing runs the extension's module code, which may raise anything.
+    except Exception as exc:
+        raise click.ClickException(
+            f"Server entrypoint would be quarantined at activation: {exc}"
+        ) from exc
+    if enabled:
+        click.echo(
+            "activation: runs at server start; a running server reports failures "
+            "(quarantined) at GET /v1/extensions/diagnostics"
+        )
+    else:
+        click.echo("activation: off (the extension is not enabled)")
+
+
 @extensions_cli.command("doctor")
 @click.argument("extension_id")
 def extensions_doctor(extension_id: str) -> None:
@@ -5574,9 +5595,14 @@ def extensions_doctor(extension_id: str) -> None:
     click.echo(f"id: {manifest.id}")
     click.echo(f"distribution: {manifest.distribution} {manifest.version}")
     click.echo(f"extension API: {manifest.extension_api}")
-    click.echo(f"enablement: {_extension_enablement().describe(manifest.id)}")
+    enablement = _extension_enablement()
+    click.echo(f"enablement: {enablement.describe(manifest.id)}")
     for item in manifest.slot_items:
         click.echo(f"UI slot: {item.slot.value} -> {item.page} ({item.label})")
+    if manifest.entrypoints.server is not None:
+        _doctor_server_entrypoint(
+            manifest, state.asset_package(extension_id), enablement.allows_slots(manifest.id)
+        )
     if manifest.entrypoints.browser is None:
         click.echo("browser bundle: not declared")
         return

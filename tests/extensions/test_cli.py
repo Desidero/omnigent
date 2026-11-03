@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from dataclasses import replace
 from types import MappingProxyType
 
@@ -109,6 +111,45 @@ def test_extensions_doctor_reports_resolved_bundle(monkeypatch) -> None:
     assert result.exit_code == 0
     assert "enablement: installed, not enabled (pages and navigation only)" in result.output
     assert f"browser bundle: ok ({'a' * 64})" in result.output
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "enabled", "expected", "exit_code"),
+    [
+        ("json:loads", True, "would be quarantined", 1),
+        ("acme_review_fixture:missing", True, "would be quarantined", 1),
+        ("acme_review_fixture:activate", True, "activation: runs at server start", 0),
+        ("acme_review_fixture:activate", False, "activation: off", 0),
+    ],
+)
+def test_extensions_doctor_checks_the_server_entrypoint(
+    monkeypatch, tmp_path, entrypoint: str, enabled: bool, expected: str, exit_code: int
+) -> None:
+    async def activate(_ctx: object) -> None:
+        return None
+
+    module = types.ModuleType("acme_review_fixture")
+    module.activate = activate  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "acme_review_fixture", module)
+    # An in-memory module has no installed file to check.
+    monkeypatch.setattr(
+        "omnigent.server.extension_activation.module_in_distribution",
+        lambda _module, _distribution: True,
+    )
+    manifest = replace(_manifest(), entrypoints=ExtensionEntrypoints(server=entrypoint))
+    state = ExtensionPluginState(
+        manifests=(manifest,), asset_packages={manifest.id: "acme_review_fixture"}
+    )
+    monkeypatch.setattr("omnigent.extensions.plugin_state", lambda: state)
+    config = tmp_path / "enabled.yaml"
+    config.write_text(f"extensions:\n  acme.review: {{enabled: {str(enabled).lower()}}}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    result = CliRunner().invoke(cli, ["extensions", "doctor", manifest.id])
+
+    assert result.exit_code == exit_code, result.output
+    assert f"server entrypoint: {entrypoint} (experimental)" in result.output
+    assert expected in result.output
 
 
 def test_extensions_doctor_honors_development_override(monkeypatch, tmp_path) -> None:
