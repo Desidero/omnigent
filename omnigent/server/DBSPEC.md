@@ -131,12 +131,38 @@ conversation_id, key)`, which serves per-extension work across sessions and
 workspaces (enumerating an extension's state; purging it on uninstall) as a
 range on `extension_id`, ordered by the full primary key for paging.
 
-**Deletion:** no DB cascade. Application code must delete a deleted session
-subtree's rows by that prefix; batching is the store's choice.
+**Deletion:** no DB cascade. `delete_conversation` first locks the subtree's
+`conversations` rows (`FOR UPDATE` where supported), then deletes the
+subtree's state rows by that prefix in the same transaction as the
+conversation rows, after them, in batches (500 sessions per statement, 1,000
+rows per `DELETE`, selected with a locking read).
 
-**Writers:** bind `value` as bytes and check its byte length before writing
-(SQLite's `length()` counts characters if text is stored). Reject keys with
-trailing whitespace: `utf8mb4_bin` ignores trailing spaces when comparing.
+**Writers:** only `SqlAlchemyConversationStore`. Every write locks the owning
+`conversations` row first (`FOR UPDATE`; SQLite's immediate transaction),
+checks the session still exists, then applies the compare-and-set and the
+per-extension key quota. A published key's mirror label
+(`ext.<extension_id>.<key>` in `conversation_labels`) is written in the same
+transaction. `value` is stored as one envelope byte (`0x01`, plaintext
+format 1) followed by the extension's bytes, so the payload is at most 16,382
+bytes. Keys and extension ids are validated against patterns without
+whitespace, since `utf8mb4_bin` ignores trailing spaces when comparing.
+
+**`ext.` labels:** `conversation_labels` keys starting with `ext.` are written
+and deleted only by this mirror; every other label write path refuses them,
+and forks drop them. The check folds case, accents and ignorable characters,
+because MySQL's default collation compares `EXT.x` and `éxt.x` equal to
+`ext.x`; the mirror deletes such a variant row before writing its exact key.
+Folding can't predict every collation, so the database decides too: on the
+upsert fallback (MySQL) and in `delete_label`, a key the database matches to
+a different `ext.` row is refused. Reads mark an `ext.` label as verified only
+when a state row with the same value backs it
+(`Conversation.verified_extension_labels`): one statement per page of sessions
+reads each candidate label joined with its state row, so a concurrent write
+can't make them disagree; values are compared in Python, not in SQL.
+
+**Writers:** the store's `_put_extension_state` / `_delete_extension_state`
+are internal; only `ExtensionStateService` calls them, deriving the mirror
+and the quotas from the extension's manifest. `max_keys` is capped at 64.
 
 ---
 

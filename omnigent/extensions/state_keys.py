@@ -60,12 +60,10 @@ def published_label_key(extension_id: str, key: str) -> str:
     return f"{EXTENSION_LABEL_PREFIX}{extension_id}.{key}"
 
 
-def validate_state_address(extension_id: str, key: str) -> None:
-    """Reject an extension id or state key the state table must not store.
+def validate_extension_id(extension_id: str) -> None:
+    """Reject an id that is not a lowercase, publisher-qualified id of at most 128 characters.
 
-    :raises ValueError: The id is not a lowercase, publisher-qualified id of
-        at most 128 characters, or the key is empty, longer than 128
-        characters, or contains whitespace or other unsupported characters.
+    :raises ValueError: The id is invalid.
     """
     if (
         not isinstance(extension_id, str)
@@ -73,8 +71,24 @@ def validate_state_address(extension_id: str, key: str) -> None:
         or not EXTENSION_ID_RE.fullmatch(extension_id)
     ):
         raise ValueError(f"invalid extension id {extension_id!r}")
+
+
+def validate_state_key(key: str) -> None:
+    """Reject an empty or overlong key, or one with whitespace or unsupported characters.
+
+    :raises ValueError: The key is invalid.
+    """
     if not isinstance(key, str) or not STATE_KEY_RE.fullmatch(key):
         raise ValueError(
             f"invalid state key {key!r}: use 1-{STATE_KEY_MAX_LENGTH} letters, digits "
             "or ._:=+/@- characters"
         )
+
+
+def validate_state_address(extension_id: str, key: str) -> None:
+    """Reject an extension id or state key the state table must not store.
+
+    :raises ValueError: Either is invalid.
+    """
+    validate_extension_id(extension_id)
+    validate_state_key(key)
