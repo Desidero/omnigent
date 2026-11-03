@@ -111,7 +111,12 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
+from omnigent.server import (
+    presence,
+    session_live_state,
+    session_status_observers,
+    shutdown_state,
+)
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -5009,10 +5014,6 @@ def _publish_status(
     _session_status_cache[session_id] = status
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
-    if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
-        # A turn can open or merge a PR while nobody watches; refresh what the server
-        # stores. Stops and archives publish idle without persisting it, and skip this.
-        session_pull_requests.notify_turn_end(session_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
@@ -5134,6 +5135,19 @@ def _publish_status(
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
+    # Observers run once the edge is fully published, so one that publishes
+    # a status inline leaves the cache and stream on its own edge.
+    if previous_status != status:
+        session_status_observers.observe(
+            session_status_observers.SessionStatusObservation(
+                session_id=session_id,
+                previous_status=previous_status,
+                status=status,
+                persist_requested=persist_live_status,
+                response_id=response_id,
+                blocked_on=blocked_on,
+            )
+        )
 
 
 def reconcile_orphaned_running_status(

@@ -343,6 +343,9 @@ PR while offline; linking needs the host. Reconnect and verify live checks and
 merge controls return. Unlink the last PR and verify it stays absent after refresh.
 A session not yet imported to the server says so. Older servers retain their
 host-dependent unlink behavior.
+A turn's end refreshes the stored summary even if nobody has the session open:
+merge a linked PR elsewhere, let a turn finish without opening Pull Requests,
+wait about ten seconds, then stop the host; the summary shows it merged.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
