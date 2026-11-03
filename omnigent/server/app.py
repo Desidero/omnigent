@@ -106,6 +106,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.extension_state import ExtensionStateService
+from omnigent.server.extension_status_observers import ExtensionStatusObservers
 from omnigent.server.feature_flags import (
     Feature,
     FeatureFlags,
@@ -1725,10 +1726,9 @@ def create_app(
         enabled set once at application construction.
     :param extension_is_enabled: The operator's persistent enablement of an
         extension id, which gates extension session state, commands and
-        published fields, and ``ext:`` session-wake sources. ``None`` makes
-        the first three follow the server config's
-        ``extensions.<id>.enabled: true``, the switch that turns on UI slots,
-        and enables no ``ext:`` wake source.
+        published fields, ``ext:`` session-wake sources and extension status
+        observers. ``None`` uses the server config's
+        ``extensions.<id>.enabled: true``, the switch that turns on UI slots.
     :param extension_state: Optional pre-resolved installed-extension registry.
         When omitted, entry points are discovered once at application
         construction and the process-cached state is reused thereafter.
@@ -2233,12 +2233,17 @@ def create_app(
         session_pull_requests.install_refresher(pull_request_refresher)
         session_wake: SessionWakeService = app_inst.state.session_wake
         await session_wake.start()
+        extension_status_observers: ExtensionStatusObservers = (
+            app_inst.state.extension_status_observers
+        )
+        extension_status_observers.start()
         try:
             with monitor_event_loop():
                 yield
         finally:
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
+            await extension_status_observers.aclose()
             await session_wake.aclose()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
@@ -2322,7 +2327,11 @@ def create_app(
         permission_store=permission_store,
         auth_provider=auth_provider,
         host_registry=host_registry,
-        extension_is_enabled=extension_is_enabled,
+        extension_is_enabled=extension_state_enabled,
+    )
+    # Extensions observe status edges under the same operator enablement.
+    app.state.extension_status_observers = ExtensionStatusObservers(
+        is_enabled=extension_state_enabled
     )
 
     def _admit_host_launch(

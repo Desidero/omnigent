@@ -126,8 +126,9 @@ turned the automation on as `generation`.
   again that the source is enabled, that `on_behalf_of` still has EDIT and that
   their account generation is still valid. If not, the wake is dropped and stop
   listeners hear `not_authorized`. A source `ext:<id>` is enabled only when the
-  operator enabled extension `<id>` (`create_app(extension_is_enabled=...)`);
-  `core:` sources always are. Once a wake has reached the runner it is not
+  operator enabled extension `<id>` (`extensions.<id>.enabled: true` in the
+  server config, or `create_app(extension_is_enabled=...)`); `core:` sources
+  always are. Once a wake has reached the runner it is not
   checked again: one the runner is still holding goes out when the session is
   idle unless someone stops or interrupts the session first.
 - **As the session owner.** The message is posted inside the owner's account

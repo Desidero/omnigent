@@ -9,6 +9,7 @@ running turn.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -19,7 +20,13 @@ from pydantic import ValidationError
 from omnigent.entities.conversation import MessageData, NewConversationItem, SlashCommandData
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runtime import pending_inputs
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT
+from omnigent.server.extension_status_observers import (
+    ExtensionNotEnabledError,
+    ExtensionStatusObservers,
+)
 from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.routes._sessions.orchestration import _dispatch_in_flight
 from omnigent.server.schemas import SessionStartupInput
@@ -31,7 +38,10 @@ from omnigent.server.session_wake import (
     WakeRequest,
     WakeStop,
 )
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 _ORIGIN = {"kind": "automation", "source": "ext:acme.goal-loop", "on_behalf_of": "alice"}
@@ -227,17 +237,53 @@ async def test_wake_waits_while_the_server_sees_a_turn(
 
 
 @pytest.mark.asyncio
-async def test_extension_sources_need_the_operator_switch(
-    app: FastAPI, client: httpx.AsyncClient
+@pytest.mark.parametrize(
+    ("extensions", "enabled"),
+    [({"acme.x": {"enabled": True}}, True), ({}, False), ({"acme.x": {"enabled": False}}, False)],
+    ids=["enabled", "not-listed", "disabled"],
+)
+async def test_extension_sources_and_observers_follow_the_operator_config(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    extensions: dict[str, Any],
+    enabled: bool,
 ) -> None:
-    session_id = await _new_session(client)
-    service: SessionWakeService = app.state.session_wake
-
-    outcome = await service.request(
-        WakeRequest(session_id, "ext:acme.x", None, "hi", generation=None)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        server_config={"extensions": extensions},
     )
+    session_id = conversation_store.create_conversation().id
+    service: SessionWakeService = app.state.session_wake
+    observers: ExtensionStatusObservers = app.state.extension_status_observers
+    # A busy session keeps the queued wake from being posted.
+    _session_status_cache[session_id] = "running"
+    observers.start()
+    try:
+        outcome = await service.request(
+            WakeRequest(session_id, "ext:acme.x", None, "hi", generation=None)
+        )
+        await service.settle()
+        if enabled:
+            observers.subscribe("acme.x", _ignore_observation)
+        else:
+            with pytest.raises(ExtensionNotEnabledError):
+                observers.subscribe("acme.x", _ignore_observation)
+    finally:
+        _session_status_cache.pop(session_id, None)
+        await observers.aclose()
 
-    assert outcome is WakeOutcome.NOT_AUTHORIZED
+    assert outcome is (WakeOutcome.QUEUED if enabled else WakeOutcome.NOT_AUTHORIZED)
+
+
+async def _ignore_observation(_observation: SessionStatusObservation) -> None:
+    return None
 
 
 @pytest.mark.asyncio
