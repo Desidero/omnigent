@@ -75,6 +75,16 @@ def test_merge_fields_shape_state_and_auto_merge() -> None:
     assert github._merge_fields({}) == {}
 
 
+@pytest.mark.parametrize(
+    ("reported", "mergeable"),
+    [("MERGEABLE", True), ("CONFLICTING", False), ("UNKNOWN", None), (None, None), ([], None)],
+)
+def test_merge_fields_report_whether_the_pr_merges_cleanly(
+    reported: object, mergeable: bool | None
+) -> None:
+    assert github._merge_fields({"mergeable": reported}) == {"mergeable": mergeable}
+
+
 @pytest.mark.parametrize("path", ["workspace", "reference"])
 def test_both_read_paths_report_merge_state(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
     data = {
@@ -83,6 +93,7 @@ def test_both_read_paths_report_merge_state(monkeypatch: pytest.MonkeyPatch, pat
         "state": "OPEN",
         "mergeStateStatus": "CLEAN",
         "autoMergeRequest": None,
+        "mergeable": "CONFLICTING",
     }
     monkeypatch.setattr(github, "_gh_pr_view", lambda *_args, **_kwargs: data)
     monkeypatch.setattr(github, "_list_accounts", lambda _root: (True, []))
@@ -98,6 +109,7 @@ def test_both_read_paths_report_merge_state(monkeypatch: pytest.MonkeyPatch, pat
 
     assert info["pr"]["merge_state_status"] == "CLEAN"
     assert info["pr"]["auto_merge"] is None
+    assert info["pr"]["mergeable"] is False
 
 
 def test_an_old_gh_without_merge_fields_keeps_the_pr(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,9 +128,25 @@ def test_an_old_gh_without_merge_fields_keeps_the_pr(monkeypatch: pytest.MonkeyP
 
     assert data is not None and data["title"] == "t"
     assert "mergeStateStatus" not in data
-    # Only the refused field is dropped; auto-merge is still read.
-    assert "autoMergeRequest" in calls[-1][-1].split(",")
-    assert github._merge_fields(data) == {"auto_merge": None}
+    # Only the refused field is dropped; auto-merge and mergeable are still read.
+    assert {"autoMergeRequest", "mergeable"} <= set(calls[-1][-1].split(","))
+    assert github._merge_fields(data) == {"auto_merge": None, "mergeable": None}
+
+
+def test_a_gh_refusing_mergeable_drops_only_that_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        fields = argv[-1].split(",")
+        if "mergeable" in fields:
+            return 1, "", 'Unknown JSON field: "mergeable"\nAvailable fields:\n  title'
+        return 0, json.dumps(dict.fromkeys(fields) | {"title": "t"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+
+    data = github._gh_pr_view([], github._PR_VIEW_FIELDS, cwd="/workspace")
+
+    assert data is not None and data["title"] == "t"
+    assert "mergeable" not in github._merge_fields(data)
+    assert github._merge_fields(data)["merge_state_status"] is None
 
 
 @pytest.mark.parametrize(

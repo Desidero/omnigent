@@ -99,6 +99,9 @@ export interface PullRequestComment {
   created_at: string | null;
   /** Link to the comment on GitHub, or null. */
   url: string | null;
+  /** The author's relation to the repository, e.g. "MEMBER" or "NONE";
+   *  absent when unknown or from an older host. */
+  author_association?: string;
 }
 
 export interface PullRequestTimelineEvent {
@@ -120,6 +123,10 @@ export interface PullRequestReviewer {
   login: string;
   kind: "user" | "team";
   state: PullRequestReviewerState;
+  /** ISO-8601 time of the reviewer's latest submitted review; absent while pending. */
+  submitted_at?: string;
+  /** The reviewer's relation to the repository, e.g. "MEMBER"; absent while pending. */
+  author_association?: string;
 }
 
 /** A label on a PR or in its repository. */
@@ -179,6 +186,9 @@ export interface PullRequest {
   merge_state_status?: string | null;
   /** Null when auto-merge is off; absent when the host can't report it. */
   auto_merge?: PullRequestAutoMerge | null;
+  /** True when the PR merges cleanly, false when it conflicts, null while the
+   *  provider is still computing it; absent when the host can't report it. */
+  mergeable?: boolean | null;
 }
 
 export interface PullRequestRepo {

@@ -100,12 +100,12 @@ _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
 # reviews, labels, and the merge fields feed the Summary and Comments tabs.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
-    ",reviews,reviewRequests,latestReviews,labels,mergeStateStatus,autoMergeRequest"
+    ",reviews,reviewRequests,latestReviews,labels,mergeStateStatus,autoMergeRequest,mergeable"
 )
 _PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
 _PR_COMMENTS_FIELD = "reviews"
 # Older ``gh`` releases lack these; :func:`_gh_pr_view` retries without them.
-_PR_MERGE_FIELDS = frozenset({"mergeStateStatus", "autoMergeRequest"})
+_PR_MERGE_FIELDS = frozenset({"mergeStateStatus", "autoMergeRequest", "mergeable"})
 # Reading check runs needs the Checks permission, which a fine-grained personal
 # access token cannot hold; GitHub refuses just this field and ``gh`` fails the
 # whole call, so :func:`_gh_pr_view` retries without it.
@@ -462,7 +462,13 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
             )
         ):
             continue
-        reviewers[("user", login.lower())] = {"login": login, "kind": "user", "state": state}
+        reviewers[("user", login.lower())] = {
+            "login": login,
+            "kind": "user",
+            "state": state,
+            **_optional_strings(review, submittedAt="submitted_at"),
+            **_optional_strings(review, authorAssociation="author_association"),
+        }
 
     requests = data.get("reviewRequests")
     for request in requests if isinstance(requests, list) else []:
@@ -477,6 +483,15 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
         # A re-request is pending even if the reviewer previously approved.
         reviewers[(kind, login.lower())] = {"login": login, "kind": kind, "state": "PENDING"}
     return list(reviewers.values())
+
+
+def _optional_strings(raw: dict[str, Any], **renames: str) -> dict[str, str]:
+    """Copy non-empty string fields under their payload names; absent ones stay out."""
+    return {
+        target: value
+        for source, target in renames.items()
+        if isinstance(value := raw.get(source), str) and value
+    }
 
 
 def _shape_comments(
@@ -494,6 +509,7 @@ def _shape_comments(
                 "body": str(comment.get("body") or ""),
                 "created_at": comment.get("createdAt") or None,
                 "url": comment.get("url") or None,
+                **_optional_strings(comment, authorAssociation="author_association"),
             }
         )
     for review in reviews if isinstance(reviews, list) else []:
@@ -512,6 +528,7 @@ def _shape_comments(
                 # gh's review objects have no URL; the PR conversation contains
                 # the review body, so link there rather than inventing an anchor.
                 "url": pr_url,
+                **_optional_strings(review, authorAssociation="author_association"),
             }
         )
     shaped.sort(key=lambda comment: comment["created_at"] or "")
@@ -795,7 +812,7 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
           comments(last: 100) @include(if: $includeComments) {
-            nodes { author { login } body createdAt url isMinimized }
+            nodes { author { login } authorAssociation body createdAt url isMinimized }
           }
           timelineItems(last: 100, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT]) {
             pageInfo { hasPreviousPage }
@@ -861,7 +878,7 @@ def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _merge_fields(data: dict[str, Any]) -> dict[str, Any]:
-    """``merge_state_status`` and ``auto_merge`` for a ``gh pr view`` object.
+    """``merge_state_status``, ``auto_merge`` and ``mergeable`` for a ``gh pr view`` object.
 
     Each is left out when :func:`_gh_pr_view` dropped its field for an older ``gh``.
     """
@@ -882,6 +899,12 @@ def _merge_fields(data: dict[str, Any]) -> dict[str, Any]:
             }
         else:
             fields["auto_merge"] = None
+    if "mergeable" in data:
+        # GitHub computes this lazily, so UNKNOWN (null here) is common at first.
+        value = data["mergeable"]
+        fields["mergeable"] = (
+            True if value == "MERGEABLE" else False if value == "CONFLICTING" else None
+        )
     return fields
 
 
