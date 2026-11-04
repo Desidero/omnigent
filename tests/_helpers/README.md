@@ -24,6 +24,7 @@ retain configuration, fault injection and behavioral assertions.
 | Local Codex marketplace/plugin install | `install_codex_plugin` in [codex_plugins.py](codex_plugins.py), with caller-owned home/workspace and names | [Plugin catalog](../harnesses/codex_native/test_skill_discovery.py), [both composers](../e2e_ui/chat/test_codex_plugin_skills.py) |
 | Provider resolution without the developer's config, overlay or ambient credentials | `isolate_provider_resolution` in [providers.py](providers.py) | [Host model options](../host/test_connect.py) |
 | Hermetic stdio ACP agent process | `FAKE_ACP_AGENT_SCRIPT`, `FAKE_ACP_AGENT_REPLY` in [acp_agent.py](acp_agent.py) | [Files tab survives an ACP reply](../e2e_ui/files/test_files_tab_survives_acp_reply.py) |
+| Fake `gh` CLI for real host/runner processes, answering from a PR scenario the test edits | `install_fake_gh`, `scenario`, `pull_request`, `check_run`, `comment`, `review`, `with_reviews` in [fake_gh.py](fake_gh.py) | [Goal loop pr-green](../e2e/test_goal_loop_pr_green_e2e.py) |
 | Codex home with rollouts, `history_base` lineage and thread store | `CodexRollout`, `write_codex_thread_store` in [codex_rollout.py](codex_rollout.py) | [Codex import history](../e2e/test_host_import_codex_history_e2e.py) |
 
 ## Session inputs stay explicit

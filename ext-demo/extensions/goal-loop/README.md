@@ -141,7 +141,20 @@ cd ext-demo/extensions/goal-loop/web
 
 # Server code
 uv run pytest tests/extensions/goal_loop tests/server/test_goal_loop_extension.py
+
+# The whole chain without GitHub: a real server, host and runner, a mock LLM
+uv run pytest tests/e2e/test_goal_loop_pr_green_e2e.py
 ```
+
+### Test without GitHub
+
+`tests/_helpers/fake_gh.py` installs a fake `gh` that the host and its runner
+find first on `PATH`. It answers the Pull Requests panel's calls from a JSON
+scenario the test edits (head commit, checks, comments, reviews,
+mergeability), and records any call it can't answer so the test fails instead
+of reading "no PR". The end-to-end test above uses it to link a PR from the
+session's branch, wake the agent on a failing check and meet the goal on a
+green head, in under a minute.
 
 ## Credits
 
