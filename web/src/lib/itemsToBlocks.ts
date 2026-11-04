@@ -59,6 +59,7 @@ import {
   isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
+  messageOrigin,
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
@@ -510,6 +511,7 @@ function ctxFor(item: ConversationItem): BlockContext {
   // Preserve human authorship only when the server sent it.
   const createdBy =
     "created_by" in item && typeof item.created_by === "string" ? item.created_by : undefined;
+  const origin = "origin" in item ? messageOrigin(item.origin) : undefined;
   return {
     agent,
     depth,
@@ -518,6 +520,7 @@ function ctxFor(item: ConversationItem): BlockContext {
     responseId: item.response_id,
     itemId: item.id,
     ...(createdBy !== undefined ? { createdBy } : {}),
+    ...(origin !== undefined ? { origin } : {}),
     ...(typeof item.created_at === "number" && item.created_at > 0
       ? { createdAtS: item.created_at }
       : {}),

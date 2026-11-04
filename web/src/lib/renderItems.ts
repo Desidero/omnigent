@@ -35,7 +35,7 @@ import {
   isSessionScopedDecision,
   routingExtras,
 } from "./routingDecision";
-import type { AssistantMessagePhase } from "./conversationItems";
+import type { AssistantMessagePhase, MessageOrigin } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
 import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
@@ -181,6 +181,8 @@ export type Bubble =
       shellCommand?: string;
       /** Human author email, when known. */
       createdBy?: string;
+      /** The automation that sent this message, when the server did. */
+      origin?: MessageOrigin;
       /** Epoch seconds of this message, when known — server-stamped from
        *  history, client-stamped while live. Display-only. */
       createdAtS?: number;
@@ -888,6 +890,7 @@ function walkBubbles(
           b.type === "user_message" ? b.content : [{ type: "input_text", text: `!${b.input}` }],
         ...(b.type === "terminal_command" ? { shellCommand: b.input } : {}),
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
+        ...(b.ctx.origin !== undefined ? { origin: b.ctx.origin } : {}),
         // Server stamp on cold load, client stamp while live — display
         // only, so either clock is correct here.
         ...(b.ctx.createdAtS !== undefined || b.ctx.clientCreatedAtS !== undefined
@@ -1932,6 +1935,10 @@ function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): b
  * equality on each render-item field is sufficient — only the streaming
  * bubble's growing items differ, so it alone re-renders.
  */
+function sameOrigin(a: MessageOrigin | undefined, b: MessageOrigin | undefined): boolean {
+  return a?.source === b?.source && a?.on_behalf_of === b?.on_behalf_of && a?.label === b?.label;
+}
+
 export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "assistant" && b.kind === "assistant") {
@@ -1963,6 +1970,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       a.createdBy !== b.createdBy ||
+      !sameOrigin(a.origin, b.origin) ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
       a.shellCommand !== b.shellCommand ||

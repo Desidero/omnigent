@@ -85,6 +85,12 @@ implements them separately, so a fix for one harness does not reach the others.
   calls, ahead of messages sent while a tool ran. Unmatched outputs become
   labeled recovery text so missing calls do not block continuation.
 - `steer`: sending while the harness is mid-turn steers the active turn.
+- `next-turn-only`: a server automation message ([session wake](../docs/extending/session_wake.md))
+  never steers: it waits until the terminal is idle and its input box is
+  empty, then starts a turn. Covered for claude-native, codex-native and
+  pi-native; other native harnesses wait for a quiet screen. Check it by
+  typing in the terminal while a wake is requested: the draft stays and the
+  wake arrives after the turn you start ends.
 - `chat-render`: the harness's output renders in chat like other harnesses.
   A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
   clicking it opens that file in the workspace viewer without expanding the

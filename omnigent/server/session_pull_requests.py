@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.git_providers import provider_display
+from omnigent.server import session_status_observers
 from omnigent.server.schemas import SessionPullRequest, SessionPullRequestList
 from omnigent.stores.session_pull_request_store import (
     FetchedState,
@@ -388,3 +389,22 @@ def notify_turn_end(session_id: str) -> None:
     """Refresh a session's stored PRs after its turn ended."""
     if _installed is not None:
         _installed.turn_ended(session_id)
+
+
+def _refresh_after_turn_end(
+    observation: session_status_observers.SessionStatusObservation,
+) -> None:
+    """Refresh after a persisted idle edge that ends a running or waiting turn.
+
+    A turn can open or merge a PR while nobody watches. Stops and archives
+    publish idle without persisting it, and skip this.
+    """
+    if (
+        observation.status == "idle"
+        and observation.previous_status in ("running", "waiting")
+        and observation.persist_requested
+    ):
+        notify_turn_end(observation.session_id)
+
+
+session_status_observers.register_core_observer(_refresh_after_turn_end)

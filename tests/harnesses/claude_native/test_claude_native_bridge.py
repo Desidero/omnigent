@@ -16928,3 +16928,162 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_composer_pane(""), None),
+        (_composer_pane('Try "fix the failing test"'), None),
+        (_composer_pane("half-typed reply"), "draft"),
+        (_composer_pane("").replace("❯ ", "! ls"), "surface"),
+        ("  step 9\n  step 10\n──────\n  paste again to expand\n", "surface"),
+        (_INLINE_REVERSE_SEARCH_PANE, "surface"),
+        (_REVERSE_SEARCH_PANE, "surface"),
+        ("──────────────────────────────\n❯ typed\n", "unreadable"),
+        ("no input box on screen\n", "surface"),
+        ("", "unreadable"),
+    ],
+    ids=[
+        "empty",
+        "suggestion",
+        "draft",
+        "shell-mode",
+        "taller-than-pane",
+        "inline-history-search",
+        "history-search",
+        "closing-rule-off-screen",
+        "overlay",
+        "blank-capture",
+    ],
+)
+def test_only_a_positively_empty_composer_is_free_for_a_wake(
+    pane: str, expected: str | None
+) -> None:
+    assert claude_native_bridge.wake_composer_blocker(pane) == expected
+
+
+def _advertise_tmux(bridge_dir: Path) -> None:
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/s.sock", "tmux_target": "main"}), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pending", "claude_status", "pane", "expected"),
+    [
+        (False, "idle", _composer_pane(""), None),
+        (True, "idle", _composer_pane(""), "prompt"),
+        (False, "busy", _composer_pane(""), "running"),
+        (False, "waiting", _composer_pane(""), "running"),
+        (False, None, _composer_pane("draft"), "draft"),
+        (False, "idle", "──────────────────────────────\n❯ \n", "unreadable"),
+    ],
+)
+def test_next_turn_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pending: bool,
+    claude_status: str | None,
+    pane: str,
+    expected: str | None,
+) -> None:
+    config_dir = tmp_path / "claude-config"
+    (config_dir / "sessions").mkdir(parents=True)
+    if claude_status is not None:
+        status_file = config_dir / "sessions" / "4242.json"
+        status_file.write_text(
+            json.dumps(
+                {"kind": "interactive", "sessionId": "claude-sid", "status": claude_status}
+            ),
+            encoding="utf-8",
+        )
+        # A long turn: the file was last written well before the scan window.
+        os.utime(status_file, (time.time() - 3600, time.time() - 3600))
+    _advertise_tmux(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: pending)
+    monkeypatch.setattr(claude_native_bridge, "read_claude_session_id", lambda _: "claude-sid")
+    monkeypatch.setattr(claude_native_bridge, "_tmux_pane_pid", lambda *_a: 4242)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_a, **_k: pane)
+
+    assert claude_native_bridge.next_turn_blocker(tmp_path) == expected
+
+
+def test_next_turn_blocker_needs_the_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: False)
+    assert claude_native_bridge.next_turn_blocker(tmp_path) == "unreadable"
+
+
+def test_wake_injection_never_clears_or_dismisses_what_a_person_left(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A draft that appears after the check is refused, not wiped, and nothing is typed."""
+    _advertise_tmux(tmp_path)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_restore_occupied_input",
+        lambda *_a, **_k: pytest.fail("a wake must not dismiss a surface"),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_clear_composer",
+        lambda *_a, **_k: pytest.fail("a wake must not clear the input box"),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda *_a, **_k: pytest.fail("nothing is typed")
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "_capture_pane", lambda *_a, **_k: _composer_pane("half-typed")
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeComposerBusy):
+        inject_user_message(tmp_path, content="wake", keep_draft=True)
+
+
+@pytest.mark.parametrize("after_repaint", [_composer_pane(""), _IDLE_COMPACT_NOTICE_PANE])
+def test_next_turn_blocker_repaints_a_box_hidden_by_stray_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, after_repaint: str
+) -> None:
+    """Printed output over the box gets the human path's repaint, never a clear."""
+    _advertise_tmux(tmp_path)
+    captures = iter([_IDLE_COMPACT_NOTICE_PANE, after_repaint])
+    repaints: list[str] = []
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: False)
+    monkeypatch.setattr(claude_native_bridge, "_claude_reports_turn", lambda *_a: False)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_a, **_k: next(captures))
+    monkeypatch.setattr(
+        claude_native_bridge, "_request_claude_repaint", lambda *_a: repaints.append("x") or 1
+    )
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda *_a, **_k: pytest.fail("nothing is typed")
+    )
+
+    expected = None if after_repaint == _composer_pane("") else "unreadable"
+    assert claude_native_bridge.next_turn_blocker(tmp_path) == expected
+    assert repaints == ["x"]
+
+
+def test_next_turn_blocker_reports_a_dialog_only_the_terminal_shows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A wake meeting an MCP approval (or similar) is refused, never typed into it."""
+    _advertise_tmux(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: False)
+    monkeypatch.setattr(claude_native_bridge, "_claude_reports_turn", lambda *_a: False)
+    monkeypatch.setattr(
+        claude_native_bridge, "_capture_pane", lambda *_a, **_k: _MCP_APPROVAL_DIALOG_PANE
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_request_claude_repaint",
+        lambda *_a: pytest.fail("a dialog is not stray output"),
+    )
+
+    assert claude_native_bridge.next_turn_blocker(tmp_path) == "dialog"

@@ -57,6 +57,7 @@ from omnigent.host.frames import (
 )
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
+from omnigent.native.next_turn import NEXT_TURN_ONLY
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
@@ -291,11 +292,18 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
     ErrorDetail,
     McpServerStartup,
+    ServerMessageInput,
     SessionEventInput,
+)
+from omnigent.server.server_messages import (
+    ServerEventContext,
+    ServerMessageDispatch,
+    SessionNotReadyError,
 )
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_wake import WakeStop
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
@@ -847,13 +855,15 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
+    register_server_message: Callable[[ServerMessageDispatch], None] | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
     def _has_bound_runner_authority(
-        request: Request | _RunnerEventContext | StartupInputContext, conv: Any
+        request: Request | _RunnerEventContext | StartupInputContext | ServerEventContext,
+        conv: Any,
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return conv.runner_id == request.runner_id
@@ -864,7 +874,8 @@ def register_events_routes(
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
     def _has_runner_created_by_authority(
-        request: Request | _RunnerEventContext | StartupInputContext, conv: Any
+        request: Request | _RunnerEventContext | StartupInputContext | ServerEventContext,
+        conv: Any,
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return _has_bound_runner_authority(request, conv)
@@ -874,7 +885,7 @@ def register_events_routes(
         return _has_bound_runner_authority(request, conv)
 
     async def _authorized_conversation(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | ServerEventContext,
         session_id: str,
         *,
         external_transcript: bool = False,
@@ -882,7 +893,7 @@ def register_events_routes(
         """Authorize event writes, reserving transcripts for owners and bound runners."""
         user_id = (
             request.user_id
-            if isinstance(request, (_RunnerEventContext, StartupInputContext))
+            if isinstance(request, (_RunnerEventContext, StartupInputContext, ServerEventContext))
             else _get_user_id(request, auth_provider)
         )
         conv = None
@@ -1079,7 +1090,7 @@ def register_events_routes(
             )
 
     async def _post_event_impl(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | ServerEventContext,
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
@@ -1288,6 +1299,17 @@ def register_events_routes(
                     conv, agent_store=agent_store, agent_cache=agent_cache
                 ),
             )
+        if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE) and isinstance(request, Request):
+            # Ending the work also ends automation waiting to restart it. An
+            # orchestrating agent (sys_cancel_task) calls with its runner's token.
+            session_wake = getattr(request.app.state, "session_wake", None)
+            if session_wake is not None:
+                by_agent = bool((request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip())
+                session_wake.stop_session(
+                    session_id,
+                    WakeStop.STOPPED_BY_AGENT if by_agent else WakeStop.STOPPED_BY_USER,
+                    live_status=conv.live_status,
+                )
         # For item types, validate the data payload shape against
         # the item-type's discriminator class. The control types
         # (interrupt, approval) bypass the item-persist path and have
@@ -1456,7 +1478,15 @@ def register_events_routes(
 
         startup = getattr(request.app.state, "startup_inputs", None)
         if (
-            not isinstance(request, (StartupInputContext, _RunnerEventContext))
+            isinstance(request, ServerEventContext)
+            and startup is not None
+            and await startup.accepts(conv, request.app)
+        ):
+            # A starting session queues its first inputs durably as the sender;
+            # server messages wait for it to finish starting instead.
+            raise SessionNotReadyError()
+        if (
+            not isinstance(request, (StartupInputContext, _RunnerEventContext, ServerEventContext))
             and startup is not None
             and (
                 (body.type == "message" and body.data.get("role") == "user")
@@ -3559,6 +3589,53 @@ def register_events_routes(
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
+
+    async def send_server_message(
+        app: Any,
+        session_id: str,
+        user_id: str | None,
+        content: list[dict[str, Any]],
+        *,
+        origin: Mapping[str, Any] | None = None,
+        delivery: Literal["next_turn_only"] | None = NEXT_TURN_ONLY,
+    ) -> dict[str, bool | str]:
+        """Send a user message as *user_id* through the normal message path.
+
+        The caller binds *user_id*'s account authority. Input policies apply;
+        a denial raises.
+
+        :param app: The FastAPI application.
+        :param session_id: Target session.
+        :param user_id: The user the message is attributed to.
+        :param content: Message content blocks, e.g. ``[{"type": "input_text",
+            "text": "Hi"}]``.
+        :param origin: :class:`~omnigent.entities.conversation.MessageOrigin`
+            fields stored on the item.
+        :param delivery: ``"next_turn_only"`` (default) never steers the message
+            into a running turn; ``None`` delivers like a person's message.
+        :returns: The events route's acknowledgement.
+        :raises SessionNotReadyError: When the session is still starting.
+        :raises OmnigentError: ``FORBIDDEN`` when a policy denied the message.
+        """
+        data: dict[str, Any] = {"role": "user", "content": content}
+        if origin is not None:
+            data["origin"] = dict(origin)
+        if delivery is not None:
+            data["delivery"] = delivery
+        body = ServerMessageInput(type="message", data=data)
+        with contextlib.ExitStack() as in_flight:
+            result = await _post_event_impl(
+                ServerEventContext(app=app, user_id=user_id), session_id, body, in_flight
+            )
+        if result.get("denied"):
+            raise OmnigentError(
+                str(result.get("reason") or "Message denied by policy"),
+                code=ErrorCode.FORBIDDEN,
+            )
+        return result
+
+    if register_server_message is not None:
+        register_server_message(send_server_message)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

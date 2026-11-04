@@ -1516,6 +1516,22 @@ function startInboxPoller(
   // re-read+re-throw the same file forever (the turn is already reported done).
   const deliverAttempts = new Map();
   const MAX_DELIVER_ATTEMPTS = 5;
+  // Session wakes (next_turn_only) still waiting in the inbox for a turn to end.
+  const dropNextTurnOnlyMessages = () => {
+    let names = [];
+    try {
+      names = fs.readdirSync(config.inboxDir).filter((name) => name.endsWith(".json"));
+    } catch (_err) {
+      return;
+    }
+    for (const name of names) {
+      const fullPath = path.join(config.inboxDir, name);
+      try {
+        const queued = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+        if (queued && queued.next_turn_only === true) fs.unlinkSync(fullPath);
+      } catch (_err) {}
+    }
+  };
   pi.__omnigentInboxPoller = setInterval(() => {
     let files = [];
     try {
@@ -1564,10 +1580,14 @@ function startInboxPoller(
         // between this check and the send is benign: the message still
         // reaches Pi's queue, and a throw leaves the file for the next tick,
         // which recomputes the mode.
-        const deliverAs =
-          typeof isTurnActive === "function" && isTurnActive()
-            ? "steer"
-            : "followUp";
+        const turnActive =
+          typeof isTurnActive === "function" && isTurnActive();
+        // A server automation message (session wake) starts a turn of its
+        // own: leave it on disk while a turn runs, never steer it in.
+        if (payload.next_turn_only === true && turnActive) {
+          continue;
+        }
+        const deliverAs = turnActive ? "steer" : "followUp";
         try {
           pi.sendUserMessage(payload.content, { deliverAs });
         } catch (_err) {
@@ -1625,6 +1645,8 @@ function startInboxPoller(
         // already in flight still gets aborted via replay without poisoning the
         // next freshly-started turn.
         if (typeof handleInterrupt === "function") handleInterrupt();
+        // A person stopping Pi also ends automation waiting to start a turn.
+        dropNextTurnOnlyMessages();
       }
       if (payload.type === "compact") {
         // Point-in-time like an interrupt: one delivery attempt against the

@@ -176,6 +176,7 @@ from omnigent.server.server_config import (
     RESTRICT_TO_AGENT_NAMES_KEY,
     PickerCuration,
 )
+from omnigent.server.session_wake import SessionWakeService, build_session_wake
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1724,8 +1725,10 @@ def create_app(
         enabled set once at application construction.
     :param extension_is_enabled: The operator's persistent enablement of an
         extension id, which gates extension session state, commands and
-        published fields. ``None`` uses the server config's
-        ``extensions.<id>.enabled: true``, the switch that turns on UI slots.
+        published fields, and ``ext:`` session-wake sources. ``None`` makes
+        the first three follow the server config's
+        ``extensions.<id>.enabled: true``, the switch that turns on UI slots,
+        and enables no ``ext:`` wake source.
     :param extension_state: Optional pre-resolved installed-extension registry.
         When omitted, entry points are discovered once at application
         construction and the process-cached state is reused thereafter.
@@ -2228,12 +2231,15 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        session_wake: SessionWakeService = app_inst.state.session_wake
+        await session_wake.start()
         try:
             with monitor_event_loop():
                 yield
         finally:
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
+            await session_wake.aclose()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
                 with suppress(asyncio.CancelledError):
@@ -2310,6 +2316,14 @@ def create_app(
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
     app.state.runner_tunnel_tokens = runner_tunnel_tokens
+    build_session_wake(
+        app,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        host_registry=host_registry,
+        extension_is_enabled=extension_is_enabled,
+    )
 
     def _admit_host_launch(
         host_id: str,
@@ -3819,6 +3833,9 @@ def create_app(
             ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
+            ),
+            register_server_message=lambda handler: setattr(
+                app.state, "server_message_dispatch", handler
             ),
         ),
         prefix="/v1",

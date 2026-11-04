@@ -28,6 +28,7 @@ from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.native.next_turn import NEXT_TURN_BUSY_CODE, next_turn_delivery
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -2294,3 +2295,48 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", [None, "draft"])
+async def test_a_wake_applies_the_routed_model_only_into_an_empty_box(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blocker: str | None
+) -> None:
+    """A wake switches models like a typed turn, but only after the box read empty."""
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_inject_slash_command(_bridge: Path, *, command: str, **_kwargs: Any) -> None:
+        calls.append(("slash", command))
+
+    def fake_inject_user_message(_bridge: Path, *, content: str, **kwargs: Any) -> None:
+        calls.append(("message", content, kwargs.get("keep_draft")))
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(claude_native_executor, "next_turn_blocker", lambda _bridge: blocker)
+
+    with next_turn_delivery("next_turn_only"):
+        events = [
+            event
+            async for event in ClaudeNativeExecutor(tmp_path / "bridge").run_turn(
+                messages=[{"role": "user", "content": "PR #7 failed"}],
+                tools=[],
+                system_prompt="",
+                config=ExecutorConfig(model="databricks-claude-sonnet-5"),
+            )
+        ]
+
+    if blocker is None:
+        assert calls == [("slash", "/model sonnet"), ("message", "PR #7 failed", True)]
+        assert events == [TurnComplete(response=None)]
+    else:
+        assert calls == []
+        [error] = events
+        assert isinstance(error, ExecutorError) and error.code == NEXT_TURN_BUSY_CODE

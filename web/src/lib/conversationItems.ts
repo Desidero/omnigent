@@ -24,6 +24,32 @@ export interface BaseItem {
   created_at?: number;
 }
 
+/** Set by the server on a user message it sent for an automation (a session wake). */
+export interface MessageOrigin {
+  kind: "automation";
+  /** `core:<name>` or `ext:<extension id>`, e.g. `"ext:acme.goal-loop"`. */
+  source: string;
+  /** The user who turned the automation on. */
+  on_behalf_of?: string;
+  /** Short display name, e.g. `"Goal loop"`. */
+  label?: string;
+}
+
+/** Read a message origin from untrusted item data; `undefined` when absent or malformed. */
+export function messageOrigin(value: unknown): MessageOrigin | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (raw.kind !== "automation" || typeof raw.source !== "string" || !raw.source) {
+    return undefined;
+  }
+  return {
+    kind: "automation",
+    source: raw.source,
+    ...(typeof raw.on_behalf_of === "string" ? { on_behalf_of: raw.on_behalf_of } : {}),
+    ...(typeof raw.label === "string" ? { label: raw.label } : {}),
+  };
+}
+
 export interface MessageItem extends BaseItem {
   type: "message";
   role: "user" | "assistant";
@@ -34,6 +60,8 @@ export interface MessageItem extends BaseItem {
   created_by?: string;
   /** Human submission confirmed by the server, including anonymous input. */
   user_authored?: boolean;
+  /** Present when the server sent this message for an automation. */
+  origin?: MessageOrigin;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */

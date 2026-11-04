@@ -41,6 +41,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.native.input_diagnostics import input_delivery_scope
+from omnigent.native.next_turn import NEXT_TURN_BUSY_CODE, next_turn_delivery
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -4235,3 +4236,72 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("bridge_turn", "native_turn", "started"),
+    [
+        (None, None, True),
+        ("turn_live", "turn_live", False),
+        (None, "turn_typed_in_tui", False),
+        ("turn_stale", None, True),
+    ],
+    ids=["idle", "running", "unrecorded-running", "stale-record"],
+)
+def test_next_turn_only_input_starts_a_turn_and_never_steers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bridge_turn: str | None,
+    native_turn: str | None,
+    started: bool,
+) -> None:
+    """A session wake asks Codex core which turn runs, and waits rather than steering."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(_FakeCodexNativeClient, "native_active_turn_id", native_turn)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=bridge_turn)
+
+    with next_turn_delivery("next_turn_only"):
+        events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "wake")
+
+    steers = [
+        params for method, params in _FakeCodexNativeClient.requests if method == "turn/steer"
+    ]
+    assert all(params["input"] == [] for params in steers)
+    starts = [method for method, _ in _FakeCodexNativeClient.requests if method == "turn/start"]
+    if started:
+        assert [type(event) for event in events] == [TurnComplete]
+        assert starts == ["turn/start"]
+    else:
+        [error] = events
+        assert isinstance(error, ExecutorError)
+        assert error.code == NEXT_TURN_BUSY_CODE
+        assert error.undelivered is True
+        assert starts == []
+
+
+def test_next_turn_only_probe_without_answer_falls_back_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unanswered probe trusts the bridge record, and says so in the log."""
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+
+    async def no_answer(*_args: Any) -> None:
+        return None
+
+    monkeypatch.setattr(codex_native_executor, "_probe_active_turn", no_answer)
+    _seed_bridge(tmp_path, active_turn_id="turn_recorded")
+
+    with caplog.at_level("WARNING"), next_turn_delivery("next_turn_only"):
+        [error] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "wake")
+
+    assert isinstance(error, ExecutorError) and error.code == NEXT_TURN_BUSY_CODE
+    assert "probe got no usable answer" in caplog.text

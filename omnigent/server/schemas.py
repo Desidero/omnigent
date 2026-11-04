@@ -1162,6 +1162,9 @@ class CreateResponseRequest(BaseModel):
     input_enqueued_at_ms: int | None = None
     # Runner-validated authorization for one delivery, separate from user content/history.
     authorized_native_shell_command: str | None = None
+    # ``"next_turn_only"``: a server automation message that must not join a
+    # running turn (see ``omnigent.native.next_turn``).
+    delivery: Literal["next_turn_only"] | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
@@ -1369,6 +1372,11 @@ class ElicitationResult(BaseModel):
 # ── Sessions (/v1/sessions) ────────────────────────────────────
 
 
+# Message fields only the server sets: ``origin`` (who started a message no
+# person typed) and ``delivery`` (``"next_turn_only"``).
+SERVER_ONLY_MESSAGE_FIELDS = ("origin", "delivery")
+
+
 class SessionEventInput(BaseModel):
     """
     A single client-submitted event/input item for a session.
@@ -1415,6 +1423,31 @@ class SessionEventInput(BaseModel):
     @classmethod
     def reject_framework_blocks(cls, data: dict[str, Any]) -> dict[str, Any]:
         reject_authored_framework_notices(data)
+        return data
+
+    @field_validator("data")
+    @classmethod
+    def reject_server_only_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Refuse ``origin`` and ``delivery``: only :class:`ServerMessageInput` sets them."""
+        payloads = [data]
+        if isinstance(data.get("item_data"), dict):
+            payloads.append(data["item_data"])
+        for payload in payloads:
+            for name in SERVER_ONLY_MESSAGE_FIELDS:
+                if name in payload:
+                    raise ValueError(f"{name!r} is set only by the server")
+        return data
+
+
+class ServerMessageInput(SessionEventInput):
+    """A message the server itself sends, the only input that may carry ``origin``/``delivery``.
+
+    Never built from client or runner input (see ``omnigent.server.server_messages``).
+    """
+
+    @field_validator("data")
+    @classmethod
+    def reject_server_only_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
         return data
 
 

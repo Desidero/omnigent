@@ -2661,3 +2661,76 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         f"interrupt must forward to the harness then finalize the turn with one "
         f"marker; got {len(markers)}."
     )
+
+
+@pytest.mark.asyncio
+async def test_midturn_next_turn_only_message_waits_for_its_own_turn() -> None:
+    """A server automation message is never live-injected into an SDK turn."""
+    gate = asyncio.Event()
+    app, _pm, hc = _build_handshake_app(gate)
+    sid = "0d" * 16
+
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": "ab" * 16})
+        first = {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": [{"type": "input_text", "text": "first"}],
+            "harness": "openai-agents",
+        }
+        assert (await client.post(f"/v1/sessions/{sid}/events", json=first)).status_code == 202
+        await poll_until_async(lambda: bool(hc.posted_bodies), timeout_s=budget(5))
+
+        wake = {
+            **first,
+            "content": [{"type": "input_text", "text": "wake"}],
+            "delivery": "next_turn_only",
+        }
+        buffered = await client.post(f"/v1/sessions/{sid}/events", json=wake)
+        assert buffered.json()["status"] == "buffered"
+        gate.set()
+        await poll_until_async(lambda: len(hc.posted_bodies) == 2, timeout_s=budget(5))
+        await poll_until_async(lambda: not app.state.active_turns, timeout_s=budget(5))
+
+    assert hc.patched_events == []
+    assert _body_contains_text(hc.posted_bodies[1], "wake")
+    assert hc.posted_bodies[1]["delivery"] == "next_turn_only"
+
+
+@pytest.mark.asyncio
+async def test_interrupt_drops_a_wake_queued_behind_an_sdk_turn() -> None:
+    """Stop ends automation too: a queued wake must not run as the next turn."""
+    gate = asyncio.Event()
+    app, _pm, hc = _build_handshake_app(gate)
+    sid = "0e" * 16
+
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": "ab" * 16})
+        first = {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": [{"type": "input_text", "text": "first"}],
+            "harness": "openai-agents",
+        }
+        await client.post(f"/v1/sessions/{sid}/events", json=first)
+        await poll_until_async(lambda: bool(hc.posted_bodies), timeout_s=budget(5))
+        wake = {
+            **first,
+            "content": [{"type": "input_text", "text": "wake"}],
+            "delivery": "next_turn_only",
+        }
+        await client.post(f"/v1/sessions/{sid}/events", json=wake)
+        typed = {**first, "content": [{"type": "input_text", "text": "typed later"}]}
+        await client.post(f"/v1/sessions/{sid}/events", json=typed)
+
+        await client.post(f"/v1/sessions/{sid}/events", json={"type": "interrupt"})
+        gate.set()
+        await poll_until_async(lambda: not app.state.active_turns, timeout_s=budget(5))
+
+        assert not any(
+            _body_contains_text(body, "wake")
+            for body in app.state.session_message_buffers.get(sid, [])
+        )
+    assert not any(_body_contains_text(body, "wake") for body in hc.posted_bodies[1:])

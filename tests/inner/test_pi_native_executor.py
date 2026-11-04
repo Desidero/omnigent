@@ -13,6 +13,7 @@ the same shape the peer native ``test_goose_native_executor.py`` uses.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import pytest
 
 from omnigent.inner import pi_native_executor as pne
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.native.next_turn import next_turn_delivery
 
 
 def test_supports_flags(tmp_path: Path) -> None:
@@ -60,7 +62,8 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
     # the bridge sink is the only boundary that needs mocking.
     enqueued: list[tuple[Path, str]] = []
 
-    def _fake_enqueue(bridge_dir: Path, content: str) -> str:
+    def _fake_enqueue(bridge_dir: Path, content: str, *, next_turn_only: bool) -> str:
+        assert next_turn_only is False
         enqueued.append((bridge_dir, content))
         return "msg_test"
 
@@ -84,7 +87,7 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
 async def test_run_turn_errors_with_no_user_text(tmp_path: Path, monkeypatch) -> None:
     enqueued: list[str] = []
     monkeypatch.setattr(
-        pne, "enqueue_user_message", lambda bridge_dir, content: enqueued.append(content)
+        pne, "enqueue_user_message", lambda bridge_dir, content, **_: enqueued.append(content)
     )
     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
     events = [e async for e in ex.run_turn([{"role": "assistant", "content": "x"}], [], "")]
@@ -126,7 +129,7 @@ async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
         return "tok"
 
     monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
-    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a, **_: "msg")
     refreshed: list[dict[str, str]] = []
     monkeypatch.setattr(
         pne,
@@ -162,7 +165,9 @@ async def test_slow_mint_keeps_overlapping_messages_in_arrival_order(
     monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
     monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: True)
     queued: list[str] = []
-    monkeypatch.setattr(pne, "enqueue_user_message", lambda bridge_dir, text: queued.append(text))
+    monkeypatch.setattr(
+        pne, "enqueue_user_message", lambda bridge_dir, text, **_: queued.append(text)
+    )
     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
 
     async def _run_turn() -> None:
@@ -187,7 +192,7 @@ async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
         raise RuntimeError("sdk down")
 
     monkeypatch.setattr(entry, "_make_auth_token_factory", _boom)
-    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a, **_: "msg")
     called: list[object] = []
     monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: called.append(a))
     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
@@ -231,3 +236,17 @@ async def test_run_turn_without_model_queues_only_message(tmp_path: Path) -> Non
 
     queued = [json.loads(p.read_text()) for p in (tmp_path / "inbox").glob("*.json")]
     assert [q["type"] for q in queued] == ["user_message"]
+
+
+async def test_run_turn_marks_a_next_turn_only_message(tmp_path: Path) -> None:
+    """A session wake reaches the extension marked, so it never steers a running turn."""
+    (tmp_path / "inbox").mkdir()
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+
+    with next_turn_delivery("next_turn_only"):
+        events = [e async for e in ex.run_turn([{"role": "user", "content": "wake"}], [], "")]
+
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
+    [path] = (tmp_path / "inbox").glob("*.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert (payload["content"], payload["next_turn_only"]) == ("wake", True)
