@@ -184,6 +184,43 @@ describe("settingsNavGroups", () => {
   });
 });
 
+// The General group's order before it moved onto the core slot registry.
+function legacyGeneralIds(
+  hasAuthSession: boolean,
+  integrationsEnabled: boolean,
+  customAgentsEnabled: boolean,
+  mcpEnabled: boolean,
+): string[] {
+  const general = ["general", "appearance", "git", "shortcuts", "import"];
+  if (!customAgentsEnabled) general.splice(2, 0, "harnesses");
+  if (integrationsEnabled) general.splice(2, 0, "integrations");
+  if (mcpEnabled) general.splice(2, 0, "mcp");
+  if (hasAuthSession) general.unshift("account");
+  return general;
+}
+
+describe("settingsNavGroups core registry parity", () => {
+  const flags = [false, true];
+  it.each(
+    flags.flatMap((auth) =>
+      flags.flatMap((integrations) =>
+        flags.flatMap((customAgents) =>
+          flags.map((mcp) => [auth, integrations, customAgents, mcp]),
+        ),
+      ),
+    ),
+  )(
+    "renders the General group unchanged (auth=%s integrations=%s customAgents=%s mcp=%s)",
+    (auth, integrations, customAgents, mcp) => {
+      const groups = settingsNavGroups(auth, false, false, false, integrations, customAgents, mcp);
+      const general = groups.find((group) => group.title === "General");
+      expect(general?.items.map((item) => item.id)).toEqual(
+        legacyGeneralIds(auth, integrations, customAgents, mcp),
+      );
+    },
+  );
+});
+
 const SETTINGS_EXTENSION: ExtensionCatalogItem = {
   object: "extension",
   id: "acme.settings",

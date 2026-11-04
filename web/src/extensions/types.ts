@@ -57,10 +57,12 @@ export type ExtensionSlotId =
   | "session.row.menu"
   | "session.row.hover";
 
+export type ExtensionSlotKind = "action" | "tab" | "section" | "decoration" | "command" | "row";
+
 export interface ExtensionSlotItem {
   id: string;
   slot: ExtensionSlotId;
-  kind: "action" | "tab" | "section" | "decoration" | "command" | "row";
+  kind: ExtensionSlotKind;
   label: string;
   /** Set on page-backed kinds; session-row kinds bind a field or name a command instead. */
   page: string | null;
