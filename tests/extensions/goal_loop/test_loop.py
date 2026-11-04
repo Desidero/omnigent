@@ -98,7 +98,9 @@ async def test_all_prs_wakes_once_for_the_red_pr_then_meets_the_goal() -> None:
     harness.reader.infos[url(9)] = pr_info(9)
     await harness.check()
     assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ("met", "green")
-    assert harness.goal(7)["note"].startswith("#7 is green")
+    assert harness.goal(7)["note"] == (
+        "#7 is green: all checks passed on bbbbbbb and no changes are requested"
+    )
     assert harness.published() == ("met", "0", "PR goals met")
     view = json.loads(harness.field("goals") or "{}")
     assert [(item["label"], item["status"]) for item in view["items"]] == [

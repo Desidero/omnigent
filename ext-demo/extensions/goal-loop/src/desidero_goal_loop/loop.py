@@ -780,7 +780,7 @@ class GoalLoop:
         goal.status = MET if reason in _MET_REASONS else STOPPED
         goal.reason = reason
         goal.pending = None
-        goal.note = self._type.stop_text(goal.target, reason, wakes=goal.wakes)
+        goal.note = self._type.stop_text(goal.target, reason, wakes=goal.wakes, state=goal.state)
         if not goal.quiet:
             _logger.info("goal loop: %s goal for %s ended: %s", goal.type, goal.target.url, reason)
 

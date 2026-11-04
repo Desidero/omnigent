@@ -518,8 +518,12 @@ class PrGreen:
         ]
         return wake_message(list(zip(prs, events, strict=True)))
 
-    def stop_text(self, target: Target, reason: str, *, wakes: int) -> str:
-        pr = {"number": target.label.lstrip("#") or None}
+    def stop_text(self, target: Target, reason: str, *, wakes: int, state: Any = None) -> str:
+        """The page's note for an ended goal; *state* names the head a green PR passed on."""
+        pr = {
+            "number": target.label.lstrip("#") or None,
+            "head_sha": WatchState.from_json(state).head,
+        }
         return stop_note(pr, reason, wakes=wakes)
 
     def forget(self, session_id: str) -> None:
