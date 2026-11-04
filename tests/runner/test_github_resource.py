@@ -1156,6 +1156,40 @@ def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPa
     assert info["pr"]["comments"] == []
 
 
+def test_shape_comments_report_each_authors_association() -> None:
+    shaped = github_resource._shape_comments(
+        [
+            {
+                "author": {"login": "outsider"},
+                "body": "drive-by",
+                "createdAt": "2026-11-01T09:00:00Z",
+                "authorAssociation": "NONE",
+            },
+            {
+                "author": {"login": "legacy"},
+                "body": "old host",
+                "createdAt": "2026-11-01T09:30:00Z",
+            },
+        ],
+        [
+            {
+                "author": {"login": "owner"},
+                "body": "please fix",
+                "submittedAt": "2026-11-01T10:00:00Z",
+                "authorAssociation": "OWNER",
+            }
+        ],
+        pr_url="https://github.com/o/r/pull/8",
+    )
+
+    assert [(c["author"], c.get("author_association")) for c in shaped] == [
+        ("outsider", "NONE"),
+        ("legacy", None),
+        ("owner", "OWNER"),
+    ]
+    assert "author_association" not in shaped[1]
+
+
 def test_shape_comments_filters_minimized_and_caps() -> None:
     """Minimized comments drop out and the merged list caps at ``_MAX_COMMENTS``."""
     raw: list[dict[str, object]] = [
@@ -1531,6 +1565,8 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
     assert "--cache" not in calls[1][0]
     assert "includeComments=true" in calls[1][0]
     assert "number=17" in calls[1][0]
+    # The refreshed page keeps each comment's author association.
+    assert any("authorAssociation" in arg for arg in calls[1][0])
     assert calls[1][1]["token"] == "selected-token"
     assert github_resource._comments_payload(data)["comments_partial"] is True
     shaped = github_resource._shape_comments(old + latest)

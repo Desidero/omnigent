@@ -68,6 +68,14 @@ Additive fields:
   when auto-merge is off, else ``{merge_method, enabled_by, enabled_at}`` with
   ``merge_method`` ``"MERGE"``, ``"SQUASH"``, or ``"REBASE"``. Both are omitted
   when the provider or its CLI cannot report them.
+- ``pr`` may carry ``mergeable``: true when the PR merges cleanly, false when it
+  conflicts, null while the provider is still computing it. Omitted when the
+  provider or its CLI cannot report it.
+- A comment may carry ``author_association``, the author's relation to the
+  repository as the provider names it (GitHub: ``"OWNER"``, ``"MEMBER"``,
+  ``"COLLABORATOR"``, ``"CONTRIBUTOR"``, ``"NONE"``, ...). Omitted when unknown.
+- A reviewer who submitted a review may carry ``submitted_at`` (ISO-8601) and
+  ``author_association``. Pending requests carry neither.
 - A changed file's ``lines_added`` and ``lines_removed`` may be null.
 - Report lookup failures in ``warnings``. Mark incomplete checks/comments with
   ``checks.partial`` / ``comments_partial``; changed files use ``has_more`` or ``warning``.

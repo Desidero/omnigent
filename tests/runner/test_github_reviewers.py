@@ -58,6 +58,42 @@ def test_shape_reviewers_deduplicates_case_insensitively_and_rerequest_is_pendin
     assert rows == [{"login": "ALICE", "kind": "user", "state": "PENDING"}]
 
 
+def test_shape_reviewers_reports_when_and_as_whom_each_reviewer_submitted() -> None:
+    rows = github_resource._shape_reviewers(
+        {
+            "latestReviews": [
+                {
+                    "author": {"login": "maintainer"},
+                    "state": "CHANGES_REQUESTED",
+                    "submittedAt": "2026-11-01T10:00:00Z",
+                    "authorAssociation": "MEMBER",
+                },
+                {**_review("drive-by", "COMMENTED"), "submittedAt": "", "authorAssociation": 7},
+                {
+                    **_review("rerequested", "APPROVED"),
+                    "submittedAt": "2026-10-30T09:00:00Z",
+                    "authorAssociation": "COLLABORATOR",
+                },
+            ],
+            "reviewRequests": [{"__typename": "User", "login": "rerequested"}],
+        }
+    )
+
+    assert rows == [
+        {
+            "login": "maintainer",
+            "kind": "user",
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-11-01T10:00:00Z",
+            "author_association": "MEMBER",
+        },
+        # Empty or malformed values stay out rather than reaching the payload.
+        {"login": "drive-by", "kind": "user", "state": "COMMENTED"},
+        # A pending re-request describes the request, not the earlier review.
+        {"login": "rerequested", "kind": "user", "state": "PENDING"},
+    ]
+
+
 def test_shape_reviewers_skips_malformed_deleted_and_unsubmitted_reviews() -> None:
     rows = github_resource._shape_reviewers(
         {
@@ -128,6 +164,7 @@ def _pr_data() -> dict[str, object]:
         ],
         "mergeStateStatus": "CLEAN",
         "autoMergeRequest": None,
+        "mergeable": "MERGEABLE",
     }
 
 
