@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from omnigent.entities import (
@@ -59,7 +60,78 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
 )
 
 
-def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+# Region anchors, in render order. Many sections may share one region; a
+# section's own ``id`` is what must be unique.
+RUNTIME_NOTICES_REGION = "core.instructions.runtime_notices"
+TOOL_GUIDANCE_REGION = "core.instructions.tool_guidance"
+FRAMEWORK_INSTRUCTION_REGIONS = (RUNTIME_NOTICES_REGION, TOOL_GUIDANCE_REGION)
+
+
+@dataclass(frozen=True)
+class FrameworkInstructionSection:
+    """
+    One named piece of spec-level framework instruction text.
+
+    :param id: Unique name of this section, e.g. ``"core.subagent_wake_notice"``.
+    :param region: Region anchor the section renders in; one of
+        :data:`FRAMEWORK_INSTRUCTION_REGIONS`.
+    :param text: Instruction text.
+    :param order: Position within the region; ties fall back to ``id``.
+    """
+
+    id: str
+    region: str
+    text: str
+    order: int = 0
+
+
+@dataclass(frozen=True)
+class FrameworkInstructions:
+    """
+    Framework-owned instructions as validated, ordered named sections.
+
+    Sections are kept sorted by region, then ``(order, id)`` within a region.
+
+    :param sections: The sections, in any order.
+    :raises ValueError: On an empty or duplicate section id, or an unknown
+        region.
+    """
+
+    sections: tuple[FrameworkInstructionSection, ...] = ()
+
+    def __post_init__(self) -> None:
+        seen_ids: set[str] = set()
+        for section in self.sections:
+            if not section.id.strip():
+                raise ValueError("framework instruction section id must not be empty")
+            if section.id in seen_ids:
+                raise ValueError(f"duplicate framework instruction section id: {section.id!r}")
+            if section.region not in FRAMEWORK_INSTRUCTION_REGIONS:
+                raise ValueError(
+                    f"unknown framework instruction region {section.region!r} "
+                    f"for section {section.id!r}"
+                )
+            seen_ids.add(section.id)
+        ordered = sorted(
+            self.sections,
+            key=lambda section: (
+                FRAMEWORK_INSTRUCTION_REGIONS.index(section.region),
+                section.order,
+                section.id,
+            ),
+        )
+        object.__setattr__(self, "sections", tuple(ordered))
+
+    def texts(self) -> list[str]:
+        """
+        Return the section texts in render order.
+
+        :returns: One text per section, unmodified.
+        """
+        return [section.text for section in self.sections]
+
+
+def _framework_instructions_for(spec: AgentSpec) -> FrameworkInstructions:
     """
     Framework instructions that apply to every turn of ``spec``.
 
@@ -78,13 +150,25 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     :returns: The applicable spec-level framework instructions; empty for
         an agent with no sub-agents and the browser group disabled.
     """
-    instructions: list[str] = []
+    sections: list[FrameworkInstructionSection] = []
     dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
     if spec.tools.agents or spec.spawn or dispatches_web_researcher:
-        instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
+        sections.append(
+            FrameworkInstructionSection(
+                id="core.subagent_wake_notice",
+                region=RUNTIME_NOTICES_REGION,
+                text=SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+            )
+        )
     if spec.tool_groups.browser:
-        instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
-    return instructions
+        sections.append(
+            FrameworkInstructionSection(
+                id="core.embedded_browser_priority",
+                region=TOOL_GUIDANCE_REGION,
+                text=EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+            )
+        )
+    return FrameworkInstructions(tuple(sections))
 
 
 def append_framework_instructions(
@@ -95,9 +179,9 @@ def append_framework_instructions(
 
     Keeps framework policy out of harness adapters while preserving a single
     ordering rule: user-authored agent/request instructions first, framework
-    metadata instructions last. If framework instructions grow beyond a small
-    ordered string list, introduce a structured ``FrameworkInstructions`` value
-    here rather than adding lifecycle policy to ``AgentSpec`` or harness adapters.
+    metadata instructions last. Spec-level framework text is a named
+    :class:`FrameworkInstructionSection` from :func:`_framework_instructions_for`,
+    not lifecycle policy in ``AgentSpec`` or a harness adapter.
 
     :param instructions: Existing composed system prompt, or ``None``.
     :param framework_instructions: Additive framework instructions.
@@ -172,7 +256,7 @@ def build_instructions(
     return (
         append_framework_instructions(
             base_instructions,
-            [*_framework_instructions_for(spec), *framework_instructions],
+            [*_framework_instructions_for(spec).texts(), *framework_instructions],
         )
         or base_instructions
     )
@@ -206,7 +290,7 @@ def build_instructions_nullable(
     base_instructions = "\n\n".join(parts) if parts else None
     return append_framework_instructions(
         base_instructions,
-        [*_framework_instructions_for(spec), *framework_instructions],
+        [*_framework_instructions_for(spec).texts(), *framework_instructions],
     )
 
 

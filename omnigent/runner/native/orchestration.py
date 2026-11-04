@@ -7741,10 +7741,10 @@ def _native_startup_raw_instructions_from_spec(
     ``developer_instructions``. Returns the verbatim ``AgentSpec.instructions``
     text only — never the fully framework-composed per-turn string. Terminal
     launch is not tied to any one turn, while the composed string is
-    assembled per conversation for the turn about to run (late-bound
-    framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
-    selected per conversation), so a startup channel carrying one turn's
-    composition would address every later turn with it.
+    assembled per conversation for the turn about to run (its per-request
+    text and any per-turn framework text belong to that turn only), so a
+    startup channel carrying one turn's composition would address every
+    later turn with it.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.

@@ -157,5 +157,7 @@ instructions:
 - Keep the canonical instruction text and lifecycle gate in the owning framework
   module. Harness adapters should only transport the composed instructions; do
   not duplicate policy across adapters or add lifecycle metadata to `AgentSpec`.
-- If framework instructions grow beyond a small ordered list, introduce a
-  structured `FrameworkInstructions` value at the prompt-composition boundary.
+- Spec-level framework instructions are named sections of a
+  `FrameworkInstructions` value at that prompt-composition boundary. Add new
+  text as a `FrameworkInstructionSection` with a unique `id` in one of the
+  shared regions (`core.instructions.*`), not as another unnamed string.

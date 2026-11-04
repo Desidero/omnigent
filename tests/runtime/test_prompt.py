@@ -13,8 +13,13 @@ from omnigent.runner.subagent_work import (
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    RUNTIME_NOTICES_REGION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
+    TOOL_GUIDANCE_REGION,
+    FrameworkInstructions,
+    FrameworkInstructionSection,
+    _framework_instructions_for,
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
@@ -356,6 +361,103 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
     )
     assert fused.startswith("You are a helpful assistant.")
     assert _SAMPLE_FRAMEWORK_INSTRUCTION in fused
+
+
+def test_several_turn_instructions_keep_caller_order() -> None:
+    """Per-turn strings render in the order given, past ten of them too, with
+    blank and whitespace-only entries dropped and the rest stripped."""
+    turn_notes = [f"Turn note {index}" for index in range(12)]
+    turn_notes[3] = "   "
+    turn_notes[7] = ""
+    turn_notes[11] = "  Turn note 11\n"
+    expected_notes = [note.strip() for note in turn_notes if note.strip()]
+
+    result = build_instructions(
+        _spec("Agent prompt", spawn=True), None, [], framework_instructions=turn_notes
+    )
+
+    assert result == "\n\n".join(
+        [
+            "Agent prompt",
+            SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+            EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+            *expected_notes,
+        ]
+    )
+    assert append_framework_instructions("Base", turn_notes) == "\n\n".join(
+        ["Base", *expected_notes]
+    )
+
+
+def test_no_framework_text_composes_to_none() -> None:
+    """With no applicable spec section and only blank per-turn strings, an
+    otherwise empty prompt stays ``None`` rather than gaining separators."""
+    spec = _spec(None, browser=False)
+
+    assert _framework_instructions_for(spec).sections == ()
+    assert build_instructions_nullable(spec, "  ", [], framework_instructions=("", "   ")) is None
+
+
+def test_framework_sections_order_by_region_then_order_then_id() -> None:
+    """Regions are shared anchors: several sections may sit in one region,
+    ordered by ``(order, id)`` there, and regions keep their fixed order
+    whatever order the sections arrive in."""
+    sections = (
+        FrameworkInstructionSection(id="test.b", region=TOOL_GUIDANCE_REGION, text="b", order=1),
+        FrameworkInstructionSection(id="test.c", region=TOOL_GUIDANCE_REGION, text="c", order=1),
+        FrameworkInstructionSection(id="test.a", region=TOOL_GUIDANCE_REGION, text="a", order=2),
+        FrameworkInstructionSection(id="test.z", region=TOOL_GUIDANCE_REGION, text="z"),
+        FrameworkInstructionSection(
+            id="test.notice", region=RUNTIME_NOTICES_REGION, text="notice"
+        ),
+    )
+
+    assert FrameworkInstructions(sections).texts() == ["notice", "z", "b", "c", "a"]
+
+
+@pytest.mark.parametrize(
+    ("sections", "message"),
+    [
+        (
+            (
+                FrameworkInstructionSection(id="test.same", region=TOOL_GUIDANCE_REGION, text="a"),
+                FrameworkInstructionSection(
+                    id="test.same", region=RUNTIME_NOTICES_REGION, text="b"
+                ),
+            ),
+            "duplicate framework instruction section id",
+        ),
+        (
+            (
+                FrameworkInstructionSection(
+                    id="test.x", region="core.instructions.nowhere", text="a"
+                ),
+            ),
+            "unknown framework instruction region",
+        ),
+        (
+            (FrameworkInstructionSection(id="  ", region=TOOL_GUIDANCE_REGION, text="a"),),
+            "section id must not be empty",
+        ),
+    ],
+    ids=["duplicate-id", "unknown-region", "empty-id"],
+)
+def test_framework_instructions_reject_invalid_sections(
+    sections: tuple[FrameworkInstructionSection, ...], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        FrameworkInstructions(sections)
+
+
+def test_core_framework_instructions_occupy_distinct_regions() -> None:
+    """The wake notice and the browser guidance each sit in their own region,
+    in that render order, so later sections can join either one."""
+    composed = _framework_instructions_for(_spec(None, spawn=True))
+
+    assert [(section.region, section.text) for section in composed.sections] == [
+        (RUNTIME_NOTICES_REGION, SUBAGENT_WAKE_NOTICE_INSTRUCTION),
+        (TOOL_GUIDANCE_REGION, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION),
+    ]
 
 
 @pytest.mark.parametrize(
