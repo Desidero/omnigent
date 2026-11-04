@@ -46,6 +46,7 @@ def get_manifest() -> ExtensionManifest:
                 StateField("all", StateVisibility.EDITORS),
                 StateField("pr:*", StateVisibility.EDITORS, max_keys=16),
                 StateField("stop", StateVisibility.EDITORS),
+                StateField("resume", StateVisibility.EDITORS),
                 StateField("refresh", StateVisibility.EDITORS),
                 StateField("goals", StateVisibility.READERS),
                 StateField(
@@ -57,6 +58,7 @@ def get_manifest() -> ExtensionManifest:
                         FieldValue("unmet", "Needs work", "octagon-alert", FieldTone.DANGER),
                         FieldValue("met", "Met", "circle-check", FieldTone.SUCCESS),
                         FieldValue("stopped", "Stopped", "square-parking", FieldTone.NEUTRAL),
+                        FieldValue("paused", "Paused", "circle-ellipsis", FieldTone.WARNING),
                     ),
                 ),
                 StateField("count", StateVisibility.PUBLISHED, max_length=4),
@@ -81,6 +83,12 @@ def get_manifest() -> ExtensionManifest:
                 title="Stop all goals",
                 action=SetState(key="stop", value="requested"),
                 confirm="Stop every goal in this session?",
+            ),
+            CommandContribution(
+                id=f"{EXTENSION_ID}.resume",
+                title="Resume this PR's goal",
+                action=SetState(key="resume", value="{pr}"),
+                arguments=(CommandArgument("pr", pattern=PR_ID_PATTERN, max_length=120),),
             ),
             CommandContribution(
                 id=f"{EXTENSION_ID}.refresh",

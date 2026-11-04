@@ -20,8 +20,8 @@ status observers and the UI slots.
 | Where | What |
 | --- | --- |
 | Composer action **Goals** | Opens the Goals page. While goals run its label is the published `summary`, e.g. "Watching 2 PRs". |
-| Goals page | **All PRs in this session** (every PR the session links now and later), one box per linked PR, each PR's goal state and wakes used, and **Stop all goals**. |
-| Session row badge | The published `goal`: Watching (`eye`), Needs work (`octagon-alert`), Met (`circle-check`), Stopped (`square-parking`). |
+| Goals page | **All PRs in this session** (every PR the session links now and later), one box per linked PR, each PR's goal state and wakes used, **Resume** on a paused goal, and **Stop all goals**. |
+| Session row badge | The published `goal`: Watching (`eye`), Needs work (`octagon-alert`), Met (`circle-check`), Stopped (`square-parking`), Paused (`circle-ellipsis`). |
 | Session row tooltip | The `summary`. |
 | Session row menu | **Stop all goals** (asks first). |
 
@@ -91,29 +91,58 @@ about 5 seconds later.
   dropped wake is asked for again at the next check.
 - **Stops.** A goal ends when it is met (`green`, or `merged`), when its PR is
   closed or its checks are unreadable, when it is turned off or "Stop all"
-  runs, when its 10 wakes are spent, or when the wake service drops the wake as
-  `undeliverable` or `session_gone`; `not_authorized` ends only the goals of
-  the person who lost access. A person (or an orchestrating agent) stopping the
-  session, or the wake service's own per-session budget, only **pauses**: the
-  same events are not sent again, new ones are, and one person's paused
-  goals don't hold back anyone else's. Turning a goal on again,
-  including after "Stop all", restarts it. "Stop all" on a session whose host
-  is connected to another replica clears the toggles at once and leaves the
-  goals to that replica's next check, which also drops toggles set in the
-  same second as the stop.
+  runs, when its 10 wakes are spent, or when the wake service drops the wake
+  as `undeliverable` or `session_gone`; `not_authorized` ends only the goals
+  of the person who lost access. Turning a goal on again, including after
+  "Stop all", restarts it. "Stop all" on a session whose host is connected to
+  another replica clears the toggles at once and leaves the goals to that
+  replica's next check, which also drops toggles set in the same second as the
+  stop.
+- **Pauses.** A person stopping the session (the web's Stop, or an interrupt
+  through the API) while the loop's wake is waiting, or stopping the turn that
+  wake started, **pauses** every active goal in the session, whoever turned it
+  on. A paused goal shows on the page as, for example, "Paused by Stop · 1/10
+  wakes · Resume to continue" (people who can only read the session are told
+  someone who can edit it can resume it), the badge and summary say paused,
+  and it is not read or woken for, even when its PR changes. **Resume** on the
+  Goals page carries it on where it stopped: the wakes it used still count
+  toward its budget, and its wakes now go out on behalf of the person who
+  resumed it. Events reported by earlier wakes stay reported. When the Stop
+  ended the turn of a delivered wake, that wake's events are owed: after
+  Resume the next check reads the PR as usual, and if that doesn't end the
+  goal (met, merged, closed), reads it again against what was reported before
+  that wake; events found that way are reported again, as a new wake with its
+  own dedupe key, after the usual gap between wakes. If that read fails, the
+  goal asks for no wake (not even for new events) until a later check reads
+  it, so nothing owed is left out; they are owed again if the new wake is
+  stopped or dropped in turn. A Stop that only dropped a waiting wake owes
+  nothing: that wake's events were never reported, so they come back by
+  themselves. So the next check may wake the agent for a PR that is still red.
+  Turning a toggle on again (clear and tick a box, or **All PRs** off and on)
+  restarts the goals that toggle asks for from scratch, with a fresh budget,
+  as for an ended goal: **All PRs** restarts the paused goals of PRs without
+  their own box setting. A toggle set before the Stop doesn't undo it. A
+  paused goal whose PR is merged is met ("merged"), and one whose PR is closed
+  ends ("closed"), without being read. Resume on a goal that isn't paused
+  (met, stopped, or ended by its budget) changes nothing. An orchestrating
+  agent stopping the session, or the wake service's own per-session budget,
+  only holds back the same events; new ones are sent. A Stop typed in the
+  agent's own terminal isn't seen by the server, so it pauses nothing.
 - **State** (extension session state, so it survives restarts and moves):
 
   | Key | Visibility | Holds |
   | --- | --- | --- |
   | `all`, `pr:<owner>/<repo>/<n>` | editors | `on`/`off` toggles, written by commands |
-  | `stop`, `refresh` | editors | control keys the commands write; `stop` is cleared once applied, `refresh` is answered (a fresh view and a check) and left set |
-  | `enablers` | service | who last set each toggle, and their account generation |
-  | `g:<digest of the PR URL>` | service | one envelope per goal: status, reason, enabler, reported-event state, wakes |
-  | `loop` | service | the requested wake's dedupe key, delivery mark and enabler, a paused key, and a "Stop all" count |
+  | `stop`, `resume`, `refresh` | editors | control keys the commands write; `stop` and `resume` (the paused goal's PR) are cleared once applied, `refresh` is answered (a fresh view and a check) and left set |
+  | `enablers` | service | who last set each toggle or resumed a goal, and their account generation |
+  | `g:<digest of the PR URL>` | service | one envelope per goal: status (including `paused`), reason, enabler, reported-event state, wakes, the reported state from before its last wake (`before_wake`, for a Stop of that wake's turn), whether that wake's events are owed (`unhandled`, then `reoffer` once resumed) and how often they were offered again (`reoffers`) |
+  | `loop` | service | the requested wake's dedupe key, delivery mark and enabler, the last enabler woken, the events held back per enabler, and a "Stop all" count |
   | `goals` | readers | the page's view |
   | `goal`, `count`, `summary` | published | the badge, the active goal count and the label |
 
   A session keeps at most 25 goals; the oldest ended ones make room for new PRs.
+  Paused goals are kept, so a session full of them enrols no new PR until one
+  is resumed, turned off or ends.
 
 ## Known gaps
 
@@ -123,6 +152,26 @@ about 5 seconds later.
   written to the transcript. They show only as the published `goal` badge and
   summary and as each PR's note on the Goals page. Adding a no-turn note is a
   core change.
+- **One Resume at a time.** `resume` holds one PR; two Resumes sent within the
+  same moment may apply only the later one, and the other goal stays paused
+  until Resume is pressed again. A Resume is applied on behalf of the person
+  who sent it only when that person also wrote the `resume` value being
+  applied; otherwise (crossed Resumes, or a Resume whose command callback was
+  lost and that a later check applies) the goal resumes for the person it was
+  already running for.
+- **A Stop with a newer wake waiting.** If the loop's next wake is already
+  waiting when a person stops a delivered wake's turn, the session wake
+  service drops the waiting wake and reports one stop. The loop takes it for a
+  Stop that only dropped a waiting wake, so the stopped turn's events are not
+  owed; the dropped wake's own events still come back after Resume.
+- **A Stop on another replica.** The wake service's record of a delivered
+  wake lives on the replica that serves the session's host. A Stop handled
+  on another replica can't see it, so a wake delivered just before that Stop
+  isn't counted toward the goal's budget, and its events may be reported
+  again after Resume.
+- **Teardown counts as a Stop.** A host stop or a CLI teardown during a wake's
+  turn sends `stop_session` without an agent's marker, so the server takes it
+  for a person's Stop and the session's goals pause. Resume continues them.
 - **Older GitHub readers.** Trusted-author filtering uses `author_association`
   on comments and reviewers, repeat reviews use each reviewer's `submitted_at`,
   and conflicts use `mergeable`. From a reader without them, no comment or

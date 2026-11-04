@@ -95,9 +95,12 @@ class _Server:
     client: httpx.AsyncClient
     infos: dict[str, dict[str, Any]]
     forwarded: list[dict[str, Any]]
+    # PR URLs the extension read, and the goal loops it started.
+    reads: list[str]
+    loops: list[Any]
 
 
-def _install(monkeypatch: pytest.MonkeyPatch, infos: dict[str, dict[str, Any]]) -> None:
+def _install(monkeypatch: pytest.MonkeyPatch, loops: list[Any]) -> None:
     """Load the extension from its source tree and stub what a host would provide."""
     monkeypatch.syspath_prepend(str(_SOURCE))
     # Installed from a wheel, its modules would be the distribution's files.
@@ -110,9 +113,13 @@ def _install(monkeypatch: pytest.MonkeyPatch, infos: dict[str, dict[str, Any]]) 
     # Check right after an idle edge instead of a few seconds later.
     import desidero_goal_loop.server as server_module
 
-    monkeypatch.setattr(
-        server_module, "GoalLoop", functools.partial(server_module.GoalLoop, hint_delay_s=0)
-    )
+    start_loop = functools.partial(server_module.GoalLoop, hint_delay_s=0)
+
+    def goal_loop(*args: Any, **kwargs: Any) -> Any:
+        loops.append(start_loop(*args, **kwargs))
+        return loops[-1]
+
+    monkeypatch.setattr(server_module, "GoalLoop", goal_loop)
 
 
 def _stub_runner(monkeypatch: pytest.MonkeyPatch, forwarded: list[dict[str, Any]]) -> Any:
@@ -135,7 +142,9 @@ async def _serve(
 ) -> AsyncIterator[_Server]:
     infos: dict[str, dict[str, Any]] = {}
     forwarded: list[dict[str, Any]] = []
-    _install(monkeypatch, infos)
+    reads: list[str] = []
+    loops: list[Any] = []
+    _install(monkeypatch, loops)
     from desidero_goal_loop.plugin import get_manifest
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -154,6 +163,7 @@ async def _serve(
     runner = _stub_runner(monkeypatch, forwarded)
 
     async def pull_request_info(_session_id: str, pr_url: str) -> dict[str, Any] | None:
+        reads.append(pr_url)
         info = infos.get(pr_url)
         return copy.deepcopy(info) if info is not None else None
 
@@ -168,7 +178,7 @@ async def _serve(
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
             ) as client:
-                yield _Server(app, store, client, infos, forwarded)
+                yield _Server(app, store, client, infos, forwarded, reads, loops)
     finally:
         await runner.aclose()
 
@@ -265,6 +275,93 @@ async def test_all_prs_wakes_once_for_the_red_pr_and_meets_the_goal(
                 ("#7", "met"),
                 ("#9", "met"),
             ]
+        finally:
+            _session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.parametrize("delivered", [False, True], ids=["wake-waiting", "wake-turn"])
+async def test_a_persons_stop_pauses_the_goal_on_its_page(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivered: bool
+) -> None:
+    async with _serve(db_uri, tmp_path, monkeypatch) as server:
+        agent = await create_test_agent(server.client)
+        session_id = server.store.create_conversation(
+            agent_id=agent["id"], host_id=_HOST, workspace="/w"
+        ).id
+        open_store(server.store).apply_report(
+            session_id,
+            [PullRequestReport(_url(7), "github", "github.com", "org/repo", 7, "created", 1, 1)],
+            complete=True,
+        )
+        server.infos[_url(7)] = _info(7, failing=("lint",))
+
+        async def fields() -> dict[str, str]:
+            response = await server.client.get(f"/v1/sessions/{session_id}")
+            return response.json().get("published_fields", {}).get(_EXT, {})
+
+        def messages() -> list[dict[str, Any]]:
+            return [body for body in server.forwarded if body.get("type") == "message"]
+
+        def idle_edge() -> None:
+            _session_status_cache[session_id] = "idle"
+            session_status_observers.observe(
+                SessionStatusObservation(session_id, "running", "idle", True)
+            )
+
+        _session_status_cache[session_id] = "running"
+        try:
+            response = await server.client.post(
+                f"/v1/sessions/{session_id}/extensions/{_EXT}/commands/{_EXT}.all",
+                json={"arguments": {"mode": "on"}},
+            )
+            assert response.status_code == 200, response.text
+            await _until(lambda: _equals(fields(), "goal", "unmet"))
+            if delivered:
+                # The wake's turn starts; the person stops it.
+                idle_edge()
+                await _until(_async(lambda: messages()))
+                _session_status_cache[session_id] = "running"
+
+            stop = await server.client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+            )
+            assert stop.status_code < 300, stop.text
+            await _until(lambda: _equals(fields(), "goal", "paused"))
+            assert (await fields())["summary"] == "PR goal paused"
+            view = await server.client.get(
+                f"/v1/sessions/{session_id}/extensions/{_EXT}/state/goals"
+            )
+            [item] = json.loads(view.json()["value"])["items"]
+            assert (item["status"], item["note"], item["wakes"]) == (
+                "paused",
+                "Paused by Stop — Resume to continue",
+                1 if delivered else 0,
+            )
+
+            # Idle again: the stopped wake doesn't go out, and a check doesn't read the PR.
+            idle_edge()
+            await server.app.state.session_wake.settle()
+            assert len(messages()) == (1 if delivered else 0)
+            [loop] = server.loops
+            server.reads.clear()
+            await loop.reconcile_all()
+            assert server.reads == [] and (await fields())["goal"] == "paused"
+
+            # Resume from the page: the goal carries on, and the failure the stopped
+            # (or dropped) wake was about goes out again.
+            response = await server.client.post(
+                f"/v1/sessions/{session_id}/extensions/{_EXT}/commands/{_EXT}.resume",
+                json={"arguments": {"pr": "org/repo/7"}},
+            )
+            assert response.status_code == 200, response.text
+            await _until(lambda: _equals(fields(), "goal", "unmet"))
+            if delivered:
+                # Offered again, not taken for a duplicate: it waits out the wake gap.
+                status = server.app.state.session_wake.status(session_id, f"ext:{_EXT}")
+                assert status is not None and status.pending and len(messages()) == 1
+            else:
+                await _until(_async(lambda: len(messages()) == 1))
+                assert "Check failed: lint" in json.dumps(messages()[-1])
         finally:
             _session_status_cache.pop(session_id, None)
 

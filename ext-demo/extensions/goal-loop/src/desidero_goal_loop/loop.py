@@ -3,9 +3,11 @@
 Everything lives in the extension's session state (``docs/extending/extension_state.md``),
 so the loop survives restarts and moves between replicas:
 
-- ``all`` and ``pr:<owner>/<repo>/<n>`` (``on``/``off``) and ``stop``: what people
-  asked for, written by the extension's commands.
-- ``enablers``: who last set each toggle, recorded from the command (service).
+- ``all`` and ``pr:<owner>/<repo>/<n>`` (``on``/``off``), ``stop`` and ``resume``
+  (a paused goal's target id): what people asked for, written by the extension's
+  commands.
+- ``enablers``: who last set each toggle or resumed a goal, recorded from the
+  command (service).
 - ``g:<digest of the target URL>``: one envelope per goal (service).
 - ``loop``: the session's wake bookkeeping (service).
 - ``goals``: a view of the goals for the extension's page (readers).
@@ -37,6 +39,7 @@ _T = TypeVar("_T")
 KEY_ALL = "all"
 TOGGLE_PREFIX = "pr:"
 KEY_STOP = "stop"
+KEY_RESUME = "resume"
 KEY_REFRESH = "refresh"
 KEY_ENABLERS = "enablers"
 KEY_LOOP = "loop"
@@ -47,11 +50,15 @@ FIELD_COUNT = "count"
 FIELD_SUMMARY = "summary"
 
 ON, OFF = "on", "off"
-WATCHING, UNMET, MET, STOPPED = "watching", "unmet", "met", "stopped"
+WATCHING, UNMET, MET, STOPPED, PAUSED = "watching", "unmet", "met", "stopped", "paused"
 _ACTIVE = frozenset({WATCHING, UNMET})
 _MET_REASONS = frozenset({"green", "merged"})
-# Wake stops that only pause: the same events are not asked for again.
-_PAUSES = frozenset({"stopped_by_user", "stopped_by_agent", "budget_spent"})
+STOPPED_BY_USER = "stopped_by_user"
+# Wake stops that only hold back the same events; new ones are asked for.
+_PAUSES = frozenset({"stopped_by_agent", "budget_spent"})
+PAUSED_NOTE = "Paused by Stop — Resume to continue"
+# Tries for a stop's write when another writer changed the session meanwhile.
+_STOP_WRITE_TRIES = 3
 # Goals one session can hold, active or ended; with the toggles and published
 # fields this stays under the 64 keys an extension may keep per session.
 MAX_GOALS = 25
@@ -135,19 +142,30 @@ class Goal:
 
     :param type: The goal type's id.
     :param target: What the goal is about.
-    :param status: ``watching``, ``unmet``, ``met`` or ``stopped``.
+    :param status: ``watching``, ``unmet``, ``met``, ``stopped`` or ``paused``
+        (a person's Stop; not checked until it is resumed or restarted).
     :param reason: Why it ended (``green``, ``off``, ``budget``, ...).
     :param note: One line about the end, for the page.
     :param state: The goal type's state (what was already reported).
     :param pending: The state to commit once the requested wake is delivered.
     :param wakes: Wakes delivered for this goal.
     :param max_wakes: Its budget.
-    :param by: The toggle that started it, as ``<epoch>:<key>:<version>``; a
-        different stamp restarts an ended goal.
+    :param by: The stamp (``<epoch>:<key>:<version>``) of the toggle that
+        started it, or for a paused goal of the toggle current at the Stop; a
+        different stamp restarts an ended or paused goal.
     :param enabled: Whether the person who set that toggle was recorded.
     :param user: That person, on whose behalf the goal's wakes go out.
     :param generation: Their account generation when they set it.
     :param quiet: Ended before it was ever watched (already merged or closed).
+    :param before_wake: ``state`` before the last delivered wake, if that wake
+        reported this goal's events.
+    :param unhandled: A person stopped that wake's turn, so its events count as
+        not handled.
+    :param reoffer: Resumed while unhandled: unless the next check finds the
+        goal met, it reports against ``before_wake``, offering that wake's
+        events again where they still apply.
+    :param reoffers: How often Resume did so; part of the wake's dedupe key, so
+        the wake service doesn't take the same events for a duplicate.
     """
 
     type: str
@@ -165,10 +183,19 @@ class Goal:
     generation: str | None = None
     quiet: bool = False
     started_at: int = 0
+    before_wake: Any = None
+    unhandled: bool = False
+    reoffer: bool = False
+    reoffers: int = 0
 
     @property
     def active(self) -> bool:
         return self.status in _ACTIVE
+
+    @property
+    def live(self) -> bool:
+        """Running or paused: turning it off or "Stop all" ends it."""
+        return self.status in _ACTIVE or self.status == PAUSED
 
     @property
     def enabler(self) -> tuple[str | None, str | None]:
@@ -205,6 +232,10 @@ class Goal:
                 ),
                 quiet=bool(data.get("quiet")),
                 started_at=int(data.get("started_at") or 0),
+                before_wake=data.get("before_wake"),
+                unhandled=bool(data.get("unhandled")),
+                reoffer=bool(data.get("reoffer")),
+                reoffers=int(data.get("reoffers") or 0),
             )
         except (TypeError, ValueError):
             return None
@@ -262,7 +293,7 @@ class _Snapshot:
     record: LoopRecord = field(default_factory=LoopRecord)
     enablers: dict[str, dict[str, Any]] = field(default_factory=dict)
     removed: set[str] = field(default_factory=set)
-    # Keys to clear once an applied "Stop all" is saved, with their versions.
+    # Control keys ("Stop all", Resume) to clear once applied and saved, with versions.
     stopped_keys: list[tuple[str, int]] = field(default_factory=list)
 
     def toggle(self, key: str) -> tuple[str, int]:
@@ -282,6 +313,18 @@ class _Snapshot:
 
     def toggles_on(self) -> list[str]:
         return [key for key in self.entries if is_toggle(key) and self.toggle(key)[0] == ON]
+
+    def wanted_by(self, target_id: str) -> tuple[str, str] | None:
+        """The toggle asking for a target's goal and its stamp, or ``None``."""
+        epoch = self.record.epoch
+        key = f"{TOGGLE_PREFIX}{target_id}"
+        value, version = self.toggle(key)
+        if value == ON:
+            return key, f"{epoch}:{key}:{version}"
+        all_value, all_version = self.toggle(KEY_ALL)
+        if all_value == ON and value != OFF:
+            return KEY_ALL, f"{epoch}:{KEY_ALL}:{all_version}"
+        return None
 
 
 class _Session:
@@ -303,6 +346,25 @@ class _Session:
 def enabler_key(enabler: tuple[str | None, str | None] | list[str | None]) -> str:
     """One enabler (user, generation) as a JSON key."""
     return json.dumps(list(enabler))
+
+
+def _commit_wake(goal: Goal, state: Any) -> None:
+    """Count a delivered wake for *goal*, keeping what it had reported before."""
+    goal.before_wake, goal.state, goal.pending = goal.state, state, None
+    goal.wakes += 1
+
+
+def _recorded_for(record: dict[str, Any], entry: Any) -> bool:
+    """Whether an ``enablers`` record comes from the command that wrote *entry*.
+
+    The writer's user decides when the store names one; otherwise the record
+    must not be older than the write.
+    """
+    updated_by = getattr(entry, "updated_by", None)
+    if updated_by is not None:
+        return record.get("user") == updated_by
+    at = record.get("at")
+    return isinstance(at, int) and at >= entry.updated_at
 
 
 def _outcome(value: Any) -> str:
@@ -394,12 +456,12 @@ class GoalLoop:
         self._ctx.create_task(later(), name=f"goal-loop-check-{session_id}")
 
     async def on_command(self, event: Any) -> None:
-        """Record who set a toggle, handle "Stop all", refresh the view, and check soon."""
+        """Record who set a toggle, handle "Stop all" and Resume, refresh the view, check soon."""
         session_id = event.session_id
         self._known.add(session_id)
         owner = await self._ctx.serves_session(session_id, require_host=True)
         async with self._lock(session_id):
-            if is_toggle(event.key) and not event.deleted:
+            if (is_toggle(event.key) or event.key == KEY_RESUME) and not event.deleted:
                 await self._record_enabler(event)
             if event.key == KEY_STOP and not event.deleted:
                 # The newest action wins over every toggle set before it.
@@ -408,10 +470,10 @@ class GoalLoop:
                         await self._clear(session_id, entry.key, entry.version)
             snapshot = await self._snapshot(session_id)
             # Only the owner writes goals; a session without a host has none.
-            if KEY_STOP in snapshot.entries and (
+            if self._has_control_keys(snapshot) and (
                 owner or await self._ctx.serves_session(session_id)
             ):
-                self._apply_stop(session_id, snapshot)
+                self._apply_control_keys(session_id, snapshot)
                 if await self._save_or_skip(session_id, snapshot):
                     await self._clear_stop(session_id, snapshot)
             await self._publish(session_id, snapshot, await self._targets(session_id))
@@ -419,7 +481,7 @@ class GoalLoop:
             self.schedule(event.workspace_id, session_id, 0)
 
     async def _record_enabler(self, event: Any) -> None:
-        """Remember who set this toggle, from the command itself."""
+        """Remember who set this toggle or resumed a goal, from the command itself."""
         record = {"user": event.user_id, "generation": event.generation, "at": int(self._clock())}
         for _ in range(3):
             entry = await self._ctx.state.read(event.session_id, KEY_ENABLERS)
@@ -438,26 +500,49 @@ class GoalLoop:
         _logger.warning("goal loop: couldn't record who set %s", event.key)
 
     async def on_stop(self, session_id: str, reason: Any) -> None:
-        """A dropped wake: a Stop or the service's budget pauses; anything else stops goals."""
+        """A dropped or stopped wake.
+
+        A person's Stop pauses every active goal of the session until it is
+        resumed; an agent's stop or the service's budget only holds back the
+        same events; anything else ends goals.
+        """
         reason = _outcome(reason)
         async with self._lock(session_id):
-            snapshot = await self._snapshot(session_id)
-            record = snapshot.record
-            if reason in _PAUSES and record.requested and record.requested_for:
-                record.paused[enabler_key(record.requested_for)] = record.requested
-            elif reason not in _PAUSES:
-                enabler = tuple(record.requested_for) if record.requested_for else None
-                for goal in snapshot.goals.values():
-                    # Only the goals of the enabler who lost access, when that is known.
-                    if goal.active and (
-                        reason != "not_authorized" or enabler is None or goal.enabler == enabler
-                    ):
-                        self._end(goal, reason)
-            record.requested, record.requested_for = "", None
+            for _ in range(_STOP_WRITE_TRIES):
+                snapshot = await self._snapshot(session_id)
+                self._apply_wake_stop(session_id, snapshot, reason)
+                if await self._save_or_skip(session_id, snapshot):
+                    await self._publish(session_id, snapshot, await self._targets(session_id))
+                    return
+            _logger.warning("goal loop: couldn't record a %s stop of %s", reason, session_id)
+
+    def _apply_wake_stop(self, session_id: str, snapshot: _Snapshot, reason: str) -> None:
+        record = snapshot.record
+        requested, requested_for = record.requested, record.requested_for
+        # A wake delivered before the stop still counts as reported.
+        delivered = self._settle_requested(session_id, snapshot)
+        if reason == STOPPED_BY_USER:
+            # Without a wake still waiting, the Stop ended the last delivered wake's
+            # turn: its events go unhandled. A dropped waiting wake reported nothing.
+            wake_turn = delivered or not requested
             for goal in snapshot.goals.values():
-                goal.pending = None
-            if await self._save_or_skip(session_id, snapshot):
-                await self._publish(session_id, snapshot, await self._targets(session_id))
+                if goal.active:
+                    self._pause(goal, snapshot)
+                    goal.unhandled = wake_turn and goal.before_wake is not None
+        elif reason in _PAUSES:
+            if requested and requested_for:
+                record.paused[enabler_key(requested_for)] = requested
+        else:
+            enabler = tuple(requested_for) if requested_for else None
+            for goal in snapshot.goals.values():
+                # Only the goals of the enabler who lost access, when that is known.
+                if goal.live and (
+                    reason != "not_authorized" or enabler is None or goal.enabler == enabler
+                ):
+                    self._end(goal, reason)
+        record.requested, record.requested_for = "", None
+        for goal in snapshot.goals.values():
+            goal.pending = None
 
     # ── One session ───────────────────────────────────────────
 
@@ -502,8 +587,10 @@ class GoalLoop:
             self._type.forget(session_id)
             return
         owner = await self._ctx.serves_session(session_id, require_host=True)
-        if KEY_STOP in snapshot.entries and (owner or await self._ctx.serves_session(session_id)):
-            self._apply_stop(session_id, snapshot)
+        if self._has_control_keys(snapshot) and (
+            owner or await self._ctx.serves_session(session_id)
+        ):
+            self._apply_control_keys(session_id, snapshot)
         if not owner:
             # A session without a host has no owner, so a stop is applied anywhere.
             if snapshot.stopped_keys and await self._save_or_skip(session_id, snapshot):
@@ -525,6 +612,40 @@ class GoalLoop:
         await self._clear_stop(session_id, snapshot)
         await self._publish(session_id, snapshot, targets)
 
+    @staticmethod
+    def _has_control_keys(snapshot: _Snapshot) -> bool:
+        return KEY_STOP in snapshot.entries or KEY_RESUME in snapshot.entries
+
+    def _apply_control_keys(self, session_id: str, snapshot: _Snapshot) -> None:
+        if KEY_STOP in snapshot.entries:
+            self._apply_stop(session_id, snapshot)
+        if KEY_RESUME in snapshot.entries:
+            self._apply_resume(snapshot)
+
+    def _apply_resume(self, snapshot: _Snapshot) -> None:
+        """Resume a paused goal where it left off: same wakes used, same reported events.
+
+        The person who resumed it becomes the one its wakes go out for.
+        """
+        entry = snapshot.entries.pop(KEY_RESUME)
+        snapshot.stopped_keys.append((KEY_RESUME, entry.version))
+        target_id = _text(entry)
+        resumer = snapshot.enablers.get(KEY_RESUME)
+        if resumer is not None and not _recorded_for(resumer, entry):
+            # Recorded for an earlier or another person's Resume: keep the enabler.
+            resumer = None
+        for goal in snapshot.goals.values():
+            if goal.status != PAUSED or goal.target.id != target_id:
+                continue
+            goal.status, goal.reason, goal.note = WATCHING, "", ""
+            if goal.unhandled:
+                goal.unhandled, goal.reoffer = False, True
+                goal.reoffers += 1
+            if resumer is not None:
+                goal.enabled = True
+                goal.user, goal.generation = resumer.get("user"), resumer.get("generation")
+            _logger.info("goal loop: %s goal for %s resumed", goal.type, goal.target.url)
+
     def _apply_stop(self, session_id: str, snapshot: _Snapshot) -> None:
         """Handle "Stop all goals": end every goal; turning one on again restarts it.
 
@@ -538,7 +659,7 @@ class GoalLoop:
                 snapshot.stopped_keys.append((key, entry.version))
                 del snapshot.entries[key]
         for goal in snapshot.goals.values():
-            if goal.active:
+            if goal.live:
                 self._end(goal, "off")
             goal.pending = None
         snapshot.record.epoch += 1
@@ -561,24 +682,17 @@ class GoalLoop:
         self, snapshot: _Snapshot, targets: list[Target]
     ) -> dict[str, tuple[Target, str, str]]:
         """The targets that should have a running goal, with the toggle asking for it."""
-        epoch = snapshot.record.epoch
-        all_value, all_version = snapshot.toggle(KEY_ALL)
-        toggles = snapshot.pr_toggles()
         wanted: dict[str, tuple[Target, str, str]] = {}
         for target in targets:
-            value, version = toggles.get(target.id, ("", 0))
-            key = f"{TOGGLE_PREFIX}{target.id}"
-            if value == ON:
-                wanted[target.id] = (target, key, f"{epoch}:{key}:{version}")
-            elif all_value == ON and value != OFF:
-                wanted[target.id] = (target, KEY_ALL, f"{epoch}:{KEY_ALL}:{all_version}")
+            if (toggle := snapshot.wanted_by(target.id)) is not None:
+                wanted[target.id] = (target, *toggle)
         return wanted
 
     def _free_slot(self, snapshot: _Snapshot) -> bool:
         """Make room for a new goal by forgetting the oldest ended one."""
         if len(snapshot.goals) < MAX_GOALS:
             return True
-        ended = [(goal.started_at, key) for key, goal in snapshot.goals.items() if not goal.active]
+        ended = [(goal.started_at, key) for key, goal in snapshot.goals.items() if not goal.live]
         if not ended:
             return False
         _, key = min(ended)
@@ -594,14 +708,19 @@ class GoalLoop:
         wanted = self._wanted(snapshot, targets)
         wanted_urls = {target.url for target, _, _ in wanted.values()}
         for goal in snapshot.goals.values():
-            if goal.active and goal.target.url not in wanted_urls:
+            if goal.live and goal.target.url not in wanted_urls:
                 self._end(goal, "off")
         now = int(self._clock())
         for target, toggle, stamp in wanted.values():
             key = goal_key(target.url)
             goal = snapshot.goals.get(key)
-            # An ended goal restarts when a different toggle stamp asks for it; one
-            # turned off restarts whenever it is wanted again.
+            # An ended or paused goal restarts when a different toggle stamp asks
+            # for it; one turned off restarts whenever it is wanted again.
+            if goal is not None and goal.status == PAUSED and goal.by == stamp:
+                goal.target = target
+                if target.closed:  # Nothing left to resume for.
+                    self._end(goal, "merged" if target.merged else "closed")
+                continue
             if goal is not None and (goal.active or (goal.by == stamp and goal.reason != "off")):
                 goal.target = target
                 continue
@@ -649,8 +768,10 @@ class GoalLoop:
         if status is not None and status.wakes > record.mark:
             for goal in snapshot.goals.values():
                 if goal.pending is not None:
-                    goal.state, goal.pending = goal.pending, None
-                    goal.wakes += 1
+                    _commit_wake(goal, goal.pending)
+                elif not (goal.unhandled or goal.reoffer):
+                    # Left out of this wake; one still owed its events keeps them.
+                    goal.before_wake = None
             record.requested, record.requested_for = "", None
             return True
         if status is None or not (status.pending or status.in_flight):
@@ -673,6 +794,20 @@ class GoalLoop:
             )
             if check is None:
                 continue
+            if goal.reoffer and check.outcome is None and goal.before_wake is not None:
+                # Resumed after a Stop of its wake's turn: report that wake's events
+                # again where they still apply, from the state before it. Only the
+                # first check decides whether the goal is met.
+                recheck = await self._guarded(
+                    f"reading {goal.target.url}",
+                    self._type.check(session, goal.target, goal.before_wake),
+                )
+                if recheck is not None:  # Unreadable now: offer them on a later pass.
+                    goal.reoffer = False
+                    if recheck.outcome is None and recheck.events:
+                        goal.state, check = goal.before_wake, recheck
+            else:
+                goal.reoffer = False
             if check.outcome is not None:
                 goal.state = check.state
                 self._end(goal, check.outcome)
@@ -682,6 +817,8 @@ class GoalLoop:
                 if goal.pending is None:
                     goal.state = check.state
                 continue
+            if goal.reoffer:
+                continue  # Its re-check failed: wake once it reads, owed events included.
             if goal.wakes >= goal.max_wakes:
                 self._end(goal, "budget")
                 continue
@@ -704,7 +841,11 @@ class GoalLoop:
             groups.setdefault(goal.enabler, []).append((goal, check))
 
         def digest(group: list[tuple[Goal, Check]]) -> str:
-            return _digest(sorted(key for _, check in group for key in check.event_keys))
+            keys = [key for _, check in group for key in check.event_keys]
+            keys += [
+                f"reoffer:{goal.target.id}:{goal.reoffers}" for goal, _ in group if goal.reoffers
+            ]
+            return _digest(sorted(keys))
 
         if record.requested:
             user, generation = (record.requested_for or [None, None])[:2]
@@ -766,15 +907,28 @@ class GoalLoop:
                 goal.pending = check.state
         elif outcome == "duplicate":
             # Nothing outstanding: the service already delivered exactly these events.
+            woken = {id(goal) for goal, _ in items}
+            for goal in snapshot.goals.values():
+                if id(goal) not in woken and not (goal.unhandled or goal.reoffer):
+                    goal.before_wake = None
             for goal, check in items:
-                goal.state, goal.pending = check.state, None
-                goal.wakes += 1
+                _commit_wake(goal, check.state)
         elif outcome == "budget_spent":
             # The service's own budget resets; pause, don't end.
             record.paused[enabler_key(enabler)] = dedupe
         elif outcome == "not_authorized":
             for goal, _ in items:
                 self._end(goal, "not_authorized")
+
+    def _pause(self, goal: Goal, snapshot: _Snapshot) -> None:
+        # The stop is newer than any toggle set so far: only a later one restarts it.
+        if (toggle := snapshot.wanted_by(goal.target.id)) is not None:
+            goal.by = toggle[1]
+        goal.status = PAUSED
+        goal.reason = STOPPED_BY_USER
+        goal.pending = None
+        goal.note = PAUSED_NOTE
+        _logger.info("goal loop: %s goal for %s paused by a Stop", goal.type, goal.target.url)
 
     def _end(self, goal: Goal, reason: str) -> None:
         goal.status = MET if reason in _MET_REASONS else STOPPED
@@ -846,13 +1000,17 @@ def published_fields(snapshot: _Snapshot) -> tuple[str, str, str]:
     """``goal``, ``count`` and ``summary`` for a session; empty strings clear them."""
     goals = [goal for goal in snapshot.goals.values() if not goal.quiet]
     active = [goal for goal in goals if goal.active]
+    paused = [goal for goal in goals if goal.status == PAUSED]
     asked = bool(snapshot.toggles_on())
     if not goals:
         return (WATCHING, "0", "Watching for PRs") if asked else ("", "", "")
     if active:
         status = UNMET if any(goal.status == UNMET for goal in active) else WATCHING
         plural = "" if len(active) == 1 else "s"
-        return status, str(len(active)), f"Watching {len(active)} PR{plural}"
+        summary = f"Watching {len(active)} PR{plural}"
+        return status, str(len(active)), summary + (f" · {len(paused)} paused" if paused else "")
+    if paused:
+        return PAUSED, "0", "PR goal paused" if len(paused) == 1 else "PR goals paused"
     if all(goal.status == MET for goal in goals):
         return MET, "0", "PR goal met" if len(goals) == 1 else "PR goals met"
     return STOPPED, "0", "Goals stopped"

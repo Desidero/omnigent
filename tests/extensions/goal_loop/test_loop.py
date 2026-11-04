@@ -8,12 +8,22 @@ from typing import Any
 
 import pytest
 from desidero_goal_loop.goals import Target
-from desidero_goal_loop.loop import Goal, GoalLoop, _Snapshot, goal_key, view_text
+from desidero_goal_loop.loop import (
+    MAX_GOALS,
+    PAUSED_NOTE,
+    Goal,
+    GoalLoop,
+    _Snapshot,
+    goal_key,
+    view_text,
+)
+from desidero_goal_loop.pr_green import PrGreen
 
 from tests.extensions.goal_loop.fakes import (
     SESSION,
     CommandEvent,
     FakeContext,
+    FakeWake,
     Linked,
     LinkedList,
     Observation,
@@ -39,8 +49,9 @@ class Harness:
 
     async def command(self, key: str, value: str, **event: Any) -> None:
         """Run a declared command: core writes the key, then tells the extension."""
-        await self.ctx.state.write(SESSION, key, value)
-        await self.loop.on_command(CommandEvent(SESSION, key, **event))
+        command = CommandEvent(SESSION, key, **event)
+        await self.ctx.state.write(SESSION, key, value, updated_by=command.user_id)
+        await self.loop.on_command(command)
         await self.settle()
 
     async def settle(self) -> None:
@@ -122,20 +133,645 @@ async def test_a_dropped_wake_is_asked_for_again() -> None:
     assert harness.goal(7)["wakes"] == 0
 
 
-async def test_a_person_stopping_the_session_pauses_until_something_new() -> None:
+async def test_a_person_stopping_the_session_pauses_until_resumed() -> None:
     harness = Harness(7)
     harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
     await harness.command("all", "on")
     harness.ctx.wake.drop(SESSION)
     await harness.loop.on_stop(SESSION, "stopped_by_user")
 
+    assert (harness.goal(7)["status"], harness.goal(7)["note"]) == ("paused", PAUSED_NOTE)
+    assert harness.published() == ("paused", "0", "PR goal paused")
+    [item] = json.loads(harness.field("goals") or "{}")["items"]
+    assert (item["status"], item["reason"], item["note"]) == (
+        "paused",
+        "stopped_by_user",
+        PAUSED_NOTE,
+    )
+
+    # Something new on the PR doesn't resume it, and a paused goal isn't read.
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))
+    harness.reader.reads.clear()
     await harness.check()
     assert len(harness.ctx.wake.requests) == 1
-    assert harness.goal(7)["status"] == "unmet"
+    assert harness.goal(7)["status"] == "paused"
+    assert url(7) not in harness.reader.reads
 
+    # Resume: it carries on for the person who resumed it, reporting what the
+    # stopped wake didn't deliver and what is new.
+    await harness.command("resume", "org/repo/7", user_id="carol@example.com", generation="g3")
+    assert (harness.goal(7)["status"], harness.goal(7)["note"]) == ("unmet", "")
+    assert harness.field("resume") is None
+    woken = harness.ctx.wake.requests[-1]
+    assert (woken["on_behalf_of"], woken["generation"]) == ("carol@example.com", "g3")
+    assert "Check failed: lint" in woken["text"] and "Check failed: tests" in woken["text"]
+    assert harness.published() == ("unmet", "1", "Watching 1 PR")
+
+
+async def test_resume_keeps_the_wakes_used_and_off_then_on_restarts_fresh() -> None:
+    harness = Harness(7)
+    harness.loop = GoalLoop(harness.ctx, harness.reader.goal_type(), hint_delay_s=0, max_wakes=2)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    assert harness.goal(7)["wakes"] == 1
+
+    await harness.command("resume", "org/repo/7")
+    assert (harness.goal(7)["status"], harness.goal(7)["wakes"]) == ("unmet", 1)
+    # The stopped wake's failure is offered again, as the goal's second wake.
+    assert len(harness.ctx.wake.requests) == 2
+    harness.ctx.wake.deliver(SESSION)
     harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))
     await harness.check()
+    assert harness.goal(7)["wakes"] == 2
+    assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ("stopped", "budget")
+
+    await harness.command("all", "off")
+    await harness.command("all", "on")
+    assert (harness.goal(7)["status"], harness.goal(7)["wakes"]) == ("unmet", 0)
+
+
+@pytest.mark.parametrize("seen", [False, True], ids=["delivered-at-stop", "counted-before"])
+async def test_resume_offers_the_stopped_wakes_events_again(seen: bool) -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    if seen:
+        await harness.check()  # The loop counted the wake before the Stop.
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("resume", "org/repo/7")
+
+    first, again = harness.ctx.wake.requests
+    assert "Check failed: lint" in again["text"] and again["text"] == first["text"]
+    # Not the delivered wake's dedupe key, or the service would call it a duplicate.
+    assert again["dedupe_key"] != first["dedupe_key"]
+    assert harness.goal(7)["wakes"] == 1
+    # The goal that wasn't in the wake has nothing to offer again.
+    await harness.command("resume", "org/repo/9")
     assert len(harness.ctx.wake.requests) == 2
+
+
+async def test_only_the_stopped_wakes_goals_are_offered_again() -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()  # #9's wake was handled.
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.check()
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")  # Stops #7's wake turn.
+
+    await harness.command("resume", "org/repo/9")
+
+    assert len(harness.ctx.wake.requests) == 2
+
+
+async def test_a_goal_met_by_resume_offers_nothing_again() -> None:
+    comment = {
+        "author": "maintainer",
+        "author_association": "MEMBER",
+        "body": "please fix",
+        "created_at": "2026-11-04T09:00:00Z",
+        "url": f"{url(7)}#c-1",
+    }
+    harness = Harness(7)
+    await harness.command("all", "on")
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",), comments=[comment])
+    await harness.check()
+    harness.ctx.wake.deliver(SESSION)
+    assert "please fix" in harness.ctx.wake.requests[0]["text"]
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    # Fixed and green; the stopped wake's comment is still on the PR.
+    harness.reader.infos[url(7)] = pr_info(7, head="b" * 40, comments=[comment])
+
+    await harness.command("resume", "org/repo/7")
+
+    assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ("met", "green")
+    assert len(harness.ctx.wake.requests) == 1
+
+
+async def test_a_stopped_reoffer_is_offered_again_under_a_new_key() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    await harness.command("resume", "org/repo/7")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")  # Stops the re-offer's turn too.
+
+    await harness.command("resume", "org/repo/7")
+
+    _, reoffer, again = harness.ctx.wake.requests
+    assert "Check failed: lint" in again["text"]
+    assert again["dedupe_key"] != reoffer["dedupe_key"]
+
+
+async def test_a_dropped_waiting_reoffer_comes_back_after_resume() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    await harness.command("resume", "org/repo/7")
+    harness.ctx.wake.drop(SESSION)  # A Stop drops the waiting re-offer.
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("resume", "org/repo/7")
+
+    assert len(harness.ctx.wake.requests) == 3
+    assert "Check failed: lint" in harness.ctx.wake.requests[-1]["text"]
+
+
+async def test_the_reoffer_never_decides_that_a_goal_is_met() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, mergeable=False)
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    # Mergeability is being recomputed: unknown, after a conflict was reported.
+    harness.reader.infos[url(7)] = pr_info(7, mergeable=None)
+
+    await harness.command("resume", "org/repo/7")
+
+    assert harness.goal(7)["status"] != "met"
+
+
+@pytest.mark.parametrize("delivered", ["by-delivery", "already"])
+async def test_another_goals_wake_while_paused_keeps_the_unhandled_events(
+    delivered: str,
+) -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("pr:org/repo/7", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    if delivered == "already":
+        harness.ctx.wake.outcome = "duplicate"  # The service had delivered #9's events.
+    await harness.command("pr:org/repo/9", "on")  # A new goal wakes while #7 is paused.
+    harness.ctx.wake.outcome = "queued"
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()
+
+    await harness.command("resume", "org/repo/7")
+
+    assert len(harness.ctx.wake.requests) == 3
+    assert "Check failed: lint" in harness.ctx.wake.requests[-1]["text"]
+
+
+async def test_two_goals_resumed_one_after_the_other_share_one_reoffer() -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("resume", "org/repo/7")
+    await harness.command("resume", "org/repo/9")
+
+    last = harness.ctx.wake.requests[-1]["text"]
+    assert "Check failed: lint" in last and "Check failed: tests" in last
+
+
+async def test_an_unreadable_recheck_keeps_the_reoffer_for_a_later_pass() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    reader = harness.reader
+    calls: list[str] = []
+
+    async def second_read_fails(session_id: str, pr_url: str) -> Any:
+        calls.append(pr_url)
+        return None if len(calls) == 2 else await Reader.__call__(reader, session_id, pr_url)
+
+    harness.loop = GoalLoop(harness.ctx, PrGreen(second_read_fails), hint_delay_s=0)
+    await harness.command("resume", "org/repo/7")
+    assert len(harness.ctx.wake.requests) == 1 and harness.goal(7)["reoffer"]
+
+    await harness.check()
+
+    assert "Check failed: lint" in harness.ctx.wake.requests[-1]["text"]
+
+
+def _fail_reads(harness: Harness, *failing: int) -> None:
+    """Make the given reads (1-based, counted from now) fail, as an unreachable host."""
+    reader = harness.reader
+    calls: list[str] = []
+
+    async def read(session_id: str, pr_url: str) -> Any:
+        calls.append(pr_url)
+        return None if len(calls) in failing else await Reader.__call__(reader, session_id, pr_url)
+
+    harness.loop = GoalLoop(harness.ctx, PrGreen(read), hint_delay_s=0)
+
+
+async def test_new_events_wait_for_a_failed_recheck_so_owed_ones_go_with_them() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))
+    _fail_reads(harness, 2)  # Resume's re-check can't read the PR.
+
+    await harness.command("resume", "org/repo/7")
+    assert len(harness.ctx.wake.requests) == 1  # No wake without the owed events.
+    await harness.check()
+
+    last = harness.ctx.wake.requests[-1]["text"]
+    assert "Check failed: lint" in last and "Check failed: tests" in last
+
+
+async def test_a_recheck_failing_twice_offers_the_events_once_it_reads() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    _fail_reads(harness, 2, 4)
+    await harness.command("resume", "org/repo/7")
+    await harness.check()
+    assert len(harness.ctx.wake.requests) == 1 and harness.goal(7)["reoffer"]
+
+    await harness.check()
+    assert "Check failed: lint" in harness.ctx.wake.requests[-1]["text"]
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()
+    await harness.check()
+
+    assert len(harness.ctx.wake.requests) == 2 and not harness.goal(7)["reoffer"]
+
+
+async def test_events_reoffered_and_handled_are_not_owed_again() -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    await harness.command("resume", "org/repo/7")
+    await harness.command("resume", "org/repo/9")
+    harness.ctx.wake.deliver(SESSION)  # The re-offer is delivered and handled.
+    await harness.check()
+    # Later #9 needs work; a person stops the turn of #9's wake.
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    await harness.check()
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    asked = len(harness.ctx.wake.requests)
+
+    await harness.command("resume", "org/repo/7")
+
+    assert len(harness.ctx.wake.requests) == asked
+
+
+async def test_an_agents_stop_owes_nothing_later() -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()  # #7's wake was handled.
+    await harness.loop.on_stop(SESSION, "stopped_by_agent")
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    await harness.check()
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()  # #9's wake was delivered, without #7.
+    await harness.loop.on_stop(SESSION, "stopped_by_user")  # A Stop of #9's turn.
+    asked = len(harness.ctx.wake.requests)
+
+    await harness.command("resume", "org/repo/7")
+
+    assert len(harness.ctx.wake.requests) == asked
+
+
+async def test_a_goal_left_out_of_the_stopped_wake_owes_nothing() -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    assert harness.goal(9)["unhandled"] is False
+
+    await harness.command("resume", "org/repo/9")
+
+    assert harness.goal(9)["reoffers"] == 0
+
+
+async def test_a_pending_reoffer_survives_another_goals_wake() -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    reader = harness.reader
+    reads_of_7: list[str] = []
+    rechecks_fail = True
+
+    async def flaky_rechecks(session_id: str, pr_url: str) -> Any:
+        if pr_url == url(7):
+            reads_of_7.append(pr_url)
+            if rechecks_fail and len(reads_of_7) % 2 == 0:
+                return None
+        return await Reader.__call__(reader, session_id, pr_url)
+
+    harness.loop = GoalLoop(harness.ctx, PrGreen(flaky_rechecks), hint_delay_s=0)
+    await harness.command("resume", "org/repo/7")
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    await harness.command("resume", "org/repo/9")
+    assert "Check failed: lint" not in harness.ctx.wake.requests[-1]["text"]
+    harness.ctx.wake.deliver(SESSION)  # #9's wake is delivered while #7 still waits.
+    rechecks_fail = False
+
+    await harness.check()
+
+    assert "Check failed: lint" in harness.ctx.wake.requests[-1]["text"]
+
+
+@pytest.mark.parametrize("left_out", [False, True], ids=["woken", "left-out"])
+async def test_a_wake_the_service_already_delivered_counts_for_the_reoffer(
+    left_out: bool,
+) -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()  # #9's wake was handled.
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    harness.ctx.wake.outcome = "duplicate"  # The service had delivered #7's events.
+    await harness.check()
+    harness.ctx.wake.outcome = "queued"
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("resume", "org/repo/9" if left_out else "org/repo/7")
+
+    if left_out:
+        assert len(harness.ctx.wake.requests) == 2
+    else:
+        assert len(harness.ctx.wake.requests) == 3
+        assert "Check failed: lint" in harness.ctx.wake.requests[-1]["text"]
+
+
+async def test_resume_skips_stopped_wake_events_resolved_meanwhile() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    harness.reader.infos[url(7)] = pr_info(7, pending=True)
+
+    await harness.command("resume", "org/repo/7")
+
+    assert len(harness.ctx.wake.requests) == 1
+    assert harness.goal(7)["status"] == "watching"
+
+
+async def test_a_stop_that_drops_a_waiting_wake_offers_nothing_again() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    await harness.check()  # Handled: the agent's turn for that wake ended.
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))
+    await harness.check()  # A second wake waits; a person stops their own turn.
+    harness.ctx.wake.drop(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("resume", "org/repo/7")
+
+    *_, last = harness.ctx.wake.requests
+    assert "Check failed: tests" in last["text"] and "Check failed: lint" not in last["text"]
+
+
+async def test_resume_only_touches_the_named_paused_goal() -> None:
+    harness = Harness(7, 9)
+    await harness.command("all", "on")
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("resume", "org/repo/9")
+
+    assert (harness.goal(7)["status"], harness.goal(9)["status"]) == ("paused", "watching")
+    assert harness.published() == ("watching", "1", "Watching 1 PR · 1 paused")
+    # Resuming a goal that isn't paused changes nothing.
+    await harness.command("resume", "org/repo/9")
+    assert harness.goal(9)["status"] == "watching"
+
+
+@pytest.mark.parametrize("written_by", ["yolanda@example.com", None], ids=["user", "unnamed"])
+async def test_a_resume_applied_later_keeps_the_goals_own_enabler(
+    written_by: str | None,
+) -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    harness.reader.infos[url(9)] = pr_info(9, failing=("tests",))
+    await harness.command("all", "on", user_id="dana@example.com")
+    harness.ctx.wake.drop(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    await harness.command("resume", "org/repo/7", user_id="xavier@example.com")
+    harness.ctx.wake.drop(SESSION)
+    # Someone else's Resume of #9 is written, but its command callback is lost;
+    # the reconciling pass applies it without knowing who sent it.
+    harness.ctx.state.now = 2**40  # Written after Xavier's Resume was recorded.
+    await harness.ctx.state.write(SESSION, "resume", "org/repo/9", updated_by=written_by)
+
+    await harness.loop.reconcile_all()
+
+    assert (harness.goal(9)["status"], harness.goal(9)["user"]) == ("unmet", "dana@example.com")
+    assert harness.goal(7)["user"] == "xavier@example.com"
+
+
+async def test_a_single_user_resume_in_the_same_second_is_credited() -> None:
+    harness = Harness(7)
+    harness.loop = GoalLoop(
+        harness.ctx, harness.reader.goal_type(), hint_delay_s=0, clock=lambda: 1000.0
+    )
+    harness.ctx.state.now = 1000  # The command's write and its record share a second.
+    await harness.command("all", "on", user_id=None, generation="g1")
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("resume", "org/repo/7", user_id=None, generation="g2")
+
+    assert (harness.goal(7)["status"], harness.goal(7)["generation"]) == ("watching", "g2")
+
+
+async def test_crossed_resumes_resume_one_goal_for_its_own_enabler() -> None:
+    harness = Harness(7, 9)
+    await harness.command("all", "on", user_id="dana@example.com")
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    # Alice resumes #7 and Bob #9; both writes land before either callback runs.
+    await harness.ctx.state.write(SESSION, "resume", "org/repo/7", updated_by="alice@example.com")
+    await harness.ctx.state.write(SESSION, "resume", "org/repo/9", updated_by="bob@example.com")
+    await harness.loop.on_command(CommandEvent(SESSION, "resume", user_id="alice@example.com"))
+    await harness.loop.on_command(CommandEvent(SESSION, "resume", user_id="bob@example.com"))
+    await harness.settle()
+
+    assert (harness.goal(7)["status"], harness.goal(9)["status"]) == ("paused", "watching")
+    assert harness.goal(9)["user"] == "dana@example.com"
+
+
+async def test_resume_leaves_an_ended_goal_ended() -> None:
+    harness = Harness(7)
+    harness.loop = GoalLoop(harness.ctx, harness.reader.goal_type(), hint_delay_s=0, max_wakes=1)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))
+    await harness.check()
+    assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ("stopped", "budget")
+
+    await harness.command("resume", "org/repo/7", user_id="mallory@example.com")
+
+    assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ("stopped", "budget")
+    assert harness.goal(7)["user"] == "alice@example.com"
+
+
+async def test_stop_all_ends_a_paused_goal_on_a_session_without_a_host() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.drop(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    # The host went away; this replica serves the session without one.
+    harness.ctx.hosted.discard(SESSION)
+    harness.ctx.hostless.add(SESSION)
+
+    await harness.command("stop", "requested")
+
+    assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ("stopped", "off")
+    assert harness.published() == ("stopped", "0", "Goals stopped")
+
+
+async def test_a_full_session_keeps_its_paused_goals() -> None:
+    numbers = range(1, MAX_GOALS + 1)
+    harness = Harness(*numbers)
+    await harness.command("all", "on")
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    newcomer = MAX_GOALS + 1
+    harness.ctx.linked[SESSION].entries.append(Linked(url(newcomer), "org/repo", newcomer))
+    harness.reader.infos[url(newcomer)] = pr_info(newcomer, pending=True)
+
+    await harness.check()
+
+    assert {harness.goal(number)["status"] for number in numbers} == {"paused"}
+    assert harness.goal(newcomer) == {}
+
+
+async def test_a_toggle_set_just_before_a_stop_does_not_undo_the_pause() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("pr:org/repo/7", "on")
+    harness.ctx.wake.drop(SESSION)
+    # Set again (a new version) before any check saw it; then the Stop.
+    await harness.ctx.state.write(SESSION, "pr:org/repo/7", "on")
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.check()
+
+    assert harness.goal(7)["status"] == "paused" and len(harness.ctx.wake.requests) == 1
+    # A toggle set after the Stop restarts it.
+    await harness.command("pr:org/repo/7", "on")
+    assert harness.goal(7)["status"] == "unmet" and len(harness.ctx.wake.requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("state", "ended", "published"),
+    [
+        ("MERGED", ("met", "merged"), ("met", "0", "PR goal met")),
+        ("CLOSED", ("stopped", "closed"), ("stopped", "0", "Goals stopped")),
+    ],
+    ids=["merged", "closed"],
+)
+async def test_a_paused_goal_on_a_finished_pr_ends_without_reading_it(
+    state: str, ended: tuple[str, str], published: tuple[str, str, str]
+) -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    harness.ctx.linked[SESSION].entries[0].state = state
+    harness.reader.reads.clear()
+
+    await harness.check()
+
+    assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ended
+    assert harness.published() == published
+    assert harness.reader.reads == []
+
+
+async def test_a_stop_that_meets_a_concurrent_write_is_retried() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    state = harness.ctx.state
+    write = state.write
+    raced: list[str] = []
+
+    async def racing_write(session_id: str, key: str, value: Any, **kwargs: Any) -> Any:
+        if key == goal_key(url(7)) and not raced:
+            raced.append(key)
+            current = await state.read(session_id, key)
+            await write(session_id, key, current.value)  # Another writer gets there first.
+        return await write(session_id, key, value, **kwargs)
+
+    state.write = racing_write  # type: ignore[method-assign]
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    assert raced and harness.goal(7)["status"] == "paused"
+
+
+async def test_a_pause_survives_a_restart() -> None:
+    harness = Harness(7)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.drop(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    harness.ctx.wake = FakeWake()  # The wake service's memory is lost.
+    harness.loop = GoalLoop(harness.ctx, harness.reader.goal_type(), hint_delay_s=0)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))
+
+    await harness.loop.reconcile_all()
+
+    assert harness.goal(7)["status"] == "paused"
+    assert harness.published() == ("paused", "0", "PR goal paused")
+    assert harness.ctx.wake.requests == []
+
+
+@pytest.mark.parametrize("seen", [False, True], ids=["before-a-check", "after-a-check"])
+async def test_a_stop_of_a_delivered_wakes_turn_pauses_and_counts_the_wake(seen: bool) -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    harness.ctx.wake.deliver(SESSION)
+    if seen:
+        await harness.check()  # The loop already counted the delivered wake.
+
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    assert (harness.goal(7)["status"], harness.goal(7)["wakes"]) == ("paused", 1)
+    assert (harness.goal(7)["pending"], len(harness.goal(7)["state"]["f"])) == (None, 1)
+    assert harness.goal(9)["status"] == "paused"
+
+
+async def test_turning_a_paused_goal_off_or_stopping_all_ends_it() -> None:
+    harness = Harness(7, 9)
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
+    await harness.command("all", "on")
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    await harness.command("pr:org/repo/7", "off")
+    assert (harness.goal(7)["status"], harness.goal(7)["reason"]) == ("stopped", "off")
+    assert harness.published() == ("paused", "0", "PR goal paused")
+
+    await harness.command("stop", "requested")
+    assert (harness.goal(9)["status"], harness.goal(9)["reason"]) == ("stopped", "off")
+    assert harness.published() == ("stopped", "0", "Goals stopped")
 
 
 @pytest.mark.parametrize("reason", ["not_authorized", "undeliverable", "session_gone"])
@@ -426,6 +1062,10 @@ async def test_wake_stops_that_pause(reason: str) -> None:
     await harness.check()
 
     assert harness.goal(7)["status"] == "unmet" and len(harness.ctx.wake.requests) == 1
+    # Only the same events are held back: new ones are reported.
+    harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))
+    await harness.check()
+    assert len(harness.ctx.wake.requests) == 2
 
 
 async def test_a_duplicate_means_the_events_were_delivered() -> None:
@@ -613,22 +1253,24 @@ async def _two_enablers(harness: Harness) -> tuple[int, int]:
     return first, 16 - first
 
 
-async def test_a_paused_enabler_does_not_hold_back_another() -> None:
+async def test_a_persons_stop_pauses_every_enablers_goals() -> None:
     harness = Harness(7, 9)
     first, other = await _two_enablers(harness)
     harness.reader.infos[url(first)] = pr_info(first, failing=("lint",))
     await harness.check()
-    harness.ctx.wake.drop(SESSION)
-    await harness.loop.on_stop(SESSION, "stopped_by_user")  # Pauses the first enabler's wake.
-
-    harness.reader.infos[url(other)] = pr_info(other, failing=("tests",))
+    harness.ctx.wake.deliver(SESSION)  # The first enabler's wake starts a turn.
     await harness.check()
+    harness.reader.infos[url(other)] = pr_info(other, failing=("tests",))
+    await harness.check()  # The other's wake waits behind that turn.
+    assert len(harness.ctx.wake.requests) == 2
+    harness.ctx.wake.drop(SESSION)
 
-    paused, woken = harness.ctx.wake.requests
-    assert f"#{other} needs attention" in woken["text"]
-    assert woken["on_behalf_of"] != paused["on_behalf_of"]
-    # The first enabler stays paused until its PR changes.
-    harness.ctx.wake.deliver(SESSION)
+    await harness.loop.on_stop(SESSION, "stopped_by_user")
+
+    assert (harness.goal(first)["status"], harness.goal(other)["status"]) == ("paused", "paused")
+    assert harness.published() == ("paused", "0", "PR goals paused")
+    harness.reader.infos[url(first)] = pr_info(first, failing=("lint", "tests"))
+    harness.reader.infos[url(other)] = pr_info(other, failing=("tests", "docs"))
     await harness.check()
     assert len(harness.ctx.wake.requests) == 2
 
@@ -783,12 +1425,12 @@ async def test_enablers_take_turns_when_one_stays_busy() -> None:
     assert woken[1] == patient and woken.count(patient) == 1 and len(woken) == 6
 
 
-async def test_a_new_wake_for_a_paused_enabler_clears_the_pause() -> None:
+async def test_a_new_wake_for_a_held_back_enabler_clears_the_hold() -> None:
     harness = Harness(7)
     harness.reader.infos[url(7)] = pr_info(7, failing=("lint",))
     await harness.command("all", "on")
     harness.ctx.wake.drop(SESSION)
-    await harness.loop.on_stop(SESSION, "stopped_by_user")
+    await harness.loop.on_stop(SESSION, "stopped_by_agent")
     assert json.loads(harness.field("loop") or "{}")["paused"]
 
     harness.reader.infos[url(7)] = pr_info(7, failing=("lint", "tests"))

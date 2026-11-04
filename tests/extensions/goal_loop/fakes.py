@@ -23,6 +23,7 @@ class Entry:
     value: bytes
     version: int
     updated_at: int = 0
+    updated_by: str | None = None
 
 
 @dataclass
@@ -104,6 +105,7 @@ class FakeState:
         value: str | bytes,
         *,
         expected_version: int | None = None,
+        updated_by: str | None = None,
         **_: Any,
     ) -> Entry:
         data = value.encode() if isinstance(value, str) else value
@@ -111,7 +113,7 @@ class FakeState:
         rows = self.rows.setdefault(session_id, {})
         old = rows.get(key)
         self._expect(key, old, expected_version)
-        rows[key] = Entry(key, data, (old.version if old else 0) + 1, self.now)
+        rows[key] = Entry(key, data, (old.version if old else 0) + 1, self.now, updated_by)
         self.writes.append((session_id, key, data.decode()))
         return rows[key]
 

@@ -4,7 +4,7 @@ import {
   type ExtensionContext,
   ExtensionApiError,
 } from "@omnigent/extension-sdk";
-import { describe, type GoalsView, isWatched, parseView } from "./model";
+import { type GoalsView, isWatched, parseView, rowView } from "./model";
 import "./style.css";
 
 const ID = "desidero.goal-loop";
@@ -96,6 +96,7 @@ function mount(root: HTMLElement, context: ExtensionContext): void {
         "change",
         () => void run("pr", { pr: item.id, mode: box.checked ? "on" : "off" }),
       );
+      const row = rowView(item, readOnly);
       return el(
         "li",
         { class: `goal goal-${item.status || "none"}` },
@@ -107,7 +108,10 @@ function mount(root: HTMLElement, context: ExtensionContext): void {
           " ",
           item.title || item.url,
         ),
-        el("span", { class: "detail", id: `pr-${item.id}-status` }, describe(item)),
+        el("span", { class: "detail", id: `pr-${item.id}-status` }, row.detail),
+        row.resume
+          ? button(`Resume ${item.label}`, "resume", () => void run("resume", { pr: item.id }))
+          : null,
       );
     });
     const stop = el("button", { type: "button", class: "danger" }, "Stop all goals");

@@ -12,7 +12,9 @@ a turn that the runner hands to a mock-LLM agent.
 2. The Goals page's refresh lists it, and its per-PR command turns the goal on.
 3. A failing check, a member's comment and a collaborator's requested changes wake
    the idle session once, as the session owner; a stranger's comment is left out.
-4. A green, approved head meets the goal; a later red head starts nothing.
+4. A person's Stop of that wake's turn, while it runs, pauses the goal on its page.
+5. Resumed, the goal carries on with its wake counted; a green, approved head
+   meets it, and a later red head starts nothing.
 
 Run (mock LLM only, no GitHub)::
 
@@ -40,8 +42,10 @@ from tests._helpers.polling import poll_until
 from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     build_agent_bundle,
+    configure_mock_llm,
     get_mock_requests,
     poll_session_until_terminal,
+    release_mock_gate,
     send_user_message_to_session,
     set_fallback_mock_llm,
 )
@@ -246,8 +250,14 @@ def test_failing_checks_wake_the_owner_once_and_a_green_head_meets_the_goal(
     assert published()["goal"] == "watching"  # CI is still running: nothing to report.
     assert wakes() == []
 
+    def status() -> str | None:
+        return client.get(f"/v1/sessions/{session_id}").json().get("status")
+
     # 3. Lint fails, a maintainer and a stranger comment, and a collaborator asks for
-    # changes. One wake goes out at idle.
+    # changes. One wake goes out at idle; the model holds its turn open.
+    configure_mock_llm(
+        isolated_mock_llm_server_url, [{"text": _REPLY, "block": True}], match="Check failed: lint"
+    )
     gh.update_pull(
         7,
         statusCheckRollup=[
@@ -290,18 +300,34 @@ def test_failing_checks_wake_the_owner_once_and_a_green_head_meets_the_goal(
         f"- Review from @reviewer: requested changes — {_PR_URL}",
     ]
     assert _UNTRUSTED_COMMENT not in text
-    # The agent was handed the wake as its next turn.
-    poll_session_until_terminal(
-        client, session_id=session_id, response_id=wake["response_id"], timeout=60
+    # The agent was handed the wake as its next turn, which is still running.
+    until(
+        lambda: any(
+            "Check failed: lint" in str(request.get("input"))
+            for request in get_mock_requests(isolated_mock_llm_server_url, key=_MODEL)
+        ),
+        timeout_s=60,
     )
-    assert any(
-        "Check failed: lint" in str(request.get("input"))
-        for request in get_mock_requests(isolated_mock_llm_server_url, key=_MODEL)
-    )
+    until(lambda: status() == "running", timeout_s=30)
     assert published()["goal"] == "unmet"
 
-    # 4. The agent pushes a fix and the reviewer approves: every check passes on the
-    # new head, which meets the goal.
+    # 4. The person stops the wake's turn (the web's Stop): the goal is paused, with
+    # the delivered wake counted.
+    stop = client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
+    assert stop.status_code < 300, stop.text
+    until(lambda: published().get("goal") == "paused", timeout_s=30)
+    release_mock_gate(isolated_mock_llm_server_url)
+    until(lambda: status() in ("idle", "failed"), timeout_s=30)
+    assert published()["summary"] == "PR goal paused"
+    [item] = goals_view()["items"]
+    assert (item["status"], item["wakes"], item["note"]) == (
+        "paused",
+        1,
+        "Paused by Stop — Resume to continue",
+    )
+
+    # 5. The agent pushes a fix and the reviewer approves: every check passes on the
+    # new head. Resumed from the page, the goal is met.
     gh.update_pull(
         7,
         headRefOid=_FIXED_HEAD,
@@ -311,6 +337,7 @@ def test_failing_checks_wake_the_owner_once_and_a_green_head_meets_the_goal(
         ],
         **_reviews(approved=True),
     )
+    command("resume", pr=_PR_ID)
     until(lambda: published().get("goal") == "met", timeout_s=60)
     assert published()["summary"] == "PR goal met"
     [item] = goals_view()["items"]

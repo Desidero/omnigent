@@ -33,6 +33,7 @@ class Target:
     :param title: Shown on the page.
     :param label: Short name, e.g. ``#7``.
     :param closed: Already finished before a goal started (not read again).
+    :param merged: Finished by being merged (``closed`` is set too).
     """
 
     id: str
@@ -40,6 +41,7 @@ class Target:
     title: str = ""
     label: str = ""
     closed: bool = False
+    merged: bool = False
 
 
 @dataclass

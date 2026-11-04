@@ -1,5 +1,5 @@
 import { describe as suite, expect, it } from "vitest";
-import { describe, EMPTY_VIEW, isWatched, parseView } from "./model";
+import { canResume, describe, EMPTY_VIEW, isWatched, parseView, rowView } from "./model";
 
 const ITEM = {
   id: "acme/app/7",
@@ -41,5 +41,41 @@ suite("describe", () => {
       JSON.stringify({ items: [{ ...ITEM, status: "met", note: "#7 is green", wakes: 2 }] }),
     ).items;
     expect(describe(item)).toBe("Met · 2/10 wakes · #7 is green");
+  });
+
+  it("shows a paused goal as paused once, with how to resume it", () => {
+    const note = "Paused by Stop — Resume to continue";
+    const [item] = parseView(
+      JSON.stringify({ items: [{ ...ITEM, status: "paused", reason: "stopped_by_user", note }] }),
+    ).items;
+    expect(item.status).toBe("paused");
+    expect(describe(item)).toBe("Paused by Stop · 1/10 wakes · Resume to continue");
+    expect(describe(item, true)).toBe(
+      "Paused by Stop · 1/10 wakes · someone who can edit this session can resume it",
+    );
+  });
+});
+
+suite("canResume", () => {
+  it("offers Resume only on paused goals", () => {
+    const view = parseView(JSON.stringify({ items: [{ ...ITEM, status: "paused" }, ITEM] }));
+    expect(view.items.map(canResume)).toEqual([true, false]);
+  });
+});
+
+suite("rowView", () => {
+  it("offers Resume on a paused goal to editors only, with matching text", () => {
+    const [paused, running] = parseView(
+      JSON.stringify({ items: [{ ...ITEM, status: "paused" }, ITEM] }),
+    ).items;
+    expect(rowView(paused, false)).toEqual({
+      detail: "Paused by Stop · 1/10 wakes · Resume to continue",
+      resume: true,
+    });
+    expect(rowView(paused, true)).toEqual({
+      detail: "Paused by Stop · 1/10 wakes · someone who can edit this session can resume it",
+      resume: false,
+    });
+    expect(rowView(running, false).resume).toBe(false);
   });
 });

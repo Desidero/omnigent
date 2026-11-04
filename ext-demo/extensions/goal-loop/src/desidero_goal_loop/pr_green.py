@@ -462,6 +462,7 @@ class PrGreen:
                 title=(entry.title or "")[:_TITLE_CHARS],
                 label=f"#{entry.number}",
                 closed=(entry.state or "").upper() in ("MERGED", "CLOSED"),
+                merged=(entry.state or "").upper() == "MERGED",
             )
             for entry in linked
         ]
