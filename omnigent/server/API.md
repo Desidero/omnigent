@@ -1160,6 +1160,21 @@ A failed transcript append restores pending inputs with their prior delivery
 uncertainty, including entries that expired while persistence was in flight.
 A later mirror cannot report a possibly recorded input as definitely undelivered.
 
+**Server-originated messages carry `origin`.** The server itself can send a
+user message into a session, for example a [session wake](../../docs/extending/session_wake.md).
+Such a message item carries
+`origin: {kind: "automation", source, on_behalf_of?, label?}`, where `source` is
+`core:<name>` or `ext:<extension id>` and `on_behalf_of` is the user who turned
+the automation on. It is attributed (`created_by`) to the session owner. A
+native-terminal message gets its `origin` when the transcript mirror matches its
+text, as `created_by` does; while it is pending, the snapshot's `pending_inputs`
+entry lists it too. `data.origin` and `data.delivery` are reserved for the
+server: every client input that carries a message — an event (or an
+`external_conversation_item`'s `item_data`), a create request's
+`initial_items` or `initial_input` — fails validation with 422 if it sets
+either. `POST /v1/imports` drops both from imported items, since the server
+can't vouch for an imported automation.
+
 **Interrupt is dual-path on purpose.** Posting `{"type": "interrupt"}`
 is exposed as an event for API uniformity, but it does NOT enter the
 queue — the route invokes the loop's `cancel_loop` directly so the

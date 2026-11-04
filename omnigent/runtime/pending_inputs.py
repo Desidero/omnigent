@@ -109,7 +109,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -233,6 +233,7 @@ class DrainedInput:
         hidden and settles quietly as an uncertain entry.
     :param uncertain: Whether a positional drain may already have mirrored
         this entry. Restore must preserve that evidence even after eviction.
+    :param origin: The automation that sent this message, when the server did.
     """
 
     pending_id: str
@@ -241,6 +242,7 @@ class DrainedInput:
     stable_id: str | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
+    origin: dict[str, Any] | None = None
     # Reconstructed entries without original delivery metadata must remain unknown.
     input_enqueued_at_ms: int | None = None
     delivery_attempt_id: str | None = None
@@ -307,6 +309,7 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param origin: The automation that sent this message, when the server did.
     """
 
     pending_id: str
@@ -314,6 +317,7 @@ class _Entry:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    origin: dict[str, Any] | None = None
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
@@ -376,6 +380,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    origin: Mapping[str, Any] | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -399,6 +404,9 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param origin: The automation that sent a server-originated message (see
+        :class:`~omnigent.entities.conversation.MessageOrigin`), applied to the
+        mirrored item like ``created_by``; ``None`` for a person's message.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -422,6 +430,7 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            origin=dict(origin) if origin is not None else None,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -644,7 +653,9 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         return _drained_input(entry) if entry is not None else None
 
 
-def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
+def resolve_oldest(
+    conversation_id: str, *, hold: bool = False, skip_automation: bool = False
+) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
 
@@ -672,6 +683,8 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
     :param hold: Keep the entry in place, marked held, instead of removing it;
         the caller settles it with :func:`release` once the persist landed or
         :func:`restore` if it did not. Entries already held are skipped.
+    :param skip_automation: Pass over server automation messages (entries
+        with an ``origin``), for mirrored text that isn't one.
     :returns: The drained :class:`DrainedInput`, or ``None`` when no
         entry was pending, or only held or interrupted ones remain.
     """
@@ -682,7 +695,13 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
             return None
         # Insertion order = FIFO; the first live, unheld key is the oldest entry.
         oldest_id = next(
-            (pid for pid, entry in entries.items() if not entry.held and not entry.interrupted),
+            (
+                pid
+                for pid, entry in entries.items()
+                if not entry.held
+                and not entry.interrupted
+                and not (skip_automation and entry.origin is not None)
+            ),
             None,
         )
         if oldest_id is None:
@@ -785,6 +804,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
+        origin=copy.deepcopy(drained.origin),
         uncertain=drained.uncertain,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
         delivery_attempt_id=drained.delivery_attempt_id,
@@ -941,6 +961,20 @@ def resolve_matching_text(
         )
 
 
+def is_pending(conversation_id: str, pending_id: str) -> bool:
+    """
+    Report whether one queued input still waits for its terminal to record it.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The entry's id, e.g. ``"pending_a1b2c3"``.
+    :returns: ``False`` once it was drained, expired or cancelled by an interrupt.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return entry is not None and not entry.interrupted
+
+
 def has_pending(conversation_id: str) -> bool:
     """
     Report whether a session still holds an un-consumed message.
@@ -996,6 +1030,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
+                **({"origin": copy.deepcopy(entry.origin)} if entry.origin is not None else {}),
             }
             for entry in entries.values()
             if not entry.interrupted
@@ -1011,6 +1046,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
+        origin=copy.deepcopy(entry.origin),
         uncertain=entry.uncertain,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,
         delivery_attempt_id=entry.delivery_attempt_id,

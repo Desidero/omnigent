@@ -219,6 +219,11 @@ class EventContext(TypedDict, total=False):
         policies should skip only explicit ``False`` to preserve those
         callers. The relay skips empty and whitespace-only segments.
         Read via ``event["context"]["turn_final"]``.
+    :param origin: On ``input`` events, the automation behind a message the
+        server sent (a session wake): ``kind``, ``source``, ``on_behalf_of``
+        (the user who turned it on) and ``label``. ``None`` otherwise. The
+        message's actor is the session owner, so policies about automation
+        read this. Read via ``event["context"]["origin"]``.
     """
 
     actor: ActorContext
@@ -242,6 +247,7 @@ class EventContext(TypedDict, total=False):
     # RESPONSE policies skip only explicit False for completion actions;
     # None preserves callers that do not distinguish segments.
     turn_final: bool | None
+    origin: dict[str, str] | None
 
 
 class PolicyEvent(TypedDict, total=False):

@@ -59,10 +59,16 @@ class FieldTone(StrEnum):
 
 @dataclass(frozen=True)
 class ExtensionEntrypoints:
-    """Lazy runtime assets declared by an extension."""
+    """Lazy runtime assets declared by an extension.
+
+    ``server`` is an experimental ``package.module:function`` naming an
+    ``async def activate(ctx)`` in the extension's own package. The server
+    runs it at startup when the operator enabled the extension.
+    """
 
     browser: str | None = None
     browser_css: str | None = None
+    server: str | None = None
 
 
 @dataclass(frozen=True)

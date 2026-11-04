@@ -823,7 +823,9 @@ def create_sessions_router(
     pull_request_refresher: PullRequestRefresher | None = None,
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
+    register_server_message: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
+    register_pull_request_info: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -893,6 +895,8 @@ def create_sessions_router(
         background titles in focused router tests.
     :param pull_request_refresher: The app-owned refresher of stored session
         PRs; ``None`` builds one for this router, as focused router tests do.
+    :param register_pull_request_info: Receives the Pull Requests panel's
+        per-PR reader, for server code such as extension activation.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -961,6 +965,7 @@ def create_sessions_router(
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
         pull_request_refresher=pull_request_refresher,
+        register_pull_request_info=register_pull_request_info,
     )
 
     register_ui_routes(
@@ -1003,6 +1008,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        register_server_message=register_server_message,
     )
 
     register_permissions_routes(

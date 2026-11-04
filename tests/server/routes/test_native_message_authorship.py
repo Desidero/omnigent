@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -92,3 +93,78 @@ async def test_native_authorship_survives_delivery_and_retries(
     await _persist_external_conversation_item(conv.id, conv, body, store, created_by=author)
     assert [row["pending_id"] for row in pending_inputs.snapshot_for(conv.id)] == pending
     assert len(store.list_items(conv.id, type="message").data) == 1
+
+
+@pytest.mark.parametrize("mirrored_text", ["Wake: PR #7 failed", "Something typed in the TUI"])
+@pytest.mark.asyncio
+async def test_native_mirror_keeps_automation_origin_only_on_its_own_text(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, mirrored_text: str
+) -> None:
+    """A wake's origin reaches its mirrored item; a FIFO fallback match is no evidence."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Wake")
+    origin = {"kind": "automation", "source": "ext:acme.goal-loop", "on_behalf_of": "alice"}
+    pending_id = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": "Wake: PR #7 failed"}], origin=origin
+    )
+    recorded: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "omnigent.server.session_wake._installed",
+        SimpleNamespace(note_persisted=lambda *args: recorded.append(args)),
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": mirrored_text}],
+            },
+        },
+    )
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+
+    await _persist_external_conversation_item(conv.id, conv, body, store, created_by="alice")
+
+    [item] = store.list_items(conv.id, type="message").data
+    expected = origin if mirrored_text.startswith("Wake") else None
+    assert (item.data.origin.model_dump() if item.data.origin else None) == (
+        {**expected, "label": None} if expected else None
+    )
+    if expected:
+        assert recorded == [(conv.id, pending_id)]
+    else:
+        # Text the terminal recorded without the automation header isn't the
+        # wake: its queued input stays for its own mirror.
+        assert recorded == []
+        assert [row["pending_id"] for row in pending_inputs.snapshot_for(conv.id)] == [pending_id]
+
+
+@pytest.mark.asyncio
+async def test_in_order_settlement_passes_over_a_held_wake(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A person's reformatted message behind a held wake still settles its own entry."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Wake")
+    wake_id = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "[Automation: Goal loop]\n\nPR #7 failed"}],
+        origin={"kind": "automation", "source": "ext:acme.goal-loop"},
+    )
+    typed_id = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": "please   fix   it"}], created_by="alice"
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "Fix it"}]},
+        },
+    )
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+
+    await _persist_external_conversation_item(conv.id, conv, body, store, created_by="alice")
+
+    assert [row["pending_id"] for row in pending_inputs.snapshot_for(conv.id)] == [wake_id]
+    assert typed_id != wake_id

@@ -1602,3 +1602,51 @@ def test_clear_bridge_state_removes_egress_certificate_failure(tmp_path: Path) -
     clear_bridge_state(bridge_dir)
 
     assert read_certificate_failure(bridge_dir) is None
+
+
+# Captured from codex-cli 0.164.0 with ``tmux capture-pane -e``: the empty
+# composer's placeholder is dimmed (SGR 2); a typed draft is not.
+_CODEX_FOOTER = (
+    "  \x1b[38;5;223mGPT-6.1-Sol default\x1b[39m · /work\n  \x1b[1m?\x1b[0m for shortcuts"
+)
+_CODEX_EMPTY = f"\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n{_CODEX_FOOTER}"
+_CODEX_DRAFT = f"\x1b[1m›\x1b[0m Reply with exactly: DRAFT\n\n{_CODEX_FOOTER}"
+_CODEX_SECOND_LINE_DRAFT = f"\x1b[1m›\x1b[0m \n  second line\n\n{_CODEX_FOOTER}"
+_CODEX_SHELL_MODE = f"\x1b[1m\x1b[38;5;9m!\x1b[0m\n\n{_CODEX_FOOTER}"
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_CODEX_EMPTY, None),
+        (_CODEX_DRAFT, "draft"),
+        (_CODEX_SECOND_LINE_DRAFT, "draft"),
+        (_CODEX_SHELL_MODE, "unreadable"),
+        (f"\x1b[1m›\x1b[0m \n\n  text on the third row\n\n{_CODEX_FOOTER}", "draft"),
+        ("\x1b[1m›\x1b[0m \n  no footer below", "draft"),
+        (f"\x1b[1m›\x1b[0m \x1b[38;5;2mgreen draft\x1b[39m\n\n{_CODEX_FOOTER}", "draft"),
+        (f"\x1b[1m›\x1b[0m \x1b[38;2;10;2;30mtruecolor\x1b[39m\n\n{_CODEX_FOOTER}", "draft"),
+        (f"\x1b[1m›\x1b[0m \x1b[48;5;2;2mfaint on green\x1b[0m\n\n{_CODEX_FOOTER}", None),
+        (f"\x1b[1m›\x1b[0m \x1b[2mAsk\x1b[22m typed\n\n{_CODEX_FOOTER}", "draft"),
+        (f"{_CODEX_EMPTY}\n\n\n", None),
+        ("\x1b[1m›\x1b[0m \x1b[2mInput disabled.\x1b[0m", "disabled"),
+        ("", "unreadable"),
+    ],
+    ids=[
+        "placeholder",
+        "draft",
+        "draft-on-second-line",
+        "shell-mode",
+        "draft-after-blank-lines",
+        "draft-without-footer",
+        "palette-colour-2",
+        "truecolour-with-2",
+        "faint-after-background-colour",
+        "faint-cleared-by-22",
+        "trailing-blank-rows",
+        "disabled",
+        "blank",
+    ],
+)
+def test_only_an_empty_codex_composer_is_free_for_a_wake(pane: str, expected: str | None) -> None:
+    assert codex_native_bridge.codex_wake_composer_blocker(pane) == expected

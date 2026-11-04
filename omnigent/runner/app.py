@@ -76,6 +76,7 @@ from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
+from omnigent.native.next_turn import DROP_NEXT_TURN_INPUT
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals, pr_reports
 from omnigent.runner import subagent_work as _subagent_work
@@ -150,6 +151,18 @@ from omnigent.runner.native import (
 from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
+from omnigent.runner.next_turn_holds import (
+    DELIVERED_TURN_GRACE_S,
+    HARNESS_BUSY,
+    NextTurnHolds,
+    block_reason,
+    is_next_turn_only,
+    is_next_turn_refusal,
+    is_slash_command_only,
+)
+from omnigent.runner.next_turn_holds import (
+    QUIET_WINDOW_S as _NEXT_TURN_QUIET_WINDOW_S,
+)
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -1513,6 +1526,56 @@ def create_runner_app(
     # Sessions whose queued Claude message waits for a launcher sign-in.
     _sign_in_holds: dict[str, _SignInHold] = {}
     app.state.sign_in_holds = _sign_in_holds
+    # Server automation messages a native session can't start a turn for yet.
+    _next_turn_holds = NextTurnHolds(
+        blocked=lambda session_id: _next_turn_block_reason(session_id),
+        release=lambda session_id, body: _release_next_turn_input(session_id, body),
+    )
+    app.state.next_turn_holds = _next_turn_holds
+    # When the runner last delivered a native turn, and last saw it settle. A
+    # terminal's status can lag the prompt it just accepted, so a delivered
+    # turn counts as running until an idle or failed edge follows it.
+    _native_delivered_at: dict[str, float] = {}
+    _turn_started_at: dict[str, float] = {}
+    _native_settled_at: dict[str, float] = {}
+    _native_running_at: dict[str, float] = {}
+
+    def _publish_turn_start(session_id: str, body: Mapping[str, Any]) -> None:
+        """Publish a turn's ``running`` edge, except for a next-turn-only native one.
+
+        The terminal reports that turn's own edges once it starts it; a harness
+        that refuses the message as busy then leaves the status unchanged.
+        """
+        if not (is_next_turn_only(body) and _is_native_harness(session_id)):
+            _publish_turn_status(session_id, "running")
+
+    def _note_native_settled(session_id: str, status: str, *, from_terminal: bool) -> None:
+        """Record a settle edge, and a running edge only when the terminal reported it.
+
+        The runner publishes its own ``running`` when it starts delivering some
+        turns (codex-native); that says nothing about the terminal's turn.
+        """
+        if status in ("idle", "failed"):
+            _native_settled_at[session_id] = time.monotonic()
+        elif status in ("running", "waiting") and from_terminal:
+            _native_running_at[session_id] = time.monotonic()
+
+    def _awaiting_native_turn_end(session_id: str) -> bool:
+        """Whether a delivered native turn has not settled yet.
+
+        A terminal's status can lag the prompt it just took, so a delivery
+        counts as running until an idle or failed edge follows it. A delivery
+        no running edge followed within :data:`DELIVERED_TURN_GRACE_S` (a
+        command that starts no turn, or a lost edge) counts as settled; the
+        harness's own check under its injection lock still decides.
+        """
+        delivered = _native_delivered_at.get(session_id)
+        if delivered is None or _native_settled_at.get(session_id, 0.0) >= delivered:
+            return False
+        if _native_running_at.get(session_id, 0.0) >= delivered:
+            return True
+        return time.monotonic() - delivered < DELIVERED_TURN_GRACE_S
+
     # The web message each background turn carries, so a sign-in refusal can queue it again.
     _turn_message_bodies: dict[str, _JsonObject] = {}
     _author_attribution_sessions: set[str] = set()
@@ -1652,6 +1715,8 @@ def create_runner_app(
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):
             queue.put_nowait(None)
+        # Shutting down: held automation messages die with this runner.
+        _next_turn_holds.close()
 
     app.state.drain_session_streams = _drain_session_streams
 
@@ -1666,6 +1731,7 @@ def create_runner_app(
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
                 _native_pane_status[session_id] = _status_value
+                _note_native_settled(session_id, _status_value, from_terminal=False)
         _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
@@ -1856,6 +1922,8 @@ def create_runner_app(
                     event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        # The terminal's own status (status file or pane watcher).
+        _note_native_settled(session_id, status, from_terminal=True)
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -3597,6 +3665,7 @@ def create_runner_app(
                 await turn_task
         await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
+        _next_turn_holds.drop(session_id)
         _live_response_id.pop(session_id, None)
         _turn_occurrences.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
@@ -4080,6 +4149,7 @@ def create_runner_app(
         turn_inputs = inputs if inputs is not None else [body] if body is not None else []
         _turn_occurrences[conv_id] = _shared_scheduled_run(turn_inputs)
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
+        _turn_started_at[conv_id] = time.monotonic()
         pending_id = body.get("pending_id") if body is not None else None
         if isinstance(pending_id, str):
             _turn_pending_ids[conv_id] = {pending_id}
@@ -4201,6 +4271,10 @@ def create_runner_app(
             if normalized_error.get("code") == "databricks_sign_in_pending":
                 _start_sign_in_watch(conv_id)
         else:
+            if _is_native_harness(conv_id):
+                # Typed into the terminal: running until the terminal says it settled.
+                if not is_slash_command_only(_turn_message_bodies.get(conv_id)):
+                    _native_delivered_at[conv_id] = _turn_started_at.get(conv_id, time.monotonic())
             # A delivered turn proves the pane takes input, so any sign-in wait is over,
             # and a watcher still polling could only ask for a resend that already happened.
             _sign_in_holds.pop(conv_id, None)
@@ -4573,6 +4647,16 @@ def create_runner_app(
         # A refusal still streaming can no longer hold the cancelled turn's message.
         _turn_message_bodies.pop(session_id, None)
         waiter = _claude_prompt_waiters.pop(session_id, None)
+        # Held automation messages go too: stop, interrupt and delete end the work,
+        # including a wake queued behind an SDK turn (people's messages keep their place).
+        _next_turn_holds.drop(session_id)
+        queued = _session_message_buffers.get(session_id)
+        if queued:
+            kept = [body for body in queued if not is_next_turn_only(body)]
+            if kept:
+                _session_message_buffers[session_id] = kept
+            else:
+                _session_message_buffers.pop(session_id, None)
         if waiter is not None or _session_harness_name(session_id) == "claude-native":
             # Cancel queued work even if the terminal control fails; restoring it
             # could restart work the user explicitly asked to stop.
@@ -4764,6 +4848,80 @@ def create_runner_app(
         )
         return False
 
+    async def _next_turn_block_reason(session_id: str, *, draining: bool = False) -> str | None:
+        """Why a native session can't start a next-turn-only message now, or ``None``.
+
+        :param draining: Called from the ordered drain, which already checked
+            for a turn and holds the message in the queue itself.
+        """
+        from omnigent.native.native_cost_popup import _tmux_last_client_input_at
+
+        person_active = False
+        screen_active: bool | None = None
+        composer_blocker: str | None = None
+        harness = _session_harness_name(session_id)
+        terminals = getattr(resource_registry, "terminal_registry", None)
+        if terminals is not None and hasattr(terminals, "native_panes"):
+            for conv_id, name, socket_path in terminals.native_panes():
+                if conv_id != session_id:
+                    continue
+                if harness == _CODEX_NATIVE_HARNESS and composer_blocker is None:
+                    # Codex delivers through its app-server, which the pane's
+                    # draft doesn't block, so the runner reads the composer.
+                    composer_blocker = await asyncio.to_thread(
+                        _codex_wake_composer_blocker, str(socket_path), "main"
+                    )
+                instance = terminals.get(conv_id, name, "main")
+                if instance is not None:
+                    person_active = person_active or instance.client_interaction_within(
+                        _NEXT_TURN_QUIET_WINDOW_S
+                    )
+                    changed = instance.screen_changed_within(_NEXT_TURN_QUIET_WINDOW_S)
+                    if changed is not None:
+                        screen_active = bool(screen_active) or changed
+                input_at = await asyncio.to_thread(
+                    _tmux_last_client_input_at, str(socket_path), "main"
+                )
+                if input_at is not None and time.time() - input_at < _NEXT_TURN_QUIET_WINDOW_S:
+                    person_active = True
+        return block_reason(
+            harness=harness,
+            composer_blocker=composer_blocker,
+            awaiting_turn_end=_awaiting_native_turn_end(session_id),
+            turn_active=not draining
+            and (
+                session_id in _active_turns
+                or (process_manager is not None and process_manager.has_active_turn(session_id))
+            ),
+            queued=not draining and bool(_session_message_buffers.get(session_id)),
+            approval_pending=pending_approvals.has_pending(session_id),
+            pane_status=_native_pane_status.get(session_id),
+            person_active=person_active,
+            screen_active=screen_active,
+        )
+
+    def _codex_wake_composer_blocker(socket_path: str, tmux_target: str) -> str | None:
+        from omnigent.harnesses.codex_native.bridge import (
+            capture_styled_pane,
+            codex_wake_composer_blocker,
+        )
+
+        return codex_wake_composer_blocker(capture_styled_pane(socket_path, tmux_target))
+
+    async def _release_next_turn_input(session_id: str, body: dict[str, Any]) -> None:
+        """Queue a held message for the ordered drain, which checks the session again."""
+        _session_message_buffers.setdefault(session_id, []).append(body)
+        await _check_and_start_next_turn(session_id)
+
+    def _hold_refused_next_turn_input(conv_id: str) -> None:
+        """Hold a next-turn-only message the harness refused because it is busy."""
+        body = _turn_message_bodies[conv_id]
+        history = _session_histories.get(conv_id)
+        if history and history[-1].get("content") == body.get("content"):
+            # The drain records the message again when it sends it.
+            history.pop()
+        _next_turn_holds.hold(conv_id, body, reason=HARNESS_BUSY, first=True)
+
     async def _check_and_start_next_turn(session_id: str) -> None:
         with scheduled_run_scope(None, session_id=session_id):
             await _drain_next_turn(session_id)
@@ -4810,6 +4968,16 @@ def create_runner_app(
                 return
             if pending_bridge_dir is not None:
                 _start_claude_prompt_waiter(session_id, pending_bridge_dir)
+                return
+            # A server automation message starts a turn of its own: while the
+            # terminal is busy it waits, and later messages go first.
+            while buf and _is_native_harness(session_id) and is_next_turn_only(buf[0]):
+                reason = await _next_turn_block_reason(session_id, draining=True)
+                if reason is None:
+                    break
+                _next_turn_holds.hold(session_id, buf.pop(0), reason=reason, first=True)
+            if not buf:
+                _session_message_buffers.pop(session_id, None)
                 return
 
             # A buffered claude-sdk /compact must dispatch as its OWN turn: the
@@ -4867,7 +5035,7 @@ def create_runner_app(
                     for body in all_bodies
                     if isinstance(pending_id := body.get("pending_id"), str)
                 }
-                _publish_turn_status(session_id, "running")
+                _publish_turn_start(session_id, next_body)
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(next_body, session_id),
                     name=f"turn-cont-{session_id}",
@@ -5639,6 +5807,8 @@ def create_runner_app(
         _authorized_shell = msg_body.get("authorized_native_shell_command")
         if isinstance(_authorized_shell, str):
             harness_body["authorized_native_shell_command"] = _authorized_shell
+        if is_next_turn_only(msg_body):
+            harness_body["delivery"] = msg_body["delivery"]
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and
@@ -6319,6 +6489,8 @@ def create_runner_app(
             # A sign-in refusal kept from the chat while its message waits to be resent.
             _held_refusal: _JsonObject | None = None
             _held_body: _JsonObject | None = None
+            # The refusal is a busy harness turning down a next-turn-only message.
+            _held_for_next_turn = False
 
             def _report_held_refusal() -> None:
                 """Publish a kept sign-in refusal as the harness sent it: nothing is held."""
@@ -6515,6 +6687,18 @@ def create_runner_app(
                                         # undelivered: it is sent after the sign-in.
                                         _held_refusal = event
                                         _held_body = _turn_message_bodies.get(conv_id)
+                                        continue
+                                    if (
+                                        dispatch is not None
+                                        and _owns_live_turn()
+                                        and is_next_turn_refusal(_stream_failed_error)
+                                        and is_next_turn_only(_turn_message_bodies.get(conv_id))
+                                    ):
+                                        # A turn or a draft owns the terminal: hold the
+                                        # message for the next turn instead of failing it.
+                                        _held_refusal = event
+                                        _held_body = _turn_message_bodies.get(conv_id)
+                                        _held_for_next_turn = True
                                         continue
                                 elif _evt_type == "response.output_item.done":
                                     _item = event.get("item")
@@ -6804,7 +6988,10 @@ def create_runner_app(
                         # this one meanwhile: report the refusal as usual.
                         _report_held_refusal()
                     _holding = _held_refusal is not None and _stream_failed_error is not None
-                    if _holding:
+                    if _holding and _held_for_next_turn:
+                        _hold_refused_next_turn_input(conv_id)
+                        _held_refusal = None
+                    elif _holding and _stream_failed_error is not None:
                         _hold_message_for_sign_in(conv_id, _stream_failed_error)
                         # Queued again: there is nothing left to report however the turn ends.
                         _held_refusal = None
@@ -7180,6 +7367,7 @@ def create_runner_app(
                         not _native
                         and not _awaiting_approval
                         and conversation_id in _live_response_id
+                        and not is_next_turn_only(message_body)
                     )
                     if _can_forward:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"
@@ -7271,6 +7459,18 @@ def create_runner_app(
                             },
                         )
 
+                if is_next_turn_only(message_body) and _is_native_harness(conversation_id):
+                    hold_reason = await _next_turn_block_reason(conversation_id)
+                    if hold_reason is not None:
+                        _next_turn_holds.hold(conversation_id, message_body, reason=hold_reason)
+                        return JSONResponse(
+                            status_code=202,
+                            content={
+                                "status": "held",
+                                "detail": "Message held until the session can start a turn.",
+                            },
+                        )
+
                 new_item = {
                     "type": "message",
                     "role": message_body.get("role", "user"),
@@ -7294,7 +7494,7 @@ def create_runner_app(
                     extra={"session_id": conversation_id},
                 )
 
-                _publish_turn_status(conversation_id, "running")
+                _publish_turn_start(conversation_id, message_body)
 
                 if stream:
                     response = await _stream_message_to_harness(message_body, conversation_id)
@@ -7326,6 +7526,26 @@ def create_runner_app(
                 async with _cond:
                     _ingest_now_serving[conversation_id] = _seq + 1
                     _cond.notify_all()
+
+        if body_type == DROP_NEXT_TURN_INPUT:
+            # A Stop overtook the post that queued this wake: forget it if it
+            # hasn't started yet.
+            pending_id = body.get("pending_id") if isinstance(body, dict) else None
+            dropped = 0
+            if isinstance(pending_id, str):
+                dropped = _next_turn_holds.drop_pending(conversation_id, pending_id)
+                queued = _session_message_buffers.get(conversation_id) or []
+                kept = [
+                    entry
+                    for entry in queued
+                    if not (is_next_turn_only(entry) and entry.get("pending_id") == pending_id)
+                ]
+                dropped += len(queued) - len(kept)
+                if queued and kept:
+                    _session_message_buffers[conversation_id] = kept
+                elif queued:
+                    _session_message_buffers.pop(conversation_id, None)
+            return JSONResponse(status_code=200, content={"dropped": dropped})
 
         if body_type == "interrupt":
             _cancel_claude_prompt_waiter(conversation_id)
@@ -7369,6 +7589,7 @@ def create_runner_app(
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
                 _native_pane_status[conversation_id] = status
+                _note_native_settled(conversation_id, status, from_terminal=True)
                 resource_registry.note_external_session_status(conversation_id, status)
                 child_status = (
                     "idle" if terminal_status == "completed" else terminal_status or status
@@ -8512,6 +8733,7 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
             _native_pane_status[conv_id] = status
+            _note_native_settled(conv_id, status, from_terminal=False)
             resource_registry.note_external_session_status(conv_id, status)
             return False
 

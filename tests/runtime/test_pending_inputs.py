@@ -1156,3 +1156,18 @@ def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
     [skipped] = match.skipped
     assert skipped.content == [_text_block(older)]
     assert match.uncertain == []
+
+
+def test_origin_round_trips_through_drain_restore_and_snapshot() -> None:
+    """A server message's origin reaches the mirrored item and survives a restore."""
+    origin = {"kind": "automation", "source": "ext:acme.goal-loop", "on_behalf_of": "alice"}
+    pending_inputs.record("conv_a", [_text_block("wake")], origin=origin)
+
+    assert pending_inputs.snapshot_for("conv_a")[0]["origin"] == origin
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None
+    assert drained.origin == origin
+    pending_inputs.restore("conv_a", drained)
+    assert pending_inputs.resolve_oldest("conv_a").origin == origin  # type: ignore[union-attr]
+    pending_inputs.record("conv_a", [_text_block("typed")])
+    assert "origin" not in pending_inputs.snapshot_for("conv_a")[0]

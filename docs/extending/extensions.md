@@ -23,6 +23,15 @@ trusted Python package -> validated manifest -> server catalog
                                       checked MessageChannel API
 ```
 
+## Server-side observations
+
+Server code can observe session status edges in process; see
+[Session status observers](status_observers.md). Server code can also hand an
+idle agent a message with the [session wake](session_wake.md) service. An
+enabled extension can run its own server code, with both, through an
+experimental `activate(ctx)`; see
+[Extension server activation](server_activation.md).
+
 ## V1 contribution points
 
 - `pages`: one-segment routes under `/extensions/{extension_id}/{route}`.

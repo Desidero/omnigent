@@ -18,6 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudeComposerBusy,
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
@@ -35,6 +36,7 @@ from omnigent.harnesses.claude_native.bridge import (
     input_box_reads_clear,
     is_auth_slash_command,
     kill_session,
+    next_turn_blocker,
     read_active_session_id,
     read_claude_status_model,
     read_launch_model,
@@ -61,8 +63,14 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.native.next_turn import NEXT_TURN_BUSY_CODE, delivery_is_next_turn_only
 
 _logger = logging.getLogger(__name__)
+
+
+class _NextTurnBusy(Exception):
+    """Claude can't take a next-turn-only message as its own turn yet."""
+
 
 _AUTH_COMMAND_GUIDANCE = (
     "Claude Code's sign-in runs in its own terminal, so /login and /logout do "
@@ -190,9 +198,16 @@ class ClaudeNativeExecutor(Executor):
     ) -> None:
         """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
         async with self._inject_lock:
+            wake = delivery_is_next_turn_only()
+            if wake:
+                blocker = await asyncio.to_thread(next_turn_blocker, self._bridge_dir)
+                if blocker is not None:
+                    raise _NextTurnBusy(blocker)
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
             if wanted_model_arg is not None:
+                # A wake gets here only with the box read empty just above, so
+                # the routed switch can't clear anything a person typed.
                 # Accepted trade-off: ``/model <id>`` also saves the
                 # pick as the person's global default for new Claude
                 # sessions. Runs to completion before the message
@@ -210,7 +225,13 @@ class ClaudeNativeExecutor(Executor):
                 # Track the routed id, not the alias: the next turn's
                 # comparison is against what routing asked for.
                 self._applied_model = wanted_model
-            await self._inject_prompt(text, notices)
+            if not wake:
+                await self._inject_prompt(text, notices)
+                return
+            try:
+                await self._inject_prompt(text, notices, keep_draft=True)
+            except ClaudeComposerBusy as exc:
+                raise _NextTurnBusy("draft") from exc
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
         """
@@ -340,14 +361,20 @@ class ClaudeNativeExecutor(Executor):
             ),
         )
 
-    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
+    async def _inject_prompt(
+        self, text: str, notices: list[str], *, keep_draft: bool = False
+    ) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+            # A person's message keeps the plain call; only a wake asks to keep drafts.
+            options = {"keep_draft": True} if keep_draft else {}
+            await self._inject(
+                partial(inject_user_message, self._bridge_dir, content=text, **options)
+            )
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise
@@ -465,11 +492,27 @@ class ClaudeNativeExecutor(Executor):
                         # Refused before the message was typed: hold it and retry.
                         if not _can_hold_refusal(exc):
                             raise
+                        if delivery_is_next_turn_only():
+                            # A wake never waits here: the runner holds it.
+                            raise _NextTurnBusy(type(exc).__name__) from exc
                         if hold_deadline is None:
                             hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
                         if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
+        except _NextTurnBusy as exc:
+            # A turn, question or draft owns the terminal; nothing was typed.
+            _logger.info(
+                "claude-native: next-turn-only message held (%s)",
+                exc,
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message="Claude is busy, so this automation message waits for the next turn.",
+                code=NEXT_TURN_BUSY_CODE,
+                undelivered=True,
+            )
+            return
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
             # fails, but the person's own teardown is not a defect; a pane that

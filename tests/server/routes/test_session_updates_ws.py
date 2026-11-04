@@ -25,7 +25,21 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.extensions import (
+    EXTENSION_API_VERSION,
+    ExtensionManifest,
+    ExtensionPluginState,
+    StateContribution,
+    StateField,
+    StateVisibility,
+)
+from omnigent.extensions.published_fields import (
+    PublishedFieldView,
+    build_published_field_view,
+    configure_published_fields,
+)
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.extension_state import ExtensionStateService
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -543,6 +557,45 @@ def test_transient_store_error_does_not_kill_stream(
         f"expected the ticker to keep rescanning after a failed tick, "
         f"but get_conversations was called only {calls['n']} time(s)"
     )
+
+
+def test_server_written_published_field_pushes_changed_frame(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """Extension server code writing a published field reaches watching rows."""
+    manifest = ExtensionManifest(
+        id="acme.loop",
+        display_name="Loop",
+        distribution="omnigent-acme-loop",
+        version="1.0.0",
+        requires_omnigent=">=0",
+        extension_api=EXTENSION_API_VERSION,
+        state=StateContribution(
+            fields=(StateField("goal", StateVisibility.PUBLISHED, max_length=16),)
+        ),
+    )
+    configure_published_fields(
+        build_published_field_view((manifest,), is_enabled=lambda _extension_id: True)
+    )
+    service = ExtensionStateService(
+        ExtensionPluginState(manifests=(manifest,)),
+        is_enabled=lambda _extension_id: True,
+        store=stores[0],
+    )
+    s1 = _seed_session(stores, owner=ALICE, title="loop")
+    try:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+            _recv_until(ws, {"snapshot"})
+            service.write_state(s1, "acme.loop", "goal", b"met")
+            changed = _recv_until(ws, {"changed"})
+    finally:
+        configure_published_fields(PublishedFieldView())
+
+    [item] = changed["items"]  # type: ignore[misc]
+    assert item["published_fields"] == {"acme.loop": {"goal": "met"}}
 
 
 def test_session_added_event_pushes_unwatched_session(

@@ -20,7 +20,9 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
 
+from omnigent.errors import ErrorCode, OmnigentError
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
@@ -262,3 +264,61 @@ async def test_input_deny_publishes_committed_item_event(
     assert "Blocked by test policy" in text, (
         f"deny sentinel missing from committed item; got {item}"
     )
+
+
+async def test_server_message_goes_through_input_policy(
+    policy_app: FastAPI,
+    policy_client: httpx.AsyncClient,
+) -> None:
+    """A message the server sends for automation is policy-checked like a typed one."""
+    agent = await create_test_agent(policy_client)
+    session_id = await _create_session(policy_client, agent["id"])
+    await _attach_deny_policy(policy_client, session_id)
+
+    with pytest.raises(OmnigentError, match="Blocked by test policy") as refused:
+        await policy_app.state.server_message_dispatch(
+            policy_app,
+            session_id,
+            None,
+            [{"type": "input_text", "text": "[Automation: Goal loop] PR #7 failed CI"}],
+            origin={"source": "ext:acme.goal-loop"},
+        )
+
+    assert refused.value.code == ErrorCode.FORBIDDEN
+
+
+async def test_input_policy_sees_the_automation_behind_a_server_message(
+    policy_app: FastAPI,
+    policy_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQUEST policies judge the owner as actor and get the enabler in ``context.origin``."""
+    from omnigent.server.routes._sessions import orchestration
+
+    seen: list[object] = []
+    original = orchestration._evaluate_policy_with_fresh_engine
+
+    async def capture(session_id: str, spec: object, store: object, conv: object, ctx: object):
+        seen.append(ctx)
+        return await original(session_id, spec, store, conv, ctx)
+
+    monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", capture)
+    agent = await create_test_agent(policy_client)
+    session_id = await _create_session(policy_client, agent["id"])
+    await _attach_deny_policy(policy_client, session_id)
+
+    with pytest.raises(OmnigentError):
+        await policy_app.state.server_message_dispatch(
+            policy_app,
+            session_id,
+            None,
+            [{"type": "input_text", "text": "[Automation: Goal loop] PR #7 failed CI"}],
+            origin={"source": "ext:acme.goal-loop", "on_behalf_of": "bob@example.com"},
+        )
+
+    [ctx] = seen
+    assert ctx.origin == {  # type: ignore[attr-defined]
+        "kind": "automation",
+        "source": "ext:acme.goal-loop",
+        "on_behalf_of": "bob@example.com",
+    }

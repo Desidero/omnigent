@@ -6063,6 +6063,30 @@ describe("chatStore — send (file attachments)", () => {
     await sendPromise;
   });
 
+  it("keeps a server automation message's origin when it arrives live", () => {
+    useChatStore.setState({ conversationId: "conv_existing", pendingUserMessages: [] });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_wake",
+      itemType: "message",
+      createdBy: "owner@example.com",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "[Automation: Goal loop]\n\nPR #7 failed" }],
+        origin: { kind: "automation", source: "ext:acme.goal-loop", label: "Goal loop" },
+      },
+    });
+
+    const [block] = useChatStore.getState().blocks as UserMessageBlock[];
+    expect(block?.ctx.origin).toEqual({
+      kind: "automation",
+      source: "ext:acme.goal-loop",
+      label: "Goal loop",
+    });
+    expect(block?.ctx.createdBy).toBe("owner@example.com");
+  });
+
   it("preserves the real file_id through a text-only consumed event", async () => {
     // End-to-end claude-native: upload → text-only consumed event →
     // promoted bubble must carry the real id so UserBubble takes the

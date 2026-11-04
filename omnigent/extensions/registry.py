@@ -67,6 +67,8 @@ _ROUTE_SEGMENT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$")
 _ASSET_SEGMENT_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 _SYMBOL_RE = _ASSET_SEGMENT_RE
 _ACTIVATION_EVENT_RE = re.compile(r"^(onPage|onCommand):(.+)$")
+# ``package.module:function``; the activation checks the package is the extension's own.
+SERVER_ENTRYPOINT_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", re.ASCII)
 _MAX_TEXT_LENGTH = 512
 _MAX_ASSET_DEPTH = 16
 #: Reserved for core's own slot entries, which the web app registers itself.
@@ -792,6 +794,14 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
         )
         if manifest.entrypoints.browser_css != "dist/extension.css":
             raise ExtensionValidationError("browser CSS entrypoint must be dist/extension.css")
+
+    server = manifest.entrypoints.server
+    if server is not None and (
+        not isinstance(server, str) or not SERVER_ENTRYPOINT_RE.fullmatch(server)
+    ):
+        raise ExtensionValidationError(
+            f"extension {manifest.id!r} server entrypoint must be 'package.module:function'"
+        )
 
     invalid_permissions = sorted(
         repr(permission)

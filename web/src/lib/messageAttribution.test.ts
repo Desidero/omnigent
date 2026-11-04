@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { TextDone, UserMessageBlock } from "./blocks";
-import type { ConversationItem } from "./conversationItems";
+import { messageOrigin, type ConversationItem } from "./conversationItems";
 import { itemsToBlocks } from "./itemsToBlocks";
+import { buildBubbles } from "./renderItems";
 
 function createdByOf(item: ConversationItem): unknown {
   return (item as Record<string, unknown>).created_by;
@@ -68,5 +69,32 @@ describe("message attribution", () => {
     const blocks = itemsToBlocks([userMessage("resp_1", "no author", "u1")]);
     const userBlocks = blocks.filter((b): b is UserMessageBlock => b.type === "user_message");
     expect(userBlocks[0]!.ctx.createdBy).toBeUndefined();
+  });
+
+  it("carries a server automation origin from history to the bubble", () => {
+    const wake = {
+      ...userMessage(
+        "resp_1",
+        "[Automation: Goal loop]\n\nPR #7 failed",
+        "u1",
+        "owner@example.com",
+      ),
+      origin: { kind: "automation", source: "ext:acme.goal-loop", label: "Goal loop" },
+    } as ConversationItem;
+    const blocks = itemsToBlocks([wake]);
+    const [bubble] = buildBubbles(blocks, null);
+
+    expect((blocks[0] as UserMessageBlock).ctx.origin).toEqual({
+      kind: "automation",
+      source: "ext:acme.goal-loop",
+      label: "Goal loop",
+    });
+    expect(bubble).toMatchObject({ kind: "user", origin: { source: "ext:acme.goal-loop" } });
+  });
+
+  it("ignores a malformed origin", () => {
+    expect(messageOrigin({ kind: "person", source: "x" })).toBeUndefined();
+    expect(messageOrigin({ kind: "automation" })).toBeUndefined();
+    expect(messageOrigin("automation")).toBeUndefined();
   });
 });

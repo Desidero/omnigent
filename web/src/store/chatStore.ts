@@ -58,7 +58,13 @@ import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import {
+  isMessageItem,
+  messageOrigin,
+  type ConversationItem,
+  type MessageItem,
+  type MessageOrigin,
+} from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
@@ -7812,6 +7818,7 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  origin?: MessageOrigin,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -7825,6 +7832,7 @@ function committedUserBlock(
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
+      ...(origin !== undefined ? { origin } : {}),
       // Client clock — see blockStream.ctx; keeps server-stamped
       // `createdAtS` comparisons single-clock. A promoted optimistic
       // bubble keeps its send-time stamp rather than re-stamping now.
@@ -8755,6 +8763,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  messageOrigin(event.data.origin),
                 ),
               ],
             };
@@ -8791,6 +8800,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 head.tempId,
                 event.createdBy ?? head.author,
                 head.createdAtS,
+                messageOrigin(event.data.origin),
               ),
             ],
           };
@@ -8802,7 +8812,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              messageOrigin(event.data.origin),
+            ),
           ],
         };
       });

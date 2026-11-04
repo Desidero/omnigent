@@ -258,8 +258,13 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    register_pull_request_info: Callable[..., None] | None = None,
 ) -> None:
-    """Register the resources routes on router."""
+    """Register the resources routes on router.
+
+    :param register_pull_request_info: Receives the Pull Requests panel's
+        reader, ``read(session_id, pr_url) -> info | None``, for server code.
+    """
     pull_request_store = server_prs.open_store(conversation_store)
 
     async def _require_filesystem_attachment_support(
@@ -3439,6 +3444,21 @@ def register_resources_routes(
 
     if pull_request_refresher is not None and pull_request_store is not None:
         pull_request_refresher.bind(_refresh_session_pull_requests)
+
+    async def _read_pull_request_info(session_id: str, pr_url: str) -> dict[str, Any] | None:
+        """One PR's panel info, only when this replica holds the session's host."""
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if (
+            conv is None
+            or conv.host_id is None
+            or host_registry is None
+            or host_registry.get(conv.host_id) is None
+        ):
+            return None
+        return await _github_info(session_id, conv, pr_url)
+
+    if register_pull_request_info is not None:
+        register_pull_request_info(_read_pull_request_info)
 
     @router.get("/sessions/{session_id}/pull-requests", response_model=SessionPullRequestList)
     async def list_session_pull_requests(

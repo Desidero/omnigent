@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
 from omnigent.extensions.api import (
@@ -56,6 +56,34 @@ class ExtensionStateAccessError(Exception):
 
 class ExtensionCommandArgumentError(ValueError):
     """A command argument is missing, unknown, or fails its declaration."""
+
+
+@dataclass(frozen=True)
+class CommandEvent:
+    """A declared command that ran, as told to its extension's server code.
+
+    :param extension_id: The extension declaring the command.
+    :param session_id: The session it ran on.
+    :param workspace_id: That session's workspace.
+    :param command_id: The command.
+    :param key: The state key it wrote or cleared.
+    :param deleted: Whether it was a clear command.
+    :param user_id: The caller, or ``None`` in single-user mode.
+    :param generation: The caller's account generation, for automation that
+        acts later on their behalf; ``None`` without account authentication.
+    """
+
+    extension_id: str
+    session_id: str
+    workspace_id: int
+    command_id: str
+    key: str
+    deleted: bool
+    user_id: str | None
+    generation: str | None
+
+
+CommandListener = Callable[[CommandEvent], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -123,6 +151,20 @@ class ExtensionStateService:
         self._plugin_state = plugin_state
         self._is_enabled = is_enabled
         self._store = store
+        self._command_listener: CommandListener | None = None
+
+    def set_command_listener(self, listener: CommandListener | None) -> None:
+        """Tell ``listener`` about every command that ran (see :meth:`notify_command`)."""
+        self._command_listener = listener
+
+    async def notify_command(self, event: CommandEvent) -> None:
+        """Tell the listener a command ran; its failures are logged, never raised."""
+        if self._command_listener is None:
+            return
+        try:
+            await self._command_listener(event)
+        except Exception:
+            _logger.exception("extension command listener failed for %s", event.command_id)
 
     def manifest(self, extension_id: str) -> ExtensionManifest:
         """Return an enabled extension's manifest.
@@ -186,6 +228,35 @@ class ExtensionStateService:
             readable = [entry for entry in readable if entry.key > after]
         page = readable[:limit]
         return page, page[-1].key if len(readable) > limit else None
+
+    def read_state(
+        self, conversation_id: str, extension_id: str, key: str
+    ) -> ExtensionStateEntry | None:
+        """Read any key as the extension's server code, service keys included."""
+        self.manifest(extension_id)
+        return self._store.get_extension_state(conversation_id, extension_id, key)
+
+    def list_state(self, conversation_id: str, extension_id: str) -> list[ExtensionStateEntry]:
+        """Every key the extension holds on a session, as its server code sees them."""
+        self.manifest(extension_id)
+        entries, _ = self._store.list_extension_state(
+            conversation_id, extension_id, limit=_ALL_KEYS_PAGE
+        )
+        return entries
+
+    def sessions_with_state(
+        self,
+        extension_id: str,
+        *,
+        key_prefix: str | None = None,
+        after: tuple[int, str] | None = None,
+        limit: int = _ALL_KEYS_PAGE,
+    ) -> list[tuple[int, str]]:
+        """One page of ``(workspace_id, session_id)`` where the extension holds state."""
+        self.manifest(extension_id)
+        return self._store.list_extension_state_sessions(
+            extension_id, key_prefix=key_prefix, after=after, limit=limit
+        )
 
     def write_state(
         self,

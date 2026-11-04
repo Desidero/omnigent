@@ -1387,6 +1387,27 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_extension_state_sessions(
+        self,
+        extension_id: str,
+        *,
+        key_prefix: str | None = None,
+        after: tuple[int, str] | None = None,
+        limit: int = 100,
+    ) -> list[tuple[int, str]]:
+        """
+        Page the sessions, in every workspace, where an extension holds state.
+
+        :param extension_id: The owning extension.
+        :param key_prefix: Only sessions holding a key that starts with this.
+        :param after: The last ``(workspace_id, session_id)`` of the
+            previous page, or ``None`` for the first page.
+        :param limit: Page size, from 1 to 100.
+        :returns: ``(workspace_id, session_id)`` pairs in that order.
+        """
+        ...
+
+    @abstractmethod
     def _put_extension_state(
         self,
         conversation_id: str,

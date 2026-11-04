@@ -88,6 +88,7 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
     with_input_attributes,
 )
+from omnigent.native.next_turn import NEXT_TURN_BUSY_CODE, delivery_is_next_turn_only
 from omnigent.process_logging import log_once
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
@@ -107,6 +108,12 @@ _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     code="codex_compacting",
     title="Codex is compacting",
     remediation="Wait for compaction to finish, then send your message again.",
+)
+_CODEX_NEXT_TURN_BUSY_FAILURE = CodexStartupFailure(
+    message="Codex is running a turn, so this automation message waits for the next one.",
+    code=NEXT_TURN_BUSY_CODE,
+    title="Waiting for the current turn",
+    remediation="It is sent when the current turn ends.",
 )
 _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     message="Codex disconnected while submitting this message. It may already be running.",
@@ -518,6 +525,74 @@ async def _run_codex_shell_command(
         client, bridge_dir, state, wait_seconds=_SHELL_TURN_WAIT_SECONDS, require_idle=False
     )
     _logger.info("Codex native submitted user shell command")
+
+
+async def _probe_active_turn(
+    client: CodexAppServerClient, state: CodexNativeBridgeState, timeout_seconds: float
+) -> str | Literal[False] | None:
+    """Ask Codex core which turn is active, without adding input.
+
+    :returns: The active turn id, ``False`` when no turn is active, or
+        ``None`` when Codex did not say.
+    """
+    expected_turn_id = f"omnigent-turn-probe-{uuid.uuid4().hex}"
+    try:
+        # A steer with a wrong expected id is refused before it touches the turn.
+        async with asyncio.timeout(timeout_seconds):
+            await client.request(
+                "turn/steer",
+                {"threadId": state.thread_id, "expectedTurnId": expected_turn_id, "input": []},
+            )
+    except CodexAppServerResponseError as error:
+        if error.code != -32600:
+            return None
+        if error.message == "no active turn to steer":
+            return False
+        prefix = f"expected active turn id `{expected_turn_id}` but found `"
+        message = error.message or ""
+        if message.startswith(prefix) and message.endswith("`"):
+            active_turn_id = message[len(prefix) : -1]
+            if active_turn_id and "`" not in active_turn_id:
+                return active_turn_id
+    except (TimeoutError, OSError, RuntimeError, WebSocketException):
+        _logger.debug("Codex active-turn probe got no answer", exc_info=True)
+    return None
+
+
+async def _start_codex_next_turn(
+    client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    input_items: list[dict[str, object]],
+    settings_overrides: Mapping[str, object],
+) -> None:
+    """Start a turn for a next-turn-only message; refuse it while a turn runs.
+
+    Never steers: Codex core is asked which turn is active, and an unanswered
+    probe falls back to the bridge's record.
+    """
+    state = await _wait_for_shell_completion(client, bridge_dir, state)
+    active = await _probe_active_turn(client, state, _SHELL_RECONCILIATION_RPC_SECONDS)
+    if active is None:
+        # Codex core didn't answer; the bridge's record may be stale either way.
+        _logger.warning(
+            "Codex active-turn probe got no usable answer; using the bridge record (%s)",
+            state.active_turn_id or "no active turn",
+        )
+        active = state.active_turn_id or False
+    if active is not False:
+        raise _CodexNativeInputUndelivered(_CODEX_NEXT_TURN_BUSY_FAILURE)
+    if state.active_turn_id is not None:
+        # The bridge still names a turn Codex says has ended.
+        clear_active_turn_id_if_matches(bridge_dir, state.active_turn_id)
+    await _start_codex_turn(
+        client,
+        bridge_dir=bridge_dir,
+        state=state,
+        input_items=input_items,
+        settings_overrides=settings_overrides,
+    )
 
 
 async def _reconcile_shell_command(
@@ -1116,7 +1191,12 @@ class CodexNativeExecutor(Executor):
                                         "objective": goal_objective,
                                     },
                                 )
-                            await _inject_codex_turn(
+                            deliver = (
+                                _start_codex_next_turn
+                                if delivery_is_next_turn_only()
+                                else _inject_codex_turn
+                            )
+                            await deliver(
                                 client,
                                 bridge_dir=self._bridge_dir,
                                 state=state,
@@ -1140,8 +1220,13 @@ class CodexNativeExecutor(Executor):
                         ) and is_compaction_steer_refusal(exc):
                             startup_failure = _CODEX_COMPACTING_FAILURE
                             undelivered = True
-                        _logger.exception(
-                            "Codex native turn injection failed",
+                        held = startup_failure is _CODEX_NEXT_TURN_BUSY_FAILURE
+                        # A next-turn-only message waiting for a running turn is no failure.
+                        _logger.log(
+                            logging.INFO if held else logging.ERROR,
+                            "Codex native turn injection %s",
+                            "held for the next turn" if held else "failed",
+                            exc_info=not held,
                             extra=with_input_attributes(
                                 debug_event(
                                     "codex_turn_injection_failed",

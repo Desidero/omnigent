@@ -104,7 +104,9 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
+from omnigent.server.extension_activation import ExtensionActivations
 from omnigent.server.extension_state import ExtensionStateService
+from omnigent.server.extension_status_observers import ExtensionStatusObservers
 from omnigent.server.feature_flags import (
     Feature,
     FeatureFlags,
@@ -175,6 +177,7 @@ from omnigent.server.server_config import (
     RESTRICT_TO_AGENT_NAMES_KEY,
     PickerCuration,
 )
+from omnigent.server.session_wake import SessionWakeService, build_session_wake
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1723,7 +1726,8 @@ def create_app(
         enabled set once at application construction.
     :param extension_is_enabled: The operator's persistent enablement of an
         extension id, which gates extension session state, commands and
-        published fields. ``None`` uses the server config's
+        published fields, ``ext:`` session-wake sources and extension status
+        observers. ``None`` uses the server config's
         ``extensions.<id>.enabled: true``, the switch that turns on UI slots.
     :param extension_state: Optional pre-resolved installed-extension registry.
         When omitted, entry points are discovered once at application
@@ -2227,12 +2231,30 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        session_wake: SessionWakeService = app_inst.state.session_wake
+        extension_status_observers: ExtensionStatusObservers = (
+            app_inst.state.extension_status_observers
+        )
+        extension_activations: ExtensionActivations = app_inst.state.extension_activations
         try:
+            await session_wake.start()
+            extension_status_observers.start()
+            await extension_activations.start()
             with monitor_event_loop():
                 yield
         finally:
             session_pull_requests.install_refresher(None)
-            await pull_request_refresher.aclose()
+            # Each step runs even when an earlier one fails.
+            for close in (
+                extension_activations.aclose,
+                pull_request_refresher.aclose,
+                extension_status_observers.aclose,
+                session_wake.aclose,
+            ):
+                try:
+                    await close()
+                except Exception:
+                    _logger.exception("Lifespan cleanup step %s failed", close)
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
                 with suppress(asyncio.CancelledError):
@@ -2309,6 +2331,34 @@ def create_app(
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
     app.state.runner_tunnel_tokens = runner_tunnel_tokens
+    build_session_wake(
+        app,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        host_registry=host_registry,
+        extension_is_enabled=extension_state_enabled,
+    )
+    # Extensions observe status edges under the same operator enablement.
+    app.state.extension_status_observers = ExtensionStatusObservers(
+        is_enabled=extension_state_enabled
+    )
+    extension_state_service = ExtensionStateService(
+        installed_extension_state,
+        is_enabled=extension_state_enabled,
+        store=conversation_store,
+    )
+    extension_activations = ExtensionActivations(
+        resolved_extension_state,
+        is_enabled=extension_state_enabled,
+        state_service=extension_state_service,
+        status_observers=app.state.extension_status_observers,
+        session_wake=app.state.session_wake,
+        conversation_store=conversation_store,
+        host_registry=host_registry,
+        pull_request_info=lambda: getattr(app.state, "pull_request_info", None),
+    )
+    app.state.extension_activations = extension_activations
 
     def _admit_host_launch(
         host_id: str,
@@ -3806,6 +3856,9 @@ def create_app(
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
             pull_request_refresher=pull_request_refresher,
+            register_pull_request_info=lambda handler: setattr(
+                app.state, "pull_request_info", handler
+            ),
             register_startup_dispatch=lambda handler: (
                 setattr(startup_inputs, "dispatch", handler)
                 if startup_inputs is not None
@@ -3816,6 +3869,9 @@ def create_app(
             ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
+            ),
+            register_server_message=lambda handler: setattr(
+                app.state, "server_message_dispatch", handler
             ),
         ),
         prefix="/v1",
@@ -3882,17 +3938,14 @@ def create_app(
             permission_store=permission_store,
             enablement=extension_enablement,
             state_enabled=extension_state_enabled,
+            activations=extension_activations.records,
         ),
         prefix="/v1",
         tags=["extensions"],
     )
     app.include_router(
         create_extension_state_router(
-            ExtensionStateService(
-                installed_extension_state,
-                is_enabled=extension_state_enabled,
-                store=conversation_store,
-            ),
+            extension_state_service,
             conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,

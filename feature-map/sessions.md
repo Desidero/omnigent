@@ -356,6 +356,29 @@ PR while offline; linking needs the host. Reconnect and verify live checks and
 merge controls return. Unlink the last PR and verify it stays absent after refresh.
 A session not yet imported to the server says so. Older servers retain their
 host-dependent unlink behavior.
+A turn's end refreshes the stored summary even if nobody has the session open:
+merge a linked PR elsewhere, let a turn finish without opening Pull Requests,
+wait about ten seconds, then stop the host; the summary shows it merged.
+
+**Session wake (server automation):** no UI starts one yet; server code calls
+`app.state.session_wake.request(...)` (see `docs/extending/session_wake.md`).
+On a throwaway local server, request a `core:` wake for an idle session from a
+Python shell attached to the app, or through a test: the message arrives once,
+as the session owner, prefixed `[Automation: …]`. Request one while a turn runs:
+nothing is sent until the turn ends, then it arrives as the next turn. In the
+web chat the bubble carries an **Automation · <label>** chip with "on behalf of
+<user>" instead of the header line, live and after a reload; a native
+session's still-pending wake shows as a plain queued bubble until the terminal
+records it.
+
+**Extension server code (experimental):** an operator-enabled extension whose
+manifest names `entrypoints.server` runs its `activate(ctx)` at server start
+(see `docs/extending/server_activation.md`). No UI shows it; check it as an
+administrator with `GET /v1/extensions/diagnostics`, whose `activations` list
+shows `active`, or `quarantined` with the error when `activate` raised. A
+quarantined extension's pages and state keep working and the server keeps
+serving. `omni extensions doctor <id>` imports the entrypoint without running
+it and says whether activation would quarantine it.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -1111,6 +1134,10 @@ plain `uv run pytest`, which starts a private server for the test.
   SDK as the viewer (a read-only sharee runs only read commands), and checks
   the header action labelled by a published field. Its bundle is built from
   the package's `web/` with the `vite build` command in its config.
+- **Extension server activation (server integration, plain `uv run pytest`):**
+  `tests/server/test_extension_activation.py` runs the real lifespan with a
+  fixture extension: enabled or not, quarantine, shutdown, and each `ctx`
+  surface against the real services.
 
 For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and

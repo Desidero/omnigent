@@ -199,4 +199,6 @@ through `ExtensionStateService.write_state` and `clear_state`
 (`omnigent.server.extension_state`), which mirror published keys as the
 manifest says, hold a published key to the same UTF-8 and `max_length` rules
 as commands, and refuse (`ValueError`) a value a published field doesn't list
-when it lists its `values`.
+when it lists its `values`. An activated extension uses `ctx.state`, which
+calls them for its own id, and hears its commands through `ctx.on_command`
+(see [Extension server activation](server_activation.md)).
