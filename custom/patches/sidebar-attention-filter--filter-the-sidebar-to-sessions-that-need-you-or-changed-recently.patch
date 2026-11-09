@@ -38,21 +38,21 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/lib/sidebarFocusPreferences.test.ts |  56 +++++
  web/src/lib/sidebarFocusPreferences.ts      |  78 ++++++
  web/src/shell/Sidebar.test.tsx              |  93 +++++++
- web/src/shell/Sidebar.tsx                   | 261 ++++++++++++++++++--
+ web/src/shell/Sidebar.tsx                   | 257 ++++++++++++++++++--
  web/src/shell/sidebarNav.test.ts            |  52 ++++
  web/src/shell/sidebarNav.ts                 |  17 ++
- 7 files changed, 557 insertions(+), 24 deletions(-)
+ 7 files changed, 553 insertions(+), 24 deletions(-)
  create mode 100644 web/src/lib/sidebarFocusPreferences.test.ts
  create mode 100644 web/src/lib/sidebarFocusPreferences.ts
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index 6c4730d728c989a6b10392e4c5240dd4e83c6895..e502b65f42e4be5cf1e2ae2f6d8b6649ce55bed5 100644
+index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..85b866fa559b4bb3987db18766681f132d4ae4a4 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
-@@ -159,6 +159,13 @@ the header menu), and each place is a separate entry point.
-   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
-   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
-   a flat Display filter and the tooltip keeps its plain layout.
+@@ -210,6 +210,13 @@ the header menu), and each place is a separate entry point.
+   the `sidebar_grouping_ui` release flag, on by default; with
+   `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the Sessions header keeps a flat
+   Display filter and the tooltip keeps its plain layout.
 +- `attention-filters`: **Needs me** (a pending approval or an unread agent
 +  reply, the same read state as the unread dot) and **Updated** (Any time, Last
 +  24 hours, Last 3 days, Last 7 days or Last 30 days, as rolling windows)
@@ -60,12 +60,12 @@ index 6c4730d728c989a6b10392e4c5240dd4e83c6895..e502b65f42e4be5cf1e2ae2f6d8b6649
 +  with the grouping flag on or off. While one is on, project folders with no
 +  match are hidden, the funnel is highlighted, pins and the open session stay
 +  listed, and a chip per filter beside the funnel clears just that filter.
- 
- ## How to get to it (user POV)
- 
-@@ -275,6 +282,11 @@ the server keeps the unlink. A session whose PRs the server hasn't imported yet
- says so instead. Against servers that predate stored PRs, the tab behaves as it
- did before and unlinking needs the host.
+ - `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
+   drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
+   a third of its width, or after a quick flick, closes it; a shorter drag springs
+@@ -400,6 +407,11 @@ merge controls return. Unlink the last PR and verify it stays absent after refre
+ A session not yet imported to the server says so. Older servers retain their
+ host-dependent unlink behavior.
  
 +**Needs me and Updated filters:** open the same funnel, with or without
 +`sidebar_grouping_ui`, and tick **Needs me** or pick a window under
@@ -75,10 +75,10 @@ index 6c4730d728c989a6b10392e4c5240dd4e83c6895..e502b65f42e4be5cf1e2ae2f6d8b6649
  **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
  a session card once. Expand navigation manually to keep it open while switching
  cards. Choosing Canvas in the sidebar returns to the selected board.
-@@ -913,6 +925,14 @@ plain `uv run pytest`, which starts a private server for the test.
-   (enable the flag by patching `GET /v1/info`). Unit tests in
-   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
-   that the flag-off sidebar ignores stored view options.
+@@ -1186,6 +1198,14 @@ plain `uv run pytest`, which starts a private server for the test.
+   under the folder while pages remain; after three automatic loads (the default
+   budget), further pages need a click on it. Turn the switch back on for the
+   saved count plus Show more.
 +- **`attention-filters`:** component coverage in `web/src/shell/Sidebar.test.tsx`,
 +  `web/src/shell/sidebarNav.test.ts` and
 +  `web/src/lib/sidebarFocusPreferences.test.ts`; no browser test. By hand: with
@@ -88,9 +88,9 @@ index 6c4730d728c989a6b10392e4c5240dd4e83c6895..e502b65f42e4be5cf1e2ae2f6d8b6649
 +  older session present and expect it hidden and a **24h** chip. Reload and
 +  expect both kept; click each chip and expect the full list back.
  
- ## Gotchas
- 
-@@ -986,3 +1006,7 @@ plain `uv run pytest`, which starts a private server for the test.
+ For the desktop Close shortcut, select a side-chat tab in an ordinary
+ session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
+@@ -1298,3 +1318,7 @@ its discoverability.
  - Grouping and ordering apply to the loaded pages only: an older session joins
    its group once it is paged in. Grouped views hide Projects, so dragging a
    session onto the list never removes it from its project there.
@@ -245,18 +245,18 @@ index 0000000000000000000000000000000000000000..ce0e8889f6f479091a66179426f16168
 +  }
 +}
 diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
-index 66f3f88638d962f7da07d65cd5fcea6d9a9831a0..08674e01b8f75c89f3b9ea9f6fd5e06cf08715db 100644
+index 5b56ab77c72286f6729dadc51e48306926952367..cc7b3580bb102c482ec5c5def410964310f551b2 100644
 --- a/web/src/shell/Sidebar.test.tsx
 +++ b/web/src/shell/Sidebar.test.tsx
-@@ -13,6 +13,7 @@ import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
- 
- import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
- import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+@@ -23,6 +23,7 @@ import {
+   waitFor,
+   within,
+ } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
+ import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
  import { useEffect } from "react";
  import { GridSessionsProvider } from "@/grid/GridSessionsContext";
- import * as readStateHooks from "@/hooks/useUnseenConversations";
-@@ -2273,6 +2274,98 @@ describe("Sidebar project sections", () => {
+@@ -2557,6 +2558,98 @@ describe("Sidebar project sections", () => {
      expect(within(recentSection).queryByText("conv_filed")).toBeNull();
    });
  
@@ -356,18 +356,18 @@ index 66f3f88638d962f7da07d65cd5fcea6d9a9831a0..08674e01b8f75c89f3b9ea9f6fd5e06c
      projectsMock.push("Customer X");
      // The global list holds only an unfiled chat — the project's sessions are
 diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
-index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c22326e418 100644
+index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9ff45ebf94 100644
 --- a/web/src/shell/Sidebar.tsx
 +++ b/web/src/shell/Sidebar.tsx
-@@ -118,6 +118,7 @@ import {
+@@ -126,6 +126,7 @@ import {
  } from "@/lib/routing";
- import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
+ import { SidebarHeaderActions, SidebarSearchButton } from "./SidebarHeaderActions";
  import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 +import { Badge } from "@/components/ui/badge";
  import { Button } from "@/components/ui/button";
+ import { OmniGlassSurface } from "@/components/OmniGlassSurface";
  import {
-   Dialog,
-@@ -234,6 +235,15 @@ import {
+@@ -258,6 +259,15 @@ import {
    type SidebarShowField,
    type SidebarViewPreferences,
  } from "@/lib/sidebarViewPreferences";
@@ -383,7 +383,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
  import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
  import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
  import { useViewerId } from "@/hooks/useViewerId";
-@@ -266,6 +276,7 @@ import {
+@@ -293,6 +303,7 @@ import {
    dateBucket,
    writeLegacyPinnedConversationIds,
    isOwnedByViewer,
@@ -391,57 +391,57 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
    sessionBelongsToProject,
    sessionsListAcceptsDrop,
  } from "./sidebarNav";
-@@ -1463,6 +1474,7 @@ function ProjectFolder({
-   onProjectAssigned,
-   onConversationsLoaded,
+@@ -1593,6 +1604,7 @@ function ProjectFolder({
    ordering,
+   scrollRoot,
+   pageSize,
 +  matches,
  }: {
-   ordering: {
-     disabled: boolean;
-@@ -1507,6 +1519,8 @@ function ProjectFolder({
-       global list — or an out-of-window member would silently drop from the
-       action. */
-   onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
-+  /** The "Needs me" / recency filter, or null when neither is on. */
+   /** The sidebar's scroll container, the root for unpaginated auto-loading. */
+   scrollRoot: RefObject<HTMLElement | null>;
+@@ -1650,6 +1662,8 @@ function ProjectFolder({
+     conversations: Conversation[],
+     visibleCount: number,
+   ) => void;
++  /** The recency filter, or null when it is off. */
 +  matches: ((c: Conversation) => boolean) | null;
  }) {
-   const { registerFolder, sortBy } = useSidebarData();
+   const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
    const viewerId = useViewerId();
-@@ -1534,7 +1548,8 @@ function ProjectFolder({
-         (c) =>
-           (c.archived === true) === archived &&
-           sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
--          (archived || !pinnedSet.has(c.id)),
-+          (archived || !pinnedSet.has(c.id)) &&
-+          (matches?.(c) ?? true),
-       ),
-       activeOverride,
-       frozenSortKeys,
-@@ -1551,6 +1566,7 @@ function ProjectFolder({
+@@ -1680,7 +1694,8 @@ function ProjectFolder({
+           (c) =>
+             (c.archived === true) === archived &&
+             sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
+-            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))),
++            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))) &&
++            (matches?.(c) ?? true),
+         ),
+         activeOverride,
+         frozenSortKeys,
+@@ -1701,6 +1716,7 @@ function ProjectFolder({
      projectId,
      name,
      viewerId,
 +    matches,
    ]);
-   const errors = useSessionErrorStates(conversations);
-   const startingConversationId = useChatStore((s) =>
-@@ -1695,7 +1711,10 @@ function ProjectFolder({
-             </div>
-           ) : (
-             <InfiniteScrollSentinel
--              hasMore={query.hasNextPage}
-+              // Filtered rows are recent or unread, so older pages would only
-+              // be fetched and hidden — and an all-hidden page keeps the
-+              // sentinel in view, paging through the whole project.
-+              hasMore={matches === null && query.hasNextPage}
-               isFetching={query.isFetchingNextPage}
-               fetchMore={query.fetchNextPage}
-               scrollRoot={scrollRoot}
-@@ -1806,6 +1825,21 @@ function ConversationList({
-     },
-     [view.grouping, saveView, selectionMode, onExitSelectionMode],
-   );
+   // Each expansion, archive switch or re-sort restarts the page count and auto-load
+   // budget; when paginated, the open session is never left hidden.
+@@ -1794,7 +1810,10 @@ function ProjectFolder({
+   } else if (pageSize === undefined) {
+     footer = (
+       <InfiniteScrollSentinel
+-        hasMore={query.hasNextPage}
++        // Filtered rows are recent, so older pages would only be fetched and
++        // hidden — and an all-hidden page keeps the sentinel in view, paging
++        // through the whole project.
++        hasMore={matches === null && query.hasNextPage}
+         isFetching={query.isFetchingNextPage}
+         fetchMore={query.fetchNextPage}
+         scrollRoot={scrollRoot}
+@@ -2101,6 +2120,21 @@ function ConversationList({
+         : undefined;
+     saveView(custom ? { ...patch, custom } : patch);
+   });
 +  const [focus, setFocus] = useState<SidebarFocus>(readSidebarFocus);
 +  const updateFocus = useCallback(
 +    (patch: Partial<SidebarFocus>) => {
@@ -460,7 +460,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
    const grouped = view.grouping !== "default";
    const harnessLabels = useHarnessLabels(view.grouping === "harness");
    const harnessLabel = useCallback(
-@@ -1818,7 +1852,7 @@ function ConversationList({
+@@ -2113,7 +2147,7 @@ function ConversationList({
    // Status buckets read the unread mirror and the drafts store; only a status
    // view subscribes, so other views don't re-render the list on those writes.
    const statusView = view.grouping === "status";
@@ -468,8 +468,8 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
 +  const unseenTick = useUnseenTick(statusView || focus.needsMe);
    const draftIds = useSessionDraftIds(statusView);
    const startingId = useStartingConversationId(statusView);
-   // All loaded conversations from the single paginated list (for the flat
-@@ -1948,6 +1982,18 @@ function ConversationList({
+   const { conversationId: activeId } = useParams<{ conversationId: string }>();
+@@ -2267,6 +2301,18 @@ function ConversationList({
    // sessions render in their own group at the bottom (below "Shared with
    // me"); a pinned-then-archived session shows under Archived, not Pinned.
    const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
@@ -488,26 +488,28 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
    const loadedSections = useMemo(() => {
      // Merge the server pinned set in, so a pinned session outside the loaded
      // paginated window still renders. Dedupe by id: a pinned session is usually
-@@ -1964,6 +2010,8 @@ function ConversationList({
+@@ -2286,6 +2332,8 @@ function ConversationList({
            : activeTab === "mine"
-             ? notArchived.filter((c) => isOwnedByViewer(c, viewerId))
-             : notArchived;
+             ? listed.filter((c) => isOwnedByViewer(c, viewerId))
+             : listed;
 +    // Pins stay put under every filter, so "Needs me" / recency apply after them.
 +    const focused = focusMatches ? tabScoped.filter(focusMatches) : tabScoped;
  
      // Pinned takes precedence over Project: pinning a session moves it OUT of
      // its project into the flat global Pinned section (no nested pins). Ordered
-@@ -2001,19 +2049,31 @@ function ConversationList({
-         id,
+@@ -2325,20 +2373,33 @@ function ConversationList({
          name,
          icon,
--        conversations: sortConversations(inProject, activeOverride, frozenKeys, sortBy),
-+        conversations: sortConversations(
-+          focusMatches ? inProject.filter(focusMatches) : inProject,
-+          activeOverride,
-+          frozenKeys,
-+          sortBy,
-+        ),
+         conversations: orderSessionFamilies(
+-          sortConversations(inProject, activeOverride, frozenKeys, sortBy, customOrder),
++          sortConversations(
++            focusMatches ? inProject.filter(focusMatches) : inProject,
++            activeOverride,
++            frozenKeys,
++            sortBy,
++            customOrder,
++          ),
+         ),
        };
      });
 -    // NOTE: empty projects are intentionally NOT filtered out. A project comes
@@ -536,33 +538,26 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
        activeOverride,
        frozenKeys,
        sortBy,
-@@ -2037,7 +2097,15 @@ function ConversationList({
-     const ordered = splitShared
-       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
-       : allOrdered;
--    if (!grouped) return { pinned, shared, sessions: ordered, projectGroups, groupTitles: null };
-+    if (!grouped) {
-+      return {
-+        pinned,
-+        shared,
-+        sessions: ordered,
+@@ -2368,7 +2429,7 @@ function ConversationList({
+         pinned,
+         shared,
+         sessions: orderSessionFamilies(ordered),
+-        projectGroups,
 +        projectGroups: visibleProjectGroups,
-+        groupTitles: null,
-+      };
-+    }
+         groupTitles: null,
+       };
      // Buckets use render-time "now", so a day rollover shows on the next list update.
-     const now = new Date();
-     const groupTitles = new Map<string, string>(
-@@ -2059,13 +2127,15 @@ function ConversationList({
+@@ -2415,7 +2476,7 @@ function ConversationList({
      const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
-       (g) => g.conversations,
+       (g) => orderSessionFamilies(g.conversations),
      );
 -    return { pinned, shared, sessions, projectGroups, groupTitles };
 +    return { pinned, shared, sessions, projectGroups: visibleProjectGroups, groupTitles };
      // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
      // eslint-disable-next-line react-hooks/exhaustive-deps
    }, [
-     allConversations,
+@@ -2423,6 +2484,8 @@ function ConversationList({
+     activeRootSessionId,
      pinnedConversations,
      pinnedSet,
 +    focusMatches,
@@ -570,7 +565,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
      activeOverride,
      frozenKeys,
      frozenStatus,
-@@ -2558,7 +2628,11 @@ function ConversationList({
+@@ -2980,7 +3043,11 @@ function ConversationList({
      ...(sections.shared.length > 0 || sharedListOnly ? ["Shared"] : []),
      ...(sharedListOnly ? [] : (sessionGroups?.map((g) => g.title) ?? ["Chats"])),
    ];
@@ -583,7 +578,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
  
    // List header controls and row props, shared by the Shared, single "Sessions"
    // and grouped sections; the controls sit on the first of the viewer's lists.
-@@ -2637,13 +2711,24 @@ function ConversationList({
+@@ -3064,13 +3131,24 @@ function ConversationList({
      </div>
    ) : undefined;
    const sessionsFilterMenu = (
@@ -615,7 +610,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
    );
  
    // Archived sessions are surfaced on the Settings page, not here, so they
-@@ -2868,7 +2953,9 @@ function ConversationList({
+@@ -3309,7 +3387,9 @@ function ConversationList({
                                  !projectOrder.data ||
                                  saveOrder.isPending ||
                                  selectionMode ||
@@ -626,10 +621,10 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
                                first: index === 0,
                                last: index === projects.length - 1,
                                move: (destination) => moveProject(group.name, destination),
-@@ -2901,12 +2988,15 @@ function ConversationList({
-                             onToggleSelected={onToggleSelected}
+@@ -3347,12 +3427,15 @@ function ConversationList({
                              onProjectAssigned={expandProject}
                              onConversationsLoaded={handleFolderConversationsLoaded}
+                             reorderable={reorderable}
 +                            matches={focusMatches}
                            />
                          ))}
@@ -643,7 +638,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
                          )}
                      </SectionGroup>
                    )}
-@@ -2974,7 +3064,13 @@ function ConversationList({
+@@ -3422,7 +3505,13 @@ function ConversationList({
                          <ConversationSection
                            title="Sessions"
                            conversations={sections.sessions}
@@ -658,7 +653,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
                            footer={sessionStatus}
                            collapsed={effectiveCollapsedSections.includes("Chats")}
                            onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-@@ -3350,6 +3446,111 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
+@@ -3810,6 +3899,111 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
    repo: "Repo",
    branch: "Branch",
  };
@@ -770,7 +765,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
  
  // A filter-menu submenu whose trigger shows the current pick at its right edge.
  function FilterMenuSub({
-@@ -3384,6 +3585,9 @@ function SessionFilterMenu({
+@@ -3844,6 +4038,9 @@ function SessionFilterMenu({
    multiUser,
    view,
    onViewChange,
@@ -780,7 +775,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
  }: {
    value: SidebarTab;
    onChange: (value: SidebarTab) => void;
-@@ -3391,10 +3595,14 @@ function SessionFilterMenu({
+@@ -3851,10 +4048,14 @@ function SessionFilterMenu({
    /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
    view: SidebarViewPreferences | null;
    onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
@@ -795,7 +790,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
    const filters = multiUser
      ? SIDEBAR_FILTERS
      : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
-@@ -3419,12 +3627,15 @@ function SessionFilterMenu({
+@@ -3880,12 +4081,18 @@ function SessionFilterMenu({
            <span className="inline-flex shrink-0" {...tooltip.triggerProps}>
              <DropdownMenuTrigger asChild>
                <Button
@@ -805,14 +800,17 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
                  size="icon-xs"
                  aria-label={triggerLabel}
                  data-testid="session-filter"
--                className="text-muted-foreground"
+-                className="text-muted-foreground mobile-touch-target"
 +                data-focus-active={isSidebarFocusActive(focus) || undefined}
 +                // Highlighted while rows are hidden, so a short list isn't mistaken for missing sessions.
-+                className={isSidebarFocusActive(focus) ? "text-primary" : "text-muted-foreground"}
++                className={cn(
++                  isSidebarFocusActive(focus) ? "text-primary" : "text-muted-foreground",
++                  "mobile-touch-target",
++                )}
                  onClick={(event) => event.stopPropagation()}
                >
                  <ListFilterIcon className="size-3.5" />
-@@ -3441,6 +3652,7 @@ function SessionFilterMenu({
+@@ -3902,6 +4109,7 @@ function SessionFilterMenu({
          <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
            <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
            {displayOptions}
@@ -820,7 +818,7 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
          </DropdownMenuContent>
        ) : (
          <DropdownMenuContent align="end" className="min-w-56">
-@@ -3471,6 +3683,7 @@ function SessionFilterMenu({
+@@ -3933,6 +4141,7 @@ function SessionFilterMenu({
            >
              {displayOptions}
            </FilterMenuSub>
@@ -829,18 +827,18 @@ index a851154caaef7330f092a165228dbb363d606376..6986861e2e32783c97b8a9e13d91c8c2
              label="Ordering"
              value={ORDERING_LABELS[view.ordering]}
 diff --git a/web/src/shell/sidebarNav.test.ts b/web/src/shell/sidebarNav.test.ts
-index 05b0c5cd88c88da4e489dd81c04d31216bdcede7..e9ac5de0a15dc584e2b42af80ec1b5c2298c754e 100644
+index 13fb54e34dfdb08f0f530f8b440bed03e5c85922..7ad7957ca9964d10e50fb29083160118948d6410 100644
 --- a/web/src/shell/sidebarNav.test.ts
 +++ b/web/src/shell/sidebarNav.test.ts
-@@ -11,6 +11,7 @@ import {
-   getConversationIconKind,
+@@ -13,6 +13,7 @@ import {
    groupConversations,
    getConversationAgentType,
+   customSortOrder,
 +  matchesSidebarFocus,
    migratePinnedConversationIds,
+   moveCustomOrder,
    orderByPinnedTimestamp,
-   pinOrderWrites,
-@@ -711,6 +712,57 @@ describe("dateBucket", () => {
+@@ -752,6 +753,57 @@ describe("dateBucket", () => {
    });
  });
  
@@ -899,18 +897,18 @@ index 05b0c5cd88c88da4e489dd81c04d31216bdcede7..e9ac5de0a15dc584e2b42af80ec1b5c2
    it("returns non-empty groups in bucket order, keeping row order", () => {
      const rows = ["a", "b", "c", "d"].map((id) => conversation(id, id, new Date(2026, 0, 1)));
 diff --git a/web/src/shell/sidebarNav.ts b/web/src/shell/sidebarNav.ts
-index b06a04231ee8282f78c654d230524adf233c2b30..628fb4a068257d40e9b9d56f41a795232859874e 100644
+index acea445d4bcee780ad8892155309889e97410453..7bec669e93a92a04b2112e832c4d35442edc0c24 100644
 --- a/web/src/shell/sidebarNav.ts
 +++ b/web/src/shell/sidebarNav.ts
-@@ -1,6 +1,7 @@
+@@ -2,6 +2,7 @@ import { arrayMove } from "@dnd-kit/sortable";
  import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
  import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
  import { getOptimisticTitle } from "@/lib/optimisticTitles";
 +import { sidebarRecencyOption, type SidebarFocus } from "@/lib/sidebarFocusPreferences";
  import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
- 
- export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
-@@ -264,6 +265,22 @@ export function dateBucket(timestamp: number, now: Date): DateBucket {
+ import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
+ import { orderSessionFamilies, isIndividuallyPinnedSibling } from "@/lib/sessionFamilies";
+@@ -368,6 +369,22 @@ export function dateBucket(timestamp: number, now: Date): DateBucket {
    return "earlier";
  }
  

@@ -128,12 +128,12 @@ index 6d1b7b81ebd3b82d7ed137d00c8c45fe1d2f7d1f..79e9f287c3bff308cb254ac4fa8aa631
  ---
  
 diff --git a/omnigent/debug_logging.py b/omnigent/debug_logging.py
-index 33af5d7b908e4cf0c5b01566e99ae8044343e553..77a5c56a519c17bc1c6a0335eeaabed3d2cbfe69 100644
+index 25a02d4256cd447726e2a7fc9515627fdc86bded..76bc869d89b9303173b099199c170340be97aa07 100644
 --- a/omnigent/debug_logging.py
 +++ b/omnigent/debug_logging.py
-@@ -76,6 +76,12 @@ _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id"
- _runner_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_runner_id", default=None)
- _request_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_request_id", default=None)
+@@ -80,6 +80,12 @@ _log_attributes_var: ContextVar[dict[str, object] | None] = ContextVar(
+     "omnigent_debug_attributes", default=None
+ )
  
 +# Log sources whose own OMNIGENT_RUNNER_ID names the runner they belong to.
 +# A server or host that inherited the var must not claim its records.
@@ -144,7 +144,7 @@ index 33af5d7b908e4cf0c5b01566e99ae8044343e553..77a5c56a519c17bc1c6a0335eeaabed3
  
  # Ambient lifecycle phase for the code currently executing. Set with
  # ``phase_scope`` around each region (runner launch, harness setup/startup, turn)
-@@ -311,6 +317,28 @@ def set_current_request_id(request_id: str | None) -> None:
+@@ -315,6 +321,28 @@ def set_current_request_id(request_id: str | None) -> None:
      _request_id_var.set(request_id or None)
  
  
@@ -173,8 +173,8 @@ index 33af5d7b908e4cf0c5b01566e99ae8044343e553..77a5c56a519c17bc1c6a0335eeaabed3
  def set_current_runner_id(runner_id: str | None) -> None:
      """Bind a known runner without looking up a session on every log record."""
      _runner_id_var.set(runner_id or None)
-@@ -569,12 +597,7 @@ def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
-         attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+@@ -625,12 +653,7 @@ def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
+         attrs = {str(k): redact_log_text(str(v)) for k, v in combined.items() if v is not None}
      for key, value in (
          ("request_id", getattr(record, "request_id", None) or _request_id_var.get()),
 -        (
@@ -187,7 +187,7 @@ index 33af5d7b908e4cf0c5b01566e99ae8044343e553..77a5c56a519c17bc1c6a0335eeaabed3
      ):
          if value:
              attrs.setdefault(key, redact_log_text(str(value)))
-@@ -658,7 +681,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
+@@ -714,7 +737,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
          "session_id": (
              getattr(record, "session_id", None)
              or current_session_id()
@@ -197,10 +197,10 @@ index 33af5d7b908e4cf0c5b01566e99ae8044343e553..77a5c56a519c17bc1c6a0335eeaabed3
          "turn_id": getattr(record, "turn_id", None),
          "source": source,
 diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
-index 396c0e39e2f7d12703a30772eb9c3e3f5a1dac30..6fbc18ec0beec5aa7d25bc490db03000d670ae13 100644
+index 06422d09d19aaacdb82c7417c403d81728a952ea..950e2af9e7608295555deb19119df22223df9367 100644
 --- a/omnigent/host/connect.py
 +++ b/omnigent/host/connect.py
-@@ -6100,15 +6100,6 @@ def _serve_host_until_exit(
+@@ -6333,15 +6333,6 @@ def _serve_host_until_exit(
      :returns: Whether the daemon exited because it lost its registry record.
      """
      from omnigent.host import crash_reporting
@@ -216,7 +216,7 @@ index 396c0e39e2f7d12703a30772eb9c3e3f5a1dac30..6fbc18ec0beec5aa7d25bc490db03000
      from omnigent.host.identity import export_configured_slice_key, host_config_path
  
      path = host_config_path(config_path)
-@@ -6125,6 +6116,19 @@ def _serve_host_until_exit(
+@@ -6358,6 +6349,19 @@ def _serve_host_until_exit(
          )
          raise SystemExit(HOST_FATAL_EXIT_CODE) from None
      crash_reporting.set_host_exit_context(host_id=identity.host_id)
@@ -237,18 +237,18 @@ index 396c0e39e2f7d12703a30772eb9c3e3f5a1dac30..6fbc18ec0beec5aa7d25bc490db03000
      if not path.exists():
          _print_host_status(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
 diff --git a/omnigent/inner/codex_executor.py b/omnigent/inner/codex_executor.py
-index c8f2fce341a398e5408e37b66a97ab02da12c3ea..4d929c10405b97b14502f5652bb87b463a297c5b 100644
+index a5c6bc4cf52f74797812c75511f46bf5d13c2a2d..99a86836a54c4451c4d609e1505f640787d8f189 100644
 --- a/omnigent/inner/codex_executor.py
 +++ b/omnigent/inner/codex_executor.py
-@@ -68,6 +68,7 @@ from omnigent.models.codex_model_vocabulary import (
+@@ -72,6 +72,7 @@ from omnigent.models.codex_model_vocabulary import (
  from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
  from omnigent.native import _native_forwarder_health as native_forwarder_health
  from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 +from omnigent.runtime.telemetry import set_resource_attribute
+ from omnigent.spec.repo_scope import repo_scope_dirs
  from omnigent.spec.types import RetryPolicy
- from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
- 
-@@ -746,12 +747,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
+ from omnigent.telemetry.surface import harness_client_surface
+@@ -752,12 +753,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
          deny_exact=_CODEX_ENV_DENY_EXACT,
          extra_allowed=extra_allow,
      )
@@ -436,7 +436,7 @@ index eef1075354d88f7e1c6f50c3258f5f5dfafc0ebc..cc5334086c72c1c9e69905332eddade8
 +        _capture_user,
      )
 diff --git a/omnigent/server/app.py b/omnigent/server/app.py
-index f144b41fc74c12d552734b22a64036902b4c63ff..21d895d9bea9c11aabdcc125ca834561ed7fb51d 100644
+index e16b9fdde495083eaf5b24bc44d63052f8361030..0f46cf02ef63eb9d66ef816dafaedbc2c23ade9e 100644
 --- a/omnigent/server/app.py
 +++ b/omnigent/server/app.py
 @@ -37,6 +37,7 @@ from omnigent.debug_logging import (
@@ -447,7 +447,7 @@ index f144b41fc74c12d552734b22a64036902b4c63ff..21d895d9bea9c11aabdcc125ca834561
      debug_event,
      debug_sink_enabled,
      reset_request_audit_attrs,
-@@ -2492,6 +2493,7 @@ def create_app(
+@@ -2667,6 +2668,7 @@ def create_app(
              )
          except Exception:  # noqa: BLE001 — attribution is best-effort
              set_current_user_id(None)
@@ -723,13 +723,13 @@ index 331b5420f913b6af38e7cc781998182a6873ed16..bb13ab9a58017a8c1b6152eb2cb472ff
      """The factory stamps any attribute from any value getter, e.g. a context var."""
      import contextvars
 diff --git a/tests/server/test_audit_logging_middleware.py b/tests/server/test_audit_logging_middleware.py
-index 3d35a7b9e07174532cbae802e6894ae9ddd0a318..afa9307e5b190a21e914a92d6dbcf0dc092c6dac 100644
+index 5a48a513981dc327c66c1300ae7afa09c3bb6dd3..236982053c8538015b4d8d30b3cd539bec1684f7 100644
 --- a/tests/server/test_audit_logging_middleware.py
 +++ b/tests/server/test_audit_logging_middleware.py
-@@ -349,3 +349,26 @@ def test_reserved_attr_keys_never_crash_and_session_id_binds(
-         dl.audit_event_logger().removeHandler(sink)
-         dl.sse_event_logger().removeHandler(sink)
-         sink.close()
+@@ -471,3 +471,26 @@ async def test_rejected_runner_id_audit_is_bounded(
+         assert rejected[0]["requested_runner_id"] == runner_id
+     else:
+         assert "requested_runner_id" not in rejected[0]
 +
 +
 +@pytest.mark.asyncio
@@ -754,10 +754,10 @@ index 3d35a7b9e07174532cbae802e6894ae9ddd0a318..afa9307e5b190a21e914a92d6dbcf0dc
 +    assert response.status_code == 200
 +    assert stamped == ["alice@example.com"]
 diff --git a/tests/test_debug_logging.py b/tests/test_debug_logging.py
-index 971288fcf946cb3f98d678d37fb23d142caf8a18..cf45084671f5e5ca6e11af783b67d35b868214a0 100644
+index 19b93a09343cdebd64067f6c863f27f41bc6c1dd..d42be97a07fa2b0f28017e269ff42b5d8834103a 100644
 --- a/tests/test_debug_logging.py
 +++ b/tests/test_debug_logging.py
-@@ -1391,6 +1391,26 @@ def test_runner_defaults_and_explicit_child_attribution(monkeypatch: pytest.Monk
+@@ -1416,6 +1416,26 @@ def test_runner_defaults_and_explicit_child_attribution(monkeypatch: pytest.Monk
          assert dl.record_to_row(record, "runner")["attributes"]["runner_id"] == "explicit_runner"
  
  

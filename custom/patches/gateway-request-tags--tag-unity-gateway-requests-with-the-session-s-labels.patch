@@ -14,11 +14,14 @@ When a harness targets a Databricks Unity Gateway URL, its requests now carry
 that header with omnigent_session_id plus the session's user labels.
 Omnigent-owned labels (omnigent.*, cost_control.*, omni_project) are skipped,
 the encoding is compact ASCII JSON, and labels are dropped in key order past
-8 KiB while the session id is always kept. Other gateways and providers never
-get the header. OMNIGENT_GATEWAY_REQUEST_TAGS=0 turns it off.
+upstream's 4 KiB request-tag budget while the session id is always kept.
+Upstream's CI tags (REQUEST_TAGS_HEADER, ci_request_tags) go in the same
+object and win over a label of the same name, so one header carries both.
+Other gateways and providers never get the header.
+OMNIGENT_GATEWAY_REQUEST_TAGS=0 turns it off.
 
-- databricks_ai_gateway: the header, tag builder, opt-out switch and the
-  dict / ANTHROPIC_CUSTOM_HEADERS helpers, next to the attribution helpers.
+- databricks_ai_gateway: the tag builder, opt-out switch and the dict /
+  ANTHROPIC_CUSTOM_HEADERS helpers, on upstream's request-tags header.
 - claude-native: the CLI and runner launch paths append the tags to
   ANTHROPIC_CUSTOM_HEADERS on gateway launches.
 - claude-sdk, codex, pi: the runner hands the encoded tags to the harness
@@ -36,34 +39,34 @@ Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 (cherry picked from commit 4bc2be0e9857e5cfabe3cbf23de8ad134b40f3e5)
 ---
- docs/databricks.md                            |  28 +++++
- omnigent/databricks_ai_gateway.py             | 110 +++++++++++++++++-
+ docs/databricks.md                            |  30 +++++
+ omnigent/databricks_ai_gateway.py             | 113 +++++++++++++++++-
  omnigent/harnesses/claude_native/main.py      |  45 ++++++-
  omnigent/harnesses/codex_native/app_server.py |   9 ++
  omnigent/harnesses/codex_native/main.py       |   4 +
  omnigent/host/connect.py                      |   2 +
  omnigent/inner/claude_sdk_executor.py         |   9 ++
- omnigent/inner/codex_executor.py              |  21 +++-
- omnigent/inner/pi_executor.py                 |  21 +++-
+ omnigent/inner/codex_executor.py              |  22 +++-
+ omnigent/inner/pi_executor.py                 |  26 +++-
  omnigent/runner/app.py                        |  61 ++++++++++
- omnigent/runner/native/orchestration.py       |  19 ++-
+ omnigent/runner/native/orchestration.py       |  17 ++-
  tests/cli/test_host_daemon_env.py             |   1 +
  .../app_server/test_launch_config.py          |  28 +++++
  tests/inner/test_claude_sdk_executor.py       |  25 ++++
  tests/inner/test_codex_executor.py            |  18 +++
- tests/inner/test_pi_executor.py               |   9 +-
+ tests/inner/test_pi_executor.py               |   5 +
  .../test_app_claude_native_launch_args.py     |  67 ++++++++++-
  ...t_app_sessions_native_terminals_runtime.py |   8 +-
  .../runner/test_codex_native_launch_config.py |   2 +
  tests/runner/test_runner_dispatch.py          |  45 +++++++
- tests/test_databricks_ai_gateway.py           |  76 ++++++++++++
- 21 files changed, 586 insertions(+), 22 deletions(-)
+ tests/test_databricks_ai_gateway.py           | 106 ++++++++++++++++
+ 21 files changed, 620 insertions(+), 23 deletions(-)
 
 diff --git a/docs/databricks.md b/docs/databricks.md
-index 79e9f287c3bff308cb254ac4fa8aa63197fd7297..914e0091241846ed568a60a8739a3bd988a87d26 100644
+index 79e9f287c3bff308cb254ac4fa8aa63197fd7297..655e1e7398372fe9a6059496505a8864013fd9f5 100644
 --- a/docs/databricks.md
 +++ b/docs/databricks.md
-@@ -469,6 +469,33 @@ production / customer-facing work goes through the workspace
+@@ -469,6 +469,35 @@ production / customer-facing work goes through the workspace
  (API tier + Gateway), individual experimentation can use consumer
  subscriptions but is out of band for compliance.
  
@@ -83,8 +86,10 @@ index 79e9f287c3bff308cb254ac4fa8aa63197fd7297..914e0091241846ed568a60a8739a3bd9
 +```
 +
 +- Omnigent's own labels (`omnigent.*`, `cost_control.*` and `omni_project`)
-+  are not sent. Past 8 KiB, labels are dropped in key order; the session id
-+  is always kept.
++  are not sent. CI attribution tags (`OMNIGENT_CI_CONTEXT` /
++  `OMNIGENT_CI_PIPELINE`) go in the same object and win over a label of the
++  same name. Past 4 KiB, labels are dropped in key order; the session id and
++  the CI tags are always kept.
 +- Covered harnesses: claude-native, claude-sdk, codex, codex-native and pi.
 +  Other gateways and providers never receive the header.
 +- Harness processes and native CLIs read the tags when they start, so a label
@@ -97,7 +102,7 @@ index 79e9f287c3bff308cb254ac4fa8aa63197fd7297..914e0091241846ed568a60a8739a3bd9
  ### What you get on Databricks vs raw provider calls
  
  | Capability | Raw provider call from omnigent | Through Unity Gateway |
-@@ -618,6 +645,7 @@ explicit consent and PII handling in place.
+@@ -618,6 +647,7 @@ explicit consent and PII handling in place.
  | `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Bearer $DATABRICKS_TOKEN` | Apps env |
  | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` to include message bodies in traces | Apps env (default off) |
  | `OMNIGENT_OTEL_CAPTURE_USER` | `true` to stamp the acting user as `enduser.id` on spans (usually an email) | Apps env (default off) |
@@ -106,10 +111,10 @@ index 79e9f287c3bff308cb254ac4fa8aa63197fd7297..914e0091241846ed568a60a8739a3bd9
  ---
  
 diff --git a/omnigent/databricks_ai_gateway.py b/omnigent/databricks_ai_gateway.py
-index a88a807a780910a27f97eaa1d99a13f9875c28d4..445c336558e464eedc35f54c23ae8f4f6b13fc4b 100644
+index f47e21511343dd9346463af82630069d21d66659..b9593be1751b9843f0b8ea900eb805a234687f07 100644
 --- a/omnigent/databricks_ai_gateway.py
 +++ b/omnigent/databricks_ai_gateway.py
-@@ -6,11 +6,14 @@ whether a resolved harness launch is gateway-backed. Keeping one predicate here
+@@ -6,7 +6,8 @@ whether a resolved harness launch is gateway-backed. Keeping one predicate here
  means a look-alike host is rejected identically everywhere.
  
  The usage-attribution headers every harness sends to the gateway live here too,
@@ -119,29 +124,20 @@ index a88a807a780910a27f97eaa1d99a13f9875c28d4..445c336558e464eedc35f54c23ae8f4f
  """
  
  from __future__ import annotations
- 
-+import json
-+import os
- from collections.abc import Mapping
- from typing import Final, TypeVar
- from urllib.parse import urlparse
-@@ -159,3 +162,108 @@ def with_gateway_attribution_lines(
-     attribution = gateway_attribution_headers(coding_agent, via_ug=via_ug)
-     lines.extend(f"{name}: {value}" for name, value in attribution.items())
+@@ -386,3 +387,113 @@ def with_gateway_attribution_lines(
+         f"{name}: {value}" for name, value in attributed if name.lower() in replaced_headers
+     )
      return "\n".join(lines)
 +
 +
 +# Per-request tags the Unity Gateway logs in the ``request_tags`` column of its
-+# usage tracking and inference tables: a JSON object of string keys to string
-+# values. Omnigent sends the session id plus the session's user labels.
-+REQUEST_TAGS_HEADER: Final[str] = "Databricks-Ai-Gateway-Request-Tags"
++# usage tracking and inference tables (:data:`REQUEST_TAGS_HEADER`). Besides
++# any CI tags, Omnigent sends the session id plus the session's user labels.
 +SESSION_ID_REQUEST_TAG: Final[str] = "omnigent_session_id"
 +# Set to ``0`` / ``false`` / ``no`` / ``off`` to stop sending session tags.
 +REQUEST_TAGS_SWITCH_ENV: Final[str] = "OMNIGENT_GATEWAY_REQUEST_TAGS"
 +# Carries a session's encoded tags from the runner into its harness process.
 +REQUEST_TAGS_VALUE_ENV: Final[str] = "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE"
-+# Keeps the header well under common proxy header-size limits.
-+_REQUEST_TAGS_MAX_BYTES: Final[int] = 8 * 1024
 +
 +
 +def gateway_request_tags_enabled(environ: Mapping[str, str] | None = None) -> bool:
@@ -165,25 +161,26 @@ index a88a807a780910a27f97eaa1d99a13f9875c28d4..445c336558e464eedc35f54c23ae8f4f
 +
 +
 +def gateway_request_tags(session_id: str, labels: Mapping[str, str] | None) -> dict[str, str]:
-+    """Build the Unity Gateway request tags for a session.
++    """Build the Unity Gateway request tags for a session, CI tags included.
 +
-+    The session id always comes first. User labels follow in key order; one
-+    that would push the encoded header past the size cap is dropped, so the
-+    same labels always yield the same tags.
++    The session id always comes first and CI tags (:func:`ci_request_tags`)
++    win over a label of the same name. User labels follow in key order; one
++    that would push the encoded header past upstream's 4 KiB request-tag
++    budget is dropped, so the same labels always yield the same tags.
 +
 +    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
 +    :param labels: The session's labels, e.g. ``{"team": "ml"}``; internal
 +        ``omnigent.*``, ``cost_control.*`` and project labels are skipped.
 +    :returns: e.g. ``{"omnigent_session_id": "conv_abc123", "team": "ml"}``.
 +    """
-+    tags = {SESSION_ID_REQUEST_TAG: session_id}
++    tags = {SESSION_ID_REQUEST_TAG: session_id, **ci_request_tags()}
 +    size = len(_encode_request_tags(tags))
 +    for key, value in sorted((labels or {}).items()):
 +        if key in tags or _is_internal_label_key(key):
 +            continue
 +        # Each entry adds ``,"key":"value"`` to the compact encoding.
 +        entry_size = len(_encode_request_tags({key: value})) - 1
-+        if size + entry_size > _REQUEST_TAGS_MAX_BYTES:
++        if size + entry_size > _MAX_CI_TAG_HEADER_LENGTH:
 +            continue
 +        tags[key] = value
 +        size += entry_size
@@ -225,20 +222,27 @@ index a88a807a780910a27f97eaa1d99a13f9875c28d4..445c336558e464eedc35f54c23ae8f4f
 +
 +
 +def with_gateway_request_tags_line(custom_headers: str | None, tags_value: str) -> str:
-+    """Append the request-tags header to Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
++    """Set the request-tags line in Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
++
++    An existing request-tags line (such as CI tags the attribution helpers
++    wrote) is replaced; *tags_value* already carries the CI tags.
 +
 +    :param custom_headers: The existing newline-separated ``Name: value`` block, or ``None``.
 +    :param tags_value: Encoded tags, e.g. from :func:`gateway_request_tags_value`.
-+    :returns: The block with the request-tags line appended.
++    :returns: The block with its other lines unchanged and one request-tags line.
 +    """
-+    lines = [custom_headers] if custom_headers else []
++    lines = [
++        line
++        for line in (custom_headers or "").splitlines()
++        if line.partition(":")[0].strip().lower() != REQUEST_TAGS_HEADER.lower()
++    ]
 +    lines.append(f"{REQUEST_TAGS_HEADER}: {tags_value}")
 +    return "\n".join(lines)
 diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
-index 490fd0ae25f831778e7f907364e0a8823f9332e6..5ea1eee2119c41329edcec7f75970b1d15c9a2fe 100644
+index 902efe679f8a25c9ff4c75e6b12d764385d62df4..d7bebbf25d4b3bd9fbda0e1bd64bdb67a89d58a8 100644
 --- a/omnigent/harnesses/claude_native/main.py
 +++ b/omnigent/harnesses/claude_native/main.py
-@@ -87,9 +87,11 @@ from omnigent.cli_invocation import cli_invocation
+@@ -88,9 +88,11 @@ from omnigent.cli_invocation import cli_invocation
  from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
  from omnigent.databricks_ai_gateway import (
      CLAUDE_CODE_AGENT,
@@ -250,7 +254,7 @@ index 490fd0ae25f831778e7f907364e0a8823f9332e6..5ea1eee2119c41329edcec7f75970b1d
  )
  from omnigent.entities.session_resources import terminal_resource_id
  from omnigent.harnesses.claude_native.bridge import (
-@@ -717,6 +719,39 @@ def claude_config_with_routed_arms_pinned(
+@@ -732,6 +734,39 @@ def claude_config_with_routed_arms_pinned(
      return replace(claude_config, env=env)
  
  
@@ -290,7 +294,7 @@ index 490fd0ae25f831778e7f907364e0a8823f9332e6..5ea1eee2119c41329edcec7f75970b1d
  def claude_config_with_launch_model_pinned(
      claude_config: ClaudeNativeUcodeConfig | None,
      launch_model: str | None,
-@@ -5257,6 +5292,8 @@ async def _prepare_claude_terminal(
+@@ -5406,6 +5441,8 @@ async def _prepare_claude_terminal(
          # single ``cold_resumed`` flag covers both.
          cold_resumed = False
          bridge_id: str | None = None
@@ -299,7 +303,7 @@ index 490fd0ae25f831778e7f907364e0a8823f9332e6..5ea1eee2119c41329edcec7f75970b1d
          if session_id is not None:
              record_startup_event("session_resolved", session_id=session_id)
          if session_id is None:
-@@ -5287,13 +5324,13 @@ async def _prepare_claude_terminal(
+@@ -5436,13 +5473,13 @@ async def _prepare_claude_terminal(
                  startup_progress=startup_progress,
                  progress_message="Loading Claude session...",
              )
@@ -315,7 +319,7 @@ index 490fd0ae25f831778e7f907364e0a8823f9332e6..5ea1eee2119c41329edcec7f75970b1d
              _mark_startup_step(
                  startup_profiler,
                  "checking existing terminal",
-@@ -5381,7 +5418,9 @@ async def _prepare_claude_terminal(
+@@ -5530,7 +5567,9 @@ async def _prepare_claude_terminal(
              (*cold_resume_args, *claude_args),
              command=command,
              bridge_dir=bridge_dir,
@@ -327,18 +331,18 @@ index 490fd0ae25f831778e7f907364e0a8823f9332e6..5ea1eee2119c41329edcec7f75970b1d
          )
          record_startup_event("terminal_available", session_id=session_id)
 diff --git a/omnigent/harnesses/codex_native/app_server.py b/omnigent/harnesses/codex_native/app_server.py
-index 29d09c6b561c304d6da87d2391f8e02d22a51a80..7eb7691fb15cf6c3aaef339dbee853cf1cd03ab4 100644
+index c37e8cf4978da54ea7fb59954b1a106a489772ef..ad25542a290eb156dbbec1dcad77b74b23e684a0 100644
 --- a/omnigent/harnesses/codex_native/app_server.py
 +++ b/omnigent/harnesses/codex_native/app_server.py
-@@ -35,6 +35,7 @@ if TYPE_CHECKING:
-     from omnigent.spec.types import AgentSpec
+@@ -37,6 +37,7 @@ if TYPE_CHECKING:
+     from omnigent.spec.types import AgentSpec, RetryPolicy
  
  from omnigent.cli_invocation import cli_invocation
 +from omnigent.databricks_ai_gateway import REQUEST_TAGS_VALUE_ENV, gateway_request_tags_env
  from omnigent.debug_logging import debug_event
  from omnigent.errors import ErrorCode, OmnigentError
  from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
-@@ -3663,6 +3664,7 @@ def build_codex_native_server(
+@@ -4080,6 +4081,7 @@ def build_codex_native_server(
      model_catalog_rows: list[_JsonObject] | None = None,
      reconcile_process_registry: bool = True,
      terminal_launch_args: Sequence[str] = (),
@@ -346,7 +350,7 @@ index 29d09c6b561c304d6da87d2391f8e02d22a51a80..7eb7691fb15cf6c3aaef339dbee853cf
  ) -> CodexNativeAppServer:
      """
      Build a configured native Codex app-server process wrapper.
-@@ -3721,6 +3723,9 @@ def build_codex_native_server(
+@@ -4138,6 +4140,9 @@ def build_codex_native_server(
      :param terminal_launch_args: Original CLI options used to select the Codex
          config-file profile (distinct from the Databricks routing profile)
          and the ``--add-dir`` roots the app-server owns.
@@ -356,7 +360,7 @@ index 29d09c6b561c304d6da87d2391f8e02d22a51a80..7eb7691fb15cf6c3aaef339dbee853cf
      :returns: Configured app-server process wrapper.
      :raises ImportError: If no Codex CLI is available.
      :raises OSError: If Databricks routing was requested but no
-@@ -3736,6 +3741,10 @@ def build_codex_native_server(
+@@ -4153,6 +4158,10 @@ def build_codex_native_server(
              "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
          )
      env = _clean_codex_env()
@@ -368,10 +372,10 @@ index 29d09c6b561c304d6da87d2391f8e02d22a51a80..7eb7691fb15cf6c3aaef339dbee853cf
      pinned_model = model
      if profile is not None:
 diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
-index 0bd38aa407c29a90bf8e73c109ce38e6c88c6472..ac9394c98aef742446cd49a1eeaf891b984bb539 100644
+index 68c2dd1de72af4c3fbf0e2e308e0c1ad4cdab159..e516c76c0d3b8e518e740f96138d26434304ab84 100644
 --- a/omnigent/harnesses/codex_native/main.py
 +++ b/omnigent/harnesses/codex_native/main.py
-@@ -1147,6 +1147,8 @@ async def _prepare_codex_terminal(
+@@ -1156,6 +1156,8 @@ async def _prepare_codex_terminal(
      async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
          bridge_id: str
          thread_id: str | None = None
@@ -380,7 +384,7 @@ index 0bd38aa407c29a90bf8e73c109ce38e6c88c6472..ac9394c98aef742446cd49a1eeaf891b
          if session_id is None:
              if session_bundle is None:
                  raise click.ClickException("Creating a Codex session requires a session bundle.")
-@@ -1165,6 +1167,7 @@ async def _prepare_codex_terminal(
+@@ -1174,6 +1176,7 @@ async def _prepare_codex_terminal(
                      f"Conversation {session_id!r} is not a codex-native session."
                  )
              bridge_id = str(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
@@ -388,7 +392,7 @@ index 0bd38aa407c29a90bf8e73c109ce38e6c88c6472..ac9394c98aef742446cd49a1eeaf891b
              existing_terminal = await _find_running_codex_terminal(client, session_id)
              external_session_id = payload.get("external_session_id")
              thread_id = external_session_id if isinstance(external_session_id, str) else None
-@@ -1244,6 +1247,7 @@ async def _prepare_codex_terminal(
+@@ -1254,6 +1257,7 @@ async def _prepare_codex_terminal(
              ap_auth_headers=headers,
              developer_instructions=developer_instructions,
              terminal_launch_args=codex_args,
@@ -397,10 +401,10 @@ index 0bd38aa407c29a90bf8e73c109ce38e6c88c6472..ac9394c98aef742446cd49a1eeaf891b
          app_server.listen_url = codex_ws_url
          event_client: CodexAppServerClient | None = None
 diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
-index 6fbc18ec0beec5aa7d25bc490db03000d670ae13..ea0dcc1e8b75fb2c6f7f1be3e4db8fda6aa9ef4d 100644
+index 950e2af9e7608295555deb19119df22223df9367..a544c616cc5bc166ed8ea71269a0064bbc739052 100644
 --- a/omnigent/host/connect.py
 +++ b/omnigent/host/connect.py
-@@ -798,6 +798,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
+@@ -811,6 +811,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
          # Numeric tuning knobs, not secrets.
          "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
          "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
@@ -410,7 +414,7 @@ index 6fbc18ec0beec5aa7d25bc490db03000d670ae13..ea0dcc1e8b75fb2c6f7f1be3e4db8fda
          # cli_auth.databricks_request_headers into every client→server connection
          # so a request pins to a specific server instance/replica. Must reach the
 diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
-index aee9d303486cf55a61d4e5304b785eee3734742d..d2493daa1e76a4f9a3c8da4b1594d84ab9e81887 100644
+index ebe083d0c57233cac0ea4e19c6a4c41e6cc1e601..87f390a4df227ed36b44b032110eaaa52b81d7db 100644
 --- a/omnigent/inner/claude_sdk_executor.py
 +++ b/omnigent/inner/claude_sdk_executor.py
 @@ -48,9 +48,12 @@ from omnigent.claude_paths import claude_config_dir, claude_json_path
@@ -426,9 +430,9 @@ index aee9d303486cf55a61d4e5304b785eee3734742d..d2493daa1e76a4f9a3c8da4b1594d84a
  )
  from omnigent.inner import _proc
  from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
-@@ -1411,6 +1414,12 @@ def _resolve_gateway_env(
-             CLAUDE_CODE_AGENT,
+@@ -1592,6 +1595,12 @@ def _resolve_gateway_env(
              via_ug=is_ug_route(base_url),
+             client_surface=harness_client_surface(),
          )
 +        # The runner hands each session's harness process its request tags.
 +        tags_value = gateway_request_tags_headers().get(REQUEST_TAGS_HEADER)
@@ -440,19 +444,18 @@ index aee9d303486cf55a61d4e5304b785eee3734742d..d2493daa1e76a4f9a3c8da4b1594d84a
          gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
      return gateway_env
 diff --git a/omnigent/inner/codex_executor.py b/omnigent/inner/codex_executor.py
-index 4d929c10405b97b14502f5652bb87b463a297c5b..69b08bc8db5fbf0c22794edcb4ce41ff54f63474 100644
+index 99a86836a54c4451c4d609e1505f640787d8f189..2afc3124388c6656a12966002ee1b76cab3a9613 100644
 --- a/omnigent/inner/codex_executor.py
 +++ b/omnigent/inner/codex_executor.py
-@@ -42,6 +42,8 @@ from packaging.version import InvalidVersion, Version
- from omnigent._platform import resolve_cli_binary
- from omnigent.databricks_ai_gateway import (
+@@ -45,6 +45,7 @@ from omnigent.databricks_ai_gateway import (
      CODEX_AGENT,
-+    REQUEST_TAGS_HEADER,
+     CODING_AGENT_HEADER,
+     REQUEST_TAGS_HEADER,
 +    REQUEST_TAGS_VALUE_ENV,
      is_databricks_ai_gateway_url,
      with_gateway_attribution,
  )
-@@ -1304,7 +1306,8 @@ def materialize_codex_provider_config(
+@@ -1345,7 +1346,8 @@ def materialize_codex_provider_config(
      Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
      untouched: Codex rejects unsupported fields there by discarding the whole config.
      Custom providers on a Databricks Unity Gateway also get the gateway's
@@ -462,11 +465,13 @@ index 4d929c10405b97b14502f5652bb87b463a297c5b..69b08bc8db5fbf0c22794edcb4ce41ff
  
      :param codex_home: Private session ``CODEX_HOME`` directory.
      :param config_overrides: Pending Codex config override strings.
-@@ -1375,6 +1378,12 @@ def materialize_codex_provider_config(
-             provider_config["http_headers"] = with_gateway_attribution(
-                 headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
-             )
-+            # Codex sends the session's request tags only while its env carries them.
+@@ -1525,6 +1527,14 @@ def materialize_codex_provider_config(
+                 },
+                 **attribution_headers,
+             }
++            # Codex sends the session's request tags only while its env carries them;
++            # that value already holds any CI tags, and Codex applies env headers
++            # after the static ones.
 +            env_headers = provider_config.get("env_http_headers")
 +            provider_config["env_http_headers"] = {
 +                **(env_headers if isinstance(env_headers, Mapping) else {}),
@@ -475,7 +480,7 @@ index 4d929c10405b97b14502f5652bb87b463a297c5b..69b08bc8db5fbf0c22794edcb4ce41ff
  
      fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
      try:
-@@ -1710,14 +1719,16 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
+@@ -1860,14 +1870,16 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
  
  
  #: Omnigent's own per-session signals for a codex launch: the subagent-router
@@ -497,7 +502,7 @@ index 4d929c10405b97b14502f5652bb87b463a297c5b..69b08bc8db5fbf0c22794edcb4ce41ff
  
  
 diff --git a/omnigent/inner/pi_executor.py b/omnigent/inner/pi_executor.py
-index 2be42372ef56722f537fc0cf5d6d37f03519c41a..c675dfbbfc85f3183e9efba3555746cc62bffc21 100644
+index ef284701c7151537c63a49223dafff5ddd8abd12..82599ae11732cbbfa55966a661e2734ead84441f 100644
 --- a/omnigent/inner/pi_executor.py
 +++ b/omnigent/inner/pi_executor.py
 @@ -56,7 +56,12 @@ from importlib.resources import files
@@ -514,19 +519,24 @@ index 2be42372ef56722f537fc0cf5d6d37f03519c41a..c675dfbbfc85f3183e9efba3555746cc
  from omnigent.debug_logging import debug_event
  from omnigent.harnesses.pi_native.credentials import (
      _databricks_workspace_url_for_gateway,
-@@ -1015,9 +1020,17 @@ def _build_models_json(
+@@ -1022,11 +1027,20 @@ def _build_models_json(
              provider["models"] = [*provider["models"], entry]
      for provider_config in config["providers"].values():
          if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
 -            provider_config["headers"] = gateway_attribution_headers(
--                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+-                PI_AGENT,
+-                via_ug=is_ug_route(provider_config["baseUrl"]),
+-                client_surface=harness_client_surface(),
 -            )
 +            provider_config["headers"] = {
 +                **gateway_attribution_headers(
-+                    PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
++                    PI_AGENT,
++                    via_ug=is_ug_route(provider_config["baseUrl"]),
++                    client_surface=harness_client_surface(),
 +                ),
-+                # The runner hands each session's harness process its request tags.
-+                # Pi expands ``$NAME`` in header values; ``$$`` keeps a label's ``$``.
++                # The runner hands each session's harness process its request tags,
++                # CI tags included. Pi expands ``$NAME`` in header values; ``$$``
++                # keeps a label's ``$``.
 +                **{
 +                    name: value.replace("$", "$$")
 +                    for name, value in gateway_request_tags_headers().items()
@@ -536,7 +546,7 @@ index 2be42372ef56722f537fc0cf5d6d37f03519c41a..c675dfbbfc85f3183e9efba3555746cc
  
  
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index a315679b8ac73897a94601e534b74f9b18b2e892..b40a3fcc4168b64b7788539e9cbfac1b15b74c98 100644
+index 5b56e7e7ed78516d73a50bc38266a0ad128d05b3..aa698aafc3579640a27c3f20fa9e1166b0247358 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
 @@ -38,6 +38,7 @@ from fastapi import FastAPI, Query, Request
@@ -547,7 +557,7 @@ index a315679b8ac73897a94601e534b74f9b18b2e892..b40a3fcc4168b64b7788539e9cbfac1b
  from omnigent.debug_logging import (
      debug_event,
      phase_scope,
-@@ -2665,6 +2666,13 @@ def create_runner_app(
+@@ -2905,6 +2906,13 @@ def create_runner_app(
                      session_id, "failed", error={"code": exc.code, "message": str(exc)}
                  )
                  raise
@@ -561,7 +571,7 @@ index a315679b8ac73897a94601e534b74f9b18b2e892..b40a3fcc4168b64b7788539e9cbfac1b
              if spawn_env is None:
                  spawn_env = await _resolve_native_spawn_env(
                      harness_name,
-@@ -5607,6 +5615,13 @@ def create_runner_app(
+@@ -6241,6 +6249,13 @@ def create_runner_app(
                      },
                  )
  
@@ -575,7 +585,7 @@ index a315679b8ac73897a94601e534b74f9b18b2e892..b40a3fcc4168b64b7788539e9cbfac1b
          if spawn_env is None:
              spawn_env = await _resolve_native_spawn_env(
                  harness_name,
-@@ -8525,6 +8540,52 @@ def _build_spawn_env_from_spec(
+@@ -9320,6 +9335,52 @@ def _build_spawn_env_from_spec(
      return env
  
  
@@ -629,10 +639,10 @@ index a315679b8ac73897a94601e534b74f9b18b2e892..b40a3fcc4168b64b7788539e9cbfac1b
  
  
 diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3d8fcc66b 100644
+index ad83e9083e008cb32dcf82ea6cce08ec75894694..584b4a131d278559591d672d4b0c6c90b4076248 100644
 --- a/omnigent/runner/native/orchestration.py
 +++ b/omnigent/runner/native/orchestration.py
-@@ -664,6 +664,7 @@ class _CodexNativeLaunchConfig:
+@@ -669,6 +669,7 @@ class _CodexNativeLaunchConfig:
          reads. A session the forwarder rotated onto carries the original
          session's id here. ``None`` when unlabelled: the bridge is then keyed
          by the session id.
@@ -640,7 +650,7 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
      """
  
      workspace: Path
-@@ -680,6 +681,7 @@ class _CodexNativeLaunchConfig:
+@@ -686,6 +687,7 @@ class _CodexNativeLaunchConfig:
      turn_routing: bool = False
      reasoning_effort: str | None = None
      bridge_id: str | None = None
@@ -648,7 +658,7 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
  
  
  @dataclasses.dataclass(frozen=True)
-@@ -1496,6 +1498,11 @@ async def _codex_native_launch_config(
+@@ -1506,6 +1508,11 @@ async def _codex_native_launch_config(
          turn_routing=routing_class.turn_routing,
          reasoning_effort=reasoning_effort,
          bridge_id=bridge_id,
@@ -660,7 +670,7 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
      )
  
  
-@@ -5643,6 +5650,7 @@ async def _auto_create_codex_terminal(
+@@ -5820,6 +5827,7 @@ async def _auto_create_codex_terminal(
          terminal_launch_args=launch_config.terminal_launch_args or (),
          reasoning_effort=launch_config.reasoning_effort,
          model_catalog_rows=_fresh_codex_catalog,
@@ -668,7 +678,7 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
          # Codex can show project-trust and legacy-model migration prompts before
          # creating a thread. This TUI runs detached for the web UI, so persist
          # the runner-owned acknowledgements in the private session config.
-@@ -8599,6 +8607,8 @@ class _ClaudeSessionLaunchMetadata:
+@@ -8898,6 +8906,8 @@ class _ClaudeSessionLaunchMetadata:
      external_session_id: str | None = None
      fork_source_external_id: str | None = None
      fork_carry_history: bool = False
@@ -677,7 +687,7 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
      #: Both routing fields come from ``routing_class_from_snapshot``, so an
      #: auto-harness session always reads as routing-enabled too. Deriving them
      #: separately was the bug: a sub-agent child of a routed parent carries the
-@@ -8646,6 +8656,7 @@ def _claude_launch_metadata_from_envelope(
+@@ -8945,6 +8955,7 @@ def _claude_launch_metadata_from_envelope(
              fork_source if isinstance(fork_source, str) and fork_source else None
          ),
          fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
@@ -685,7 +695,7 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
      )
  
  
-@@ -8712,6 +8723,7 @@ async def _load_legacy_claude_launch_metadata(
+@@ -9011,6 +9022,7 @@ async def _load_legacy_claude_launch_metadata(
              fork_source if isinstance(fork_source, str) and fork_source else None
          ),
          fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
@@ -693,7 +703,7 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
      )
      permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
      _logger.info(
-@@ -9014,6 +9026,7 @@ async def _auto_create_claude_terminal(
+@@ -9315,6 +9327,7 @@ async def _auto_create_claude_terminal(
  
      from omnigent.harnesses.claude_native.main import (
          build_native_claude_terminal_env,
@@ -701,19 +711,17 @@ index 3012bff5181a06295e53948be13c0f2f4017669d..13f855645ef6d4b921dfcf5f15b0f7d3
          claude_config_with_launch_model_pinned,
          claude_config_with_routed_arms_pinned,
          resolve_claude_native_model_selection,
-@@ -9617,7 +9630,11 @@ async def _auto_create_claude_terminal(
-         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
+@@ -9923,7 +9936,9 @@ async def _auto_create_claude_terminal(
          # etc.) when derived. Empty provider config still forces
          # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
--        env=build_native_claude_terminal_env(claude_config),
-+        env=build_native_claude_terminal_env(
+         env=build_native_claude_terminal_env(
+-            claude_config,
 +            claude_config_with_gateway_request_tags(
 +                claude_config, session_id=session_id, labels=launch_metadata.labels
-+            )
-+        ),
++            ),
+             client_surface=resource_registry.client_surface(session_id),
+         ),
          # Names to strip (see ``_claude_terminal_env_unset``). Dropping
-         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
-         # inherit this env and several build ``WorkspaceClient`` without pinning
 diff --git a/tests/cli/test_host_daemon_env.py b/tests/cli/test_host_daemon_env.py
 index 5e40277ccd4b0bb0022f22324e3a0c18fced0852..6fb775b9df43abb3537e1ee0d6e495404d50f28d 100644
 --- a/tests/cli/test_host_daemon_env.py
@@ -727,10 +735,10 @@ index 5e40277ccd4b0bb0022f22324e3a0c18fced0852..6fb775b9df43abb3537e1ee0d6e49540
  )
  def test_release_controls_reach_daemon_and_runner(
 diff --git a/tests/harnesses/codex_native/app_server/test_launch_config.py b/tests/harnesses/codex_native/app_server/test_launch_config.py
-index 4b6e6e0f44638dc63c88d72f4ca8af105f145948..d041949d6b06636f839ce5363dbd19e53ec852b0 100644
+index 214fe50548579cd7125d921991eee3ae13e976a7..b3482f7218fb00c243c8a3a2a5217f26e6f0f893 100644
 --- a/tests/harnesses/codex_native/app_server/test_launch_config.py
 +++ b/tests/harnesses/codex_native/app_server/test_launch_config.py
-@@ -419,6 +419,34 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
+@@ -475,6 +475,34 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
          }
  
  
@@ -766,10 +774,10 @@ index 4b6e6e0f44638dc63c88d72f4ca8af105f145948..d041949d6b06636f839ce5363dbd19e5
      tmp_path: Path,
      monkeypatch: pytest.MonkeyPatch,
 diff --git a/tests/inner/test_claude_sdk_executor.py b/tests/inner/test_claude_sdk_executor.py
-index 69c74f1baa07b45e32fd741fccf6922b6b818181..57f9394e352abbde4ee57585df5d7c2532b4b89c 100644
+index 9511a536b9b42627031b7e922ad24659219cf203..fcd9aba0be7493c7d5b22ac17dfd0a70a4bd0350 100644
 --- a/tests/inner/test_claude_sdk_executor.py
 +++ b/tests/inner/test_claude_sdk_executor.py
-@@ -1791,6 +1791,31 @@ class TestResolveGatewayEnv(unittest.TestCase):
+@@ -1873,6 +1873,31 @@ class TestResolveGatewayEnv(unittest.TestCase):
          self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
          self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
  
@@ -802,10 +810,10 @@ index 69c74f1baa07b45e32fd741fccf6922b6b818181..57f9394e352abbde4ee57585df5d7c25
          from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
          from omnigent.inner.databricks_executor import DatabricksCredentials
 diff --git a/tests/inner/test_codex_executor.py b/tests/inner/test_codex_executor.py
-index a321425c55d063951f0052fc5d08eee36e88c6ae..d43203e982f53f7c1ab7fb75962e484a954d2952 100644
+index f91a06c0b7309ac5db2d545dde9cdb97a2cc86d6..d4a1645694b8a6699791963c3b32908bbf847f75 100644
 --- a/tests/inner/test_codex_executor.py
 +++ b/tests/inner/test_codex_executor.py
-@@ -4574,6 +4574,8 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
+@@ -4889,6 +4889,8 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
          f'[model_providers.Databricks]\nbase_url = "{gateway_url}"\n\n'
          "[model_providers.Databricks.http_headers]\n"
          'User-Agent = "ucode/0.1.0 codex/0.145.0"\n\n'
@@ -814,7 +822,7 @@ index a321425c55d063951f0052fc5d08eee36e88c6ae..d43203e982f53f7c1ab7fb75962e484a
          '[model_providers.other]\nbase_url = "https://openrouter.ai/api/v1"\n'
      )
  
-@@ -4595,6 +4597,11 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
+@@ -4915,6 +4917,11 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
          "Databricks-Custom-Client-Surfaces": "omnigent",
      }
      assert "http_headers" not in providers["other"]
@@ -825,8 +833,8 @@ index a321425c55d063951f0052fc5d08eee36e88c6ae..d43203e982f53f7c1ab7fb75962e484a
 +    assert "env_http_headers" not in providers["other"]
  
  
- # ---------------------------------------------------------------------------
-@@ -4709,6 +4716,17 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
+ @pytest.mark.parametrize("include_effective_providers", [True, False])
+@@ -5126,6 +5133,17 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
      assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
  
  
@@ -845,25 +853,20 @@ index a321425c55d063951f0052fc5d08eee36e88c6ae..d43203e982f53f7c1ab7fb75962e484a
  # Tests for _to_codex_input_items — input_file → inline text conversion
  # ---------------------------------------------------------------------------
 diff --git a/tests/inner/test_pi_executor.py b/tests/inner/test_pi_executor.py
-index 33d8c8c9614805a7e873ede534c174da9a390481..1df4f9b30f3986c8d954ebc06c5eeb570ed910dd 100644
+index 3dd440a4cd2d578d9d8379c9d7d08f4e3194129e..20cf730e3d32df1b6d1c293f4b89964deaea0b01 100644
 --- a/tests/inner/test_pi_executor.py
 +++ b/tests/inner/test_pi_executor.py
-@@ -4528,8 +4528,13 @@ def test_models_json_lists_only_live_gateway_models() -> None:
-     ]
- 
- 
--def test_models_json_attributes_only_unity_gateway_providers() -> None:
-+def test_models_json_attributes_only_unity_gateway_providers(
-+    monkeypatch: pytest.MonkeyPatch,
-+) -> None:
+@@ -4559,6 +4559,9 @@ def test_models_json_attributes_only_unity_gateway_providers(
      """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
+     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
 +    monkeypatch.setenv(
 +        "OMNIGENT_GATEWAY_REQUEST_TAGS_VALUE", '{"omnigent_session_id":"conv_1","budget":"$HOME"}'
 +    )
      providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
  
      attributed = {name for name, provider in providers.items() if "headers" in provider}
-@@ -4537,6 +4542,8 @@ def test_models_json_attributes_only_unity_gateway_providers() -> None:
+@@ -4566,6 +4569,8 @@ def test_models_json_attributes_only_unity_gateway_providers(
      assert providers["databricks-openai"]["headers"] == {
          "Databricks-Custom-Coding-Agent": "pi",
          "Databricks-Custom-Client-Surfaces": "omnigent",
@@ -873,10 +876,10 @@ index 33d8c8c9614805a7e873ede534c174da9a390481..1df4f9b30f3986c8d954ebc06c5eeb57
  
  
 diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
-index 3c4a3a1c778becf1de91309ff1e1bd7a925c997b..022894d2fc382f20d2c12ac16505ad4747e1a7b5 100644
+index 079ac991b50e9d284f1d52af5bb779620f023001..e3a4f80a0b837f361a91e39bf99ece9592d4ca22 100644
 --- a/tests/runner/test_app_claude_native_launch_args.py
 +++ b/tests/runner/test_app_claude_native_launch_args.py
-@@ -1280,12 +1280,15 @@ def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
+@@ -1319,12 +1319,15 @@ def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
      assert sorted(path.name for path in workspace.iterdir()) == []
  
  
@@ -893,7 +896,7 @@ index 3c4a3a1c778becf1de91309ff1e1bd7a925c997b..022894d2fc382f20d2c12ac16505ad47
      :returns: A :class:`RunnerSessionInitEnvelope` rooted at *workspace*.
      """
      from omnigent.runner.session_init_protocol import (
-@@ -1299,7 +1302,9 @@ def _claude_auto_create_session_init(session_id: str, workspace: Path):
+@@ -1338,7 +1341,9 @@ def _claude_auto_create_session_init(session_id: str, workspace: Path):
          server_version="test",
          session_id=session_id,
          agent_id="agent",
@@ -904,27 +907,27 @@ index 3c4a3a1c778becf1de91309ff1e1bd7a925c997b..022894d2fc382f20d2c12ac16505ad47
      )
  
  
-@@ -1309,6 +1314,8 @@ async def _auto_create_claude_terminal_for_test(
-     session_id: str,
+@@ -1349,6 +1354,8 @@ async def _auto_create_claude_terminal_for_test(
      workspace: Path,
      registry: object,
+     publish_event: object | None = None,
 +    labels: dict[str, str] | None = None,
 +    launch_config: ClaudeNativeUcodeConfig | None = None,
  ) -> None:
      """
      Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
-@@ -1317,6 +1324,8 @@ async def _auto_create_claude_terminal_for_test(
-     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
+@@ -1358,6 +1365,8 @@ async def _auto_create_claude_terminal_for_test(
      :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
      :param registry: Session resource registry double.
+     :param publish_event: Event publisher double; a plain ``Mock`` by default.
 +    :param labels: Session labels carried by the init envelope.
 +    :param launch_config: Provider config the launch resolves; ``None`` uses Claude's login.
      :returns: None. Raises whatever the auto-create path raises.
      """
      from unittest.mock import AsyncMock, Mock
-@@ -1335,9 +1344,9 @@ async def _auto_create_claude_terminal_for_test(
+@@ -1376,9 +1385,9 @@ async def _auto_create_claude_terminal_for_test(
          registry,
-         Mock(),
+         publish_event if publish_event is not None else Mock(),
          server_client=AsyncMock(spec=httpx.AsyncClient),
 -        session_init=_claude_auto_create_session_init(session_id, workspace),
 +        session_init=_claude_auto_create_session_init(session_id, workspace, labels),
@@ -934,7 +937,7 @@ index 3c4a3a1c778becf1de91309ff1e1bd7a925c997b..022894d2fc382f20d2c12ac16505ad47
      )
  
  
-@@ -1519,6 +1528,56 @@ async def test_auto_create_claude_terminal_hands_claude_the_account_token(
+@@ -1623,6 +1632,56 @@ async def test_auto_create_claude_terminal_hands_claude_the_account_token(
          assert seeded == []
  
  
@@ -992,10 +995,10 @@ index 3c4a3a1c778becf1de91309ff1e1bd7a925c997b..022894d2fc382f20d2c12ac16505ad47
      "subagent_started,turn_started",
      [(True, True), (True, False), (False, True), (False, False)],
 diff --git a/tests/runner/test_app_sessions_native_terminals_runtime.py b/tests/runner/test_app_sessions_native_terminals_runtime.py
-index 14c275ea7bef73c9b271514d092e1f7ddd4e3d2e..3872fb3387c92893a305f9b0138a1f31797426ff 100644
+index e66513c5e566b5d379323af19c813f4a7f55d878..7087c689552dffd42ae1c20fa092ecb8a352bd04 100644
 --- a/tests/runner/test_app_sessions_native_terminals_runtime.py
 +++ b/tests/runner/test_app_sessions_native_terminals_runtime.py
-@@ -567,9 +567,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+@@ -572,9 +572,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
      bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
      bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(bridge_id)
      session_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
@@ -1005,10 +1008,10 @@ index 14c275ea7bef73c9b271514d092e1f7ddd4e3d2e..3872fb3387c92893a305f9b0138a1f31
 +    session_labels: dict[str, str] = {"team": "ml"}
 +    if rotated:
 +        session_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
-     launch_snapshot = RunnerSessionInitSnapshot(
-         created_at=10,
-         updated_at=11,
-@@ -898,6 +898,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+     plan_mode = provider_profile is not None
+     plan_rejected = plan_mode and rotated
+     if plan_mode:
+@@ -946,6 +946,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
      assert build_calls[0]["developer_instructions"] == (
          f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
      )
@@ -1018,27 +1021,27 @@ index 14c275ea7bef73c9b271514d092e1f7ddd4e3d2e..3872fb3387c92893a305f9b0138a1f31
      assert resolve_calls and all(
          call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
 diff --git a/tests/runner/test_codex_native_launch_config.py b/tests/runner/test_codex_native_launch_config.py
-index 6b47a5b16521f9cb0efb404a6c4f6c0b0d0a2e5c..f46bec128cc6b409b316af656f4de8b44afde73b 100644
+index 5747bbe409fc606540075f395f25704cd0506933..ca3e28c03a3413c2c265d26224c670fd4ea7bdf4 100644
 --- a/tests/runner/test_codex_native_launch_config.py
 +++ b/tests/runner/test_codex_native_launch_config.py
-@@ -285,6 +285,7 @@ async def test_happy_path_parses_full_config(
-             "omnigent.fork.source_external_session_id": "thread_src",
+@@ -286,6 +286,7 @@ async def test_happy_path_parses_full_config(
              "omnigent.fork.carry_history": "1",
              "omnigent.codex_native.bypass_sandbox": "1",
+             "omnigent.codex_native.collaboration_mode": "plan",
 +            "team": "ml",
          },
      }
      client = _Client(_Resp(200, snapshot))
-@@ -304,6 +305,7 @@ async def test_happy_path_parses_full_config(
-     assert cfg.fork_source_external_id == "thread_src"
+@@ -306,6 +307,7 @@ async def test_happy_path_parses_full_config(
      assert cfg.fork_carry_history is True, "carry_history label '1' should parse to True."
      assert cfg.bypass_sandbox is True, "bypass_sandbox label '1' should parse to True."
+     assert cfg.plan_mode is True, "collaboration_mode label 'plan' should parse to True."
 +    assert cfg.labels["team"] == "ml", "Labels feed the Unity Gateway request tags."
      assert cfg.auto_harness is True
      assert cfg.routing_enabled is True
      assert cfg.turn_routing is True
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index a07697c9c697df77cd9e6eeb3f6a3e46fc39dd1d..210e9f570f7b3c3cf72a66b18788ebdd439433bc 100644
+index bdb6aef237f7473a9ed57dc3acddc1d7b8accd58..224cb3cfa4bd7e9c9c24db8849740cf67a019cbd 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
 @@ -46,6 +46,7 @@ import threading
@@ -1057,7 +1060,7 @@ index a07697c9c697df77cd9e6eeb3f6a3e46fc39dd1d..210e9f570f7b3c3cf72a66b18788ebdd
  )
  from omnigent.runner.policy_proxy import (
      _evaluate_policy_via_omnigent,
-@@ -2131,6 +2133,49 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
+@@ -2178,6 +2180,49 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
      assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
  
  
@@ -1108,18 +1111,26 @@ index a07697c9c697df77cd9e6eeb3f6a3e46fc39dd1d..210e9f570f7b3c3cf72a66b18788ebdd
  @pytest.mark.asyncio
  @pytest.mark.asyncio
 diff --git a/tests/test_databricks_ai_gateway.py b/tests/test_databricks_ai_gateway.py
-index acf3f0d7a68830d97f01b4705851a3f93b496fc5..19884f63c726b780d82b81590952ceba9dfdb69d 100644
+index ace9d325e1ed192b5f6e718e1dd1b6467d898b66..9e6d8b8bcbe98b9b8f141ff009977a9957681916 100644
 --- a/tests/test_databricks_ai_gateway.py
 +++ b/tests/test_databricks_ai_gateway.py
-@@ -66,3 +66,79 @@ def test_ug_configured_workspace_marks_a_provider_without_a_ug_user_agent(
+@@ -494,3 +494,109 @@ def test_ug_configured_workspace_marks_a_provider_without_a_ug_user_agent(
          "Databricks-Custom-Coding-Agent": "codex",
          "Databricks-Custom-Client-Surfaces": "omnigent, ug",
      }
 +
 +
-+def test_gateway_request_tags_send_the_session_id_and_user_labels_only() -> None:
++def _clear_ci_tags(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
++    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
++
++
++def test_gateway_request_tags_send_the_session_id_and_user_labels_only(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
 +    from omnigent.databricks_ai_gateway import gateway_request_tags_value
 +
++    _clear_ci_tags(monkeypatch)
 +    labels = {
 +        "team": "ml",
 +        "project": "chat bot",
@@ -1135,18 +1146,34 @@ index acf3f0d7a68830d97f01b4705851a3f93b496fc5..19884f63c726b780d82b81590952ceba
 +    )
 +
 +
-+def test_gateway_request_tags_drop_labels_past_the_cap_but_keep_the_session_id() -> None:
++def test_gateway_request_tags_drop_labels_past_the_cap_but_keep_the_session_id(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
 +    from omnigent.databricks_ai_gateway import gateway_request_tags, gateway_request_tags_value
 +
-+    labels = {"a": "x" * 5000, "b": "y" * 5000, "c": "small", "d\n": "é"}
++    _clear_ci_tags(monkeypatch)
++    labels = {"a": "x" * 3000, "b": "y" * 3000, "c": "small", "d\n": "é"}
 +
 +    tags = gateway_request_tags("conv_1", labels)
 +
 +    assert list(tags) == ["omnigent_session_id", "a", "c", "d\n"]
 +    encoded = gateway_request_tags_value("conv_1", labels)
 +    assert encoded is not None and encoded.isascii() and "\n" not in encoded
-+    assert len(encoded) <= 8 * 1024
-+    assert gateway_request_tags("conv_1", {"a": "x" * 9000}) == {"omnigent_session_id": "conv_1"}
++    assert len(encoded) <= 4096
++    assert gateway_request_tags("conv_1", {"a": "x" * 5000}) == {"omnigent_session_id": "conv_1"}
++
++
++def test_gateway_request_tags_carry_ci_tags_ahead_of_labels(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from omnigent.databricks_ai_gateway import gateway_request_tags
++
++    _clear_ci_tags(monkeypatch)
++    monkeypatch.setenv("OMNIGENT_CI_PIPELINE", "review")
++
++    tags = gateway_request_tags("conv_1", {"pipeline": "label", "team": "ml"})
++
++    assert tags == {"omnigent_session_id": "conv_1", "pipeline": "review", "team": "ml"}
 +
 +
 +@pytest.mark.parametrize(
@@ -1188,6 +1215,12 @@ index acf3f0d7a68830d97f01b4705851a3f93b496fc5..19884f63c726b780d82b81590952ceba
 +        'Databricks-Ai-Gateway-Request-Tags: {"omnigent_session_id":"c"}'
 +    )
 +    assert with_gateway_request_tags_line("X-A: 1", "{}").splitlines() == [
++        "X-A: 1",
++        "Databricks-Ai-Gateway-Request-Tags: {}",
++    ]
++    # A request-tags line already in the block (CI tags) is replaced, not repeated.
++    existing = 'X-A: 1\ndatabricks-ai-gateway-request-tags: {"pipeline":"review"}'
++    assert with_gateway_request_tags_line(existing, "{}").splitlines() == [
 +        "X-A: 1",
 +        "Databricks-Ai-Gateway-Request-Tags: {}",
 +    ]

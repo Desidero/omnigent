@@ -6,9 +6,10 @@ Subject: [PATCH] feat: Run button for agent-suggested shell commands
 When an agent asks the user to run something, the chat now offers Run on
 `!command` code blocks, shell-language blocks and inline `! cmd` spans.
 Run confirms the exact list, then queues each command as its own `!command`
-shell input. Claude-native already treats those as shell mode; codex-native
-now routes them to the app-server `thread/shellCommand` RPC and mirrors the
-run as terminal_command items.
+shell input. Claude-native treats those as shell mode, and codex-native
+runs them through the app-server `thread/shellCommand` RPC (upstream since
+https://github.com/omnigent-ai/omnigent/pull/11396), so this patch is the web
+half only: the Run button, its confirmation and the queueing.
 
 Carried on custom until the upstream PR (branch feat/run-suggested-commands)
 lands; drop this patch on rebase once it does.
@@ -16,25 +17,20 @@ lands; drop this patch on rebase once it does.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/run-suggested-commands.md                |  35 +++++
- feature-map/native-harnesses.md               |  14 ++
- omnigent/harnesses/codex_native/forwarder.py  | 132 +++++++++++++++++-
- omnigent/inner/codex_native_executor.py       |  91 ++++++++++--
+ docs/run-suggested-commands.md                |  32 +++++
+ feature-map/native-harnesses.md               |  13 ++
  .../test_native_claude_shell_input.py         |  52 +++++++
- .../messages/test_native_codex_shell_input.py |  76 ++++++++++
- .../codex_native/test_codex_native.py         | 112 +++++++++++++++
- tests/inner/test_codex_native_executor.py     |  57 ++++++++
- web/src/components/ai-elements/message.tsx    | 120 ++++++++++++----
+ .../messages/test_native_codex_shell_input.py |  41 ++++++
+ web/src/components/ai-elements/message.tsx    | 128 +++++++++++++-----
  web/src/components/blocks/BlockRenderer.tsx   |   1 +
  web/src/components/blocks/ChatMarkdown.tsx    |  26 +++-
  .../chat/RunCommandsProvider.test.tsx         |  89 ++++++++++++
- .../components/chat/RunCommandsProvider.tsx   |  85 +++++++++++
+ .../components/chat/RunCommandsProvider.tsx   |  85 ++++++++++++
  web/src/lib/runnableCommands.test.ts          |  79 +++++++++++
  web/src/lib/runnableCommands.ts               |  90 ++++++++++++
  web/src/pages/ChatPage.tsx                    |  56 ++++++--
- 16 files changed, 1056 insertions(+), 59 deletions(-)
+ 12 files changed, 643 insertions(+), 49 deletions(-)
  create mode 100644 docs/run-suggested-commands.md
- create mode 100644 tests/e2e_ui/messages/test_native_codex_shell_input.py
  create mode 100644 web/src/components/chat/RunCommandsProvider.test.tsx
  create mode 100644 web/src/components/chat/RunCommandsProvider.tsx
  create mode 100644 web/src/lib/runnableCommands.test.ts
@@ -42,10 +38,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
 
 diff --git a/docs/run-suggested-commands.md b/docs/run-suggested-commands.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..70f7f781bbcea8b147d216718fb75c695e6dd9f7
+index 0000000000000000000000000000000000000000..a7471262e7e1c9c0a98f9ae4ff389a943c39a8d6
 --- /dev/null
 +++ b/docs/run-suggested-commands.md
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,32 @@
 +# Run suggested commands
 +
 +When an agent asks you to run a shell command, the chat shows a Run button on
@@ -78,25 +74,21 @@ index 0000000000000000000000000000000000000000..70f7f781bbcea8b147d216718fb75c69
 +the previous finishes, so they never merge into one turn. Claude Code runs
 +them in its shell mode; Codex runs them as shell commands in the session's
 +thread and the chat shows each one as a terminal command.
-+
-+A `!command` you type yourself in a codex-native session's web composer now
-+runs the same way, as a shell command rather than a prompt.
 diff --git a/feature-map/native-harnesses.md b/feature-map/native-harnesses.md
-index 17e3482547c2215e9a8d7acff424f88e5b01aa44..d28b2cc1c45e64389e16769b67128584646a48af 100644
+index 96118469d141d20739d08bb620f47d89e8bd61ce..40be15de1f4dbc744a0c5283ecc0dc0561cad0be 100644
 --- a/feature-map/native-harnesses.md
 +++ b/feature-map/native-harnesses.md
-@@ -68,6 +68,10 @@ implements them separately, so a fix for one harness does not reach the others.
+@@ -108,6 +108,9 @@ implements them separately, so a fix for one harness does not reach the others.
    the command (a script's first line and "+N lines") and expands to a
    terminal panel with the command, its output and exit status, in the
    Settings terminal theme.
 +- `run-suggested-commands`: in claude-native and codex-native chats, **Run**
 +  on a shell command an agent suggests queues it as a `!command` shell input
 +  after a confirmation; see [Run suggested commands](../docs/run-suggested-commands.md).
-+  A `!command` typed in a codex-native web composer runs in Codex's shell too.
  - `working-status`: quiet work stays working; waiting for input is explained;
    completion, interruption and process exit settle the indicator. A following
-   turn and reconnect must not leave a stale idle or working state.
-@@ -215,6 +219,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
+   turn and reconnect must not leave a stale idle or working state. The sidebar
+@@ -343,6 +346,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
  follow-up in the side pane, then close its tab. The parent conversation stays
  separate. See [sessions](./sessions.md) for all side-chat entry points.
  
@@ -108,10 +100,10 @@ index 17e3482547c2215e9a8d7acff424f88e5b01aa44..d28b2cc1c45e64389e16769b67128584
  **Matrix.** "Mock" means the verification instance can drive the harness with
  the mock model; the others need their real CLI and vendor credentials. Test
  columns name one journey test per harness; "—" means none exists yet.
-@@ -773,6 +782,11 @@ Cross-harness journeys:
-   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
-   prompt must remain a separate user turn outside the assistant's folded work,
-   including after reload. This browser contract does not launch the Claude CLI.
+@@ -1035,6 +1043,11 @@ Cross-harness journeys:
+   `!sleep 5` followed immediately by a question; the question must receive an
+   answer. Upload a text file containing `!echo file-content` with an empty
+   composer and verify that it reaches the model without running a shell command.
 +- **`run-suggested-commands`:**
 +  `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_run_button_queues_each_suggested_command`,
 +  `tests/e2e_ui/messages/test_native_codex_shell_input.py::test_run_button_runs_each_suggested_command_in_codex_shell`
@@ -120,357 +112,6 @@ index 17e3482547c2215e9a8d7acff424f88e5b01aa44..d28b2cc1c45e64389e16769b67128584
  - **`codex-plugin-skills`:** use the
    [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
    real CLI catalog regression and recorded browser journey across both
-diff --git a/omnigent/harnesses/codex_native/forwarder.py b/omnigent/harnesses/codex_native/forwarder.py
-index 5b07ae7ffc7258d5a6befbe6dadc144af7945b34..554896dc990ced21b65589422b54b45881930486 100644
---- a/omnigent/harnesses/codex_native/forwarder.py
-+++ b/omnigent/harnesses/codex_native/forwarder.py
-@@ -8,6 +8,7 @@ import hashlib
- import json
- import logging
- import re
-+import shlex
- import urllib.error
- import urllib.request
- from collections import deque
-@@ -565,6 +566,8 @@ class _CodexForwarderState:
-     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
-     resume_echo_thread_ids: set[str] = field(default_factory=set)
-     posted_tool_calls: set[str] = field(default_factory=set)
-+    # User shell commands whose input was mirrored at item start.
-+    started_user_shell_items: set[str] = field(default_factory=set)
-     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
-     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
-     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
-@@ -3354,6 +3357,10 @@ async def _handle_event(
-             # ``item/completed`` guard below remains the backstop for the
-             # resume-backfill path, which replays only ``item/completed``.
-             await _ensure_user_message_posted(client, route_session_id, params, event_state)
-+        elif isinstance(item, dict) and _user_shell_command(item) is not None:
-+            if await _post_user_shell_input(client, route_session_id, params, item):
-+                if event_state is not None and isinstance(item_id := item.get("id"), str):
-+                    event_state.started_user_shell_items.add(item_id)
-         elif isinstance(item, dict) and item.get("type") == "commandExecution":
-             call_id = await _post_tool_call_item(client, route_session_id, params, item)
-             if call_id is not None and event_state is not None:
-@@ -4198,6 +4205,10 @@ async def _maybe_handle_delta_event(
-         if not isinstance(delta, str):
-             _logger.warning("Codex command output delta missing string delta: call_id=%s", call_id)
-             return True
-+        if forwarder_state is not None and call_id in forwarder_state.started_user_shell_items:
-+            # A user shell command has no tool call to stream into; its output
-+            # is mirrored whole when the item completes.
-+            return True
-         turn_id = _turn_id_from_payload(params)
-         if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
-             _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
-@@ -4695,7 +4706,11 @@ def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
-     if not isinstance(item, dict):
-         return False
-     item_type = item.get("type")
--    return isinstance(item_type, str) and item_type != "userMessage"
-+    return (
-+        isinstance(item_type, str)
-+        and item_type != "userMessage"
-+        and _user_shell_command(item) is None
-+    )
- 
- 
- async def _post_mcp_startup(
-@@ -5603,6 +5618,16 @@ async def _handle_completed_item_inner(
-     if item_type == "plan":
-         await _post_plan_item(client, session_id, params, item, source_id=source_id)
-         return
-+    if _user_shell_command(item) is not None:
-+        await _post_user_shell_item(
-+            client,
-+            session_id,
-+            params,
-+            item,
-+            forwarder_state=forwarder_state,
-+            source_id=source_id,
-+        )
-+        return
-     if item_type in _REVIEW_MODE_ITEM_TYPES:
-         await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
-         return
-@@ -6680,6 +6705,111 @@ async def _post_tool_call_item(
-     return tool_call.call_id if posted else None
- 
- 
-+def _user_shell_command(item: _JsonObject) -> str | None:
-+    """
-+    Return the command a person ran through Codex shell mode.
-+
-+    Codex reports the typed text wrapped as ``<shell> -lc '<command>'``; unwrap
-+    it so the mirror matches the web ``!command`` that requested it.
-+
-+    :param item: Codex thread item, e.g. ``{"type": "commandExecution",
-+        "source": "userShell", "command": "/bin/bash -lc 'ls -la'"}``.
-+    :returns: The typed command, e.g. ``"ls -la"``, or ``None`` for any item
-+        that is not a user shell command.
-+    """
-+    if item.get("type") != "commandExecution" or item.get("source") != "userShell":
-+        return None
-+    command = item.get("command")
-+    if not isinstance(command, str) or not command:
-+        return None
-+    try:
-+        argv = shlex.split(command)
-+    except ValueError:
-+        return command
-+    if len(argv) == 3 and argv[1] in {"-c", "-lc"}:
-+        return argv[2]
-+    return command
-+
-+
-+async def _post_user_shell_input(
-+    client: httpx.AsyncClient,
-+    session_id: str,
-+    params: _JsonObject,
-+    item: _JsonObject,
-+    *,
-+    source_id: str | None = None,
-+) -> bool:
-+    """
-+    Mirror a user shell command's input as a ``terminal_command`` item.
-+
-+    Persisting it settles the matching web ``!command`` pending input.
-+
-+    :param client: HTTP client for Omnigent event posts.
-+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-+    :param params: Codex ``item/started`` or ``item/completed`` params.
-+    :param item: Codex user-shell ``commandExecution`` item.
-+    :param source_id: Stable native item id; derived from ``params`` when omitted.
-+    :returns: Whether the item was accepted by the server.
-+    """
-+    command = _user_shell_command(item)
-+    if command is None:
-+        return False
-+    return await _post_external_item(
-+        client,
-+        session_id,
-+        item_type="terminal_command",
-+        item_data={"kind": "input", "input": command},
-+        response_id=_response_id(params),
-+        source_id=f"{source_id or _source_id(params, item)}:input",
-+    )
-+
-+
-+async def _post_user_shell_item(
-+    client: httpx.AsyncClient,
-+    session_id: str,
-+    params: _JsonObject,
-+    item: _JsonObject,
-+    *,
-+    forwarder_state: _CodexForwarderState | None,
-+    source_id: str,
-+) -> None:
-+    """
-+    Mirror one completed user shell command as ``terminal_command`` items.
-+
-+    The input half is posted here only when ``item/started`` did not already
-+    post it (e.g. resume backfill); the output half carries the aggregated
-+    output and any non-zero exit code.
-+
-+    :param client: HTTP client for Omnigent event posts.
-+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-+    :param params: Codex ``item/completed`` params.
-+    :param item: Codex user-shell ``commandExecution`` item.
-+    :param forwarder_state: Optional state tracking inputs posted at item start.
-+    :param source_id: Stable native item id used for server-side deduplication.
-+    :returns: None.
-+    """
-+    item_id = item.get("id")
-+    started = forwarder_state is not None and item_id in forwarder_state.started_user_shell_items
-+    if started:
-+        assert forwarder_state is not None
-+        forwarder_state.started_user_shell_items.discard(item_id)
-+    elif not await _post_user_shell_input(client, session_id, params, item, source_id=source_id):
-+        return
-+    tool_call = _codex_tool_call_from_item(item)
-+    await _post_external_item(
-+        client,
-+        session_id,
-+        item_type="terminal_command",
-+        item_data={
-+            "kind": "output",
-+            "stdout": tool_call.output if tool_call is not None else "",
-+            "stderr": None,
-+        },
-+        response_id=_response_id(params),
-+        source_id=f"{source_id}:output",
-+    )
-+
-+
- async def _post_tool_item(
-     client: httpx.AsyncClient,
-     session_id: str,
-diff --git a/omnigent/inner/codex_native_executor.py b/omnigent/inner/codex_native_executor.py
-index ad010f59839f9ded373fed06ccdd7c291554f231..825416f65503b9ddbebaca48854c62a7e1bcb0d1 100644
---- a/omnigent/inner/codex_native_executor.py
-+++ b/omnigent/inner/codex_native_executor.py
-@@ -221,9 +221,17 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
-                 await client.close()
- 
- 
-+_NativeDeliveryMethod = Literal["turn/start", "turn/steer", "thread/shellCommand"]
-+_DELIVERY_STAGES: dict[str, str] = {
-+    "turn/start": "turn_start",
-+    "turn/steer": "turn_steer",
-+    "thread/shellCommand": "shell_command",
-+}
-+
-+
- async def _native_delivery_request(
-     client: CodexAppServerClient,
--    method: Literal["turn/start", "turn/steer"],
-+    method: _NativeDeliveryMethod,
-     params: CodexParams,
-     state: CodexNativeBridgeState,
-     *,
-@@ -241,7 +249,7 @@ async def _native_delivery_request(
-             session_id=state.session_id,
-             thread_id=state.thread_id,
-             requested_native_turn_id=state.active_turn_id,
--            stage="turn_start" if method == "turn/start" else "turn_steer",
-+            stage=_DELIVERY_STAGES[method],
-             outcome="server_draining",
-             rpc_error_code=error.code,
-         )
-@@ -272,13 +280,13 @@ async def _native_delivery_request(
- 
- async def _native_delivery_request_once(
-     client: CodexAppServerClient,
--    method: Literal["turn/start", "turn/steer"],
-+    method: _NativeDeliveryMethod,
-     params: CodexParams,
-     state: CodexNativeBridgeState,
- ) -> CodexMessage:
-     """Pair each RPC attempt with its result, including a rejected stale steer."""
-     attempt_id = uuid.uuid4().hex
--    stage = "turn_start" if method == "turn/start" else "turn_steer"
-+    stage = _DELIVERY_STAGES[method]
-     expected = params.get("expectedTurnId") if method == "turn/steer" else None
-     requested_turn_id = expected if isinstance(expected, str) else None
-     requested_thread = params.get("threadId")
-@@ -326,6 +334,8 @@ async def _native_delivery_request_once(
-     else:
-         turn_id = result.get("turnId") if result is not None else None
-     native_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
-+    # A shell command's ack is empty; its turn arrives later via turn/started.
-+    accepted = native_turn_id is not None or method == "thread/shellCommand"
-     log_input_event(
-         _logger,
-         "codex_native_delivery_finished",
-@@ -335,7 +345,7 @@ async def _native_delivery_request_once(
-         thread_id=thread_id,
-         requested_native_turn_id=requested_turn_id,
-         native_turn_id=native_turn_id,
--        outcome="rpc_accepted" if native_turn_id else "rpc_accepted_missing_turn_id",
-+        outcome="rpc_accepted" if accepted else "rpc_accepted_missing_turn_id",
-     )
-     return response
- 
-@@ -445,6 +455,24 @@ async def _steer_codex_turn(
-         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
- 
- 
-+async def _run_codex_shell_command(
-+    client: CodexAppServerClient,
-+    *,
-+    bridge_dir: Path,
-+    state: CodexNativeBridgeState,
-+    command: str,
-+) -> None:
-+    """Run a web ``!command`` in the thread's shell, inside any active turn."""
-+    await _native_delivery_request(
-+        client,
-+        "thread/shellCommand",
-+        {"threadId": state.thread_id, "command": command},
-+        state,
-+        bridge_dir=bridge_dir,
-+    )
-+    _logger.info("Codex native ran user shell command")
-+
-+
- async def _inject_codex_turn(
-     client: CodexAppServerClient,
-     *,
-@@ -656,13 +684,19 @@ class CodexNativeExecutor(Executor):
-             if client is None:
-                 return False
-             try:
--                await _inject_codex_turn(
--                    client,
--                    bridge_dir=self._bridge_dir,
--                    state=state,
--                    input_items=input_items,
--                    settings_overrides={},
--                )
-+                shell_command = _shell_command_from_input_items(input_items)
-+                if shell_command is not None:
-+                    await _run_codex_shell_command(
-+                        client, bridge_dir=self._bridge_dir, state=state, command=shell_command
-+                    )
-+                else:
-+                    await _inject_codex_turn(
-+                        client,
-+                        bridge_dir=self._bridge_dir,
-+                        state=state,
-+                        input_items=input_items,
-+                        settings_overrides={},
-+                    )
-             except Exception as exc:
-                 ambiguous = isinstance(exc, InjectionDeliveryAmbiguous)
-                 _logger.warning(
-@@ -919,8 +953,20 @@ class CodexNativeExecutor(Executor):
-                     undelivered = True
-                 else:
-                     try:
-+                        shell_command = (
-+                            _shell_command_from_input_items(input_items)
-+                            if goal_objective is None
-+                            else None
-+                        )
-                         side_question = side_chat.side_chat_question(input_items)
--                        if side_question is not None:
-+                        if shell_command is not None:
-+                            await _run_codex_shell_command(
-+                                client,
-+                                bridge_dir=self._bridge_dir,
-+                                state=state,
-+                                command=shell_command,
-+                            )
-+                        elif side_question is not None:
-                             # /side opens an ephemeral fork as its own sub-agent chat.
-                             # The fork must happen on the forwarder's connection —
-                             # it owns the fork's event stream, while this client
-@@ -1104,6 +1150,25 @@ def _latest_user_content(messages: list[Message]) -> object:
-     return None
- 
- 
-+def _shell_command_from_input_items(input_items: list[dict[str, object]]) -> str | None:
-+    """
-+    Return the command of a lone shell-mode text input.
-+
-+    :param input_items: Codex input items, e.g. ``[{"type": "text", "text": "!ls -la"}]``.
-+    :returns: The command without its ``!`` prefix, e.g. ``"ls -la"``, or ``None``
-+        when the input is a prompt (including ``!!`` and attachment-bearing input).
-+    """
-+    if len(input_items) != 1 or input_items[0].get("type") != "text":
-+        return None
-+    text = input_items[0].get("text")
-+    if not isinstance(text, str):
-+        return None
-+    text = text.strip()
-+    if not text.startswith("!") or text.startswith("!!"):
-+        return None
-+    return text[1:].strip() or None
-+
-+
- def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
-     """
-     Normalize executor content into Codex app-server input items.
 diff --git a/tests/e2e_ui/messages/test_native_claude_shell_input.py b/tests/e2e_ui/messages/test_native_claude_shell_input.py
 index 9cf394f86e72baac2ebef95f9c966c3a0352f7c8..adea1a5f0f1da27a8af70a2ecdb86f4eae6e0cdd 100644
 --- a/tests/e2e_ui/messages/test_native_claude_shell_input.py
@@ -539,47 +180,13 @@ index 9cf394f86e72baac2ebef95f9c966c3a0352f7c8..adea1a5f0f1da27a8af70a2ecdb86f4e
 +        snapshot.raise_for_status()
 +        assert snapshot.json()["pending_inputs"] == []
 diff --git a/tests/e2e_ui/messages/test_native_codex_shell_input.py b/tests/e2e_ui/messages/test_native_codex_shell_input.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..3f7c97e34cf145505f7773fc11d1a7a4e3802dff
---- /dev/null
+index c121de6365eaaa2a1e9dea53d12221e8dd4c8e1b..c292dc4f692cb433ba58aaed62df535c5cf933dc 100644
+--- a/tests/e2e_ui/messages/test_native_codex_shell_input.py
 +++ b/tests/e2e_ui/messages/test_native_codex_shell_input.py
-@@ -0,0 +1,76 @@
-+"""Web shell commands run through Codex's shell RPC, not as prompts."""
-+
-+import shutil
-+import time
-+import uuid
-+
-+import httpx
-+import pytest
-+from playwright.sync_api import Page, expect
-+
-+from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
-+
-+from .test_message_render_parity import _ASSISTANT, _USER, _WORKING, _ensure_chat_view, _send
-+from .test_native_codex_render_parity import (
-+    _CODEX_MOCK_MODEL,
-+    _open_terminal_view,
-+    _wait_terminal_connected,
-+)
-+
-+
-+@pytest.fixture(scope="session", autouse=True)
-+def _requires_codex() -> None:
-+    for binary in ("codex", "tmux"):
-+        if shutil.which(binary) is None:
-+            pytest.skip(f"requires the real {binary} executable")
-+
-+
-+def _shell_inputs(client: httpx.Client, session_id: str) -> list[str]:
-+    """Commands mirrored as ``terminal_command`` inputs, oldest first."""
-+    items = client.get(f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"})
-+    items.raise_for_status()
-+    return [
-+        item["input"]
-+        for item in items.json()["data"]
-+        if item["type"] == "terminal_command" and item["kind"] == "input"
-+    ]
+@@ -81,3 +81,44 @@ def test_web_shell_input_runs_in_codex_shell_not_as_prompt(
+     expect(page.get_by_text(marker, exact=True)).to_be_visible(timeout=10_000)
+     # The shell command never reached the model as a prompt.
+     assert page.locator(_ASSISTANT, has_text=leaked).count() == int(warmup)
 +
 +
 +@pytest.mark.nightly
@@ -611,208 +218,18 @@ index 0000000000000000000000000000000000000000..3f7c97e34cf145505f7773fc11d1a7a4
 +    for marker in (first, second):
 +        expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(1, timeout=60_000)
 +    with httpx.Client(base_url=base_url, timeout=15) as client:
-+        deadline = time.monotonic() + 60
-+        while _shell_inputs(client, session_id) != [f"echo {first}", f"echo {second}"]:
-+            assert time.monotonic() < deadline, _shell_inputs(client, session_id)
-+            time.sleep(1)
++        poll_until(
++            lambda: _shell_inputs(client, session_id) == [f"echo {first}", f"echo {second}"],
++            timeout_s=60,
++            interval_s=1,
++        )
 +        snapshot = client.get(f"/v1/sessions/{session_id}")
 +        snapshot.raise_for_status()
 +        assert snapshot.json()["pending_inputs"] == []
-+        # The shell commands never reached the model as prompts.
-+        assert page.locator(_ASSISTANT, has_text="Please run:").count() == 1
-diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
-index e739f243bff9c0dcdbc5d2e8d84e68f1db49aa81..52cd6fb56b5d21452190a13d81ab0c1a39411b5a 100644
---- a/tests/harnesses/codex_native/test_codex_native.py
-+++ b/tests/harnesses/codex_native/test_codex_native.py
-@@ -6943,6 +6943,118 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path:
-     }
- 
- 
-+@pytest.mark.parametrize(
-+    ("raw_command", "typed_command"),
-+    [
-+        # Real app-server captures of ``thread/shellCommand`` items (codex 0.159).
-+        ("/bin/bash -lc 'echo hi && pwd'", "echo hi && pwd"),
-+        ('/bin/bash -lc "printf \\"x  y\\\\n\\" | cat"', 'printf "x  y\\n" | cat'),
-+        ("/bin/bash -lc \"ls -la ~ && echo \\\\\"'$done'", "ls -la ~ && echo \\$done"),
-+        ("/bin/bash -lc 'for i in 1 2; do\n  echo $i\ndone'", "for i in 1 2; do\n  echo $i\ndone"),
-+        ("pwsh -NoProfile -Command ls", "pwsh -NoProfile -Command ls"),
-+    ],
-+)
-+def test_user_shell_command_recovers_the_typed_command(
-+    raw_command: str, typed_command: str
-+) -> None:
-+    """The mirrored input must equal the web ``!command`` so its bubble settles."""
-+    item = {"type": "commandExecution", "source": "userShell", "command": raw_command}
-+
-+    assert codex_native_forwarder._user_shell_command(item) == typed_command
-+    assert codex_native_forwarder._user_shell_command({**item, "source": "agent"}) is None
-+
-+
-+@pytest.mark.parametrize("live", [True, False], ids=["live", "resume-backfill"])
-+def test_forwarder_mirrors_user_shell_command_as_terminal_command(
-+    tmp_path: Path, live: bool
-+) -> None:
-+    """A ``thread/shellCommand`` run is a terminal command, not a model tool call."""
-+    write_bridge_state(
-+        tmp_path,
-+        CodexNativeBridgeState(
-+            session_id="conv_123",
-+            socket_path=str(tmp_path / "app-server.sock"),
-+            thread_id="thread_123",
-+            codex_home=str(tmp_path / "codex-home"),
-+            active_turn_id="turn_123",
-+        ),
-+    )
-+    posted: list[dict[str, Any]] = []
-+    started_item = {
-+        "type": "commandExecution",
-+        "id": "shell_1",
-+        "command": "/bin/bash -lc 'gcloud auth list'",
-+        "cwd": "/repo",
-+        "source": "userShell",
-+        "status": "inProgress",
-+    }
-+    completed_item = {
-+        **started_item,
-+        "status": "completed",
-+        "aggregatedOutput": "No credentialed accounts.\n",
-+        "exitCode": 1,
-+    }
-+
-+    def event(method: str, **params: Any) -> dict[str, Any]:
-+        return {
-+            "method": method,
-+            "params": {"threadId": "thread_123", "turnId": "turn_123", **params},
-+        }
-+
-+    events = (
-+        [
-+            event("item/started", item=started_item),
-+            event("item/commandExecution/outputDelta", itemId="shell_1", delta="No credentialed"),
-+        ]
-+        if live
-+        else []
-+    )
-+    events.append(event("item/completed", item=completed_item))
-+    state = codex_native_forwarder._CodexForwarderState()
-+
-+    async def run() -> None:
-+        async with httpx.AsyncClient(
-+            base_url="http://127.0.0.1:8000",
-+            transport=httpx.MockTransport(_capture_handler(posted)),
-+        ) as client:
-+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
-+                client, "conv_123", flush_interval_seconds=60.0, flush_char_threshold=1000
-+            )
-+            for codex_event in events:
-+                await codex_native_forwarder._handle_event(
-+                    client,
-+                    session_id="conv_123",
-+                    bridge_dir=tmp_path,
-+                    usage_coalescer=_usage_coalescer(client),
-+                    elicitation_tracker=_elicitation_tracker(),
-+                    event=codex_event,
-+                    delta_coalescer=coalescer,
-+                    forwarder_state=state,
-+                )
-+            await coalescer.close()
-+
-+    asyncio.run(run())
-+
-+    assert [payload["data"] for payload in posted] == [
-+        {
-+            "item_type": "terminal_command",
-+            "item_data": {"kind": "input", "input": "gcloud auth list"},
-+            "response_id": "codex_turn_123",
-+            "source_id": "thread_123:turn_123:shell_1:input",
-+        },
-+        {
-+            "item_type": "terminal_command",
-+            "item_data": {
-+                "kind": "output",
-+                "stdout": "No credentialed accounts.\n\n[exit code: 1]",
-+                "stderr": None,
-+            },
-+            "response_id": "codex_turn_123",
-+            "source_id": "thread_123:turn_123:shell_1:output",
-+        },
-+    ]
-+
-+
- def test_forwarder_surfaces_failed_command_exit_code() -> None:
-     """
-     A non-zero command exit is surfaced in the mirrored output.
-diff --git a/tests/inner/test_codex_native_executor.py b/tests/inner/test_codex_native_executor.py
-index 5ac4779bcef223f3759a1e135eb040bfe0ab90dd..d5be35a9d8a09ab2edd07634a09d4bb2d3e05338 100644
---- a/tests/inner/test_codex_native_executor.py
-+++ b/tests/inner/test_codex_native_executor.py
-@@ -1007,6 +1007,63 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
-     ]
- 
- 
-+@pytest.mark.parametrize(
-+    ("active_turn_id", "live_injection"),
-+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
-+    ids=["idle", "active-turn", "live-queue"],
-+)
-+def test_shell_input_runs_through_thread_shell_command(
-+    active_turn_id: str | None,
-+    live_injection: bool,
-+    monkeypatch: pytest.MonkeyPatch,
-+    tmp_path: Path,
-+) -> None:
-+    """A web ``!command`` runs in Codex's shell instead of prompting the model."""
-+    _FakeCodexNativeClient.requests = []
-+    _FakeCodexNativeClient.created = []
-+    monkeypatch.setattr(
-+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
-+        _FakeCodexNativeClient,
-+    )
-+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
-+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
-+
-+    if live_injection:
-+        assert asyncio.run(executor.enqueue_session_message("main", "  !gcloud auth login\n"))
-+    else:
-+        events = _collect_turn_events(executor, "  !gcloud auth login\n")
-+        assert [type(event) for event in events] == [TurnComplete]
-+
-+    assert _FakeCodexNativeClient.requests == [
-+        ("thread/shellCommand", {"threadId": "thread_123", "command": "gcloud auth login"})
-+    ]
-+    # Codex reports the shell's turn through turn/started; nothing is recorded here.
-+    state = read_bridge_state(tmp_path)
-+    assert state is not None
-+    assert state.active_turn_id == active_turn_id
-+
-+
-+@pytest.mark.parametrize("text", ["!!not a command", "!", "say !hi"])
-+def test_non_shell_bang_text_is_sent_as_a_prompt(
-+    text: str,
-+    monkeypatch: pytest.MonkeyPatch,
-+    tmp_path: Path,
-+) -> None:
-+    """Only a lone ``!command`` is shell input; anything else reaches the model."""
-+    _FakeCodexNativeClient.requests = []
-+    _FakeCodexNativeClient.created = []
-+    _FakeCodexNativeClient.next_turn = 1
-+    monkeypatch.setattr(
-+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
-+        _FakeCodexNativeClient,
-+    )
-+    _seed_bridge(tmp_path)
-+
-+    _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), text)
-+
-+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
-+
-+
- def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
-     monkeypatch: pytest.MonkeyPatch,
-     tmp_path: Path,
++    # The shell commands never reached the model as prompts.
++    assert page.locator(_ASSISTANT, has_text="Please run:").count() == 1
 diff --git a/web/src/components/ai-elements/message.tsx b/web/src/components/ai-elements/message.tsx
-index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50fde28e205 100644
+index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c57910383cd7 100644
 --- a/web/src/components/ai-elements/message.tsx
 +++ b/web/src/components/ai-elements/message.tsx
 @@ -6,6 +6,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
@@ -823,7 +240,7 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
  import { cn } from "@/lib/utils";
  import type { UIMessage } from "ai";
  import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-@@ -310,7 +311,15 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
+@@ -319,7 +320,15 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
    );
  };
  
@@ -839,7 +256,7 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
    /**
     * Hand file-path links to the `a` component override instead of letting the
     * harden pass turn them into app-origin navigations or " [blocked]" text.
-@@ -362,6 +371,14 @@ function extractCodeText(children: ReactNode): string {
+@@ -401,6 +410,14 @@ function extractCodeText(children: ReactNode): string {
    return "";
  }
  
@@ -854,7 +271,7 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
  // Streamdown ships its own 16px icon set (filled, even-odd fill rule) rather
  // than lucide, so the copy/wrap buttons we overlay on a code block header use
  // the same glyphs as Streamdown's native buttons (e.g. copy/download in a
-@@ -514,6 +531,17 @@ const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
+@@ -553,6 +570,17 @@ const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
    </svg>
  );
  
@@ -872,7 +289,7 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
  // Shared visual style for the buttons in a chat code block header (copy, wrap
  // toggle). Keeps the frosted resting look that matches Streamdown's own button
  // pill, but pins the hover background to that same frosted fill so the ghost
-@@ -570,6 +598,31 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
+@@ -609,6 +637,31 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
    );
  }
  
@@ -904,10 +321,10 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
  function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
    return (
      <Button
-@@ -597,6 +650,12 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
-   // horizontal-scroll view for when column alignment matters.
-   const [wrap, setWrap] = useState(true);
-   const toggleWrap = useCallback(() => setWrap((w) => !w), []);
+@@ -650,6 +703,12 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+   }
+   const hideSource = useCallback(() => setShowsSource(false), []);
+   const { lineNumbers } = useContext(StreamdownContext);
 +  const requestRun = useContext(RunCommandsContext);
 +  const language = extractCodeLanguage(children);
 +  const commands = useMemo(
@@ -917,7 +334,7 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
    const block = isValidElement(children)
      ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
      : children;
-@@ -614,6 +673,9 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+@@ -660,6 +719,9 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
        {/* Match Streamdown's action-pill height and reserve its rightmost slot
            for download. All controls stay anchored to the header. */}
        <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
@@ -927,96 +344,103 @@ index 32d3f530cab6eb84e64c6e1c2fae604c13c8b1be..b6b446082d379b9fd5455a0e5fbbd50f
          <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
          <ChatCodeBlockCopyButton getCode={getCode} />
        </div>
-@@ -628,9 +690,11 @@ export const MessageResponse = memo(
-     controls,
+@@ -708,9 +770,11 @@ export const MessageResponse = memo(
      markFileLinks = false,
      allowGitHubAttachmentImages = false,
+     isStreaming = false,
 +    allowRunCommands = false,
      ...props
    }: MessageResponseProps) => {
      const themeMode = useResolvedThemeMode();
 +    const requestRun = useContext(RunCommandsContext);
      const messageComponents = useMemo(
-       () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
+       () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
        [components],
-@@ -640,34 +704,36 @@ export const MessageResponse = memo(
+@@ -720,37 +784,39 @@ export const MessageResponse = memo(
      const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
  
      return (
 -      <MarkdownErrorBoundary source={props.children}>
--        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+-        <StreamingTextContext.Provider value={isStreaming}>
+-          {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+-              so remount on theme change to recolor already-rendered diagrams. */}
+-          <Streamdown
+-            key={themeMode}
+-            // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+-            className={cn(
+-              "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+-              className,
+-            )}
+-            plugins={STREAMDOWN_PLUGINS}
+-            // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+-            // instead of Streamdown's default "Open external link?" modal.
+-            linkSafety={CHAT_LINK_SAFETY}
+-            {...props}
+-            BlockComponent={StreamingTextBlock}
+-            components={messageComponents}
+-            controls={messageControls}
+-            mermaid={mermaidOptions}
+-            // Block remote image fetches that can exfiltrate data through URLs.
+-            rehypePlugins={
+-              markFileLinks
+-                ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
+-                : allowGitHubAttachmentImages
+-                  ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
+-                  : SECURE_STREAMDOWN_REHYPE_PLUGINS
+-            }
+-          />
+-        </StreamingTextContext.Provider>
+-      </MarkdownErrorBoundary>
 +      <RunCommandsContext.Provider value={allowRunCommands ? requestRun : null}>
 +        <MarkdownErrorBoundary source={props.children}>
-+          {/* Streamdown is memoized and its comparator ignores the mermaid prop,
-             so remount on theme change to recolor already-rendered diagrams. */}
--        <Streamdown
--          key={themeMode}
--          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
--          className={cn(
--            "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
--            className,
--          )}
--          plugins={STREAMDOWN_PLUGINS}
--          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
--          // instead of Streamdown's default "Open external link?" modal.
--          linkSafety={CHAT_LINK_SAFETY}
--          {...props}
--          components={messageComponents}
--          controls={messageControls}
--          mermaid={mermaidOptions}
--          // Block remote image fetches that can exfiltrate data through URLs.
--          rehypePlugins={
--            markFileLinks
--              ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
--              : allowGitHubAttachmentImages
--                ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
--                : SECURE_STREAMDOWN_REHYPE_PLUGINS
--          }
--        />
--      </MarkdownErrorBoundary>
-+          <Streamdown
-+            key={themeMode}
-+            // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-+            className={cn(
-+              "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-+              className,
-+            )}
-+            plugins={STREAMDOWN_PLUGINS}
-+            // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-+            // instead of Streamdown's default "Open external link?" modal.
-+            linkSafety={CHAT_LINK_SAFETY}
-+            {...props}
-+            components={messageComponents}
-+            controls={messageControls}
-+            mermaid={mermaidOptions}
-+            // Block remote image fetches that can exfiltrate data through URLs.
-+            rehypePlugins={
-+              markFileLinks
-+                ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
-+                : allowGitHubAttachmentImages
-+                  ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
-+                  : SECURE_STREAMDOWN_REHYPE_PLUGINS
-+            }
-+          />
++          <StreamingTextContext.Provider value={isStreaming}>
++            {/* Streamdown is memoized and its comparator ignores the mermaid prop,
++                so remount on theme change to recolor already-rendered diagrams. */}
++            <Streamdown
++              key={themeMode}
++              // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
++              className={cn(
++                "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
++                className,
++              )}
++              plugins={STREAMDOWN_PLUGINS}
++              // Let links open on a plain click (and cmd/ctrl-click in a new tab)
++              // instead of Streamdown's default "Open external link?" modal.
++              linkSafety={CHAT_LINK_SAFETY}
++              {...props}
++              BlockComponent={StreamingTextBlock}
++              components={messageComponents}
++              controls={messageControls}
++              mermaid={mermaidOptions}
++              // Block remote image fetches that can exfiltrate data through URLs.
++              rehypePlugins={
++                markFileLinks
++                  ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
++                  : allowGitHubAttachmentImages
++                    ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
++                    : SECURE_STREAMDOWN_REHYPE_PLUGINS
++              }
++            />
++          </StreamingTextContext.Provider>
 +        </MarkdownErrorBoundary>
 +      </RunCommandsContext.Provider>
      );
    },
  );
 diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
-index 79c3f198ce018f1e22102f32088e19f8d49b995e..937aaf1cd484367b3ff1b633df69d165379b9ccc 100644
+index 4e18f3f5e7120698db6177f1bb73b82a5a68cead..ff59d77f3144e8d20a02beee9b51c2a024daa505 100644
 --- a/web/src/components/blocks/BlockRenderer.tsx
 +++ b/web/src/components/blocks/BlockRenderer.tsx
-@@ -867,6 +867,7 @@ function renderItem(
+@@ -891,6 +891,7 @@ function renderItem(
            className={cn("min-w-0", followsText && "mt-2")}
          >
            <FilePathAwareMessageResponse
 +            allowRunCommands={!isTextStreaming}
-             className="chat-markdown"
-             mode={isTextStreaming ? "streaming" : "static"}
-           >
+             className="chat-markdown text-message"
+             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
+             isStreaming={isTextStreaming}
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index 184db5481fe8bf2e116c25305c669eccd9a7551a..a21f66c05764942f4644fe80f8cac22581e9fb81 100644
+index dcfca48f4410fda66549efb8dda2cb72c878f001..b4e84c3f0119983974167e1af001c4f37a88a62b 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
 @@ -11,13 +11,17 @@
@@ -1047,7 +471,7 @@ index 184db5481fe8bf2e116c25305c669eccd9a7551a..a21f66c05764942f4644fe80f8cac225
  import { cn } from "@/lib/utils";
  import {
    useFileViewer,
-@@ -179,6 +184,8 @@ function WorkspacePathInlineCode({
+@@ -197,6 +202,8 @@ function WorkspacePathInlineCode({
    // non-openable one just stays styled inline code — only an explicit
    // markdown link (WorkspaceFileLink) earns dead-path feedback.
    const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
@@ -1056,7 +480,7 @@ index 184db5481fe8bf2e116c25305c669eccd9a7551a..a21f66c05764942f4644fe80f8cac225
  
    if (openWorkspaceFile) {
      const shortLabel = shortFileCitationLabel(text);
-@@ -216,7 +223,7 @@ function WorkspacePathInlineCode({
+@@ -234,7 +241,7 @@ function WorkspacePathInlineCode({
    }
    // Match Streamdown's default inline-code styling so non-path inline code
    // looks unchanged.
@@ -1065,7 +489,7 @@ index 184db5481fe8bf2e116c25305c669eccd9a7551a..a21f66c05764942f4644fe80f8cac225
      <code
        className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
        data-streamdown="inline-code"
-@@ -225,6 +232,19 @@ function WorkspacePathInlineCode({
+@@ -243,6 +250,19 @@ function WorkspacePathInlineCode({
        {codeChildren}
      </code>
    );
@@ -1453,10 +877,10 @@ index 0000000000000000000000000000000000000000..edf73abd8b759f2a25e89fd6b2a00bd9
 +  return text.includes("\n") ? null : bangCommand(text);
 +}
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854b3f21d22 100644
+index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f99686664e 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
-@@ -116,6 +116,7 @@ import {
+@@ -127,6 +127,7 @@ import {
  } from "@/lib/sideChat";
  import { shouldQueueSend } from "@/lib/messageQueue";
  import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
@@ -1464,7 +888,7 @@ index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854
  import { skillInvocationPrefix } from "@/lib/harnessSetup";
  import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
  import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-@@ -299,6 +300,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
+@@ -320,6 +321,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
  import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
  import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
  import { ConnectionIndicator } from "./ChatIndicators";
@@ -1472,7 +896,7 @@ index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854
  import { Transcript } from "@/components/chat/Transcript";
  
  /** Server-info as consumers see it: the probe's result, or "loading". */
-@@ -1042,6 +1044,22 @@ export function ChatPage() {
+@@ -1075,6 +1077,22 @@ export function ChatPage() {
      ],
    );
  
@@ -1495,7 +919,7 @@ index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854
    const onSendSlashCommand = useCallback(
      (name: string, args: string) => {
        if (!agentId) return;
-@@ -1215,6 +1233,7 @@ export function ChatPage() {
+@@ -1263,6 +1281,7 @@ export function ChatPage() {
        agentsError={agentsError}
        disabled={!agentId || agentsError !== null}
        onSend={onSend}
@@ -1503,7 +927,7 @@ index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854
        onNewSession={openNewSession}
        onSendSlashCommand={onSendSlashCommand}
        onStop={onStop}
-@@ -1364,6 +1383,8 @@ interface MainAgentSurfaceProps {
+@@ -1413,6 +1432,8 @@ interface MainAgentSurfaceProps {
    agentsError: unknown;
    disabled: boolean;
    onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
@@ -1512,7 +936,7 @@ index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854
    /**
     * Invoke a skill via the `slash_command` event path. Gated off inside
     * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
-@@ -1546,6 +1567,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1597,6 +1618,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
    agentsError,
    disabled,
    onSend,
@@ -1520,7 +944,7 @@ index 329e900a36cd263c51e17215c66d129311a1097a..3d2894389db24ba84480cc85c26bc854
    onSendSlashCommand,
    onNewSession,
    onStop,
-@@ -1831,21 +1853,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1890,21 +1912,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
            {/* The scrolling transcript column owns every streaming-hot store
            subscription and the bubble pipeline, so an SSE frame re-renders it
            alone — this surface's composer and chrome below bail out. */}

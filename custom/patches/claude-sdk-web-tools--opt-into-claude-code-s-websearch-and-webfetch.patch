@@ -24,7 +24,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/AGENT_YAML_SPEC.md                    |  19 +++
- omnigent/inner/claude_sdk_executor.py      |  56 ++++++++-
+ omnigent/inner/claude_sdk_executor.py      |  55 ++++++++-
  omnigent/inner/claude_sdk_harness.py       |  45 ++++++-
  omnigent/inner/datamodel.py                |  22 ++++
  omnigent/inner/loader.py                   |   7 ++
@@ -36,14 +36,14 @@ Signed-off-by: Desidero <desidero@gmail.com>
  tests/inner/test_claude_sdk_harness.py     |  35 ++++++
  tests/runtime/test_claude_sdk_spawn_env.py |  15 +++
  tests/spec/test_claude_sdk_native_tools.py |  81 +++++++++++++
- 13 files changed, 424 insertions(+), 5 deletions(-)
+ 13 files changed, 423 insertions(+), 5 deletions(-)
  create mode 100644 tests/spec/test_claude_sdk_native_tools.py
 
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
-index 7734c5c0c9ed7367a823741a5e31f10ba0e4dd77..59b5eadb581ba41a8a99c5e4fed9e836878178cc 100644
+index 9f91ab1cc3f609a44c41b6bfcb98d899281a47ee..fe0f6b4c241a8775e1a9f1b73ff1f8a9d37b592f 100644
 --- a/docs/AGENT_YAML_SPEC.md
 +++ b/docs/AGENT_YAML_SPEC.md
-@@ -89,6 +89,25 @@ authoritative approval surface; supported one-time tool approvals can also be
+@@ -114,6 +114,25 @@ authoritative approval surface; supported one-time tool approvals can also be
  mirrored into Chat cards, while persistent trust choices remain explicit Kiro
  TUI/flag actions. See `kiro-native-elicitation.md`.
  
@@ -70,11 +70,11 @@ index 7734c5c0c9ed7367a823741a5e31f10ba0e4dd77..59b5eadb581ba41a8a99c5e4fed9e836
  
  `harness: antigravity` runs the agent through Google's
 diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
-index 9ef1e9621951bfc07e2b2ed90fec721703c75470..aee9d303486cf55a61d4e5304b785eee3734742d 100644
+index 89a18e0f3c6c2e33c87184638ea595f0ac81b0a4..ebe083d0c57233cac0ea4e19c6a4c41e6cc1e601 100644
 --- a/omnigent/inner/claude_sdk_executor.py
 +++ b/omnigent/inner/claude_sdk_executor.py
 @@ -41,6 +41,7 @@ from contextlib import ExitStack, contextmanager, suppress
- from dataclasses import dataclass
+ from dataclasses import dataclass, field
  from types import ModuleType
  from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 +from urllib.parse import urlparse
@@ -88,8 +88,8 @@ index 9ef1e9621951bfc07e2b2ed90fec721703c75470..aee9d303486cf55a61d4e5304b785eee
 +from omnigent.process_logging import env_truthy
  from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
  from omnigent.spec.types import RetryPolicy
- from omnigent.util.json_serialization import json_dumps_transport_safe
-@@ -824,6 +826,40 @@ def _kill_process_tree(process: _Process | None) -> None:
+ from omnigent.telemetry.surface import harness_client_surface
+@@ -924,6 +926,40 @@ def _kill_process_tree(process: _Process | None) -> None:
      _proc.kill_tree(process)
  
  
@@ -130,15 +130,15 @@ index 9ef1e9621951bfc07e2b2ed90fec721703c75470..aee9d303486cf55a61d4e5304b785eee
  @contextmanager
  def _unset_env_var(name: str) -> Iterator[None]:
      """
-@@ -1712,6 +1748,7 @@ class ClaudeSDKExecutor(Executor):
-         skills_filter: str | list[str] = "all",
+@@ -1894,6 +1930,7 @@ class ClaudeSDKExecutor(Executor):
          api_key_helper: str | None = None,
          system_prompt_preset: str | None = None,
+         context_window: int | None = None,
 +        native_tools: list[str] | None = None,
      ) -> None:
          """Create a ClaudeSDKExecutor.
  
-@@ -1787,6 +1824,10 @@ class ClaudeSDKExecutor(Executor):
+@@ -1972,6 +2009,10 @@ class ClaudeSDKExecutor(Executor):
                  Injected into ``_extra_env`` as
                  :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                  the SDK's ``settings.apiKeyHelper`` option at turn time.
@@ -149,7 +149,7 @@ index 9ef1e9621951bfc07e2b2ed90fec721703c75470..aee9d303486cf55a61d4e5304b785eee
          """
          # Fail loud: a Databricks model requires the gateway transport.
          if not gateway and model is not None and is_databricks_model_id(model):
-@@ -1816,6 +1857,7 @@ class ClaudeSDKExecutor(Executor):
+@@ -2002,6 +2043,7 @@ class ClaudeSDKExecutor(Executor):
          self._bundle_dir = bundle_dir
          self._agent_name = agent_name
          self._skills_filter = skills_filter
@@ -157,7 +157,7 @@ index 9ef1e9621951bfc07e2b2ed90fec721703c75470..aee9d303486cf55a61d4e5304b785eee
          # Write the bundle's plugin manifest now (idempotent) so that
          # ``--plugin-dir <bundle>`` produces clean
          # ``<agent-name>:<skill-name>`` labels in Claude's skill
-@@ -2607,6 +2649,11 @@ class ClaudeSDKExecutor(Executor):
+@@ -2952,6 +2994,11 @@ class ClaudeSDKExecutor(Executor):
          # never prompt; otherwise defer to the elicitation gate.
          if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
              return PermissionResultAllow()
@@ -169,27 +169,26 @@ index 9ef1e9621951bfc07e2b2ed90fec721703c75470..aee9d303486cf55a61d4e5304b785eee
          return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
  
      async def run_turn(
-@@ -2777,8 +2824,13 @@ class ClaudeSDKExecutor(Executor):
+@@ -3127,8 +3174,12 @@ class ClaudeSDKExecutor(Executor):
          # OS-environment tools are provided via Omnigent ``sys_os_*``
          # MCP tools (declared via ``os_env`` in the spec), not the
          # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
 -        # the base set so MCP definitions can be discovered on demand.
--        base_tools: list[str] = ["Skill", "ToolSearch"]
+-        base_tools: list[str] = self._base_tools(sdk)
 +        # the base set so MCP definitions can be discovered on demand, plus
 +        # any built-ins the spec opted into (``native_tools``).
 +        base_tools: list[str] = [
-+            "Skill",
-+            "ToolSearch",
++            *self._base_tools(sdk),
 +            *_native_tools_for_endpoint(self._native_tools, env),
 +        ]
          # Translate the spec's host-skill filter into the SDK
          # options. Falls back to ``"all"`` semantics when the
          # field is malformed (the parser already validates, so
 diff --git a/omnigent/inner/claude_sdk_harness.py b/omnigent/inner/claude_sdk_harness.py
-index d196e46bdf620e44d9e59bd1c6b8b6f7e3bac67f..1984071071a75fcaefd8c888665c48329e9c9eb3 100644
+index 3c61c8d88633da368fdbac9a64ce0d40384da290..009313d2e88563ccecd82b97c77646213eb6de29 100644
 --- a/omnigent/inner/claude_sdk_harness.py
 +++ b/omnigent/inner/claude_sdk_harness.py
-@@ -77,6 +77,13 @@ Env vars read at startup:
+@@ -80,6 +80,13 @@ Env vars read at startup:
    surface as agent-bundled skills (regardless of
    ``skills_filter``). Unset for agents without a bundled-skills
    directory.
@@ -203,7 +202,7 @@ index d196e46bdf620e44d9e59bd1c6b8b6f7e3bac67f..1984071071a75fcaefd8c888665c4832
  - ``HARNESS_CLAUDE_SDK_AGENT_NAME``: Agent display name. Used
    when ``HARNESS_CLAUDE_SDK_BUNDLE_DIR`` is set to write the
    bundle's ``.claude-plugin/plugin.json`` manifest with a
-@@ -95,7 +102,7 @@ from pathlib import Path
+@@ -98,7 +105,7 @@ from pathlib import Path
  from fastapi import FastAPI
  
  from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -212,7 +211,7 @@ index d196e46bdf620e44d9e59bd1c6b8b6f7e3bac67f..1984071071a75fcaefd8c888665c4832
  from omnigent.inner.executor import Executor
  from omnigent.inner.os_env_serialization import decode_sandbox_spec
  from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-@@ -118,6 +125,7 @@ _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
+@@ -122,6 +129,7 @@ _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
  _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
  _ENV_BUNDLE_DIR = "HARNESS_CLAUDE_SDK_BUNDLE_DIR"
  _ENV_AGENT_NAME = "HARNESS_CLAUDE_SDK_AGENT_NAME"
@@ -220,8 +219,8 @@ index d196e46bdf620e44d9e59bd1c6b8b6f7e3bac67f..1984071071a75fcaefd8c888665c4832
  _ENV_GATEWAY_BASE_URL = "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"
  _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"
  _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
-@@ -254,6 +262,40 @@ def _resolve_skills_filter() -> str | list[str]:
-     return "all"
+@@ -276,6 +284,40 @@ def _resolve_context_window() -> int | None:
+     return window if window > 0 else None
  
  
 +def _resolve_native_tools() -> list[str]:
@@ -261,7 +260,7 @@ index d196e46bdf620e44d9e59bd1c6b8b6f7e3bac67f..1984071071a75fcaefd8c888665c4832
  def _build_claude_sdk_executor() -> Executor:
      """
      Construct a :class:`ClaudeSDKExecutor` from env-var config.
-@@ -301,6 +343,7 @@ def _build_claude_sdk_executor() -> Executor:
+@@ -324,6 +366,7 @@ def _build_claude_sdk_executor() -> Executor:
          agent_name=agent_name,
          skills_filter=_resolve_skills_filter(),
          api_key_helper=os.environ.get(_ENV_API_KEY_HELPER) or None,
@@ -317,7 +316,7 @@ index cacac0a6ed9ae62df1a863fa5eea95096b00c75d..62179f32c1ad5206867b1ef76d36b99b
  
  # ---------------------------------------------------------------------------
 diff --git a/omnigent/inner/loader.py b/omnigent/inner/loader.py
-index 28eecfd7ba4d2b2aed546850e13cc84fecf8c9ce..13be407d2dcf5f1865492d88bdb1b48b641a4d6b 100644
+index 6ebbc580e36bebb3d2364af257495c16d42a4246..c9e29454a2b0dea3a5485f0744d7077038f51c77 100644
 --- a/omnigent/inner/loader.py
 +++ b/omnigent/inner/loader.py
 @@ -18,6 +18,7 @@ from .datamodel import (
@@ -328,7 +327,7 @@ index 28eecfd7ba4d2b2aed546850e13cc84fecf8c9ce..13be407d2dcf5f1865492d88bdb1b48b
      parse_write_paths,
  )
  from .policies import (
-@@ -705,6 +706,11 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
+@@ -718,6 +719,11 @@ def _parse_executor_spec(
          system_prompt_mode = data.get("system_prompt_mode")
          if "system_prompt_mode" in data and system_prompt_mode not in ("append", "replace"):
              raise ValueError("executor.system_prompt_mode must be 'append' or 'replace'")
@@ -340,7 +339,7 @@ index 28eecfd7ba4d2b2aed546850e13cc84fecf8c9ce..13be407d2dcf5f1865492d88bdb1b48b
          return ExecutorSpec(
              model=data.get("model"),
              harness=data.get("harness"),
-@@ -712,6 +718,7 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
+@@ -725,6 +731,7 @@ def _parse_executor_spec(
              auth=auth,
              context_files=context_files,
              system_prompt_mode=system_prompt_mode,
@@ -349,10 +348,10 @@ index 28eecfd7ba4d2b2aed546850e13cc84fecf8c9ce..13be407d2dcf5f1865492d88bdb1b48b
      return None
  
 diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
-index 4230c3778b67aad8634c79f1f102c63f8a9c8b67..2fe3286a6a598050e6ee05409734d70590b7761e 100644
+index 66772327715306ffd3df4dd92d420056f754a157..fee2ca19b20995eb19dc8c579abd9a6f0bebd321 100644
 --- a/omnigent/runtime/workflow.py
 +++ b/omnigent/runtime/workflow.py
-@@ -1449,6 +1449,10 @@ def _build_claude_sdk_spawn_env(
+@@ -1451,6 +1451,10 @@ def _build_claude_sdk_spawn_env(
      # Explicitly clear inherited presets for agents that have not opted in.
      preset = spec.executor.config.get("system_prompt_preset")
      env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
@@ -364,7 +363,7 @@ index 4230c3778b67aad8634c79f1f102c63f8a9c8b67..2fe3286a6a598050e6ee05409734d705
  
  
 diff --git a/omnigent/spec/_omnigent_compat.py b/omnigent/spec/_omnigent_compat.py
-index 60fe4fb6c4ce19bd7b2e5cc9116cf5eff435d634..06358d62a335c60a7f3064c28665197a99e2f9e0 100644
+index 23cf54ae9cdfef630fdd788aea035d400e5dc15a..5cdac4f90cb236c28844385b80e5c66a615f0387 100644
 --- a/omnigent/spec/_omnigent_compat.py
 +++ b/omnigent/spec/_omnigent_compat.py
 @@ -41,7 +41,7 @@ from typing import TYPE_CHECKING
@@ -434,10 +433,10 @@ index c12722c51ad7f77b4158ea704ae8f169e375e5f7..e27f79b197da78b965dc2b37331dbaea
  
  # Copy the resolver dict onto the subclass before mutating — it's inherited
 diff --git a/tests/inner/test_claude_sdk_executor.py b/tests/inner/test_claude_sdk_executor.py
-index 290cc01e4f6676a57184e3d9bfbb0972a2b2522c..69c74f1baa07b45e32fd741fccf6922b6b818181 100644
+index d213d6701f50dceeefd34498c8476f96db004f26..9511a536b9b42627031b7e922ad24659219cf203 100644
 --- a/tests/inner/test_claude_sdk_executor.py
 +++ b/tests/inner/test_claude_sdk_executor.py
-@@ -3559,6 +3559,53 @@ def test_unset_env_var_restores_on_exception(monkeypatch):
+@@ -3661,6 +3661,53 @@ def test_unset_env_var_restores_on_exception(monkeypatch):
      assert os.environ["CLAUDECODE"] == "original"
  
  
@@ -491,7 +490,7 @@ index 290cc01e4f6676a57184e3d9bfbb0972a2b2522c..69c74f1baa07b45e32fd741fccf6922b
  def test_databricks_model_without_routing_raises() -> None:
      """``databricks-*`` model with ``gateway=False`` raises ``ValueError``.
  
-@@ -5187,6 +5234,88 @@ class TestToolCallPolicyGate(unittest.TestCase):
+@@ -5442,6 +5489,88 @@ class TestToolCallPolicyGate(unittest.TestCase):
  
          _run(_t())
  
@@ -581,10 +580,10 @@ index 290cc01e4f6676a57184e3d9bfbb0972a2b2522c..69c74f1baa07b45e32fd741fccf6922b
  # ---------------------------------------------------------------------------
  # Tests: Compaction detection via PreCompact hook
 diff --git a/tests/inner/test_claude_sdk_harness.py b/tests/inner/test_claude_sdk_harness.py
-index 0a8362da853ed3c3e0c58ee6b49e57e94d73a937..8d18dd4bf16931b6d16c67fa0a5a2c356c3c8481 100644
+index f26609eac1e2adfdb342e98efb3c9e169155ea96..703c84051ac3029fec119846e418a01efe2943b9 100644
 --- a/tests/inner/test_claude_sdk_harness.py
 +++ b/tests/inner/test_claude_sdk_harness.py
-@@ -439,6 +439,41 @@ def test_skills_filter_env_var_malformed_json_falls_back_to_all(
+@@ -464,6 +464,41 @@ def test_skills_filter_env_var_malformed_json_falls_back_to_all(
      assert captured["skills_filter"] == "all"
  
  
@@ -627,10 +626,10 @@ index 0a8362da853ed3c3e0c58ee6b49e57e94d73a937..8d18dd4bf16931b6d16c67fa0a5a2c35
      monkeypatch: pytest.MonkeyPatch,
  ) -> None:
 diff --git a/tests/runtime/test_claude_sdk_spawn_env.py b/tests/runtime/test_claude_sdk_spawn_env.py
-index b0f39d3bd123ca06d7b6a464773c2e842d2f6c5d..b4df185f8681816793b702196b8e5868de5382a9 100644
+index ab4496d8091f33de5f58debbbfe54df3a087156b..1cac65243a31ae7bbe0d8e6304d336bf0208e3e1 100644
 --- a/tests/runtime/test_claude_sdk_spawn_env.py
 +++ b/tests/runtime/test_claude_sdk_spawn_env.py
-@@ -125,6 +125,21 @@ def test_bare_model_is_passed_through_unchanged() -> None:
+@@ -136,6 +136,21 @@ def test_bare_model_is_passed_through_unchanged() -> None:
      assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
  
  
