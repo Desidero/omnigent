@@ -8,50 +8,58 @@ Agents set up most of a user's tooling, so they should be able to add a
 link rule when asked ("link BST-123 to our Jira"), and they should write
 references in the form the chat links instead of wrapping them in code.
 
-- sys_link_rules lists, adds, updates and removes rules. The runner proxies
-  it to /v1/link-rules: it applies one change to the rules it read, checks
-  the list with the server's validator and saves it with that version, so a
-  concurrent edit from Settings is refused rather than overwritten. It is a
-  framework tool group (tool_groups.link_rules) and rides the native relay.
+- sys_link_rules lists, adds, updates and removes rules, git hosts included.
+  The runner proxies it to /v1/link-rules: it applies one change to the rules
+  it read, checks the list with the server's validator and saves it with
+  that version, so a concurrent edit from Settings is refused rather than
+  overwritten. It is a framework tool group (tool_groups.link_rules) and
+  rides the native relay.
 - Rules run in every viewer's browser, so every add, update and remove asks
   the user first: __ask_on_link_rule_change joins the approval policies
   every engine carries, and the tool skips the no-policy fast path, like the
   scheduled-task tools. Listing is not gated.
-- A framework instruction names each enabled rule's syntax (#123 and
-  owner/repo#123, session:<id>, ABC-123 for a short form) so agents write
-  them as plain text. SDK harnesses get it per turn from rules the runner
-  rereads after a minute; native Claude and Codex get it at launch, from the
-  runner or from omnigent claude/codex, so a rule changed mid-session reaches
-  their prompt on the next launch. A failed read just leaves it out.
+- A framework instruction names each enabled rule's syntax (session:<id>,
+  ABC-123 for a short form) so agents write them as plain text. When the
+  workspace is a git checkout (a stat walk for .git), a second sentence asks
+  for issue #123 or PR #123 rather than a bare #123, and owner/repo#123 for
+  another repository, naming the provider's !123 only when the workspace
+  remote's git rule uses it; outside a checkout it is left out. SDK harnesses
+  get it per turn from rules and a workspace remote the runner rereads after
+  a minute; native Claude and Codex get it at launch, from the runner or from
+  omnigent claude/codex, so a rule changed mid-session reaches their prompt
+  on the next launch. A failed read just leaves it out.
 
-Not upstream yet: proposed from feat/chat-link-rules; drop this copy once it merges.
+Not upstream yet: proposed from feat/chat-link-rules, the git-reference part from
+feat/git-ref-notation; drop this copy once they merge.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/AGENT_YAML_SPEC.md                       |   1 +
- docs/chat-link-rules.md                       |  36 +++++
- feature-map/preferences.md                    |  15 +-
- omnigent/harnesses/claude_native/main.py      |  10 +-
- omnigent/harnesses/codex_native/main.py       |   5 +-
- omnigent/native/native_terminal.py            |  24 ++++
- omnigent/policies/builtins/safety.py          |  37 +++++
- omnigent/runner/app.py                        |  25 ++++
- omnigent/runner/native/orchestration.py       |  15 ++
- omnigent/runner/tool_dispatch.py              | 121 ++++++++++++++++
- omnigent/runtime/policies/builder.py          |  24 +++-
- omnigent/runtime/prompt.py                    |  30 +++-
+ docs/chat-link-rules.md                       |  47 +++++
+ feature-map/preferences.md                    |  19 +-
+ omnigent/harnesses/claude_native/main.py      |  12 +-
+ omnigent/harnesses/codex_native/main.py       |   9 +-
+ omnigent/native/native_terminal.py            |  36 ++++
+ omnigent/policies/builtins/safety.py          |  37 ++++
+ omnigent/runner/app.py                        |  38 ++++
+ omnigent/runner/native/orchestration.py       |  17 ++
+ omnigent/runner/pr_resource.py                |  25 +++
+ omnigent/runner/tool_dispatch.py              | 121 +++++++++++++
+ omnigent/runtime/policies/builder.py          |  24 ++-
+ omnigent/runtime/prompt.py                    |  76 +++++++-
  omnigent/spec/types.py                        |   2 +
- omnigent/tools/builtins/link_rules.py         |  87 ++++++++++++
+ omnigent/tools/builtins/link_rules.py         |  98 ++++++++++
  omnigent/tools/manager.py                     |  15 ++
- tests/runner/test_link_rules_tool_dispatch.py | 133 ++++++++++++++++++
- tests/runtime/policies/test_builder.py        |  16 ++-
+ tests/runner/test_link_rules_tool_dispatch.py | 170 ++++++++++++++++++
+ tests/runner/test_pr_resource.py              |  23 +++
+ tests/runtime/policies/test_builder.py        |  16 +-
  .../policies/test_builder_session_policies.py |   6 +-
  .../policies/test_yaml_full_roundtrip.py      |   1 +
- tests/runtime/test_prompt.py                  |  32 +++++
- tests/test_native_terminal.py                 |  26 ++++
+ tests/runtime/test_prompt.py                  |  97 ++++++++++
+ tests/test_native_terminal.py                 |  26 +++
  tests/tools/test_manager.py                   |  10 +-
- 22 files changed, 654 insertions(+), 17 deletions(-)
+ 24 files changed, 909 insertions(+), 17 deletions(-)
  create mode 100644 omnigent/tools/builtins/link_rules.py
  create mode 100644 tests/runner/test_link_rules_tool_dispatch.py
 
@@ -68,10 +76,10 @@ index 59b5eadb581ba41a8a99c5e4fed9e836878178cc..4453c39b52beef354adfbf676f6f678b
  
  Every group defaults to `true`, so omitting the block changes nothing. Values
 diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
-index c62b2cdb0a25539e1cba9679a43a78c55c218ae2..da8372b852243fb91b0ae019e2dee2a21991434e 100644
+index 98d8be8bdf83b51dc9724f6658ab8b00079609ae..97ab65eb9f6d44676cbb25c969167ff5105ecaae 100644
 --- a/docs/chat-link-rules.md
 +++ b/docs/chat-link-rules.md
-@@ -121,3 +121,39 @@ config); without them the defaults apply and can't be changed.
+@@ -183,3 +183,50 @@ config); without them the defaults apply and can't be changed.
    a version check.
  - The [shared preferences API](shared-preferences-api.md) reads and writes the
    same value, with its conflict handling.
@@ -85,8 +93,8 @@ index c62b2cdb0a25539e1cba9679a43a78c55c218ae2..da8372b852243fb91b0ae019e2dee2a2
 +| `action` | Arguments | Effect |
 +| --- | --- | --- |
 +| `list` | none | Returns the rules in effect and whether they are saved |
-+| `add` | `name`, then `kind` (default `url`), `pattern`, `url`, `enabled` (default true) | Appends a rule |
-+| `update` | `name`, then any of `new_name`, `kind`, `pattern`, `url`, `enabled` | Changes one rule |
++| `add` | `name`, then `kind` (default `url`), `pattern` and `url` or `provider` and `host`, `enabled` (default true) | Appends a rule |
++| `update` | `name`, then any of `new_name`, `kind`, `pattern`, `url`, `provider`, `host`, `enabled` | Changes one rule |
 +| `remove` | `name` | Deletes one rule |
 +
 +Names match case-insensitively. The tool checks the changed list with the
@@ -94,7 +102,7 @@ index c62b2cdb0a25539e1cba9679a43a78c55c218ae2..da8372b852243fb91b0ae019e2dee2a2
 +a change made meanwhile from Settings is refused rather than overwritten.
 +
 +Every `add`, `update` and `remove` parks on an approval prompt in the session,
-+showing the rule's name, pattern and URL, even when no other policy applies
++showing the rule's name, pattern, URL, provider and host, even when no other policy applies
 +(the built-in `__ask_on_link_rule_change` policy, like the one for scheduled
 +tasks). `list` is not gated. Agents get the tool unless their spec sets
 +`tool_groups.link_rules: false` ([agent YAML](AGENT_YAML_SPEC.md#tool-groups)),
@@ -104,15 +112,26 @@ index c62b2cdb0a25539e1cba9679a43a78c55c218ae2..da8372b852243fb91b0ae019e2dee2a2
 +
 +Agents are told which references the chat links, so they write them as plain
 +text instead of code: one short framework instruction listing each enabled
-+rule's syntax, such as `` `#123` or `owner/repo#123` `` and `` `ABC-123`
-+(Jira) ``. With every rule off there is no instruction.
++`url` and `session` rule's syntax, such as `` `ABC-123` (Jira) ``. With every
++rule off there is no instruction.
++
++When the session's workspace is a git checkout (a `.git` directory or file in
++it or an ancestor), a second sentence asks for `issue #123` or `PR #123`
++rather than a bare `#123`, and for `owner/repo#123` for another repository.
++It names only the notations that link in that session: the provider's own
++`!123` only when the workspace's remote is on a host whose `git` rule uses it
++(GitLab, Azure DevOps), and `owner/repo#123` only when the GitHub rule is on
++or the session's provider links it. The runner picks the rule as the chat
++does, from the provider and host of the workspace's first remote. Outside a
++checkout, or with every `git` rule off, there is no such sentence.
 +
 +A rule saved mid-session renders in the chat right away. SDK harnesses read
-+the rules again for a later turn (the runner keeps them for up to a minute).
++the rules again for a later turn (the runner keeps them, and each workspace's
++remote, for up to a minute).
 +Native Claude and Codex sessions get their instructions once, at launch, so
 +they see a changed rule in their prompt only after their next launch.
 diff --git a/feature-map/preferences.md b/feature-map/preferences.md
-index 2e0419435883c40e2d2459d2833e8ce8a3346878..670637851030db566dc91700810ca606c7b4ef98 100644
+index a373949db27550c375bcbfea820c9a22b4558c31..143213a709e5db6624a024f965c3f7d85376858e 100644
 --- a/feature-map/preferences.md
 +++ b/feature-map/preferences.md
 @@ -30,7 +30,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
@@ -125,7 +144,7 @@ index 2e0419435883c40e2d2459d2833e8ce8a3346878..670637851030db566dc91700810ca606
  
  - `configuration-copy`: review, save, show and import model defaults, harness
    selection/arguments and launcher plugin opt-outs; preserve local-only values.
-@@ -101,6 +102,18 @@ cd web && npx vitest run src/lib/linkRules.test.ts \
+@@ -106,6 +107,22 @@ cd web && npx vitest run src/lib/linkRules.test.ts \
    src/pages/settings/LinkRulesSettingsGroup.test.tsx
  ```
  
@@ -134,26 +153,31 @@ index 2e0419435883c40e2d2459d2833e8ce8a3346878..670637851030db566dc91700810ca606
 +`sys_link_rules` call waits on an approval card naming the rule; approve it and
 +check the rule appears in Settings → General → Chat links and that `BST-7` in
 +a later message renders as a link. Deny it and check nothing changed. Ask the
-+agent to list the rules: that call is not gated. Component coverage:
++agent to list the rules: that call is not gated. In a session on a git
++checkout, the agent's instructions end with the issue and pull request
++sentence (with `!123` on GitLab); outside a checkout they don't. Component
++coverage:
 +
 +```sh
 +uv run --no-sync pytest tests/runner/test_link_rules_tool_dispatch.py \
-+  tests/runtime/test_prompt.py -k "link_rule" tests/test_native_terminal.py --reruns 0 -q
++  tests/runtime/test_prompt.py tests/test_native_terminal.py \
++  tests/runner/test_pr_resource.py -k "link_rule or git" --reruns 0 -q
 +```
 +
  **Shared scope controls:** the CLI and UI do not yet offer automatic following,
  saving machine overrides, removing a machine override,
  resolving conflicts, or continuing with temporary defaults. The API above can
 diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
-index 1c1ba57d8d2346e5b71a4c6ab98ca546f0dd0fe3..be40fe2d0312777d4141a4528f180f5761f951a4 100644
+index 1c1ba57d8d2346e5b71a4c6ab98ca546f0dd0fe3..5eeb06925cc6f92e68b5d7d1747fc499bb598b6a 100644
 --- a/omnigent/harnesses/claude_native/main.py
 +++ b/omnigent/harnesses/claude_native/main.py
-@@ -156,7 +156,11 @@ from omnigent.native.native_terminal import (
+@@ -156,7 +156,12 @@ from omnigent.native.native_terminal import (
  from omnigent.native.native_terminal import (
      bind_session_runner as _bind_session_runner,
  )
 -from omnigent.native.native_terminal import fetch_session_chat_features, post_initial_prompt
 +from omnigent.native.native_terminal import (
++    fetch_git_workspace,
 +    fetch_link_rules,
 +    fetch_session_chat_features,
 +    post_initial_prompt,
@@ -161,7 +185,7 @@ index 1c1ba57d8d2346e5b71a4c6ab98ca546f0dd0fe3..be40fe2d0312777d4141a4528f180f57
  from omnigent.native.native_terminal import (
      normalize_extra_args as _normalize_extra_args,
  )
-@@ -5420,7 +5424,9 @@ async def _prepare_claude_terminal(
+@@ -5420,7 +5425,10 @@ async def _prepare_claude_terminal(
                  claude_config, session_id=session_id, labels=session_labels
              ),
              append_system_prompt=native_startup_instructions(
@@ -169,45 +193,56 @@ index 1c1ba57d8d2346e5b71a4c6ab98ca546f0dd0fe3..be40fe2d0312777d4141a4528f180f57
 +                author_instructions,
 +                await fetch_session_chat_features(client, session_id),
 +                await fetch_link_rules(client),
++                await fetch_git_workspace(Path.cwd()),
              ),
          )
          record_startup_event("terminal_available", session_id=session_id)
 diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
-index 3b2614534add079368bbff312d63959fb9c47e26..d6aeb68a9cb414e2cf99fcd82d83490f12dd4a5e 100644
+index 3b2614534add079368bbff312d63959fb9c47e26..7b4b0bcb72692be62ff651ae927926f0f7cf9b1c 100644
 --- a/omnigent/harnesses/codex_native/main.py
 +++ b/omnigent/harnesses/codex_native/main.py
-@@ -102,6 +102,7 @@ from omnigent.native.native_terminal import (
+@@ -102,6 +102,8 @@ from omnigent.native.native_terminal import (
      bind_session_runner as _bind_session_runner,
  )
  from omnigent.native.native_terminal import (
++    fetch_git_workspace,
 +    fetch_link_rules,
      fetch_session_chat_features,
      post_initial_prompt,
      request_with_429_retry,
-@@ -1251,7 +1252,9 @@ async def _prepare_codex_terminal(
+@@ -1251,7 +1253,12 @@ async def _prepare_codex_terminal(
              bridge_dir=bridge_dir,
              ap_server_url=base_url,
              ap_auth_headers=headers,
 -            developer_instructions=native_startup_instructions(author_instructions, chat_features),
 +            developer_instructions=native_startup_instructions(
-+                author_instructions, chat_features, await fetch_link_rules(client)
++                author_instructions,
++                chat_features,
++                await fetch_link_rules(client),
++                await fetch_git_workspace(Path.cwd()),
 +            ),
              terminal_launch_args=codex_args,
              session_labels=session_labels,
          )
 diff --git a/omnigent/native/native_terminal.py b/omnigent/native/native_terminal.py
-index 6d54778392e0a440974f4ae476661ba987a7f512..2a31e4c2f545b1817af21f1cd8cbde6714a2b1d0 100644
+index 6d54778392e0a440974f4ae476661ba987a7f512..dc46ed0075b3883055334333d3ca7d83405f30be 100644
 --- a/omnigent/native/native_terminal.py
 +++ b/omnigent/native/native_terminal.py
-@@ -11,6 +11,7 @@ import click
+@@ -6,11 +6,13 @@ import asyncio
+ import urllib.parse
+ import warnings
+ from collections.abc import Awaitable, Callable
++from pathlib import Path
+ 
+ import click
  import httpx
  
  from omnigent.host.daemon_launch import error_text
-+from omnigent.link_rules import LinkRule, LinkRuleError, validate_link_rules
++from omnigent.link_rules import GitWorkspace, LinkRule, LinkRuleError, validate_link_rules
  from omnigent.runtime.chat_features import (
      DEFAULT_CHAT_FEATURES,
      ChatFeature,
-@@ -206,6 +207,29 @@ async def fetch_session_chat_features(
+@@ -206,6 +208,40 @@ async def fetch_session_chat_features(
      return chat_features_from_wire(payload.get("chat_features"))
  
  
@@ -234,11 +269,22 @@ index 6d54778392e0a440974f4ae476661ba987a7f512..2a31e4c2f545b1817af21f1cd8cbde67
 +        return ()
 +
 +
++async def fetch_git_workspace(workspace: str | Path) -> GitWorkspace | None:
++    """The git remote of a launch's workspace, for its issue and pull request wording.
++
++    :param workspace: The session's workspace directory.
++    :returns: ``None`` outside a git checkout, else its provider and host.
++    """
++    from omnigent.runner.pr_resource import workspace_git
++
++    return await asyncio.to_thread(workspace_git, workspace)
++
++
  async def bind_session_runner(
      client: httpx.AsyncClient,
      session_id: str,
 diff --git a/omnigent/policies/builtins/safety.py b/omnigent/policies/builtins/safety.py
-index 198b0b450c58d9efa3897eb4c5c205e699a95f72..46eff831a18241e3eacf8394ff746fbb35f0f057 100644
+index 198b0b450c58d9efa3897eb4c5c205e699a95f72..6495652551a842e26755c9cebc39eb0d1288a2e8 100644
 --- a/omnigent/policies/builtins/safety.py
 +++ b/omnigent/policies/builtins/safety.py
 @@ -464,6 +464,43 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
@@ -271,7 +317,7 @@ index 198b0b450c58d9efa3897eb4c5c205e699a95f72..46eff831a18241e3eacf8394ff746fbb
 +    name = _clip(str(args.get("name") or "(unnamed)"))
 +    fields = [
 +        f"{key}={_clip(str(args[key]))}"
-+        for key in ("new_name", "kind", "pattern", "url", "enabled")
++        for key in ("new_name", "kind", "provider", "host", "pattern", "url", "enabled")
 +        if key in args
 +    ]
 +    detail = f" ({', '.join(fields)})" if fields else ""
@@ -286,14 +332,14 @@ index 198b0b450c58d9efa3897eb4c5c205e699a95f72..46eff831a18241e3eacf8394ff746fbb
  
  
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index 826e24b440134f4826776b5a03d2411755bc2e74..bb3cf94a6328b8487ba510ea816a35b65d709368 100644
+index 826e24b440134f4826776b5a03d2411755bc2e74..25d2f89ba90a260cd5c16f72c67b24f51b1ca49a 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
 @@ -70,12 +70,14 @@ from omnigent.harness_plugins import (
      model_env_keys,
      spawn_env_builders,
  )
-+from omnigent.link_rules import LinkRule
++from omnigent.link_rules import GitWorkspace, LinkRule
  from omnigent.llms.errors import detect_request_size_overflow
  from omnigent.native.failure_telemetry import failure_log_attributes
  from omnigent.native.input_diagnostics import input_attributes
@@ -321,39 +367,52 @@ index 826e24b440134f4826776b5a03d2411755bc2e74..bb3cf94a6328b8487ba510ea816a35b6
  
  
  # Pending questions outlive prompt delivery; poll outside the turn watchdog.
-@@ -1313,6 +1318,8 @@ def create_runner_app(
+@@ -1313,6 +1318,10 @@ def create_runner_app(
      # session_id → enabled chat features, seeded from the session-init snapshot
      # and refreshed by every forwarded turn body, so a PATCH applies next turn.
      _session_chat_features: dict[str, frozenset[ChatFeature]] = {}
 +    # (fetched at, rules): the user's chat link rules, re-read after a TTL.
 +    _link_rules_cache: list[tuple[float, tuple[LinkRule, ...]]] = []
++    # workspace path → (resolved at, its git remote or None outside a checkout).
++    _git_workspace_cache: dict[str, tuple[float, GitWorkspace | None]] = {}
      _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
      _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
      _session_cursor_model_names: dict[str, dict[str, str]] = {}
-@@ -5109,6 +5116,18 @@ def create_runner_app(
+@@ -5109,6 +5118,29 @@ def create_runner_app(
          """
          return _resolve_turn_chat_features(_session_chat_features, conv, msg_body)
  
-+    async def _turn_link_rule_instructions() -> list[str]:
-+        """The chat-links instruction for this turn, from rules cached briefly.
++    async def _turn_link_rule_instructions(conv: str) -> list[str]:
++        """The chat-links instructions for this turn, from rules cached briefly.
 +
 +        Rules are per user and a runner serves one user, so one cache entry
 +        covers every session; a saved change reaches the next turn after
-+        :data:`_LINK_RULES_CACHE_TTL_S`.
++        :data:`_LINK_RULES_CACHE_TTL_S`. The session's workspace decides the
++        issue and pull request wording, re-resolved after the same interval.
 +        """
 +        now = time.monotonic()
 +        if not _link_rules_cache or now - _link_rules_cache[0][0] > _LINK_RULES_CACHE_TTL_S:
 +            _link_rules_cache[:] = [(now, await fetch_link_rules(server_client))]
-+        return link_rule_instructions(_link_rules_cache[0][1])
++        git_workspace: GitWorkspace | None = None
++        workspace = await _session_runtime_cwd(conv)
++        if workspace is not None:
++            cached = _git_workspace_cache.get(str(workspace))
++            if cached is None or now - cached[0] > _LINK_RULES_CACHE_TTL_S:
++                from omnigent.runner.pr_resource import workspace_git
++
++                cached = (now, await asyncio.to_thread(workspace_git, workspace))
++                _git_workspace_cache[str(workspace)] = cached
++            git_workspace = cached[1]
++        return link_rule_instructions(_link_rules_cache[0][1], git_workspace)
 +
      def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
          """Reasoning block to forward on a turn, or ``None`` when unset.
  
-@@ -5233,12 +5252,14 @@ def create_runner_app(
+@@ -5233,12 +5265,14 @@ def create_runner_app(
              # Gated harnesses use nullable to avoid the fallback literal.
              _authored_bg = raw_author_instructions(cached_spec) is not None
              _bg_chat_features = _turn_chat_features(conv, msg_body)
-+            _bg_link_rules = await _turn_link_rule_instructions()
++            _bg_link_rules = await _turn_link_rule_instructions(conv)
              if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                  instructions = build_instructions_nullable(
                      cached_spec,
@@ -364,7 +423,7 @@ index 826e24b440134f4826776b5a03d2411755bc2e74..bb3cf94a6328b8487ba510ea816a35b6
                  )
              else:
                  instructions = build_instructions(
-@@ -5246,6 +5267,7 @@ def create_runner_app(
+@@ -5246,6 +5280,7 @@ def create_runner_app(
                      _raw_per_request_instructions,
                      [],
                      chat_features=_bg_chat_features,
@@ -372,15 +431,15 @@ index 826e24b440134f4826776b5a03d2411755bc2e74..bb3cf94a6328b8487ba510ea816a35b6
                  )
              # Warn once per (conversation, harness, delivery) if the agent has
              # authored instructions but the harness can't deliver them.
-@@ -5920,6 +5942,7 @@ def create_runner_app(
+@@ -5920,6 +5955,7 @@ def create_runner_app(
                          _per_req_instr = cast(str | None, body.get("instructions"))
                          _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
                          _ds_chat_features = _turn_chat_features(conv_id, body)
-+                        _ds_link_rules = await _turn_link_rule_instructions()
++                        _ds_link_rules = await _turn_link_rule_instructions(conv_id)
                          _ic_ds = InstructionComposition(
                              authored_present=_authored_ds,
                              composed=build_instructions_nullable(
-@@ -5927,6 +5950,7 @@ def create_runner_app(
+@@ -5927,6 +5963,7 @@ def create_runner_app(
                                  _per_req_instr,
                                  [],
                                  chat_features=_ds_chat_features,
@@ -388,7 +447,7 @@ index 826e24b440134f4826776b5a03d2411755bc2e74..bb3cf94a6328b8487ba510ea816a35b6
                              ),
                          )
                          # Gated harnesses get nullable — skip the fallback literal.
-@@ -5942,6 +5966,7 @@ def create_runner_app(
+@@ -5942,6 +5979,7 @@ def create_runner_app(
                                      _per_req_instr,
                                      [],
                                      chat_features=_ds_chat_features,
@@ -397,7 +456,7 @@ index 826e24b440134f4826776b5a03d2411755bc2e74..bb3cf94a6328b8487ba510ea816a35b6
                              }
                          if _authored_ds and harness_name:
 diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index 69f3416d35f26309486dc0cc60bf771591fa39ff..92e1acfd88924bfee4fbfca9f31ebca9cbe76cb3 100644
+index 69f3416d35f26309486dc0cc60bf771591fa39ff..ef8fbc6be015c2d583bbb607ec123f24a0b0a8d2 100644
 --- a/omnigent/runner/native/orchestration.py
 +++ b/omnigent/runner/native/orchestration.py
 @@ -69,6 +69,7 @@ from omnigent.harness_plugins import native_provider_for_key
@@ -412,19 +471,20 @@ index 69f3416d35f26309486dc0cc60bf771591fa39ff..92e1acfd88924bfee4fbfca9f31ebca9
      native_coding_agent_for_terminal_name,
  )
  from omnigent.native.native_dispatch import resolve_hook
-+from omnigent.native.native_terminal import fetch_link_rules
++from omnigent.native.native_terminal import fetch_git_workspace, fetch_link_rules
  from omnigent.pi_prompt import pi_prompt_args
  from omnigent.process_logging import process_log_reference
  from omnigent.runner.resource_registry import (
-@@ -5636,6 +5638,7 @@ async def _auto_create_codex_terminal(
+@@ -5636,6 +5638,8 @@ async def _auto_create_codex_terminal(
                  native_startup_instructions(
                      _native_startup_raw_instructions_from_spec(agent_spec),
                      launch_config.chat_features,
 +                    await _launch_link_rules(server_client),
++                    await fetch_git_workspace(workspace),
                  ),
                  _codex_routing_note,
              ]
-@@ -7528,6 +7531,17 @@ def _session_init_chat_features(
+@@ -7528,6 +7532,17 @@ def _session_init_chat_features(
      return chat_features_from_wire(getattr(session_init.snapshot, "chat_features", None))
  
  
@@ -442,16 +502,67 @@ index 69f3416d35f26309486dc0cc60bf771591fa39ff..92e1acfd88924bfee4fbfca9f31ebca9
  def _native_startup_raw_instructions_from_spec(
      agent_spec: AgentSpec | ResolvedSpec | None,
  ) -> str | None:
-@@ -9603,6 +9617,7 @@ async def _auto_create_claude_terminal(
+@@ -9603,6 +9618,8 @@ async def _auto_create_claude_terminal(
                  native_startup_instructions(
                      _native_startup_raw_instructions_from_spec(agent_spec),
                      launch_metadata.chat_features,
 +                    await _launch_link_rules(server_client),
++                    await fetch_git_workspace(workspace),
                  ),
                  routed_spawn_note,
              ]
+diff --git a/omnigent/runner/pr_resource.py b/omnigent/runner/pr_resource.py
+index 2bc27a6ae75e2adc4734c75c99b99c57be7efa7d..ca04343e1c2f474415a2cf5ab73a645788991904 100644
+--- a/omnigent/runner/pr_resource.py
++++ b/omnigent/runner/pr_resource.py
+@@ -22,6 +22,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
+ from contextlib import contextmanager, suppress
+ from contextvars import ContextVar
+ from dataclasses import dataclass
++from pathlib import Path
+ from threading import Lock
+ from typing import Any
+ 
+@@ -35,6 +36,7 @@ from omnigent.git_providers import (
+     providers,
+     resolve_remote,
+ )
++from omnigent.link_rules import GitWorkspace
+ from omnigent.runner import pr_reports
+ from omnigent.runner.git_providers import (
+     PR_DIFF_OBJECT,
+@@ -202,6 +204,29 @@ def resolve_provider(
+     return _resolve(root, _default_pr(session_id, pr_url))
+ 
+ 
++def workspace_git(root: str | Path) -> GitWorkspace | None:
++    """The git remote a workspace's chat references link to, for agent prompts.
++
++    :param root: The session's workspace directory.
++    :returns: ``None`` outside a git checkout; otherwise the provider that
++        claims its first remote (``None`` when none does) and that remote's host
++        (``None`` without a network remote).
++    """
++    from omnigent.runtime.prompt import is_git_checkout
++
++    if not is_git_checkout(Path(root)):
++        return None
++    try:
++        resolution = _workspace_provider(str(root))
++    except Exception:  # the prompt hint is optional; never fail a turn
++        _logger.debug("Could not resolve the git provider of %s", root, exc_info=True)
++        return GitWorkspace()
++    if resolution.remote_host is None:
++        return GitWorkspace()
++    provider = None if resolution.unclaimed else resolution.provider
++    return GitWorkspace(provider=provider, host=resolution.remote_host)
++
++
+ def _facet(provider_id: str | None) -> PullRequestFacet | None:
+     """Return the provider's pull request facet, or ``None`` when it has none."""
+     return load_facet(provider_id, "pull_requests") if provider_id else None
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index 95308a4172359c5c15dc408c848d3798e5d6af4f..f9666beadcce66daabfdc4243ca8ebc17dfb89c2 100644
+index 95308a4172359c5c15dc408c848d3798e5d6af4f..f1e2fb79394a24666e1aad2e569ce31eba13b20e 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
 @@ -36,6 +36,7 @@ from datetime import UTC, datetime
@@ -493,7 +604,7 @@ index 95308a4172359c5c15dc408c848d3798e5d6af4f..f9666beadcce66daabfdc4243ca8ebc1
      return json.dumps(resp.json())
  
  
-+_LINK_RULE_FIELDS = ("kind", "pattern", "url", "enabled")
++_LINK_RULE_FIELDS = ("kind", "pattern", "url", "enabled", "provider", "host")
 +
 +
 +def _changed_link_rules(rules: list[_JsonObject], args: _JsonObject) -> list[_JsonObject] | str:
@@ -672,47 +783,99 @@ index b11affef744bf5d513c3916ef9c36876a09d8d1e..6f286ee6c02a56989cf2d1c643662f73
          return True
      if spec.guardrails and spec.guardrails.policies:
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..11e87b149191ac05a656e691468a45c071e61fbe 100644
+index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..c34758f5f4d99c78c8bfca3d629f6ad0379e7f65 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
-@@ -15,6 +15,7 @@ from omnigent.entities import (
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import json
+ import re
+ from collections.abc import Iterable, Sequence
++from pathlib import Path
+ from typing import Any
+ 
+ from omnigent.entities import (
+@@ -15,6 +16,14 @@ from omnigent.entities import (
      NativeToolData,
  )
  from omnigent.inner.native_attachments import expand_framework_notices
-+from omnigent.link_rules import LinkRule, describe_link_syntax, enabled_link_rules
++from omnigent.link_rules import (
++    GitWorkspace,
++    LinkRule,
++    LinkRuleKind,
++    describe_link_syntax,
++    enabled_link_rules,
++    git_reference_instruction,
++)
  from omnigent.runtime.chat_features import ChatFeature, chat_feature_instructions
  from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
  from omnigent.runtime.tool_result_replay import (
-@@ -96,6 +97,24 @@ ITEM_LABEL_INSTRUCTION = (
+@@ -96,6 +105,60 @@ ITEM_LABEL_INSTRUCTION = (
  )
  
  
-+def link_rule_instructions(rules: Sequence[LinkRule]) -> list[str]:
-+    """The chat-links instruction for the user's enabled link rules.
++def is_git_checkout(path: Path) -> bool:
++    """
++    Whether ``path`` lies inside a git checkout.
++
++    Looks for ``.git`` in the directory or any ancestor: a directory for a
++    main checkout, a file for a linked worktree. A stat walk costs microseconds
++    and needs no git binary, so it can run on every turn.
++
++    :param path: A workspace directory.
++    :returns: ``True`` when ``path`` or an ancestor holds ``.git``.
++    """
++    try:
++        return any((candidate / ".git").exists() for candidate in (path, *path.parents))
++    except OSError:
++        return False
++
++
++def link_rule_instructions(
++    rules: Sequence[LinkRule], git_workspace: GitWorkspace | None = None
++) -> list[str]:
++    """The chat-links instructions for the user's enabled link rules.
 +
 +    The chat UI links these references (web/src/lib/linkRules.ts) wherever
-+    they appear as plain text, so agents should write them bare.
++    they appear as plain text, so agents should write them bare. Issue and
++    pull request wording is added only for a session in a git checkout, so a
++    model working outside a repository is not told about notation it has no
++    use for.
 +
 +    :param rules: The user's link rules, saved or default.
-+    :returns: One instruction naming each enabled rule's syntax, or none.
++    :param git_workspace: The session's git checkout, or ``None`` when its
++        workspace is not one.
++    :returns: Up to two instructions: the non-git rules' syntaxes, then the
++        issue and pull request notation the session's git rules link.
 +    """
-+    syntaxes = [describe_link_syntax(rule) for rule in enabled_link_rules(rules)]
-+    if not syntaxes:
-+        return []
-+    return [
-+        "Chat links: the chat UI turns these references into links when they "
-+        "appear as plain text, not inside code or a markdown link: " + "; ".join(syntaxes) + "."
++    syntaxes = [
++        describe_link_syntax(rule)
++        for rule in enabled_link_rules(rules)
++        if rule.kind != LinkRuleKind.GIT
 +    ]
++    instructions = []
++    if syntaxes:
++        instructions.append(
++            "Chat links: the chat UI turns these references into links when they "
++            "appear as plain text, not inside code or a markdown link: "
++            + "; ".join(syntaxes)
++            + "."
++        )
++    if git_workspace is not None and (
++        git_instruction := git_reference_instruction(rules, git_workspace)
++    ):
++        instructions.append(git_instruction)
++    return instructions
 +
 +
  def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      """
      Framework instructions that apply to every turn of ``spec``.
-@@ -129,19 +148,26 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -129,19 +192,28 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
  def native_startup_instructions(
      author_instructions: str | None,
      chat_features: Iterable[ChatFeature],
 +    link_rules: Sequence[LinkRule] = (),
++    git_workspace: GitWorkspace | None = None,
  ) -> str | None:
      """Author instructions plus the framework text a native launch channel carries.
  
@@ -724,6 +887,7 @@ index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..11e87b149191ac05a656e691468a45c0
      :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
      :param chat_features: The session's enabled chat features.
 +    :param link_rules: The user's chat link rules at launch.
++    :param git_workspace: The session's git checkout, or ``None`` outside one.
      :returns: The combined text, or ``None`` when there is nothing to send.
      """
      return append_framework_instructions(
@@ -732,7 +896,7 @@ index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..11e87b149191ac05a656e691468a45c0
 +        [
 +            ITEM_LABEL_INSTRUCTION,
 +            *chat_feature_instructions(chat_features),
-+            *link_rule_instructions(link_rules),
++            *link_rule_instructions(link_rules, git_workspace),
 +        ],
      )
  
@@ -759,10 +923,10 @@ index 6d525c98f8096f9bb68a7ed6e35de39d27a32ebd..af0a6555a5695da1305ea28e93750c46
  @dataclass
 diff --git a/omnigent/tools/builtins/link_rules.py b/omnigent/tools/builtins/link_rules.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b071ef125d99bf0f1551b64d7c4694e842ea05c0
+index 0000000000000000000000000000000000000000..d3fd975990ef9e7e537ec4d09b5cc6dda6719b0e
 --- /dev/null
 +++ b/omnigent/tools/builtins/link_rules.py
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,98 @@
 +"""Built-in tool for the user's chat link rules.
 +
 +``sys_link_rules`` lists, adds, updates and removes the rules that turn short
@@ -797,9 +961,11 @@ index 0000000000000000000000000000000000000000..b071ef125d99bf0f1551b64d7c4694e8
 +            "letters/digits/_/-, or a raw '/regex/' without lookaround, named groups or "
 +            "backreferences) and an https URL template using the same placeholders "
 +            "('{1}' for a regex group), e.g. 'https://jira.example.com/browse/BST-{num}'. "
-+            "The built-in 'github' (#123) and 'session' (session:<id>) kinds take no "
-+            "pattern or url. Every change asks the user to approve it; only change rules "
-+            "when the user asks."
++            "A 'git' rule has a provider ('github', 'gitlab' or 'azure_devops') and a bare "
++            "host (e.g. 'gitlab.example.com', no scheme or path); it links #123, PR #123 "
++            "and owner/repo#123 in sessions whose repository is on that host. The "
++            "'session' kind (session:<id>) is built in. Neither takes a pattern or url. "
++            "Every change asks the user to approve it; only change rules when the user asks."
 +        )
 +
 +    def get_schema(self) -> dict[str, Any]:
@@ -829,7 +995,7 @@ index 0000000000000000000000000000000000000000..b071ef125d99bf0f1551b64d7c4694e8
 +                        },
 +                        "kind": {
 +                            "type": "string",
-+                            "enum": ["url", "github", "session"],
++                            "enum": ["url", "git", "session"],
 +                            "description": "add: the rule's kind (default 'url').",
 +                        },
 +                        "pattern": {
@@ -839,6 +1005,15 @@ index 0000000000000000000000000000000000000000..b071ef125d99bf0f1551b64d7c4694e8
 +                        "url": {
 +                            "type": "string",
 +                            "description": "add/update, url kind: the link template.",
++                        },
++                        "provider": {
++                            "type": "string",
++                            "enum": ["github", "gitlab", "azure_devops"],
++                            "description": "add/update, git kind: the host's git provider.",
++                        },
++                        "host": {
++                            "type": "string",
++                            "description": "add/update, git kind: the bare host name.",
 +                        },
 +                        "enabled": {
 +                            "type": "boolean",
@@ -885,10 +1060,10 @@ index c67cb8a3da92eb05860f320cde148f8dc79262a2..a79067cd1e4052df1c3e80d4abcc7870
          Register the async-dispatch builtins when the agent spec
 diff --git a/tests/runner/test_link_rules_tool_dispatch.py b/tests/runner/test_link_rules_tool_dispatch.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e7f591b6ba4850b1c9dad700313afa5ba6029264
+index 0000000000000000000000000000000000000000..c84dbf4c1eb3e673d6ae148ab73cb030e5c057d0
 --- /dev/null
 +++ b/tests/runner/test_link_rules_tool_dispatch.py
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,170 @@
 +"""``sys_link_rules``: the runner's handler against the real ``/v1/link-rules`` routes,
 +its registration, and the approval it asks for."""
 +
@@ -971,13 +1146,42 @@ index 0000000000000000000000000000000000000000..e7f591b6ba4850b1c9dad700313afa5b
 +        assert "no rule named" in (await _call(client, action="remove", name="GitHub"))["error"]
 +
 +
++async def test_add_and_move_a_git_host(server_client):
++    async with server_client as client:
++        added = await _call(
++            client,
++            action="add",
++            name="Our GitLab",
++            kind="git",
++            provider="gitlab",
++            host="GitLab.example.com",
++        )
++        assert added["rules"][-1] == {
++            "name": "Our GitLab",
++            "kind": "git",
++            "provider": "gitlab",
++            "host": "gitlab.example.com",
++            "pattern": "",
++            "enabled": True,
++        }
++        moved = await _call(client, action="update", name="our gitlab", host="git.example.com")
++        assert moved["rules"][-1]["host"] == "git.example.com"
++        refused = await _call(client, action="update", name="Our GitLab", host="gitlab.com")
++        assert "two git rules are for gitlab.com" in refused["error"]
++
++
 +@pytest.mark.parametrize(
 +    ("change", "message"),
 +    [
 +        ({"url": "javascript:alert(1)//{num}"}, "https://"),
 +        ({"pattern": "/(a+)+/"}, "repeated group"),
 +        ({"pattern": "/(?<=x)BST-(\\d+)/"}, "lookaround"),
-+        ({"kind": "github"}, "takes no pattern"),
++        ({"kind": "session"}, "takes no pattern"),
++        ({"kind": "git", "pattern": "", "url": None, "provider": "gitlab"}, "host: required"),
++        (
++            {"kind": "git", "pattern": "", "url": None, "provider": "gitlab", "host": "https://x"},
++            "bare host name",
++        ),
 +    ],
 +)
 +async def test_invalid_changes_are_refused_before_saving(server_client, change, message):
@@ -1022,6 +1226,52 @@ index 0000000000000000000000000000000000000000..e7f591b6ba4850b1c9dad700313afa5b
 +    assert "url=https://jira.example.com/browse/BST-{num}" in asked["reason"]
 +    for args in ({"action": "remove", "name": "GitHub"}, {"action": "update", "name": "x"}, {}):
 +        assert ask_on_link_rule_change(_event(args))["result"] == "ASK"
++    git = {
++        "action": "add",
++        "name": "Ours",
++        "kind": "git",
++        "provider": "gitlab",
++        "host": "g.example",
++    }
++    assert "provider=gitlab, host=g.example" in ask_on_link_rule_change(_event(git))["reason"]
+diff --git a/tests/runner/test_pr_resource.py b/tests/runner/test_pr_resource.py
+index a0a4ae4bd8a65ade0516a6573b2a566f1939ef7b..c5b1cf069c86705cb5813acb2fc0464583da8ac7 100644
+--- a/tests/runner/test_pr_resource.py
++++ b/tests/runner/test_pr_resource.py
+@@ -21,6 +21,7 @@ from omnigent.git_providers import (
+     host_of,
+     reset_for_tests,
+ )
++from omnigent.link_rules import GitWorkspace
+ from omnigent.runner import github_resource, pr_resource
+ from omnigent.runner.pr_resource import ProviderResolution
+ from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+@@ -467,3 +468,25 @@ def test_the_github_facet_loads_without_the_panel_module() -> None:
+     )
+ 
+     assert result.returncode == 0, result.stderr
++
++
++@pytest.mark.parametrize(
++    ("remote", "expected"),
++    [
++        ("git@gitlab.com:group/sub/project.git", GitWorkspace("gitlab", "gitlab.com")),
++        ("https://github.com/o/r.git", GitWorkspace("github", "github.com")),
++        # No provider claims the host: the prompt can still match a listed host.
++        ("git@git.example.test:o/r.git", GitWorkspace(None, "git.example.test")),
++        (None, GitWorkspace()),
++    ],
++)
++def test_workspace_git_reports_the_remote_a_prompt_links_to(
++    repo: Path, remote: str | None, expected: GitWorkspace
++) -> None:
++    if remote is not None:
++        _git(repo, "remote", "add", "origin", remote)
++    assert pr_resource.workspace_git(repo) == expected
++
++
++def test_workspace_git_is_none_outside_a_checkout(tmp_path: Path) -> None:
++    assert pr_resource.workspace_git(tmp_path) is None
 diff --git a/tests/runtime/policies/test_builder.py b/tests/runtime/policies/test_builder.py
 index d77ac1b891bd34e527014e40c99207b8eea86f73..c940348288f71fdc3d3e8773fe692c8659fb881d 100644
 --- a/tests/runtime/policies/test_builder.py
@@ -1146,54 +1396,58 @@ index f8c4d4c643534f783cffac5e3505b6c601f1bf78..776377ab2bd9d8da5d710daae6ac9b78
  
      from omnigent.spec.types import FunctionPolicySpec
 diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
-index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..bc378950d71bc1b72a10f5589f1baab6876a973e 100644
+index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..f88da7ccf6475e1f2e482c1080ba13ae7a3be85d 100644
 --- a/tests/runtime/test_prompt.py
 +++ b/tests/runtime/test_prompt.py
-@@ -2,12 +2,14 @@
+@@ -2,12 +2,15 @@
  
  import json
  import re
 +from dataclasses import replace
++from pathlib import Path
  from types import SimpleNamespace
  from typing import cast
  
  import pytest
  
  from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
-+from omnigent.link_rules import DEFAULT_LINK_RULES
++from omnigent.link_rules import DEFAULT_LINK_RULES, GitWorkspace, LinkRule, LinkRuleKind
  from omnigent.runner.subagent_work import (
      _format_subagent_wake_notice,
  )
-@@ -22,6 +24,7 @@ from omnigent.runtime.prompt import (
+@@ -22,6 +25,8 @@ from omnigent.runtime.prompt import (
      build_instructions,
      build_instructions_nullable,
      history_to_input_items,
++    is_git_checkout,
 +    link_rule_instructions,
      native_startup_instructions,
      raw_author_instructions,
  )
-@@ -460,6 +463,35 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+@@ -460,6 +465,98 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
      assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
  
  
 +def test_link_rule_instructions_name_each_enabled_syntax() -> None:
 +    """The chat-links instruction lists only enabled rules, and none means no text."""
 +    [instruction] = link_rule_instructions(DEFAULT_LINK_RULES)
-+    assert "`#123` or `owner/repo#123`" in instruction
 +    assert "`session:<session id>`" in instruction
 +    assert "ABC-123" not in instruction  # the Jira example is off by default
++    assert "#123" not in instruction  # git wording waits for a git checkout
 +    assert "not inside code" in instruction
 +    assert link_rule_instructions(()) == []
 +    disabled = [replace(rule, enabled=False) for rule in DEFAULT_LINK_RULES]
 +    assert link_rule_instructions(disabled) == []
++    assert link_rule_instructions(disabled, GitWorkspace("github", "github.com")) == []
 +
 +
 +def test_native_startup_instructions_carry_link_rules_last() -> None:
 +    """A native launch appends the chat-links instruction after the other framework text."""
-+    text = native_startup_instructions("Agent prompt", frozenset(), DEFAULT_LINK_RULES)
++    workspace = GitWorkspace("github", "github.com")
++    text = native_startup_instructions("Agent prompt", frozenset(), DEFAULT_LINK_RULES, workspace)
 +    assert text is not None
 +    assert text.startswith(f"Agent prompt\n\n{ITEM_LABEL_INSTRUCTION}")
-+    assert text.endswith(link_rule_instructions(DEFAULT_LINK_RULES)[0])
++    assert text.endswith("\n\n".join(link_rule_instructions(DEFAULT_LINK_RULES, workspace)))
 +
 +
 +def test_build_instructions_takes_link_rules_as_framework_text() -> None:
@@ -1205,11 +1459,72 @@ index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..bc378950d71bc1b72a10f5589f1baab6
 +    )
 +
 +
++# ─── Issue and pull request wording follows the session's git checkout ────
++
++
++def test_git_checkout_detected_from_any_directory_inside_it(tmp_path: Path) -> None:
++    """A ``.git`` directory (main checkout) or file (linked worktree) at the
++    workspace or any ancestor counts; a plain directory does not."""
++    checkout = tmp_path / "checkout"
++    (checkout / ".git").mkdir(parents=True)
++    (checkout / "src" / "pkg").mkdir(parents=True)
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++    (worktree / ".git").write_text("gitdir: ../checkout/.git/worktrees/worktree\n")
++    plain = tmp_path / "plain"
++    plain.mkdir()
++
++    assert is_git_checkout(checkout)
++    assert is_git_checkout(checkout / "src" / "pkg")
++    assert is_git_checkout(worktree)
++    assert not is_git_checkout(plain)
++    assert not is_git_checkout(tmp_path / "missing")
++
++
++def _git_instruction(workspace: GitWorkspace | None, rules=DEFAULT_LINK_RULES) -> str | None:
++    texts = [text for text in link_rule_instructions(rules, workspace) if "PR #123" in text]
++    return texts[0] if texts else None
++
++
++def test_git_wording_only_in_a_git_checkout() -> None:
++    assert _git_instruction(None) is None
++    instruction = _git_instruction(GitWorkspace("github", "github.com"))
++    assert instruction is not None
++    for form in ("issue #123", "PR #123", "owner/repo#123"):
++        assert f"`{form}`" in instruction
++    assert "!123" not in instruction
++
++
++def test_git_wording_names_the_session_providers_own_notation() -> None:
++    gitlab = _git_instruction(GitWorkspace("gitlab", "gitlab.com"))
++    assert gitlab is not None and "`!123` for a merge request" in gitlab
++    azure = _git_instruction(GitWorkspace("azure_devops", "dev.azure.com"))
++    assert azure is not None and "`!123` for a pull request" in azure
++    # A self-managed host the user listed counts even when no provider claims it.
++    ours = LinkRule(name="Ours", kind=LinkRuleKind.GIT, provider="gitlab", host="git.example.com")
++    listed = _git_instruction(GitWorkspace(None, "git.example.com"), (*DEFAULT_LINK_RULES, ours))
++    assert listed is not None and "`!123`" in listed
++
++
++def test_git_wording_without_a_session_repository_keeps_github_references() -> None:
++    """With no repository (or an unknown host), only GitHub's qualified form links."""
++    for workspace in (GitWorkspace(), GitWorkspace(None, "git.example.com")):
++        instruction = _git_instruction(workspace)
++        assert instruction is not None
++        assert "`owner/repo#123`" in instruction and "!123" not in instruction
++    only_azure = [
++        replace(rule, enabled=rule.provider == "azure_devops") for rule in DEFAULT_LINK_RULES
++    ]
++    assert _git_instruction(GitWorkspace(), only_azure) is None
++    azure = _git_instruction(GitWorkspace("azure_devops", "dev.azure.com"), only_azure)
++    assert azure is not None and "owner/repo#123" not in azure
++
++
  def test_native_startup_instructions_append_item_labels_after_author_text() -> None:
      """Native launch channels carry the author text first, then the label guidance."""
      assert native_startup_instructions("  Agent prompt  ", frozenset()) == (
 diff --git a/tests/test_native_terminal.py b/tests/test_native_terminal.py
-index 360d46aba343903a8f0f53d14e6d776255fe33ee..4f8b461a5d0476ba8a3908eb65727aad2fae7c98 100644
+index 360d46aba343903a8f0f53d14e6d776255fe33ee..ab223ae891d39465f862bcfc5562fa05bc261b65 100644
 --- a/tests/test_native_terminal.py
 +++ b/tests/test_native_terminal.py
 @@ -426,3 +426,29 @@ async def test_fetch_session_chat_features(
@@ -1221,7 +1536,7 @@ index 360d46aba343903a8f0f53d14e6d776255fe33ee..4f8b461a5d0476ba8a3908eb65727aad
 +@pytest.mark.parametrize(
 +    ("status_code", "payload", "expected"),
 +    [
-+        (200, {"rules": [{"name": "GitHub", "kind": "github", "url": None}]}, ("GitHub",)),
++        (200, {"rules": [{"name": "S", "kind": "session", "url": None}]}, ("S",)),
 +        (404, {"detail": "Not Found"}, ()),
 +        (200, {"rules": [{"name": "x", "kind": "url", "pattern": "/(a+)+/"}]}, ()),
 +        (200, {"rules": "nope"}, ()),

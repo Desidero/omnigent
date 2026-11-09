@@ -3,7 +3,7 @@ From: Desidero <desidero@gmail.com>
 Date: Thu, 29 Oct 2026 20:05:15 +0000
 Subject: [PATCH] feat(web): render chat link rules and edit them in Settings
 
-Short references in chat messages (BST-2135, #123, session:<id>) are plain
+Short references in chat messages (BST-2135, PR #123, session:<id>) are plain
 text today. This renders the user's link rules from /v1/link-rules and adds a
 Settings group to edit them.
 
@@ -15,40 +15,53 @@ Settings group to edit them.
   regexes take their leading boundary as a group instead of lookbehind, which
   older Safari can't parse. Captures are percent-encoded and every href is
   re-parsed as http(s) before use.
-- GitHub references link on the session's own provider host, read from the
-  git info the PR panel already fetches; the runner's GitHub resource now
-  reports the repository URL so a session with no PR knows its host. #N goes
-  to /pull/N for a known PR and /issues/N otherwise.
+- Git references follow the session's repository, read from the git info
+  the PR panel already fetches: the git rule for its host (or, unlisted, the
+  provider the server resolved) links #123, issue #123, PR #123 / MR #123 and
+  the provider's !123 with GitHub, GitLab or Azure DevOps URL shapes. Without
+  a repository a bare #123 stays text. The GitHub rule links owner/repo#123
+  in every session; in a session on another host, a qualified reference under
+  the session's top-level group, with more than two segments or with !, stays
+  on that host. The runner's GitHub, GitLab and Azure DevOps resources report
+  the repository URL, so a session with no PR knows its host.
 - session:<id>[/<message id>] opens /c/<id>?message=<message id> in the app,
   the deep link item labels use for Show in conversation.
-- Settings > General > Chat links lists, adds, edits, toggles, deletes and
-  resets rules, shows each rule's error, and previews sample text with the
-  rules being edited.
+- Streamdown's memo ignores remarkPlugins, so a message is keyed on its
+  matchers and re-parses once when the rules or repository arrive; the
+  repository keeps its identity across PR panel polls.
+- Settings > General > Chat links lists, adds (url rules and git hosts),
+  edits, toggles, deletes and resets rules, shows each rule's error, and
+  previews sample text with the rules being edited.
 
-Not upstream yet: proposed from feat/chat-link-rules; drop this copy once it merges.
+Not upstream yet: proposed from feat/chat-link-rules, the git-reference part from
+feat/git-ref-notation; drop this copy once they merge.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/chat-link-rules.md                       |  31 +
- feature-map/preferences.md                    |  17 +-
+ docs/chat-link-rules.md                       |  77 ++
+ feature-map/preferences.md                    |  20 +-
+ omnigent/runner/git_providers/azure_devops.py |   9 +-
+ omnigent/runner/git_providers/gitlab.py       |   9 +-
  omnigent/runner/github_resource.py            |  11 +-
- tests/runner/test_github_resource.py          |  35 ++
- .../blocks/ChatMarkdown.linkRules.test.tsx    | 185 ++++++
- web/src/components/blocks/ChatMarkdown.tsx    |  52 +-
- .../components/chat/LinkRulesScope.test.ts    |  46 ++
- web/src/components/chat/LinkRulesScope.tsx    |  55 ++
+ tests/runner/test_github_resource.py          |  35 +
+ tests/runner/test_gitlab_provider.py          |   2 +
+ tests/runner/test_pr_resource_azure_devops.py |  10 +-
+ .../blocks/ChatMarkdown.linkRules.test.tsx    | 247 +++++
+ web/src/components/blocks/ChatMarkdown.tsx    |  63 +-
+ .../components/chat/LinkRulesScope.test.ts    |  69 ++
+ web/src/components/chat/LinkRulesScope.tsx    |  88 ++
  web/src/components/chat/Transcript.tsx        |   8 +-
  web/src/hooks/useLinkRules.ts                 |  14 +
  web/src/hooks/usePullRequests.ts              |   2 +
- web/src/lib/linkRules.test.ts                 | 172 ++++++
- web/src/lib/linkRules.ts                      | 556 ++++++++++++++++++
- web/src/lib/linkRulesApi.ts                   |  79 +++
+ web/src/lib/linkRules.test.ts                 | 418 +++++++++
+ web/src/lib/linkRules.ts                      | 857 ++++++++++++++++++
+ web/src/lib/linkRulesApi.ts                   |  86 ++
  web/src/pages/SettingsPage.test.tsx           |   3 +
  web/src/pages/SettingsPage.tsx                |   2 +
- .../settings/LinkRulesSettingsGroup.test.tsx  | 164 ++++++
- .../pages/settings/LinkRulesSettingsGroup.tsx | 313 ++++++++++
- 18 files changed, 1735 insertions(+), 10 deletions(-)
+ .../settings/LinkRulesSettingsGroup.test.tsx  | 180 ++++
+ .../pages/settings/LinkRulesSettingsGroup.tsx | 384 ++++++++
+ 22 files changed, 2578 insertions(+), 16 deletions(-)
  create mode 100644 web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
  create mode 100644 web/src/components/chat/LinkRulesScope.test.ts
  create mode 100644 web/src/components/chat/LinkRulesScope.tsx
@@ -60,22 +73,24 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/pages/settings/LinkRulesSettingsGroup.tsx
 
 diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
-index 7133177c422a1d1a144c58c1d620cf3b9f8a42f1..c62b2cdb0a25539e1cba9679a43a78c55c218ae2 100644
+index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..98d8be8bdf83b51dc9724f6658ab8b00079609ae 100644
 --- a/docs/chat-link-rules.md
 +++ b/docs/chat-link-rules.md
-@@ -4,6 +4,37 @@ Link rules turn short references in chat messages, such as `BST-2135` or
- `#123`, into links. Each user has one list of rules, saved as a shared
+@@ -4,6 +4,83 @@ Link rules turn short references in chat messages, such as `BST-2135` or
+ `PR #123`, into links. Each user has one list of rules, saved as a shared
  preference, so every session and device shows the same links.
  
 +## Setting them up
 +
 +Settings → General → **Chat links** lists the rules. Each one can be turned on
-+or off, renamed, edited (pattern and URL for a `url` rule) or deleted; **Add
-+rule** adds a `url` rule, and a removed GitHub or Sessions rule can be added
-+back. A rule that fails a check shows why under it, and **Save** stays off
-+until every rule passes. **Reset to defaults** removes the saved list. The
-+**Preview** box renders its text with the rules being edited, before they are
-+saved. GitHub references don't link in the preview, which has no session.
++or off, renamed, edited (pattern and URL for a `url` rule, provider and host
++for a `git` rule) or deleted; **Add rule** adds a `url` rule, **Add git host**
++a `git` rule (for GitHub Enterprise or a self-managed GitLab, say), and a
++removed Sessions rule can be added back. A rule that fails a check shows why
++under it, and **Save** stays off until every rule passes. **Reset to
++defaults** removes the saved list. The **Preview** box renders its text with
++the rules being edited, before they are saved. The preview has no session, so
++only GitHub's `owner/repo#123` links there.
 +
 +A saved rule applies to messages as soon as the transcript refetches the
 +rules, in every open session.
@@ -87,22 +102,66 @@ index 7133177c422a1d1a144c58c1d620cf3b9f8a42f1..c62b2cdb0a25539e1cba9679a43a78c5
 +or raw HTML. Where two rules match overlapping text, the match that starts
 +first wins, then the rule listed first. A link's tooltip names its rule.
 +
-+- `url` and `github` links open in a new tab like any other web link.
-+- A `github` reference links to the session's repository on its provider's own
-+  host (GitHub Enterprise included), taken from the session's git info: the
-+  repository URL, or the host of a known pull request. `#123` goes to
-+  `/pull/123` when the session knows that pull request and to `/issues/123`
-+  otherwise, which GitHub redirects for pull requests. `owner/repo#123` links
-+  on the same host. A session with no GitHub repository leaves them as text.
++- `url` and `git` links open in a new tab like any other web link.
++- `git` references link as described in [Git references](#git-references).
 +- A `session` reference opens the session in the app, scrolled to the message
 +  when one is named (`/c/<session id>?message=<message id>`, the same link
 +  as an item's **Show in conversation**).
++
++A message that rendered before the rules or the session's repository loaded
++renders again once they arrive.
++
++### Git references
++
++The session's repository comes from its git info (the Pull Requests panel's
++query): the provider the server resolved, the repository path and its host,
++taken from the repository URL or a known pull request's, never assumed from
++the provider.
++
++**Which rule a session uses.** The `git` rule whose host is the repository's
++host owns the session's references; a disabled one turns them off. With no
++rule for that host, the first enabled rule for the provider the server
++resolved does (so a GitHub Enterprise or self-managed GitLab host links with
++nobody listing it, on its own host). A session with no repository, or one on
++a host no rule or provider covers, leaves bare references as text: a bare
++`#123` is never guessed onto a host. Projects carry no repository of their
++own (only a default workspace path), so there is no project fallback.
++
++| In the session's rule | Links to |
++| --- | --- |
++| `#123` | GitHub: the pull request when the session knows one by that number, else `/issues/123` (GitHub redirects for pull requests). GitLab: `/-/issues/123`. Azure DevOps: work item 123 |
++| `issue #123`, `work item #123` | The issue (GitLab, GitHub) or work item (Azure DevOps) |
++| `PR #123`, `pull #123`, `pull request #123`, `MR #123`, `merge request #123` | The pull or merge request |
++| `!123` (GitLab, Azure DevOps only) | The merge or pull request |
++| `owner/repo#123`, `group/sub/project!123` | That repository on the session's host (not on Azure DevOps, which has no notation for another repository) |
++
++**GitHub links qualified references everywhere.** GitHub is referenced often
++even from private repositories elsewhere, so the first enabled GitHub rule
++(`github.com` by default) links `owner/repo#123` in every session, including
++sessions on GitLab or Azure DevOps and sessions with no repository. GitLab
++writes `group/project#123` the same way, so when the session's repository is
++on another host, a qualified reference stays with the session's host if
++
++- its path has more than two segments (`group/sub/project#123`: GitHub
++  repositories are always `owner/repo`), or
++- its first segment is the session repository's top-level owner or group
++  (`acme/web#4` in a session on `acme/backend/api`), or
++- it uses the provider's `!` marker;
++
++and goes to GitHub otherwise (`facebook/react#7`). Comparing the top-level
++group rather than the full namespace keeps sibling subgroups
++(`acme/frontend/web#7`) on the session's host. Turning the GitHub rule off
++turns this off: qualified references then stay with the session's host, and
++link nowhere in a session without a repository.
++
++References never link inside a path, URL or entity (after `/`, `.`, `:`, `#`,
++`!` or `&`), and a number has at most seven digits.
 +
  ## Rules
  
  A rule has a `name` (unique, up to 64 characters), a `kind`, a `pattern`, a
 diff --git a/feature-map/preferences.md b/feature-map/preferences.md
-index ea8f36b32375aae980552bbee1038dfcac9f8aa2..2e0419435883c40e2d2459d2833e8ce8a3346878 100644
+index a3508d93e7acfe9c78d0bbc28c74d909147313a4..a373949db27550c375bcbfea820c9a22b4558c31 100644
 --- a/feature-map/preferences.md
 +++ b/feature-map/preferences.md
 @@ -29,7 +29,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
@@ -115,16 +174,19 @@ index ea8f36b32375aae980552bbee1038dfcac9f8aa2..2e0419435883c40e2d2459d2833e8ce8
  
  - `configuration-copy`: review, save, show and import model defaults, harness
    selection/arguments and launcher plugin opt-outs; preserve local-only values.
-@@ -86,6 +87,20 @@ restores the defaults). Covered by `tests/test_link_rules.py` (pattern and URL
- checks) and `tests/server/routes/test_link_rules.py` (per-user storage, stale
- versions, rejected rules, a server without shared preferences).
+@@ -88,6 +89,23 @@ git host checks, which `git` rule a session uses, reading and saving the old
+ stale versions, rejected rules, the old kind on input, a server without shared
+ preferences).
  
 +**Chat links in Settings and the chat:** Settings → General → Chat links lists,
-+edits, previews, saves and resets the rules; without shared preferences it
-+shows the defaults read-only. In a session, write `ABC-12` (after turning on
-+and editing the Jira example), `#12`, or `session:<id>` in a message and check
-+each renders as a link, while the same text in backticks stays code. Component
-+coverage:
++edits, previews, saves and resets the rules, including **Add git host** for a
++self-managed host; without shared preferences it shows the defaults
++read-only. In a session, write `ABC-12` (after turning on and editing the Jira
++example), `#12`, `PR #12`, `owner/repo#12` or `session:<id>` in a message and
++check each renders as a link, while the same text in backticks stays code. In
++a session on a GitLab checkout, `!12` links to the merge request and
++`facebook/react#1` to GitHub; in a session outside a repository only
++`owner/repo#12` links. Component coverage:
 +
 +```sh
 +cd web && npx vitest run src/lib/linkRules.test.ts \
@@ -136,6 +198,67 @@ index ea8f36b32375aae980552bbee1038dfcac9f8aa2..2e0419435883c40e2d2459d2833e8ce8
  **Shared scope controls:** the CLI and UI do not yet offer automatic following,
  saving machine overrides, removing a machine override,
  resolving conflicts, or continuing with temporary defaults. The API above can
+diff --git a/omnigent/runner/git_providers/azure_devops.py b/omnigent/runner/git_providers/azure_devops.py
+index d4e9e8507faceddddc390f71623bde9cc927a7cb..60230ce13a2c95edaef916d9cdd1eb51330b1c2e 100644
+--- a/omnigent/runner/git_providers/azure_devops.py
++++ b/omnigent/runner/git_providers/azure_devops.py
+@@ -428,6 +428,13 @@ def _name(repo: AzureRepo) -> str:
+     return f"{repo.org}/{repo.project}/{repo.repo}"
+ 
+ 
++def _repo_payload(repo: AzureRepo) -> dict[str, str]:
++    """The panel's ``repo``: its name and web URL, which chat links read the host from."""
++    org, project, name = (quote(part, safe="") for part in (repo.org, repo.project, repo.repo))
++    url = f"https://dev.azure.com/{org}/{project}/_git/{name}"
++    return {"name_with_owner": _name(repo), "url": url}
++
++
+ def _branch_pr(
+     client: AzureDevOpsClient, repo: AzureRepo, branch: str | None
+ ) -> dict[str, Any] | None:
+@@ -751,7 +758,7 @@ class AzureDevOpsPullRequests:
+             authenticated=token is not None,
+             branch=branch,
+             base_ref=None,
+-            repo=None if repo is None else {"name_with_owner": _name(repo)},
++            repo=None if repo is None else _repo_payload(repo),
+             pr=None,
+         )
+         if repo is None or token is None:
+diff --git a/omnigent/runner/git_providers/gitlab.py b/omnigent/runner/git_providers/gitlab.py
+index 0d68034e13eb625b6d80ddbf9849934533882002..443d0249666abc81d7f1408edf99d319abc553c5 100644
+--- a/omnigent/runner/git_providers/gitlab.py
++++ b/omnigent/runner/git_providers/gitlab.py
+@@ -181,6 +181,11 @@ def _resolved(
+     return None
+ 
+ 
++def _repo_payload(host: str, repository: str) -> dict[str, str]:
++    """The panel's ``repo``: its path and web URL, which chat links read the host from."""
++    return {"name_with_owner": repository, "url": f"https://{host}/{repository}"}
++
++
+ def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
+     repo = reference or next(iter(_remotes(root)), None)
+     host = repo.host if repo else "gitlab.com"
+@@ -191,7 +196,7 @@ def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str,
+         "provider_display": provider_display("gitlab"),
+         "branch": _branch(root),
+         "base_ref": None,
+-        "repo": {"name_with_owner": repo.repository} if repo else None,
++        "repo": _repo_payload(repo.host, repo.repository) if repo else None,
+         "pr": None,
+         "selected_pr_url": reference.url if reference else None,
+         "capabilities": _CAPABILITIES.to_json(),
+@@ -309,7 +314,7 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
+         info["auth"]["hint"] = None
+         if resolved:
+             client, ref, mr = resolved
+-            info.update(repo={"name_with_owner": ref.repository}, selected_pr_url=ref.url)
++            info.update(repo=_repo_payload(ref.host, ref.repository), selected_pr_url=ref.url)
+             info["pr"] = _pr_payload(client, ref, mr, info["warnings"])
+             info["base_ref"] = info["pr"]["base_ref"]
+     except ValueError as exc:
 diff --git a/omnigent/runner/github_resource.py b/omnigent/runner/github_resource.py
 index 035ac9785b4b304157fa0e60abf22544d21cb0fa..e9a78a549d6488a4f9ee763084dd6b12fd7f3e7e 100644
 --- a/omnigent/runner/github_resource.py
@@ -210,12 +333,53 @@ index 9f9d4114a52f22442ccc66ce1b16005f66656443..cebbac91a1b88d5e4a177cb6b1d3c728
  def test_github_info_pr_via_commit_fork_fallback(
      repo: Path, monkeypatch: pytest.MonkeyPatch
  ) -> None:
+diff --git a/tests/runner/test_gitlab_provider.py b/tests/runner/test_gitlab_provider.py
+index 3b1285bdfa706cd80b9bb5b02222964165793eaa..b25d5aee8702eabbd18d8b03e798a7cfe674f8e4 100644
+--- a/tests/runner/test_gitlab_provider.py
++++ b/tests/runner/test_gitlab_provider.py
+@@ -161,6 +161,8 @@ def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Moc
+     assert info["provider"] == "gitlab" and info["auth"]["authenticated"]
+     assert info["branch"] == "feature"
+     assert info["repo"]["name_with_owner"] == "team/sub/project"
++    # The repository's web URL gives chat links its host when no MR names one.
++    assert info["repo"]["url"] == "https://gitlab.com/team/sub/project"
+     assert info["selected_pr_url"] == URL
+     pr = info["pr"]
+     assert pr["number"] == 7 and pr["state"] == "OPEN" and pr["is_draft"]
+diff --git a/tests/runner/test_pr_resource_azure_devops.py b/tests/runner/test_pr_resource_azure_devops.py
+index a329b6b7bc2663a9a60f44fae3ae2a6fef5ffbd9..17dbba5d2462e9c76b05c736b0eb9cc060b1adbb 100644
+--- a/tests/runner/test_pr_resource_azure_devops.py
++++ b/tests/runner/test_pr_resource_azure_devops.py
+@@ -196,7 +196,10 @@ def test_pr_info_returns_the_azure_devops_payload_for_the_branch_pr(
+     assert info["capabilities"] == NO_CAPABILITIES
+     assert info["auth"]["cli"] == {"name": "az", "available": False}
+     assert not LEGACY_FIELDS & info.keys()
+-    assert info["repo"] == {"name_with_owner": "contoso/web/app"}
++    assert info["repo"] == {
++        "name_with_owner": "contoso/web/app",
++        "url": "https://dev.azure.com/contoso/web/_git/app",
++    }
+     assert (info["branch"], info["base_ref"]) == ("feat", "main")
+     pr = info["pr"]
+     assert (pr["number"], pr["url"], pr["title"], pr["state"]) == (
+@@ -275,7 +278,10 @@ def test_every_remote_form_reaches_the_same_repository(
+     info = pr_resource.pr_info(str(workspace), session_id=SESSION)
+ 
+     assert info["provider"] == "azure_devops"
+-    assert info["repo"] == {"name_with_owner": "contoso/web/app"}
++    assert info["repo"] == {
++        "name_with_owner": "contoso/web/app",
++        "url": "https://dev.azure.com/contoso/web/_git/app",
++    }
+     assert info["pr"]["url"] == PR_URL
+ 
+ 
 diff --git a/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx b/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5910c2d04
+index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7dd6b35276
 --- /dev/null
 +++ b/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,247 @@
 +// Link rules in chat markdown: references in plain text become links after
 +// item labels and file links have taken theirs, and text in links, code and
 +// code blocks is never rewritten.
@@ -233,9 +397,10 @@ index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5
 +} from "@/lib/itemLabels";
 +import {
 +  compileLinkRules,
-+  type GithubLinkTarget,
 +  type LinkRule,
++  type LinkMatcher,
 +  LinkRuleMatchersContext,
++  type SessionGitRepository,
 +} from "@/lib/linkRules";
 +import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 +
@@ -248,7 +413,9 @@ index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5
 +};
 +const GITHUB_RULE: LinkRule = {
 +  name: "GitHub",
-+  kind: "github",
++  kind: "git",
++  provider: "github",
++  host: "github.com",
 +  pattern: "",
 +  url: null,
 +  enabled: true,
@@ -260,9 +427,10 @@ index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5
 +  url: null,
 +  enabled: true,
 +};
-+const GITHUB: GithubLinkTarget = {
++const GITHUB: SessionGitRepository = {
++  provider: "github",
 +  origin: "https://git.example.com",
-+  repo: "acme/app",
++  repository: "acme/app",
 +  pullNumbers: new Set(),
 +};
 +
@@ -291,10 +459,25 @@ index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5
 +  return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
 +}
 +
-+function renderMarkdown(markdown: string, rules: LinkRule[] = [JIRA], breaks = false) {
-+  const matchers = compileLinkRules(rules, GITHUB);
++function renderMarkdown(
++  markdown: string,
++  rules: LinkRule[] = [JIRA],
++  breaks = false,
++  session: SessionGitRepository | null = GITHUB,
++) {
 +  return render(
-+    <QueryClientProvider client={new QueryClient()}>
++    markdownTree(markdown, compileLinkRules(rules, session), new QueryClient(), breaks),
++  );
++}
++
++function markdownTree(
++  markdown: string,
++  matchers: readonly LinkMatcher[],
++  client: QueryClient,
++  breaks = false,
++) {
++  return (
++    <QueryClientProvider client={client}>
 +      <MemoryRouter initialEntries={["/c/current"]}>
 +        <ItemLabelSessionContext.Provider value="current">
 +          <ItemLabelIndexContext.Provider value={INDEX}>
@@ -309,7 +492,7 @@ index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5
 +        </ItemLabelSessionContext.Provider>
 +        <LocationProbe />
 +      </MemoryRouter>
-+    </QueryClientProvider>,
++    </QueryClientProvider>
 +  );
 +}
 +
@@ -381,6 +564,49 @@ index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5
 +    );
 +  });
 +
++  it("links issue and pull request references except inside code", async () => {
++    renderMarkdown(
++      [
++        "Reported in #12, fixed by PR #34 and backported in other/project#56.",
++        "The span `#78` and the block below stay plain:",
++        "",
++        "```sh",
++        "gh pr checkout 34  # not a reference: #34",
++        "```",
++      ].join("\n"),
++      [GITHUB_RULE],
++    );
++    expect(linkFor("#12")?.getAttribute("href")).toBe("https://git.example.com/acme/app/issues/12");
++    expect((await screen.findByText("PR #34", { selector: "a" })).getAttribute("href")).toBe(
++      "https://git.example.com/acme/app/pull/34",
++    );
++    // Another owner's repository is GitHub's, not the Enterprise host's.
++    expect(linkFor("other/project#56")?.getAttribute("href")).toBe(
++      "https://github.com/other/project/issues/56",
++    );
++    expect(screen.getByText("#78").tagName).toBe("CODE");
++  });
++
++  it("leaves bare references as text when the session has no repository", async () => {
++    renderMarkdown("Reported in #12, fixed by PR #34 in acme/web#5.", [GITHUB_RULE], false, null);
++    expect((await screen.findByText("acme/web#5", { selector: "a" })).getAttribute("href")).toBe(
++      "https://github.com/acme/web/issues/5",
++    );
++    expect(linkFor("#12")).toBe(null);
++    expect(linkFor("PR #34")).toBe(null);
++  });
++
++  it("re-renders a message when its rules arrive after it rendered", async () => {
++    const client = new QueryClient();
++    const view = render(markdownTree("Fixes #12.", [], client));
++    await screen.findByText(/Fixes #12/);
++    expect(linkFor("#12")).toBe(null);
++    view.rerender(markdownTree("Fixes #12.", compileLinkRules([GITHUB_RULE], GITHUB), client));
++    expect((await screen.findByText("#12", { selector: "a" })).getAttribute("href")).toBe(
++      "https://git.example.com/acme/app/issues/12",
++    );
++  });
++
 +  it("opens a session reference in the app at the message", async () => {
 +    renderMarkdown("See session:abc123def/resp_9 for context.", [SESSION_RULE]);
 +    const link = await screen.findByText("session:abc123def/resp_9", { selector: "a" });
@@ -402,32 +628,33 @@ index 0000000000000000000000000000000000000000..dbff1e438ab6f2036dee36d7896832f5
 +  });
 +});
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be411d954a5 100644
+index 2e2001406c9eaa603e3d36d603d6895905e195f3..c95d1ae04a8d51bf449a1394b40cebd160b539f2 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
 @@ -8,6 +8,8 @@
  //   2. Markdown links whose href is a file path: see `WorkspaceFileLink`.
  //   3. Item labels (`[Q3]`) that preview where they were raised and take
  //      comments: see `ItemLabelChip`.
-+//   4. Link rules (`BST-12`, `#123`, `session:<id>`) the user configures: see
++//   4. Link rules (`BST-12`, `PR #123`, `session:<id>`) the user configures: see
 +//      `remarkLinkRules` and `SessionReferenceLink`.
  //
  // Lives apart from `BlockRenderer` so approval cards can render agent markdown
  // without importing the block dispatcher that renders them.
-@@ -58,6 +60,12 @@ import {
+@@ -58,6 +60,13 @@ import {
    type ItemLabelSource,
  } from "@/lib/itemLabels";
  import { itemCommentTitle } from "@/lib/itemComments";
 +import {
 +  LinkRuleMatchersContext,
 +  SESSION_REFERENCE_HREF_PREFIX,
++  linkMatchersKey,
 +  parseSessionReference,
 +  remarkLinkRules,
 +} from "@/lib/linkRules";
  import {
    requestItemComment,
    useCanCommentOnItems,
-@@ -70,7 +78,7 @@ import { SessionImage } from "@/components/SessionImage";
+@@ -70,7 +79,7 @@ import { SessionImage } from "@/components/SessionImage";
  import { Button } from "@/components/ui/button";
  import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
  import { relativeTime } from "@/lib/relativeTime";
@@ -436,7 +663,7 @@ index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be4
  import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
  import { keyedAttachments } from "@/lib/blocks";
  import { cn } from "@/lib/utils";
-@@ -908,7 +916,34 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
+@@ -908,7 +917,34 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
    );
  }
  
@@ -472,7 +699,7 @@ index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be4
  function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
    if (props.href?.startsWith(ITEM_LABEL_HREF_PREFIX)) {
      return (
-@@ -917,6 +952,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
+@@ -917,6 +953,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
        </ItemLabelChip>
      );
    }
@@ -482,7 +709,7 @@ index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be4
    return <WorkspaceFileLink {...props} />;
  }
  
-@@ -1037,7 +1075,9 @@ function remarkHtmlAsText() {
+@@ -1037,7 +1076,9 @@ function remarkHtmlAsText() {
   * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
   * block rendering too, stripping `<pre>` and collapsing whitespace.
   *
@@ -493,7 +720,7 @@ index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be4
   *
   * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
   * instead of collapsing to spaces per CommonMark. Used for user bubbles,
-@@ -1057,6 +1097,7 @@ export function FilePathAwareMessageResponse({
+@@ -1057,6 +1098,7 @@ export function FilePathAwareMessageResponse({
    ...props
  }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
    const components = FILE_PATH_AWARE_COMPONENTS;
@@ -501,7 +728,7 @@ index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be4
  
    // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
    const remarkPlugins = useMemo(
-@@ -1064,9 +1105,12 @@ export function FilePathAwareMessageResponse({
+@@ -1064,9 +1106,12 @@ export function FilePathAwareMessageResponse({
        ...Object.values(defaultRemarkPlugins),
        ...(literalHtml ? [remarkHtmlAsText] : []),
        remarkItemLabels,
@@ -515,15 +742,32 @@ index 2e2001406c9eaa603e3d36d603d6895905e195f3..8fa612b3dd4816e012cc6d44e66f9be4
    );
  
    // Throttle the markdown so the live (still-growing) bubble re-parses a few
+@@ -1096,7 +1141,15 @@ export function FilePathAwareMessageResponse({
+   }
+ 
+   return (
+-    <MessageResponse {...props} components={components} remarkPlugins={remarkPlugins} markFileLinks>
++    <MessageResponse
++      // Streamdown's memo ignores `remarkPlugins`: remount when the link rules
++      // or the session's repository arrive after the message rendered.
++      key={linkMatchersKey(linkMatchers)}
++      {...props}
++      components={components}
++      remarkPlugins={remarkPlugins}
++      markFileLinks
++    >
+       {isString ? throttledText : children}
+     </MessageResponse>
+   );
 diff --git a/web/src/components/chat/LinkRulesScope.test.ts b/web/src/components/chat/LinkRulesScope.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..36ab74743123456e4373facda431752b920dfc80
+index 0000000000000000000000000000000000000000..608e37ad73bd993bc739cc8c6496059ca2ff61aa
 --- /dev/null
 +++ b/web/src/components/chat/LinkRulesScope.test.ts
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,69 @@
 +import { describe, expect, it } from "vitest";
 +import type { PullRequestAssociation, PullRequestInfo } from "@/hooks/usePullRequests";
-+import { githubLinkTarget } from "./LinkRulesScope";
++import { sessionGitRepository } from "./LinkRulesScope";
 +
 +function info(fields: Partial<PullRequestInfo>): PullRequestInfo {
 +  return { object: "session.github.info", available: true, provider: "github", ...fields };
@@ -533,17 +777,22 @@ index 0000000000000000000000000000000000000000..36ab74743123456e4373facda431752b
 +  return { url, host: new URL(url).host, repository, number, relationship: "created" };
 +}
 +
-+describe("githubLinkTarget", () => {
-+  it("uses the host the repository reports, not github.com", () => {
++describe("sessionGitRepository", () => {
++  it("uses the host the repository reports, not the provider's", () => {
 +    expect(
-+      githubLinkTarget(
++      sessionGitRepository(
 +        info({ repo: { name_with_owner: "acme/app", url: "https://ghe.example.com/acme/app" } }),
 +      ),
-+    ).toEqual({ origin: "https://ghe.example.com", repo: "acme/app", pullNumbers: new Set() });
++    ).toEqual({
++      provider: "github",
++      origin: "https://ghe.example.com",
++      repository: "acme/app",
++      pullNumbers: new Set(),
++    });
 +  });
 +
 +  it("falls back to a known pull request's host and collects pull numbers", () => {
-+    const target = githubLinkTarget(
++    const target = sessionGitRepository(
 +      info({
 +        repo: { name_with_owner: "acme/app" },
 +        prs: [
@@ -556,27 +805,53 @@ index 0000000000000000000000000000000000000000..36ab74743123456e4373facda431752b
 +    expect([...(target?.pullNumbers ?? [])]).toEqual([5]);
 +  });
 +
++  it("keeps the provider the server resolved", () => {
++    const gitlab = info({
++      provider: "gitlab",
++      repo: { name_with_owner: "team/sub/app", url: "https://gitlab.example.com/team/sub/app" },
++    });
++    expect(sessionGitRepository(gitlab)).toMatchObject({
++      provider: "gitlab",
++      origin: "https://gitlab.example.com",
++      repository: "team/sub/app",
++    });
++    // A host that predates the provider field serves GitHub.
++    const legacy: PullRequestInfo = {
++      object: "session.github.info",
++      available: true,
++      repo: { name_with_owner: "a/b", url: "https://github.com/a/b" },
++    };
++    expect(sessionGitRepository(legacy)?.provider).toBe("github");
++  });
++
 +  it.each([
 +    ["no info", undefined],
 +    ["not a repo", info({ available: false })],
-+    ["another provider", info({ provider: "gitlab", repo: { name_with_owner: "a/b" } })],
 +    ["no repository", info({ repo: null })],
 +    ["an unknown host", info({ repo: { name_with_owner: "acme/app" } })],
 +    ["a non-http URL", info({ repo: { name_with_owner: "acme/app", url: "javascript:alert(1)" } })],
 +  ])("is null with %s", (_case, value) => {
-+    expect(githubLinkTarget(value)).toBe(null);
++    expect(sessionGitRepository(value)).toBe(null);
 +  });
 +});
 diff --git a/web/src/components/chat/LinkRulesScope.tsx b/web/src/components/chat/LinkRulesScope.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..4b9810d4793ce9810d900e2edfbfeb01dafa4824
+index 0000000000000000000000000000000000000000..02e55e65c27d10313a220c603d86adaf0a91463a
 --- /dev/null
 +++ b/web/src/components/chat/LinkRulesScope.tsx
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,88 @@
 +import { useMemo } from "react";
 +import { useLinkRules } from "@/hooks/useLinkRules";
-+import { type PullRequestInfo, usePullRequestInfo } from "@/hooks/usePullRequests";
-+import { compileLinkRules, type GithubLinkTarget, LinkRuleMatchersContext } from "@/lib/linkRules";
++import {
++  normalizePullRequestInfo,
++  type PullRequestInfo,
++  usePullRequestInfo,
++} from "@/hooks/usePullRequests";
++import {
++  compileLinkRules,
++  LinkRuleMatchersContext,
++  type SessionGitRepository,
++} from "@/lib/linkRules";
 +
 +function originOf(url: string | null | undefined): string | null {
 +  if (!url) return null;
@@ -589,24 +864,50 @@ index 0000000000000000000000000000000000000000..4b9810d4793ce9810d900e2edfbfeb01
 +}
 +
 +/**
-+ * Where the session's `#123` references link, from its git provider info: the
-+ * repository's own host (never assumed to be github.com), or `null` when the
-+ * session has no GitHub repository or its host isn't known yet.
++ * The repository a session's chat references link to, from its git info: the
++ * provider the server resolved and the repository's own host (never assumed
++ * from the provider), or `null` when the session has no repository or its
++ * host isn't known yet.
 + */
-+export function githubLinkTarget(info: PullRequestInfo | undefined): GithubLinkTarget | null {
++export function sessionGitRepository(
++  info: PullRequestInfo | undefined,
++): SessionGitRepository | null {
 +  if (!info?.available) return null;
 +  // An absent provider is a host that predates the field, which serves GitHub.
-+  if (info.provider !== undefined && info.provider !== "github") return null;
-+  const repo = info.repo?.name_with_owner;
-+  if (!repo) return null;
-+  const sameRepo = (other: string) => other.toLowerCase() === repo.toLowerCase();
-+  const known = (info.prs ?? []).filter((pr) => sameRepo(pr.repository));
++  const { provider } = normalizePullRequestInfo(info);
++  const repository = info.repo?.name_with_owner;
++  if (!repository) return null;
++  const sameRepository = (other: string) => other.toLowerCase() === repository.toLowerCase();
++  const known = (info.prs ?? []).filter((pr) => sameRepository(pr.repository));
 +  const origin =
 +    originOf(info.repo?.url) ?? originOf(info.pr?.url) ?? originOf(known[0]?.url) ?? null;
 +  if (origin === null) return null;
 +  const pullNumbers = new Set(known.map((pr) => pr.number));
 +  if (info.pr) pullNumbers.add(info.pr.number);
-+  return { origin, repo, pullNumbers };
++  return { provider, origin, repository, pullNumbers };
++}
++
++/**
++ * {@link sessionGitRepository} with a stable identity while its fields are
++ * unchanged: the git info polls, and new matchers would re-parse every message.
++ */
++function useSessionGitRepository(sessionId: string | null): SessionGitRepository | null {
++  const { data: info } = usePullRequestInfo(sessionId ?? undefined);
++  const repository = sessionGitRepository(info);
++  const serialized =
++    repository === null
++      ? null
++      : JSON.stringify({
++          ...repository,
++          pullNumbers: [...repository.pullNumbers].sort((a, b) => a - b),
++        });
++  return useMemo(() => {
++    if (serialized === null) return null;
++    const parsed = JSON.parse(serialized) as Omit<SessionGitRepository, "pullNumbers"> & {
++      pullNumbers: number[];
++    };
++    return { ...parsed, pullNumbers: new Set(parsed.pullNumbers) };
++  }, [serialized]);
 +}
 +
 +/** Compiles the user's link rules for the transcript of `sessionId`. */
@@ -618,11 +919,10 @@ index 0000000000000000000000000000000000000000..4b9810d4793ce9810d900e2edfbfeb01
 +  children: React.ReactNode;
 +}) {
 +  const { data: settings } = useLinkRules();
-+  const { data: info } = usePullRequestInfo(sessionId ?? undefined);
-+  const github = useMemo(() => githubLinkTarget(info), [info]);
++  const repository = useSessionGitRepository(sessionId);
 +  const matchers = useMemo(
-+    () => compileLinkRules(settings?.rules ?? [], github),
-+    [settings, github],
++    () => compileLinkRules(settings?.rules ?? [], repository),
++    [settings, repository],
 +  );
 +  return (
 +    <LinkRuleMatchersContext.Provider value={matchers}>{children}</LinkRuleMatchersContext.Provider>
@@ -682,48 +982,69 @@ index 0000000000000000000000000000000000000000..94151ca2ce887f27a28f2e89db4c6d84
 +  });
 +}
 diff --git a/web/src/hooks/usePullRequests.ts b/web/src/hooks/usePullRequests.ts
-index 17024c3db63dd0fbeb7b2d78eac55f38c95b7fb4..b7e77cce83596753bbd69124ac2dd75a7174264c 100644
+index 17024c3db63dd0fbeb7b2d78eac55f38c95b7fb4..7efa8b5d6c3a0e92ea29d341b621f1643103c40c 100644
 --- a/web/src/hooks/usePullRequests.ts
 +++ b/web/src/hooks/usePullRequests.ts
 @@ -152,6 +152,8 @@ export interface PullRequest {
  
  export interface PullRequestRepo {
    name_with_owner: string | null;
-+  /** The repository's web URL, when the host reports it (GitHub without a PR). */
++  /** The repository's web URL, when the host reports it; chat links read its host. */
 +  url?: string | null;
  }
  
  /** A `gh`-configured account — one option in the panel's account selector. */
 diff --git a/web/src/lib/linkRules.test.ts b/web/src/lib/linkRules.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..dbd2b200dedb201a5bb9bf47bcf8ecdb5cc5c938
+index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3efd24fbd
 --- /dev/null
 +++ b/web/src/lib/linkRules.test.ts
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,418 @@
 +import { describe, expect, it } from "vitest";
 +import {
++  checkGitHost,
 +  compileLinkPattern,
 +  compileLinkRules,
 +  findLinks,
-+  type GithubLinkTarget,
++  type GitLinkTarget,
++  type GitProviderId,
++  gitReferenceUrl,
 +  type LinkRule,
 +  linkRuleError,
 +  linkRuleErrors,
 +  parseSessionReference,
++  remarkLinkRules,
++  type SessionGitRepository,
++  sessionGitRule,
 +} from "./linkRules";
 +
 +function urlRule(pattern: string, url: string, name = "Rule"): LinkRule {
 +  return { name, kind: "url", pattern, url, enabled: true };
 +}
 +
-+const GITHUB: GithubLinkTarget = {
-+  origin: "https://git.example.com",
-+  repo: "acme/app",
-+  pullNumbers: new Set([7]),
-+};
++function gitRule(name: string, provider: GitProviderId, host: string, enabled = true): LinkRule {
++  return { name, kind: "git", provider, host, pattern: "", url: null, enabled };
++}
 +
-+function links(text: string, rules: LinkRule[], github: GithubLinkTarget | null = null) {
-+  return findLinks(text, compileLinkRules(rules, github)).map(({ start, end, href }) => ({
++const GITHUB_RULE = gitRule("GitHub", "github", "github.com");
++const GITLAB_RULE = gitRule("GitLab", "gitlab", "gitlab.com");
++const AZURE_RULE = gitRule("Azure DevOps", "azure_devops", "dev.azure.com");
++const GIT_DEFAULTS = [GITHUB_RULE, GITLAB_RULE, AZURE_RULE];
++
++function repo(
++  provider: string | null,
++  origin: string,
++  repository: string,
++  pullNumbers: number[] = [],
++): SessionGitRepository {
++  return { provider, origin, repository, pullNumbers: new Set(pullNumbers) };
++}
++
++const GITHUB_SESSION = repo("github", "https://github.com", "acme/app", [7]);
++const GITLAB_SESSION = repo("gitlab", "https://gitlab.com", "acme/backend/api");
++
++function links(text: string, rules: LinkRule[], session: SessionGitRepository | null = null) {
++  return findLinks(text, compileLinkRules(rules, session)).map(({ start, end, href }) => ({
 +    text: text.slice(start, end),
 +    href,
 +  }));
@@ -782,9 +1103,40 @@ index 0000000000000000000000000000000000000000..dbd2b200dedb201a5bb9bf47bcf8ecdb
 +  });
 +
 +  it("refuses a pattern on a built-in kind", () => {
++    expect(linkRuleError({ ...GITHUB_RULE, pattern: "#{num}" })).toContain("takes no pattern");
 +    expect(
-+      linkRuleError({ name: "GH", kind: "github", pattern: "#{num}", url: null, enabled: true }),
-+    ).toContain("takes no pattern");
++      linkRuleError({
++        name: "S",
++        kind: "session",
++        pattern: "",
++        url: null,
++        enabled: true,
++        host: "x",
++      }),
++    ).toContain("belong to a git rule");
++  });
++
++  it("checks a git rule's provider and host", () => {
++    expect(linkRuleError(gitRule("Ours", "gitlab", "GitLab.Example.com:8443"))).toBe(null);
++    expect(linkRuleError({ ...GITLAB_RULE, provider: "bitbucket" as GitProviderId })).toContain(
++      "provider: must be github, gitlab, azure_devops",
++    );
++    expect(linkRuleError({ ...GITLAB_RULE, host: "" })).toContain("host: required");
++  });
++
++  it.each([
++    "https://gitlab.example.com",
++    "gitlab.example.com/group",
++    "user@gitlab.example.com",
++    "user:pw@gitlab.example.com",
++    "gitlab example.com",
++    "gitlab.example.com:0",
++    "gitlab.example.com:99999",
++    "-gitlab.example.com",
++    "gitlab..example.com",
++    "a".repeat(254),
++  ])("rejects the host %s", (host) => {
++    expect(() => checkGitHost(host)).toThrow("host:");
 +  });
 +
 +  it("reports repeated names and a built-in kind listed twice", () => {
@@ -797,6 +1149,9 @@ index 0000000000000000000000000000000000000000..dbd2b200dedb201a5bb9bf47bcf8ecdb
 +        { ...session, name: "S2" },
 +      ]),
 +    ).toEqual([null, "two rules are named jira", null, "only one session rule"]);
++    expect(
++      linkRuleErrors([GITLAB_RULE, gitRule("Again", "gitlab", "GITLAB.com"), GITHUB_RULE]),
++    ).toEqual([null, "two git rules are for gitlab.com", null]);
 +  });
 +});
 +
@@ -834,22 +1189,213 @@ index 0000000000000000000000000000000000000000..dbd2b200dedb201a5bb9bf47bcf8ecdb
 +    expect(links("BST-9", [wide, jira])[0].href).toContain("wide.example");
 +  });
 +
-+  it("links GitHub references on the session's own host", () => {
-+    const github: LinkRule = { name: "GH", kind: "github", pattern: "", url: null, enabled: true };
-+    expect(links("Fixes #12, see #7 and other/lib#3. a#4", [github], GITHUB)).toEqual([
-+      { text: "#12", href: "https://git.example.com/acme/app/issues/12" },
-+      { text: "#7", href: "https://git.example.com/acme/app/pull/7" },
-+      { text: "other/lib#3", href: "https://git.example.com/other/lib/issues/3" },
-+    ]);
-+    expect(links("#12", [github], null)).toEqual([]);
-+  });
-+
 +  it("turns session references into in-app hrefs", () => {
 +    const session: LinkRule = { name: "S", kind: "session", pattern: "", url: null, enabled: true };
 +    expect(links("see session:abc123def and session:abc123def/resp_9", [session])).toEqual([
 +      { text: "session:abc123def", href: "#omnigent-session-abc123def" },
 +      { text: "session:abc123def/resp_9", href: "#omnigent-session-abc123def/resp_9" },
 +    ]);
++  });
++});
++
++describe("git references", () => {
++  it("reads the kind from the word before the number", () => {
++    expect(
++      links("See issue #12, PR #34, pull #56 and merge request #78.", GIT_DEFAULTS, GITHUB_SESSION),
++    ).toEqual([
++      { text: "issue #12", href: "https://github.com/acme/app/issues/12" },
++      { text: "PR #34", href: "https://github.com/acme/app/pull/34" },
++      { text: "pull #56", href: "https://github.com/acme/app/pull/56" },
++      { text: "merge request #78", href: "https://github.com/acme/app/pull/78" },
++    ]);
++  });
++
++  it("sends a bare GitHub number to a known pull request, else the issue page", () => {
++    expect(links("Fixes #12, see #7 and other/lib#3. a#4", GIT_DEFAULTS, GITHUB_SESSION)).toEqual([
++      { text: "#12", href: "https://github.com/acme/app/issues/12" },
++      { text: "#7", href: "https://github.com/acme/app/pull/7" },
++      { text: "other/lib#3", href: "https://github.com/other/lib/issues/3" },
++    ]);
++  });
++
++  it("ignores anchors, entities, identifiers and over-long numbers", () => {
++    expect(
++      links(
++        "page.html#12 and https://x.test/a#3, C#5, &#123; bad; see #12345678 or ticket#4.",
++        GIT_DEFAULTS,
++        GITHUB_SESSION,
++      ),
++    ).toEqual([]);
++  });
++
++  it("links a GitLab session's issues, merge requests and own groups", () => {
++    expect(
++      links(
++        "issue #3, !4, MR #5, acme/web!6, acme/frontend/web#7 and #8",
++        GIT_DEFAULTS,
++        GITLAB_SESSION,
++      ),
++    ).toEqual([
++      { text: "issue #3", href: "https://gitlab.com/acme/backend/api/-/issues/3" },
++      { text: "!4", href: "https://gitlab.com/acme/backend/api/-/merge_requests/4" },
++      { text: "MR #5", href: "https://gitlab.com/acme/backend/api/-/merge_requests/5" },
++      { text: "acme/web!6", href: "https://gitlab.com/acme/web/-/merge_requests/6" },
++      { text: "acme/frontend/web#7", href: "https://gitlab.com/acme/frontend/web/-/issues/7" },
++      { text: "#8", href: "https://gitlab.com/acme/backend/api/-/issues/8" },
++    ]);
++  });
++
++  it("recognises `!` only where the session's provider writes requests that way", () => {
++    expect(links("Merged !5 and #6.", GIT_DEFAULTS, GITHUB_SESSION).map((l) => l.text)).toEqual([
++      "#6",
++    ]);
++  });
++
++  it("maps an Azure DevOps session to work items and pull requests", () => {
++    const azure = repo("azure_devops", "https://dev.azure.com", "org/project/repo");
++    expect(links("#8, PR #9, !10 and org/other#2", GIT_DEFAULTS, azure)).toEqual([
++      { text: "#8", href: "https://dev.azure.com/org/project/_workitems/edit/8" },
++      { text: "PR #9", href: "https://dev.azure.com/org/project/_git/repo/pullrequest/9" },
++      { text: "!10", href: "https://dev.azure.com/org/project/_git/repo/pullrequest/10" },
++    ]);
++  });
++
++  it("uses a listed self-hosted host, and its provider's URL shapes", () => {
++    const ours = gitRule("Our GitLab", "gitlab", "git.example.com");
++    const session = repo(null, "https://git.example.com", "team/app");
++    expect(links("#3 and !4", [...GIT_DEFAULTS, ours], session)).toEqual([
++      { text: "#3", href: "https://git.example.com/team/app/-/issues/3" },
++      { text: "!4", href: "https://git.example.com/team/app/-/merge_requests/4" },
++    ]);
++    // Unlisted, and no provider claims it: only GitHub's qualified form links.
++    expect(links("#3 and acme/web#4", GIT_DEFAULTS, session)).toEqual([
++      { text: "acme/web#4", href: "https://github.com/acme/web/issues/4" },
++    ]);
++  });
++
++  it("links a GitHub Enterprise session through the GitHub rule on its own host", () => {
++    const enterprise = repo("github", "https://ghe.example.com", "acme/app");
++    expect(links("#3, acme/lib#4 and torvalds/linux#5", GIT_DEFAULTS, enterprise)).toEqual([
++      { text: "#3", href: "https://ghe.example.com/acme/app/issues/3" },
++      { text: "acme/lib#4", href: "https://ghe.example.com/acme/lib/issues/4" },
++      { text: "torvalds/linux#5", href: "https://github.com/torvalds/linux/issues/5" },
++    ]);
++  });
++
++  it("leaves bare numbers as text without a repository, but links GitHub's qualified form", () => {
++    expect(links("#3, PR #4, !5 and acme/web#6", GIT_DEFAULTS, null)).toEqual([
++      { text: "acme/web#6", href: "https://github.com/acme/web/issues/6" },
++    ]);
++  });
++
++  it("sends a GitLab session's references outside its namespace to GitHub", () => {
++    expect(
++      links("facebook/react#7, acme/web#8 and other/lib!9", GIT_DEFAULTS, GITLAB_SESSION),
++    ).toEqual([
++      { text: "facebook/react#7", href: "https://github.com/facebook/react/issues/7" },
++      { text: "acme/web#8", href: "https://gitlab.com/acme/web/-/issues/8" },
++      // GitHub has no `!` marker, so the provider's own notation stays.
++      { text: "other/lib!9", href: "https://gitlab.com/other/lib/-/merge_requests/9" },
++    ]);
++  });
++
++  it("keeps every qualified reference on the session when GitHub is off", () => {
++    const rules = [{ ...GITHUB_RULE, enabled: false }, GITLAB_RULE];
++    expect(links("facebook/react#7", rules, GITLAB_SESSION)).toEqual([
++      { text: "facebook/react#7", href: "https://gitlab.com/facebook/react/-/issues/7" },
++    ]);
++    expect(links("facebook/react#7", rules, null)).toEqual([]);
++  });
++
++  it("turns a session's host off with its disabled rule", () => {
++    const rules = [GITHUB_RULE, { ...GITLAB_RULE, enabled: false }];
++    expect(links("#3 and facebook/react#4", rules, GITLAB_SESSION)).toEqual([
++      { text: "facebook/react#4", href: "https://github.com/facebook/react/issues/4" },
++    ]);
++  });
++});
++
++describe("sessionGitRule", () => {
++  const ours = gitRule("Our GitLab", "gitlab", "gitlab.example.com");
++  const rules = [...GIT_DEFAULTS, ours];
++
++  it.each([
++    ["github", "github.com", GITHUB_RULE],
++    ["gitlab", "GitLab.com", GITLAB_RULE],
++    ["gitlab", "gitlab.example.com:8443", ours],
++    [null, "gitlab.example.com", ours],
++    ["github", "ghe.example.com", GITHUB_RULE],
++    [null, "ghe.example.com", null],
++    ["bitbucket", "bitbucket.org", null],
++    ["github", null, null],
++  ] as const)("picks for %s on %s", (provider, host, expected) => {
++    expect(sessionGitRule(rules, provider, host)).toBe(expected);
++  });
++});
++
++describe("gitReferenceUrl", () => {
++  const github: GitLinkTarget = {
++    provider: "github",
++    origin: "https://github.com",
++    repository: "owner/repo",
++    pullNumbers: new Set(),
++  };
++
++  it("builds each provider's issue and request pages", () => {
++    const issue = { kind: "unspecified" as const, number: 7, repository: null };
++    expect(gitReferenceUrl(github, issue)).toBe("https://github.com/owner/repo/issues/7");
++    expect(gitReferenceUrl(github, { ...issue, kind: "request" })).toBe(
++      "https://github.com/owner/repo/pull/7",
++    );
++    expect(gitReferenceUrl(github, { ...issue, repository: "a/b/c" })).toBeNull();
++    const gitlab = { ...github, provider: "gitlab" as const, repository: "group/my project" };
++    expect(gitReferenceUrl(gitlab, { ...issue, kind: "request" })).toBe(
++      "https://github.com/group/my%20project/-/merge_requests/7",
++    );
++    const azure = { ...github, provider: "azure_devops" as const, repository: "org" };
++    expect(gitReferenceUrl(azure, issue)).toBeNull();
++  });
++});
++
++describe("remarkLinkRules with git references", () => {
++  it("splits prose around links and leaves code and existing links alone", () => {
++    const tree = {
++      type: "root",
++      children: [
++        {
++          type: "paragraph",
++          children: [
++            { type: "text", value: "Fixed #1 in " },
++            { type: "inlineCode", value: "#2" },
++            { type: "text", value: " (PR #3)." },
++            { type: "link", url: "https://x.test", children: [{ type: "text", value: "#4" }] },
++          ],
++        },
++        { type: "code", value: "#5" },
++      ],
++    };
++    remarkLinkRules(compileLinkRules(GIT_DEFAULTS, GITHUB_SESSION))(tree);
++    expect(tree.children[0].children).toEqual([
++      { type: "text", value: "Fixed " },
++      {
++        type: "link",
++        url: "https://github.com/acme/app/issues/1",
++        title: "GitHub",
++        children: [{ type: "text", value: "#1" }],
++      },
++      { type: "text", value: " in " },
++      { type: "inlineCode", value: "#2" },
++      { type: "text", value: " (" },
++      {
++        type: "link",
++        url: "https://github.com/acme/app/pull/3",
++        title: "GitHub",
++        children: [{ type: "text", value: "PR #3" }],
++      },
++      { type: "text", value: ")." },
++      { type: "link", url: "https://x.test", children: [{ type: "text", value: "#4" }] },
++    ]);
++    expect(tree.children[1]).toEqual({ type: "code", value: "#5" });
 +  });
 +});
 +
@@ -874,22 +1420,29 @@ index 0000000000000000000000000000000000000000..dbd2b200dedb201a5bb9bf47bcf8ecdb
 +});
 diff --git a/web/src/lib/linkRules.ts b/web/src/lib/linkRules.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50f00a1e6c
+index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c047839eff
 --- /dev/null
 +++ b/web/src/lib/linkRules.ts
-@@ -0,0 +1,556 @@
-+// Chat link rules: short references such as `BST-2135`, `#123` or
+@@ -0,0 +1,857 @@
++// Chat link rules: short references such as `BST-2135`, `PR #123` or
 +// `session:<id>` that chat messages render as links. The server validates a
 +// rule when it is saved (omnigent/link_rules.py); this module checks it again
 +// before compiling, with the same rules, because every viewer's browser runs
 +// the result on every message. See docs/chat-link-rules.md.
++//
++// `git` rules list git hosts. The session's repository picks the one that
++// links bare `#123`, `issue #123`, `PR #123` and the provider's `!123`; the
++// GitHub rule links `owner/repo#123` in every session.
 +//
 +// Compiled regexes avoid lookbehind and named groups, which older Safari can't
 +// parse: a match's leading boundary is consumed as group 1 instead.
 +
 +import { createContext } from "react";
 +
-+export type LinkRuleKind = "url" | "github" | "session";
++export type LinkRuleKind = "url" | "git" | "session";
++
++/** Providers a `git` rule can name, by the git info payload's provider id. */
++export type GitProviderId = "github" | "gitlab" | "azure_devops";
 +
 +export interface LinkRule {
 +  name: string;
@@ -899,6 +1452,28 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +  /** `url` kind: the http(s) template, e.g. `https://jira.example.com/browse/BST-{num}`. */
 +  url: string | null;
 +  enabled: boolean;
++  /** `git` kind: the host's provider. */
++  provider?: GitProviderId | null;
++  /** `git` kind: a bare host name with an optional port, e.g. `gitlab.example.com`. */
++  host?: string | null;
++}
++
++export interface GitProviderNotation {
++  label: string;
++  defaultHost: string;
++  /** The marker before a pull request number: `#` on GitHub, `!` on GitLab and Azure DevOps. */
++  requestPrefix: string;
++}
++
++/** Mirrors `GIT_PROVIDERS` in omnigent/link_rules.py. */
++export const GIT_PROVIDERS: Readonly<Record<GitProviderId, GitProviderNotation>> = {
++  github: { label: "GitHub", defaultHost: "github.com", requestPrefix: "#" },
++  gitlab: { label: "GitLab", defaultHost: "gitlab.com", requestPrefix: "!" },
++  azure_devops: { label: "Azure DevOps", defaultHost: "dev.azure.com", requestPrefix: "!" },
++};
++
++function isGitProvider(value: unknown): value is GitProviderId {
++  return typeof value === "string" && Object.hasOwn(GIT_PROVIDERS, value);
 +}
 +
 +export const MAX_LINK_RULES = 32;
@@ -922,6 +1497,9 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +const URL_PLACEHOLDER = /\{([a-z]+|\d)\}/g;
 +const URL_FIXED_PREFIX = /^https?:\/\/[^/?#{}\s@\\]+[/?#]/i;
 +const CLASS_ESCAPES = new Set(["d", "D", "w", "W", "s", "S"]);
++const MAX_HOST_LENGTH = 253;
++const HOST_LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
++const BARE_HOST = new RegExp(`^${HOST_LABEL}(?:\\.${HOST_LABEL})*(?::([0-9]{1,5}))?$`);
 +const ALPHANUMERIC = /^[A-Za-z0-9]$/;
 +
 +/** Fragment href a session reference carries from the remark pass to the link renderer. */
@@ -1184,6 +1762,27 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +  }
 +}
 +
++/**
++ * Check a `git` rule's host: a bare host name with an optional port, no
++ * scheme, path, credentials or spaces. Hosts compare lower-cased.
++ *
++ * @throws LinkRuleError naming the problem.
++ */
++export function checkGitHost(host: string | null | undefined): void {
++  if (!host) throw new LinkRuleError("host: required for a git rule, e.g. gitlab.example.com");
++  const match = BARE_HOST.exec(host.toLowerCase());
++  const port = match?.[1];
++  if (
++    host.length > MAX_HOST_LENGTH ||
++    !match ||
++    (port !== undefined && !(Number(port) > 0 && Number(port) < 65536))
++  ) {
++    throw new LinkRuleError(
++      "host: a bare host name such as gitlab.example.com, with no scheme, path or credentials",
++    );
++  }
++}
++
 +/** Why `rule` can't be used, or `null` when it is valid on its own. */
 +export function linkRuleError(rule: LinkRule): string | null {
 +  const name = rule.name.trim();
@@ -1192,9 +1791,22 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +    return `name: longer than ${MAX_LINK_RULE_NAME_LENGTH} characters`;
 +  }
 +  try {
-+    if (rule.kind === "url") checkUrlTemplate(rule.url ?? "", compileLinkPattern(rule.pattern));
-+    else if (rule.pattern || rule.url)
++    if (rule.kind !== "url" && rule.kind !== "git" && rule.kind !== "session") {
++      return "kind: must be url, git or session";
++    }
++    if (rule.kind !== "url" && (rule.pattern || rule.url)) {
 +      return `the built-in ${rule.kind} kind takes no pattern or url`;
++    }
++    if (rule.kind !== "git" && (rule.provider != null || rule.host != null)) {
++      return "provider and host belong to a git rule";
++    }
++    if (rule.kind === "url") checkUrlTemplate(rule.url ?? "", compileLinkPattern(rule.pattern));
++    if (rule.kind === "git") {
++      if (!isGitProvider(rule.provider)) {
++        return `provider: must be ${Object.keys(GIT_PROVIDERS).join(", ")}`;
++      }
++      checkGitHost(rule.host);
++    }
 +  } catch (error) {
 +    if (error instanceof LinkRuleError) return error.message;
 +    throw error;
@@ -1203,34 +1815,70 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +}
 +
 +/**
-+ * Per-rule errors for a whole list, including repeated names and a built-in
-+ * kind listed twice; `null` where a rule is fine.
++ * Per-rule errors for a whole list, including repeated names, two `git` rules
++ * for one host and a second `session` rule; `null` where a rule is fine.
 + */
 +export function linkRuleErrors(rules: readonly LinkRule[]): (string | null)[] {
-+  const names = new Map<string, number>();
-+  const builtins = new Map<LinkRuleKind, number>();
-+  return rules.map((rule, index) => {
++  const names = new Set<string>();
++  const hosts = new Set<string>();
++  let sessions = 0;
++  return rules.map((rule) => {
 +    const own = linkRuleError(rule);
 +    if (own) return own;
 +    const folded = rule.name.trim().toLowerCase();
 +    if (names.has(folded)) return `two rules are named ${rule.name.trim()}`;
-+    names.set(folded, index);
-+    if (rule.kind !== "url") {
-+      if (builtins.has(rule.kind)) return `only one ${rule.kind} rule`;
-+      builtins.set(rule.kind, index);
++    names.add(folded);
++    if (rule.kind === "session" && ++sessions > 1) return "only one session rule";
++    if (rule.kind === "git") {
++      const host = (rule.host ?? "").toLowerCase();
++      if (hosts.has(host)) return `two git rules are for ${host}`;
++      hosts.add(host);
 +    }
 +    return null;
 +  });
 +}
 +
-+/** Where `#123` and `owner/repo#123` link: the session's repository on its provider's host. */
-+export interface GithubLinkTarget {
-+  /** Scheme and host, e.g. `https://github.example.com`. */
++/** The session's repository, from its git info; chat references link to it. */
++export interface SessionGitRepository {
++  /** The provider id the server resolved, or `null` when none claims the remote. */
++  provider: string | null;
++  /** Scheme and host of the repository's web pages, e.g. `https://gitlab.example.com`. */
 +  origin: string;
-+  /** `owner/repo` of the session's repository. */
-+  repo: string;
-+  /** Pull request numbers known on `repo`; other numbers link as issues. */
++  /** The repository path, e.g. `owner/repo`, `group/sub/project` or `org/project/repo`. */
++  repository: string;
++  /** Pull request numbers known on `repository`; GitHub's bare `#N` links those to the PR. */
 +  pullNumbers: ReadonlySet<number>;
++}
++
++function hostName(host: string): string {
++  return host.toLowerCase().replace(/:\d+$/, "");
++}
++
++/**
++ * The `git` rule that owns a session's bare references: the rule for the
++ * repository's host (a disabled one turns linking off), else the first
++ * enabled rule for the provider the server resolved. Mirrors
++ * `session_git_rule` in omnigent/link_rules.py.
++ */
++export function sessionGitRule(
++  rules: readonly LinkRule[],
++  provider: string | null,
++  host: string | null,
++): LinkRule | null {
++  if (!host) return null;
++  const gitRules = rules.filter((rule) => rule.kind === "git" && rule.host);
++  const wanted = hostName(host);
++  const listed = gitRules.find((rule) => hostName(rule.host ?? "") === wanted);
++  if (listed) return listed.enabled ? listed : null;
++  if (!provider) return null;
++  return gitRules.find((rule) => rule.enabled && rule.provider === provider) ?? null;
++}
++
++/** The enabled GitHub rule that links `owner/repo#123` in every session. */
++export function githubGitRule(rules: readonly LinkRule[]): LinkRule | null {
++  return (
++    rules.find((rule) => rule.kind === "git" && rule.enabled && rule.provider === "github") ?? null
++  );
 +}
 +
 +/** One compiled rule: a global regex and how to turn its match into an href. */
@@ -1240,8 +1888,6 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +  href: (match: RegExpExecArray) => string | null;
 +}
 +
-+const GITHUB_QUALIFIED = String.raw`([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})#(\d{1,10})`;
-+const GITHUB_LOCAL = String.raw`#(\d{1,10})`;
 +const SESSION_REFERENCE = String.raw`session:([A-Za-z0-9_-]{6,64})(?:/([A-Za-z0-9_-]{1,128}))?`;
 +
 +function bounded(source: string): RegExp {
@@ -1257,45 +1903,228 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +  }
 +}
 +
-+function githubHref(target: GithubLinkTarget, repo: string, number: string): string | null {
-+  const [owner, name] = repo.split("/");
-+  const sameRepo = repo.toLowerCase() === target.repo.toLowerCase();
-+  // GitHub redirects /issues/N to the pull request when N is one.
-+  const section = sameRepo && target.pullNumbers.has(Number(number)) ? "pull" : "issues";
-+  return safeHttpUrl(
-+    `${target.origin}/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${section}/${number}`,
++// Words that say which kind a git reference is; longer phrases first so the
++// alternation prefers them.
++const REQUEST_WORDS = ["pull request", "merge request", "pull", "pr", "mr"];
++const ISSUE_WORDS = ["work item", "issue"];
++
++/** What a git reference says it is: `issue #1`, `PR #1` / `!1`, or a bare `#1`. */
++export type GitReferenceKind = "issue" | "request" | "unspecified";
++
++/** Where one compiled git rule links: a repository on a host, with its provider's URL shapes. */
++export interface GitLinkTarget {
++  provider: GitProviderId;
++  origin: string;
++  /** The session's repository, or `null` for GitHub's own rule outside it. */
++  repository: string | null;
++  pullNumbers: ReadonlySet<number>;
++}
++
++/**
++ * Matches a git reference. Group 1 is the leading boundary, which also keeps
++ * out paths, URLs and entities (after `/`, `.`, `:`, `#`, `!` or `&`); group 2
++ * an optional kind word; group 3 another repository; group 4 the marker; group
++ * 5 a number of up to seven digits that nothing word-like follows.
++ */
++function gitReferenceRegex(marks: "#" | "#!", qualifiedOnly: boolean): RegExp {
++  const words = [...REQUEST_WORDS, ...ISSUE_WORDS].join("|");
++  const repository = String.raw`([A-Za-z0-9_.-]{1,100}(?:/[A-Za-z0-9_.-]{1,100}){1,4})`;
++  return new RegExp(
++    String.raw`(^|[^A-Za-z0-9_/.:#!&])(?:(${words})\s+)?` +
++      `${repository}${qualifiedOnly ? "" : "?"}([${marks}])` +
++      String.raw`(\d{1,7})(?![A-Za-z0-9_#!/-])`,
++    "gi",
 +  );
++}
++
++function gitReferenceKind(word: string | undefined, mark: string): GitReferenceKind {
++  if (word) {
++    const folded = word.toLowerCase().replace(/\s+/g, " ");
++    return REQUEST_WORDS.includes(folded) ? "request" : "issue";
++  }
++  return mark === "!" ? "request" : "unspecified";
++}
++
++const encodePath = (path: string) => path.split("/").map(encodeURIComponent).join("/");
++
++/**
++ * The page a reference names on `target`'s provider, or null when the
++ * provider has no page for it. A bare GitHub `#N` goes to the pull request when
++ * the session knows one by that number, else to the issue page, which GitHub
++ * redirects for pull requests.
++ */
++export function gitReferenceUrl(
++  target: GitLinkTarget,
++  reference: { kind: GitReferenceKind; number: number; repository: string | null },
++): string | null {
++  const repository = reference.repository ?? target.repository;
++  if (repository === null) return null;
++  const request = reference.kind === "request";
++  const sameRepository =
++    target.repository !== null && repository.toLowerCase() === target.repository.toLowerCase();
++  switch (target.provider) {
++    case "github": {
++      if (repository.split("/").length !== 2) return null;
++      const pull =
++        request ||
++        (reference.kind === "unspecified" &&
++          sameRepository &&
++          target.pullNumbers.has(reference.number));
++      return safeHttpUrl(
++        `${target.origin}/${encodePath(repository)}/${pull ? "pull" : "issues"}/${reference.number}`,
++      );
++    }
++    case "gitlab":
++      return safeHttpUrl(
++        `${target.origin}/${encodePath(repository)}/-/${request ? "merge_requests" : "issues"}/${reference.number}`,
++      );
++    case "azure_devops": {
++      // Azure paths are `org/project/repo`; another repository has no notation.
++      if (!sameRepository) return null;
++      const [organization, project, name, ...rest] = repository.split("/");
++      if (!organization || !project || !name || rest.length > 0) return null;
++      const base = `${target.origin}/${encodeURIComponent(organization)}/${encodeURIComponent(project)}`;
++      return safeHttpUrl(
++        request
++          ? `${base}/_git/${encodeURIComponent(name)}/pullrequest/${reference.number}`
++          : `${base}/_workitems/edit/${reference.number}`,
++      );
++    }
++    default:
++      return null;
++  }
++}
++
++/**
++ * Whether a qualified reference outside GitHub's own host belongs to the
++ * session's provider: one with the provider's `!` marker does, and GitHub
++ * paths are exactly `owner/repo`, so a longer path stays, as does one under
++ * the session repository's top-level owner or group. Everything else is
++ * GitHub's.
++ */
++function staysWithSession(reference: string, mark: string, sessionRepository: string): boolean {
++  const segments = reference.split("/");
++  if (mark === "!" || segments.length > 2) return true;
++  return segments[0].toLowerCase() === sessionRepository.split("/")[0].toLowerCase();
++}
++
++function gitMatcher(
++  name: string,
++  target: GitLinkTarget,
++  regex: RegExp,
++  accepts: (repository: string | null, mark: string) => boolean,
++): LinkMatcher {
++  return {
++    name,
++    regex,
++    href: (match) => {
++      const repository = match[3] ?? null;
++      if (!accepts(repository, match[4])) return null;
++      return gitReferenceUrl(target, {
++        kind: gitReferenceKind(match[2], match[4]),
++        number: Number(match[5]),
++        repository,
++      });
++    },
++  };
++}
++
++function originHost(origin: string): string | null {
++  try {
++    return new URL(origin).host;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * Matchers for the `git` rules, at their rules' places in the list: the
++ * session's rule links bare references and its own qualified ones, and the
++ * GitHub rule links every other `owner/repo#123`.
++ */
++function gitMatchers(
++  rules: readonly LinkRule[],
++  session: SessionGitRepository | null,
++): Map<LinkRule, LinkMatcher[]> {
++  const byRule = new Map<LinkRule, LinkMatcher[]>();
++  const add = (rule: LinkRule, matcher: LinkMatcher) =>
++    byRule.set(rule, [...(byRule.get(rule) ?? []), matcher]);
++  const sessionHost = session === null ? null : originHost(session.origin);
++  const sessionRule =
++    session === null ? null : sessionGitRule(rules, session.provider, sessionHost);
++  const githubRule = githubGitRule(rules);
++  const githubOrigin = githubRule ? `https://${(githubRule.host ?? "").toLowerCase()}` : null;
++  const githubIsSession =
++    sessionRule !== null &&
++    sessionHost !== null &&
++    githubRule !== null &&
++    hostName(sessionHost) === hostName(githubRule.host ?? "");
++  if (sessionRule !== null && session !== null && isGitProvider(sessionRule.provider)) {
++    const provider = sessionRule.provider;
++    const marks = GIT_PROVIDERS[provider].requestPrefix === "!" ? "#!" : "#";
++    const target = {
++      provider,
++      origin: session.origin,
++      repository: session.repository,
++      pullNumbers: session.pullNumbers,
++    };
++    add(
++      sessionRule,
++      gitMatcher(
++        sessionRule.name,
++        target,
++        gitReferenceRegex(marks, false),
++        (repository, mark) =>
++          repository === null ||
++          githubRule === null ||
++          githubIsSession ||
++          staysWithSession(repository, mark, session.repository),
++      ),
++    );
++  }
++  if (githubRule !== null && githubOrigin !== null && !githubIsSession) {
++    const target = {
++      provider: "github" as const,
++      origin: githubOrigin,
++      repository: null,
++      pullNumbers: new Set<number>(),
++    };
++    add(
++      githubRule,
++      gitMatcher(
++        githubRule.name,
++        target,
++        gitReferenceRegex("#", true),
++        (repository, mark) =>
++          repository !== null &&
++          (sessionRule === null ||
++            session === null ||
++            !staysWithSession(repository, mark, session.repository)),
++      ),
++    );
++  }
++  return byRule;
 +}
 +
 +/**
 + * Compile the enabled rules into matchers, skipping any that fail the checks.
 + *
 + * @param rules - The user's rules, in priority order.
-+ * @param github - The session's repository, or `null` when it has none, which
-+ *   leaves GitHub references as text.
++ * @param session - The session's repository, or `null` when it has none:
++ *   then only GitHub's `owner/repo#123` links, and bare `#123` stays text.
 + */
 +export function compileLinkRules(
 +  rules: readonly LinkRule[],
-+  github: GithubLinkTarget | null,
++  session: SessionGitRepository | null,
 +): LinkMatcher[] {
 +  const errors = linkRuleErrors(rules);
++  const valid = rules.filter((_rule, index) => errors[index] === null);
++  const git = gitMatchers(valid, session);
 +  const matchers: LinkMatcher[] = [];
 +  rules.forEach((rule, index) => {
 +    if (!rule.enabled || errors[index] !== null) return;
-+    if (rule.kind === "github") {
-+      if (github === null) return;
-+      matchers.push(
-+        {
-+          name: rule.name,
-+          regex: bounded(GITHUB_QUALIFIED),
-+          href: (match) => githubHref(github, `${match[2]}/${match[3]}`, match[4]),
-+        },
-+        {
-+          name: rule.name,
-+          regex: bounded(GITHUB_LOCAL),
-+          href: (match) => githubHref(github, github.repo, match[2]),
-+        },
-+      );
++    if (rule.kind === "git") {
++      matchers.push(...(git.get(rule) ?? []));
 +    } else if (rule.kind === "session") {
 +      matchers.push({
 +        name: rule.name,
@@ -1325,6 +2154,24 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +    }
 +  });
 +  return matchers;
++}
++
++const matcherKeys = new WeakMap<readonly LinkMatcher[], number>();
++let nextMatcherKey = 1;
++
++/**
++ * A key that changes whenever the matchers do. Streamdown's memo ignores
++ * `remarkPlugins`, so a message keyed on it re-parses when its rules or
++ * repository arrive after it rendered.
++ */
++export function linkMatchersKey(matchers: readonly LinkMatcher[]): string {
++  if (matchers.length === 0) return "";
++  let key = matcherKeys.get(matchers);
++  if (key === undefined) {
++    key = nextMatcherKey++;
++    matcherKeys.set(matchers, key);
++  }
++  return `link-rules-${key}`;
 +}
 +
 +/** A link found in text: `[start, end)` and where it goes. */
@@ -1436,10 +2283,10 @@ index 0000000000000000000000000000000000000000..fd834757ce04b328d35ca536a6fc7d50
 +}
 diff --git a/web/src/lib/linkRulesApi.ts b/web/src/lib/linkRulesApi.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..7396cf11dc4539bbaa563cb9486cf34f77cc023b
+index 0000000000000000000000000000000000000000..c67e65adecd29ad7d511edffb93ef5d6567c046a
 --- /dev/null
 +++ b/web/src/lib/linkRulesApi.ts
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,86 @@
 +// The user's chat link rules (`/v1/link-rules`), stored by the server as the
 +// `link_rules` shared preference. See docs/chat-link-rules.md.
 +
@@ -1469,7 +2316,13 @@ index 0000000000000000000000000000000000000000..7396cf11dc4539bbaa563cb9486cf34f
 +};
 +
 +function normalizeRule(rule: LinkRule): LinkRule {
-+  return { ...rule, pattern: rule.pattern ?? "", url: rule.url ?? null };
++  return {
++    ...rule,
++    pattern: rule.pattern ?? "",
++    url: rule.url ?? null,
++    provider: rule.provider ?? null,
++    host: rule.host ?? null,
++  };
 +}
 +
 +function normalize(settings: LinkRuleSettings): LinkRuleSettings {
@@ -1507,11 +2360,12 @@ index 0000000000000000000000000000000000000000..7396cf11dc4539bbaa563cb9486cf34f
 +      rules:
 +        rules === null
 +          ? null
-+          : rules.map(({ name, kind, pattern, url, enabled }) => ({
++          : rules.map(({ name, kind, pattern, url, enabled, provider, host }) => ({
 +              name,
 +              kind,
 +              enabled,
 +              ...(kind === "url" ? { pattern, url } : {}),
++              ...(kind === "git" ? { provider, host } : {}),
 +            })),
 +      expected_version: expectedVersion,
 +    }),
@@ -1555,10 +2409,10 @@ index 3d4c399b806be12d2ace9f4208200c355a008a53..4d5520a3d671abbcb64de8734a59d78e
          </SettingsGroup>
 diff --git a/web/src/pages/settings/LinkRulesSettingsGroup.test.tsx b/web/src/pages/settings/LinkRulesSettingsGroup.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..4672eb779cb29a908dd04c415e16982edfb7d059
+index 0000000000000000000000000000000000000000..34ffaa7964822fa54fa2e21e12c725f0fae24fb1
 --- /dev/null
 +++ b/web/src/pages/settings/LinkRulesSettingsGroup.test.tsx
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,180 @@
 +import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 +import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 +import { MemoryRouter } from "react-router-dom";
@@ -1574,7 +2428,15 @@ index 0000000000000000000000000000000000000000..4672eb779cb29a908dd04c415e16982e
 +
 +const mockAuthenticatedFetch = vi.mocked(authenticatedFetch);
 +
-+const GITHUB: LinkRule = { name: "GitHub", kind: "github", pattern: "", url: null, enabled: true };
++const GITHUB: LinkRule = {
++  name: "GitHub",
++  kind: "git",
++  provider: "github",
++  host: "github.com",
++  pattern: "",
++  url: null,
++  enabled: true,
++};
 +const JIRA: LinkRule = {
 +  name: "Jira",
 +  kind: "url",
@@ -1641,9 +2503,10 @@ index 0000000000000000000000000000000000000000..4672eb779cb29a908dd04c415e16982e
 +    expect((screen.getByTestId("link-rule-1-pattern") as HTMLInputElement).value).toBe("ABC-{num}");
 +    const preview = screen.getByTestId("link-rules-preview");
 +    await waitFor(() =>
-+      expect(preview.querySelector("a")?.getAttribute("href")).toBe(
++      expect([...preview.querySelectorAll("a")].map((link) => link.getAttribute("href"))).toEqual([
++        "https://github.com/acme/web/issues/12",
 +        "https://jira.example.com/browse/ABC-345",
-+      ),
++      ]),
 +    );
 +    // Code in the sample stays text.
 +    expect(preview.querySelector("code a")).toBe(null);
@@ -1666,7 +2529,7 @@ index 0000000000000000000000000000000000000000..4672eb779cb29a908dd04c415e16982e
 +    await waitFor(() => expect(puts).toHaveLength(1));
 +    expect(puts[0]).toEqual({
 +      rules: [
-+        { name: "GitHub", kind: "github", enabled: true },
++        { name: "GitHub", kind: "git", enabled: true, provider: "github", host: "github.com" },
 +        {
 +          name: "Jira",
 +          kind: "url",
@@ -1689,15 +2552,22 @@ index 0000000000000000000000000000000000000000..4672eb779cb29a908dd04c415e16982e
 +    fireEvent.click(screen.getByTestId("link-rules-add"));
 +    expect(screen.getByTestId("link-rule-1-error").textContent).toContain("pattern: required");
 +    fireEvent.click(screen.getByTestId("link-rule-1-delete"));
-+    fireEvent.click(screen.getByTestId("link-rules-add-github"));
-+    expect(screen.getByTestId("link-rule-1").textContent).toContain("Built in");
++    fireEvent.click(screen.getByTestId("link-rules-add-git"));
++    expect(screen.getByTestId("link-rule-1").textContent).toContain("Git host");
++    expect(screen.getByTestId("link-rule-1-error").textContent).toContain("host: required");
++    const host = screen.getByTestId("link-rule-1-host") as HTMLInputElement;
++    fireEvent.change(host, { target: { value: "https://gitlab.example.com" } });
++    expect(screen.getByTestId("link-rule-1-error").textContent).toContain("bare host name");
++    fireEvent.change(host, { target: { value: "gitlab.example.com" } });
++    expect(screen.queryByTestId("link-rule-1-error")).toBe(null);
++    expect(screen.getByTestId("link-rule-1").textContent).toContain("!123");
 +    fireEvent.click(screen.getByTestId("link-rule-0-enabled"));
 +    expect(screen.getByTestId("link-rules-add-session")).toBeTruthy();
 +
 +    fireEvent.click(screen.getByTestId("link-rules-reset"));
 +    await waitFor(() => expect(puts).toEqual([{ rules: null, expected_version: 3 }]));
 +    await waitFor(() =>
-+      expect(screen.getByTestId("link-rule-0").textContent).toContain("Built in"),
++      expect(screen.getByTestId("link-rule-0").textContent).toContain("Git host"),
 +    );
 +  });
 +
@@ -1725,23 +2595,31 @@ index 0000000000000000000000000000000000000000..4672eb779cb29a908dd04c415e16982e
 +});
 diff --git a/web/src/pages/settings/LinkRulesSettingsGroup.tsx b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568fea90b74
+index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068af1d30a8d
 --- /dev/null
 +++ b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,384 @@
 +import { useQueryClient } from "@tanstack/react-query";
 +import { useMemo, useState } from "react";
 +import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 +import { SettingsGroup } from "@/components/SettingsGroup";
 +import { Button } from "@/components/ui/button";
 +import { Input } from "@/components/ui/input";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
 +import { Switch } from "@/components/ui/switch";
 +import { Textarea } from "@/components/ui/textarea";
 +import { LINK_RULES_QUERY_KEY, useLinkRules } from "@/hooks/useLinkRules";
 +import {
 +  compileLinkRules,
++  GIT_PROVIDERS,
++  type GitProviderId,
 +  type LinkRule,
-+  type LinkRuleKind,
 +  LinkRuleMatchersContext,
 +  linkRuleErrors,
 +  MAX_LINK_RULES,
@@ -1750,19 +2628,42 @@ index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568
 +import { ApiError } from "@/lib/sessionsApi";
 +
 +const DEFAULT_SAMPLE =
-+  "Fixes #12 and ABC-345 (see ENG-6). Earlier: session:0123456789abcdef. `ABC-1` in code stays text.";
++  "Fixes acme/web#12 and ABC-345 (see ENG-6). Earlier: session:0123456789abcdef. `ABC-1` in code stays text.";
 +
-+const BUILTIN_DESCRIPTIONS: Record<Exclude<LinkRuleKind, "url">, string> = {
-+  github:
-+    "#123 and owner/repo#123 link to issues and pull requests on the session's repository host.",
-+  session: "session:<id> and session:<id>/<message id> open that session, or a message in it.",
-+};
++const SESSION_DESCRIPTION =
++  "session:<id> and session:<id>/<message id> open that session, or a message in it.";
 +
-+function newUrlRule(rules: readonly LinkRule[]): LinkRule {
++function gitDescription(rule: LinkRule): string {
++  const notation = rule.provider ? GIT_PROVIDERS[rule.provider] : null;
++  const request = notation?.requestPrefix === "!" ? ", !123" : "";
++  const github =
++    rule.provider === "github"
++      ? " The first GitHub host also links owner/repo#123 in every other session."
++      : "";
++  return `#123, issue #123, PR #123${request} and owner/repo#123 link in sessions whose repository is on this host.${github}`;
++}
++
++function uniqueName(rules: readonly LinkRule[], base: string): string {
 +  const taken = new Set(rules.map((rule) => rule.name.trim().toLowerCase()));
 +  let number = 1;
-+  while (taken.has(`rule ${number}`)) number += 1;
-+  return { name: `Rule ${number}`, kind: "url", pattern: "", url: "", enabled: true };
++  while (taken.has(`${base} ${number}`.toLowerCase())) number += 1;
++  return `${base} ${number}`;
++}
++
++function newUrlRule(rules: readonly LinkRule[]): LinkRule {
++  return { name: uniqueName(rules, "Rule"), kind: "url", pattern: "", url: "", enabled: true };
++}
++
++function newGitRule(rules: readonly LinkRule[]): LinkRule {
++  return {
++    name: uniqueName(rules, "Git host"),
++    kind: "git",
++    provider: "gitlab",
++    host: "",
++    pattern: "",
++    url: null,
++    enabled: true,
++  };
 +}
 +
 +/** The user's chat link rules: list, edit, preview and save them. */
@@ -1777,7 +2678,7 @@ index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568
 +  const [sample, setSample] = useState(DEFAULT_SAMPLE);
 +  const rules = useMemo(() => draft ?? current?.rules ?? [], [draft, current]);
 +  const errors = useMemo(() => linkRuleErrors(rules), [rules]);
-+  // The preview has no session, so GitHub references stay text there.
++  // The preview has no session, so only GitHub's owner/repo#123 links there.
 +  const matchers = useMemo(() => compileLinkRules(rules, null), [rules]);
 +
 +  if (!current) {
@@ -1793,9 +2694,7 @@ index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568
 +  const editable = current.supported && !saving;
 +  const update = (index: number, change: Partial<LinkRule>) =>
 +    setDraft(rules.map((rule, at) => (at === index ? { ...rule, ...change } : rule)));
-+  const missingBuiltins = (["github", "session"] as const).filter(
-+    (kind) => !rules.some((rule) => rule.kind === kind),
-+  );
++  const missingSession = !rules.some((rule) => rule.kind === "session");
 +
 +  const save = async (next: LinkRule[] | null) => {
 +    setSaving(true);
@@ -1859,30 +2758,33 @@ index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568
 +        >
 +          Add rule
 +        </Button>
-+        {missingBuiltins.map((kind) => (
++        <Button
++          variant="outline"
++          size="sm"
++          disabled={!editable || rules.length >= MAX_LINK_RULES}
++          onClick={() => setDraft([...rules, newGitRule(rules)])}
++          data-testid="link-rules-add-git"
++          componentId="settings.general.link_rules.add_git"
++        >
++          Add git host
++        </Button>
++        {missingSession && (
 +          <Button
-+            key={kind}
 +            variant="outline"
 +            size="sm"
 +            disabled={!editable || rules.length >= MAX_LINK_RULES}
 +            onClick={() =>
 +              setDraft([
 +                ...rules,
-+                {
-+                  name: kind === "github" ? "GitHub" : "Sessions",
-+                  kind,
-+                  pattern: "",
-+                  url: null,
-+                  enabled: true,
-+                },
++                { name: "Sessions", kind: "session", pattern: "", url: null, enabled: true },
 +              ])
 +            }
-+            data-testid={`link-rules-add-${kind}`}
-+            componentId={`settings.general.link_rules.add_${kind}`}
++            data-testid="link-rules-add-session"
++            componentId="settings.general.link_rules.add_session"
 +          >
-+            {kind === "github" ? "Add GitHub references" : "Add session references"}
++            Add session references
 +          </Button>
-+        ))}
++        )}
 +        <span className="flex-1" />
 +        {draft !== null && (
 +          <Button
@@ -1945,7 +2847,8 @@ index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568
 +          </LinkRuleMatchersContext.Provider>
 +        </div>
 +        <p className="mt-1 text-xs text-muted-foreground">
-+          GitHub references link only in a session whose repository is on GitHub.
++          The preview has no session, so only GitHub&rsquo;s owner/repo#123 links here. Bare #123,
++          PR #123 and !123 link in a session whose repository is on a listed git host.
 +        </p>
 +      </div>
 +    </SettingsGroup>
@@ -1989,7 +2892,7 @@ index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568
 +          data-testid={`link-rule-${index}-name`}
 +        />
 +        <span className="text-xs text-muted-foreground">
-+          {rule.kind === "url" ? "Link" : "Built in"}
++          {rule.kind === "url" ? "Link" : rule.kind === "git" ? "Git host" : "Built in"}
 +        </span>
 +        <span className="flex-1" />
 +        <Button
@@ -2027,8 +2930,46 @@ index 0000000000000000000000000000000000000000..884117ce7593e02b51a4ac0a460a3568
 +            data-testid={`link-rule-${index}-url`}
 +          />
 +        </div>
++      ) : rule.kind === "git" ? (
++        <>
++          <div className="mt-2 grid gap-2 sm:grid-cols-2">
++            <Select
++              value={rule.provider ?? undefined}
++              disabled={disabled}
++              onValueChange={(provider) => onChange({ provider: provider as GitProviderId })}
++              componentId="settings.general.link_rules.provider"
++              valueHasNoPii
++            >
++              <SelectTrigger
++                className="h-8"
++                aria-label="Git provider"
++                data-testid={`link-rule-${index}-provider`}
++              >
++                <SelectValue />
++              </SelectTrigger>
++              <SelectContent>
++                {(Object.keys(GIT_PROVIDERS) as GitProviderId[]).map((provider) => (
++                  <SelectItem key={provider} value={provider}>
++                    {GIT_PROVIDERS[provider].label}
++                  </SelectItem>
++                ))}
++              </SelectContent>
++            </Select>
++            <Input
++              className="h-8 font-mono"
++              value={rule.host ?? ""}
++              disabled={disabled}
++              placeholder="gitlab.example.com"
++              onChange={(event) => onChange({ host: event.target.value })}
++              aria-label="Host"
++              aria-describedby={error ? errorId : undefined}
++              data-testid={`link-rule-${index}-host`}
++            />
++          </div>
++          <p className="mt-2 text-sm text-muted-foreground">{gitDescription(rule)}</p>
++        </>
 +      ) : (
-+        <p className="mt-2 text-sm text-muted-foreground">{BUILTIN_DESCRIPTIONS[rule.kind]}</p>
++        <p className="mt-2 text-sm text-muted-foreground">{SESSION_DESCRIPTION}</p>
 +      )}
 +      {error && (
 +        <p

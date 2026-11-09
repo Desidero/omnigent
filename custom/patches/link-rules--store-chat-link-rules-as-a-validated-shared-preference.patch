@@ -4,20 +4,30 @@ Date: Thu, 29 Oct 2026 19:51:05 +0000
 Subject: [PATCH] feat(server): store chat link rules as a validated shared
  preference
 
-Chat messages should turn short references such as BST-2135 or #123 into
+Chat messages should turn short references such as BST-2135 or PR #123 into
 links, using rules each user sets. The rules run in every viewer's browser on
 every message, and agents will be able to write them, so the server checks a
 rule before it is stored.
 
 - omnigent/link_rules.py holds the rule shape ({name, kind, pattern, url,
-  enabled}), the defaults (GitHub and session references on, two example url
-  rules off) and the validator. A url rule's pattern is a short form such as
-  BST-{num} or a raw /regex/ limited to a subset Python and every supported
-  browser parse alike: no backreferences, lookaround, named groups or inline
-  flags (older Safari can't parse named groups or lookbehind), no repeated
-  group holding a repeat or |, at most three repeats capped at 64 characters,
-  200 characters in all. Its URL template must be http(s) with a fixed scheme
-  and host before any placeholder, so a match can't choose where a link goes.
+  enabled}, plus provider and host for a git rule), the defaults (GitHub,
+  GitLab, Azure DevOps and session references on, two example url rules off)
+  and the validator. A url rule's pattern is a short form such as BST-{num}
+  or a raw /regex/ limited to a subset Python and every supported browser
+  parse alike: no backreferences, lookaround, named groups or inline flags
+  (older Safari can't parse named groups or lookbehind), no repeated group
+  holding a repeat or |, at most three repeats capped at 64 characters, 200
+  characters in all. Its URL template must be http(s) with a fixed scheme and
+  host before any placeholder, so a match can't choose where a link goes.
+- A git rule stores one git host and its provider (github, gitlab or
+  azure_devops), so users can add GitHub Enterprise or a self-managed GitLab.
+  The host must be a bare host name with an optional port, with no scheme,
+  path or credentials, and a list holds one rule per host. The module also
+  picks the rule a session's repository uses (its host, else the provider the
+  server resolved), shared with the agent instructions.
+- A rule of the earlier github kind reads as the GitHub git rule and is
+  stored in the new form on the next write; the validator accepts it on input
+  until 0.22.0.
 - The rules are the {"kind": "link_rules", "name": "default"} shared
   preference, a JSON array in a string that the preference layer validates
   and stores in a canonical form. null restores the defaults.
@@ -25,25 +35,26 @@ rule before it is stored.
   replaces the list with a version check, refusing a stale edit instead of
   storing a conflict. Without shared preferences the defaults are read-only.
 
-Not upstream yet: proposed from feat/chat-link-rules; drop this copy once it merges.
+Not upstream yet: proposed from feat/chat-link-rules, the git-reference part from
+feat/git-ref-notation; drop this copy once they merge.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/chat-link-rules.md                |  92 +++++
+ docs/chat-link-rules.md                | 108 ++++
  docs/shared-preferences-api.md         |   7 +-
- feature-map/preferences.md             |   9 +
- omnigent/link_rules.py                 | 541 +++++++++++++++++++++++++
+ feature-map/preferences.md             |  11 +
+ omnigent/link_rules.py                 | 733 +++++++++++++++++++++++++
  omnigent/preference_sync.py            |   8 +-
  omnigent/preferences.py                |  16 +-
- omnigent/server/API.md                 |  36 ++
+ omnigent/server/API.md                 |  44 ++
  omnigent/server/app.py                 |   6 +
- omnigent/server/routes/preferences.py  | 132 +++++-
- omnigent/server/schemas.py             |  41 ++
- openapi.json                           | 190 +++++++++
- tests/server/routes/test_link_rules.py | 152 +++++++
- tests/test_link_rules.py               | 209 ++++++++++
- 13 files changed, 1430 insertions(+), 9 deletions(-)
+ omnigent/server/routes/preferences.py  | 132 ++++-
+ omnigent/server/schemas.py             |  48 ++
+ openapi.json                           | 219 ++++++++
+ tests/server/routes/test_link_rules.py | 191 +++++++
+ tests/test_link_rules.py               | 356 ++++++++++++
+ 13 files changed, 1870 insertions(+), 9 deletions(-)
  create mode 100644 docs/chat-link-rules.md
  create mode 100644 omnigent/link_rules.py
  create mode 100644 tests/server/routes/test_link_rules.py
@@ -51,33 +62,49 @@ Signed-off-by: Desidero <desidero@gmail.com>
 
 diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7133177c422a1d1a144c58c1d620cf3b9f8a42f1
+index 0000000000000000000000000000000000000000..79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd
 --- /dev/null
 +++ b/docs/chat-link-rules.md
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,108 @@
 +# Chat link rules
 +
 +Link rules turn short references in chat messages, such as `BST-2135` or
-+`#123`, into links. Each user has one list of rules, saved as a shared
++`PR #123`, into links. Each user has one list of rules, saved as a shared
 +preference, so every session and device shows the same links.
 +
 +## Rules
 +
 +A rule has a `name` (unique, up to 64 characters), a `kind`, a `pattern`, a
-+`url` and `enabled`. There are three kinds:
++`url` and `enabled`; a `git` rule also has a `provider` and a `host`. There
++are three kinds:
 +
 +| Kind | Matches | Links to |
 +| --- | --- | --- |
 +| `url` | The rule's `pattern` | The rule's `url` template, filled from the match |
-+| `github` | `#123` and `owner/repo#123` | The issue or pull request on the session's own repository host |
++| `git` | `#123`, `issue #123`, `PR #123`, the provider's `!123` and `owner/repo#123` | The issue or pull request on the host, in sessions whose repository is there (see [Git references](#git-references)) |
 +| `session` | `session:<session id>` and `session:<session id>/<message id>` | That Omnigent session, scrolled to the message |
 +
-+The `github` and `session` kinds are built in: they take no `pattern` or `url`,
-+and a list can hold at most one of each. A list holds up to 32 rules.
++The `git` and `session` kinds take no `pattern` or `url`. A `git` rule's
++`provider` is `github`, `gitlab` or `azure_devops`, and its `host` is a bare
++host name with an optional port (`gitlab.example.com`,
++`git.example.com:8443`): no scheme, path or credentials. Hosts are stored
++lower-cased, and a list holds one `git` rule per host and at most one `session`
++rule. A list holds up to 32 rules.
 +
-+With nothing saved, these defaults apply: GitHub and Sessions on, and two
++```json
++{"name": "Our GitLab", "kind": "git", "provider": "gitlab",
++ "host": "gitlab.example.com", "enabled": true}
++```
++
++With nothing saved, these defaults apply: GitHub (`github.com`), GitLab
++(`gitlab.com`), Azure DevOps (`dev.azure.com`) and Sessions on, and two
 +example `url` rules off, a Jira-style short form (`ABC-{num}`) and a raw
 +regex (`/(ENG-\d+)/`). Edit an example's pattern and URL before turning it on.
++
++A rule saved with the old `github` kind (before `git` rules) is read as the
++GitHub `git` rule for `github.com`, and stored in the new form the next time
++the list is saved. The validator still accepts `{"kind": "github"}` on input,
++with no `provider` or `host`; that is deprecated and goes in 0.22.0.
 +
 +### Patterns
 +
@@ -175,7 +202,7 @@ index 45a6f72ab09f5c369b6b5c7163a4a3071ae18048..608591071def677ec9455a5c6d6d30b3
  canonicalization rules. Credentials, executable commands, plugin installation,
  and arbitrary plugin configuration are not supported preference keys.
 diff --git a/feature-map/preferences.md b/feature-map/preferences.md
-index 5cea29cc0d1fdeb398d3fa5fb847208b89255306..ea8f36b32375aae980552bbee1038dfcac9f8aa2 100644
+index 5cea29cc0d1fdeb398d3fa5fb847208b89255306..a3508d93e7acfe9c78d0bbc28c74d909147313a4 100644
 --- a/feature-map/preferences.md
 +++ b/feature-map/preferences.md
 @@ -27,6 +27,9 @@ local; automatic client sync and shared/machine scope controls remain deferred.
@@ -188,25 +215,27 @@ index 5cea29cc0d1fdeb398d3fa5fb847208b89255306..ea8f36b32375aae980552bbee1038dfc
  
  - `configuration-copy`: review, save, show and import model defaults, harness
    selection/arguments and launcher plugin opt-outs; preserve local-only values.
-@@ -77,6 +80,12 @@ switches are disabled with a note, and new sessions get every feature. The
+@@ -77,6 +80,14 @@ switches are disabled with a note, and new sessions get every feature. The
  new-chat agent menu and the session configure menu set one session's features
  on any server.
  
 +**Chat link rules API:** `GET /v1/link-rules` returns the rules in effect;
 +`PUT /v1/link-rules` with `expected_version` replaces them (`rules: null`
-+restores the defaults). Covered by `tests/test_link_rules.py` (pattern and URL
-+checks) and `tests/server/routes/test_link_rules.py` (per-user storage, stale
-+versions, rejected rules, a server without shared preferences).
++restores the defaults). Covered by `tests/test_link_rules.py` (pattern, URL and
++git host checks, which `git` rule a session uses, reading and saving the old
++`github` kind) and `tests/server/routes/test_link_rules.py` (per-user storage,
++stale versions, rejected rules, the old kind on input, a server without shared
++preferences).
 +
  **Shared scope controls:** the CLI and UI do not yet offer automatic following,
  saving machine overrides, removing a machine override,
  resolving conflicts, or continuing with temporary defaults. The API above can
 diff --git a/omnigent/link_rules.py b/omnigent/link_rules.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7969254de
+index 0000000000000000000000000000000000000000..0bb35ef02004fbf41b99e51c4d115165213d3295
 --- /dev/null
 +++ b/omnigent/link_rules.py
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,733 @@
 +"""Chat link rules: short references in chat messages that render as links.
 +
 +Each viewer's browser runs the rules on every message, and agents can write
@@ -220,8 +249,10 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +A ``url`` rule's pattern is a short form such as ``BST-{num}`` or a raw
 +``/regex/``; its URL template fills ``{num}``-style placeholders (or ``{1}``,
 +``{2}`` for regex groups, ``{0}`` for the whole match) with percent-encoded
-+captures. The ``github`` and ``session`` kinds are built in and take no
-+pattern or URL.
++captures. A ``git`` rule names a git host and its provider (GitHub, GitLab or
++Azure DevOps) instead; the session's repository decides which one links a bare
++``#123``, and GitHub's links ``owner/repo#123`` everywhere. The ``session``
++kind is built in. Neither takes a pattern or URL.
 +"""
 +
 +from __future__ import annotations
@@ -239,11 +270,44 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +    """What a rule links to."""
 +
 +    URL = "url"
-+    GITHUB = "github"
++    GIT = "git"
 +    SESSION = "session"
 +
 +
-+BUILTIN_KINDS = frozenset({LinkRuleKind.GITHUB, LinkRuleKind.SESSION})
++# Kinds that take no pattern or URL.
++BUILTIN_KINDS = frozenset({LinkRuleKind.GIT, LinkRuleKind.SESSION})
++# The single-rule kind each list may hold once.
++SINGLE_KINDS = frozenset({LinkRuleKind.SESSION})
++# @deprecated The pre-``git`` kind, read as the GitHub ``git`` rule. Remove in 0.22.0.
++LEGACY_GITHUB_KIND = "github"
++
++
++@dataclass(frozen=True)
++class GitProviderNotation:
++    """How a git provider writes and serves issue and pull request references.
++
++    :param display_name: E.g. ``"GitLab"``.
++    :param default_host: The provider's public host, e.g. ``"gitlab.com"``.
++    :param request_prefix: The marker before a pull request number in its own
++        notation: ``"#"`` on GitHub, ``"!"`` on GitLab and Azure DevOps.
++    :param request_name: E.g. ``"merge request"``.
++    """
++
++    display_name: str
++    default_host: str
++    request_prefix: str
++    request_name: str
++
++
++# Providers a ``git`` rule can name, keyed by the git info payload's provider id.
++GIT_PROVIDERS: dict[str, GitProviderNotation] = {
++    "github": GitProviderNotation("GitHub", "github.com", "#", "pull request"),
++    "gitlab": GitProviderNotation("GitLab", "gitlab.com", "!", "merge request"),
++    "azure_devops": GitProviderNotation("Azure DevOps", "dev.azure.com", "!", "pull request"),
++}
++MAX_HOST_LENGTH = 253
++_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
++_BARE_HOST = re.compile(rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*(?::[0-9]{{1,5}})?")
 +MAX_RULES = 32
 +MAX_NAME_LENGTH = 64
 +MAX_PATTERN_LENGTH = 200
@@ -289,6 +353,9 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +    :param url: ``url`` kind only: the link template, e.g.
 +        ``"https://jira.example.com/browse/BST-{num}"``.
 +    :param enabled: Whether chat messages use the rule.
++    :param provider: ``git`` kind only: a :data:`GIT_PROVIDERS` key.
++    :param host: ``git`` kind only: the lower-cased host name, with an optional
++        port, e.g. ``"gitlab.example.com"``.
 +    """
 +
 +    name: str
@@ -296,15 +363,18 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +    pattern: str = ""
 +    url: str | None = None
 +    enabled: bool = True
++    provider: str | None = None
++    host: str | None = None
 +
 +    def to_wire(self) -> dict[str, Any]:
-+        """The rule as stored and served, omitting ``url`` when unset."""
-+        wire: dict[str, Any] = {
-+            "name": self.name,
-+            "kind": str(self.kind),
-+            "pattern": self.pattern,
-+            "enabled": self.enabled,
-+        }
++        """The rule as stored and served, omitting unset ``url``, ``provider`` and ``host``."""
++        wire: dict[str, Any] = {"name": self.name, "kind": str(self.kind)}
++        if self.provider is not None:
++            wire["provider"] = self.provider
++        if self.host is not None:
++            wire["host"] = self.host
++        wire["pattern"] = self.pattern
++        wire["enabled"] = self.enabled
 +        if self.url is not None:
 +            wire["url"] = self.url
 +        return wire
@@ -329,8 +399,17 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +        return f"{_LEADING_BOUNDARY}(?:{self.source}){_TRAILING_BOUNDARY}"
 +
 +
++def _git_rule(name: str, provider: str, *, enabled: bool = True) -> LinkRule:
++    host = GIT_PROVIDERS[provider].default_host
++    return LinkRule(
++        name=name, kind=LinkRuleKind.GIT, provider=provider, host=host, enabled=enabled
++    )
++
++
 +DEFAULT_LINK_RULES: tuple[LinkRule, ...] = (
-+    LinkRule(name="GitHub", kind=LinkRuleKind.GITHUB),
++    _git_rule("GitHub", "github"),
++    _git_rule("GitLab", "gitlab"),
++    _git_rule("Azure DevOps", "azure_devops"),
 +    LinkRule(name="Sessions", kind=LinkRuleKind.SESSION),
 +    LinkRule(
 +        name="Jira",
@@ -617,17 +696,44 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +        raise LinkRuleError("url: unmatched { or }")
 +
 +
++def check_git_host(host: object) -> str:
++    """Check a ``git`` rule's host and return it lower-cased.
++
++    :param host: E.g. ``"GitLab.example.com"`` or ``"git.example.com:8443"``.
++    :returns: The host, lower-cased.
++    :raises LinkRuleError: Unless it is a bare host name with an optional port:
++        no scheme, path, credentials or spaces.
++    """
++    if not isinstance(host, str) or not host:
++        raise LinkRuleError("host: required for a git rule, e.g. gitlab.example.com")
++    folded = host.lower()
++    port = folded.rpartition(":")[2] if ":" in folded else None
++    if (
++        len(folded) > MAX_HOST_LENGTH
++        or not _BARE_HOST.fullmatch(folded)
++        or (port is not None and not 0 < int(port) < 65536)
++    ):
++        raise LinkRuleError(
++            "host: a bare host name such as gitlab.example.com, with no scheme, path "
++            "or credentials"
++        )
++    return folded
++
++
 +def validate_link_rule(raw: object) -> LinkRule:
 +    """Validate one rule from the wire.
 +
++    A rule of the old ``github`` kind is read as the GitHub ``git`` rule.
++
 +    :param raw: A mapping with ``name``, ``kind``, ``pattern``, ``url`` and
-+        ``enabled``; built-in kinds may omit ``pattern``.
-+    :returns: The rule, with its name trimmed.
++        ``enabled``, plus ``provider`` and ``host`` for a ``git`` rule; built-in
++        kinds may omit ``pattern``.
++    :returns: The rule, with its name trimmed and its host lower-cased.
 +    :raises LinkRuleError: Naming the field at fault.
 +    """
 +    if not isinstance(raw, dict):
 +        raise LinkRuleError("a rule must be an object")
-+    unknown = sorted(set(raw) - {"name", "kind", "pattern", "url", "enabled"})
++    unknown = sorted(set(raw) - {"name", "kind", "pattern", "url", "enabled", "provider", "host"})
 +    if unknown:
 +        raise LinkRuleError(f"unknown field(s): {', '.join(unknown)}")
 +    name = raw.get("name")
@@ -636,10 +742,11 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +    name = name.strip()
 +    if len(name) > MAX_NAME_LENGTH:
 +        raise LinkRuleError(f"name: longer than {MAX_NAME_LENGTH} characters")
++    legacy_github = raw.get("kind") == LEGACY_GITHUB_KIND
 +    try:
-+        kind = LinkRuleKind(raw.get("kind"))
++        kind = LinkRuleKind.GIT if legacy_github else LinkRuleKind(raw.get("kind"))
 +    except ValueError:
-+        raise LinkRuleError("kind: must be url, github or session") from None
++        raise LinkRuleError("kind: must be url, git or session") from None
 +    enabled = raw.get("enabled", True)
 +    if not isinstance(enabled, bool):
 +        raise LinkRuleError("enabled: must be true or false")
@@ -649,15 +756,36 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +        raise LinkRuleError("pattern: must be a string")
 +    if url is not None and not isinstance(url, str):
 +        raise LinkRuleError("url: must be a string")
++    provider: str | None = None
++    host: str | None = None
 +    try:
-+        if kind in BUILTIN_KINDS:
-+            if pattern or url:
-+                raise LinkRuleError(f"the built-in {kind} kind takes no pattern or url")
-+        else:
++        if kind in BUILTIN_KINDS and (pattern or url):
++            raise LinkRuleError(f"the built-in {kind} kind takes no pattern or url")
++        names_a_host = raw.get("provider") is not None or raw.get("host") is not None
++        if kind != LinkRuleKind.GIT and names_a_host:
++            raise LinkRuleError("provider and host belong to a git rule")
++        if legacy_github:
++            if names_a_host:
++                raise LinkRuleError("the old github kind takes no provider or host")
++            provider, host = "github", GIT_PROVIDERS["github"].default_host
++        elif kind == LinkRuleKind.GIT:
++            provider = raw.get("provider")
++            if not isinstance(provider, str) or provider not in GIT_PROVIDERS:
++                raise LinkRuleError(f"provider: must be {', '.join(GIT_PROVIDERS)}")
++            host = check_git_host(raw.get("host"))
++        elif kind == LinkRuleKind.URL:
 +            check_url_template(url or "", compile_pattern(pattern))
 +    except LinkRuleError as exc:
 +        raise LinkRuleError(f"{name}: {exc}") from None
-+    return LinkRule(name=name, kind=kind, pattern=pattern, url=url or None, enabled=enabled)
++    return LinkRule(
++        name=name,
++        kind=kind,
++        pattern=pattern,
++        url=url or None,
++        enabled=enabled,
++        provider=provider,
++        host=host,
++    )
 +
 +
 +def validate_link_rules(raw: object) -> tuple[LinkRule, ...]:
@@ -665,8 +793,8 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +
 +    :param raw: A list of rule mappings.
 +    :returns: The rules in order.
-+    :raises LinkRuleError: On a bad rule, too many rules, a repeated name, or a
-+        built-in kind listed twice.
++    :raises LinkRuleError: On a bad rule, too many rules, a repeated name, two
++        ``git`` rules for one host, or a ``session`` rule listed twice.
 +    """
 +    if not isinstance(raw, list):
 +        raise LinkRuleError("link rules must be a list")
@@ -674,16 +802,21 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +        raise LinkRuleError(f"at most {MAX_RULES} link rules")
 +    rules = tuple(validate_link_rule(entry) for entry in raw)
 +    seen: set[str] = set()
-+    builtins: set[LinkRuleKind] = set()
++    singles: set[LinkRuleKind] = set()
++    hosts: set[str] = set()
 +    for rule in rules:
 +        folded = rule.name.casefold()
 +        if folded in seen:
 +            raise LinkRuleError(f"two rules are named {rule.name!r}")
 +        seen.add(folded)
-+        if rule.kind in BUILTIN_KINDS:
-+            if rule.kind in builtins:
++        if rule.kind in SINGLE_KINDS:
++            if rule.kind in singles:
 +                raise LinkRuleError(f"only one {rule.kind} rule")
-+            builtins.add(rule.kind)
++            singles.add(rule.kind)
++        if rule.host is not None:
++            if rule.host in hosts:
++                raise LinkRuleError(f"two git rules are for {rule.host}")
++            hosts.add(rule.host)
 +    return rules
 +
 +
@@ -730,8 +863,10 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +    :param rule: An enabled rule.
 +    :returns: E.g. ``"`ABC-123` (Jira)"``.
 +    """
-+    if rule.kind == LinkRuleKind.GITHUB:
-+        return "`#123` or `owner/repo#123` (issues and pull requests on this session's repository)"
++    if rule.kind == LinkRuleKind.GIT:
++        notation = GIT_PROVIDERS.get(rule.provider or "")
++        label = notation.display_name if notation else rule.name
++        return f"`issue #123`, `PR #123` and `owner/repo#123` ({label} on {rule.host})"
 +    if rule.kind == LinkRuleKind.SESSION:
 +        return (
 +            "`session:<session id>` or `session:<session id>/<message id>` "
@@ -748,6 +883,92 @@ index 0000000000000000000000000000000000000000..015a7e3d0d99ff240d5c30d66394a4d7
 +def enabled_link_rules(rules: Sequence[LinkRule]) -> tuple[LinkRule, ...]:
 +    """The rules chat messages use."""
 +    return tuple(rule for rule in rules if rule.enabled)
++
++
++@dataclass(frozen=True)
++class GitWorkspace:
++    """The git remote of a session's workspace, which is a git checkout.
++
++    :param provider: The provider id the server resolved for the remote, or
++        ``None`` when none claims it.
++    :param host: The remote's host, or ``None`` without a network remote.
++    """
++
++    provider: str | None = None
++    host: str | None = None
++
++
++def _host_name(host: str) -> str:
++    return host.rpartition(":")[0] if ":" in host else host
++
++
++def session_git_rule(
++    rules: Sequence[LinkRule], *, provider: str | None, host: str | None
++) -> LinkRule | None:
++    """The ``git`` rule that owns a session's bare ``#123`` references.
++
++    The rule for the repository's host wins, and a disabled one turns linking
++    off; failing that, the first enabled rule for the provider the server
++    resolved (a GitHub Enterprise or self-managed host nobody listed).
++    ``web/src/lib/linkRules.ts`` picks the same way.
++
++    :param rules: The user's rules.
++    :param provider: The repository's provider id, or ``None`` when unknown.
++    :param host: The repository's host, or ``None`` when the session has none.
++    :returns: The rule, or ``None`` when the session's references stay text.
++    """
++    if not host:
++        return None
++    git_rules = [rule for rule in rules if rule.kind == LinkRuleKind.GIT and rule.host]
++    wanted = _host_name(host.lower())
++    for rule in git_rules:
++        if _host_name(rule.host or "") == wanted:
++            return rule if rule.enabled else None
++    if provider is None:
++        return None
++    return next((rule for rule in git_rules if rule.enabled and rule.provider == provider), None)
++
++
++def github_git_rule(rules: Sequence[LinkRule]) -> LinkRule | None:
++    """The GitHub rule that links ``owner/repo#123`` in any session, if enabled.
++
++    :param rules: The user's rules.
++    :returns: The first enabled GitHub ``git`` rule (github.com by default).
++    """
++    return next(
++        (
++            rule
++            for rule in rules
++            if rule.kind == LinkRuleKind.GIT and rule.enabled and rule.provider == "github"
++        ),
++        None,
++    )
++
++
++def git_reference_instruction(rules: Sequence[LinkRule], workspace: GitWorkspace) -> str | None:
++    """Ask the agent to say whether a number is an issue or a pull request.
++
++    Names only notations that link in this session: the provider's ``!123``
++    when the session's ``git`` rule uses it, and ``owner/repo#123`` when GitHub
++    or the session's provider links qualified references.
++
++    :param rules: The user's rules.
++    :param workspace: The session's git checkout.
++    :returns: The instruction, or ``None`` when no ``git`` rule applies.
++    """
++    session = session_git_rule(rules, provider=workspace.provider, host=workspace.host)
++    github = github_git_rule(rules)
++    if session is None and github is None:
++        return None
++    notation = GIT_PROVIDERS.get(session.provider or "") if session else None
++    text = "Issue and pull request references: write them as `issue #123` or `PR #123`"
++    if notation is not None and notation.request_prefix != "#":
++        text += f" (or `{notation.request_prefix}123` for a {notation.request_name})"
++    text += " rather than a bare `#123`"
++    # Azure DevOps has no notation for another repository's references.
++    if github is not None or (session is not None and session.provider != "azure_devops"):
++        text += ", and as `owner/repo#123` when they belong to another repository"
++    return text + "."
 diff --git a/omnigent/preference_sync.py b/omnigent/preference_sync.py
 index 0f596cd65546d011c179cfbaf6535a83395bd143..f8f41a63c81d5081aceb36d463988f156e02018d 100644
 --- a/omnigent/preference_sync.py
@@ -825,10 +1046,10 @@ index 8ed73fd8fe32d9917da3c41784132dcdb339cd04..1a1000ddfc29d6b54cb4c3d1d2dc597d
          valid = isinstance(value, str) and bool(value.strip())
      if not valid:
 diff --git a/omnigent/server/API.md b/omnigent/server/API.md
-index 245d248dededad1d050006538a7ecda1345854a2..cbe4ffddb0861cf3cf925fdf3f9d143c96530efc 100644
+index 245d248dededad1d050006538a7ecda1345854a2..e252cdbd0712a71f9ed307e6a8330eb4d576d857 100644
 --- a/omnigent/server/API.md
 +++ b/omnigent/server/API.md
-@@ -1544,6 +1544,42 @@ Updated clients preserve later bubbles when that older server's receipt arrives.
+@@ -1544,6 +1544,50 @@ Updated clients preserve later bubbles when that older server's receipt arrives.
  
  ---
  
@@ -847,10 +1068,16 @@ index 245d248dededad1d050006538a7ecda1345854a2..cbe4ffddb0861cf3cf925fdf3f9d143c
 +  "supported": true,          // false: no shared preferences, rules are read-only
 +  "saved": false,             // false: the defaults apply
 +  "version": 0,               // send back as expected_version
-+  "rules": [{"name": "GitHub", "kind": "github", "pattern": "", "url": null, "enabled": true}, ...],
++  "rules": [{"name": "GitHub", "kind": "git", "provider": "github", "host": "github.com",
++             "pattern": "", "url": null, "enabled": true}, ...],
 +  "defaults": [...]
 +}
 +```
++
++A rule's `kind` is `url`, `git` or `session`. A `git` rule names a `provider`
++(`github`, `gitlab` or `azure_devops`) and a bare `host`; `url` and `session`
++rules return `provider` and `host` as `null`. A rule saved with the old
++`github` kind is returned as the GitHub `git` rule.
 +
 +### Replace Link Rules
 +
@@ -863,6 +1090,8 @@ index 245d248dededad1d050006538a7ecda1345854a2..cbe4ffddb0861cf3cf925fdf3f9d143c
 +```
 +
 +`rules` is the whole list; `null` removes the saved rules so the defaults apply.
++A `{"kind": "github"}` rule is still accepted and stored as the GitHub `git`
++rule (deprecated; removal in 0.22.0).
 +Returns 422 with the rule and field at fault when a rule fails validation, and
 +409 when `expected_version` is stale or the server has no shared preferences.
 +
@@ -1062,10 +1291,10 @@ index 5449a7a0bb04b66a11cdb2127a3eff8ca0cd7222..258fd5b5aff4f8f06c79f7510009c16e
 +
 +    return router
 diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
-index 1da9448c32e17b0b7498615cba9b25a4bd8ee676..fc7e48a8d718f608de545697b9a820d49c5a64ca 100644
+index 1da9448c32e17b0b7498615cba9b25a4bd8ee676..d6cd1bee0451e4ac7841233c3100de4b5352e4c7 100644
 --- a/omnigent/server/schemas.py
 +++ b/omnigent/server/schemas.py
-@@ -5334,6 +5334,47 @@ class ChatFeatureCatalogResponse(BaseModel):
+@@ -5334,6 +5334,54 @@ class ChatFeatureCatalogResponse(BaseModel):
      available: list[ChatFeatureOption]
  
  
@@ -1073,11 +1302,18 @@ index 1da9448c32e17b0b7498615cba9b25a4bd8ee676..fc7e48a8d718f608de545697b9a820d4
 +    """One chat link rule; see ``docs/chat-link-rules.md``."""
 +
 +    name: str = Field(description="Unique display name, e.g. 'Jira'.")
-+    kind: Literal["url", "github", "session"]
++    kind: Literal["url", "git", "session"]
++    provider: Literal["github", "gitlab", "azure_devops"] | None = Field(
++        default=None, description="git kind: the git provider the host runs."
++    )
++    host: str | None = Field(
++        default=None,
++        description="git kind: a bare host name with an optional port, e.g. 'gitlab.example.com'.",
++    )
 +    pattern: str = Field(
 +        default="",
 +        description="url kind: a short form like 'BST-{num}' or a raw '/regex/'; "
-+        "empty for github and session.",
++        "empty for git and session.",
 +    )
 +    url: str | None = Field(
 +        default=None,
@@ -1114,10 +1350,10 @@ index 1da9448c32e17b0b7498615cba9b25a4bd8ee676..fc7e48a8d718f608de545697b9a820d4
  
  
 diff --git a/openapi.json b/openapi.json
-index d6227ae0d0531ecde41470f6456b7521fbb01ddc..a249edb7e3485774d4f87d57d5356ad8832568a9 100644
+index d6227ae0d0531ecde41470f6456b7521fbb01ddc..7796d05a400ce5b784eb19e6e30170bf16b80b17 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -3725,6 +3725,134 @@
+@@ -3725,6 +3725,163 @@
          "title": "LaunchRunnerRequest",
          "type": "object"
        },
@@ -1129,10 +1365,22 @@ index d6227ae0d0531ecde41470f6456b7521fbb01ddc..a249edb7e3485774d4f87d57d5356ad8
 +            "title": "Enabled",
 +            "type": "boolean"
 +          },
++          "host": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "git kind: a bare host name with an optional port, e.g. 'gitlab.example.com'.",
++            "title": "Host"
++          },
 +          "kind": {
 +            "enum": [
 +              "url",
-+              "github",
++              "git",
 +              "session"
 +            ],
 +            "title": "Kind",
@@ -1145,9 +1393,26 @@ index d6227ae0d0531ecde41470f6456b7521fbb01ddc..a249edb7e3485774d4f87d57d5356ad8
 +          },
 +          "pattern": {
 +            "default": "",
-+            "description": "url kind: a short form like 'BST-{num}' or a raw '/regex/'; empty for github and session.",
++            "description": "url kind: a short form like 'BST-{num}' or a raw '/regex/'; empty for git and session.",
 +            "title": "Pattern",
 +            "type": "string"
++          },
++          "provider": {
++            "anyOf": [
++              {
++                "enum": [
++                  "github",
++                  "gitlab",
++                  "azure_devops"
++                ],
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "git kind: the git provider the host runs.",
++            "title": "Provider"
 +          },
 +          "url": {
 +            "anyOf": [
@@ -1252,7 +1517,7 @@ index d6227ae0d0531ecde41470f6456b7521fbb01ddc..a249edb7e3485774d4f87d57d5356ad8
        "LocalImportRequest": {
          "description": "Request to import local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server. A\nsupplied `session_id` loads that exact session without enumerating local\nhistory.",
          "properties": {
-@@ -13441,6 +13569,68 @@
+@@ -13441,6 +13598,68 @@
          ]
        }
      },
@@ -1323,10 +1588,10 @@ index d6227ae0d0531ecde41470f6456b7521fbb01ddc..a249edb7e3485774d4f87d57d5356ad8
          "operationId": "gateway_v1_mcp__service_id__post",
 diff --git a/tests/server/routes/test_link_rules.py b/tests/server/routes/test_link_rules.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2fb9474ddc917b2bb9499e6af93eeed83ace21f7
+index 0000000000000000000000000000000000000000..a9ee0b93c4270891e33bb8f0db27d8fd30709354
 --- /dev/null
 +++ b/tests/server/routes/test_link_rules.py
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,191 @@
 +"""``/v1/link-rules``: the caller's chat link rules over shared preferences."""
 +
 +import httpx
@@ -1351,6 +1616,18 @@ index 0000000000000000000000000000000000000000..2fb9474ddc917b2bb9499e6af93eeed8
 +    "url": "https://jira.example.com/browse/BST-{num}",
 +    "enabled": True,
 +}
++GITLAB_SELF_MANAGED = {
++    "name": "Our GitLab",
++    "kind": "git",
++    "provider": "gitlab",
++    "host": "GitLab.Example.com",
++    "enabled": True,
++}
++
++
++def _served(rule: dict) -> dict:
++    """A rule as the route serves it: every field present."""
++    return {"provider": None, "host": None, **rule}
 +
 +
 +def _app(db_uri, tmp_path, *, with_store: bool):
@@ -1393,18 +1670,17 @@ index 0000000000000000000000000000000000000000..2fb9474ddc917b2bb9499e6af93eeed8
 +        saved = await client.put(
 +            "/v1/link-rules",
 +            headers=ALICE,
-+            json={"rules": [{"name": "GitHub", "kind": "github"}, JIRA], "expected_version": 0},
++            json={"rules": [GITLAB_SELF_MANAGED, JIRA], "expected_version": 0},
 +        )
 +        assert saved.status_code == 200, saved.text
 +        body = saved.json()
 +        assert body["saved"] is True and body["version"] == 1
-+        assert body["rules"][1] == JIRA
++        assert body["rules"][1] == _served(JIRA)
 +        assert body["rules"][0] == {
-+            "name": "GitHub",
-+            "kind": "github",
++            **GITLAB_SELF_MANAGED,
++            "host": "gitlab.example.com",
 +            "pattern": "",
 +            "url": None,
-+            "enabled": True,
 +        }
 +
 +        # Bob still sees the defaults: rules are per user.
@@ -1428,7 +1704,9 @@ index 0000000000000000000000000000000000000000..2fb9474ddc917b2bb9499e6af93eeed8
 +        assert stale.status_code == 409
 +        shared = (await client.get("/v1/preferences/shared", headers=ALICE)).json()
 +        assert shared["conflicts"] == []
-+        assert (await client.get("/v1/link-rules", headers=ALICE)).json()["rules"] == [JIRA]
++        assert (await client.get("/v1/link-rules", headers=ALICE)).json()["rules"] == [
++            _served(JIRA)
++        ]
 +
 +
 +@pytest.mark.parametrize(
@@ -1439,6 +1717,8 @@ index 0000000000000000000000000000000000000000..2fb9474ddc917b2bb9499e6af93eeed8
 +        {**JIRA, "pattern": "/(a+)+$/"},
 +        {**JIRA, "pattern": "/(?<=x)BST-(\\d+)/"},
 +        {"name": "GitHub", "kind": "github", "pattern": "#{num}"},
++        {**GITLAB_SELF_MANAGED, "host": "https://gitlab.example.com"},
++        {**GITLAB_SELF_MANAGED, "provider": "bitbucket"},
 +    ],
 +)
 +async def test_invalid_rules_are_rejected_with_the_reason(client_factory, rule):
@@ -1479,12 +1759,36 @@ index 0000000000000000000000000000000000000000..2fb9474ddc917b2bb9499e6af93eeed8
 +            "/v1/link-rules", headers=ALICE, json={"rules": [JIRA], "expected_version": 0}
 +        )
 +        assert refused.status_code == 409
++
++
++async def test_a_rule_of_the_old_github_kind_is_saved_as_the_github_git_rule(client_factory):
++    """The old kind is still accepted on input and comes back in the new form."""
++    async with client_factory() as client:
++        saved = await client.put(
++            "/v1/link-rules",
++            headers=ALICE,
++            json={"rules": [{"name": "GitHub", "kind": "github"}], "expected_version": 0},
++        )
++        assert saved.status_code == 200, saved.text
++        expected = {
++            "name": "GitHub",
++            "kind": "git",
++            "provider": "github",
++            "host": "github.com",
++            "pattern": "",
++            "url": None,
++            "enabled": True,
++        }
++        assert saved.json()["rules"] == [expected]
++        shared = (await client.get("/v1/preferences/shared", headers=ALICE)).json()
++        [entry] = [item for item in shared["entries"] if item["key"]["kind"] == "link_rules"]
++        assert '"kind":"git"' in entry["value"] and '"github"' in entry["value"]
 diff --git a/tests/test_link_rules.py b/tests/test_link_rules.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6abbc94daa34fcf979ce3a616c550ca3819e7222
+index 0000000000000000000000000000000000000000..047c148ad0b671abf4bdb43e7c3e51657986d852
 --- /dev/null
 +++ b/tests/test_link_rules.py
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,356 @@
 +"""Chat link rules: the pattern compiler, URL template check and stored form."""
 +
 +import json
@@ -1493,20 +1797,33 @@ index 0000000000000000000000000000000000000000..6abbc94daa34fcf979ce3a616c550ca3
 +
 +import pytest
 +
++from omnigent.git_providers import provider_display
 +from omnigent.link_rules import (
 +    DEFAULT_LINK_RULES,
++    GIT_PROVIDERS,
 +    MAX_REPEAT,
++    LinkRule,
 +    LinkRuleError,
 +    LinkRuleKind,
++    check_git_host,
 +    check_url_template,
 +    compile_pattern,
 +    describe_link_syntax,
 +    encode_link_rules,
++    github_git_rule,
 +    link_rules_from_value,
 +    parse_link_rules_json,
++    session_git_rule,
 +    validate_link_rules,
 +)
 +from omnigent.preference_sync import PreferenceMutation
++
++GITLAB_SELF_MANAGED = {
++    "name": "Our GitLab",
++    "kind": "git",
++    "provider": "gitlab",
++    "host": "gitlab.example.com",
++}
 +
 +
 +@pytest.mark.parametrize(
@@ -1619,23 +1936,72 @@ index 0000000000000000000000000000000000000000..6abbc94daa34fcf979ce3a616c550ca3
 +
 +def test_builtin_kinds_take_no_pattern_or_url():
 +    with pytest.raises(LinkRuleError, match="takes no pattern"):
-+        validate_link_rules([{"name": "GH", "kind": "github", "pattern": "#{num}"}])
-+    rules = validate_link_rules([{"name": " GH ", "kind": "github"}])
-+    assert rules[0].name == "GH" and rules[0].kind == LinkRuleKind.GITHUB
++        validate_link_rules([{"name": "S", "kind": "session", "pattern": "s:{id}"}])
++    with pytest.raises(LinkRuleError, match="takes no pattern"):
++        validate_link_rules([{**GITLAB_SELF_MANAGED, "url": "https://x.example/{0}"}])
++    rules = validate_link_rules([{"name": " S ", "kind": "session"}])
++    assert rules[0].name == "S" and rules[0].kind == LinkRuleKind.SESSION
++
++
++def test_git_rules_name_a_provider_and_a_bare_host():
++    [rule] = validate_link_rules([{**GITLAB_SELF_MANAGED, "host": "GitLab.Example.COM:8443"}])
++    assert rule.kind == LinkRuleKind.GIT
++    assert (rule.provider, rule.host) == ("gitlab", "gitlab.example.com:8443")
++    assert rule.to_wire() == {
++        "name": "Our GitLab",
++        "kind": "git",
++        "provider": "gitlab",
++        "host": "gitlab.example.com:8443",
++        "pattern": "",
++        "enabled": True,
++    }
++
++
++@pytest.mark.parametrize(
++    "host",
++    [
++        "https://gitlab.example.com",
++        "gitlab.example.com/group",
++        "user@gitlab.example.com",
++        "user:pw@gitlab.example.com",
++        "gitlab example.com",
++        "gitlab.example.com:0",
++        "gitlab.example.com:99999",
++        "-gitlab.example.com",
++        "gitlab..example.com",
++        "",
++        None,
++        "a" * 254,
++    ],
++)
++def test_git_hosts_with_a_scheme_path_or_credentials_are_rejected(host):
++    with pytest.raises(LinkRuleError, match="host:"):
++        check_git_host(host)
 +
 +
 +@pytest.mark.parametrize(
 +    ("rules", "message"),
 +    [
 +        ({"name": "x"}, "must be a list"),
-+        ([{"name": "", "kind": "github"}], "name: required"),
-+        ([{"name": "a", "kind": "ftp"}], "kind:"),
-+        ([{"name": "a", "kind": "github", "enabled": "yes"}], "enabled:"),
-+        ([{"name": "a", "kind": "github", "color": "red"}], "unknown field"),
-+        ([{"name": "a", "kind": "github"}, {"name": "A", "kind": "session"}], "two rules"),
++        ([{"name": "", "kind": "session"}], "name: required"),
++        ([{"name": "a", "kind": "ftp"}], "kind: must be url, git or session"),
++        ([{"name": "a", "kind": "session", "enabled": "yes"}], "enabled:"),
++        ([{"name": "a", "kind": "session", "color": "red"}], "unknown field"),
++        ([{"name": "a", "kind": "session"}, {**GITLAB_SELF_MANAGED, "name": "A"}], "two rules"),
 +        ([{"name": "a", "kind": "session"}, {"name": "b", "kind": "session"}], "only one"),
-+        ([{"name": f"r{i}", "kind": "github"} for i in range(33)], "at most 32"),
++        ([{"name": f"r{i}", "kind": "session"} for i in range(33)], "at most 32"),
 +        ([{"name": "Jira", "kind": "url", "pattern": "B-{num}"}], "Jira: url: required"),
++        ([{**GITLAB_SELF_MANAGED, "provider": "bitbucket"}], "provider: must be"),
++        ([{**GITLAB_SELF_MANAGED, "provider": None}], "provider: must be"),
++        ([{"name": "S", "kind": "session", "host": "x.example"}], "belong to a git rule"),
++        (
++            [
++                GITLAB_SELF_MANAGED,
++                {**GITLAB_SELF_MANAGED, "name": "Again", "host": "GITLAB.example.com"},
++            ],
++            "two git rules are for gitlab.example.com",
++        ),
++        ([{"name": "GH", "kind": "github", "host": "ghe.example.com"}], "old github kind"),
 +    ],
 +)
 +def test_rule_lists_are_validated(rules, message):
@@ -1643,10 +2009,95 @@ index 0000000000000000000000000000000000000000..6abbc94daa34fcf979ce3a616c550ca3
 +        validate_link_rules(rules)
 +
 +
++def test_git_provider_notation_matches_the_provider_registry():
++    """The web client links with the same prefixes the git providers declare."""
++    for provider_id, notation in GIT_PROVIDERS.items():
++        display = provider_display(provider_id)
++        assert display is not None
++        assert display["number_prefix"] == notation.request_prefix
++        assert display["display_name"] == notation.display_name
++
++
++# ─── The old github kind (accepted on input until 0.22.0) ────
++
++
++def test_an_old_github_rule_is_read_as_the_github_git_rule():
++    stored = '[{"name":"GitHub","kind":"github","pattern":"","enabled":false}]'
++    assert link_rules_from_value(stored) == (
++        LinkRule(
++            name="GitHub",
++            kind=LinkRuleKind.GIT,
++            provider="github",
++            host="github.com",
++            enabled=False,
++        ),
++    )
++
++
++def test_an_old_github_rule_is_saved_in_the_new_form():
++    stored = _mutation('[{"name":"GitHub","kind":"github","pattern":"","enabled":true}]').value
++    assert stored == (
++        '[{"name":"GitHub","kind":"git","provider":"github","host":"github.com",'
++        '"pattern":"","enabled":true}]'
++    )
++
++
++# ─── Which git rules a session uses ────
++
++
++def _git(name: str, provider: str, host: str, *, enabled: bool = True) -> LinkRule:
++    return LinkRule(
++        name=name, kind=LinkRuleKind.GIT, provider=provider, host=host, enabled=enabled
++    )
++
++
++GITHUB = _git("GitHub", "github", "github.com")
++GITLAB = _git("GitLab", "gitlab", "gitlab.com")
++OUR_GITLAB = _git("Our GitLab", "gitlab", "gitlab.example.com")
++
++
++@pytest.mark.parametrize(
++    ("provider", "host", "expected"),
++    [
++        ("github", "github.com", GITHUB),
++        ("gitlab", "GitLab.com", GITLAB),
++        # A listed self-managed host wins over the provider's public one.
++        ("gitlab", "gitlab.example.com", OUR_GITLAB),
++        # The listed host decides even when the server names no provider.
++        (None, "gitlab.example.com", OUR_GITLAB),
++        # A GitHub Enterprise host nobody listed falls back to the provider.
++        ("github", "ghe.example.com", GITHUB),
++        (None, "ghe.example.com", None),
++        ("bitbucket", "bitbucket.org", None),
++        ("github", None, None),
++    ],
++)
++def test_the_session_repository_picks_one_git_rule(provider, host, expected):
++    rules = (GITHUB, GITLAB, OUR_GITLAB)
++    assert session_git_rule(rules, provider=provider, host=host) == expected
++
++
++def test_a_disabled_git_rule_turns_its_host_off():
++    rules = (GITHUB, _git("Our GitLab", "gitlab", "gitlab.example.com", enabled=False), GITLAB)
++    assert session_git_rule(rules, provider="gitlab", host="gitlab.example.com") is None
++    assert session_git_rule(rules, provider="gitlab", host="gitlab.com") == GITLAB
++
++
++def test_github_links_qualified_references_unless_turned_off():
++    assert github_git_rule(DEFAULT_LINK_RULES) == DEFAULT_LINK_RULES[0]
++    disabled = _git("GitHub", "github", "github.com", enabled=False)
++    assert github_git_rule((disabled, GITLAB)) is None
++
++
 +def test_defaults_round_trip_through_the_stored_form():
 +    encoded = encode_link_rules(DEFAULT_LINK_RULES)
 +    assert parse_link_rules_json(encoded) == DEFAULT_LINK_RULES
-+    assert [rule.enabled for rule in DEFAULT_LINK_RULES] == [True, True, False, False]
++    assert [rule.enabled for rule in DEFAULT_LINK_RULES] == [True, True, True, True, False, False]
++    assert [(rule.provider, rule.host) for rule in DEFAULT_LINK_RULES[:3]] == [
++        ("github", "github.com"),
++        ("gitlab", "gitlab.com"),
++        ("azure_devops", "dev.azure.com"),
++    ]
 +
 +
 +def test_unusable_stored_values_fall_back_to_the_defaults():
@@ -1656,10 +2107,10 @@ index 0000000000000000000000000000000000000000..6abbc94daa34fcf979ce3a616c550ca3
 +
 +
 +def test_describe_link_syntax_shows_an_example():
-+    jira, linear = DEFAULT_LINK_RULES[2], DEFAULT_LINK_RULES[3]
++    jira, linear = DEFAULT_LINK_RULES[4], DEFAULT_LINK_RULES[5]
 +    assert describe_link_syntax(jira) == "`ABC-123` (Jira)"
 +    assert describe_link_syntax(linear) == "text matching `/(ENG-\\d+)/` (Linear)"
-+    assert "owner/repo#123" in describe_link_syntax(DEFAULT_LINK_RULES[0])
++    assert describe_link_syntax(OUR_GITLAB).endswith("(GitLab on gitlab.example.com)")
 +
 +
 +def _mutation(value: object) -> PreferenceMutation:
@@ -1677,9 +2128,9 @@ index 0000000000000000000000000000000000000000..6abbc94daa34fcf979ce3a616c550ca3
 +
 +
 +def test_shared_preference_edits_store_the_canonical_form():
-+    value = json.dumps([{"enabled": True, "kind": "github", "name": "  GitHub "}], indent=2)
++    value = json.dumps([{"enabled": True, "kind": "session", "name": "  Sessions "}], indent=2)
 +    stored = _mutation(value).value
-+    assert stored == '[{"name":"GitHub","kind":"github","pattern":"","enabled":true}]'
++    assert stored == '[{"name":"Sessions","kind":"session","pattern":"","enabled":true}]'
 +
 +
 +@pytest.mark.parametrize(
