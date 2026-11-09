@@ -33,7 +33,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
 ---
  feature-map/composer.md                       |  10 ++
  tests/e2e_ui/conftest.py                      |  10 ++
- tests/e2e_ui/sessions/test_command_palette.py |  44 ++++++++
+ tests/e2e_ui/sessions/test_command_palette.py |  39 +++++++
  .../test_initial_prompt_session_switch.py     |   3 +
  .../test_sidebar_pinned_project_collapse.py   |   5 +
  .../start_session/test_start_session.py       |   4 +
@@ -44,13 +44,13 @@ Signed-off-by: Desidero <desidero@gmail.com>
  .../lib/newChatProjectPromptPreferences.ts    |  26 +++++
  web/src/pages/SettingsPage.test.tsx           |  18 +++
  web/src/pages/SettingsPage.tsx                |  40 +++++++
- web/src/shell/AppShell.test.tsx               | 103 +++++++++++++++++-
+ web/src/shell/AppShell.test.tsx               | 103 ++++++++++++++++-
  web/src/shell/AppShell.tsx                    |  29 ++++-
  web/src/shell/CommandPalette.test.tsx         |  71 ++++++++++++
- web/src/shell/CommandPalette.tsx              | 103 +++++++++++++-----
+ web/src/shell/CommandPalette.tsx              | 109 +++++++++++++-----
  web/src/shell/Sidebar.test.tsx                |  24 +++-
  web/src/shell/Sidebar.tsx                     |  20 ++++
- 19 files changed, 536 insertions(+), 38 deletions(-)
+ 19 files changed, 537 insertions(+), 38 deletions(-)
  create mode 100644 web/src/hooks/useNewChatProjectPrompt.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.test.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.ts
@@ -105,7 +105,7 @@ index 0b2bbf9cf8b2bfcea89c5057e0d25e495c01b858..6493b436e183ffe64a9f33086a81113e
  _server_state: dict[str, object] = ServerState()
  
 diff --git a/tests/e2e_ui/sessions/test_command_palette.py b/tests/e2e_ui/sessions/test_command_palette.py
-index bbafd870b9cea399c56173721b36b5fc800dcaa3..3aa4c7af9081a122054c7a98ce685b9e7583abfe 100644
+index bbafd870b9cea399c56173721b36b5fc800dcaa3..fdd4ad59b8de73d1c14312521da7a7ba586b5e56 100644
 --- a/tests/e2e_ui/sessions/test_command_palette.py
 +++ b/tests/e2e_ui/sessions/test_command_palette.py
 @@ -34,6 +34,7 @@ from __future__ import annotations
@@ -116,7 +116,7 @@ index bbafd870b9cea399c56173721b36b5fc800dcaa3..3aa4c7af9081a122054c7a98ce685b9e
  
  from playwright.sync_api import Page, expect
  
-@@ -89,6 +90,49 @@ def test_command_palette_opens_and_switches_session(
+@@ -89,6 +90,44 @@ def test_command_palette_opens_and_switches_session(
      expect(page.get_by_test_id("command-palette-input")).to_have_count(0)
  
  
@@ -133,12 +133,7 @@ index bbafd870b9cea399c56173721b36b5fc800dcaa3..3aa4c7af9081a122054c7a98ce685b9e
 +    """
 +    base_url, session_id = seeded_session
 +    project = f"e2e-pick-{uuid.uuid4().hex[:6]}"
-+    resp = httpx.patch(
-+        f"{base_url}/v1/sessions/{session_id}",
-+        json={"labels": {"omni_project": project}},
-+        timeout=10.0,
-+    )
-+    resp.raise_for_status()
++    patch_session(base_url, session_id, labels={"omni_project": project})
 +
 +    page.goto(f"{base_url}/c/{session_id}")
 +    new_session_link = page.get_by_role("link", name=re.compile(r"New session", re.IGNORECASE))
@@ -785,7 +780,7 @@ index 917d19ec7865a383df39f7bc9a23c20bbfe530f8..06bd6632d98e6aad9853233930576494
    it("uses the sessions-first placeholder", () => {
      renderPalette();
 diff --git a/web/src/shell/CommandPalette.tsx b/web/src/shell/CommandPalette.tsx
-index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579c1e17186 100644
+index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e84dbcb2ac 100644
 --- a/web/src/shell/CommandPalette.tsx
 +++ b/web/src/shell/CommandPalette.tsx
 @@ -2,6 +2,9 @@
@@ -860,12 +855,18 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
          shortcut: newSessionShortcutKeys(),
        },
        {
-@@ -234,37 +255,46 @@ export function CommandPalette({
+@@ -234,37 +255,52 @@ export function CommandPalette({
          shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
        },
      ],
 -    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
-+    [navigate, onNewSession, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
++    [
++      navigate,
++      onNewSession,
++      onToggleLeftSidebar,
++      onToggleRightSidebar,
++      rightSidebarShortcutEnabled,
++    ],
    );
  
    const filteredActions = useMemo(() => {
@@ -921,7 +922,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
    // Wait briefly for server info so a supporting server never gets the mixed
    // request; if it stalls, fall back to that request rather than never searching.
    const serverInfoLoading = serverInfo === "loading";
-@@ -314,6 +344,8 @@ export function CommandPalette({
+@@ -314,6 +350,8 @@ export function CommandPalette({
    ]);
  
    const sessions = useMemo(() => {
@@ -930,7 +931,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
      if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
      // Rows archived after they loaded are still cached here, so drop them.
      const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
-@@ -326,7 +358,7 @@ export function CommandPalette({
+@@ -326,7 +364,7 @@ export function CommandPalette({
      }
      // The full first page would push Actions below the fold.
      return out.slice(0, IDLE_SESSION_LIMIT);
@@ -939,7 +940,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
    // Excludes title matches again in case a rename moved a session between the
    // two groups' requests: cmdk needs each item value to be unique.
    const contentSessions = useMemo(
-@@ -341,9 +373,12 @@ export function CommandPalette({
+@@ -341,9 +379,12 @@ export function CommandPalette({
    );
    const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
    const searchGroups = [titleSearch, contentSearch];
@@ -955,7 +956,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
    const loadMoreError = searching
      ? searchGroups.some((group) => group.isFetchNextPageError)
      : isFetchNextPageError;
-@@ -379,10 +414,16 @@ export function CommandPalette({
+@@ -379,10 +420,16 @@ export function CommandPalette({
      if (!userMovedSelection.current) setSelectedValue(firstItemValue);
    }, [firstItemValue, open, debouncedQuery]);
  
@@ -976,7 +977,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
  
    const runAction = (action: ActionCommand): void => {
      close();
-@@ -392,7 +433,7 @@ export function CommandPalette({
+@@ -392,7 +439,7 @@ export function CommandPalette({
    const queryClient = useQueryClient();
    const newChatInProject = (name: string): void => {
      close();
@@ -985,7 +986,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
    };
  
    const goToSession = (id: string): void => {
-@@ -609,8 +650,14 @@ export function CommandPalette({
+@@ -609,8 +656,14 @@ export function CommandPalette({
                  })}
                </CommandGroup>
              )}
@@ -1002,7 +1003,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
                  {filteredProjects.map((project) => (
                    <CommandItem
                      key={project.name}
-@@ -618,7 +665,9 @@ export function CommandPalette({
+@@ -618,7 +671,9 @@ export function CommandPalette({
                      onSelect={() => newChatInProject(project.name)}
                    >
                      <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
@@ -1014,7 +1015,7 @@ index ec708627828be71077e19e2504f84a956724e898..7756ebff35d553ba2f6e5b78a4c92579
                  ))}
                </CommandGroup>
 diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
-index cc7b3580bb102c482ec5c5def410964310f551b2..9156ad2d0fec7e458a0367d7289e49802f94ad30 100644
+index e08ef86976f07933986ab9d33187eb46a19a3ba2..efae8a1d4b80b3c22ba7b0fedbe5a6534f2b30ca 100644
 --- a/web/src/shell/Sidebar.test.tsx
 +++ b/web/src/shell/Sidebar.test.tsx
 @@ -268,6 +268,7 @@ function renderSidebar(
@@ -1063,7 +1064,7 @@ index cc7b3580bb102c482ec5c5def410964310f551b2..9156ad2d0fec7e458a0367d7289e4980
      // A loopback-only server can't share sessions, so that one option is
      // meaningless there. The rest of the menu keeps working.
 diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
-index defac49bef7acd0c17b3df7483e3ef9ff45ebf94..bb8e6d5787bb8079720ccaebc297b6fa50984504 100644
+index c7d5bf9772cf6624eaec01e9c0579ff115ff7c7b..7f1c03dc194e4f3fb1cad4b7b6fb916f0958dedb 100644
 --- a/web/src/shell/Sidebar.tsx
 +++ b/web/src/shell/Sidebar.tsx
 @@ -555,6 +555,12 @@ interface SidebarProps {
@@ -1134,7 +1135,7 @@ index defac49bef7acd0c17b3df7483e3ef9ff45ebf94..bb8e6d5787bb8079720ccaebc297b6fa
    searchQuery,
    newSessionProjectName,
    activeTab,
-@@ -3117,6 +3136,7 @@ function ConversationList({
+@@ -3114,6 +3133,7 @@ function ConversationList({
                  event.stopPropagation();
                  onActiveTabChange("mine");
                  onRowClick(event);

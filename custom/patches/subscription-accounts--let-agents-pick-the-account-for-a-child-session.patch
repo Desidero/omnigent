@@ -43,23 +43,23 @@ Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 (cherry picked from commit f72a7ba03eae839f9dff878bfa34669902c32daf)
 ---
- docs/providers.md                             |  29 +++
+ docs/providers.md                             |  29 ++
  feature-map/native-harnesses.md               |   9 +
  omnigent/onboarding/subscription_accounts.py  |  35 +++
  omnigent/runner/app.py                        |   7 +-
- omnigent/runner/child_account.py              | 130 +++++++++++
- omnigent/runner/tool_dispatch.py              | 208 ++++++++++++++++--
+ omnigent/runner/child_account.py              | 130 +++++++++
+ omnigent/runner/tool_dispatch.py              | 253 ++++++++++++++++--
  .../server/routes/_sessions/orchestration.py  |   8 +-
  omnigent/server/schemas.py                    |   3 +-
- omnigent/tools/builtins/list_models.py        |  41 +++-
+ omnigent/tools/builtins/list_models.py        |  41 ++-
  omnigent/tools/builtins/spawn.py              |  20 ++
  .../onboarding/test_subscription_accounts.py  |  61 +++++
  .../test_native_subagent_inbox_delivery.py    |  22 ++
- tests/runner/test_runner_dispatch.py          | 207 ++++++++++++++++-
- .../integration/test_session_host_launch.py   |  42 ++++
+ tests/runner/test_runner_dispatch.py          | 207 +++++++++++++-
+ .../integration/test_session_host_launch.py   |  42 +++
  .../test_subagent_status_forward_recovery.py  |  33 +++
- tests/tools/builtins/test_list_models.py      |  42 ++++
- 16 files changed, 866 insertions(+), 31 deletions(-)
+ tests/tools/builtins/test_list_models.py      |  42 +++
+ 16 files changed, 911 insertions(+), 31 deletions(-)
  create mode 100644 omnigent/runner/child_account.py
 
 diff --git a/docs/providers.md b/docs/providers.md
@@ -327,7 +327,7 @@ index 0000000000000000000000000000000000000000..86467dd72475ebbf165fc3a13611aa6f
 +        f"Providers for {harness!r} on this host: {valid}.",
 +    )
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..f26432a7d148e992e42365778a283e7d1d9e8c15 100644
+index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..ff035953f1ea04a61ef20711efa0dfd08f2545ac 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
 @@ -2413,13 +2413,14 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
@@ -390,10 +390,55 @@ index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..f26432a7d148e992e42365778a283e7d
      body = _build_session_create_body(
          str(agent_id),
          conversation_id,
-@@ -3735,6 +3763,123 @@ async def _execute_session_create(
+@@ -3735,6 +3763,168 @@ async def _execute_session_create(
      )
  
  
++async def _post_child_first_message(
++    child_session_id: str,
++    message: str,
++    server_client: httpx.AsyncClient,
++) -> str | None:
++    """
++    Queue a provider-created child's first user message.
++
++    Posted as a separate event so the server forwards it to the child's
++    runner and starts its turn.
++
++    :param child_session_id: The new child session id, e.g. ``"conv_abc123"``.
++    :param message: The first user message text.
++    :param server_client: HTTP client pointed at the Omnigent server.
++    :returns: ``None`` on success; a JSON error string carrying the created
++        ``conversation_id`` (so the caller can retry with ``sys_session_send``)
++        on failure.
++    """
++    try:
++        msg_resp = await _post_child_message_event(
++            server_client,
++            child_session_id,
++            content=[{"type": "input_text", "text": message}],
++            created_by=None,
++        )
++    except httpx.HTTPError as exc:
++        return json.dumps(
++            {
++                "error": f"child session created but message failed: {exc}",
++                "conversation_id": child_session_id,
++            }
++        )
++    if msg_resp.status_code >= 400:
++        return json.dumps(
++            {
++                "error": (
++                    "child session created but message failed: "
++                    f"{msg_resp.status_code} {msg_resp.text[:200]}"
++                ),
++                "conversation_id": child_session_id,
++            }
++        )
++    return None
++
++
 +async def _session_create_on_provider(
 +    agent_id: str,
 +    provider: str,
@@ -514,7 +559,7 @@ index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..f26432a7d148e992e42365778a283e7d
  def _bundle_local_agent_source(source: Path) -> bytes:
      """
      Build gzipped agent-bundle bytes from a local source path.
-@@ -6031,32 +6176,51 @@ async def _agent_list_host_readiness(
+@@ -6031,32 +6221,51 @@ async def _agent_list_host_readiness(
      try:
          async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
              host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)

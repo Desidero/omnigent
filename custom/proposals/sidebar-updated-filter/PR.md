@@ -1,4 +1,4 @@
-<!-- Draft PR body for the sidebar-attention-filter series; title: feat(web): filter the sidebar to sessions that need you or changed recently -->
+<!-- Draft PR body for the sidebar-updated-filter series (was sidebar-attention-filter); title: feat(web): filter the sidebar to sessions updated recently. Written before the series dropped the Needs me filter: rewrite the body without it before filing. -->
 
 ## Related issue
 

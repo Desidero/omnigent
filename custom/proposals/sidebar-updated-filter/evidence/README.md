@@ -1,4 +1,4 @@
-# Evidence for sidebar-attention-filter
+# Evidence for sidebar-updated-filter
 
 Screenshots, recordings and logs to attach to the upstream PR (see the Demo
 section of `../PR.md`). Upload them as GitHub attachments on the PR rather

@@ -1,106 +1,97 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Desidero <desidero@gmail.com>
 Date: Mon, 19 Oct 2026 13:29:42 +0000
-Subject: [PATCH] feat(web): filter the sidebar to sessions that need you or
- changed recently
+Subject: [PATCH] feat(web): filter the sidebar to sessions updated recently
 
-The sidebar lists every session and every project folder, so the few
-sessions waiting on the viewer get lost. The status grouping can surface
-them, but it is release-flagged and drops the project folders.
+The sidebar lists every session and every project folder, so a long-lived
+sidebar buries what changed lately. The Updated grouping can surface it,
+but it is release-flagged and drops the project folders.
 
-Add two device-local filters to the sessions filter menu, alongside the
-My/Shared/All/Archived scope and independent of the grouping flag:
+Add a device-local "Updated" filter to the sessions filter menu,
+alongside the My/Shared/All/Archived scope and independent of the
+grouping flag: Any time / Last 24 hours / Last 3 days / Last 7 days /
+Last 30 days. These are rolling windows, not calendar days, so the
+shortest one doesn't empty out just after midnight. The choices live in
+one ordered table, so another window is a one-line addition.
 
-- "Needs me": sessions with a pending approval or unread agent output,
-  using the same read-state as the unread dot.
-- "Updated": Any time / Last 24 hours / Last 3 days / Last 7 days /
-  Last 30 days. These are rolling windows, not calendar days, so the
-  shortest one doesn't empty out just after midnight. The choices live
-  in one ordered table, so another window is a one-line addition.
-
-While either is on, project folders with nothing matching are hidden, the
+While it is on, project folders with nothing matching are hidden, the
 filter icon is highlighted, and the open session stays listed. Pins are
 unaffected, as with the scope filter.
 
-Each active filter also shows as a chip beside the filter button (24h,
-3d, 7d or 30d, and "Needs me"), so a short list reads as filtered at a
-glance. A chip is a button that clears just its own filter; activated
-from the keyboard, it hands focus back to the filter button.
+The active window also shows as a chip beside the filter button (24h,
+3d, 7d or 30d), so a short list reads as filtered at a glance. The chip
+is a button that clears the filter; activated from the keyboard, it
+hands focus back to the filter button.
 
 Carried on custom until it lands upstream; cut from upstream/main as
 feat/sidebar-attention-filters. Drop this copy once merged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
-(cherry picked from commit 523c39f40ba01567b9f5d481c1a445139b6c0d1e)
 ---
- feature-map/sessions.md                     |  24 ++
+ feature-map/sessions.md                     |  20 ++
  web/src/lib/sidebarFocusPreferences.test.ts |  56 +++++
- web/src/lib/sidebarFocusPreferences.ts      |  78 ++++++
- web/src/shell/Sidebar.test.tsx              |  93 +++++++
- web/src/shell/Sidebar.tsx                   | 257 ++++++++++++++++++--
- web/src/shell/sidebarNav.test.ts            |  52 ++++
- web/src/shell/sidebarNav.ts                 |  17 ++
- 7 files changed, 553 insertions(+), 24 deletions(-)
+ web/src/lib/sidebarFocusPreferences.ts      |  75 +++++++
+ web/src/shell/Sidebar.test.tsx              |  66 ++++++
+ web/src/shell/Sidebar.tsx                   | 233 ++++++++++++++++++--
+ web/src/shell/sidebarNav.test.ts            |  28 +++
+ web/src/shell/sidebarNav.ts                 |   7 +
+ 7 files changed, 462 insertions(+), 23 deletions(-)
  create mode 100644 web/src/lib/sidebarFocusPreferences.test.ts
  create mode 100644 web/src/lib/sidebarFocusPreferences.ts
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..85b866fa559b4bb3987db18766681f132d4ae4a4 100644
+index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..d5ba859c5e34fa080a8859cb122c8ae395265a78 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
-@@ -210,6 +210,13 @@ the header menu), and each place is a separate entry point.
+@@ -210,6 +210,12 @@ the header menu), and each place is a separate entry point.
    the `sidebar_grouping_ui` release flag, on by default; with
    `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the Sessions header keeps a flat
    Display filter and the tooltip keeps its plain layout.
-+- `attention-filters`: **Needs me** (a pending approval or an unread agent
-+  reply, the same read state as the unread dot) and **Updated** (Any time, Last
-+  24 hours, Last 3 days, Last 7 days or Last 30 days, as rolling windows)
-+  narrow the list. They are saved per device and work with any Display choice,
-+  with the grouping flag on or off. While one is on, project folders with no
++- `updated-filter`: **Updated** (Any time, Last 24 hours, Last 3 days, Last 7
++  days or Last 30 days, as rolling windows) narrows the list to recently
++  updated sessions. It is saved per device and works with any Display choice,
++  with the grouping flag on or off. While it is on, project folders with no
 +  match are hidden, the funnel is highlighted, pins and the open session stay
-+  listed, and a chip per filter beside the funnel clears just that filter.
++  listed, and a chip beside the funnel clears it.
  - `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
    drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
    a third of its width, or after a quick flick, closes it; a shorter drag springs
-@@ -400,6 +407,11 @@ merge controls return. Unlink the last PR and verify it stays absent after refre
+@@ -400,6 +406,11 @@ merge controls return. Unlink the last PR and verify it stays absent after refre
  A session not yet imported to the server says so. Older servers retain their
  host-dependent unlink behavior.
  
-+**Needs me and Updated filters:** open the same funnel, with or without
-+`sidebar_grouping_ui`, and tick **Needs me** or pick a window under
-+**Updated**. Each active filter shows as a chip beside the funnel (**Needs
-+me**, **24h**, **3d**, **7d** or **30d**); click a chip to clear that filter.
++**Updated filter:** open the same funnel, with or without
++`sidebar_grouping_ui`, and pick a window under **Updated**. The active window
++shows as a chip beside the funnel (**24h**, **3d**, **7d** or **30d**); click
++the chip to clear it.
 +
  **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
  a session card once. Expand navigation manually to keep it open while switching
  cards. Choosing Canvas in the sidebar returns to the selected board.
-@@ -1186,6 +1198,14 @@ plain `uv run pytest`, which starts a private server for the test.
+@@ -1186,6 +1197,12 @@ plain `uv run pytest`, which starts a private server for the test.
    under the folder while pages remain; after three automatic loads (the default
    budget), further pages need a click on it. Turn the switch back on for the
    saved count plus Show more.
-+- **`attention-filters`:** component coverage in `web/src/shell/Sidebar.test.tsx`,
++- **`updated-filter`:** component coverage in `web/src/shell/Sidebar.test.tsx`,
 +  `web/src/shell/sidebarNav.test.ts` and
-+  `web/src/lib/sidebarFocusPreferences.test.ts`; no browser test. By hand: with
-+  one session showing the unread dot or waiting on an approval and another
-+  read, tick **Needs me** and expect only the first (plus pins and the open
-+  session) and a **Needs me** chip. Pick **Updated → Last 24 hours** with an
-+  older session present and expect it hidden and a **24h** chip. Reload and
-+  expect both kept; click each chip and expect the full list back.
++  `web/src/lib/sidebarFocusPreferences.test.ts`; no browser test. By hand: pick
++  **Updated → Last 24 hours** with an older session present and expect it
++  hidden, folders with no recent session hidden, and a **24h** chip. Reload
++  and expect it kept; click the chip and expect the full list back.
  
  For the desktop Close shortcut, select a side-chat tab in an ordinary
  session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
-@@ -1298,3 +1318,7 @@ its discoverability.
+@@ -1298,3 +1315,6 @@ its discoverability.
  - Grouping and ordering apply to the loaded pages only: an older session joins
    its group once it is paged in. Grouped views hide Projects, so dragging a
    session onto the list never removes it from its project there.
-+- With **Needs me** or **Updated** on, the sidebar stops paging in older
-+  sessions, so both filters match loaded rows only; matches are recent or
-+  unread, so they are normally loaded. Changing either filter leaves selection
-+  mode.
++- With **Updated** on, the sidebar stops paging in older sessions, so the
++  filter matches loaded rows only; matches are recent, so they are normally
++  loaded. Changing the filter leaves selection mode.
 diff --git a/web/src/lib/sidebarFocusPreferences.test.ts b/web/src/lib/sidebarFocusPreferences.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..50f4415a20bcf99e0298b96404d53ba14e6c572e
+index 0000000000000000000000000000000000000000..2d42cb187e1a3cb217ce02248573dc478d4c5c46
 --- /dev/null
 +++ b/web/src/lib/sidebarFocusPreferences.test.ts
 @@ -0,0 +1,56 @@
@@ -124,22 +115,22 @@ index 0000000000000000000000000000000000000000..50f4415a20bcf99e0298b96404d53ba1
 +    expect(isSidebarFocusActive(DEFAULT_SIDEBAR_FOCUS)).toBe(false);
 +  });
 +
-+  it("round-trips both filters", () => {
-+    const focus = { needsMe: true, recency: "three-days" } as const;
++  it("round-trips the filter", () => {
++    const focus = { recency: "three-days" } as const;
 +    writeSidebarFocus(focus);
 +    expect(readSidebarFocus()).toEqual(focus);
 +    expect(isSidebarFocusActive(focus)).toBe(true);
 +  });
 +
 +  it.each(["day", "week", "month"])("still loads the stored %s id", (recency) => {
-+    localStorage.setItem("omnigent:sidebar-focus", JSON.stringify({ needsMe: false, recency }));
-+    expect(readSidebarFocus()).toEqual({ needsMe: false, recency });
++    localStorage.setItem("omnigent:sidebar-focus", JSON.stringify({ recency }));
++    expect(readSidebarFocus()).toEqual({ recency });
 +  });
 +
-+  it("falls back per field on unknown or corrupt values", () => {
++  it("falls back on unknown or corrupt values, ignoring a retired Needs me flag", () => {
 +    localStorage.setItem(
 +      "omnigent:sidebar-focus",
-+      JSON.stringify({ needsMe: "yes", recency: "year" }),
++      JSON.stringify({ needsMe: true, recency: "year" }),
 +    );
 +    expect(readSidebarFocus()).toEqual(DEFAULT_SIDEBAR_FOCUS);
 +    localStorage.setItem("omnigent:sidebar-focus", "{not json");
@@ -162,13 +153,13 @@ index 0000000000000000000000000000000000000000..50f4415a20bcf99e0298b96404d53ba1
 +});
 diff --git a/web/src/lib/sidebarFocusPreferences.ts b/web/src/lib/sidebarFocusPreferences.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..ce0e8889f6f479091a66179426f16168b8416346
+index 0000000000000000000000000000000000000000..56ab43737607307347eed6108f20d41dd5b987dc
 --- /dev/null
 +++ b/web/src/lib/sidebarFocusPreferences.ts
-@@ -0,0 +1,78 @@
-+// Device-local "Needs me" and recency filters that narrow the sidebar to the
-+// sessions worth looking at. Independent of the My/Shared/All/Archived scope
-+// and of the flagged grouping options, so they compose with either.
+@@ -0,0 +1,75 @@
++// Device-local "Updated" filter that narrows the sidebar to recently updated
++// sessions. Independent of the My/Shared/All/Archived scope and of the flagged
++// grouping options, so it composes with either.
 +
 +const STORAGE_KEY = "omnigent:sidebar-focus";
 +
@@ -193,12 +184,10 @@ index 0000000000000000000000000000000000000000..ce0e8889f6f479091a66179426f16168
 +export type SidebarRecency = SidebarRecencyOption["id"];
 +
 +export interface SidebarFocus {
-+  /** Only sessions with a pending approval or an unread agent reply. */
-+  needsMe: boolean;
 +  recency: SidebarRecency;
 +}
 +
-+export const DEFAULT_SIDEBAR_FOCUS: SidebarFocus = { needsMe: false, recency: "any" };
++export const DEFAULT_SIDEBAR_FOCUS: SidebarFocus = { recency: "any" };
 +
 +function findRecencyOption(id: unknown): SidebarRecencyOption | undefined {
 +  return SIDEBAR_RECENCY_OPTIONS.find((option) => option.id === id);
@@ -209,15 +198,15 @@ index 0000000000000000000000000000000000000000..ce0e8889f6f479091a66179426f16168
 +  return findRecencyOption(id) ?? SIDEBAR_RECENCY_OPTIONS[0];
 +}
 +
-+/** Whether either filter narrows the list. */
++/** Whether the filter narrows the list. */
 +export function isSidebarFocusActive(focus: SidebarFocus): boolean {
-+  return focus.needsMe || focus.recency !== "any";
++  return focus.recency !== "any";
 +}
 +
 +/**
-+ * Read the persisted filters. Each field falls back to its default on its own,
-+ * so a stale or hand-edited entry can't strand the viewer on a filter the menu
-+ * no longer offers. Never throws.
++ * Read the persisted filter. A stale or hand-edited entry falls back to the
++ * default, so it can't strand the viewer on a filter the menu no longer
++ * offers. Never throws.
 + */
 +export function readSidebarFocus(): SidebarFocus {
 +  if (typeof window === "undefined") return DEFAULT_SIDEBAR_FOCUS;
@@ -230,12 +219,11 @@ index 0000000000000000000000000000000000000000..ce0e8889f6f479091a66179426f16168
 +    return DEFAULT_SIDEBAR_FOCUS;
 +  }
 +  return {
-+    needsMe: stored.needsMe === true,
 +    recency: findRecencyOption(stored.recency)?.id ?? DEFAULT_SIDEBAR_FOCUS.recency,
 +  };
 +}
 +
-+/** Persist the filters. Swallows quota/access errors. */
++/** Persist the filter. Swallows quota/access errors. */
 +export function writeSidebarFocus(value: SidebarFocus): void {
 +  if (typeof window === "undefined") return;
 +  try {
@@ -245,7 +233,7 @@ index 0000000000000000000000000000000000000000..ce0e8889f6f479091a66179426f16168
 +  }
 +}
 diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
-index 5b56ab77c72286f6729dadc51e48306926952367..cc7b3580bb102c482ec5c5def410964310f551b2 100644
+index 5b56ab77c72286f6729dadc51e48306926952367..e08ef86976f07933986ab9d33187eb46a19a3ba2 100644
 --- a/web/src/shell/Sidebar.test.tsx
 +++ b/web/src/shell/Sidebar.test.tsx
 @@ -23,6 +23,7 @@ import {
@@ -256,50 +244,42 @@ index 5b56ab77c72286f6729dadc51e48306926952367..cc7b3580bb102c482ec5c5def4109643
  import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
  import { useEffect } from "react";
  import { GridSessionsProvider } from "@/grid/GridSessionsContext";
-@@ -2557,6 +2558,98 @@ describe("Sidebar project sections", () => {
+@@ -2557,6 +2558,71 @@ describe("Sidebar project sections", () => {
      expect(within(recentSection).queryByText("conv_filed")).toBeNull();
    });
  
-+  it("Needs me keeps approvals and unread replies and hides folders with neither", () => {
++  it("Updated keeps recent sessions and hides folders with none", () => {
 +    projectsMock.push("Customer X", "Quiet", "Empty");
-+    seedReadState([
-+      { id: "conv_unread", viewer_last_seen: 199 },
-+      { id: "conv_unread_filed", viewer_last_seen: 199 },
-+      { id: "conv_read", viewer_last_seen: 200 },
-+      { id: "conv_read_filed", viewer_last_seen: 200 },
-+      { id: "conv_waiting", viewer_last_seen: 200 },
-+    ]);
-+    const row = (id: string, partial: Partial<Conversation> = {}) =>
-+      conv(id, "Codex", { status: "idle", updated_at: 200, ...partial });
++    const nowSeconds = Date.now() / 1000;
++    const row = (id: string, ageSeconds: number, partial: Partial<Conversation> = {}) =>
++      conv(id, "Codex", { status: "idle", updated_at: nowSeconds - ageSeconds, ...partial });
 +    mockConversations([
-+      row("conv_unread"),
-+      row("conv_read"),
-+      row("conv_waiting", { pending_elicitations_count: 1 }),
-+      row("conv_unread_filed", { labels: { omni_project: "Customer X" } }),
-+      row("conv_read_filed", { labels: { omni_project: "Quiet" } }),
++      row("conv_recent", 60 * 60),
++      row("conv_stale", 5 * 86400),
++      row("conv_recent_filed", 60 * 60, { labels: { omni_project: "Customer X" } }),
++      row("conv_stale_filed", 5 * 86400, { labels: { omni_project: "Quiet" } }),
 +    ]);
 +    renderSidebar();
 +    expect(screen.getByRole("button", { name: /^Empty/ })).toBeInTheDocument();
 +
 +    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
-+    fireEvent.click(screen.getByTestId("session-focus-needs-me"));
++    fireEvent.keyDown(screen.getByTestId("session-focus-recency-menu"), { key: "ArrowRight" });
++    fireEvent.click(screen.getByTestId("session-focus-recency-day"));
 +    closeProjectsMenu();
 +
 +    const sessions = screen.getByText("Sessions").closest("section")!;
-+    expect(within(sessions).getByText("conv_unread")).toBeInTheDocument();
-+    expect(within(sessions).getByText("conv_waiting")).toBeInTheDocument();
-+    expect(within(sessions).queryByText("conv_read")).toBeNull();
++    expect(within(sessions).getByText("conv_recent")).toBeInTheDocument();
++    expect(within(sessions).queryByText("conv_stale")).toBeNull();
 +    expect(screen.getByRole("button", { name: /^Customer X/ })).toBeInTheDocument();
 +    expect(screen.queryByRole("button", { name: /^Quiet/ })).toBeNull();
 +    expect(screen.queryByRole("button", { name: /^Empty/ })).toBeNull();
 +    expect(screen.getByTestId("session-filter")).toHaveAttribute("data-focus-active", "true");
 +    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
-+      needsMe: true,
-+      recency: "any",
++      recency: "day",
 +    });
 +  });
 +
-+  it("shows a removable chip per active filter beside the filter button", async () => {
++  it("shows a removable chip for the Updated filter beside the filter button", async () => {
 +    const nowSeconds = Date.now() / 1000;
 +    mockConversations([
 +      conv("conv_recent", "Codex", { status: "idle", updated_at: nowSeconds - 60 * 60 }),
@@ -308,7 +288,6 @@ index 5b56ab77c72286f6729dadc51e48306926952367..cc7b3580bb102c482ec5c5def4109643
 +    renderSidebar();
 +    const sessions = screen.getByText("Sessions").closest("section")!;
 +    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
-+    expect(screen.queryByTestId("session-focus-chip-needs-me")).toBeNull();
 +
 +    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
 +    fireEvent.keyDown(screen.getByTestId("session-focus-recency-menu"), { key: "ArrowRight" });
@@ -317,37 +296,19 @@ index 5b56ab77c72286f6729dadc51e48306926952367..cc7b3580bb102c482ec5c5def4109643
 +    const recencyChip = screen.getByRole("button", { name: "Clear Updated filter: last 3 days" });
 +    expect(recencyChip).toHaveTextContent("3d");
 +    expect(within(sessions).queryByText("conv_stale")).toBeNull();
-+    expect(screen.queryByTestId("session-focus-chip-needs-me")).toBeNull();
 +
-+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
-+    fireEvent.click(screen.getByTestId("session-focus-needs-me"));
-+    closeProjectsMenu();
-+    expect(screen.getByRole("button", { name: "Clear Needs me filter" })).toHaveTextContent(
-+      "Needs me",
-+    );
-+
-+    // Each chip clears only its own filter, and the change persists.
-+    fireEvent.click(screen.getByRole("button", { name: "Clear Updated filter: last 3 days" }));
-+    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
-+    expect(screen.getByTestId("session-focus-chip-needs-me")).toBeInTheDocument();
-+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
-+      needsMe: true,
-+      recency: "any",
-+    });
-+
-+    // Shift+Tab from the filter button reaches the remaining chip; Enter clears
-+    // it and leaves focus on the filter button.
++    // Shift+Tab from the filter button reaches the chip; Enter clears the
++    // filter, persists that, and leaves focus on the filter button.
 +    const user = userEvent.setup();
 +    screen.getByTestId("session-filter").focus();
 +    await user.tab({ shift: true });
-+    expect(screen.getByTestId("session-focus-chip-needs-me")).toHaveFocus();
++    expect(recencyChip).toHaveFocus();
 +    await user.keyboard("{Enter}");
 +    expect(screen.getByTestId("session-filter")).toHaveFocus();
-+    expect(screen.queryByTestId("session-focus-chip-needs-me")).toBeNull();
++    expect(screen.queryByTestId("session-focus-chip-recency")).toBeNull();
 +    expect(screen.getByTestId("session-filter")).not.toHaveAttribute("data-focus-active");
 +    expect(within(sessions).getByText("conv_stale")).toBeInTheDocument();
 +    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
-+      needsMe: false,
 +      recency: "any",
 +    });
 +  });
@@ -356,7 +317,7 @@ index 5b56ab77c72286f6729dadc51e48306926952367..cc7b3580bb102c482ec5c5def4109643
      projectsMock.push("Customer X");
      // The global list holds only an unfiled chat — the project's sessions are
 diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
-index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9ff45ebf94 100644
+index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff115ff7c7b 100644
 --- a/web/src/shell/Sidebar.tsx
 +++ b/web/src/shell/Sidebar.tsx
 @@ -126,6 +126,7 @@ import {
@@ -460,44 +421,32 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
    const grouped = view.grouping !== "default";
    const harnessLabels = useHarnessLabels(view.grouping === "harness");
    const harnessLabel = useCallback(
-@@ -2113,7 +2147,7 @@ function ConversationList({
-   // Status buckets read the unread mirror and the drafts store; only a status
-   // view subscribes, so other views don't re-render the list on those writes.
-   const statusView = view.grouping === "status";
--  const unseenTick = useUnseenTick(statusView);
-+  const unseenTick = useUnseenTick(statusView || focus.needsMe);
-   const draftIds = useSessionDraftIds(statusView);
-   const startingId = useStartingConversationId(statusView);
-   const { conversationId: activeId } = useParams<{ conversationId: string }>();
-@@ -2267,6 +2301,18 @@ function ConversationList({
+@@ -2267,6 +2301,15 @@ function ConversationList({
    // sessions render in their own group at the bottom (below "Shared with
    // me"); a pinned-then-archived session shows under Archived, not Pinned.
    const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
-+  // Rows passing the "Needs me" / recency filters; null when neither is on. The
-+  // open session always passes, so reading it doesn't pull it out of the list.
++  // Rows passing the "Updated" filter; null when it is off. The open session
++  // always passes, so it doesn't drop out of the list while it is open.
 +  const focusMatches = useMemo(() => {
 +    if (!focusActive) return null;
 +    const now = new Date();
-+    return (c: Conversation) =>
-+      c.id === displayedActiveId ||
-+      matchesSidebarFocus(c, focus, isConversationUnseen(c.id, c.updated_at, c.status), now);
-+    // `unseenTick` versions the read-state store the predicate reads; a list
-+    // update renews `now`, so rows age out of a recency window.
++    return (c: Conversation) => c.id === displayedActiveId || matchesSidebarFocus(c, focus, now);
++    // A list update renews `now`, so rows age out of the window.
 +    // eslint-disable-next-line react-hooks/exhaustive-deps
-+  }, [focusActive, focus, displayedActiveId, unseenTick, allConversations]);
++  }, [focusActive, focus, displayedActiveId, allConversations]);
    const loadedSections = useMemo(() => {
      // Merge the server pinned set in, so a pinned session outside the loaded
      // paginated window still renders. Dedupe by id: a pinned session is usually
-@@ -2286,6 +2332,8 @@ function ConversationList({
+@@ -2286,6 +2329,8 @@ function ConversationList({
            : activeTab === "mine"
              ? listed.filter((c) => isOwnedByViewer(c, viewerId))
              : listed;
-+    // Pins stay put under every filter, so "Needs me" / recency apply after them.
++    // Pins stay put under every filter, so the "Updated" filter applies after them.
 +    const focused = focusMatches ? tabScoped.filter(focusMatches) : tabScoped;
  
      // Pinned takes precedence over Project: pinning a session moves it OUT of
      // its project into the flat global Pinned section (no nested pins). Ordered
-@@ -2325,20 +2373,33 @@ function ConversationList({
+@@ -2325,20 +2370,33 @@ function ConversationList({
          name,
          icon,
          conversations: orderSessionFamilies(
@@ -517,13 +466,13 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
 -    // conversations — either genuinely empty or because its chats live on an
 -    // unloaded page. We render it as a folder with a "No sessions" placeholder
 -    // rather than hiding it (matches the target sidebar layout).
-+    // NOTE: without a "Needs me" / recency filter, empty projects are NOT
++    // NOTE: without the "Updated" filter, empty projects are NOT
 +    // filtered out. A project comes from the server project list (useProjects),
 +    // so it can have zero *loaded* conversations — either genuinely empty or
 +    // because its chats live on an unloaded page. We render it as a folder with
 +    // a "No sessions" placeholder rather than hiding it. With a filter on, a
 +    // folder with no matching loaded rows is hidden (unless the composer targets
-+    // it): matches are recent or unread, so they sit in the loaded window.
++    // it): matches are recent, so they sit in the loaded window.
 +    const visibleProjectGroups = focusMatches
 +      ? projectGroups.filter(
 +          (group) => group.conversations.length > 0 || group.name === newSessionProjectName,
@@ -538,7 +487,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
        activeOverride,
        frozenKeys,
        sortBy,
-@@ -2368,7 +2429,7 @@ function ConversationList({
+@@ -2368,7 +2426,7 @@ function ConversationList({
          pinned,
          shared,
          sessions: orderSessionFamilies(ordered),
@@ -547,7 +496,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
          groupTitles: null,
        };
      // Buckets use render-time "now", so a day rollover shows on the next list update.
-@@ -2415,7 +2476,7 @@ function ConversationList({
+@@ -2415,7 +2473,7 @@ function ConversationList({
      const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
        (g) => orderSessionFamilies(g.conversations),
      );
@@ -556,7 +505,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
      // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
      // eslint-disable-next-line react-hooks/exhaustive-deps
    }, [
-@@ -2423,6 +2484,8 @@ function ConversationList({
+@@ -2423,6 +2481,8 @@ function ConversationList({
      activeRootSessionId,
      pinnedConversations,
      pinnedSet,
@@ -565,7 +514,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
      activeOverride,
      frozenKeys,
      frozenStatus,
-@@ -2980,7 +3043,11 @@ function ConversationList({
+@@ -2980,7 +3040,11 @@ function ConversationList({
      ...(sections.shared.length > 0 || sharedListOnly ? ["Shared"] : []),
      ...(sharedListOnly ? [] : (sessionGroups?.map((g) => g.title) ?? ["Chats"])),
    ];
@@ -578,7 +527,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
  
    // List header controls and row props, shared by the Shared, single "Sessions"
    // and grouped sections; the controls sit on the first of the viewer's lists.
-@@ -3064,13 +3131,24 @@ function ConversationList({
+@@ -3064,13 +3128,24 @@ function ConversationList({
      </div>
    ) : undefined;
    const sessionsFilterMenu = (
@@ -610,7 +559,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
    );
  
    // Archived sessions are surfaced on the Settings page, not here, so they
-@@ -3309,7 +3387,9 @@ function ConversationList({
+@@ -3309,7 +3384,9 @@ function ConversationList({
                                  !projectOrder.data ||
                                  saveOrder.isPending ||
                                  selectionMode ||
@@ -621,7 +570,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
                                first: index === 0,
                                last: index === projects.length - 1,
                                move: (destination) => moveProject(group.name, destination),
-@@ -3347,12 +3427,15 @@ function ConversationList({
+@@ -3347,12 +3424,15 @@ function ConversationList({
                              onProjectAssigned={expandProject}
                              onConversationsLoaded={handleFolderConversationsLoaded}
                              reorderable={reorderable}
@@ -638,7 +587,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
                          )}
                      </SectionGroup>
                    )}
-@@ -3422,7 +3505,13 @@ function ConversationList({
+@@ -3422,7 +3502,13 @@ function ConversationList({
                          <ConversationSection
                            title="Sessions"
                            conversations={sections.sessions}
@@ -653,11 +602,11 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
                            footer={sessionStatus}
                            collapsed={effectiveCollapsedSections.includes("Chats")}
                            onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-@@ -3810,6 +3899,111 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
+@@ -3810,6 +3896,92 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
    repo: "Repo",
    branch: "Branch",
  };
-+// "Needs me" and recency filters, offered in both forms of the filter menu.
++// The "Updated" filter, offered in both forms of the filter menu.
 +function SessionFocusMenuItems({
 +  focus,
 +  onFocusChange,
@@ -668,15 +617,6 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
 +  return (
 +    <>
 +      <DropdownMenuSeparator />
-+      <DropdownMenuCheckboxItem
-+        checked={focus.needsMe}
-+        data-testid="session-focus-needs-me"
-+        className="text-ui"
-+        onSelect={(event) => event.preventDefault()}
-+        onCheckedChange={(checked) => onFocusChange({ needsMe: checked })}
-+      >
-+        Needs me
-+      </DropdownMenuCheckboxItem>
 +      <FilterMenuSub
 +        label="Updated"
 +        value={sidebarRecencyOption(focus.recency).label}
@@ -701,8 +641,8 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
 +  );
 +}
 +
-+// One removable chip per active "Needs me" / recency filter, beside the filter
-+// button, so a short list reads as filtered at a glance.
++// A removable chip for an active "Updated" filter, beside the filter button, so
++// a short list reads as filtered at a glance.
 +function SessionFocusChips({
 +  focus,
 +  onFocusChange,
@@ -722,16 +662,6 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
 +            text: recency.shortLabel,
 +            label: `Clear Updated filter: ${recency.label.toLowerCase()}`,
 +            clear: { recency: "any" } as const,
-+          },
-+        ]
-+      : []),
-+    ...(focus.needsMe
-+      ? [
-+          {
-+            key: "needs-me",
-+            text: "Needs me",
-+            label: "Clear Needs me filter",
-+            clear: { needsMe: false },
 +          },
 +        ]
 +      : []),
@@ -765,7 +695,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
  
  // A filter-menu submenu whose trigger shows the current pick at its right edge.
  function FilterMenuSub({
-@@ -3844,6 +4038,9 @@ function SessionFilterMenu({
+@@ -3844,6 +4016,9 @@ function SessionFilterMenu({
    multiUser,
    view,
    onViewChange,
@@ -775,7 +705,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
  }: {
    value: SidebarTab;
    onChange: (value: SidebarTab) => void;
-@@ -3851,10 +4048,14 @@ function SessionFilterMenu({
+@@ -3851,10 +4026,14 @@ function SessionFilterMenu({
    /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
    view: SidebarViewPreferences | null;
    onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
@@ -790,7 +720,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
    const filters = multiUser
      ? SIDEBAR_FILTERS
      : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
-@@ -3880,12 +4081,18 @@ function SessionFilterMenu({
+@@ -3880,12 +4059,18 @@ function SessionFilterMenu({
            <span className="inline-flex shrink-0" {...tooltip.triggerProps}>
              <DropdownMenuTrigger asChild>
                <Button
@@ -810,7 +740,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
                  onClick={(event) => event.stopPropagation()}
                >
                  <ListFilterIcon className="size-3.5" />
-@@ -3902,6 +4109,7 @@ function SessionFilterMenu({
+@@ -3902,6 +4087,7 @@ function SessionFilterMenu({
          <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
            <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
            {displayOptions}
@@ -818,7 +748,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
          </DropdownMenuContent>
        ) : (
          <DropdownMenuContent align="end" className="min-w-56">
-@@ -3933,6 +4141,7 @@ function SessionFilterMenu({
+@@ -3933,6 +4119,7 @@ function SessionFilterMenu({
            >
              {displayOptions}
            </FilterMenuSub>
@@ -827,7 +757,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..defac49bef7acd0c17b3df7483e3ef9f
              label="Ordering"
              value={ORDERING_LABELS[view.ordering]}
 diff --git a/web/src/shell/sidebarNav.test.ts b/web/src/shell/sidebarNav.test.ts
-index 13fb54e34dfdb08f0f530f8b440bed03e5c85922..7ad7957ca9964d10e50fb29083160118948d6410 100644
+index 13fb54e34dfdb08f0f530f8b440bed03e5c85922..032b5cc50b19a66e5347af5b65a787f18b3ebb99 100644
 --- a/web/src/shell/sidebarNav.test.ts
 +++ b/web/src/shell/sidebarNav.test.ts
 @@ -13,6 +13,7 @@ import {
@@ -838,33 +768,17 @@ index 13fb54e34dfdb08f0f530f8b440bed03e5c85922..7ad7957ca9964d10e50fb29083160118
    migratePinnedConversationIds,
    moveCustomOrder,
    orderByPinnedTimestamp,
-@@ -752,6 +753,57 @@ describe("dateBucket", () => {
+@@ -752,6 +753,33 @@ describe("dateBucket", () => {
    });
  });
  
 +describe("matchesSidebarFocus", () => {
 +  const now = new Date(2026, 8, 30, 10, 0);
 +  const updated = (date: Date) => conversation("a", "A", date, { updatedAt: date });
-+  const today = updated(new Date(2026, 8, 30, 9, 0));
 +
 +  it("keeps everything with no filter", () => {
 +    const old = updated(new Date(2025, 0, 1));
-+    expect(matchesSidebarFocus(old, { needsMe: false, recency: "any" }, false, now)).toBe(true);
-+  });
-+
-+  it("needs me: keeps pending approvals and unseen output, not seen failures", () => {
-+    const needsMe = { needsMe: true, recency: "any" } as const;
-+    expect(matchesSidebarFocus({ ...today, status: "idle" }, needsMe, false, now)).toBe(false);
-+    expect(matchesSidebarFocus({ ...today, status: "idle" }, needsMe, true, now)).toBe(true);
-+    expect(matchesSidebarFocus({ ...today, status: "failed" }, needsMe, false, now)).toBe(false);
-+    expect(
-+      matchesSidebarFocus(
-+        { ...today, status: "running", pending_elicitations_count: 1 },
-+        needsMe,
-+        false,
-+        now,
-+      ),
-+    ).toBe(true);
++    expect(matchesSidebarFocus(old, { recency: "any" }, now)).toBe(true);
 +  });
 +
 +  it.each([
@@ -873,23 +787,15 @@ index 13fb54e34dfdb08f0f530f8b440bed03e5c85922..7ad7957ca9964d10e50fb29083160118
 +    ["week", new Date(2026, 8, 23, 10, 0), new Date(2026, 8, 23, 9, 59)],
 +    ["month", new Date(2026, 7, 31, 10, 0), new Date(2026, 7, 31, 9, 59)],
 +  ] as const)("recency %s keeps sessions inside its rolling window", (recency, inside, outside) => {
-+    const focus = { needsMe: false, recency };
-+    expect(matchesSidebarFocus(updated(inside), focus, false, now)).toBe(true);
-+    expect(matchesSidebarFocus(updated(outside), focus, false, now)).toBe(false);
++    const focus = { recency };
++    expect(matchesSidebarFocus(updated(inside), focus, now)).toBe(true);
++    expect(matchesSidebarFocus(updated(outside), focus, now)).toBe(false);
 +  });
 +
 +  it("keeps the day before's sessions just after midnight", () => {
 +    const justAfterMidnight = new Date(2026, 8, 30, 0, 15);
 +    const lateEvening = updated(new Date(2026, 8, 29, 22, 0));
-+    const focus = { needsMe: false, recency: "day" } as const;
-+    expect(matchesSidebarFocus(lateEvening, focus, false, justAfterMidnight)).toBe(true);
-+  });
-+
-+  it("applies both filters together", () => {
-+    const focus = { needsMe: true, recency: "day" } as const;
-+    const stale = updated(new Date(2026, 8, 1));
-+    expect(matchesSidebarFocus(stale, focus, true, now)).toBe(false);
-+    expect(matchesSidebarFocus(today, focus, true, now)).toBe(true);
++    expect(matchesSidebarFocus(lateEvening, { recency: "day" }, justAfterMidnight)).toBe(true);
 +  });
 +});
 +
@@ -897,7 +803,7 @@ index 13fb54e34dfdb08f0f530f8b440bed03e5c85922..7ad7957ca9964d10e50fb29083160118
    it("returns non-empty groups in bucket order, keeping row order", () => {
      const rows = ["a", "b", "c", "d"].map((id) => conversation(id, id, new Date(2026, 0, 1)));
 diff --git a/web/src/shell/sidebarNav.ts b/web/src/shell/sidebarNav.ts
-index acea445d4bcee780ad8892155309889e97410453..7bec669e93a92a04b2112e832c4d35442edc0c24 100644
+index acea445d4bcee780ad8892155309889e97410453..697688525ea5334fe31b7f0f50ee64b8f17d83ce 100644
 --- a/web/src/shell/sidebarNav.ts
 +++ b/web/src/shell/sidebarNav.ts
 @@ -2,6 +2,7 @@ import { arrayMove } from "@dnd-kit/sortable";
@@ -908,22 +814,12 @@ index acea445d4bcee780ad8892155309889e97410453..7bec669e93a92a04b2112e832c4d3544
  import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
  import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
  import { orderSessionFamilies, isIndividuallyPinnedSibling } from "@/lib/sessionFamilies";
-@@ -368,6 +369,22 @@ export function dateBucket(timestamp: number, now: Date): DateBucket {
+@@ -368,6 +369,12 @@ export function dateBucket(timestamp: number, now: Date): DateBucket {
    return "earlier";
  }
  
-+/**
-+ * Whether a session passes the sidebar's "Needs me" and recency filters.
-+ * "Needs me" is a pending approval or unseen agent output (`unseen` comes from
-+ * the read-state store); a failure the viewer has already seen doesn't count.
-+ */
-+export function matchesSidebarFocus(
-+  c: Conversation,
-+  focus: SidebarFocus,
-+  unseen: boolean,
-+  now: Date,
-+): boolean {
-+  if (focus.needsMe && (c.pending_elicitations_count ?? 0) === 0 && !unseen) return false;
++/** Whether a session passes the sidebar's "Updated" (recency) filter. */
++export function matchesSidebarFocus(c: Conversation, focus: SidebarFocus, now: Date): boolean {
 +  const { windowMs } = sidebarRecencyOption(focus.recency);
 +  return windowMs === null || c.updated_at * 1000 >= now.getTime() - windowMs;
 +}
