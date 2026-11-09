@@ -1,0 +1,805 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 30 Oct 2026 00:00:59 +0000
+Subject: [PATCH] feat(web): combine queued messages into one
+
+When several messages wait behind a running turn, steering sends each one
+as its own message, so the agent gets several partial steers instead of one
+combined instruction.
+
+When two or more adjacent queued messages can merge, the queue strip's
+header now offers Combine: their texts are joined by a blank line and their
+attachments concatenated, in queue order, in the first message's place.
+Where rows can be steered, Send all combines and then steers the queue. Side
+chats get the same actions.
+
+Messages that have to be sent as they are stay separate and in place: `!`
+shell commands; `/`-led commands, skills and paths, which the harness reads
+as the first text; Codex `$` skills; failed sends the server may already
+hold; and item-comment messages, whose drafts are tracked by the exact text
+they were sent with. Nothing moves across such a message, so the runs on
+either side combine separately; a change of agent also starts a new run.
+The merge is a pure function over the queued messages, so it can move to
+the server with the queue.
+
+Not upstream yet: proposed from feat/queue-combine; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/QUEUE_STEER_DESIGN.md                    |  19 +++
+ feature-map/composer.md                       |  21 +++
+ web/src/components/chat/SideChatPane.tsx      |   8 ++
+ web/src/lib/messageQueue.test.ts              | 124 +++++++++++++++++-
+ web/src/lib/messageQueue.ts                   | 121 +++++++++++++++++
+ web/src/pages/ChatPage.tsx                    |  11 ++
+ web/src/pages/QueuedMessagesStrip.stories.tsx |  14 ++
+ web/src/pages/QueuedMessagesStrip.test.tsx    |  82 ++++++++++++
+ web/src/pages/QueuedMessagesStrip.tsx         |  70 +++++++++-
+ web/src/store/chatStore.test.ts               |  30 +++++
+ web/src/store/chatStore.ts                    |  28 ++++
+ 11 files changed, 524 insertions(+), 4 deletions(-)
+
+diff --git a/docs/QUEUE_STEER_DESIGN.md b/docs/QUEUE_STEER_DESIGN.md
+index 802bc1c52000c93c96e36b5af5a1d99d43883c6e..df723c2857df6393a45d2cd194e4749f36aecc04 100644
+--- a/docs/QUEUE_STEER_DESIGN.md
++++ b/docs/QUEUE_STEER_DESIGN.md
+@@ -53,6 +53,25 @@ message is only sent to the server when it's flushed or steered.
+ | **Steer** | POST it now (jump the queue) — deliver mid-turn where the harness supports it |
+ | **Reorder** | client-side drag (grip handle) to reorder the queue within a conversation |
+ 
++### Queue-wide actions
++
++When at least two adjacent queued messages can be combined, the strip's header
++shows **Combine** and, where rows can be steered, **Send all**:
++
++| Action | Behavior |
++|--------|----------|
++| **Combine** | merge each run of adjacent combinable messages into one, in queue order: texts joined by a blank line, attachments concatenated. The merged message takes its run's first place and gets a new idempotency id. |
++| **Send all** | Combine, then steer the whole queue in order (the same send as the composer's steer-all shortcut) |
++
++Some messages are never combined and stay where they are: `!` shell commands,
++`/`-led messages (commands, skills, and paths the harness reads first), `$`
++skills on Codex, failed sends awaiting retry (the server may already hold
++them), and item-comment messages (their drafts are tracked by the exact text
++sent). Nothing moves across such a message, so Combine merges the runs on
++either side of it separately; a change of agent also starts a new run. The
++merge is a pure function over the queued messages (`combinedQueue` in
++`web/src/lib/messageQueue.ts`).
++
+ ### Promote-to-bubble rule
+ 
+ Promote a message from the strip into a normal chat bubble **as soon as it is
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index a34e301ded64503dc0f042b9326a4ab81d48d3e9..1578272175515b671f472a9adf93f77899b057fd 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -173,6 +173,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+   same way, with their own queue strip.
+   A message sent mid-turn to a native session says the agent will read it
+   after its current step until it does.
++- `queue-combine`: with two or more adjacent combinable messages queued, the
++  queue strip's header offers **Combine** (merge them into one message, texts
++  joined by a blank line, attachments kept) and, where rows can be steered,
++  **Send all** (combine, then steer the queue). `!` commands, `/`-led messages,
++  Codex `$` skills, failed sends and item-comment messages stay separate and in
++  place. Side-chat strips have the same actions.
+ - `host-offline-hold`: a message sent to a native session whose host is offline
+   waits in the queue as "Waiting for host", ahead of other queued messages, and
+   sends once the host reconnects; no failed turn is recorded.
+@@ -259,6 +265,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+ - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
+   message box; press Enter to keep the text or Escape to discard it.
+ - Send while the agent is working to queue a message, then steer it.
++- While the agent is working, queue two or three plain messages (one with an
++  attachment) and a `!git status`; the strip's header shows "N queued" with
++  **Combine** and **Send all**. Combine merges the plain messages into the
++  first one's row, leaving `!git status` on its own; Send all sends the
++  combined message and the rest into the running turn.
+ - With the in-session message box empty, press Up to recall a previous prompt
+   (or the last queued message). While writing a draft, Up stops at the top.
+ - With a native session's host offline, send a message; it waits in the queue
+@@ -694,6 +705,16 @@ Other connection providers alone do not enable the managed MCP picker.
+   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
+   The native mid-turn notice has component coverage in
+   `web/src/pages/ChatPage.userBubble.test.tsx`.
++- **`queue-combine`:** component coverage in
++  `web/src/pages/QueuedMessagesStrip.test.tsx`, the merge rules in
++  `web/src/lib/messageQueue.test.ts` and the store action in
++  `web/src/store/chatStore.test.ts`; no browser-level coverage. Manually, on a
++  desktop and a phone-sized viewport: hold a turn open, queue `one`, `two`
++  with an attachment, `!pwd` and `three`, `four`; Combine should leave three
++  rows (`one` + `two` with the attachment, `!pwd`, `three` + `four`), and Edit
++  on the first should restore both texts and the file. Repeat and use Send
++  all: the messages reach the turn in that order. With the host offline, Send
++  all is disabled and Combine still works.
+ - **`host-offline-hold`:** no browser-level coverage.
+   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
+   (plain `uv run pytest`) checks that a held send is refused with nothing
+diff --git a/web/src/components/chat/SideChatPane.tsx b/web/src/components/chat/SideChatPane.tsx
+index 24afae30db2a153d5364bfabce786f7e75b4590b..f4d6629e624fa8eec72933c385f4eb01682af34e 100644
+--- a/web/src/components/chat/SideChatPane.tsx
++++ b/web/src/components/chat/SideChatPane.tsx
+@@ -486,6 +486,7 @@ function SideChatComposer({
+   const steerMessage = useChatStore((s) => s.steerMessage);
+   const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
+   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
++  const combineQueuedMessages = useChatStore((s) => s.combineQueuedMessages);
+   const allQueuedMessages = useChatStore((s) => s.queuedMessages);
+   const queuedMessages = useMemo(
+     () => allQueuedMessages.filter((message) => message.conversationId === childId),
+@@ -929,6 +930,13 @@ function SideChatComposer({
+                   }
+             }
+             onReorder={reorderQueuedMessage}
++            skillPrefix={skillPrefix}
++            onCombine={() => combineQueuedMessages(childId, { skillPrefix })}
++            onSendAll={() => {
++              if (settingsSavePending()) return;
++              combineQueuedMessages(childId, { skillPrefix });
++              steerAllQueuedMessages(childId);
++            }}
+             widthClassName="mx-3 w-auto"
+           />
+         </TooltipProvider>
+diff --git a/web/src/lib/messageQueue.test.ts b/web/src/lib/messageQueue.test.ts
+index 7d362199893042704a199fd7b883a36c519f9b22..d40ed09306dde146e4e66a4b969a0fe1037d4f90 100644
+--- a/web/src/lib/messageQueue.test.ts
++++ b/web/src/lib/messageQueue.test.ts
+@@ -1,6 +1,13 @@
+ import { describe, expect, it } from "vitest";
++import { buildItemCommentMessage } from "@/lib/itemComments";
++import { readComposerDraft, serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+ import type { QueuedMessage } from "@/store/chatStore";
+-import { shouldQueueSend } from "./messageQueue";
++import {
++  canCombineQueue,
++  combinedQueue,
++  keepsQueuedMessageSeparate,
++  shouldQueueSend,
++} from "./messageQueue";
+ 
+ describe("shouldQueueSend", () => {
+   const q = (conversationId: string): QueuedMessage => ({
+@@ -69,3 +76,118 @@ describe("shouldQueueSend", () => {
+     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")], false, true)).toBe(false);
+   });
+ });
++
++describe("combinedQueue", () => {
++  const queued = (queueId: string, text: string, extra: Partial<QueuedMessage> = {}) =>
++    ({ queueId, text, conversationId: "conv_a", stableId: `id_${queueId}`, ...extra }) as const;
++  const file = (name: string) => new File(["x"], name, { type: "text/plain" });
++
++  it("merges in queue order with a blank line, in the first message's place", () => {
++    const [merged, ...rest] = combinedQueue([
++      queued("q_1", "Use the account's zone."),
++      queued("q_2", "Also store it per row."),
++      queued("q_3", "Then rerun the export."),
++    ]);
++    expect(rest).toEqual([]);
++    expect(merged).toMatchObject({
++      queueId: "q_1",
++      conversationId: "conv_a",
++      text: "Use the account's zone.\n\nAlso store it per row.\n\nThen rerun the export.",
++    });
++    // A new submission: the store gives it a fresh idempotency id.
++    expect(merged!.stableId).toBeUndefined();
++  });
++
++  it("concatenates attachments and skips empty texts in the join", () => {
++    const [a, b, c] = [file("a.txt"), file("b.png"), file("c.csv")];
++    const [merged] = combinedQueue([
++      queued("q_1", "Compare these", { files: [a!] }),
++      queued("q_2", "  ", { files: [b!, c!] }),
++      queued("q_3", "and summarize"),
++    ]);
++    expect(merged!.text).toBe("Compare these\n\nand summarize");
++    expect(merged!.files).toEqual([a, b, c]);
++  });
++
++  it("keeps ! and / messages separate and in place, merging only runs between them", () => {
++    const result = combinedQueue([
++      queued("q_1", "first"),
++      queued("q_2", "second"),
++      queued("q_3", "!git status"),
++      queued("q_4", "third"),
++      queued("q_5", "  /compact", { command: "compact" }),
++      queued("q_6", "fourth"),
++      queued("q_7", "fifth"),
++      queued("q_8", "/review the diff"),
++    ]);
++    expect(result.map((m) => [m.queueId, m.text])).toEqual([
++      ["q_1", "first\n\nsecond"],
++      ["q_3", "!git status"],
++      ["q_4", "third"],
++      ["q_5", "  /compact"],
++      ["q_6", "fourth\n\nfifth"],
++      ["q_8", "/review the diff"],
++    ]);
++  });
++
++  it("keeps Codex $skill messages, failed sends and item-comment messages separate", () => {
++    const comments = buildItemCommentMessage([
++      { label: "Q2", title: "Cutoff", comments: [{ text: "Use UTC.", attachments: [] }] },
++    ]);
++    const skillPrefix = "$";
++    expect(keepsQueuedMessageSeparate(queued("q_1", "$review now"), { skillPrefix })).toBe(true);
++    expect(keepsQueuedMessageSeparate(queued("q_1", "$5 is fine"))).toBe(false);
++    expect(keepsQueuedMessageSeparate(queued("q_1", "x", { requiresRetry: true }))).toBe(true);
++    expect(keepsQueuedMessageSeparate(queued("q_1", comments))).toBe(true);
++    expect(keepsQueuedMessageSeparate(queued("q_1", "plain text"))).toBe(false);
++  });
++
++  it("does not merge across a change of agent", () => {
++    const result = combinedQueue([
++      queued("q_1", "a", { agentId: "agent_1" }),
++      queued("q_2", "b", { agentId: "agent_1" }),
++      queued("q_3", "c", { agentId: "agent_2" }),
++    ]);
++    expect(result.map((m) => [m.queueId, m.agentId, m.text])).toEqual([
++      ["q_1", "agent_1", "a\n\nb"],
++      ["q_3", "agent_2", "c"],
++    ]);
++  });
++
++  it("holds the merged message for the host when any part waits for it", () => {
++    const [merged] = combinedQueue([
++      queued("q_1", "a"),
++      queued("q_2", "b", { waitingForHost: true }),
++    ]);
++    expect(merged!.waitingForHost).toBe(true);
++  });
++
++  it("keeps reply quotes editable when the combined text still matches them", () => {
++    const reply: StoredReplyDraft = {
++      version: 1,
++      quotes: [{ before: "", text: "the cutoff is local" }],
++      text: "Why local?",
++    };
++    const [merged] = combinedQueue([
++      queued("q_1", "One more thing."),
++      queued("q_2", serializeReplyDraft(reply), { replyDraft: reply }),
++    ]);
++    expect(merged!.text).toBe("One more thing.\n\n> the cutoff is local\n\nWhy local?");
++    expect(readComposerDraft(merged)?.replyDraft).toEqual({
++      version: 1,
++      quotes: [{ before: "One more thing.", text: "the cutoff is local" }],
++      text: "Why local?",
++    });
++  });
++
++  it("changes nothing with fewer than two adjacent combinable messages", () => {
++    const lone = [queued("q_1", "only")];
++    expect(combinedQueue(lone)).toEqual(lone);
++    expect(canCombineQueue(lone)).toBe(false);
++    const split = [queued("q_1", "a"), queued("q_2", "/clear"), queued("q_3", "b")];
++    expect(combinedQueue(split)).toEqual(split);
++    expect(canCombineQueue(split)).toBe(false);
++    expect(canCombineQueue([])).toBe(false);
++    expect(canCombineQueue([queued("q_1", "a"), queued("q_2", "b")])).toBe(true);
++  });
++});
+diff --git a/web/src/lib/messageQueue.ts b/web/src/lib/messageQueue.ts
+index 02f5032bcd5da757ede10f6779ad0bf660e2e93a..f54057a0cc35bebbb8240b3f19cdda7a0c9f2d9e 100644
+--- a/web/src/lib/messageQueue.ts
++++ b/web/src/lib/messageQueue.ts
+@@ -1,3 +1,5 @@
++import { parseItemCommentMessage } from "@/lib/itemComments";
++import { readComposerDraft, serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+ import type { SessionStatus } from "@/lib/types";
+ import type { QueuedMessage } from "@/store/chatStore";
+ 
+@@ -21,3 +23,122 @@ export function shouldQueueSend(
+   const isBusy = status === "streaming" || sessionStatus === "running";
+   return isBusy || hasQueued;
+ }
++
++/** What decides whether queued messages may be combined. */
++export interface CombineQueueOptions {
++  /** The harness's skill prefix (`skillInvocationPrefix`); `$` on Codex. */
++  skillPrefix?: "/" | "$";
++}
++
++/**
++ * Whether a queued message has to be sent on its own: a `!` shell command, a
++ * `/`-led command, skill or path (the harness reads the first text), a failed
++ * send that may already be on the server, or an item-comment message, whose
++ * comment tracking matches the exact text it was sent with.
++ */
++export function keepsQueuedMessageSeparate(
++  message: QueuedMessage,
++  { skillPrefix = "/" }: CombineQueueOptions = {},
++): boolean {
++  const lead = message.text.trimStart();
++  return (
++    lead.startsWith("!") ||
++    lead.startsWith("/") ||
++    lead.startsWith(skillPrefix) ||
++    message.command !== undefined ||
++    message.requiresRetry === true ||
++    parseItemCommentMessage(message.text) !== null
++  );
++}
++
++function joinWithBlankLine(before: string, after: string): string {
++  return before !== "" && after !== "" ? `${before}\n\n${after}` : before || after;
++}
++
++/** The reply quotes of `messages` as one draft, when it still reproduces `text`. */
++function combinedReplyDraft(
++  messages: readonly QueuedMessage[],
++  text: string,
++): StoredReplyDraft | undefined {
++  const quotes: StoredReplyDraft["quotes"] = [];
++  let tail = "";
++  for (const message of messages) {
++    const draft = readComposerDraft(message)?.replyDraft;
++    if (draft === undefined) {
++      tail = joinWithBlankLine(tail, message.text);
++      continue;
++    }
++    draft.quotes.forEach((quote, index) => {
++      quotes.push(
++        index === 0 ? { ...quote, before: joinWithBlankLine(tail, quote.before) } : quote,
++      );
++    });
++    tail = draft.text;
++  }
++  if (quotes.length === 0) return undefined;
++  const combined: StoredReplyDraft = { version: 1, quotes, text: tail };
++  return serializeReplyDraft(combined) === text ? combined : undefined;
++}
++
++function mergeQueuedRun(run: readonly QueuedMessage[]): QueuedMessage {
++  const [first] = run;
++  if (run.length === 1) return first!;
++  const withText = run.filter((message) => message.text.trim() !== "");
++  const text = withText.map((message) => message.text).join("\n\n");
++  const files = run.flatMap((message) => message.files ?? []);
++  const replyDraft = combinedReplyDraft(withText, text);
++  // No stableId: the combined text is a new submission and needs a new one.
++  return {
++    queueId: first!.queueId,
++    text,
++    conversationId: first!.conversationId,
++    ...(first!.agentId !== undefined ? { agentId: first!.agentId } : {}),
++    ...(files.length > 0 ? { files } : {}),
++    ...(replyDraft ? { replyDraft } : {}),
++    ...(run.some((message) => message.waitingForHost) ? { waitingForHost: true } : {}),
++  };
++}
++
++/**
++ * One conversation's queue with each run of adjacent combinable messages
++ * merged into one: texts joined by a blank line, attachments concatenated, in
++ * queue order. The merged message takes its run's first `queueId` and place.
++ * Messages that stay separate keep their place and end a run, so nothing moves
++ * across a command; a change of agent ends a run too.
++ */
++export function combinedQueue(
++  messages: readonly QueuedMessage[],
++  options: CombineQueueOptions = {},
++): QueuedMessage[] {
++  const combined: QueuedMessage[] = [];
++  let run: QueuedMessage[] = [];
++  const endRun = () => {
++    if (run.length > 0) combined.push(mergeQueuedRun(run));
++    run = [];
++  };
++  for (const message of messages) {
++    if (keepsQueuedMessageSeparate(message, options)) {
++      endRun();
++      combined.push(message);
++      continue;
++    }
++    const runStart = run[0];
++    if (
++      runStart !== undefined &&
++      (runStart.agentId !== message.agentId || runStart.conversationId !== message.conversationId)
++    ) {
++      endRun();
++    }
++    run.push(message);
++  }
++  endRun();
++  return combined;
++}
++
++/** Whether combining would merge anything, i.e. two adjacent messages can combine. */
++export function canCombineQueue(
++  messages: readonly QueuedMessage[],
++  options: CombineQueueOptions = {},
++): boolean {
++  return combinedQueue(messages, options).length < messages.length;
++}
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index a01aa0cac41d05de1eb1316a1164c3b92996f799..c63bd25968c0dbca46eed3dadab13dfbec281f37 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -2561,6 +2561,7 @@ function ComposerImpl(
+   const steerMessage = useChatStore((s) => s.steerMessage);
+   const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
+   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
++  const combineQueuedMessages = useChatStore((s) => s.combineQueuedMessages);
+   // Drain the queue whenever idle with a waiting head — level-triggered so a
+   // message queued right after the turn ended (or after an SSE reconnect that
+   // carries no fresh idle transition) still sends instead of stranding. Hold
+@@ -4084,6 +4085,16 @@ function ComposerImpl(
+           }}
+           onSteer={(queueId) => steerMessage(queueId)}
+           onReorder={reorderQueuedMessage}
++          skillPrefix={skillPrefix}
++          onCombine={() => {
++            if (conversationId !== null) combineQueuedMessages(conversationId, { skillPrefix });
++          }}
++          onSendAll={() => {
++            if (conversationId === null) return;
++            combineQueuedMessages(conversationId, { skillPrefix });
++            // While unreachable the queue waits for the host, so nothing is steered.
++            if (!unreachable) steerAllQueuedMessages(conversationId);
++          }}
+           widthClassName="mx-3 w-auto"
+         />
+         {/* Sub-agent context tray — peeks above the workspace bar; reserves
+diff --git a/web/src/pages/QueuedMessagesStrip.stories.tsx b/web/src/pages/QueuedMessagesStrip.stories.tsx
+index 228e0ba553bbb96b812f6d249596fcd62bf3bfc5..8f7f4bf06d43bef8afbcd9894142e5a24d1449b2 100644
+--- a/web/src/pages/QueuedMessagesStrip.stories.tsx
++++ b/web/src/pages/QueuedMessagesStrip.stories.tsx
+@@ -47,6 +47,20 @@ export const ReorderableWithSteer: Story = {
+   },
+ };
+ 
++export const CombineAndSendAll: Story = {
++  args: {
++    messages: [
++      message("queue-1", "Use the account's time zone for the cutoff."),
++      message("queue-2", "Also store the zone on each report row."),
++      message("queue-3", "!git status"),
++    ],
++    onSteer: () => undefined,
++    onReorder: () => undefined,
++    onCombine: () => undefined,
++    onSendAll: () => undefined,
++  },
++};
++
+ export const LongBacklog: Story = {
+   args: {
+     messages: Array.from({ length: 12 }, (_, index) =>
+diff --git a/web/src/pages/QueuedMessagesStrip.test.tsx b/web/src/pages/QueuedMessagesStrip.test.tsx
+index e297f3c24336a1e51ef723513c91a901d7d33675..8e5cb67cea5a757c4b17bd33d0edf8b743820b69 100644
+--- a/web/src/pages/QueuedMessagesStrip.test.tsx
++++ b/web/src/pages/QueuedMessagesStrip.test.tsx
+@@ -2,6 +2,7 @@
+ // listing messages queued while the agent is busy. It's a pure prop-driven
+ // component (no store access), so we exercise it with plain props.
+ 
++import type { ComponentProps } from "react";
+ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ 
+@@ -363,6 +364,87 @@ describe("QueuedMessagesStrip", () => {
+     }
+   });
+ 
++  // Ahead of the drag tests, whose dnd-kit sensors can swallow a later click.
++  describe("queue actions", () => {
++    const renderStrip = (
++      messages: QueuedMessage[],
++      props: Partial<ComponentProps<typeof QueuedMessagesStrip>> = {},
++    ) =>
++      render(
++        <TooltipProvider>
++          <QueuedMessagesStrip
++            messages={messages}
++            onDelete={vi.fn()}
++            onEdit={vi.fn()}
++            onCombine={vi.fn()}
++            {...props}
++          />
++        </TooltipProvider>,
++      );
++
++    it("offers Combine and Send all once two messages can merge, and runs them", () => {
++      const onCombine = vi.fn();
++      const onSendAll = vi.fn();
++      renderStrip([msg("q_1", "first"), msg("q_2", "second")], {
++        onCombine,
++        onSendAll,
++        onSteer: vi.fn(),
++      });
++      expect(screen.getByRole("group", { name: "Queue actions" })).toHaveTextContent("2 queued");
++      const combine = screen.getByRole("button", { name: "Combine queued messages" });
++      fireEvent.click(combine);
++      expect(onCombine).toHaveBeenCalledTimes(1);
++      // Focus stays in the strip rather than falling to the page.
++      expect(screen.getByRole("list", { name: "Queued messages" })).toHaveFocus();
++      fireEvent.click(screen.getByRole("button", { name: "Send all queued messages now" }));
++      expect(onSendAll).toHaveBeenCalledTimes(1);
++    });
++
++    it("hides both actions with fewer than two adjacent combinable messages", () => {
++      renderStrip([msg("q_1", "only")], { onSendAll: vi.fn(), onSteer: vi.fn() });
++      expect(screen.queryByRole("group", { name: "Queue actions" })).toBeNull();
++      cleanup();
++      renderStrip([msg("q_1", "a"), msg("q_2", "!git status"), msg("q_3", "/compact")], {
++        onSendAll: vi.fn(),
++        onSteer: vi.fn(),
++      });
++      expect(screen.queryByRole("button", { name: "Combine queued messages" })).toBeNull();
++      cleanup();
++      // Codex reads `$name` as a skill.
++      renderStrip([msg("q_1", "a"), msg("q_2", "$review")], { skillPrefix: "$" });
++      expect(screen.queryByRole("button", { name: "Combine queued messages" })).toBeNull();
++    });
++
++    it("shows Send all only where rows can be steered, disabled while waiting for the host", () => {
++      renderStrip([msg("q_1", "a"), msg("q_2", "b")], { onSendAll: vi.fn() });
++      expect(screen.getByRole("button", { name: "Combine queued messages" })).toBeEnabled();
++      expect(screen.queryByRole("button", { name: "Send all queued messages now" })).toBeNull();
++      cleanup();
++      renderStrip([msg("q_1", "a"), { ...msg("q_2", "b"), waitingForHost: true }], {
++        onSendAll: vi.fn(),
++        onSteer: vi.fn(),
++      });
++      expect(screen.getByRole("button", { name: "Combine queued messages" })).toBeEnabled();
++      expect(screen.getByRole("button", { name: "Send all queued messages now" })).toBeDisabled();
++    });
++
++    it("keeps the actions keyboard-operable with a 44px touch hit area", () => {
++      const onCombine = vi.fn();
++      renderStrip([msg("q_1", "a"), msg("q_2", "b")], {
++        onCombine,
++        onSendAll: vi.fn(),
++        onSteer: vi.fn(),
++      });
++      for (const name of ["Combine queued messages", "Send all queued messages now"]) {
++        const button = screen.getByRole("button", { name });
++        expect(button.tagName, name).toBe("BUTTON");
++        expect(button, name).toHaveAttribute("type", "button");
++        // 32px tall on phones plus 6px of hit area above and below.
++        expect(button, name).toHaveClass("max-md:h-8", "max-md:after:-inset-y-1.5");
++      }
++    });
++  });
++
+   it("shows a drag handle per row only when onReorder is provided", () => {
+     const { rerender } = render(
+       <QueuedMessagesStrip messages={[msg("q_1", "first")]} onDelete={vi.fn()} onEdit={vi.fn()} />,
+diff --git a/web/src/pages/QueuedMessagesStrip.tsx b/web/src/pages/QueuedMessagesStrip.tsx
+index 0f280764d0a94daa87756adc67adcf1f32993ae8..f723d0d7f6f6988a7da9f17695b28ec0ad08808f 100644
+--- a/web/src/pages/QueuedMessagesStrip.tsx
++++ b/web/src/pages/QueuedMessagesStrip.tsx
+@@ -18,12 +18,13 @@ import {
+   ClockIcon,
+   GripVerticalIcon,
+   ImageIcon,
++  MergeIcon,
+   PaperclipIcon,
+   PencilIcon,
+   XIcon,
+ } from "lucide-react";
+ 
+-import { useMemo } from "react";
++import { useMemo, useRef } from "react";
+ 
+ import { itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
+ import { Badge } from "@/components/ui/badge";
+@@ -31,6 +32,7 @@ import { Button } from "@/components/ui/button";
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+ import type { QueuedMessage } from "@/store/chatStore";
+ import { attachmentFilename } from "@/lib/attachments";
++import { canCombineQueue } from "@/lib/messageQueue";
+ import { summarizeItemCommentMessage } from "@/lib/itemComments";
+ import { cn } from "@/lib/utils";
+ 
+@@ -40,6 +42,10 @@ const ACTION_BUTTON_CLASS =
+ 
+ const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+ 
++/** Queue-wide actions: compact text buttons whose hit area reaches 44px on touch. */
++const QUEUE_ACTION_BUTTON_CLASS =
++  "relative h-6 px-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:h-8 max-md:after:absolute max-md:after:inset-x-0 max-md:after:-inset-y-1.5";
++
+ /**
+  * Keep the dragged row vertical and inside the scrolling list, which would
+  * otherwise clip it. A fixed-position overlay is avoided on purpose: Mobile
+@@ -81,6 +87,15 @@ interface QueuedMessagesStripProps {
+    * Drives drag-to-reorder; omit to render a non-reorderable strip.
+    */
+   onReorder?: (queueId: string, beforeQueueId: string | null) => void;
++  /**
++   * Merge the queue's combinable messages into one. Shown only while at least
++   * two adjacent messages can combine (see `canCombineQueue`).
++   */
++  onCombine?: () => void;
++  /** Combine, then send the queue now. Shown with Combine when `onSteer` is set. */
++  onSendAll?: () => void;
++  /** The harness's skill prefix, so `$skill` messages on Codex stay separate. */
++  skillPrefix?: "/" | "$";
+   /**
+    * Layout class aligning the strip with the composer surface it docks
+    * onto (its tuck only hides behind a surface at least as wide, so match
+@@ -286,7 +301,8 @@ function QueuedRow({
+  *
+  * Each row can be steered (sent now), edited (pulled back into the composer),
+  * deleted, or — when `onReorder` is provided — dragged by its grip to reorder
+- * the queue (drains FIFO, so order is the send order).
++ * the queue (drains FIFO, so order is the send order). A header offers
++ * Combine (and Send all, when steering is available) while messages can merge.
+  */
+ export function QueuedMessagesStrip({
+   messages,
+@@ -294,8 +310,12 @@ export function QueuedMessagesStrip({
+   onEdit,
+   onSteer,
+   onReorder,
++  onCombine,
++  onSendAll,
++  skillPrefix,
+   widthClassName,
+ }: QueuedMessagesStripProps) {
++  const listRef = useRef<HTMLDivElement>(null);
+   // Pointer sensors use activation constraints so pressing the grip does not
+   // accidentally start a drag. KeyboardSensor keeps reordering operable
+   // without a mouse or touch input.
+@@ -321,6 +341,8 @@ export function QueuedMessagesStrip({
+   };
+ 
+   const steerBlocked = messages.some((m) => m.waitingForHost);
++  const showCombine = onCombine !== undefined && canCombineQueue(messages, { skillPrefix });
++  const showSendAll = showCombine && onSteer !== undefined && onSendAll !== undefined;
+   const rows = messages.map((message) => (
+     <QueuedRow
+       key={message.queueId}
+@@ -344,12 +366,54 @@ export function QueuedMessagesStrip({
+         widthClassName,
+       )}
+     >
++      {showCombine && (
++        <div
++          role="group"
++          aria-label="Queue actions"
++          className="flex items-center justify-between gap-2 pb-1 max-md:pb-1.5"
++        >
++          <span className="text-xs text-muted-foreground">{messages.length} queued</span>
++          <span className="flex items-center gap-1">
++            <Button
++              type="button"
++              variant="ghost"
++              size="xs"
++              aria-label="Combine queued messages"
++              className={QUEUE_ACTION_BUTTON_CLASS}
++              onClick={() => {
++                onCombine();
++                // The button may go away; keep focus in the strip.
++                listRef.current?.focus({ preventScroll: true });
++              }}
++            >
++              <MergeIcon className="size-3.5" aria-hidden="true" />
++              Combine
++            </Button>
++            {showSendAll && (
++              <Button
++                type="button"
++                variant="ghost"
++                size="xs"
++                aria-label="Send all queued messages now"
++                className={QUEUE_ACTION_BUTTON_CLASS}
++                disabled={steerBlocked}
++                onClick={onSendAll}
++              >
++                <ArrowUpIcon className="size-3.5" aria-hidden="true" />
++                Send all
++              </Button>
++            )}
++          </span>
++        </div>
++      )}
+       {/* Cap the list height and scroll when the queue is long, so a big
+           backlog never pushes the composer off-screen. ~5 rows tall. */}
+       <div
++        ref={listRef}
+         role="list"
+         aria-label="Queued messages"
+-        className="flex max-h-32 flex-col gap-1 overflow-y-auto overscroll-contain"
++        tabIndex={-1}
++        className="flex max-h-32 outline-none flex-col gap-1 overflow-y-auto overscroll-contain"
+       >
+         {onReorder === undefined ? (
+           rows
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 79d5268ded30829a9e89fcbbb707c1fcb3f94de5..818c1af70ddafb8cc220f1782850c83685e41a08 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -19089,6 +19089,36 @@ describe("chatStore — client-side message queue", () => {
+     ]);
+   });
+ 
++  it("combineQueuedMessages merges one conversation's queue in place with a fresh id", () => {
++    useChatStore.setState({
++      conversationId: "conv_abc",
++      queuedMessages: [
++        { queueId: "q_1", text: "first", conversationId: "conv_abc", stableId: "s1" },
++        { queueId: "q_x", text: "elsewhere", conversationId: "conv_other", stableId: "sx" },
++        { queueId: "q_2", text: "second", conversationId: "conv_abc", stableId: "s2" },
++        { queueId: "q_3", text: "!ls", conversationId: "conv_abc", stableId: "s3" },
++        { queueId: "q_y", text: "also elsewhere", conversationId: "conv_other" },
++      ],
++    });
++
++    useChatStore.getState().combineQueuedMessages("conv_abc");
++    const queue = useChatStore.getState().queuedMessages;
++    expect(queue.map((m) => [m.queueId, m.text])).toEqual([
++      ["q_1", "first\n\nsecond"],
++      ["q_x", "elsewhere"],
++      ["q_3", "!ls"],
++      ["q_y", "also elsewhere"],
++    ]);
++    expect(queue[0]!.stableId).toMatch(/^[0-9a-f]{32}$/);
++    expect(queue[2]!.stableId).toBe("s3");
++    // Another conversation's entry is left as it was, even without a stableId.
++    expect(queue[3]!.stableId).toBeUndefined();
++
++    // Nothing left to combine: no state churn.
++    useChatStore.getState().combineQueuedMessages("conv_abc");
++    expect(useChatStore.getState().queuedMessages).toBe(queue);
++  });
++
+   it("reorderQueuedMessage no-ops for a missing id or a self move", () => {
+     const initial = [
+       { queueId: "q_1", text: "first", conversationId: "conv_abc" },
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 71c4320e92c4177d76edfc001252a1150eb630a8..141ebede4bdea9ba4212bd98a95459b5a87aee96 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -100,6 +100,7 @@ import type {
+   StreamEvent,
+ } from "@/lib/events";
+ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
++import { combinedQueue, type CombineQueueOptions } from "@/lib/messageQueue";
+ import { randomUUID } from "@/lib/randomUUID";
+ import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
+ import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
+@@ -1270,6 +1271,12 @@ export interface ChatActions {
+    * absolute positions. No-op if the id isn't queued or the move is a no-op.
+    */
+   reorderQueuedMessage: (queueId: string, beforeQueueId: string | null) => void;
++  /**
++   * Merge each run of a conversation's adjacent combinable queued messages
++   * into one (the strip's Combine; see `combinedQueue`). The merged message
++   * gets a fresh `stableId`; other conversations' entries keep their places.
++   */
++  combineQueuedMessages: (conversationId: string, options?: CombineQueueOptions) => void;
+   /**
+    * Send a queued message NOW instead of waiting for the idle flush (the
+    * strip's per-row steer). Removes it from the queue and POSTs it: on an
+@@ -2341,6 +2348,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+     });
+   },
+ 
++  combineQueuedMessages: (conversationId, options) => {
++    setActive((s) => {
++      const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
++      const combined = combinedQueue(own, options);
++      if (combined.length === own.length) return {};
++      const kept = new Map(
++        combined.map((m) => [
++          m.queueId,
++          m.stableId ? m : { ...m, stableId: randomUUID().replace(/-/g, "") },
++        ]),
++      );
++      return {
++        queuedMessages: s.queuedMessages.flatMap((m) => {
++          if (m.conversationId !== conversationId) return [m];
++          const next = kept.get(m.queueId);
++          return next === undefined ? [] : [next];
++        }),
++      };
++    });
++  },
++
+   steerMessage: (queueId) => {
+     const s = get();
+     const target = s.queuedMessages.find((m) => m.queueId === queueId);
