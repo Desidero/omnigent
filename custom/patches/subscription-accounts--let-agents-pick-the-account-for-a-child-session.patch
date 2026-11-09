@@ -43,23 +43,23 @@ Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 (cherry picked from commit f72a7ba03eae839f9dff878bfa34669902c32daf)
 ---
- docs/providers.md                             |  29 ++
+ docs/providers.md                             |  29 +++
  feature-map/native-harnesses.md               |   9 +
  omnigent/onboarding/subscription_accounts.py  |  35 +++
  omnigent/runner/app.py                        |   7 +-
- omnigent/runner/child_account.py              | 130 +++++++++
- omnigent/runner/tool_dispatch.py              | 253 ++++++++++++++++--
+ omnigent/runner/child_account.py              | 130 ++++++++++
+ omnigent/runner/tool_dispatch.py              | 206 ++++++++++++++--
  .../server/routes/_sessions/orchestration.py  |   8 +-
  omnigent/server/schemas.py                    |   3 +-
- omnigent/tools/builtins/list_models.py        |  41 ++-
+ omnigent/tools/builtins/list_models.py        |  41 +++-
  omnigent/tools/builtins/spawn.py              |  20 ++
  .../onboarding/test_subscription_accounts.py  |  61 +++++
  .../test_native_subagent_inbox_delivery.py    |  22 ++
- tests/runner/test_runner_dispatch.py          | 207 +++++++++++++-
- .../integration/test_session_host_launch.py   |  42 +++
+ tests/runner/test_runner_dispatch.py          | 224 +++++++++++++++++-
+ .../integration/test_session_host_launch.py   |  42 ++++
  .../test_subagent_status_forward_recovery.py  |  33 +++
- tests/tools/builtins/test_list_models.py      |  42 +++
- 16 files changed, 911 insertions(+), 31 deletions(-)
+ tests/tools/builtins/test_list_models.py      |  42 ++++
+ 16 files changed, 881 insertions(+), 31 deletions(-)
  create mode 100644 omnigent/runner/child_account.py
 
 diff --git a/docs/providers.md b/docs/providers.md
@@ -327,7 +327,7 @@ index 0000000000000000000000000000000000000000..86467dd72475ebbf165fc3a13611aa6f
 +        f"Providers for {harness!r} on this host: {valid}.",
 +    )
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..ff035953f1ea04a61ef20711efa0dfd08f2545ac 100644
+index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..4bb57141a666ff6da9d1864c768b6ec562703653 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
 @@ -2413,13 +2413,14 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
@@ -390,55 +390,10 @@ index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..ff035953f1ea04a61ef20711efa0dfd0
      body = _build_session_create_body(
          str(agent_id),
          conversation_id,
-@@ -3735,6 +3763,168 @@ async def _execute_session_create(
+@@ -3735,6 +3763,121 @@ async def _execute_session_create(
      )
  
  
-+async def _post_child_first_message(
-+    child_session_id: str,
-+    message: str,
-+    server_client: httpx.AsyncClient,
-+) -> str | None:
-+    """
-+    Queue a provider-created child's first user message.
-+
-+    Posted as a separate event so the server forwards it to the child's
-+    runner and starts its turn.
-+
-+    :param child_session_id: The new child session id, e.g. ``"conv_abc123"``.
-+    :param message: The first user message text.
-+    :param server_client: HTTP client pointed at the Omnigent server.
-+    :returns: ``None`` on success; a JSON error string carrying the created
-+        ``conversation_id`` (so the caller can retry with ``sys_session_send``)
-+        on failure.
-+    """
-+    try:
-+        msg_resp = await _post_child_message_event(
-+            server_client,
-+            child_session_id,
-+            content=[{"type": "input_text", "text": message}],
-+            created_by=None,
-+        )
-+    except httpx.HTTPError as exc:
-+        return json.dumps(
-+            {
-+                "error": f"child session created but message failed: {exc}",
-+                "conversation_id": child_session_id,
-+            }
-+        )
-+    if msg_resp.status_code >= 400:
-+        return json.dumps(
-+            {
-+                "error": (
-+                    "child session created but message failed: "
-+                    f"{msg_resp.status_code} {msg_resp.text[:200]}"
-+                ),
-+                "conversation_id": child_session_id,
-+            }
-+        )
-+    return None
-+
-+
 +async def _session_create_on_provider(
 +    agent_id: str,
 +    provider: str,
@@ -479,7 +434,6 @@ index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..ff035953f1ea04a61ef20711efa0dfd0
 +        agent_id,
 +        conversation_id,
 +        args.get("title"),
-+        None,
 +        model=args.get("model"),
 +        reasoning_effort=args.get("reasoning_effort"),
 +    )
@@ -532,20 +486,19 @@ index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..ff035953f1ea04a61ef20711efa0dfd0
 +        if warning:
 +            error["warning"] = warning
 +        return json.dumps(error)
-+    message = args.get("message")
-+    if isinstance(message, str) and message:
-+        message_error = await _post_child_first_message(child_id, message, server_client)
-+        if message_error is not None:
-+            return message_error
 +    handle = json.loads(
-+        _finalize_created_session(
++        await _finalize_created_session(
 +            data,
 +            conversation_id=conversation_id,
 +            agent_id=agent_id,
 +            title=args.get("title"),
++            message=args.get("message"),
++            server_client=server_client,
 +            publish_event=publish_event,
 +        )
 +    )
++    if "error" in handle:
++        return json.dumps(handle)
 +    handle["provider"] = provider
 +    if account.own_runner:
 +        handle["note"] = (
@@ -559,7 +512,7 @@ index 7f4a84115ea20a34bded20b94f8c65f7b81c86d5..ff035953f1ea04a61ef20711efa0dfd0
  def _bundle_local_agent_source(source: Path) -> bytes:
      """
      Build gzipped agent-bundle bytes from a local source path.
-@@ -6031,32 +6221,51 @@ async def _agent_list_host_readiness(
+@@ -6031,32 +6174,51 @@ async def _agent_list_host_readiness(
      try:
          async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
              host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
@@ -893,7 +846,7 @@ index 58563b6d873f19223a6231f4b49909922623fd7d..4db0eb352efa608afc66383a3a957656
  async def test_retained_result_is_delivered_when_parent_inbox_is_created(
      _clean_subagent_registry: None,
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index 429b3cd933ec654971c57e1df5ffb51811ca34cd..497b176ad51aa862f1c971f87acc422ab1a969f0 100644
+index 429b3cd933ec654971c57e1df5ffb51811ca34cd..7f41995361926f44fbc985fbe4c8a39da9a04388 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
 @@ -5032,7 +5032,14 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
@@ -922,7 +875,7 @@ index 429b3cd933ec654971c57e1df5ffb51811ca34cd..497b176ad51aa862f1c971f87acc422a
      handle = json.loads(output)
      assert handle["conversation_id"] == "conv_child", output
      if failure is not None:
-@@ -8886,6 +8896,201 @@ async def test_sys_session_create_config_not_found(tmp_path: Path) -> None:
+@@ -8886,6 +8896,218 @@ async def test_sys_session_create_config_not_found(tmp_path: Path) -> None:
      assert info["config_path"] == "nope.yaml"
  
  
@@ -958,8 +911,11 @@ index 429b3cd933ec654971c57e1df5ffb51811ca34cd..497b176ad51aa862f1c971f87acc422a
 +    arguments: dict[str, Any], *, child_harness: str = "claude-native", parent_host: bool = True
 +) -> tuple[dict[str, Any], list[tuple[str, str, dict[str, Any] | None]]]:
 +    """Run ``sys_session_create`` against a fake server; return (result, requests)."""
++    from omnigent.runner import subagent_work
 +    from omnigent.runner.tool_dispatch import execute_tool
 +
++    # Each call reuses the child id, so drop a turn an earlier call left tracked.
++    subagent_work.unregister_subagent_work_for_session("conv_child")
 +    requests: list[tuple[str, str, dict[str, Any] | None]] = []
 +
 +    async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -978,6 +934,12 @@ index 429b3cd933ec654971c57e1df5ffb51811ca34cd..497b176ad51aa862f1c971f87acc422a
 +                    "harness": child_harness,
 +                    "status": "idle",
 +                },
++            )
++        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
++            # The by-id first-message send checks the child is the caller's.
++            return httpx.Response(
++                200,
++                json={"id": "conv_child", "parent_session_id": "conv_caller", "status": "idle"},
 +            )
 +        if request.url.path.startswith("/v1/sessions/conv_child"):
 +            return httpx.Response(204 if request.method == "DELETE" else 200, json={})
@@ -1021,7 +983,11 @@ index 429b3cd933ec654971c57e1df5ffb51811ca34cd..497b176ad51aa862f1c971f87acc422a
 +            "provider_override": "max2",
 +        }
 +    ]
-+    assert requests[-1][:2] == ("POST", "/v1/sessions/conv_child/events")
++    # The first message goes out after the create, through the by-id send path.
++    calls = [request[:2] for request in requests]
++    assert calls.index(("POST", "/v1/sessions/conv_child/events")) > calls.index(
++        ("POST", "/v1/sessions")
++    )
 +    assert result["conversation_id"] == "conv_child"
 +    assert result["provider"] == "max2"
 +    assert "does not wake you" in result["note"]
@@ -1040,7 +1006,11 @@ index 429b3cd933ec654971c57e1df5ffb51811ca34cd..497b176ad51aa862f1c971f87acc422a
 +
 +    creates = [body for method, path, body in requests if path == "/v1/sessions"]
 +    assert creates == [{"agent_id": "ag_x", "parent_session_id": "conv_caller"}]
-+    assert requests[-1][:2] == ("POST", "/v1/sessions/conv_child/events")
++    # The first message goes out after the create, through the by-id send path.
++    calls = [request[:2] for request in requests]
++    assert calls.index(("POST", "/v1/sessions/conv_child/events")) > calls.index(
++        ("POST", "/v1/sessions")
++    )
 +    assert result["provider"] == "max1"
 +    assert "note" not in result
 +

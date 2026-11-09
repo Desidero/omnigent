@@ -55,12 +55,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  tests/inner/test_claude_sdk_executor.py       |  25 ++++
  tests/inner/test_codex_executor.py            |  18 +++
  tests/inner/test_pi_executor.py               |   5 +
- .../test_app_claude_native_launch_args.py     |  67 ++++++++++-
+ .../test_app_claude_native_launch_args.py     |  76 +++++++++++-
  ...t_app_sessions_native_terminals_runtime.py |   8 +-
  .../runner/test_codex_native_launch_config.py |   2 +
  tests/runner/test_runner_dispatch.py          |  45 +++++++
  tests/test_databricks_ai_gateway.py           | 106 ++++++++++++++++
- 21 files changed, 620 insertions(+), 23 deletions(-)
+ 21 files changed, 629 insertions(+), 23 deletions(-)
 
 diff --git a/docs/databricks.md b/docs/databricks.md
 index 79e9f287c3bff308cb254ac4fa8aa63197fd7297..655e1e7398372fe9a6059496505a8864013fd9f5 100644
@@ -876,7 +876,7 @@ index 3dd440a4cd2d578d9d8379c9d7d08f4e3194129e..20cf730e3d32df1b6d1c293f4b89964d
  
  
 diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
-index 079ac991b50e9d284f1d52af5bb779620f023001..e3a4f80a0b837f361a91e39bf99ece9592d4ca22 100644
+index 079ac991b50e9d284f1d52af5bb779620f023001..b22359647a37eaf37d7259702454dd8a366093fd 100644
 --- a/tests/runner/test_app_claude_native_launch_args.py
 +++ b/tests/runner/test_app_claude_native_launch_args.py
 @@ -1319,12 +1319,15 @@ def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
@@ -937,7 +937,7 @@ index 079ac991b50e9d284f1d52af5bb779620f023001..e3a4f80a0b837f361a91e39bf99ece95
      )
  
  
-@@ -1623,6 +1632,56 @@ async def test_auto_create_claude_terminal_hands_claude_the_account_token(
+@@ -1623,6 +1632,65 @@ async def test_auto_create_claude_terminal_hands_claude_the_account_token(
          assert seeded == []
  
  
@@ -961,6 +961,8 @@ index 079ac991b50e9d284f1d52af5bb779620f023001..e3a4f80a0b837f361a91e39bf99ece95
 +    from omnigent.runner.resource_registry import SessionResourceRegistry
 +
 +    monkeypatch.delenv("OMNIGENT_GATEWAY_REQUEST_TAGS", raising=False)
++    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
++    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
 +    monkeypatch.setattr(
 +        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
 +        lambda *_args, **_kwargs: None,
@@ -982,13 +984,20 @@ index 079ac991b50e9d284f1d52af5bb779620f023001..e3a4f80a0b837f361a91e39bf99ece95
 +            launch_config=launch_config,
 +        )
 +
-+    terminal_env = registry.launch_required_terminal.await_args.kwargs["spec"].env
-+    expected = ["X-Existing: 1"]
-+    if tagged:
-+        expected.append(
-+            'Databricks-Ai-Gateway-Request-Tags: {"omnigent_session_id":"conv_tags","team":"ml"}'
-+        )
-+    assert terminal_env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == expected
++    lines = (
++        registry.launch_required_terminal.await_args.kwargs["spec"]
++        .env["ANTHROPIC_CUSTOM_HEADERS"]
++        .splitlines()
++    )
++    assert "X-Existing: 1" in lines
++    # Attribution headers may join the block; exactly one request-tags line, on the gateway only.
++    tag_lines = [line for line in lines if line.startswith("Databricks-Ai-Gateway-Request-Tags:")]
++    expected = (
++        ['Databricks-Ai-Gateway-Request-Tags: {"omnigent_session_id":"conv_tags","team":"ml"}']
++        if tagged
++        else []
++    )
++    assert tag_lines == expected
 +
 +
  @pytest.mark.parametrize(
@@ -1041,7 +1050,7 @@ index 5747bbe409fc606540075f395f25704cd0506933..ca3e28c03a3413c2c265d26224c670fd
      assert cfg.routing_enabled is True
      assert cfg.turn_routing is True
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index bdb6aef237f7473a9ed57dc3acddc1d7b8accd58..224cb3cfa4bd7e9c9c24db8849740cf67a019cbd 100644
+index 295d52278b26babfa67a29897a3581fe70b62c12..c02381cc12aebdd7f14fe4e7cfc82bbd9c4960b2 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
 @@ -46,6 +46,7 @@ import threading
