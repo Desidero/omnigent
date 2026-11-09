@@ -14,21 +14,26 @@ parent's runner, so deleting only the sub-agent leaves that runner up;
 deleting the parent cascades to the tree and releases it, including a
 runner a sub-agent moved to after a relaunch.
 
+Route-level tests cover releasing the runner, matching
+https://github.com/omnigent-ai/omnigent/pull/11391.
+
 Not upstream yet: proposed from fix/delete-stops-runner; drop this copy once it merges.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- feature-map/sessions.md                       |  5 +
- .../server/routes/_sessions/orchestration.py  | 72 +++++++++++++++
- .../server/routes/sessions/routes_events.py   | 13 +++
- .../integration/test_session_host_launch.py   | 91 +++++++++++++++++++
- 4 files changed, 181 insertions(+)
+ feature-map/sessions.md                       |   5 +
+ .../server/routes/_sessions/orchestration.py  |  72 +++++++++++
+ .../server/routes/sessions/routes_events.py   |  13 ++
+ .../integration/test_session_host_launch.py   |  91 ++++++++++++++
+ .../test_delete_released_host_runners.py      | 114 ++++++++++++++++++
+ 5 files changed, 295 insertions(+)
+ create mode 100644 tests/server/routes/test_delete_released_host_runners.py
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index 8746259e7f5dddcf475f7d2025d11f58eac50555..284426686d31ecf8816eeada1891cc2df87ab53a 100644
+index 9bab8a7805ffb378f970ebf6e687cad5aa2d051c..80c7d59da33a0a7e7cfb6966d4e236aa5cd909e1 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
-@@ -546,6 +546,11 @@ plain `uv run pytest`, which starts a private server for the test.
+@@ -753,6 +753,11 @@ plain `uv run pytest`, which starts a private server for the test.
  - **`delete`:**
    `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
    `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
@@ -41,10 +46,10 @@ index 8746259e7f5dddcf475f7d2025d11f58eac50555..284426686d31ecf8816eeada1891cc2d
    `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
    `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
 diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
-index 0e19aa18d773c85a0a02dfe909bba8710d8756df..43be22e727abc055132f8fcbcba9e9b0bd9fb2c4 100644
+index eb2c78541b94abe6e4c5d6d19d511e71fbed1abf..0f4b09baa81a60aade618e1a63dc28aac4c3e16c 100644
 --- a/omnigent/server/routes/_sessions/orchestration.py
 +++ b/omnigent/server/routes/_sessions/orchestration.py
-@@ -805,6 +805,76 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
+@@ -817,6 +817,76 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
              handle.task.cancel()
  
  
@@ -121,7 +126,7 @@ index 0e19aa18d773c85a0a02dfe909bba8710d8756df..43be22e727abc055132f8fcbcba9e9b0
  # Strong references to detached archive stops so the tasks can't be
  # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
  # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
-@@ -13765,6 +13835,7 @@ __all__ = [
+@@ -14218,6 +14288,7 @@ __all__ = [
      "_handle_mcp_tools_call",
      "_heal_subagent_runner_binding_via_parent",
      "_hold_native_ask_gate",
@@ -129,7 +134,7 @@ index 0e19aa18d773c85a0a02dfe909bba8710d8756df..43be22e727abc055132f8fcbcba9e9b0
      "_is_native_terminal_session",
      "_kick_managed_relaunch",
      "_kick_managed_wake",
-@@ -13800,6 +13871,7 @@ __all__ = [
+@@ -14253,6 +14324,7 @@ __all__ = [
      "_spawn_native_approval_popup_forward",
      "_spawn_native_blocked_notice_forward",
      "_stop_host_runner_intentionally",
@@ -138,10 +143,10 @@ index 0e19aa18d773c85a0a02dfe909bba8710d8756df..43be22e727abc055132f8fcbcba9e9b0
      "_wait_for_host_reconnect",
      "_wake_parent_for_blocked_child",
 diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
-index 28fe33f80de88bc8648efd68c238b30d97bdb739..8a0ad9dd1f31b270234cdcfb10b6c66fc00b67fd 100644
+index 64b4c62952202a074376f62a0c6743515a7534ff..d6bd163ff6b8a493b02542fe5bbd12369468380a 100644
 --- a/omnigent/server/routes/sessions/routes_events.py
 +++ b/omnigent/server/routes/sessions/routes_events.py
-@@ -258,6 +258,7 @@ from omnigent.server.routes._sessions.orchestration import (
+@@ -271,6 +271,7 @@ from omnigent.server.routes._sessions.orchestration import (
      _evaluate_input_policy,
      _evaluate_tool_call_policy,
      _heal_subagent_runner_binding_via_parent,
@@ -149,15 +154,15 @@ index 28fe33f80de88bc8648efd68c238b30d97bdb739..8a0ad9dd1f31b270234cdcfb10b6c66f
      _is_native_terminal_session,
      _mark_dispatch_in_flight,
      _maybe_relaunch_managed_sandbox,
-@@ -276,6 +277,7 @@ from omnigent.server.routes._sessions.orchestration import (
-     _runner_live_on_another_replica_from_conversations,
+@@ -291,6 +292,7 @@ from omnigent.server.routes._sessions.orchestration import (
+     _session_is_moving,
      _side_chat_source_id,
      _stop_host_runner_intentionally,
 +    _stop_released_host_runners,
      _wait_for_host_bound_runner_client,
      _wait_for_host_reconnect,
      ensure_runner_connected,
-@@ -3755,6 +3757,9 @@ def register_events_routes(
+@@ -4167,6 +4169,9 @@ def register_events_routes(
              raise _session_not_found()
          # Capture relay IDs before subtree deletion removes parent links.
          descendant_ids = await _best_effort_stop(session_id, conversation_store, runner_router)
@@ -167,7 +172,7 @@ index 28fe33f80de88bc8648efd68c238b30d97bdb739..8a0ad9dd1f31b270234cdcfb10b6c66f
          # Runner-side resource cleanup is best-effort: if the bound
          # runner is offline or unbound, the session must still be
          # deletable. Server-owned records (files and conversation row
-@@ -3850,6 +3855,14 @@ def register_events_routes(
+@@ -4263,6 +4268,14 @@ def register_events_routes(
          # A relay still inside an offline runner's reconnect grace must not
          # fail the deleted turns when that grace expires.
          _cancel_runner_relays([session_id, *descendant_ids])
@@ -183,10 +188,10 @@ index 28fe33f80de88bc8648efd68c238b30d97bdb739..8a0ad9dd1f31b270234cdcfb10b6c66f
          # launches are retained in the cache for reload visibility while
          # the session exists; without this eviction every deleted
 diff --git a/tests/server/integration/test_session_host_launch.py b/tests/server/integration/test_session_host_launch.py
-index e48fff429cd529c2825eb12cff5437672098148b..edf3514587906dcb61eb96afc3ce059dd8fa9ed9 100644
+index 82bba6fc721da5c1fa3f8fd9687eb983aff8516f..8714671309565fe92be65944231ddb8ad09fa35f 100644
 --- a/tests/server/integration/test_session_host_launch.py
 +++ b/tests/server/integration/test_session_host_launch.py
-@@ -1663,6 +1663,97 @@ async def test_stop_session_stops_host_launched_runner(
+@@ -1812,6 +1812,97 @@ async def test_stop_session_stops_host_launched_runner(
      )
  
  
@@ -284,3 +289,123 @@ index e48fff429cd529c2825eb12cff5437672098148b..edf3514587906dcb61eb96afc3ce059d
  @pytest.mark.parametrize("runner_status", ["alive", "dead", "unknown", "offline", None])
  async def test_stop_session_requires_confirmed_host_runner_exit(
      client: httpx.AsyncClient,
+diff --git a/tests/server/routes/test_delete_released_host_runners.py b/tests/server/routes/test_delete_released_host_runners.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcb6d0d5446a60fad1ea1b4e6e9376e1c57ad95f
+--- /dev/null
++++ b/tests/server/routes/test_delete_released_host_runners.py
+@@ -0,0 +1,114 @@
++"""Delete releases the host-launched runners no remaining session is bound to."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++
++from omnigent.server.routes import sessions
++from omnigent.server.routes._sessions import orchestration
++
++
++def _row(session_id: str, host_id: str | None = None, runner_id: str | None = None):
++    return SimpleNamespace(id=session_id, host_id=host_id, runner_id=runner_id)
++
++
++class _Store:
++    """Just the two reads the delete-time helpers make."""
++
++    def __init__(
++        self,
++        rows: dict[str, SimpleNamespace] | None = None,
++        *,
++        bound_runners: set[str] = frozenset(),
++        failing_lookups: set[str] = frozenset(),
++        descendants_fail: bool = False,
++    ) -> None:
++        self.rows = rows or {}
++        self.bound_runners = bound_runners
++        self.failing_lookups = failing_lookups
++        self.descendants_fail = descendants_fail
++        self.lookups: list[tuple[str, int]] = []
++
++    def get_conversations(self, conversation_ids: list[str]) -> dict[str, SimpleNamespace]:
++        if self.descendants_fail:
++            raise RuntimeError("database unavailable")
++        return {cid: self.rows[cid] for cid in conversation_ids if cid in self.rows}
++
++    def list_runner_session_statuses(
++        self, runner_id: str, *, after: str | None = None, limit: int = 200
++    ) -> list[tuple[str, str | None]]:
++        self.lookups.append((runner_id, limit))
++        if runner_id in self.failing_lookups:
++            raise RuntimeError("database unavailable")
++        return [("other-session", "running")] if runner_id in self.bound_runners else []
++
++
++@pytest.fixture
++def stops(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, bool]]:
++    """Record every host runner stop the helper asks for."""
++    calls: list[tuple[str, str, str, bool]] = []
++
++    async def stop(session_id, host_id, runner_id, host_registry, *, expect_already_stopped=False):
++        calls.append((session_id, host_id, runner_id, expect_already_stopped))
++        if runner_id == "runner-broken":
++            raise RuntimeError("host did not answer")
++        return True
++
++    monkeypatch.setattr(sessions, "_stop_session_host_runner", stop)
++    return calls
++
++
++async def test_host_runner_bindings_cover_the_session_tree() -> None:
++    parent = _row("parent", "host-1", "runner-shared")
++    store = _Store(
++        {
++            "child-shared": _row("child-shared", "host-1", "runner-shared"),
++            "child-moved": _row("child-moved", "host-1", "runner-moved"),
++            "child-unbound": _row("child-unbound", None, None),
++        }
++    )
++
++    bindings = await orchestration._host_runner_bindings(
++        store, parent, ["child-shared", "child-moved", "child-unbound", "child-gone"]
++    )
++
++    assert bindings == {("host-1", "runner-shared"), ("host-1", "runner-moved")}
++
++
++async def test_host_runner_bindings_keep_the_session_binding_when_descendants_fail() -> None:
++    parent = _row("parent", "host-1", "runner-shared")
++    store = _Store(descendants_fail=True)
++
++    bindings = await orchestration._host_runner_bindings(store, parent, ["child"])
++
++    assert bindings == {("host-1", "runner-shared")}
++
++
++async def test_stop_released_host_runners_skips_a_runner_another_session_uses(
++    stops: list[tuple[str, str, str, bool]],
++) -> None:
++    store = _Store(bound_runners={"runner-shared"})
++
++    await orchestration._stop_released_host_runners(
++        "child", {("host-1", "runner-shared"), ("host-1", "runner-moved")}, store, object()
++    )
++
++    assert store.lookups == [("runner-moved", 1), ("runner-shared", 1)]
++    assert stops == [("child", "host-1", "runner-moved", True)]
++
++
++async def test_stop_released_host_runners_keeps_going_past_failures(
++    stops: list[tuple[str, str, str, bool]],
++) -> None:
++    store = _Store(failing_lookups={"runner-a"})
++    bindings = {
++        ("host-1", "runner-a"),  # the "still bound" check fails: left running
++        ("host-1", "runner-broken"),  # the host stop raises: swallowed
++        ("host-1", "runner-c"),
++    }
++
++    await orchestration._stop_released_host_runners("parent", bindings, store, object())
++
++    assert [call[2] for call in stops] == ["runner-broken", "runner-c"]

@@ -30,6 +30,9 @@ and workspace are exported as metadata and documented as such.
 
 No change when telemetry is disabled. There is no user attribute here.
 
+The git remote fixture uses a neutral credential, so secret scanners don't
+mistake it for a real one.
+
 Related: #10794
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -120,10 +123,10 @@ index 5e12808411bb42058ffa6c294a6f12c7642cf3f6..d3a5fb468ba22fe0a0e03f8584affb69
 +telemetry is off. No user attribute is stamped here: the acting user belongs
 +to the semconv `enduser.id`, proposed separately.
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index 873c065dcc5df918c7452d1140a70f385488eb6a..912ab6f7e0b11cbc786946824310506d60767af1 100644
+index 2509cc24ba7e8d905ab956763dbe5295256efbec..866aa640742f32db056f15990d2ac0ad1080f539 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
-@@ -1297,6 +1297,9 @@ def create_runner_app(
+@@ -1382,6 +1382,9 @@ def create_runner_app(
      _session_agent_revisions: dict[str, str] = {}
      _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
      _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
@@ -133,7 +136,7 @@ index 873c065dcc5df918c7452d1140a70f385488eb6a..912ab6f7e0b11cbc786946824310506d
      _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
      _session_init_tasks: dict[
          tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
-@@ -2192,6 +2195,31 @@ def create_runner_app(
+@@ -2422,6 +2425,31 @@ def create_runner_app(
              return Path(workspace.strip()).expanduser().resolve()
          return runner_workspace.resolve() if runner_workspace is not None else None
  
@@ -165,7 +168,7 @@ index 873c065dcc5df918c7452d1140a70f385488eb6a..912ab6f7e0b11cbc786946824310506d
      async def _load_legacy_session_init_context() -> _SessionInitContext:
          await _get_server_version(server_client)
          return _SessionInitContext(envelope=None)
-@@ -3559,6 +3587,7 @@ def create_runner_app(
+@@ -3823,6 +3851,7 @@ def create_runner_app(
          _session_workspace_cache.pop(session_id, None)
          _session_snapshot_cache.pop(session_id, None)
          _session_snapshot_locks.pop(session_id, None)
@@ -173,10 +176,10 @@ index 873c065dcc5df918c7452d1140a70f385488eb6a..912ab6f7e0b11cbc786946824310506d
          _session_init_envelopes.pop(session_id, None)
          _session_reasoning_effort.pop(session_id, None)
          _session_chat_features.pop(session_id, None)
-@@ -5258,6 +5287,8 @@ def create_runner_app(
-             "role": "user",
-             "model": msg_body.get("model", ""),
-         }
+@@ -5891,6 +5920,8 @@ def create_runner_app(
+         _authorized_shell = msg_body.get("authorized_native_shell_command")
+         if isinstance(_authorized_shell, str):
+             harness_body["authorized_native_shell_command"] = _authorized_shell
 +        if _span_attributes := await _session_span_attributes(conv):
 +            harness_body["telemetry_attributes"] = _span_attributes
          # The routed model rides in-band on the forwarded message. This body is
@@ -389,10 +392,10 @@ index 0000000000000000000000000000000000000000..d37407d32bb090281df31cae76fc82fd
 +        branch = await asyncio.to_thread(git_branch, workspace)
 +    return session_metadata_attributes(session, project_name=project_name, git_branch=branch)
 diff --git a/omnigent/runtime/harnesses/_executor_adapter.py b/omnigent/runtime/harnesses/_executor_adapter.py
-index cf3afefbdea67e0480cb36f649b42c7d3429b088..5487eef3a190515d8a9145249051761bb74c4917 100644
+index 114017311852efb54a785cb1e1ae9d537873bfa1..11c2169002cbef72080a6e928b1130f0e134eca1 100644
 --- a/omnigent/runtime/harnesses/_executor_adapter.py
 +++ b/omnigent/runtime/harnesses/_executor_adapter.py
-@@ -306,6 +306,7 @@ class ExecutorAdapter(HarnessApp):
+@@ -319,6 +319,7 @@ class ExecutorAdapter(HarnessApp):
          from omnigent.runtime.telemetry import (
              current_session_id,
              reset_active_skill,
@@ -400,7 +403,7 @@ index cf3afefbdea67e0480cb36f649b42c7d3429b088..5487eef3a190515d8a9145249051761b
              session_scope,
              set_active_skill,
          )
-@@ -343,6 +344,7 @@ class ExecutorAdapter(HarnessApp):
+@@ -356,6 +357,7 @@ class ExecutorAdapter(HarnessApp):
                      _logger.debug("trace_context_for_response unavailable", exc_info=True)
              with (
                  session_scope(turn_session_id),
@@ -528,10 +531,10 @@ index cc5334086c72c1c9e69905332eddade8a9024381..5b4b189b179695a2c0e1162b4ae95297
              provider.add_span_processor(_make_active_skill_processor())
              # Attribute every span to its runner, and to the acting user when
 diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
-index 3f8820abe8e32deab8b4aef5a47ee8ceea1e7e7f..cfe01f32777c8c647ddb4bb39ab84fce54515263 100644
+index 48f32f6e3b1849b165dc837348d5dfe5a77306ec..aa313336a252bd1f8eee7a4f01780254068aafbd 100644
 --- a/omnigent/server/schemas.py
 +++ b/omnigent/server/schemas.py
-@@ -1167,6 +1167,9 @@ class CreateResponseRequest(BaseModel):
+@@ -1179,6 +1179,9 @@ class CreateResponseRequest(BaseModel):
      model_override: str | None = None
      # Compaction strategy objects, e.g. [{"type": "compaction", ...}]
      context_management: list[dict[str, Any]] | None = None
@@ -542,10 +545,10 @@ index 3f8820abe8e32deab8b4aef5a47ee8ceea1e7e7f..cfe01f32777c8c647ddb4bb39ab84fce
      # Typed loosely because we only need to accept and discard them.
      temperature: float | None = None
 diff --git a/tests/runner/test_app_sessions_native_workflow_messages.py b/tests/runner/test_app_sessions_native_workflow_messages.py
-index 95969719de1f4780bf91bd1334ec35f73e9324dc..de49753cae57c49da8c9168e920a43c548595ef8 100644
+index b137b4e19eff48cb5258f0ba5a8e80a872607ac5..01f776d1150653f87f5de637abae398c4c6bbe52 100644
 --- a/tests/runner/test_app_sessions_native_workflow_messages.py
 +++ b/tests/runner/test_app_sessions_native_workflow_messages.py
-@@ -986,6 +986,67 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
+@@ -1176,6 +1176,67 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
      )
  
  
@@ -615,7 +618,7 @@ index 95969719de1f4780bf91bd1334ec35f73e9324dc..de49753cae57c49da8c9168e920a43c5
      """The turn's reasoning effort rides the forwarded message to the harness.
 diff --git a/tests/runner/test_session_telemetry.py b/tests/runner/test_session_telemetry.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..191553971e095d0547ee6a216b49aca379c0e007
+index 0000000000000000000000000000000000000000..5840da993901357472b681c40e25bb233bad0051
 --- /dev/null
 +++ b/tests/runner/test_session_telemetry.py
 @@ -0,0 +1,185 @@
@@ -707,7 +710,7 @@ index 0000000000000000000000000000000000000000..191553971e095d0547ee6a216b49aca3
 +
 +    # The SSH user and any https credentials are dropped from the remote.
 +    assert session_telemetry.git_remote_url(workspace) == "github.com:acme/app.git"
-+    git("remote", "set-url", "origin", "https://alice:ghp_secret@github.com/acme/app.git")
++    git("remote", "set-url", "origin", "https://alice:s3cr3t-pw@github.com/acme/app.git")
 +    assert session_telemetry.git_remote_url(workspace) == "https://github.com/acme/app.git"
 +    assert session_telemetry.git_branch(workspace) == "main"
 +    git("checkout", "-q", "--detach")

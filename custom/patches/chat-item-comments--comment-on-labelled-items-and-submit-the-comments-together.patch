@@ -78,9 +78,9 @@ Signed-off-by: Desidero <desidero@gmail.com>
  omnigent/runtime/prompt.py                    |  12 +-
  tests/e2e_ui/chat/test_item_label_chips.py    | 160 ++++-
  .../blocks/ChatMarkdown.itemLabels.test.tsx   | 151 ++++-
- web/src/components/blocks/ChatMarkdown.tsx    | 303 ++++++++--
- web/src/components/chat/OpenItemsPanel.tsx    |  92 ++-
- web/src/components/chat/Transcript.tsx        |  33 +-
+ web/src/components/blocks/ChatMarkdown.tsx    | 311 ++++++++--
+ web/src/components/chat/OpenItemsPanel.tsx    |  77 ++-
+ web/src/components/chat/Transcript.tsx        |   8 +-
  web/src/components/chat/chatBubbleParts.tsx   |  45 +-
  web/src/components/chat/itemCommentActions.ts |  16 +
  .../composer/ItemCommentTray.test.tsx         | 222 +++++++
@@ -94,12 +94,12 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/lib/itemComments.test.ts              | 238 ++++++++
  web/src/lib/itemComments.ts                   | 348 +++++++++++
  web/src/lib/itemLabels.test.ts                |  92 +++
- web/src/lib/itemLabels.ts                     | 112 +++-
+ web/src/lib/itemLabels.ts                     | 122 +++-
  web/src/pages/ChatPage.composer.test.tsx      | 149 +++++
- web/src/pages/ChatPage.tsx                    | 276 +++++++--
+ web/src/pages/ChatPage.tsx                    | 292 ++++++++--
  web/src/pages/QueuedMessagesStrip.test.tsx    |  22 +
  web/src/pages/QueuedMessagesStrip.tsx         |  29 +-
- 25 files changed, 4215 insertions(+), 153 deletions(-)
+ 25 files changed, 4207 insertions(+), 155 deletions(-)
  create mode 100644 web/src/components/chat/itemCommentActions.ts
  create mode 100644 web/src/components/composer/ItemCommentTray.test.tsx
  create mode 100644 web/src/components/composer/ItemCommentTray.tsx
@@ -113,13 +113,13 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/itemComments.ts
 
 diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
-index 7881ca781760c7cfc9e083aca49de413028acb7b..84e3c6d8471e5f560062849ca909cd5ee06c5c07 100644
+index c71593c419d610591887328648523d73affe649e..58e44a58b30af3e35682ac8cdd2d71c25d6e6745 100644
 --- a/docs/chat-item-labels.md
 +++ b/docs/chat-item-labels.md
-@@ -46,3 +46,54 @@ channel; labels still render when you or the agent write them.
-   it. The newest mention decides, so a later plain mention reopens it.
- - **Open items:** a bar above the thread lists the open labels as chips.
-   Expand it for every item with its title, closed ones under **Closed (N)**.
+@@ -55,3 +55,54 @@ channel; labels still render when you or the agent write them.
+   at the bottom lists it with **Restore**. An item the agent later closes shows
+   as closed as usual. Dismissals are stored on the session, as the
+   `omnigent.items_dismissed` label, so they follow you to other devices.
 +
 +## Comment on items
 +
@@ -385,7 +385,7 @@ index d4bb89de6735438a06e1e6413e3c197783361cd1..7769081c819bb117c0b84140f0f3f9d1
 +            assert send_box["x"] + send_box["width"] <= tray_box["x"] + tray_box["width"]
 +            assert tray_box["x"] + tray_box["width"] <= width
 diff --git a/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx b/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
-index f7dc1949fb52c0cb7094a9a55e34b5d56963d659..80820d311f14901072bd87f4fbc5ea3cdc1a1a69 100644
+index 57e24ef66227603143d69c6cb48ce29baa6996f6..8ad97d4751527d12f9685d9549f25af3bacac881 100644
 --- a/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
 @@ -1,24 +1,37 @@
@@ -576,7 +576,7 @@ index f7dc1949fb52c0cb7094a9a55e34b5d56963d659..80820d311f14901072bd87f4fbc5ea3c
    });
  
    it("keeps the written text where no transcript index is available", async () => {
-@@ -127,23 +250,23 @@ describe("item labels in chat markdown", () => {
+@@ -132,23 +255,23 @@ describe("item labels in chat markdown", () => {
  
    it("previews on a desktop mouse hover and stays open over the popover", async () => {
      stubHoverDevice();
@@ -608,7 +608,7 @@ index f7dc1949fb52c0cb7094a9a55e34b5d56963d659..80820d311f14901072bd87f4fbc5ea3c
  
    it("does not preview on touch", async () => {
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db8046b04cf0 100644
+index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f14b8de0b2 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
 @@ -6,14 +6,15 @@
@@ -660,24 +660,41 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
  import { cn } from "@/lib/utils";
  import {
    useFileViewer,
-@@ -530,18 +545,121 @@ export function itemLabelChipClass(closed: boolean): string {
+@@ -539,7 +554,7 @@ function citesSamePlace(
+ const ITEM_LABEL_BADGE_CLASS =
+   "inline-flex items-baseline rounded border border-border bg-muted px-1 font-mono text-[0.85em] leading-snug";
+ const ITEM_LABEL_CLOSED_CLASS = "line-through opacity-60";
+-// Same amber as the message highlight, for items the latest reply mentions.
++// Same amber as the draft dot and message highlight, for items the latest reply mentions.
+ const ITEM_LABEL_RECENT_CLASS = "border-warning/60 bg-warning/15";
+ 
+ /**
+@@ -555,23 +570,126 @@ export function itemLabelChipClass(closed: boolean, recent = false): string {
    );
  }
  
--function describeSource(source: ItemLabelSource): string {
-+/** A chip's accessible name, e.g. "Show item Q2 (closed), 2 comments, 1 draft". */
+-/** A chip's accessible name, e.g. "Show item Q2 (closed), mentioned in the latest reply". */
+-export function itemLabelChipName(label: string, closed: boolean, recent = false): string {
+-  return `Show item ${label}${closed ? " (closed)" : ""}${recent ? ", mentioned in the latest reply" : ""}`;
++/**
++ * A chip's accessible name, e.g. "Show item Q2 (closed), mentioned in the
++ * latest reply, 2 comments, 1 draft".
++ */
 +export function itemLabelChipName(
 +  label: string,
 +  closed: boolean,
 +  commentCount: number,
 +  draftCount: number,
++  recent = false,
 +): string {
 +  const parts = [`Show item ${label}${closed ? " (closed)" : ""}`];
++  if (recent) parts.push("mentioned in the latest reply");
 +  if (commentCount > 0) parts.push(`${commentCount} comment${commentCount === 1 ? "" : "s"}`);
 +  if (draftCount > 0) parts.push(`${draftCount} draft${draftCount === 1 ? "" : "s"}`);
 +  return parts.join(", ");
-+}
-+
+ }
+ 
+-function describeSource(source: ItemLabelSource): string {
 +/** A chip's marks: an amber dot while drafts are unsent, then the sent-comment count. */
 +export function ItemLabelChipMarks({
 +  commentCount,
@@ -787,7 +804,7 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
    const closing = useMemo(
      () => (closedBy ? extractLabelSentence(closedBy.text, label) : null),
      [closedBy, label],
-@@ -554,32 +672,129 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -584,32 +702,129 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
        return next;
      });
    };
@@ -927,7 +944,7 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
                onClick={() => showMessage(closedBy.messageId)}
              >
                Show
-@@ -592,7 +807,21 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -622,7 +837,21 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
            )}
          </div>
        )}
@@ -950,7 +967,7 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
    );
  }
  
-@@ -627,36 +856,42 @@ export function ItemLabelPopover({
+@@ -657,36 +886,42 @@ export function ItemLabelPopover({
  }
  
  /**
@@ -1010,128 +1027,138 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
      </ItemLabelPopover>
    );
 diff --git a/web/src/components/chat/OpenItemsPanel.tsx b/web/src/components/chat/OpenItemsPanel.tsx
-index 77a05f5690427b3656f637ae80a03073a62b38d1..bf6a1af9643dd83f424c22f02412a4da09a61f9f 100644
+index fa90a49ca033aae6929add93951b05182b4f203b..3017dcefd9e31189cbac7753a62a8a76bd06d847 100644
 --- a/web/src/components/chat/OpenItemsPanel.tsx
 +++ b/web/src/components/chat/OpenItemsPanel.tsx
-@@ -1,7 +1,18 @@
+@@ -1,6 +1,7 @@
  import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
- import { ChevronDownIcon, MessageSquareDotIcon } from "lucide-react";
--import { ItemLabelPopover, itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
--import { ItemLabelIndexContext, itemLabelTitle, type ItemLabelEntry } from "@/lib/itemLabels";
-+import {
+ import { ChevronDownIcon, MessageSquareDotIcon, XIcon } from "lucide-react";
+ import {
 +  ItemLabelChipMarks,
-+  ItemLabelPopover,
-+  itemLabelChipClass,
-+  itemLabelChipName,
-+} from "@/components/blocks/ChatMarkdown";
-+import {
-+  ItemLabelIndexContext,
-+  ItemLabelSessionContext,
-+  itemLabelTitle,
-+  type ItemLabelEntry,
-+} from "@/lib/itemLabels";
+   ItemLabelPopover,
+   itemLabelChipClass,
+   itemLabelChipName,
+@@ -17,6 +18,7 @@ import {
+   mentionedInLatestReply,
+   type ItemLabelEntry,
+ } from "@/lib/itemLabels";
 +import { revealItemCommentTray, useItemCommentDraftCounts } from "@/lib/itemCommentDrafts";
  import { cn } from "@/lib/utils";
  
  // Header chips shown before the row has been measured (or without layout).
-@@ -76,17 +87,20 @@ export function useCollapseOnOutsidePress() {
-   return detailsRef;
- }
+@@ -116,11 +118,13 @@ function useDismissedItems(sessionId: string | null) {
  
--function ItemRow({ item }: { item: ItemLabelEntry }) {
-+function ItemRow({ item, draftCount }: { item: ItemLabelEntry; draftCount: number }) {
-   const closed = item.closedBy !== null;
-   const title = useMemo(() => itemLabelTitle(item.source.text, item.label), [item]);
-   return (
-     <ItemLabelPopover item={item}>
-       <button
-         type="button"
--        aria-label={`Show item ${item.label}${closed ? " (closed)" : ""}`}
-+        aria-label={itemLabelChipName(item.label, closed, item.comments.length, draftCount)}
-         className="flex w-full min-w-0 items-baseline gap-2 px-3 py-1.5 text-left text-ui hover:bg-muted"
-       >
--        <span className={cn(itemLabelChipClass(closed), "shrink-0")}>{item.label}</span>
-+        <span className={cn(itemLabelChipClass(closed), "shrink-0")}>
-+          {item.label}
-+          <ItemLabelChipMarks commentCount={item.comments.length} draftCount={draftCount} />
-+        </span>
-         <span className={cn("truncate", closed && "text-muted-foreground line-through")}>
-           {title}
-         </span>
-@@ -97,20 +111,25 @@ function ItemRow({ item }: { item: ItemLabelEntry }) {
+ function ItemRow({
+   item,
++  draftCount,
+   recent,
+   onDismiss,
+   onRestore,
+ }: {
+   item: ItemLabelEntry;
++  draftCount: number;
+   recent: boolean;
+   onDismiss?: () => void;
+   onRestore?: () => void;
+@@ -132,10 +136,19 @@ function ItemRow({
+       <ItemLabelPopover item={item}>
+         <button
+           type="button"
+-          aria-label={itemLabelChipName(item.label, closed, recent)}
++          aria-label={itemLabelChipName(
++            item.label,
++            closed,
++            item.comments.length,
++            draftCount,
++            recent,
++          )}
+           className="flex min-w-0 flex-1 items-baseline gap-2 px-3 py-1.5 text-left text-ui hover:bg-muted"
+         >
+-          <span className={cn(itemLabelChipClass(closed, recent), "shrink-0")}>{item.label}</span>
++          <span className={cn(itemLabelChipClass(closed, recent), "shrink-0")}>
++            {item.label}
++            <ItemLabelChipMarks commentCount={item.comments.length} draftCount={draftCount} />
++          </span>
+           <span className={cn("truncate", closed && "text-muted-foreground line-through")}>
+             {title}
+           </span>
+@@ -168,16 +181,18 @@ function ItemRow({
  
  /**
   * Collapsible "Open items" tracker pinned above the chat thread, beside the
 - * Plan tracker. The header lists open item labels as chips; expanding lists
-- * every item with its title, closed ones last. Self-hides until the transcript
-- * uses item labels.
+- * every item with its title, closed ones last. Items the latest reply mentions
+- * come first, tinted, one it just closed among them struck through. An open
+- * item can be dismissed from the tracker (per session, on every device) and
+- * restored from the "dismissed" list at the bottom. Self-hides until the
+- * transcript uses item labels.
 + * Plan tracker. The header lists open item labels as chips, plus a jump to the
 + * comment drafts when there are any; expanding lists every item with its
-+ * title, closed ones last. Self-hides until the transcript uses item labels.
++ * title, closed ones last. Items the latest reply mentions come first, tinted,
++ * one it just closed among them struck through. An open item can be dismissed
++ * from the tracker (per session, on every device) and restored from the
++ * "dismissed" list at the bottom. Self-hides until the transcript uses item
++ * labels.
   */
  export function OpenItemsPanel({ className }: { className?: string }) {
    const index = useContext(ItemLabelIndexContext);
-+  const sessionId = useContext(ItemLabelSessionContext);
+   const sessionId = useContext(ItemLabelSessionContext);
 +  const draftCounts = useItemCommentDraftCounts(sessionId);
-   const items = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
-   const open = items.filter((item) => item.closedBy === null);
-   const closed = items.filter((item) => item.closedBy !== null);
--  const chipKey = open.map((item) => item.label).join(" ");
-+  const chipKey = open
-+    .map((item) => `${item.label}:${item.comments.length}:${draftCounts.get(item.label) ?? 0}`)
-+    .join(" ");
+   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
+   const [showDismissed, setShowDismissed] = useState(false);
+   const allItems = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
+@@ -192,12 +207,16 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+   const closed = items.filter((item) => item.closedBy !== null && !isRecent(item));
+   const chips = [...recent, ...otherOpen];
+   const chipKey = chips
+-    .map((item) => `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}`)
++    .map(
++      (item) =>
++        `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}:${item.comments.length}:${draftCounts.get(item.label) ?? 0}`,
++    )
+     .join(" ");
    const fit = useFittedChipCount(chipKey);
    const detailsRef = useCollapseOnOutsidePress();
-   if (items.length === 0) return null;
-   const headerChips = open.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
+   if (allItems.length === 0) return null;
+   const headerChips = chips.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
 +  const draftTotal = [...draftCounts.values()].reduce((total, count) => total + count, 0);
  
    return (
      <div className={cn("shrink-0 px-3 md:px-4", className)}>
-@@ -131,17 +150,29 @@ export function OpenItemsPanel({ className }: { className?: string }) {
-               if ((event.target as Element).closest("button")) event.preventDefault();
+@@ -219,18 +238,29 @@ export function OpenItemsPanel({ className }: { className?: string }) {
              }}
            >
--            {headerChips.map((item) => (
--              <ItemLabelPopover key={item.label} item={item} openOnHover>
--                <button
--                  type="button"
--                  aria-label={`Show item ${item.label}`}
--                  className={cn(itemLabelChipClass(false), "shrink-0")}
--                >
--                  {item.label}
--                </button>
--              </ItemLabelPopover>
--            ))}
-+            {headerChips.map((item) => {
+             {headerChips.map((item) => {
 +              const draftCount = draftCounts.get(item.label) ?? 0;
-+              return (
-+                <ItemLabelPopover key={item.label} item={item} openOnHover>
-+                  <button
-+                    type="button"
+               const recentChip = isRecent(item);
+               return (
+                 <ItemLabelPopover key={item.label} item={item} openOnHover>
+                   <button
+                     type="button"
+-                    aria-label={itemLabelChipName(item.label, item.closedBy !== null, recentChip)}
 +                    aria-label={itemLabelChipName(
 +                      item.label,
-+                      false,
++                      item.closedBy !== null,
 +                      item.comments.length,
 +                      draftCount,
++                      recentChip,
 +                    )}
-+                    className={cn(itemLabelChipClass(false), "shrink-0")}
-+                  >
-+                    {item.label}
+                     className={cn(
+                       itemLabelChipClass(item.closedBy !== null, recentChip),
+                       "shrink-0",
+                     )}
+                   >
+                     {item.label}
 +                    <ItemLabelChipMarks
 +                      commentCount={item.comments.length}
 +                      draftCount={draftCount}
 +                    />
-+                  </button>
-+                </ItemLabelPopover>
-+              );
-+            })}
-             {open.length > headerChips.length && (
-               <span className="shrink-0 text-xs text-muted-foreground">
-                 +{open.length - headerChips.length}
-@@ -156,16 +187,33 @@ export function OpenItemsPanel({ className }: { className?: string }) {
-             {open.map((item) => (
-               <span key={item.label} className={itemLabelChipClass(false)}>
+                   </button>
+                 </ItemLabelPopover>
+               );
+@@ -252,10 +282,27 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+                 className={itemLabelChipClass(item.closedBy !== null, isRecent(item))}
+               >
                  {item.label}
 +                <ItemLabelChipMarks
 +                  commentCount={item.comments.length}
@@ -1139,7 +1166,7 @@ index 77a05f5690427b3656f637ae80a03073a62b38d1..bf6a1af9643dd83f424c22f02412a4da
 +                />
                </span>
              ))}
-             <span className="text-xs">+{open.length}</span>
+             <span className="text-xs">+{chips.length}</span>
            </span>
 +          {draftTotal > 0 && (
 +            <button
@@ -1157,41 +1184,57 @@ index 77a05f5690427b3656f637ae80a03073a62b38d1..bf6a1af9643dd83f424c22f02412a4da
            <ChevronDownIcon className="size-4 shrink-0 transition-transform group-open:rotate-180" />
          </summary>
          {/* Capped like the Plan tracker so a long list can't swallow the chat. */}
-         <div className="max-h-[180px] overflow-y-auto border-t border-border py-1">
-           {open.map((item) => (
--            <ItemRow key={item.label} item={item} />
-+            <ItemRow key={item.label} item={item} draftCount={draftCounts.get(item.label) ?? 0} />
-           ))}
-           {closed.length > 0 && (
-             <div className="px-3 pt-2 pb-1 text-xs text-muted-foreground">
-@@ -173,7 +221,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+@@ -267,6 +314,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+             <ItemRow
+               key={item.label}
+               item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
+               recent
+               onDismiss={item.closedBy === null ? () => dismiss(item.label) : undefined}
+             />
+@@ -280,6 +328,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+             <ItemRow
+               key={item.label}
+               item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
+               recent={false}
+               onDismiss={() => dismiss(item.label)}
+             />
+@@ -290,7 +339,12 @@ export function OpenItemsPanel({ className }: { className?: string }) {
              </div>
            )}
            {closed.map((item) => (
--            <ItemRow key={item.label} item={item} />
-+            <ItemRow key={item.label} item={item} draftCount={draftCounts.get(item.label) ?? 0} />
+-            <ItemRow key={item.label} item={item} recent={false} />
++            <ItemRow
++              key={item.label}
++              item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
++              recent={false}
++            />
            ))}
-         </div>
-       </details>
+           {dismissedItems.length > 0 && (
+             <button
+@@ -307,6 +361,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+               <ItemRow
+                 key={item.label}
+                 item={item}
++                draftCount={draftCounts.get(item.label) ?? 0}
+                 recent={false}
+                 onRestore={() => restore(item.label)}
+               />
 diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
-index d0481788f89fde902b21ce6fe0ec3d819cd780f2..332f3a8107eaf780a32f47be692c33d6fe68aea6 100644
+index 393a7e97dbb908a39707c282a637f7b5716a59a7..dece9fe9000858a21d2e94a40feecbe25cb50918 100644
 --- a/web/src/components/chat/Transcript.tsx
 +++ b/web/src/components/chat/Transcript.tsx
-@@ -31,7 +31,12 @@ import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
- import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
- import { useSearchParams } from "@/lib/routing";
- import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
--import { ItemLabelIndexContext } from "@/lib/itemLabels";
-+import {
-+  ItemLabelIndexContext,
-+  ItemLabelSessionContext,
-+  type ItemLabelIndex,
-+} from "@/lib/itemLabels";
+@@ -37,6 +37,7 @@ import {
+   ItemLabelSessionContext,
+   type ItemLabelIndex,
+ } from "@/lib/itemLabels";
 +import { publishItemLabelIndex } from "@/lib/itemCommentDrafts";
  import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
  import { useUserMessageNav } from "@/hooks/useUserMessageNav";
  import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-@@ -327,10 +332,15 @@ function TranscriptImpl({
+@@ -378,6 +379,11 @@ function TranscriptImpl({
      () => buildBubbleItemLabelIndex(display.bubbles),
      [display.bubbles],
    );
@@ -1203,42 +1246,20 @@ index d0481788f89fde902b21ce6fe0ec3d819cd780f2..332f3a8107eaf780a32f47be692c33d6
    const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
    const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
    return (
--    <ItemLabelIndexContext.Provider value={itemLabelIndex}>
-+    <ItemLabelScope index={itemLabelIndex} sessionId={display.conversationId ?? null}>
-       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
-       overlay) so it shrinks the scroll area rather than covering messages.
-       Self-hides with no tasks. */}
-@@ -470,6 +480,25 @@ function TranscriptImpl({
-           />
-         )}
-       </div>
-+    </ItemLabelScope>
-+  );
-+}
-+
-+/** Gives the transcript's item labels their index, and the session their drafts belong to. */
-+function ItemLabelScope({
-+  index,
-+  sessionId,
-+  children,
-+}: {
-+  index: ItemLabelIndex;
-+  sessionId: string | null;
-+  children: React.ReactNode;
-+}) {
-+  return (
-+    <ItemLabelIndexContext.Provider value={index}>
-+      <ItemLabelSessionContext.Provider value={sessionId}>
-+        {children}
-+      </ItemLabelSessionContext.Provider>
-     </ItemLabelIndexContext.Provider>
+@@ -539,7 +545,7 @@ function TranscriptImpl({
    );
  }
+ 
+-/** Gives the transcript's item labels their index, and the session they belong to. */
++/** Gives the transcript's item labels their index, and the session their drafts belong to. */
+ function ItemLabelScope({
+   index,
+   sessionId,
 diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
-index f5909b70ef079b3af9ced5db971d697fec9c3b71..c787145d279fcd847f2947361017db09ef44facd 100644
+index 8bda49dded5807c291c954036af9080f2adbdb47..2ddea290fc76c97533c40ee3b6b6010bb516a01b 100644
 --- a/web/src/components/chat/chatBubbleParts.tsx
 +++ b/web/src/components/chat/chatBubbleParts.tsx
-@@ -63,6 +63,7 @@ import {
+@@ -69,6 +69,7 @@ import {
    imagePreview,
    isTextBlock,
    keyedAttachments,
@@ -1246,7 +1267,7 @@ index f5909b70ef079b3af9ced5db971d697fec9c3b71..c787145d279fcd847f2947361017db09
  } from "@/lib/blocks";
  import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
  import { getCurrentAuthorId } from "@/lib/identity";
-@@ -86,12 +87,12 @@ import { buildMessageDeepLink } from "@/lib/messageDeepLink";
+@@ -94,12 +95,12 @@ import { buildMessageDeepLink } from "@/lib/messageDeepLink";
  import {
    ItemLabelMessageContext,
    buildItemLabelIndex,
@@ -1261,7 +1282,7 @@ index f5909b70ef079b3af9ced5db971d697fec9c3b71..c787145d279fcd847f2947361017db09
  import { copyText } from "@/lib/clipboard";
  import { copyMarkdown } from "@/lib/copyMarkdown";
  import { showToast } from "@/components/ui/toast";
-@@ -182,35 +183,57 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
+@@ -192,35 +193,57 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
  // Finalized bubbles are reused by reference across rebuilds, so each is scanned once.
  const itemLabelScans = new WeakMap<Bubble, ItemLabelScan>();
  
@@ -4236,18 +4257,18 @@ index 0000000000000000000000000000000000000000..1981cf54ad4b0fd8433de9cf2edfa23b
 +  };
 +}
 diff --git a/web/src/lib/itemLabels.test.ts b/web/src/lib/itemLabels.test.ts
-index 0abe54cf4d5808231608b8defa7941ce3f777d95..2bea08dd0329a8f62cc94bcf5a45541afa0fe3ba 100644
+index 67ba29690bf84629b3d91b36fce1d39f5ad72043..ca394773678d6e54762a97b09799d4f55a6dd28e 100644
 --- a/web/src/lib/itemLabels.test.ts
 +++ b/web/src/lib/itemLabels.test.ts
-@@ -11,6 +11,7 @@ import {
-   struckItemLabelsIn,
+@@ -15,6 +15,7 @@ import {
+   type ItemLabelIndex,
    type ItemLabelSource,
  } from "./itemLabels";
 +import { buildItemCommentMessage, scanItemLabelSource } from "./itemComments";
  
  describe("itemLabelsIn", () => {
    it("finds distinct labels in order and ignores code, links, and non-label brackets", () => {
-@@ -175,6 +176,97 @@ describe("buildItemLabelIndex", () => {
+@@ -214,6 +215,97 @@ describe("buildItemLabelIndex", () => {
    });
  });
  
@@ -4346,7 +4367,7 @@ index 0abe54cf4d5808231608b8defa7941ce3f777d95..2bea08dd0329a8f62cc94bcf5a45541a
    it("finds labels inside strikethrough spans, outside code", () => {
      const markdown = [
 diff --git a/web/src/lib/itemLabels.ts b/web/src/lib/itemLabels.ts
-index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb6848b92e 100644
+index 8b6814ea6f55290f1797750ed673b22cc966bf58..1b08ae22005b367f42f8685b08b0abfd9ff7a84b 100644
 --- a/web/src/lib/itemLabels.ts
 +++ b/web/src/lib/itemLabels.ts
 @@ -2,7 +2,8 @@
@@ -4358,8 +4379,8 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
 +// except a user's comment heading (`#### [Q3] …`), which leaves the state alone.
  
  import { createContext } from "react";
- 
-@@ -18,12 +19,40 @@ function itemLabelPattern(): RegExp {
+ import { LABEL_VALUE_MAX_LENGTH } from "@/lib/sessionLabels";
+@@ -19,12 +20,40 @@ function itemLabelPattern(): RegExp {
    return new RegExp(ITEM_LABEL_SOURCE, "g");
  }
  
@@ -4400,7 +4421,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  }
  
  /** What one message says about labels. */
-@@ -33,6 +62,20 @@ export interface ItemLabelScan {
+@@ -34,6 +63,20 @@ export interface ItemLabelScan {
    labels: readonly string[];
    /** Labels this message mentions struck through. */
    struck: readonly string[];
@@ -4421,8 +4442,8 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  }
  
  /** One labelled item across the transcript. */
-@@ -44,6 +87,8 @@ export interface ItemLabelEntry {
-   closedBy: ItemLabelSource | null;
+@@ -47,6 +90,8 @@ export interface ItemLabelEntry {
+   lastMention: ItemLabelSource;
    /** How many messages mention the label. */
    messageCount: number;
 +  /** Comments sent on the item, oldest first. */
@@ -4430,14 +4451,15 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  }
  
  export interface ItemLabelIndex {
-@@ -62,28 +107,77 @@ export const ItemLabelIndexContext = createContext<ItemLabelIndex | null>(null);
+@@ -67,30 +112,83 @@ export const ItemLabelIndexContext = createContext<ItemLabelIndex | null>(null);
  /** Id of the message whose markdown is being rendered. */
  export const ItemLabelMessageContext = createContext<string | null>(null);
  
--/** Builds the index from messages in transcript order; the first definition wins. */
+-/** The session whose transcript is rendering labels. */
 +/** The session whose transcript is rendering labels, for its comment drafts. */
-+export const ItemLabelSessionContext = createContext<string | null>(null);
-+
+ export const ItemLabelSessionContext = createContext<string | null>(null);
+ 
+-/** Builds the index from messages in transcript order; the first definition wins. */
 +function stemOf(filename: string): string {
 +  const dot = filename.lastIndexOf(".");
 +  return dot > 0 ? filename.slice(0, dot) : filename;
@@ -4466,6 +4488,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIndex {
    const items = new Map<string, ItemLabelEntry>();
    let enabled = false;
+   let latestReply: ItemLabelSource | null = null;
 -  for (const { source, labels, struck } of scans) {
 +  let awaitingReply: { label: string; comment: ItemLabelComment }[] = [];
 +  for (const { source, labels, struck, comments, commentHeadingOnly } of scans) {
@@ -4474,16 +4497,28 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
        const closedBy = struck.includes(label) ? source : null;
        const entry = items.get(label);
        if (!entry) {
--        items.set(label, { label, source, closedBy, messageCount: 1 });
-+        items.set(label, { label, source, closedBy, messageCount: 1, comments: [] });
+-        items.set(label, { label, source, closedBy, lastMention: source, messageCount: 1 });
++        items.set(label, {
++          label,
++          source,
++          closedBy,
++          lastMention: source,
++          messageCount: 1,
++          comments: [],
++        });
          continue;
        }
 -      entry.closedBy = closedBy;
 +      if (!commentHeadingOnly?.includes(label)) entry.closedBy = closedBy;
+       entry.lastMention = source;
        entry.messageCount += 1;
        enabled = true;
      }
+-    // A tool-only turn has no text and isn't the reply the user is reading.
+-    if (source.role === "assistant" && source.text.trim() !== "") latestReply = source;
 +    if (source.role === "assistant") {
++      // A tool-only turn has no text and isn't the reply the user is reading.
++      if (source.text.trim() !== "") latestReply = source;
 +      for (const { label, comment } of awaitingReply) {
 +        const sentence = labels.includes(label) ? extractLabelSentence(source.text, label) : null;
 +        if (sentence) comment.reply = { source, sentence };
@@ -4505,7 +4540,10 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
 +      }
 +    }
    }
-   return { enabled, items };
+   return { enabled, items, latestReply };
+ }
+@@ -138,7 +236,7 @@ export function encodeDismissedItems(labels: Iterable<string>): string | null {
+   return encoded === "" ? null : encoded;
  }
  
 -interface ScannedLine {
@@ -4513,7 +4551,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
    text: string;
    /** Inside a fenced code block, or one of its fence lines. */
    inFence: boolean;
-@@ -91,7 +185,8 @@ interface ScannedLine {
+@@ -146,7 +244,8 @@ interface ScannedLine {
  
  const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
  
@@ -4523,7 +4561,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
    const lines: ScannedLine[] = [];
    let fence: string | null = null;
    for (const text of markdown.split("\n")) {
-@@ -113,7 +208,8 @@ function withoutInlineCode(line: string): string {
+@@ -168,7 +267,8 @@ function withoutInlineCode(line: string): string {
    return line.replace(/(`+)[^`]*?\1/g, (span) => " ".repeat(span.length));
  }
  
@@ -4534,10 +4572,10 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  }
  
 diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
-index e54a0538e6dcc2ebfcf0658cd1cd761d1ca4e43a..2fca9f06918426ea8b3f119ed5bc29c489eae1d7 100644
+index a3691d9d8d6e8486ca9e566e3a6df802363ab48f..e7fee58992d0a0ca5af844867242663d6fb5b05a 100644
 --- a/web/src/pages/ChatPage.composer.test.tsx
 +++ b/web/src/pages/ChatPage.composer.test.tsx
-@@ -32,6 +32,14 @@ import {
+@@ -35,6 +35,14 @@ import {
  import { setOmnigentHostConfig } from "@/lib/host";
  import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
  import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -4552,7 +4590,7 @@ index e54a0538e6dcc2ebfcf0658cd1cd761d1ca4e43a..2fca9f06918426ea8b3f119ed5bc29c4
  import * as host from "@/lib/host";
  import * as identity from "@/lib/identity";
  import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
-@@ -430,6 +438,147 @@ describe("Composer session drafts", () => {
+@@ -479,6 +487,147 @@ describe("Composer session drafts", () => {
    });
  });
  
@@ -4701,7 +4739,7 @@ index e54a0538e6dcc2ebfcf0658cd1cd761d1ca4e43a..2fca9f06918426ea8b3f119ed5bc29c4
    beforeEach(() => {
      clearSessionDrafts();
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b28ff6dccd 100644
+index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325d5026173 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
 @@ -25,7 +25,14 @@ import {
@@ -4720,16 +4758,16 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
  import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
  import {
    composerSendShortcutKeys,
-@@ -56,6 +63,8 @@ import { useAppName } from "@/lib/branding";
- import { hasPendingOwnElicitation } from "@/lib/blocks";
+@@ -60,6 +67,8 @@ import { hasPendingOwnElicitation } from "@/lib/blocks";
  import { cn } from "@/lib/utils";
+ import { isInlineRenameFocused } from "@/lib/inlineRename";
  import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 +import { ItemCommentModeHeader, ItemCommentTray } from "@/components/composer/ItemCommentTray";
 +import { useItemCommentMode, type ComposerContent } from "@/hooks/useItemCommentMode";
  import {
    serverSwitcherHiddenForSurface,
    useSurfaceFrontmost,
-@@ -92,6 +101,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
+@@ -98,6 +107,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
  import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
  import {
    takeFailedSendDraft,
@@ -4737,7 +4775,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
    composerAttachmentKey,
    consumePendingInitialPrompt,
    holdsInitialDraft,
-@@ -2743,6 +2753,9 @@ function ComposerImpl(
+@@ -2862,6 +2872,9 @@ function ComposerImpl(
    valueRef.current = fullText;
    const replyDraftRef = useRef(storedReplyDraft);
    replyDraftRef.current = storedReplyDraft;
@@ -4747,9 +4785,9 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
    // Guards against React StrictMode double-invoke in development:
    // setup → cleanup → setup runs cleanup before the user has touched
    // the input, which would delete the draft. Only save when the user
-@@ -2820,13 +2833,17 @@ function ComposerImpl(
-     draftConversationIdRef.current = conversationId ?? null;
-     if (!isMobileRef.current) textareaRef.current?.focus();
+@@ -2942,13 +2955,17 @@ function ComposerImpl(
+     // The store binds a clicked session a moment later; keep focus in a rename started meanwhile.
+     if (!isMobileRef.current && !isInlineRenameFocused()) textareaRef.current?.focus();
  
 +    // Read when the session is left: the composer may be mid-comment then.
 +    const setAsideRef = commentSetAsideRef;
@@ -4770,7 +4808,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
      };
    }, [conversationId, replaceText]);
  
-@@ -2834,7 +2851,13 @@ function ComposerImpl(
+@@ -2972,7 +2989,13 @@ function ComposerImpl(
    // rather than only learning about a draft when this composer unmounts.
    useEffect(() => {
      if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
@@ -4785,7 +4823,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
    }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
  
    const terminalPending = useChatStore((s) => s.terminalPending);
-@@ -3052,6 +3075,63 @@ function ComposerImpl(
+@@ -3205,6 +3228,63 @@ function ComposerImpl(
      // setMentionedItems is a stable useState setter (from useMentionBrowser).
    }, [pendingComposerAttachments, setMentionedItems]);
  
@@ -4849,7 +4887,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
    // Restore the text (and attachments) of a send that failed, so the user can
    // fix and resend instead of retyping. The composer is empty in the normal
    // case — `submit` clears it optimistically — so only fill it when the user
-@@ -3067,10 +3147,14 @@ function ComposerImpl(
+@@ -3221,9 +3301,17 @@ function ComposerImpl(
      // conversation's draft and wrongly conclude the user is mid-sentence,
      // dropping the failed message on the way back to the session it failed in.
      if (settledConversationId !== conversationId) return;
@@ -4858,14 +4896,17 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
 +      !committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft) &&
 +      takeFailedCommentSend(failedSendDraft.text);
      // Re-check live delivery and preserve any newer input before consuming the failure.
-     const failed = takeFailedSendDraft(
-       failedSendDraft.conversationId,
--      valueRef.current.trim() !== "" || filesRef.current.length > 0,
-+      commentRestored || valueRef.current.trim() !== "" || filesRef.current.length > 0,
-     );
+     const hasNewerInput = valueRef.current.trim() !== "" || filesRef.current.length > 0;
+-    const failed = takeFailedSendDraft(failedSendDraft.conversationId, hasNewerInput, true);
++    const failed = takeFailedSendDraft(
++      failedSendDraft.conversationId,
++      commentRestored || hasNewerInput,
++      !commentRestored,
++    );
      if (!failed) return;
-     pendingFailedSendRestore.current = failed.stableId
-@@ -3081,7 +3165,14 @@ function ComposerImpl(
+     if (hasNewerInput) {
+       const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
+@@ -3239,7 +3327,14 @@ function ComposerImpl(
      dirtyRef.current = true;
      if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
      if (!isMobileRef.current) textareaRef.current?.focus();
@@ -4881,7 +4922,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
  
    // Retract a restored failed-send draft once its send proves delivered (its
    // committed item arrived over the stream or a reconnect snapshot). Edits win:
-@@ -3571,6 +3662,11 @@ function ComposerImpl(
+@@ -3779,6 +3874,11 @@ function ComposerImpl(
    }: { resetNativeInputSession?: boolean } = {}) => {
      // The /btw overlay locks the composer — never send while it's open.
      if (composerLockedByBtw) return;
@@ -4893,7 +4934,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
      const trimmed = fullText.trim();
      // Allow send if there's text, attached files, OR "@"-tagged paths.
      if (
-@@ -3734,7 +3830,7 @@ function ComposerImpl(
+@@ -3942,7 +4042,7 @@ function ComposerImpl(
  
    const handleSubmit = (e: FormEvent) => {
      e.preventDefault();
@@ -4902,7 +4943,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
        onStop();
        return;
      }
-@@ -3767,7 +3863,12 @@ function ComposerImpl(
+@@ -3985,7 +4085,12 @@ function ComposerImpl(
      // steers everything: the draft, if any, is submitted first so it joins the
      // queue tail (or sends directly when idle), then every queued message is
      // sent into the running turn in FIFO order instead of draining one per idle.
@@ -4916,7 +4957,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
        e.preventDefault();
        if (!mentionListingPending) submit();
        // While unreachable the queue waits for the host, so nothing is steered.
-@@ -3800,6 +3901,12 @@ function ComposerImpl(
+@@ -4018,6 +4123,12 @@ function ComposerImpl(
        submit();
        return;
      }
@@ -4929,7 +4970,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
      // Esc dismisses the /btw sidechat overlay if open
      if (e.key === "Escape" && btwSidechat) {
        e.preventDefault();
-@@ -3817,6 +3924,7 @@ function ComposerImpl(
+@@ -4035,6 +4146,7 @@ function ComposerImpl(
      // Recall starts from empty text; boundary checks preserve caret movement
      // through wrapped recalled entries. Modified arrows belong to global hotkeys.
      if (
@@ -4937,9 +4978,9 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
        (draft.quotes.length === 0 || recallingRef.current) &&
        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
        !e.metaKey &&
-@@ -3828,6 +3936,11 @@ function ComposerImpl(
+@@ -4046,6 +4158,11 @@ function ComposerImpl(
          // Empty-composer recall takes the last queued row before browsing history.
-         if (fullText === "" && files.length === 0 && mentionedItems.length === 0) {
+         if (composerEmptyForRecall) {
            const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
 +          if (target !== undefined && commentMode.restoreQueuedMessage(target.text)) {
 +            e.preventDefault();
@@ -4949,7 +4990,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
            if (target !== undefined) {
              e.preventDefault();
              resetCursor();
-@@ -3901,13 +4014,33 @@ function ComposerImpl(
+@@ -4123,6 +4240,21 @@ function ComposerImpl(
            bottom corners when the surface below is at least as wide,
            otherwise page background shows and the tray floats detached. */}
        <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
@@ -4971,9 +5012,10 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
          {/* Queued messages — peeks above the workspace bar like the
              sub-agent tray. Lists follow-ups held while the agent is busy;
              drains FIFO on idle. Scope to this conversation so a queue held
-             elsewhere never leaks in. */}
+@@ -4130,7 +4262,12 @@ function ComposerImpl(
          <QueuedMessagesStrip
            messages={composerQueuedMessages}
+           arrowUpRecallQueueId={arrowUpRecallQueueId}
 -          onDelete={dequeueMessage}
 +          onDelete={(queueId) => {
 +            const target = queuedMessages.find((m) => m.queueId === queueId);
@@ -4984,7 +5026,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
            onEdit={(queueId) => {
              // Pull the queued message back into the composer for editing:
              // replace the composer's text + attachments with the queued
-@@ -3915,6 +4048,11 @@ function ComposerImpl(
+@@ -4138,6 +4275,11 @@ function ComposerImpl(
              // Re-sending re-queues it (busy) or sends it (idle).
              const target = queuedMessages.find((m) => m.queueId === queueId);
              if (!target) return;
@@ -4996,16 +5038,16 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
              replaceText(target.text, target.replyDraft);
              dirtyRef.current = true;
              resetCursor();
-@@ -3936,7 +4074,7 @@ function ComposerImpl(
-         <ComposerWorkspaceBar
-           data-testid="composer-workspace-controls"
-           className={cn(
--            hasQueuedComposerMessages &&
-+            (hasQueuedComposerMessages || showCommentTray) &&
-               "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
-           )}
-         >
-@@ -4004,19 +4142,21 @@ function ComposerImpl(
+@@ -4160,7 +4302,7 @@ function ComposerImpl(
+           <ComposerWorkspaceBar
+             data-testid="composer-workspace-controls"
+             className={cn(
+-              hasQueuedComposerMessages &&
++              (hasQueuedComposerMessages || showCommentTray) &&
+                 "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
+             )}
+           >
+@@ -4241,19 +4383,21 @@ function ComposerImpl(
            "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
            placeholder: composerLockedByBtw
              ? "Side chat open — press Esc to close"
@@ -5038,9 +5080,9 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
 +                          ? "Send a follow-up (queued) — Esc to stop"
 +                          : readyPlaceholder,
            rows: 1,
-           // An Arca send waits in the queue for the host, so typing reopens; other gates stay.
-           disabled:
-@@ -4066,6 +4206,17 @@ function ComposerImpl(
+           disabled: inputDisabled,
+           "data-slash-command": composerIsCommand ? "true" : undefined,
+@@ -4299,6 +4443,17 @@ function ComposerImpl(
              ) : undefined,
            beforeInput: (
              <>
@@ -5058,7 +5100,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
                {/* Slash-command suggestions — floats above the composer box */}
                {slashCompletion.open && (
                  <SlashCommandMenu
-@@ -4313,32 +4464,53 @@ function ComposerImpl(
+@@ -4573,41 +4728,60 @@ function ComposerImpl(
                    resetCursor();
                  }}
                />
@@ -5076,18 +5118,19 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
 -                            sendDisabledReason !== null ||
 -                            hasPendingElicitation
 -                      }
--                      title={showInterruptButton ? "Interrupt" : (sendDisabledReason ?? undefined)}
+-                      title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
 -                      label={showInterruptButton ? "Interrupt" : "Send"}
 -                    />
 -                  </TooltipTrigger>
--                  {!showInterruptButton && !preventsKeyboardSubmit && (
+-                  {showInterruptButton ? (
+-                    // The message box takes Esc to interrupt, so not while it's disabled
+-                    // or while dictation listens (Esc then cancels the take).
 -                    <KeyboardShortcutTooltipContent
--                      label="Send"
--                      keys={composerSendShortcutKeys(submitWithModEnter)}
+-                      label="Interrupt"
+-                      keys={inputDisabled || dictating ? [] : [ESC_KEY]}
 -                    />
--                  )}
--                </Tooltip>
--              </TooltipProvider>
+-                  ) : (
+-                    !preventsKeyboardSubmit && (
 +              {commentTarget ? (
 +                <Button
 +                  type="submit"
@@ -5120,17 +5163,30 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
 +                              sendDisabledReason !== null ||
 +                              hasPendingElicitation
 +                        }
-+                        title={
-+                          showInterruptButton ? "Interrupt" : (sendDisabledReason ?? undefined)
-+                        }
++                        title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
 +                        label={showInterruptButton ? "Interrupt" : "Send"}
 +                      />
 +                    </TooltipTrigger>
-+                    {!showInterruptButton && !preventsKeyboardSubmit && (
-+                      <KeyboardShortcutTooltipContent
-+                        label="Send"
-+                        keys={composerSendShortcutKeys(submitWithModEnter)}
-+                      />
++                    {showInterruptButton ? (
++                      // The message box takes Esc to interrupt, so not while it's disabled
++                      // or while dictation listens (Esc then cancels the take).
+                       <KeyboardShortcutTooltipContent
+-                        label="Send"
+-                        keys={composerSendShortcutKeys(submitWithModEnter)}
++                        label="Interrupt"
++                        keys={inputDisabled || dictating ? [] : [ESC_KEY]}
+                       />
+-                    )
+-                  )}
+-                </Tooltip>
+-              </TooltipProvider>
++                    ) : (
++                      !preventsKeyboardSubmit && (
++                        <KeyboardShortcutTooltipContent
++                          label="Send"
++                          keys={composerSendShortcutKeys(submitWithModEnter)}
++                        />
++                      )
 +                    )}
 +                  </Tooltip>
 +                </TooltipProvider>
@@ -5139,7 +5195,7 @@ index 3d2894389db24ba84480cc85c26bc854b3f21d22..fe85fac6fd18708476643e9b3881d4b2
            ),
            testId: "composer-action-row",
 diff --git a/web/src/pages/QueuedMessagesStrip.test.tsx b/web/src/pages/QueuedMessagesStrip.test.tsx
-index 06927ed441e2eaa6cd1d0c30f175da86bae81034..e297f3c24336a1e51ef723513c91a901d7d33675 100644
+index 3ce4cd0e32784cb4fa72b70593f62e607b30f14b..5faa3a80a1eb881b5c269113f2e30c258b06bd9c 100644
 --- a/web/src/pages/QueuedMessagesStrip.test.tsx
 +++ b/web/src/pages/QueuedMessagesStrip.test.tsx
 @@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
@@ -5179,15 +5235,16 @@ index 06927ed441e2eaa6cd1d0c30f175da86bae81034..e297f3c24336a1e51ef723513c91a901
      ["attachment only, named", "", "Screenshot 2026-09-18 at 11.49.24 AM.png"],
      ["attachment only, unnamed", "", ""],
 diff --git a/web/src/pages/QueuedMessagesStrip.tsx b/web/src/pages/QueuedMessagesStrip.tsx
-index fc2a1e7dd1ae44e16b3ea4b5073f26e9edf23a1e..0f280764d0a94daa87756adc67adcf1f32993ae8 100644
+index e2157d005b184d9be41601251c6b44129e48f324..dc121d39eae1c4b08a93cee85e705545dd78b488 100644
 --- a/web/src/pages/QueuedMessagesStrip.tsx
 +++ b/web/src/pages/QueuedMessagesStrip.tsx
-@@ -23,11 +23,15 @@ import {
+@@ -23,12 +23,16 @@ import {
    XIcon,
  } from "lucide-react";
  
 +import { useMemo } from "react";
 +
+ import { ARROW_UP_KEY, KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 +import { itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
  import { Badge } from "@/components/ui/badge";
  import { Button } from "@/components/ui/button";
@@ -5198,7 +5255,7 @@ index fc2a1e7dd1ae44e16b3ea4b5073f26e9edf23a1e..0f280764d0a94daa87756adc67adcf1f
  import { cn } from "@/lib/utils";
  
  /** Keep touch targets large without enlarging the visible glyphs. */
-@@ -124,6 +128,8 @@ function QueuedRow({
+@@ -133,6 +137,8 @@ function QueuedRow({
      setDropRef(node);
    };
    const hasText = message.text.trim().length > 0;
@@ -5207,7 +5264,7 @@ index fc2a1e7dd1ae44e16b3ea4b5073f26e9edf23a1e..0f280764d0a94daa87756adc67adcf1f
    const files = message.files ?? [];
    const attachmentNames = files.map(attachmentFilename);
    const AttachmentIcon = files.every((file) => file.type.startsWith("image/"))
-@@ -165,10 +171,27 @@ function QueuedRow({
+@@ -174,10 +180,27 @@ function QueuedRow({
          />
        )}
        <div className="flex min-w-0 flex-1 items-center gap-2 max-md:flex-col max-md:items-start max-md:gap-0.5">

@@ -31,10 +31,10 @@ Docs: none (fix: queued !cmd bubbles settle after a reconnect; no setting)
  2 files changed, 140 insertions(+), 21 deletions(-)
 
 diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
-index e3b92f7ee00f95383c6ca7171213ebfa43933440..98cb80032c7673bad1b95f205913eb4fc552f773 100644
+index ebe09725a5436ba04e75e269b0da4cdc662db9a0..4807e63fa165dc6d761e47ec3d1eafb1490e59ad 100644
 --- a/web/src/store/chatStore.test.ts
 +++ b/web/src/store/chatStore.test.ts
-@@ -15365,6 +15365,75 @@ describe("chatStore — startStreamPump reconnect loop", () => {
+@@ -17143,6 +17143,75 @@ describe("chatStore — startStreamPump reconnect loop", () => {
      await loop;
    });
  
@@ -111,13 +111,13 @@ index e3b92f7ee00f95383c6ca7171213ebfa43933440..98cb80032c7673bad1b95f205913eb4f
      { path: "ordinary backfill", gapLength: 5 },
      { path: "the fresh-window fallback", gapLength: 100 },
 diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
-index 04b8ddf7613a919d0e7a63c9caa24ccc74c8c3e8..0cfcf9131eb475a3f2f08cc3b9e6323bb2a0ee35 100644
+index 4c1cf87482495409a92d1fe0d965881483a1a602..1f501fcd9b2806b7d0d04dfee5abda104c890b3c 100644
 --- a/web/src/store/chatStore.ts
 +++ b/web/src/store/chatStore.ts
-@@ -54,7 +54,12 @@ import type {
-   UserMessageBlock,
+@@ -55,7 +55,12 @@ import type {
  } from "@/lib/blocks";
  import { userInputElicitationKey } from "@/lib/askUserQuestion";
+ import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 -import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 +import {
 +  isTerminalCommandInput,
@@ -128,10 +128,10 @@ index 04b8ddf7613a919d0e7a63c9caa24ccc74c8c3e8..0cfcf9131eb475a3f2f08cc3b9e6323b
  import { BlockStream } from "@/lib/blockStream";
  import { itemsToBlocks } from "@/lib/itemsToBlocks";
  import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
-@@ -5741,6 +5746,10 @@ async function rehydrateWindowOnReconnect(
+@@ -6240,6 +6245,10 @@ async function rehydrateWindowOnReconnect(
        withoutRebuiltUserInputCards(tail, windowBlocks),
      );
-     const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+     const statusPatch = statusPatchFor(s);
 +    const shellSettled = settleRecoveredShellInputs(
 +      s,
 +      freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
@@ -139,7 +139,7 @@ index 04b8ddf7613a919d0e7a63c9caa24ccc74c8c3e8..0cfcf9131eb475a3f2f08cc3b9e6323b
      const blocks =
        reconcileElicitationBlocks(
          merged,
-@@ -5754,6 +5763,7 @@ async function rehydrateWindowOnReconnect(
+@@ -6254,6 +6263,7 @@ async function rehydrateWindowOnReconnect(
        // Same persisted-item evidence as the reconnect path: a rehydrated item
        // can be a send whose POST died in the gap.
        ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
@@ -147,7 +147,7 @@ index 04b8ddf7613a919d0e7a63c9caa24ccc74c8c3e8..0cfcf9131eb475a3f2f08cc3b9e6323b
        blocks:
          snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
        hasMoreHistory: fresh.hasMore,
-@@ -5900,12 +5910,15 @@ async function reconcileOnReconnect(
+@@ -6425,12 +6435,15 @@ async function reconcileOnReconnect(
        ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
      };
      // `session.input.consumed` is not replayed, so recovered user blocks are
@@ -166,7 +166,7 @@ index 04b8ddf7613a919d0e7a63c9caa24ccc74c8c3e8..0cfcf9131eb475a3f2f08cc3b9e6323b
      }
      let nextBlocks = reconciledBlocks;
      if (unseen.length > 0) {
-@@ -7755,6 +7768,58 @@ function isShellCommandBubble(bubble: PendingUserMessage, command: string): bool
+@@ -8466,6 +8479,58 @@ function isShellCommandBubble(bubble: PendingUserMessage, command: string): bool
  /** Bound replay protection to the server's maximum pending queue size. */
  const MAX_SETTLED_SHELL_INPUTS = 64;
  
@@ -225,7 +225,7 @@ index 04b8ddf7613a919d0e7a63c9caa24ccc74c8c3e8..0cfcf9131eb475a3f2f08cc3b9e6323b
  /**
   * Normalized texts of the committed user-message blocks in `blocks`,
   * dropping empties (image-only messages). The dedup baseline for the
-@@ -8633,23 +8698,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
+@@ -9371,23 +9436,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
        const command = event.kind === "input" ? event.input : null;
        if (command === null) return;
        applyToConversation((s) => {

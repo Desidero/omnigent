@@ -32,9 +32,9 @@ harnesses get it every turn with the other framework instructions.
 claude-native and codex-native take instructions only at launch, so the
 static instruction is appended to the agent's own instructions on
 --append-system-prompt and developer_instructions, for both
-runner-created and CLI-launched sessions. Claude Code honours only the
-last --append-system-prompt, so a user-supplied one is now merged into
-the single flag rather than shadowed. codex-native relies on the
+runner-created and CLI-launched sessions. A user-supplied
+--append-system-prompt is folded into the same flag by upstream's
+_merge_append_system_prompt. codex-native relies on the
 collaboration-mode fix so the always-present developer_instructions
 no longer replace Plan mode's built-in instructions. Other native
 harnesses have no instruction channel and are unchanged.
@@ -45,21 +45,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/chat-item-labels.md                      |  48 +++
- omnigent/harnesses/claude_native/bridge.py    |  33 +-
  omnigent/harnesses/claude_native/main.py      |  20 +-
  omnigent/harnesses/codex_native/main.py       |   8 +-
  omnigent/runner/native/orchestration.py       |  12 +-
  omnigent/runtime/prompt.py                    |  46 +-
  tests/e2e_ui/chat/test_item_label_chips.py    | 138 ++++++
  .../claude_native/test_claude_native.py       |   3 +
- .../test_claude_native_bridge.py              |  26 ++
  .../codex_native/test_codex_native.py         |   3 +
  ...pp_sessions_native_terminals_autocreate.py |  25 +-
  ...t_app_sessions_native_terminals_runtime.py |   9 +-
  tests/runner/test_runner_dispatch.py          |   7 +-
  tests/runtime/test_prompt.py                  |  82 ++--
  tests/spec/test_resolve_agent_bundle.py       |   6 +-
- .../blocks/ChatMarkdown.itemLabels.test.tsx   | 157 +++++++
+ .../blocks/ChatMarkdown.itemLabels.test.tsx   | 162 +++++++
  web/src/components/blocks/ChatMarkdown.tsx    | 198 ++++++++-
  .../components/chat/OpenItemsPanel.test.tsx   | 128 ++++++
  web/src/components/chat/OpenItemsPanel.tsx    | 182 ++++++++
@@ -69,7 +67,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/hooks/useHoverPopover.ts              |  95 +++++
  web/src/lib/itemLabels.test.ts                | 276 ++++++++++++
  web/src/lib/itemLabels.ts                     | 399 ++++++++++++++++++
- 25 files changed, 2034 insertions(+), 89 deletions(-)
+ 23 files changed, 1982 insertions(+), 87 deletions(-)
  create mode 100644 docs/chat-item-labels.md
  create mode 100644 tests/e2e_ui/chat/test_item_label_chips.py
  create mode 100644 web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
@@ -134,62 +132,11 @@ index 0000000000000000000000000000000000000000..7881ca781760c7cfc9e083aca49de413
 +  it. The newest mention decides, so a later plain mention reopens it.
 +- **Open items:** a bar above the thread lists the open labels as chips.
 +  Expand it for every item with its title, closed ones under **Closed (N)**.
-diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
-index 668e172dd4ddf1828f5550c77d55c2b89277604a..9b3ff59a2a13fe0fbe9eb53b0fa5d635a2c175aa 100644
---- a/omnigent/harnesses/claude_native/bridge.py
-+++ b/omnigent/harnesses/claude_native/bridge.py
-@@ -2866,8 +2866,7 @@ def augment_claude_args(
-             str(settings_path),
-         ]
-     )
--    if append_system_prompt:
--        args.extend(["--append-system-prompt", append_system_prompt])
-+    args = _merge_append_system_prompt(args, append_system_prompt)
-     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
-     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
- 
-@@ -2933,6 +2932,36 @@ def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
-     )
- 
- 
-+def _merge_append_system_prompt(args: list[str], addition: str | None) -> list[str]:
-+    """Append ``addition`` to the ``--append-system-prompt`` text in ``args``.
-+
-+    Claude Code honours only the last ``--append-system-prompt``, so a second
-+    flag would silently replace a user-supplied value; fold both into one flag.
-+
-+    :param args: Claude CLI argument list.
-+    :param addition: Omnigent's text to append, or ``None`` to leave ``args`` as is.
-+    :returns: ``args`` with at most one ``--append-system-prompt`` flag.
-+    """
-+    if not addition:
-+        return args
-+    flag = "--append-system-prompt"
-+    existing = _arg_value(tuple(args), flag)
-+    merged: list[str] = []
-+    skip_value = False
-+    for idx, arg in enumerate(args):
-+        if skip_value:
-+            skip_value = False
-+            continue
-+        if arg.startswith(f"{flag}="):
-+            continue
-+        if arg == flag:
-+            skip_value = idx + 1 < len(args) and not args[idx + 1].startswith("--")
-+            continue
-+        merged.append(arg)
-+    merged.extend([flag, f"{existing}\n\n{addition}" if existing else addition])
-+    return merged
-+
-+
- def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
-     """Merge framework-approved tools into Claude's ``--allowedTools`` flag.
- 
 diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
-index 69836210fe2a7926fe28f898c1a15ac8e900545d..490fd0ae25f831778e7f907364e0a8823f9332e6 100644
+index 82398ba50b494fd514044c55b7b6102d75595c76..902efe679f8a25c9ff4c75e6b12d764385d62df4 100644
 --- a/omnigent/harnesses/claude_native/main.py
 +++ b/omnigent/harnesses/claude_native/main.py
-@@ -25,6 +25,7 @@ import uuid
+@@ -26,6 +26,7 @@ import uuid
  
  from omnigent.claude_paths import claude_config_dir
  from omnigent.llms.adapters._content import redact_binary_payloads
@@ -197,7 +144,7 @@ index 69836210fe2a7926fe28f898c1a15ac8e900545d..490fd0ae25f831778e7f907364e0a882
  from omnigent.runtime.tool_result_replay import (
      blocks_from_parsed_list,
      image_payloads_in_blocks,
-@@ -3882,7 +3883,9 @@ def _run_with_local_server(
+@@ -4031,7 +4032,9 @@ def _run_with_local_server(
                      claude_config=claude_config,
                      startup_profiler=startup_profiler,
                      startup_progress=progress,
@@ -208,7 +155,7 @@ index 69836210fe2a7926fe28f898c1a15ac8e900545d..490fd0ae25f831778e7f907364e0a882
                  )
              )
              _mark_startup_step(
-@@ -5228,7 +5231,8 @@ async def _prepare_claude_terminal(
+@@ -5377,7 +5380,8 @@ async def _prepare_claude_terminal(
          marks. ``None`` disables output.
      :param startup_progress: Optional user-visible progress renderer,
          e.g. a handle from :func:`runner_startup_progress`.
@@ -218,7 +165,7 @@ index 69836210fe2a7926fe28f898c1a15ac8e900545d..490fd0ae25f831778e7f907364e0a882
          ``--append-system-prompt``, applied on fresh launch and cold
          resume only — the hot-reattach fast path below returns before
          this is used, so it never relaunches or duplicates the flag.
-@@ -6684,9 +6688,9 @@ async def _launch_claude_terminal(
+@@ -6833,9 +6837,9 @@ async def _launch_claude_terminal(
      :param bridge_dir: Bridge directory shared with Claude's MCP
          MCP server and the web-chat harness.
      :param claude_config: Optional ucode-derived Claude Code config.
@@ -231,7 +178,7 @@ index 69836210fe2a7926fe28f898c1a15ac8e900545d..490fd0ae25f831778e7f907364e0a882
      :param allowed_tools: Optional narrowly scoped Claude tools preapproved
          for this native session.
      :returns: Terminal resource id.
-@@ -6863,9 +6867,9 @@ def _claude_terminal_request(
+@@ -7012,9 +7016,9 @@ def _claude_terminal_request(
      :param ap_auth_headers: Auth headers for the
          ``PermissionRequest`` command hook.
      :param claude_config: Optional ucode-derived Claude Code config.
@@ -245,10 +192,10 @@ index 69836210fe2a7926fe28f898c1a15ac8e900545d..490fd0ae25f831778e7f907364e0a882
          for this native session.
      :returns: JSON body for ``POST /resources/terminals``.
 diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
-index a7557c3c3ac299b88ec61e820ed8327c53f00824..0bd38aa407c29a90bf8e73c109ce38e6c88c6472 100644
+index d8d732928df18da5d754a64cd66a851b87cc1d91..68c2dd1de72af4c3fbf0e2e308e0c1ad4cdab159 100644
 --- a/omnigent/harnesses/codex_native/main.py
 +++ b/omnigent/harnesses/codex_native/main.py
-@@ -108,6 +108,7 @@ from omnigent.native.native_terminal import post_initial_prompt, request_with_42
+@@ -110,6 +110,7 @@ from omnigent.native.native_terminal import post_initial_prompt, request_with_42
  from omnigent.native.native_terminal import (
      terminal_attach_url as _attach_url,
  )
@@ -256,7 +203,7 @@ index a7557c3c3ac299b88ec61e820ed8327c53f00824..0bd38aa407c29a90bf8e73c109ce38e6
  from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
  from omnigent.util.http_retry import jittered_retry_delay
  from omnigent.util.json_types import JsonObject as _JsonObject
-@@ -743,7 +744,9 @@ def _run_with_local_server(
+@@ -752,7 +753,9 @@ def _run_with_local_server(
                      command=command,
                      model=model,
                      startup_progress=progress,
@@ -267,7 +214,7 @@ index a7557c3c3ac299b88ec61e820ed8327c53f00824..0bd38aa407c29a90bf8e73c109ce38e6
                  )
              if resolved_session_id is None:
                  _record_launch_for_fresh_session(prepared.session_id)
-@@ -1131,7 +1134,8 @@ async def _prepare_codex_terminal(
+@@ -1140,7 +1143,8 @@ async def _prepare_codex_terminal(
      :param model: Optional model id.
      :param startup_progress: Optional user-visible progress renderer,
          e.g. a handle from :func:`runner_startup_progress`.
@@ -278,10 +225,10 @@ index a7557c3c3ac299b88ec61e820ed8327c53f00824..0bd38aa407c29a90bf8e73c109ce38e6
          cold resume only — the reattach branch below returns before this
          is used, so it never relaunches or duplicates the value.
 diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index fecc15e0934697216690e141bd9d4934650f6b22..3012bff5181a06295e53948be13c0f2f4017669d 100644
+index e491b1f2fb156bd1c4b680ca166bd8bc8d9c2f81..ad83e9083e008cb32dcf82ea6cce08ec75894694 100644
 --- a/omnigent/runner/native/orchestration.py
 +++ b/omnigent/runner/native/orchestration.py
-@@ -103,6 +103,7 @@ from omnigent.runner.session_init_protocol import (
+@@ -104,6 +104,7 @@ from omnigent.runner.session_init_protocol import (
      RunnerSessionInitEnvelope,
  )
  from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
@@ -289,7 +236,7 @@ index fecc15e0934697216690e141bd9d4934650f6b22..3012bff5181a06295e53948be13c0f2f
  from omnigent.spec.types import AgentSpec
  
  _logger = logging.getLogger("omnigent.runner.app")
-@@ -5614,7 +5615,9 @@ async def _auto_create_codex_terminal(
+@@ -5791,7 +5792,9 @@ async def _auto_create_codex_terminal(
          "\n\n".join(
              x
              for x in [
@@ -300,7 +247,7 @@ index fecc15e0934697216690e141bd9d4934650f6b22..3012bff5181a06295e53948be13c0f2f
                  _codex_routing_note,
              ]
              if x
-@@ -9554,7 +9557,12 @@ async def _auto_create_claude_terminal(
+@@ -9859,7 +9862,12 @@ async def _auto_create_claude_terminal(
          subagent_router_dir=subagent_router_dir,
          append_system_prompt="\n\n".join(
              x
@@ -535,18 +482,18 @@ index 0000000000000000000000000000000000000000..d4bb89de6735438a06e1e6413e3c1977
 +    page.locator(_ASSISTANT).nth(1).get_by_role("button", name="Show item R1").click()
 +    expect(popover).to_contain_text("ON DELETE CASCADE")
 diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
-index 51d7793723bcbe55a5194305ab83130712b15c20..e5bf29bc9a214b87a50d7a69fe2f96ce20edbda3 100644
+index d6d595931442a71319558f0d7ed70bf1c7c32d4e..8746db3e60b753ae0564593504f73ceddd06cd45 100644
 --- a/tests/harnesses/claude_native/test_claude_native.py
 +++ b/tests/harnesses/claude_native/test_claude_native.py
-@@ -41,6 +41,7 @@ from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
- from omnigent.native import native_terminal
+@@ -43,6 +43,7 @@ from omnigent.native import native_terminal
  from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
  from omnigent.runtime import tool_result_replay as trc
+ from omnigent.runtime import workflow
 +from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
  from omnigent.spec import load_omnigent_yaml
  from omnigent.terminals.ws_common import (
      WS_CLOSE_TERMINAL_DETACHED,
-@@ -1721,6 +1722,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+@@ -1802,6 +1803,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -554,7 +501,7 @@ index 51d7793723bcbe55a5194305ab83130712b15c20..e5bf29bc9a214b87a50d7a69fe2f96ce
  
  
  def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
-@@ -1808,6 +1810,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
+@@ -1889,6 +1891,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -562,45 +509,8 @@ index 51d7793723bcbe55a5194305ab83130712b15c20..e5bf29bc9a214b87a50d7a69fe2f96ce
  
  
  def test_local_resume_does_not_print_redundant_resume_hint(
-diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
-index 60be61d7acf8b92145940a83c8effb6c3d5f9147..81af3c6a9690c0a218179dc3babac2da90b6489d 100644
---- a/tests/harnesses/claude_native/test_claude_native_bridge.py
-+++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
-@@ -4178,6 +4178,32 @@ def test_augment_claude_args_appends_caller_system_prompt(
-     assert args[index + 1] == framework_instruction
- 
- 
-+@pytest.mark.parametrize(
-+    "user_args",
-+    [
-+        ("--append-system-prompt", "User guidance.", "--verbose"),
-+        ("--append-system-prompt=User guidance.", "--verbose"),
-+    ],
-+    ids=["split", "joined"],
-+)
-+def test_augment_claude_args_merges_caller_system_prompt(
-+    tmp_path: Path, user_args: tuple[str, ...]
-+) -> None:
-+    """Framework text extends a user-supplied system prompt rather than shadowing it."""
-+    args = augment_claude_args(
-+        user_args,
-+        bridge_dir=tmp_path,
-+        python_executable="/venv/bin/python",
-+        append_system_prompt="Framework guidance.",
-+    )
-+
-+    prompt_flags = [arg for arg in args if arg.startswith("--append-system-prompt")]
-+    assert prompt_flags == ["--append-system-prompt"]
-+    index = args.index("--append-system-prompt")
-+    assert args[index + 1] == "User guidance.\n\nFramework guidance."
-+    assert "--verbose" in args
-+
-+
- def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
-     """Framework preapproval extends rather than replaces the user's allowlist."""
-     args = augment_claude_args(
 diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
-index 52cd6fb56b5d21452190a13d81ab0c1a39411b5a..a2e039b20cbac9551ae9551787596c4f33a4e08d 100644
+index d675f0a06c0978b24b9e7a5bf1db0b2ed86e9504..b42c0ca35bc2db650f416d82ff70e156e3a5d65d 100644
 --- a/tests/harnesses/codex_native/test_codex_native.py
 +++ b/tests/harnesses/codex_native/test_codex_native.py
 @@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
@@ -611,7 +521,7 @@ index 52cd6fb56b5d21452190a13d81ab0c1a39411b5a..a2e039b20cbac9551ae9551787596c4f
  from omnigent.spec import load
  
  # The default-stance auto-review override normalize_codex_permission_launch_args
-@@ -8980,6 +8981,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+@@ -9247,6 +9248,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
  
      assert captured.get("developer_instructions") is not None
      assert "Codex is running in the session terminal" in captured["developer_instructions"]
@@ -619,7 +529,7 @@ index 52cd6fb56b5d21452190a13d81ab0c1a39411b5a..a2e039b20cbac9551ae9551787596c4f
  
  
  def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
-@@ -9062,6 +9064,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
+@@ -9329,6 +9331,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
  
      assert captured.get("developer_instructions") is not None
      assert "Codex is running in the session terminal" in captured["developer_instructions"]
@@ -628,10 +538,10 @@ index 52cd6fb56b5d21452190a13d81ab0c1a39411b5a..a2e039b20cbac9551ae9551787596c4f
  
  @pytest.mark.asyncio
 diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
-index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86fbd256754 100644
+index 48b9777544176ce099fdddf8606ff20a74c90a5c..3335b38461c59692b37a5e913fbe3f40397df8bd 100644
 --- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
 +++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
-@@ -77,6 +77,7 @@ from omnigent.runner.resource_registry import (
+@@ -78,6 +78,7 @@ from omnigent.runner.resource_registry import (
      SessionResourceRegistry,
  )
  from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
@@ -639,7 +549,7 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
  from omnigent.spec.types import AgentSpec, ExecutorSpec
  from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
  from omnigent.terminals import TerminalRegistry
-@@ -166,6 +167,13 @@ def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
+@@ -168,6 +169,13 @@ def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
      return json.loads(settings_path.read_text(encoding="utf-8"))
  
  
@@ -653,7 +563,7 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
  def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
      tmp_path: Path,
  ) -> None:
-@@ -2310,7 +2318,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+@@ -2312,7 +2320,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
  ) -> None:
      """
      Host-spawned launch emits ``--append-system-prompt`` with the agent's
@@ -662,7 +572,7 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
  
      The managed-host wiring in ``runner/native/orchestration.py``
      (``augment_claude_args(..., append_system_prompt=
-@@ -2377,10 +2385,9 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+@@ -2379,10 +2387,9 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
          agent_spec=agent_spec,
      )
  
@@ -676,7 +586,7 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
  
  
  @pytest.mark.asyncio
-@@ -3138,7 +3145,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+@@ -3198,7 +3205,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
  
      # Session titles are generated by an isolated background job, so neither
      # fresh nor resumed Claude terminals receive framework rename instructions.
@@ -685,7 +595,7 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
  
      permission_mode_index = launched_args.index("--permission-mode")
      assert launched_args[permission_mode_index + 1] == "auto"
-@@ -5830,7 +5837,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
+@@ -5890,7 +5897,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
      # early no longer cascades into "no server running" (#540).
      assert spec.keep_alive_after_exit is True
      args = spec.args
@@ -694,7 +604,7 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
      settings = _load_claude_invocation_settings(args)
      assert "PermissionRequest" in settings["hooks"]
      permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
-@@ -6045,7 +6052,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+@@ -6105,7 +6112,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
      assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
      # A pinned session's spawns stay on the claude family, so it gets neither
      # the routed-spawn note nor the pre-approvals the cross-family hop needs.
@@ -703,7 +613,7 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
  
  
  async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
-@@ -6073,7 +6080,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
+@@ -6133,7 +6140,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
      assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
      assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
      # And the auto-harness extras, which only make sense alongside the router.
@@ -713,18 +623,18 @@ index a24784bc453f7261dd42ec959d971fb85dad2288..e2e1e1876e4d4bd678d82f03891dc86f
      assert "mcp__omnigent__sys_session_create" in allowed
  
 diff --git a/tests/runner/test_app_sessions_native_terminals_runtime.py b/tests/runner/test_app_sessions_native_terminals_runtime.py
-index 75f97eb88ca022bbc0a1f0ddf4e48e33a85f0509..14c275ea7bef73c9b271514d092e1f7ddd4e3d2e 100644
+index d95901fc546691abec9ec8bee754d21afcdb8f8c..e66513c5e566b5d379323af19c813f4a7f55d878 100644
 --- a/tests/runner/test_app_sessions_native_terminals_runtime.py
 +++ b/tests/runner/test_app_sessions_native_terminals_runtime.py
-@@ -47,6 +47,7 @@ from omnigent.runner.session_init_protocol import (
+@@ -50,6 +50,7 @@ from omnigent.runner.session_init_protocol import (
      RunnerSessionInitEnvelope,
      RunnerSessionInitSnapshot,
  )
 +from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
  from omnigent.spec.types import AgentSpec, ExecutorSpec
- from tests.budgets import budget
- from tests.runner.conftest import (
-@@ -894,7 +895,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+ from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
+ from omnigent.terminals import TerminalRegistry
+@@ -942,7 +943,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
      assert build_calls[0]["cwd"] == tmp_path / "workspace"
      assert build_calls[0]["trust_project"] is True
      assert build_calls[0]["reconcile_process_registry"] is False
@@ -735,7 +645,7 @@ index 75f97eb88ca022bbc0a1f0ddf4e48e33a85f0509..14c275ea7bef73c9b271514d092e1f7d
      # Persisted pass-through args must reach launch resolution (--profile layering).
      assert resolve_calls and all(
          call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
-@@ -1862,7 +1865,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
+@@ -1914,7 +1917,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
          "mean the session snapshot workspace was ignored."
      )
      assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
@@ -747,7 +657,7 @@ index 75f97eb88ca022bbc0a1f0ddf4e48e33a85f0509..14c275ea7bef73c9b271514d092e1f7d
      # Sandbox-override regression: the launched Codex terminal must inherit
      # the agent's sandbox: none rather than falling back to the platform
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index f62d1bd6ff56c6ddf80920e925ed4378f128516f..a07697c9c697df77cd9e6eeb3f6a3e46fc39dd1d 100644
+index 95d12f0c85ef1d2d90c18598e83e45fe4f059398..295d52278b26babfa67a29897a3581fe70b62c12 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
 @@ -96,7 +96,10 @@ from omnigent.runtime.harnesses._executor_adapter import (
@@ -762,7 +672,7 @@ index f62d1bd6ff56c6ddf80920e925ed4378f128516f..a07697c9c697df77cd9e6eeb3f6a3e46
  from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
  from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
  from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-@@ -12635,7 +12638,7 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
+@@ -13081,7 +13084,7 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
  
  def _contract_composed_instructions(*parts: str) -> str:
      """Compose expected author/request text with framework guidance."""
@@ -999,10 +909,10 @@ index bcf8bd62a0936d371de5206d8f870c217ea9354d..cb1702d12f8de92a141c3352afb4ef85
          assert skill.name in prompt
 diff --git a/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx b/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..f7dc1949fb52c0cb7094a9a55e34b5d56963d659
+index 0000000000000000000000000000000000000000..57e24ef66227603143d69c6cb48ce29baa6996f6
 --- /dev/null
 +++ b/web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,162 @@
 +// Item labels (`[Q2]`) in chat markdown: a later mention previews the block
 +// that defined the item (and how it was closed), the defining message shows a
 +// static badge, and a transcript not using labels keeps the text as written.
@@ -1127,7 +1037,12 @@ index 0000000000000000000000000000000000000000..f7dc1949fb52c0cb7094a9a55e34b5d5
 +  const stubHoverDevice = () =>
 +    vi.stubGlobal(
 +      "matchMedia",
-+      vi.fn((query: string) => ({ matches: query.includes("hover: hover"), media: query })),
++      vi.fn((query: string) => ({
++        matches: query.includes("hover: hover"),
++        media: query,
++        addEventListener: vi.fn(),
++        removeEventListener: vi.fn(),
++      })),
 +    );
 +
 +  it("previews on a desktop mouse hover and stays open over the popover", async () => {
@@ -1161,7 +1076,7 @@ index 0000000000000000000000000000000000000000..f7dc1949fb52c0cb7094a9a55e34b5d5
 +  });
 +});
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index a21f66c05764942f4644fe80f8cac22581e9fb81..5284fa1b56e30171cc9fe967963b686801c8f72a 100644
+index b4e84c3f0119983974167e1af001c4f37a88a62b..61caf203545260a8d49f207439cfde789f7a9e91 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
 @@ -1,11 +1,12 @@
@@ -1207,7 +1122,7 @@ index a21f66c05764942f4644fe80f8cac22581e9fb81..5284fa1b56e30171cc9fe967963b6868
  import { cn } from "@/lib/utils";
  import {
    useFileViewer,
-@@ -501,6 +517,163 @@ function citesSamePlace(
+@@ -520,6 +536,163 @@ function citesSamePlace(
    );
  }
  
@@ -1371,7 +1286,7 @@ index a21f66c05764942f4644fe80f8cac22581e9fb81..5284fa1b56e30171cc9fe967963b6868
  // Markdown images open in the shared lightbox on click, matching uploaded and
  // generated images. (Remote `src`s are still gated by Streamdown's image
  // security; this only adds the zoom affordance to whatever does render.)
-@@ -519,7 +692,7 @@ function ZoomableMarkdownImage({
+@@ -538,7 +711,7 @@ function ZoomableMarkdownImage({
  const FILE_PATH_AWARE_COMPONENTS = {
    inlineCode: WorkspacePathInlineCode,
    img: ZoomableMarkdownImage,
@@ -1380,7 +1295,7 @@ index a21f66c05764942f4644fe80f8cac22581e9fb81..5284fa1b56e30171cc9fe967963b6868
  };
  
  // How often the live (growing) assistant bubble re-parses its markdown. The
-@@ -618,6 +791,8 @@ function remarkHtmlAsText() {
+@@ -642,6 +815,8 @@ function remarkHtmlAsText() {
   * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
   * block rendering too, stripping `<pre>` and collapsing whitespace.
   *
@@ -1389,7 +1304,7 @@ index a21f66c05764942f4644fe80f8cac22581e9fb81..5284fa1b56e30171cc9fe967963b6868
   * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
   * instead of collapsing to spaces per CommonMark. Used for user bubbles,
   * where people type multi-line messages without blank-line paragraph
-@@ -637,17 +812,14 @@ export function FilePathAwareMessageResponse({
+@@ -662,17 +837,14 @@ export function FilePathAwareMessageResponse({
  }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
    const components = FILE_PATH_AWARE_COMPONENTS;
  
@@ -1737,13 +1652,13 @@ index 0000000000000000000000000000000000000000..77a05f5690427b3656f637ae80a03073
 +  );
 +}
 diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
-index 866f46f9e235ed613344855faf5beecc06719425..d0481788f89fde902b21ce6fe0ec3d819cd780f2 100644
+index 4ac340b6ddb9ec6897f10aa0c3c7e1416e68d624..e1f67c2053edc89cd3e3eb73405d31d62c584065 100644
 --- a/web/src/components/chat/Transcript.tsx
 +++ b/web/src/components/chat/Transcript.tsx
-@@ -31,9 +31,11 @@ import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
- import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
+@@ -32,9 +32,11 @@ import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
  import { useSearchParams } from "@/lib/routing";
  import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+ import { onFindOpened } from "@/lib/nativeBridge";
 +import { ItemLabelIndexContext } from "@/lib/itemLabels";
  import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
  import { useUserMessageNav } from "@/hooks/useUserMessageNav";
@@ -1752,7 +1667,7 @@ index 866f46f9e235ed613344855faf5beecc06719425..d0481788f89fde902b21ce6fe0ec3d81
  import {
    RunnerStartingIndicator,
    McpStartupIndicator,
-@@ -44,6 +46,7 @@ import {
+@@ -45,6 +47,7 @@ import {
    type ConversationScroller,
    BubbleView,
    ConversationScrollRefBridge,
@@ -1760,8 +1675,8 @@ index 866f46f9e235ed613344855faf5beecc06719425..d0481788f89fde902b21ce6fe0ec3d81
    HistoryAutoLoader,
    HistoryLoadingIndicator,
    JumpToTopButton,
-@@ -320,14 +323,26 @@ function TranscriptImpl({
-   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+@@ -367,14 +370,26 @@ function TranscriptImpl({
+     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
    const arcaWarning = useArcaShutdownBanner();
    const showArcaBanner = arcaWarning.showForHost(hostId);
 -  const hasPinnedBanner = display.hasTasks || showArcaBanner;
@@ -1790,7 +1705,7 @@ index 866f46f9e235ed613344855faf5beecc06719425..d0481788f89fde902b21ce6fe0ec3d81
        {/* Wrapper div gives us a ref to scope the SelectionPopup to the
        conversation area without requiring Conversation to forward refs. */}
        <div
-@@ -455,7 +470,7 @@ function TranscriptImpl({
+@@ -516,7 +531,7 @@ function TranscriptImpl({
            />
          )}
        </div>
@@ -1800,12 +1715,12 @@ index 866f46f9e235ed613344855faf5beecc06719425..d0481788f89fde902b21ce6fe0ec3d81
  }
  
 diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
-index 0fa6e0f2e0d2c3c403e6cacfa1570dcc925e6cf4..f5909b70ef079b3af9ced5db971d697fec9c3b71 100644
+index f603aaf1886ad5fd2d9b650a3c4d22b50cb063cd..8bda49dded5807c291c954036af9080f2adbdb47 100644
 --- a/web/src/components/chat/chatBubbleParts.tsx
 +++ b/web/src/components/chat/chatBubbleParts.tsx
-@@ -83,6 +83,15 @@ import { useTerminalFirst } from "@/shell/TerminalFirstContext";
- import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
- import { InlineImage, SessionImage } from "@/components/SessionImage";
+@@ -91,6 +91,15 @@ import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+ import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+ import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
  import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 +import {
 +  ItemLabelMessageContext,
@@ -1819,7 +1734,7 @@ index 0fa6e0f2e0d2c3c403e6cacfa1570dcc925e6cf4..f5909b70ef079b3af9ced5db971d697f
  import { copyText } from "@/lib/clipboard";
  import { copyMarkdown } from "@/lib/copyMarkdown";
  import { showToast } from "@/components/ui/toast";
-@@ -170,6 +179,42 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
+@@ -180,6 +189,42 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
      .trim();
  }
  
@@ -1862,7 +1777,7 @@ index 0fa6e0f2e0d2c3c403e6cacfa1570dcc925e6cf4..f5909b70ef079b3af9ced5db971d697f
  const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
  const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
  const MERMAID_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})mermaid(?:\s|$)/im;
-@@ -596,7 +641,13 @@ export const BubbleView = memo(
+@@ -758,7 +803,13 @@ export const BubbleView = memo(
      /** Hide retry/recovery controls when the surrounding session is sealed. */
      recoveryDisabled?: boolean;
    }) {
@@ -1877,7 +1792,7 @@ index 0fa6e0f2e0d2c3c403e6cacfa1570dcc925e6cf4..f5909b70ef079b3af9ced5db971d697f
      if (bubble.kind === "compaction_loading") {
        return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
      }
-@@ -616,13 +667,15 @@ export const BubbleView = memo(
+@@ -778,13 +829,15 @@ export const BubbleView = memo(
        );
      }
      return (

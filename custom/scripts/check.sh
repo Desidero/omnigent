@@ -7,6 +7,7 @@
 # DOC_PATHS) or a "Docs: none (<reason>)" trailer, every "# series:" needs a
 # "## <series>" section in docs/custom/README.md of the applied tree, and the
 # last series must be custom-docs-index, the commit that holds that index.
+# Each series must be one block that comes after every series it "# needs:".
 #
 # --repo     Omnigent clone that has (or can fetch) the BASE commit
 #            (default: $OMNIGENT_REPO, else the clone this script is in).
@@ -56,11 +57,12 @@ problems=()
 for patch in "${patches[@]}"; do
   file="$here/patches/$patch"
   [[ -f "$file" ]] || { problems+=("$patch is listed in custom/series but missing"); continue; }
-  if grep -E '^diff --git a/' "$file" | sed -E 's|^diff --git a/(.*) b/.*$|\1|' \
-      | grep -qE "$DOC_PATHS_RE"; then
+  # grep -q on a pipe can SIGPIPE the writer, which pipefail reports; use strings.
+  touched="$(grep -E '^diff --git a/' "$file" | sed -E 's|^diff --git a/(.*) b/.*$|\1|')"
+  if grep -qE "$DOC_PATHS_RE" <<< "$touched"; then
     continue
   fi
-  if patch_message "$file" | git interpret-trailers --parse | grep -q '^Docs: none ('; then
+  if grep -q '^Docs: none (' <<< "$(patch_message "$file" | git interpret-trailers --parse)"; then
     continue
   fi
   problems+=("$patch has no usage docs and no 'Docs: none (<reason>)' trailer")
@@ -68,7 +70,7 @@ done
 shopt -s nullglob
 for file in "$here"/patches/*.patch; do
   name="$(basename "$file")"
-  printf '%s\n' "${patches[@]}" | grep -qxF -- "$name" || problems+=("$name is not listed in custom/series")
+  grep -qxF -- "$name" <<< "$(printf '%s\n' "${patches[@]}")" || problems+=("$name is not listed in custom/series")
 done
 mapfile -t series_names < <(sed -nE 's/^#[[:space:]]*series:[[:space:]]*([^[:space:]]+).*$/\1/p' \
   "$here/series" | awk '!seen[$0]++')
@@ -77,9 +79,27 @@ last_series="$(sed -nE 's/^#[[:space:]]*series:[[:space:]]*([^[:space:]]+).*$/\1
 if [[ "$last_series" != "$INDEX_SERIES" ]]; then
   problems+=("the last series is ${last_series:-missing}, not $INDEX_SERIES")
 fi
+# Each series is one block, after every series it needs, so any set of
+# series (series-files.sh --only) applies in custom/series order.
+mapfile -t -O "${#problems[@]}" problems < <(awk '
+  /^#[[:space:]]*series:/ {
+    current = $0
+    sub(/^#[[:space:]]*series:[[:space:]]*/, "", current)
+    sub(/[[:space:]].*$/, "", current)
+    if (current in seen) print "series " current " is split into several blocks; keep its patches together"
+    seen[current] = 1
+    next
+  }
+  /^#[[:space:]]*needs:/ {
+    need = $0
+    sub(/^#[[:space:]]*needs:[[:space:]]*/, "", need)
+    sub(/[[:space:]].*$/, "", need)
+    if (!(need in seen)) print "series " current " needs " need ", which does not come before it"
+  }
+' "$here/series")
 if [[ ${#problems[@]} -gt 0 ]]; then
   printf '%s\n' "${problems[@]}" >&2
-  fail "docs check failed: ${problems[0]}"
+  fail "series check failed: ${problems[0]}"
 fi
 
 if [[ -n "$tree_dir" ]]; then
@@ -123,7 +143,7 @@ if [[ -f "$work/$INDEX_PATH" ]]; then
   mapfile -t indexed < <(sed -nE 's/^##[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' "$work/$INDEX_PATH")
 fi
 for name in "${series_names[@]}"; do
-  if ! printf '%s\n' "${indexed[@]}" | grep -qxF -- "$name"; then
+  if ! grep -qxF -- "$name" <<< "$(printf '%s\n' "${indexed[@]}")"; then
     problems+=("series $name has no '## $name' section in $INDEX_PATH")
   fi
 done

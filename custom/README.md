@@ -7,12 +7,10 @@ holds is a set of candidate contributions to Omnigent, kept as patch files
 until they land upstream, and the workflow builds and releases Omnigent with
 them.
 
-> **Status: pending cutover.** This layout replaces the separate
-> `Desidero/omnigent-patches` repository, whose content was imported here in
-> one commit. Until the cutover, that repository is still where the series
-> changes, `custom` is still pushed by hand, and GitHub Actions is off on this
-> fork, so nothing below runs yet. The cutover steps are in
-> [Cutover](#cutover).
+> This layout replaced the separate `Desidero/omnigent-patches` repository
+> (now archived), whose content was imported here in one commit. It is live
+> since 2026-10-28: the first release is `custom/2026-10-28.1`. How it was set
+> up is in [Cutover](#cutover).
 
 Each change here is meant to go upstream. Until it does, it lives here as a
 plain patch file, so you can read it, apply it to your own Omnigent checkout,
@@ -24,7 +22,7 @@ are dropped from the series.
 | Path | What |
 | --- | --- |
 | `custom/BASE` | The upstream commit the series applies to. The branch merges upstream up to exactly this commit. |
-| `custom/series` | The patches in apply order, grouped into named series (`# series: <name>`). A `# needs: <name>` line means that series expects another one first. |
+| `custom/series` | The patches in apply order, grouped into named series (`# series: <name>`), one block per series. A `# needs: <name>` line means that series expects another one first, and it comes earlier in the file. |
 | `custom/patches/*.patch` | `git format-patch` files, one per commit, named `<series>--<subject>.patch`. |
 | `custom/proposals/<series>/` | The draft upstream PR description (`PR.md`), a draft issue where useful (`issue.md`), and `evidence/` (screenshots and logs to attach). `_reviews/` and `_watch/` hold review notes and drafts for upstream threads we only follow. |
 | `custom/scripts/` | Build, export, check, refresh and the upstream-workflow switch (below). |
@@ -79,8 +77,9 @@ scripts default to the clone they are checked out in; `--repo` or
    everywhere (fixed committer, committer date = author date), so the branch
    matches what CI builds and what `custom` holds.
 2. **Change it** like any branch: add commits, amend or `git rebase -i` the
-   patch you are fixing (keep fixups squashed into the patch they fix), drop
-   a patch that landed upstream. Develop a fix headed upstream on a
+   patch you are fixing (keep fixups squashed into the patch they fix, and
+   each series' commits together, after the series it needs), drop a patch
+   that landed upstream. Develop a fix headed upstream on a
    contribution branch cut from `upstream/main`, never from `custom`, and
    cherry-pick it here. Try it with the repo's tests, or install the pull
    request's build (below).
@@ -91,9 +90,10 @@ scripts default to the clone they are checked out in; `--repo` or
    with a warning, so move it in `custom/series` if it belongs elsewhere and
    run the export again. `# needs:` lines and other comments in a series are
    kept. `BASE` must not move here; moving it is a [refresh](#refreshing-the-base).
-4. **Check**: `custom/scripts/check.sh --custom work/<topic>` applies the
-   series in a throwaway worktree, runs the [docs rule](#docs-rule), a quick
-   sanity check (no conflict markers, changed Python and JSON parse) and
+4. **Check**: `custom/scripts/check.sh --custom work/<topic>` checks that
+   each series is one block that comes after every series it needs, applies
+   the series in a throwaway worktree, runs the [docs rule](#docs-rule), a
+   quick sanity check (no conflict markers, changed Python and JSON parse) and
    confirms the result has exactly your branch's tree. After committing,
    `custom/scripts/check-tree.sh` confirms the [tree rule](#the-tree-rule).
 5. **Open a pull request into `patches`**, from a branch named
@@ -149,12 +149,30 @@ needs a person anyway.
 git am -3 $(custom/scripts/series-files.sh --needs toast-safe-area)
 ```
 
-`series-files.sh` prints a series' files in apply order (a `(continued)`
-fixup after the patch it fixes, which a shell glob gets wrong) and, with
-`--needs`, the series it needs first; `--all` prints the whole series. If
+`series-files.sh` prints a series' files in apply order (a shell glob of
+`<series>--*.patch` sorts them by name instead) and, with `--needs`, the
+series it needs first; `--all` prints the whole series. If
 your branch is ahead of `BASE` and a patch conflicts, `-3` falls back to a
 three-way merge; resolve it and `git am --continue`. `git config
 rerere.enabled true` means you resolve each conflict only once.
+
+### Building a set of features
+
+Each series is one feature, and any set of them builds:
+
+```bash
+custom/scripts/build-custom.sh --only link-rules,toast-safe-area work/mine
+custom/scripts/series-files.sh --only link-rules,toast-safe-area   # just list the files
+```
+
+`--only` takes series names, comma-separated (or repeat the option), adds
+every series they need, recursively, and always `custom-docs-index`, and keeps
+the order of `custom/series`; it prints each series it added and why. In the
+built tree, the index (`docs/custom/README.md`) keeps only the sections of the
+series that were built. `series-files.sh --only ... --names` prints the chosen
+series instead of their files. A `# needs:` line also covers a series that
+only conflicts without another one (two rows added next to each other in the
+same table, say), so that every set applies.
 
 ## What CI does
 
@@ -244,19 +262,19 @@ docs say, and the fallbacks for what may not work:
   repository ([#35410](https://github.com/orgs/community/discussions/35410),
   [#151442](https://github.com/orgs/community/discussions/151442), where a tag
   on a commit already on `main` was refused). Built commits match `patches`'
-  workflows except for lacking ours, so the push should pass; confirm it on
-  the first real publish.
+  workflows except for lacking ours, so the push should pass. Untested: this
+  fork pushes with the deploy key instead (next point).
 - **Rulesets:** a ruleset can name bypass actors by repository role, team,
   GitHub App, deploy key or (since 2026-05) user
   ([creating rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository),
   [REST](https://docs.github.com/en/rest/repos/rules),
   [changelog](https://github.blog/changelog/2026-05-07-repository-rulesets-user-bypass-and-branch-renaming/)).
-  Adding the GitHub Actions app (actor type `Integration`) is reported to be
-  refused with a 422 on repositories a user owns ("must be part of the
-  ruleset source or owner organization"; community reports, not docs), and
-  nothing in the docs says workflow-token pushes bypass rulesets. So a
-  ruleset that restricts `custom` and `custom/**` tags probably blocks the
-  workflow token.
+  Adding the GitHub Actions app (actor type `Integration`) is refused with a
+  422 on a repository a user owns ("must be part of the ruleset source or
+  owner organization"; confirmed on this fork), and nothing in the docs says
+  workflow-token pushes bypass rulesets. So this fork's `custom` and
+  `custom/**` rulesets name deploy keys as the bypass, and the pushes use
+  `CUSTOM_DEPLOY_KEY`.
 - **Fallbacks**, as secrets of the `custom-release` environment (limit it to
   the `patches` branch); `publish` uses them only when they are set:
   `CUSTOM_DEPLOY_KEY`, the private half of a deploy key with write access,
@@ -274,34 +292,29 @@ disabled) listens for `custom`, `custom/*` tags or releases.
 
 ## Cutover
 
-Pending; done by the maintainer, in order. The commands assume
-`Desidero/omnigent`.
+Done on 2026-10-28, in this order:
 
-1. Push the branch: `git push origin patches`.
-2. Make `patches` the default branch
-   (`gh repo edit Desidero/omnigent --default-branch patches`). Needed for
-   the manual run button and the daily job, and it keeps built commits free
-   of workflow changes relative to the default branch.
-3. Disable upstream's workflows while Actions is still off:
-   `custom/scripts/disable-upstream-workflows.sh --repo Desidero/omnigent`.
-   If the API refuses while Actions is off, do it straight after the next
-   step.
-4. Turn Actions on
-   (`gh api -X PUT repos/Desidero/omnigent/actions/permissions -F enabled=true -f allowed_actions=all`),
-   then run the script again with `--cancel-runs` and check the listing.
-5. Rulesets: `patches` (require a pull request and the `apply` check, block
-   force pushes and deletion); `custom` and tags `custom/**` (restrict
-   updates, creations and deletions; bypass: Repository admin plus the
-   publishing identity, trying the GitHub Actions integration first and
-   falling back to a deploy key).
-6. GHCR: the first publish creates `ghcr.io/desidero/omnigent-server`,
-   linked to this repository through the workflow token and the image's
-   source label; it starts private. If the package already exists unlinked,
-   give this repository Write under "Manage Actions access" first.
-7. A dry run (`gh workflow run custom-release.yml -R Desidero/omnigent --ref patches`,
-   `dry_run` defaults to true), then the first real release with
-   `-f dry_run=false` or the first merge.
-8. Close the old repository's open pull request and archive it.
+1. Pushed the `patches` branch and made it the default branch, so the manual
+   run button and the daily job work, and built commits add or modify no
+   workflow relative to the default branch.
+2. Disabled upstream's 92 workflows with
+   `custom/scripts/disable-upstream-workflows.sh` while Actions was still off
+   (the API allows it), turned Actions on, and ran the script again with
+   `--cancel-runs`. Nothing of upstream's ran.
+3. Rulesets: `patches` takes pull requests only (the `apply` check, merge
+   commits only, so a refresh keeps its upstream parent; no force push or
+   deletion); `custom` and tags `custom/**` allow updates, creations and
+   deletions only by repository admins and deploy keys. Naming the GitHub
+   Actions integration as a bypass actor is refused on a user-owned
+   repository ("must be part of the ruleset source or owner organization"),
+   so the pushes use the `CUSTOM_DEPLOY_KEY` fallback: a write deploy key
+   whose private half is a secret of the `custom-release` environment, which
+   only the `patches` branch may use.
+4. A dry run, then the first real release by a manual run with
+   `dry_run=false`. The tag and `custom` went out over the deploy key; the
+   release was created with the workflow token, and the image pushed with it
+   to `ghcr.io/desidero/omnigent-server`.
+5. Closed the old repository's pull request and archived it.
 
 ## Releases
 
@@ -367,22 +380,21 @@ request carries it, and the series holds a copy until it merges).
 
 | Series | What it does | Status |
 |---|---|---|
-| `claude-config-dir` | claude-native and claude-sdk follow `CLAUDE_CONFIG_DIR` instead of assuming `~/.claude`. | PR open ([#9617](https://github.com/omnigent-ai/omnigent/pull/9617), carried copy) |
+| `claude-config-dir` | claude-native and claude-sdk follow `CLAUDE_CONFIG_DIR` instead of assuming `~/.claude`. | issue open ([#7124](https://github.com/omnigent-ai/omnigent/issues/7124); the PR this copied, [#9617](https://github.com/omnigent-ai/omnigent/pull/9617), was closed) |
 | `subscription-accounts` | Several Claude or Codex subscription logins per host: pick the account for a new session, switch a running session's account from the harness menu, accounts that share sessions through account tokens, and agents can start a child session on another account. Docs in `docs/providers.md`. Needs `claude-config-dir`. | issue open ([#503](https://github.com/omnigent-ai/omnigent/issues/503)) |
 | `toast-safe-area` | Toasts stay below the iOS status bar and Dynamic Island. | PR open ([#11390](https://github.com/omnigent-ai/omnigent/pull/11390)) |
 | `session-history-paging` | Agents can page through a session's history and list recently updated sessions. | proposed |
 | `terminal-touch` | The terminal on phones and tablets: a Termux-style extra-keys row, long-press select, copy and paste, and native iOS clipboard reads for Paste. | PR open for the extra-keys row ([#6136](https://github.com/omnigent-ai/omnigent/pull/6136), carried copy of its head, which includes our two iOS fixes); the rest proposed (issue drafted) |
 | `telemetry-attribution` | Exported spans carry the acting user (opt-in), the runner and the host. | PR open ([#11380](https://github.com/omnigent-ai/omnigent/pull/11380); issue [#10794](https://github.com/omnigent-ai/omnigent/issues/10794)) |
 | `session-telemetry` | Every span of a turn carries the session's metadata (labels, project, agent, git, workspace, host) and the model and reasoning effort the turn ran with. | PR open ([#11384](https://github.com/omnigent-ai/omnigent/pull/11384), then [#11434](https://github.com/omnigent-ai/omnigent/pull/11434) stacked on it, draft) |
-| `sidebar-attention-filter` | Sidebar filters for sessions that need you or changed recently. | proposed |
+| `sidebar-updated-filter` | A sidebar filter for sessions updated recently (24 hours, 3, 7 or 30 days), with a chip while it is on. | proposed |
 | `claude-sdk-web-tools` | claude-sdk agents can opt into Claude Code's WebSearch and WebFetch. | proposed |
-| `run-suggested-commands` | A Run button on shell commands an agent suggests in chat. | proposed |
-| `codex-native-shell-input` | A web `!command` runs as a Codex shell command instead of reaching the model as a prompt. Rides on `run-suggested-commands`, which carried the first version. | PR open ([#11396](https://github.com/omnigent-ai/omnigent/pull/11396)) |
+| `run-suggested-commands` | A Run button on shell commands an agent suggests in chat (the web half; Codex shell routing is upstream since [#11396](https://github.com/omnigent-ai/omnigent/pull/11396)). | proposed |
 | `claude-native-teammates` | Claude Code agent-team teammates show up as child sessions, and their deliveries no longer appear as raw `<teammate-message>` bubbles. | PR open ([#11388](https://github.com/omnigent-ai/omnigent/pull/11388) for the child sessions, [#11389](https://github.com/omnigent-ai/omnigent/pull/11389) for the deliveries; issue [#10745](https://github.com/omnigent-ai/omnigent/issues/10745)) |
-| `claude-native-subagent-status` | Quiet sub-agents stay "running" until their turn actually ends. | proposed |
+| `claude-native-subagent-status` | Quiet sub-agents stay "running" until their turn actually ends. | covered by open PR [#12411](https://github.com/omnigent-ai/omnigent/pull/12411) (not ours); drop when it merges |
 | `claude-native-coordinator-messages` | A parent agent's follow-ups appear in the sub-agent's chat. | proposed |
 | `skip-gzip-binary-files` | Images and PDFs load in the file viewer again instead of failing with a 500. | PR open ([#10585](https://github.com/omnigent-ai/omnigent/pull/10585), carried copy) |
-| `codex-native-mode-instructions` | Codex keeps its own Plan and Default mode instructions instead of having them replaced by the session's developer instructions. | proposed |
+| `codex-native-mode-instructions` | A Default-mode Codex turn keeps Codex's own Default mode instructions instead of having them replaced by the session's developer instructions (the Plan toggle is upstream since [#11570](https://github.com/omnigent-ai/omnigent/pull/11570)). | proposed |
 | `chat-item-labels` | Bracketed labels like `[Q2]` in chat become chips that preview the item they refer to; `~~[Q2]~~` closes it, and an Open items panel lists what is still open. Adds the labelling rules to agents' instructions. Needs `run-suggested-commands` and `codex-native-mode-instructions`. | proposed |
 | `web-reconnect-shell-inputs` | A queued `!command` no longer stays stuck at the bottom of the chat after the connection drops. | PR open ([#11395](https://github.com/omnigent-ai/omnigent/pull/11395)) |
 | `chat-item-comments` | Comment on labelled items and send the comments together as one structured message. Needs `chat-item-labels`. | proposed |
@@ -394,9 +406,9 @@ request carries it, and the series holds a copy until it merges).
 | `pr-watch` | Watch a session's pull requests and wake the agent on failed checks, conflicts and reviews until they are green. Behind the default-off `pr_watch` feature flag. Needs `subscription-accounts`. | proposed |
 | `claude-native-delegate-idle` | A Claude session stops showing Working, and takes follow-ups without Steer, once its turn ends while a background agent or teammate keeps running. Covers the default OSC status path and agent-team teammates, including lead turns a teammate's message starts. Needs `claude-native-teammates`. | PR open for the status-file part ([#10849](https://github.com/omnigent-ai/omnigent/pull/10849), carried copy); OSC and teammate parts proposed |
 | `delete-stops-runner` | Deleting a session stops its host-launched runner once no remaining session uses it, instead of leaving the process running until its idle timeout. | PR open ([#11391](https://github.com/omnigent-ai/omnigent/pull/11391)) |
-| `app-error-boundary` | A rendering error shows the error, its stack and a Reload button instead of a blank window. | proposed |
-| `jump-to-latest` | A labelled Jump-to-latest pill, outside the scroll fade, that counts new replies landing below a reader who scrolled up. | proposed |
+| `app-error-boundary` | Upstream's render error fallback also shows the error, component stack and path, with Copy details and Reload. | proposed |
 | `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. Needs `chat-features` and `chat-item-comments`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
+| `queue-combine` | The queue strip's Combine merges the messages queued behind a running turn into one (texts joined by a blank line, attachments kept), and Send all combines and steers them; `!` commands, `/`-led messages, Codex `$` skills, failed sends and item-comment messages stay separate. Needs `chat-item-comments`. | proposed (related issues [#10986](https://github.com/omnigent-ai/omnigent/issues/10986), [#4426](https://github.com/omnigent-ai/omnigent/issues/4426), [#8326](https://github.com/omnigent-ai/omnigent/issues/8326)) |
 | `custom-docs-index` | `docs/custom/README.md`, the index of the series: what each changes, how to turn it on, and where its docs are. | custom only |
 
 
