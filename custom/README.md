@@ -7,12 +7,10 @@ holds is a set of candidate contributions to Omnigent, kept as patch files
 until they land upstream, and the workflow builds and releases Omnigent with
 them.
 
-> **Status: pending cutover.** This layout replaces the separate
-> `Desidero/omnigent-patches` repository, whose content was imported here in
-> one commit. Until the cutover, that repository is still where the series
-> changes, `custom` is still pushed by hand, and GitHub Actions is off on this
-> fork, so nothing below runs yet. The cutover steps are in
-> [Cutover](#cutover).
+> This layout replaced the separate `Desidero/omnigent-patches` repository
+> (now archived), whose content was imported here in one commit. It is live
+> since 2026-10-28: the first release is `custom/2026-10-28.1`. How it was set
+> up is in [Cutover](#cutover).
 
 Each change here is meant to go upstream. Until it does, it lives here as a
 plain patch file, so you can read it, apply it to your own Omnigent checkout,
@@ -244,19 +242,19 @@ docs say, and the fallbacks for what may not work:
   repository ([#35410](https://github.com/orgs/community/discussions/35410),
   [#151442](https://github.com/orgs/community/discussions/151442), where a tag
   on a commit already on `main` was refused). Built commits match `patches`'
-  workflows except for lacking ours, so the push should pass; confirm it on
-  the first real publish.
+  workflows except for lacking ours, so the push should pass. Untested: this
+  fork pushes with the deploy key instead (next point).
 - **Rulesets:** a ruleset can name bypass actors by repository role, team,
   GitHub App, deploy key or (since 2026-05) user
   ([creating rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository),
   [REST](https://docs.github.com/en/rest/repos/rules),
   [changelog](https://github.blog/changelog/2026-05-07-repository-rulesets-user-bypass-and-branch-renaming/)).
-  Adding the GitHub Actions app (actor type `Integration`) is reported to be
-  refused with a 422 on repositories a user owns ("must be part of the
-  ruleset source or owner organization"; community reports, not docs), and
-  nothing in the docs says workflow-token pushes bypass rulesets. So a
-  ruleset that restricts `custom` and `custom/**` tags probably blocks the
-  workflow token.
+  Adding the GitHub Actions app (actor type `Integration`) is refused with a
+  422 on a repository a user owns ("must be part of the ruleset source or
+  owner organization"; confirmed on this fork), and nothing in the docs says
+  workflow-token pushes bypass rulesets. So this fork's `custom` and
+  `custom/**` rulesets name deploy keys as the bypass, and the pushes use
+  `CUSTOM_DEPLOY_KEY`.
 - **Fallbacks**, as secrets of the `custom-release` environment (limit it to
   the `patches` branch); `publish` uses them only when they are set:
   `CUSTOM_DEPLOY_KEY`, the private half of a deploy key with write access,
@@ -274,34 +272,29 @@ disabled) listens for `custom`, `custom/*` tags or releases.
 
 ## Cutover
 
-Pending; done by the maintainer, in order. The commands assume
-`Desidero/omnigent`.
+Done on 2026-10-28, in this order:
 
-1. Push the branch: `git push origin patches`.
-2. Make `patches` the default branch
-   (`gh repo edit Desidero/omnigent --default-branch patches`). Needed for
-   the manual run button and the daily job, and it keeps built commits free
-   of workflow changes relative to the default branch.
-3. Disable upstream's workflows while Actions is still off:
-   `custom/scripts/disable-upstream-workflows.sh --repo Desidero/omnigent`.
-   If the API refuses while Actions is off, do it straight after the next
-   step.
-4. Turn Actions on
-   (`gh api -X PUT repos/Desidero/omnigent/actions/permissions -F enabled=true -f allowed_actions=all`),
-   then run the script again with `--cancel-runs` and check the listing.
-5. Rulesets: `patches` (require a pull request and the `apply` check, block
-   force pushes and deletion); `custom` and tags `custom/**` (restrict
-   updates, creations and deletions; bypass: Repository admin plus the
-   publishing identity, trying the GitHub Actions integration first and
-   falling back to a deploy key).
-6. GHCR: the first publish creates `ghcr.io/desidero/omnigent-server`,
-   linked to this repository through the workflow token and the image's
-   source label; it starts private. If the package already exists unlinked,
-   give this repository Write under "Manage Actions access" first.
-7. A dry run (`gh workflow run custom-release.yml -R Desidero/omnigent --ref patches`,
-   `dry_run` defaults to true), then the first real release with
-   `-f dry_run=false` or the first merge.
-8. Close the old repository's open pull request and archive it.
+1. Pushed the `patches` branch and made it the default branch, so the manual
+   run button and the daily job work, and built commits add or modify no
+   workflow relative to the default branch.
+2. Disabled upstream's 92 workflows with
+   `custom/scripts/disable-upstream-workflows.sh` while Actions was still off
+   (the API allows it), turned Actions on, and ran the script again with
+   `--cancel-runs`. Nothing of upstream's ran.
+3. Rulesets: `patches` takes pull requests only (the `apply` check, merge
+   commits only, so a refresh keeps its upstream parent; no force push or
+   deletion); `custom` and tags `custom/**` allow updates, creations and
+   deletions only by repository admins and deploy keys. Naming the GitHub
+   Actions integration as a bypass actor is refused on a user-owned
+   repository ("must be part of the ruleset source or owner organization"),
+   so the pushes use the `CUSTOM_DEPLOY_KEY` fallback: a write deploy key
+   whose private half is a secret of the `custom-release` environment, which
+   only the `patches` branch may use.
+4. A dry run, then the first real release by a manual run with
+   `dry_run=false`. The tag and `custom` went out over the deploy key; the
+   release was created with the workflow token, and the image pushed with it
+   to `ghcr.io/desidero/omnigent-server`.
+5. Closed the old repository's pull request and archived it.
 
 ## Releases
 
