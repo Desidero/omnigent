@@ -11,6 +11,8 @@
 # a commit with an unknown slug joins the previous commit's series (with a warning),
 # so edit custom/series and re-run to file it elsewhere. Comment lines kept per
 # series ("# needs: ...", notes) and the header above the first series survive.
+# Keep each series' commits together on the branch: a series split in two
+# exports as a "(continued)" block, which check.sh rejects.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -94,8 +96,9 @@ if not header:
     header = [
         "# Apply order for the files in custom/patches/, onto the commit in custom/BASE:",
         "#   git am -3 $(custom/scripts/series-files.sh --all)",
-        "# '# series: <name>' starts a series; '# needs: <name>' names a series",
-        "# that has to be applied first if you take this one on its own.",
+        "# '# series: <name>' starts a series, one block each; '# needs: <name>'",
+        "# names a series that has to come first. Build a set of series with",
+        "#   custom/scripts/build-custom.sh --only <name>,<name> <branch>",
     ]
 
 plan, lines, previous, seen, used = [], list(header), None, set(), set()
@@ -113,6 +116,8 @@ for raw in open(commits_path, encoding="utf-8").read().splitlines():
     if series != previous:
         lines.append("")
         if series in seen:
+            print(f"warning: series '{series}' is split; keep its commits together "
+                  "(check.sh fails on a split series)", file=sys.stderr)
             lines.append(f"# series: {series} (continued)")
         else:
             lines.append(f"# series: {series}")

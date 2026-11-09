@@ -78,9 +78,9 @@ Signed-off-by: Desidero <desidero@gmail.com>
  omnigent/runtime/prompt.py                    |  12 +-
  tests/e2e_ui/chat/test_item_label_chips.py    | 160 ++++-
  .../blocks/ChatMarkdown.itemLabels.test.tsx   | 151 ++++-
- web/src/components/blocks/ChatMarkdown.tsx    | 303 ++++++++--
- web/src/components/chat/OpenItemsPanel.tsx    |  92 ++-
- web/src/components/chat/Transcript.tsx        |  33 +-
+ web/src/components/blocks/ChatMarkdown.tsx    | 311 ++++++++--
+ web/src/components/chat/OpenItemsPanel.tsx    |  77 ++-
+ web/src/components/chat/Transcript.tsx        |   8 +-
  web/src/components/chat/chatBubbleParts.tsx   |  45 +-
  web/src/components/chat/itemCommentActions.ts |  16 +
  .../composer/ItemCommentTray.test.tsx         | 222 +++++++
@@ -94,12 +94,12 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/lib/itemComments.test.ts              | 238 ++++++++
  web/src/lib/itemComments.ts                   | 348 +++++++++++
  web/src/lib/itemLabels.test.ts                |  92 +++
- web/src/lib/itemLabels.ts                     | 112 +++-
+ web/src/lib/itemLabels.ts                     | 122 +++-
  web/src/pages/ChatPage.composer.test.tsx      | 149 +++++
  web/src/pages/ChatPage.tsx                    | 276 +++++++--
  web/src/pages/QueuedMessagesStrip.test.tsx    |  22 +
  web/src/pages/QueuedMessagesStrip.tsx         |  29 +-
- 25 files changed, 4215 insertions(+), 153 deletions(-)
+ 25 files changed, 4198 insertions(+), 148 deletions(-)
  create mode 100644 web/src/components/chat/itemCommentActions.ts
  create mode 100644 web/src/components/composer/ItemCommentTray.test.tsx
  create mode 100644 web/src/components/composer/ItemCommentTray.tsx
@@ -113,13 +113,13 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/itemComments.ts
 
 diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
-index 7881ca781760c7cfc9e083aca49de413028acb7b..84e3c6d8471e5f560062849ca909cd5ee06c5c07 100644
+index c71593c419d610591887328648523d73affe649e..58e44a58b30af3e35682ac8cdd2d71c25d6e6745 100644
 --- a/docs/chat-item-labels.md
 +++ b/docs/chat-item-labels.md
-@@ -46,3 +46,54 @@ channel; labels still render when you or the agent write them.
-   it. The newest mention decides, so a later plain mention reopens it.
- - **Open items:** a bar above the thread lists the open labels as chips.
-   Expand it for every item with its title, closed ones under **Closed (N)**.
+@@ -55,3 +55,54 @@ channel; labels still render when you or the agent write them.
+   at the bottom lists it with **Restore**. An item the agent later closes shows
+   as closed as usual. Dismissals are stored on the session, as the
+   `omnigent.items_dismissed` label, so they follow you to other devices.
 +
 +## Comment on items
 +
@@ -608,7 +608,7 @@ index f7dc1949fb52c0cb7094a9a55e34b5d56963d659..80820d311f14901072bd87f4fbc5ea3c
  
    it("does not preview on touch", async () => {
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db8046b04cf0 100644
+index c1831a6df94f276ff6a6eb069ab1666193adb39c..2e2001406c9eaa603e3d36d603d6895905e195f3 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
 @@ -6,14 +6,15 @@
@@ -660,24 +660,41 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
  import { cn } from "@/lib/utils";
  import {
    useFileViewer,
-@@ -530,18 +545,121 @@ export function itemLabelChipClass(closed: boolean): string {
+@@ -520,7 +535,7 @@ function citesSamePlace(
+ const ITEM_LABEL_BADGE_CLASS =
+   "inline-flex items-baseline rounded border border-border bg-muted px-1 font-mono text-[0.85em] leading-snug";
+ const ITEM_LABEL_CLOSED_CLASS = "line-through opacity-60";
+-// Same amber as the message highlight, for items the latest reply mentions.
++// Same amber as the draft dot and message highlight, for items the latest reply mentions.
+ const ITEM_LABEL_RECENT_CLASS = "border-warning/60 bg-warning/15";
+ 
+ /**
+@@ -536,23 +551,126 @@ export function itemLabelChipClass(closed: boolean, recent = false): string {
    );
  }
  
--function describeSource(source: ItemLabelSource): string {
-+/** A chip's accessible name, e.g. "Show item Q2 (closed), 2 comments, 1 draft". */
+-/** A chip's accessible name, e.g. "Show item Q2 (closed), mentioned in the latest reply". */
+-export function itemLabelChipName(label: string, closed: boolean, recent = false): string {
+-  return `Show item ${label}${closed ? " (closed)" : ""}${recent ? ", mentioned in the latest reply" : ""}`;
++/**
++ * A chip's accessible name, e.g. "Show item Q2 (closed), mentioned in the
++ * latest reply, 2 comments, 1 draft".
++ */
 +export function itemLabelChipName(
 +  label: string,
 +  closed: boolean,
 +  commentCount: number,
 +  draftCount: number,
++  recent = false,
 +): string {
 +  const parts = [`Show item ${label}${closed ? " (closed)" : ""}`];
++  if (recent) parts.push("mentioned in the latest reply");
 +  if (commentCount > 0) parts.push(`${commentCount} comment${commentCount === 1 ? "" : "s"}`);
 +  if (draftCount > 0) parts.push(`${draftCount} draft${draftCount === 1 ? "" : "s"}`);
 +  return parts.join(", ");
-+}
-+
+ }
+ 
+-function describeSource(source: ItemLabelSource): string {
 +/** A chip's marks: an amber dot while drafts are unsent, then the sent-comment count. */
 +export function ItemLabelChipMarks({
 +  commentCount,
@@ -787,7 +804,7 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
    const closing = useMemo(
      () => (closedBy ? extractLabelSentence(closedBy.text, label) : null),
      [closedBy, label],
-@@ -554,32 +672,129 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -565,32 +683,129 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
        return next;
      });
    };
@@ -927,7 +944,7 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
                onClick={() => showMessage(closedBy.messageId)}
              >
                Show
-@@ -592,7 +807,21 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -603,7 +818,21 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
            )}
          </div>
        )}
@@ -950,7 +967,7 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
    );
  }
  
-@@ -627,36 +856,42 @@ export function ItemLabelPopover({
+@@ -638,36 +867,42 @@ export function ItemLabelPopover({
  }
  
  /**
@@ -1010,128 +1027,138 @@ index 5284fa1b56e30171cc9fe967963b686801c8f72a..f9205078f3e21fa0874b3073a278db80
      </ItemLabelPopover>
    );
 diff --git a/web/src/components/chat/OpenItemsPanel.tsx b/web/src/components/chat/OpenItemsPanel.tsx
-index 77a05f5690427b3656f637ae80a03073a62b38d1..bf6a1af9643dd83f424c22f02412a4da09a61f9f 100644
+index fa90a49ca033aae6929add93951b05182b4f203b..3017dcefd9e31189cbac7753a62a8a76bd06d847 100644
 --- a/web/src/components/chat/OpenItemsPanel.tsx
 +++ b/web/src/components/chat/OpenItemsPanel.tsx
-@@ -1,7 +1,18 @@
+@@ -1,6 +1,7 @@
  import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
- import { ChevronDownIcon, MessageSquareDotIcon } from "lucide-react";
--import { ItemLabelPopover, itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
--import { ItemLabelIndexContext, itemLabelTitle, type ItemLabelEntry } from "@/lib/itemLabels";
-+import {
+ import { ChevronDownIcon, MessageSquareDotIcon, XIcon } from "lucide-react";
+ import {
 +  ItemLabelChipMarks,
-+  ItemLabelPopover,
-+  itemLabelChipClass,
-+  itemLabelChipName,
-+} from "@/components/blocks/ChatMarkdown";
-+import {
-+  ItemLabelIndexContext,
-+  ItemLabelSessionContext,
-+  itemLabelTitle,
-+  type ItemLabelEntry,
-+} from "@/lib/itemLabels";
+   ItemLabelPopover,
+   itemLabelChipClass,
+   itemLabelChipName,
+@@ -17,6 +18,7 @@ import {
+   mentionedInLatestReply,
+   type ItemLabelEntry,
+ } from "@/lib/itemLabels";
 +import { revealItemCommentTray, useItemCommentDraftCounts } from "@/lib/itemCommentDrafts";
  import { cn } from "@/lib/utils";
  
  // Header chips shown before the row has been measured (or without layout).
-@@ -76,17 +87,20 @@ export function useCollapseOnOutsidePress() {
-   return detailsRef;
- }
+@@ -116,11 +118,13 @@ function useDismissedItems(sessionId: string | null) {
  
--function ItemRow({ item }: { item: ItemLabelEntry }) {
-+function ItemRow({ item, draftCount }: { item: ItemLabelEntry; draftCount: number }) {
-   const closed = item.closedBy !== null;
-   const title = useMemo(() => itemLabelTitle(item.source.text, item.label), [item]);
-   return (
-     <ItemLabelPopover item={item}>
-       <button
-         type="button"
--        aria-label={`Show item ${item.label}${closed ? " (closed)" : ""}`}
-+        aria-label={itemLabelChipName(item.label, closed, item.comments.length, draftCount)}
-         className="flex w-full min-w-0 items-baseline gap-2 px-3 py-1.5 text-left text-ui hover:bg-muted"
-       >
--        <span className={cn(itemLabelChipClass(closed), "shrink-0")}>{item.label}</span>
-+        <span className={cn(itemLabelChipClass(closed), "shrink-0")}>
-+          {item.label}
-+          <ItemLabelChipMarks commentCount={item.comments.length} draftCount={draftCount} />
-+        </span>
-         <span className={cn("truncate", closed && "text-muted-foreground line-through")}>
-           {title}
-         </span>
-@@ -97,20 +111,25 @@ function ItemRow({ item }: { item: ItemLabelEntry }) {
+ function ItemRow({
+   item,
++  draftCount,
+   recent,
+   onDismiss,
+   onRestore,
+ }: {
+   item: ItemLabelEntry;
++  draftCount: number;
+   recent: boolean;
+   onDismiss?: () => void;
+   onRestore?: () => void;
+@@ -132,10 +136,19 @@ function ItemRow({
+       <ItemLabelPopover item={item}>
+         <button
+           type="button"
+-          aria-label={itemLabelChipName(item.label, closed, recent)}
++          aria-label={itemLabelChipName(
++            item.label,
++            closed,
++            item.comments.length,
++            draftCount,
++            recent,
++          )}
+           className="flex min-w-0 flex-1 items-baseline gap-2 px-3 py-1.5 text-left text-ui hover:bg-muted"
+         >
+-          <span className={cn(itemLabelChipClass(closed, recent), "shrink-0")}>{item.label}</span>
++          <span className={cn(itemLabelChipClass(closed, recent), "shrink-0")}>
++            {item.label}
++            <ItemLabelChipMarks commentCount={item.comments.length} draftCount={draftCount} />
++          </span>
+           <span className={cn("truncate", closed && "text-muted-foreground line-through")}>
+             {title}
+           </span>
+@@ -168,16 +181,18 @@ function ItemRow({
  
  /**
   * Collapsible "Open items" tracker pinned above the chat thread, beside the
 - * Plan tracker. The header lists open item labels as chips; expanding lists
-- * every item with its title, closed ones last. Self-hides until the transcript
-- * uses item labels.
+- * every item with its title, closed ones last. Items the latest reply mentions
+- * come first, tinted, one it just closed among them struck through. An open
+- * item can be dismissed from the tracker (per session, on every device) and
+- * restored from the "dismissed" list at the bottom. Self-hides until the
+- * transcript uses item labels.
 + * Plan tracker. The header lists open item labels as chips, plus a jump to the
 + * comment drafts when there are any; expanding lists every item with its
-+ * title, closed ones last. Self-hides until the transcript uses item labels.
++ * title, closed ones last. Items the latest reply mentions come first, tinted,
++ * one it just closed among them struck through. An open item can be dismissed
++ * from the tracker (per session, on every device) and restored from the
++ * "dismissed" list at the bottom. Self-hides until the transcript uses item
++ * labels.
   */
  export function OpenItemsPanel({ className }: { className?: string }) {
    const index = useContext(ItemLabelIndexContext);
-+  const sessionId = useContext(ItemLabelSessionContext);
+   const sessionId = useContext(ItemLabelSessionContext);
 +  const draftCounts = useItemCommentDraftCounts(sessionId);
-   const items = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
-   const open = items.filter((item) => item.closedBy === null);
-   const closed = items.filter((item) => item.closedBy !== null);
--  const chipKey = open.map((item) => item.label).join(" ");
-+  const chipKey = open
-+    .map((item) => `${item.label}:${item.comments.length}:${draftCounts.get(item.label) ?? 0}`)
-+    .join(" ");
+   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
+   const [showDismissed, setShowDismissed] = useState(false);
+   const allItems = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
+@@ -192,12 +207,16 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+   const closed = items.filter((item) => item.closedBy !== null && !isRecent(item));
+   const chips = [...recent, ...otherOpen];
+   const chipKey = chips
+-    .map((item) => `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}`)
++    .map(
++      (item) =>
++        `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}:${item.comments.length}:${draftCounts.get(item.label) ?? 0}`,
++    )
+     .join(" ");
    const fit = useFittedChipCount(chipKey);
    const detailsRef = useCollapseOnOutsidePress();
-   if (items.length === 0) return null;
-   const headerChips = open.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
+   if (allItems.length === 0) return null;
+   const headerChips = chips.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
 +  const draftTotal = [...draftCounts.values()].reduce((total, count) => total + count, 0);
  
    return (
      <div className={cn("shrink-0 px-3 md:px-4", className)}>
-@@ -131,17 +150,29 @@ export function OpenItemsPanel({ className }: { className?: string }) {
-               if ((event.target as Element).closest("button")) event.preventDefault();
+@@ -219,18 +238,29 @@ export function OpenItemsPanel({ className }: { className?: string }) {
              }}
            >
--            {headerChips.map((item) => (
--              <ItemLabelPopover key={item.label} item={item} openOnHover>
--                <button
--                  type="button"
--                  aria-label={`Show item ${item.label}`}
--                  className={cn(itemLabelChipClass(false), "shrink-0")}
--                >
--                  {item.label}
--                </button>
--              </ItemLabelPopover>
--            ))}
-+            {headerChips.map((item) => {
+             {headerChips.map((item) => {
 +              const draftCount = draftCounts.get(item.label) ?? 0;
-+              return (
-+                <ItemLabelPopover key={item.label} item={item} openOnHover>
-+                  <button
-+                    type="button"
+               const recentChip = isRecent(item);
+               return (
+                 <ItemLabelPopover key={item.label} item={item} openOnHover>
+                   <button
+                     type="button"
+-                    aria-label={itemLabelChipName(item.label, item.closedBy !== null, recentChip)}
 +                    aria-label={itemLabelChipName(
 +                      item.label,
-+                      false,
++                      item.closedBy !== null,
 +                      item.comments.length,
 +                      draftCount,
++                      recentChip,
 +                    )}
-+                    className={cn(itemLabelChipClass(false), "shrink-0")}
-+                  >
-+                    {item.label}
+                     className={cn(
+                       itemLabelChipClass(item.closedBy !== null, recentChip),
+                       "shrink-0",
+                     )}
+                   >
+                     {item.label}
 +                    <ItemLabelChipMarks
 +                      commentCount={item.comments.length}
 +                      draftCount={draftCount}
 +                    />
-+                  </button>
-+                </ItemLabelPopover>
-+              );
-+            })}
-             {open.length > headerChips.length && (
-               <span className="shrink-0 text-xs text-muted-foreground">
-                 +{open.length - headerChips.length}
-@@ -156,16 +187,33 @@ export function OpenItemsPanel({ className }: { className?: string }) {
-             {open.map((item) => (
-               <span key={item.label} className={itemLabelChipClass(false)}>
+                   </button>
+                 </ItemLabelPopover>
+               );
+@@ -252,10 +282,27 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+                 className={itemLabelChipClass(item.closedBy !== null, isRecent(item))}
+               >
                  {item.label}
 +                <ItemLabelChipMarks
 +                  commentCount={item.comments.length}
@@ -1139,7 +1166,7 @@ index 77a05f5690427b3656f637ae80a03073a62b38d1..bf6a1af9643dd83f424c22f02412a4da
 +                />
                </span>
              ))}
-             <span className="text-xs">+{open.length}</span>
+             <span className="text-xs">+{chips.length}</span>
            </span>
 +          {draftTotal > 0 && (
 +            <button
@@ -1157,41 +1184,57 @@ index 77a05f5690427b3656f637ae80a03073a62b38d1..bf6a1af9643dd83f424c22f02412a4da
            <ChevronDownIcon className="size-4 shrink-0 transition-transform group-open:rotate-180" />
          </summary>
          {/* Capped like the Plan tracker so a long list can't swallow the chat. */}
-         <div className="max-h-[180px] overflow-y-auto border-t border-border py-1">
-           {open.map((item) => (
--            <ItemRow key={item.label} item={item} />
-+            <ItemRow key={item.label} item={item} draftCount={draftCounts.get(item.label) ?? 0} />
-           ))}
-           {closed.length > 0 && (
-             <div className="px-3 pt-2 pb-1 text-xs text-muted-foreground">
-@@ -173,7 +221,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+@@ -267,6 +314,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+             <ItemRow
+               key={item.label}
+               item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
+               recent
+               onDismiss={item.closedBy === null ? () => dismiss(item.label) : undefined}
+             />
+@@ -280,6 +328,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+             <ItemRow
+               key={item.label}
+               item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
+               recent={false}
+               onDismiss={() => dismiss(item.label)}
+             />
+@@ -290,7 +339,12 @@ export function OpenItemsPanel({ className }: { className?: string }) {
              </div>
            )}
            {closed.map((item) => (
--            <ItemRow key={item.label} item={item} />
-+            <ItemRow key={item.label} item={item} draftCount={draftCounts.get(item.label) ?? 0} />
+-            <ItemRow key={item.label} item={item} recent={false} />
++            <ItemRow
++              key={item.label}
++              item={item}
++              draftCount={draftCounts.get(item.label) ?? 0}
++              recent={false}
++            />
            ))}
-         </div>
-       </details>
+           {dismissedItems.length > 0 && (
+             <button
+@@ -307,6 +361,7 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+               <ItemRow
+                 key={item.label}
+                 item={item}
++                draftCount={draftCounts.get(item.label) ?? 0}
+                 recent={false}
+                 onRestore={() => restore(item.label)}
+               />
 diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
-index d0481788f89fde902b21ce6fe0ec3d819cd780f2..332f3a8107eaf780a32f47be692c33d6fe68aea6 100644
+index f4a83e25d22e5f00a4c60fbb7e12eafb4ac4bf04..332f3a8107eaf780a32f47be692c33d6fe68aea6 100644
 --- a/web/src/components/chat/Transcript.tsx
 +++ b/web/src/components/chat/Transcript.tsx
-@@ -31,7 +31,12 @@ import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
- import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
- import { useSearchParams } from "@/lib/routing";
- import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
--import { ItemLabelIndexContext } from "@/lib/itemLabels";
-+import {
-+  ItemLabelIndexContext,
-+  ItemLabelSessionContext,
-+  type ItemLabelIndex,
-+} from "@/lib/itemLabels";
+@@ -36,6 +36,7 @@ import {
+   ItemLabelSessionContext,
+   type ItemLabelIndex,
+ } from "@/lib/itemLabels";
 +import { publishItemLabelIndex } from "@/lib/itemCommentDrafts";
  import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
  import { useUserMessageNav } from "@/hooks/useUserMessageNav";
  import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-@@ -327,10 +332,15 @@ function TranscriptImpl({
+@@ -331,6 +332,11 @@ function TranscriptImpl({
      () => buildBubbleItemLabelIndex(display.bubbles),
      [display.bubbles],
    );
@@ -1203,37 +1246,15 @@ index d0481788f89fde902b21ce6fe0ec3d819cd780f2..332f3a8107eaf780a32f47be692c33d6
    const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
    const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
    return (
--    <ItemLabelIndexContext.Provider value={itemLabelIndex}>
-+    <ItemLabelScope index={itemLabelIndex} sessionId={display.conversationId ?? null}>
-       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
-       overlay) so it shrinks the scroll area rather than covering messages.
-       Self-hides with no tasks. */}
-@@ -470,6 +480,25 @@ function TranscriptImpl({
-           />
-         )}
-       </div>
-+    </ItemLabelScope>
-+  );
-+}
-+
-+/** Gives the transcript's item labels their index, and the session their drafts belong to. */
-+function ItemLabelScope({
-+  index,
-+  sessionId,
-+  children,
-+}: {
-+  index: ItemLabelIndex;
-+  sessionId: string | null;
-+  children: React.ReactNode;
-+}) {
-+  return (
-+    <ItemLabelIndexContext.Provider value={index}>
-+      <ItemLabelSessionContext.Provider value={sessionId}>
-+        {children}
-+      </ItemLabelSessionContext.Provider>
-     </ItemLabelIndexContext.Provider>
+@@ -478,7 +484,7 @@ function TranscriptImpl({
    );
  }
+ 
+-/** Gives the transcript's item labels their index, and the session they belong to. */
++/** Gives the transcript's item labels their index, and the session their drafts belong to. */
+ function ItemLabelScope({
+   index,
+   sessionId,
 diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
 index f5909b70ef079b3af9ced5db971d697fec9c3b71..c787145d279fcd847f2947361017db09ef44facd 100644
 --- a/web/src/components/chat/chatBubbleParts.tsx
@@ -4236,18 +4257,18 @@ index 0000000000000000000000000000000000000000..1981cf54ad4b0fd8433de9cf2edfa23b
 +  };
 +}
 diff --git a/web/src/lib/itemLabels.test.ts b/web/src/lib/itemLabels.test.ts
-index 0abe54cf4d5808231608b8defa7941ce3f777d95..2bea08dd0329a8f62cc94bcf5a45541afa0fe3ba 100644
+index 67ba29690bf84629b3d91b36fce1d39f5ad72043..ca394773678d6e54762a97b09799d4f55a6dd28e 100644
 --- a/web/src/lib/itemLabels.test.ts
 +++ b/web/src/lib/itemLabels.test.ts
-@@ -11,6 +11,7 @@ import {
-   struckItemLabelsIn,
+@@ -15,6 +15,7 @@ import {
+   type ItemLabelIndex,
    type ItemLabelSource,
  } from "./itemLabels";
 +import { buildItemCommentMessage, scanItemLabelSource } from "./itemComments";
  
  describe("itemLabelsIn", () => {
    it("finds distinct labels in order and ignores code, links, and non-label brackets", () => {
-@@ -175,6 +176,97 @@ describe("buildItemLabelIndex", () => {
+@@ -214,6 +215,97 @@ describe("buildItemLabelIndex", () => {
    });
  });
  
@@ -4346,7 +4367,7 @@ index 0abe54cf4d5808231608b8defa7941ce3f777d95..2bea08dd0329a8f62cc94bcf5a45541a
    it("finds labels inside strikethrough spans, outside code", () => {
      const markdown = [
 diff --git a/web/src/lib/itemLabels.ts b/web/src/lib/itemLabels.ts
-index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb6848b92e 100644
+index 8b6814ea6f55290f1797750ed673b22cc966bf58..1b08ae22005b367f42f8685b08b0abfd9ff7a84b 100644
 --- a/web/src/lib/itemLabels.ts
 +++ b/web/src/lib/itemLabels.ts
 @@ -2,7 +2,8 @@
@@ -4358,8 +4379,8 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
 +// except a user's comment heading (`#### [Q3] …`), which leaves the state alone.
  
  import { createContext } from "react";
- 
-@@ -18,12 +19,40 @@ function itemLabelPattern(): RegExp {
+ import { LABEL_VALUE_MAX_LENGTH } from "@/lib/sessionLabels";
+@@ -19,12 +20,40 @@ function itemLabelPattern(): RegExp {
    return new RegExp(ITEM_LABEL_SOURCE, "g");
  }
  
@@ -4400,7 +4421,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  }
  
  /** What one message says about labels. */
-@@ -33,6 +62,20 @@ export interface ItemLabelScan {
+@@ -34,6 +63,20 @@ export interface ItemLabelScan {
    labels: readonly string[];
    /** Labels this message mentions struck through. */
    struck: readonly string[];
@@ -4421,8 +4442,8 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  }
  
  /** One labelled item across the transcript. */
-@@ -44,6 +87,8 @@ export interface ItemLabelEntry {
-   closedBy: ItemLabelSource | null;
+@@ -47,6 +90,8 @@ export interface ItemLabelEntry {
+   lastMention: ItemLabelSource;
    /** How many messages mention the label. */
    messageCount: number;
 +  /** Comments sent on the item, oldest first. */
@@ -4430,14 +4451,15 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  }
  
  export interface ItemLabelIndex {
-@@ -62,28 +107,77 @@ export const ItemLabelIndexContext = createContext<ItemLabelIndex | null>(null);
+@@ -67,30 +112,83 @@ export const ItemLabelIndexContext = createContext<ItemLabelIndex | null>(null);
  /** Id of the message whose markdown is being rendered. */
  export const ItemLabelMessageContext = createContext<string | null>(null);
  
--/** Builds the index from messages in transcript order; the first definition wins. */
+-/** The session whose transcript is rendering labels. */
 +/** The session whose transcript is rendering labels, for its comment drafts. */
-+export const ItemLabelSessionContext = createContext<string | null>(null);
-+
+ export const ItemLabelSessionContext = createContext<string | null>(null);
+ 
+-/** Builds the index from messages in transcript order; the first definition wins. */
 +function stemOf(filename: string): string {
 +  const dot = filename.lastIndexOf(".");
 +  return dot > 0 ? filename.slice(0, dot) : filename;
@@ -4466,6 +4488,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
  export function buildItemLabelIndex(scans: Iterable<ItemLabelScan>): ItemLabelIndex {
    const items = new Map<string, ItemLabelEntry>();
    let enabled = false;
+   let latestReply: ItemLabelSource | null = null;
 -  for (const { source, labels, struck } of scans) {
 +  let awaitingReply: { label: string; comment: ItemLabelComment }[] = [];
 +  for (const { source, labels, struck, comments, commentHeadingOnly } of scans) {
@@ -4474,16 +4497,28 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
        const closedBy = struck.includes(label) ? source : null;
        const entry = items.get(label);
        if (!entry) {
--        items.set(label, { label, source, closedBy, messageCount: 1 });
-+        items.set(label, { label, source, closedBy, messageCount: 1, comments: [] });
+-        items.set(label, { label, source, closedBy, lastMention: source, messageCount: 1 });
++        items.set(label, {
++          label,
++          source,
++          closedBy,
++          lastMention: source,
++          messageCount: 1,
++          comments: [],
++        });
          continue;
        }
 -      entry.closedBy = closedBy;
 +      if (!commentHeadingOnly?.includes(label)) entry.closedBy = closedBy;
+       entry.lastMention = source;
        entry.messageCount += 1;
        enabled = true;
      }
+-    // A tool-only turn has no text and isn't the reply the user is reading.
+-    if (source.role === "assistant" && source.text.trim() !== "") latestReply = source;
 +    if (source.role === "assistant") {
++      // A tool-only turn has no text and isn't the reply the user is reading.
++      if (source.text.trim() !== "") latestReply = source;
 +      for (const { label, comment } of awaitingReply) {
 +        const sentence = labels.includes(label) ? extractLabelSentence(source.text, label) : null;
 +        if (sentence) comment.reply = { source, sentence };
@@ -4505,7 +4540,10 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
 +      }
 +    }
    }
-   return { enabled, items };
+   return { enabled, items, latestReply };
+ }
+@@ -138,7 +236,7 @@ export function encodeDismissedItems(labels: Iterable<string>): string | null {
+   return encoded === "" ? null : encoded;
  }
  
 -interface ScannedLine {
@@ -4513,7 +4551,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
    text: string;
    /** Inside a fenced code block, or one of its fence lines. */
    inFence: boolean;
-@@ -91,7 +185,8 @@ interface ScannedLine {
+@@ -146,7 +244,8 @@ interface ScannedLine {
  
  const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
  
@@ -4523,7 +4561,7 @@ index a2a0ea93fee6f5ee35ded8963a90902167182107..5e19df7b3982f45192bb7fbc7095e5eb
    const lines: ScannedLine[] = [];
    let fence: string | null = null;
    for (const text of markdown.split("\n")) {
-@@ -113,7 +208,8 @@ function withoutInlineCode(line: string): string {
+@@ -168,7 +267,8 @@ function withoutInlineCode(line: string): string {
    return line.replace(/(`+)[^`]*?\1/g, (span) => " ".repeat(span.length));
  }
  
