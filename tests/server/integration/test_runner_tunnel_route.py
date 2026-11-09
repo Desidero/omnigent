@@ -8,9 +8,10 @@ import json
 import logging
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -140,6 +141,7 @@ def _tunnel_route_app(
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    admit_managed_runner: Callable[[str], bool] | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -162,6 +164,7 @@ def _tunnel_route_app(
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
             resolve_managed_runner_owner=resolve_managed_runner_owner,
+            admit_managed_runner=admit_managed_runner,
         ),
         prefix="/v1",
     )
@@ -495,14 +498,46 @@ async def test_abnormal_peer_disconnect_preserves_code_during_registry_cleanup(
     assert route_app.registry.get(_RUNNER_ID) is None
 
 
+@pytest.mark.parametrize("first_helper", ["sender", "receive"])
+@pytest.mark.parametrize("send_error", [ValueError, OSError])
+@pytest.mark.parametrize("peer_code", [1000, 1006, 1012])
 async def test_tunnel_close_race_logs_each_helper_outcome(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    first_helper: str,
+    send_error: type[Exception],
+    peer_code: int,
 ) -> None:
     """A failed sender must not hide the receive helper's peer-close evidence."""
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import runner_tunnel
+
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    monkeypatch.setattr(shutdown_state, "_marked_at", None)
     frame_in_transport = asyncio.Event()
     peer_closed = asyncio.Event()
     private_detail = "transport-private-detail"
+    peer_reason = RUNNER_IDLE_SHUTDOWN_CLOSE_REASON if peer_code == 1000 else ""
+
+    class OrderedTasks(set[asyncio.Task[None]]):
+        def __iter__(self) -> Iterator[asyncio.Task[None]]:
+            return iter(
+                sorted(
+                    super().__iter__(),
+                    key=lambda task: not task.get_name().startswith(f"tunnel-{first_helper}:"),
+                )
+            )
+
+    async def ordered_wait(
+        tasks: set[asyncio.Task[None]], *, return_when: str
+    ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+        done, pending = await asyncio.wait(tasks, return_when=return_when)
+        return OrderedTasks(done), pending
+
+    monkeypatch.setattr(
+        runner_tunnel, "asyncio", SimpleNamespace(**(vars(asyncio) | {"wait": ordered_wait}))
+    )
 
     class ClosingTransport:
         def __init__(self, app: ASGIApp) -> None:
@@ -519,8 +554,7 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
                 if message["type"] == "websocket.send":
                     frame_in_transport.set()
                     await peer_closed.wait()
-                    # RuntimeError after disconnect is an expected send/close race.
-                    raise ValueError(private_detail)
+                    raise send_error(private_detail)
                 await send(message)
 
             await self.app(scope, receive_frame, send_frame)
@@ -534,7 +568,9 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
         assert session is not None
         await route_app.registry.send_text(session, encode_frame(PingFrame(ts=0)))
         await asyncio.wait_for(frame_in_transport.wait(), timeout=budget(1.0))
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.send_input(
+            {"type": "websocket.disconnect", "code": peer_code, "reason": peer_reason}
+        )
         await asyncio.wait_for(communicator.future, timeout=budget(1.0))
     finally:
         communicator.stop(exceptions=False)
@@ -544,13 +580,31 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
     assert len(ends) == 1
     assert ends[0]["connection_id"] == "conn-close-race"
     outcomes = json.loads(ends[0]["helper_outcomes"])
-    assert outcomes["sender"] == "error:ValueError"
+    assert outcomes["sender"] == (
+        "error:WebSocketDisconnect" if send_error is OSError else "error:ValueError"
+    )
     assert outcomes["receive"] == "error:WebSocketDisconnect"
-    assert ends[0]["receive_close_code"] == 1006
+    assert ends[0]["receive_close_code"] == peer_code
     assert ends[0]["asgi_client_state"] == "DISCONNECTED"
-    assert ends[0]["asgi_application_state"] == "CONNECTED"
+    assert ends[0]["asgi_application_state"] == (
+        "DISCONNECTED" if send_error is OSError else "CONNECTED"
+    )
     assert private_detail not in str(ends[0])
     assert route_app.registry.get(_RUNNER_ID) is None
+    assert session.peer_close_reason == (peer_reason or None)
+    evidence = DisconnectEvidence.from_session(session)
+    assert evidence is not None
+    assert evidence.close_code == peer_code
+    assert evidence.close_reason_category == (
+        "idle_shutdown"
+        if peer_code == 1000
+        else "abnormal"
+        if peer_code == 1006
+        else "runner_closed"
+    )
+    assert shutdown_state.server_shutting_down() is (peer_code == 1012)
+    if send_error is ValueError and first_helper == "sender":
+        assert ends[0]["phase"] == "error"
 
 
 @pytest.mark.parametrize(
@@ -1380,7 +1434,13 @@ async def test_ws_tunnel_registers_authenticated_non_loopback_owner(
 
     :returns: None.
     """
-    route_app = _tunnel_route_app(auth_provider=_CredentialHeaderAuthProvider())
+
+    def reject_delegated(_rid):
+        raise AssertionError("User-authenticated runners must bypass profile admission")
+
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(), admit_managed_runner=reject_delegated
+    )
 
     token = "alice-runner-token"
     runner_id = token_bound_runner_id(token)
@@ -1407,8 +1467,10 @@ async def test_ws_tunnel_registers_authenticated_non_loopback_owner(
             await communicator.wait(timeout=budget(1.0))
 
 
+@pytest.mark.parametrize("admission", [None, True, False])
 async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token(
     debug_log_rows: list[dict[str, Any]],
+    admission: bool | None,
 ) -> None:
     """A managed-sandbox runner registers under its launch owner.
 
@@ -1433,11 +1495,18 @@ async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token(
     """
     token = "managed-runner-binding-token"
     runner_id = token_bound_runner_id(token)
+    admitted = []
+
+    def admit(rid):
+        admitted.append(rid)
+        return admission
+
     route_app = _tunnel_route_app(
         auth_provider=_CredentialHeaderAuthProvider(),
         resolve_managed_runner_owner=(
             lambda rid: "owner@example.com" if rid == runner_id else None
         ),
+        admit_managed_runner=admit if admission is not None else None,
     )
     communicator = await _connect_route(
         route_app.app,
@@ -1448,8 +1517,26 @@ async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token(
         client_host="203.0.113.7",
     )
 
+    if admission is False:
+        await communicator.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(HelloFrame(runner_version="test", frame_protocol_version=1)),
+            }
+        )
+        close = await communicator.receive_output(timeout=budget(1.0))
+        assert close == {
+            "type": "websocket.close",
+            "code": 4004,
+            "reason": "runner binding was replaced",
+        }
+        assert route_app.registry.get(runner_id) is None
+        assert admitted == [runner_id]
+        await communicator.wait(timeout=budget(1.0))
+        return
     await _send_hello(communicator, route_app.registry, runner_id=runner_id)
     try:
+        assert admitted == ([runner_id] if admission is True else [])
         assert route_app.registry.online_runner_ids() == [runner_id]
         # Registered under the launch owner the resolver returned — not
         # rejected, and not the owner-less registration the gate forbids.
@@ -2342,10 +2429,17 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
 async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    from omnigent.server import managed_host_keepalive
     from omnigent.server.routes import runner_tunnel
 
     monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 1000)
+    reports: list[tuple[str, bool | None]] = []
+    monkeypatch.setattr(
+        managed_host_keepalive,
+        "record_pong",
+        lambda runner_id, keep_warm: reports.append((runner_id, keep_warm)),
+    )
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
@@ -2354,7 +2448,10 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
         assert isinstance(ping, PingFrame)
         await communicator.send_input(
-            {"type": "websocket.receive", "text": encode_frame(PongFrame(ts=ping.ts))}
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(PongFrame(ts=ping.ts, keep_warm=False)),
+            }
         )
         session = route_app.registry.get(_RUNNER_ID)
         assert session is not None
@@ -2367,6 +2464,8 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         communicator.stop(exceptions=False)
         await asyncio.gather(communicator.future, return_exceptions=True)
 
+    # The pong's keep-warm report reaches the managed-sandbox keepalive gate.
+    assert reports == [(_RUNNER_ID, False)]
     row = _tunnel_end_events(caplog)[0]
     assert row["connection_id"] == "conn-heartbeat"
     assert row["app_ping_rtt_s"] >= 0
@@ -2374,6 +2473,29 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
     assert row["last_app_pong_received_age_s"] >= 0
     assert row["outbound_queue_high_water"] >= 1
     assert row["send_errors"] == 0
+
+
+async def test_first_app_ping_is_sent_at_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With managed sandboxes, the first pong carries the runner's first
+    keep-warm report, so it must not wait a whole ping interval; later pings keep
+    the normal interval."""
+    from omnigent.server import managed_host_keepalive
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 60.0)
+    monkeypatch.setattr(managed_host_keepalive, "is_enabled", lambda: True)
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-first-ping")
+        ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
+        assert isinstance(ping, PingFrame)
+        assert await communicator.receive_nothing(timeout=0.1), "the next ping waits an interval"
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(communicator.future, timeout=budget(1))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
 
 
 async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(
