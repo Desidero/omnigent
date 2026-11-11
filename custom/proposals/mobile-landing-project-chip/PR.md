@@ -15,9 +15,9 @@ This adds a project chip as the first control under that heading, on phones only
 - Picking the project that is already selected no longer pushes a duplicate history entry.
 - Desktop is unchanged: it still names the project in the heading and has no chip. **Add nested agent** has no chip either.
 
-The menu is the existing `DropdownMenu` with the mobile glass surface used by other phone menus. The codebase has no bottom-sheet primitive, and `ProjectPicker` has a search field, so I didn't reuse it here. Its `ProjectRowIcon` provides the icons.
+The menu is the existing `DropdownMenu` with the mobile glass surface used by other phone menus. The codebase has no bottom-sheet primitive yet (#11397 proposes one), and `ProjectPicker` has a search field, so I didn't reuse it here. Its `ProjectRowIcon` provides the icons.
 
-This is a smaller step toward #11083: it makes the project choice visible on the phone landing. It doesn't add the prompt on every entry point.
+This is a smaller step toward #11083: it makes the project choice visible on the phone landing. #11397 adds the prompt that asks for a project on every new-session entry point, with a bottom sheet on phones; this PR works without it, and with both the chip shows and changes the project picked in the sheet.
 
 ## Test Plan
 
@@ -78,4 +78,6 @@ Should this change be included in the release notes? Choose exactly one.
 On phones, the new-session screen shows a project chip for choosing which project a session starts in
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
 

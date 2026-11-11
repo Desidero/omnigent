@@ -26,42 +26,52 @@ session and expect the composer turn the prompt off
 (omnigent:new-chat-project-prompt=off), and a dedicated E2E drives the
 picker's No project and project rows.
 
-Phones (below the md breakpoint) skip the project step: New session, the
-hotkey and the drawer's links open the composer directly, which picks the
-project on the landing itself, so a phone doesn't stack the palette over
-the drawer first. Desktop is unchanged. Matches
-https://github.com/omnigent-ai/omnigent/pull/11397.
+Phones (below the md breakpoint) ask in a bottom sheet instead of the
+palette, whose search field would raise the keyboard for a choice among a
+handful of projects: a grab handle, "Start a new session in", then No
+project and every project as 48px rows, with no search field. Picking a
+row opens the same /?project=<name> or plain composer; tapping outside,
+Escape or dragging the handle down closes it where the user was. It
+follows the same switch and step-aside rule as the palette. The sheet is
+a small controlled BottomSheet primitive on the Radix dialog (the UI kit
+had none). Matches https://github.com/omnigent-ai/omnigent/pull/11397.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
-(cherry picked from commit 1401d53cc127a9668163e508b749c5c49c43e99c)
+(cherry picked from commit 8aacafc9a2edf35cadd88651666eca630700b489)
 ---
- feature-map/composer.md                       |  12 ++
- tests/e2e_ui/conftest.py                      |  10 ++
- tests/e2e_ui/sessions/test_command_palette.py |  39 ++++++
+ feature-map/composer.md                       |  16 ++
+ tests/e2e_ui/conftest.py                      |  10 +
+ tests/e2e_ui/sessions/test_command_palette.py |  39 ++++
  .../test_initial_prompt_session_switch.py     |   3 +
  .../test_sidebar_pinned_project_collapse.py   |   5 +
  .../start_session/test_start_session.py       |   4 +
- web/src/hooks/useNewChatProjectPrompt.ts      |  23 ++++
- web/src/hooks/useNewSessionHotkey.test.tsx    |  10 ++
+ web/src/components/ui/bottom-sheet.test.tsx   |  98 +++++++++
+ web/src/components/ui/bottom-sheet.tsx        | 157 +++++++++++++++
+ web/src/hooks/useNewChatProjectPrompt.ts      |  43 ++++
+ web/src/hooks/useNewSessionHotkey.test.tsx    |  10 +
  web/src/hooks/useNewSessionHotkey.ts          |  13 +-
- .../newChatProjectPromptPreferences.test.ts   |  24 ++++
- .../lib/newChatProjectPromptPreferences.ts    |  26 ++++
- web/src/pages/SettingsPage.test.tsx           |  18 +++
- web/src/pages/SettingsPage.tsx                |  40 ++++++
- web/src/shell/AppShell.test.tsx               | 115 +++++++++++++++++-
- web/src/shell/AppShell.tsx                    |  29 ++++-
- web/src/shell/CommandPalette.test.tsx         |  71 +++++++++++
- web/src/shell/CommandPalette.tsx              | 109 +++++++++++++----
- web/src/shell/Sidebar.test.tsx                |  24 +++-
- web/src/shell/Sidebar.tsx                     |  20 +++
- 19 files changed, 557 insertions(+), 38 deletions(-)
+ .../newChatProjectPromptPreferences.test.ts   |  24 +++
+ .../lib/newChatProjectPromptPreferences.ts    |  26 +++
+ web/src/pages/SettingsPage.test.tsx           |  18 ++
+ web/src/pages/SettingsPage.tsx                |  40 ++++
+ web/src/shell/AppShell.test.tsx               | 188 +++++++++++++++++-
+ web/src/shell/AppShell.tsx                    |  38 +++-
+ web/src/shell/CommandPalette.test.tsx         |  71 +++++++
+ web/src/shell/CommandPalette.tsx              | 105 +++++++---
+ web/src/shell/NewSessionProjectSheet.tsx      |  85 ++++++++
+ web/src/shell/Sidebar.test.tsx                |  24 ++-
+ web/src/shell/Sidebar.tsx                     |  20 ++
+ 22 files changed, 1000 insertions(+), 37 deletions(-)
+ create mode 100644 web/src/components/ui/bottom-sheet.test.tsx
+ create mode 100644 web/src/components/ui/bottom-sheet.tsx
  create mode 100644 web/src/hooks/useNewChatProjectPrompt.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.test.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.ts
+ create mode 100644 web/src/shell/NewSessionProjectSheet.tsx
 
 diff --git a/feature-map/composer.md b/feature-map/composer.md
-index e4ae3f0aba297eb8d6a68372da194c10e3db91fb..db08c26849b26b5bd5874426f1a49e21fca478cd 100644
+index e4ae3f0aba297eb8d6a68372da194c10e3db91fb..6cb53b501dd52b743d31ade2c7a838e0b62db0b0 100644
 --- a/feature-map/composer.md
 +++ b/feature-map/composer.md
 @@ -209,6 +209,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
@@ -72,12 +82,12 @@ index e4ae3f0aba297eb8d6a68372da194c10e3db91fb..db08c26849b26b5bd5874426f1a49e21
 +  New session links, and the palette's New chat first ask for a project (or No
 +  project), then open the composer with its defaults. Settings › General ›
 +  Sessions turns it off. Modified clicks on the links still open a new tab.
-+  Phones (below the `md` breakpoint) skip the step and open the composer
-+  directly, where the project is picked on the landing itself.
++  Phones (below the `md` breakpoint) ask in a bottom sheet instead of the
++  palette: No project, then every project, with no search field.
  - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
    can be steered into the running turn. Side-chat composers queue and steer the
    same way, with their own queue strip.
-@@ -370,6 +376,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+@@ -370,6 +376,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
  - Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
    **New chat in <project>** to open the new-session composer with that
    project's host, workspace and agent prefilled.
@@ -86,7 +96,11 @@ index e4ae3f0aba297eb8d6a68372da194c10e3db91fb..db08c26849b26b5bd5874426f1a49e21
 +  project name and press Enter to land on `/?project=<name>` with its defaults;
 +  choose No project for a plain composer. Turn off **Ask for a project when
 +  starting a session** in Settings and the same actions open the composer
-+  directly. On a phone, New session in the drawer opens the composer directly.
++  directly.
++- On a phone with at least one project, tap New session in the drawer: a
++  "Start a new session in" sheet slides up with No project and each project,
++  and the keyboard stays down. Tap a project to land on `/?project=<name>`, or
++  tap outside it, press Escape or drag its handle down to stay where you were.
  - Hover the model/effort pill to see the tooltip.
  - Hover the host chip to see the selected host or sandbox and its connection.
  - Pick a harness, then open its configuration for model, effort (Codex, Claude,
@@ -241,34 +255,321 @@ index 17165e5706d1a5d94d049efef13cb178e1605244..6a252f98e27b605b2c8cd8b5408f1631
              await page.add_init_script(
                  f"""window.localStorage.setItem(
                      "omnigent:recent-workspaces",
+diff --git a/web/src/components/ui/bottom-sheet.test.tsx b/web/src/components/ui/bottom-sheet.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3eb80c7f511c4c62056a5dbed10d7fcadcc9a96
+--- /dev/null
++++ b/web/src/components/ui/bottom-sheet.test.tsx
+@@ -0,0 +1,98 @@
++import { useState } from "react";
++import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++import { BottomSheet, BottomSheetContent } from "./bottom-sheet";
++
++afterEach(cleanup);
++
++let setSheetOpen: (open: boolean) => void = () => {};
++
++function StatefulSheet({ onOpenChange }: { onOpenChange: (open: boolean) => void }) {
++  const [open, setOpen] = useState(true);
++  setSheetOpen = setOpen;
++  return (
++    <BottomSheet
++      open={open}
++      onOpenChange={(next) => {
++        onOpenChange(next);
++        setOpen(next);
++      }}
++    >
++      <BottomSheetContent title="Pick one">
++        <button type="button">Row</button>
++      </BottomSheetContent>
++    </BottomSheet>
++  );
++}
++
++function renderSheet() {
++  const onOpenChange = vi.fn();
++  render(<StatefulSheet onOpenChange={onOpenChange} />);
++  return onOpenChange;
++}
++
++const handle = () => screen.getByText("Pick one");
++const sheet = () => screen.queryByRole("dialog", { name: "Pick one" });
++
++function press(clientY: number) {
++  fireEvent.pointerDown(handle(), { pointerId: 1, button: 0, clientY });
++}
++function move(clientY: number) {
++  fireEvent.pointerMove(handle(), { pointerId: 1, clientY });
++}
++function release(clientY: number) {
++  fireEvent.pointerUp(handle(), { pointerId: 1, clientY });
++}
++
++describe("BottomSheet", () => {
++  it("names the dialog by its title and focuses the sheet, not its first row", () => {
++    renderSheet();
++    expect(sheet()).toHaveFocus();
++  });
++
++  it("follows the drag and closes when released far enough down", () => {
++    const onOpenChange = renderSheet();
++    press(100);
++    move(220);
++    expect(sheet()!.style.transform).toBe("translateY(120px)");
++    release(220);
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++    expect(sheet()).toBeNull();
++  });
++
++  it("springs back from a short drag", () => {
++    const onOpenChange = renderSheet();
++    press(100);
++    move(130);
++    expect(sheet()!.style.transform).toBe("translateY(30px)");
++    release(130);
++    expect(onOpenChange).not.toHaveBeenCalled();
++    expect(sheet()!.style.transform).toBe("");
++  });
++
++  it("ignores pointer moves without a press", () => {
++    renderSheet();
++    move(220);
++    expect(sheet()!.style.transform).toBe("");
++  });
++
++  it("drops an unfinished drag when it closes another way", () => {
++    renderSheet();
++    press(100);
++    move(140);
++    fireEvent.keyDown(sheet()!, { key: "Escape" });
++    expect(sheet()).toBeNull();
++
++    act(() => setSheetOpen(true));
++    expect(sheet()!.style.transform).toBe("");
++    move(240);
++    expect(sheet()!.style.transform).toBe("");
++  });
++
++  it("closes on Escape", () => {
++    const onOpenChange = renderSheet();
++    fireEvent.keyDown(sheet()!, { key: "Escape" });
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++  });
++});
+diff --git a/web/src/components/ui/bottom-sheet.tsx b/web/src/components/ui/bottom-sheet.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ee88b0b49d44cc02b2b22af15f3b6f4ab737a65
+--- /dev/null
++++ b/web/src/components/ui/bottom-sheet.tsx
+@@ -0,0 +1,157 @@
++// Bottom sheet for phones: a Radix dialog that slides up from the bottom edge,
++// with a grab handle and title that can be dragged down to dismiss it.
++
++import * as React from "react";
++import * as DialogPrimitive from "radix-ui/dialog";
++
++import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
++import { cn } from "@/lib/utils";
++import { Dialog, DialogOverlay, DialogPortal, DialogTitle } from "@/components/ui/dialog";
++
++/** How far the handle must be dragged down before releasing it dismisses the sheet. */
++const SWIPE_DISMISS_PX = 80;
++
++const BottomSheetContext = React.createContext<{ open: boolean; close: () => void }>({
++  open: false,
++  close: () => {},
++});
++
++/** Controlled only: a swipe closes the sheet through `onOpenChange(false)`. */
++function BottomSheet({
++  open,
++  onOpenChange,
++  ...props
++}: Omit<
++  React.ComponentProps<typeof DialogPrimitive.Root>,
++  "open" | "defaultOpen" | "onOpenChange"
++> & {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++}) {
++  const sheet = React.useMemo(
++    () => ({ open, close: () => onOpenChange(false) }),
++    [open, onOpenChange],
++  );
++  return (
++    <BottomSheetContext.Provider value={sheet}>
++      <Dialog open={open} onOpenChange={onOpenChange} {...props} />
++    </BottomSheetContext.Provider>
++  );
++}
++
++/** Puts the sheet back at rest, e.g. after a drag that didn't dismiss it. */
++function resetSheetOffset(sheet: HTMLElement | null, animate: boolean) {
++  if (!sheet) return;
++  sheet.style.transition = animate ? "transform 200ms ease-out" : "";
++  sheet.style.transform = "";
++}
++
++/**
++ * Grab handle and title: the sheet follows a downward drag on them, and
++ * releasing past the threshold closes it, so it slides out from where it was
++ * dropped.
++ */
++function BottomSheetHandle({
++  sheetRef,
++  title,
++}: {
++  sheetRef: React.RefObject<HTMLElement | null>;
++  title: React.ReactNode;
++}) {
++  const { open, close } = React.useContext(BottomSheetContext);
++  const start = React.useRef<{ pointerId: number; y: number } | null>(null);
++  // The handle stays mounted through the exit animation, and a reopen in that
++  // window reuses it: a drag the sheet closed under must not carry over.
++  React.useEffect(() => {
++    if (!open) start.current = null;
++  }, [open]);
++  const distance = (event: React.PointerEvent<HTMLElement>) =>
++    Math.max(0, event.clientY - (start.current?.y ?? event.clientY));
++  const cancel = () => {
++    if (!start.current) return;
++    start.current = null;
++    resetSheetOffset(sheetRef.current, true);
++  };
++  return (
++    <div
++      className="shrink-0 cursor-grab touch-none select-none"
++      onPointerDown={(event) => {
++        if (event.button !== 0) return;
++        start.current = { pointerId: event.pointerId, y: event.clientY };
++        event.currentTarget.setPointerCapture?.(event.pointerId);
++      }}
++      onPointerMove={(event) => {
++        const sheet = sheetRef.current;
++        if (start.current?.pointerId !== event.pointerId || !sheet) return;
++        sheet.style.transition = "none";
++        sheet.style.transform = `translateY(${distance(event)}px)`;
++      }}
++      onPointerUp={(event) => {
++        if (start.current?.pointerId !== event.pointerId) return;
++        if (distance(event) > SWIPE_DISMISS_PX) {
++          start.current = null;
++          close();
++        } else {
++          cancel();
++        }
++      }}
++      onPointerCancel={cancel}
++      onLostPointerCapture={cancel}
++    >
++      <div
++        aria-hidden="true"
++        className="mx-auto mt-2 mb-2.5 h-[5px] w-[38px] rounded-full bg-muted-foreground/30"
++      />
++      <DialogTitle className="min-h-0 px-6 pb-2 text-[17px] leading-6">{title}</DialogTitle>
++    </div>
++  );
++}
++
++function BottomSheetContent({
++  className,
++  children,
++  title,
++  style,
++  onOpenAutoFocus,
++  ...props
++}: Omit<React.ComponentProps<typeof DialogPrimitive.Content>, "title"> & {
++  /** Heading shown under the grab handle; also the dialog's accessible name. */
++  title: React.ReactNode;
++}) {
++  const contentRef = React.useRef<HTMLDivElement>(null);
++  // Reopening during the exit animation reuses the node a swipe moved down.
++  const { open } = React.useContext(BottomSheetContext);
++  React.useLayoutEffect(() => {
++    if (open) resetSheetOffset(contentRef.current, false);
++  }, [open]);
++  return (
++    <DialogPortal>
++      <DialogOverlay />
++      <DialogPrimitive.Content
++        ref={contentRef}
++        data-slot="bottom-sheet-content"
++        aria-describedby={undefined}
++        className={cn(
++          "fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-[26px] bg-popover text-ui text-popover-foreground shadow-dialog outline-none duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] data-open:animate-in data-open:slide-in-from-bottom data-closed:animate-out data-closed:slide-out-to-bottom",
++          className,
++        )}
++        style={{ paddingBottom: "var(--omnigent-safe-bottom, 0px)", ...style }}
++        // Focus the sheet itself rather than its first row, so opening it
++        // doesn't paint a focus ring on a row the user hasn't reached yet.
++        onOpenAutoFocus={(event) => {
++          onOpenAutoFocus?.(event);
++          if (event.defaultPrevented) return;
++          event.preventDefault();
++          contentRef.current?.focus();
++        }}
++        {...props}
++      >
++        <SuppressBrowserView />
++        <BottomSheetHandle sheetRef={contentRef} title={title} />
++        {children}
++      </DialogPrimitive.Content>
++    </DialogPortal>
++  );
++}
++
++export { BottomSheet, BottomSheetContent };
 diff --git a/web/src/hooks/useNewChatProjectPrompt.ts b/web/src/hooks/useNewChatProjectPrompt.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..64c60ce5cadee30090a3b81fea7641047c940b04
+index 0000000000000000000000000000000000000000..b6ff3227aaa7c5351b618919e21d1b657cdf8ca8
 --- /dev/null
 +++ b/web/src/hooks/useNewChatProjectPrompt.ts
-@@ -0,0 +1,23 @@
-+import { useCallback } from "react";
+@@ -0,0 +1,43 @@
++import { useCallback, useEffect } from "react";
 +
 +import { useProjects } from "@/hooks/useConversations";
-+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 +import { readNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPreferences";
++import { useNavigate } from "@/lib/routing";
 +
 +/**
 + * Returns a check for whether starting a new session should first ask for a
-+ * project: the project list may hold one, the prompt isn't turned off in
-+ * Settings, and the viewport isn't a phone's, whose composer picks the project
-+ * itself. Until the list resolves it counts as "may": the picker lists
-+ * projects as they arrive and steps aside if none do (see `CommandPalette`).
++ * project: the project list may hold one and the prompt isn't turned off in
++ * Settings. Until the list resolves it counts as "may": the picker lists
++ * projects as they arrive and steps aside if none do (see
++ * `useLeaveProjectPickerWithoutProjects`).
 + * The preference is read at call time so a toggle applies at once.
 + */
 +export function useShouldPromptForProject(): () => boolean {
 +  const { data: projects } = useProjects();
-+  const isMobile = useIsMobileViewport();
 +  const mayHaveProjects = projects === undefined || projects.length > 0;
-+  return useCallback(
-+    () => mayHaveProjects && !isMobile && readNewChatProjectPromptEnabled(),
-+    [mayHaveProjects, isMobile],
-+  );
++  return useCallback(() => mayHaveProjects && readNewChatProjectPromptEnabled(), [mayHaveProjects]);
++}
++
++/** The new-session composer route for `projectName`, or the plain one for "". */
++export function newSessionPath(projectName: string): string {
++  return projectName ? `/?project=${encodeURIComponent(projectName)}` : "/";
++}
++
++/**
++ * While a project picker is `active`, closes it for the plain composer once the
++ * project list fails or comes back empty: with nothing to choose from, the
++ * session starts as if the prompt had never been offered.
++ */
++export function useLeaveProjectPickerWithoutProjects(
++  active: boolean,
++  onOpenChange: (open: boolean) => void,
++): void {
++  const { data: projects, isSuccess, isError } = useProjects();
++  const navigate = useNavigate();
++  const nothingToOffer = isError || (isSuccess && (projects?.length ?? 0) === 0);
++  useEffect(() => {
++    if (!active || !nothingToOffer) return;
++    onOpenChange(false);
++    navigate("/");
++  }, [active, nothingToOffer, onOpenChange, navigate]);
 +}
 diff --git a/web/src/hooks/useNewSessionHotkey.test.tsx b/web/src/hooks/useNewSessionHotkey.test.tsx
 index b1706fc9815305fcc7423e031af00dbcdefd0d6b..b26a41ef4cec7373eb59d9149292db0b762d4ed2 100644
@@ -429,7 +730,7 @@ index 1c66fe789bd399ce0054f94902780af9746434fa..420507b14caa4c88cacc35201a25c7dd
      renderPage("/settings/general");
      const select = screen.getByTestId("terminal-clipboard-preference-select");
 diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
-index b34af6fd7632fa71ce7990819b960a9fe9543922..cfecc06b40eca7b8d55299b3451e75edef3bac09 100644
+index b34af6fd7632fa71ce7990819b960a9fe9543922..64286ea773030cb50ee22a800e27ac22675537b4 100644
 --- a/web/src/pages/SettingsPage.tsx
 +++ b/web/src/pages/SettingsPage.tsx
 @@ -247,6 +247,10 @@ import {
@@ -464,7 +765,7 @@ index b34af6fd7632fa71ce7990819b960a9fe9543922..cfecc06b40eca7b8d55299b3451e75ed
 +        labelId={labelId}
 +        descriptionId={descriptionId}
 +        className="flex-1"
-+        description="When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer. Phones skip this and pick the project on the new-session screen."
++        description="When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer."
 +        descriptionClassName="text-ui"
 +      />
 +      <Switch
@@ -494,7 +795,7 @@ index b34af6fd7632fa71ce7990819b960a9fe9543922..cfecc06b40eca7b8d55299b3451e75ed
          <SettingsGroup title="Terminal" testId="settings-group-terminal">
            <TerminalClipboardControl />
 diff --git a/web/src/shell/AppShell.test.tsx b/web/src/shell/AppShell.test.tsx
-index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001ef6fbe5c 100644
+index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..af134b7d78491e8ced238f77fcca2311dac2ec5a 100644
 --- a/web/src/shell/AppShell.test.tsx
 +++ b/web/src/shell/AppShell.test.tsx
 @@ -15,7 +15,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
@@ -516,7 +817,7 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
  import {
    useCreateTerminal,
    useTerminals,
-@@ -6052,6 +6053,116 @@ describe("new-session browser shortcut", () => {
+@@ -6052,6 +6053,189 @@ describe("new-session browser shortcut", () => {
      expect(screen.getByText("New session route")).toBeInTheDocument();
      setEmbedRoot(null);
    });
@@ -529,7 +830,15 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
 +        client,
 +        "/c/conv_abc",
 +        <>
-+          <Route index element={<p>New session route</p>} />
++          <Route
++            index
++            element={
++              <>
++                <p>New session route</p>
++                <LocationDisplay />
++              </>
++            }
++          />
 +          <Route path="c/:conversationId" element={<p>Session route</p>} />
 +        </>,
 +        <AppShell />,
@@ -537,6 +846,17 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
 +    );
 +    fireEvent.keyDown(document, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
 +  }
++
++  function onPhone() {
++    const baseMatchMedia = window.matchMedia;
++    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
++      ...baseMatchMedia(query),
++      matches: query === "(max-width: 767.98px)",
++    }));
++    onTestFinished(() => matchMedia.mockRestore());
++  }
++
++  const projectSheet = () => screen.queryByRole("dialog", { name: "Start a new session in" });
 +
 +  function restoreNoProjects() {
 +    vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<
@@ -556,6 +876,7 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
 +    it("asks for a project before opening the composer", () => {
 +      pressNewSession();
 +      expect(screen.getByPlaceholderText("Start a new session in…")).toBeInTheDocument();
++      expect(projectSheet()).toBeNull();
 +      expect(screen.queryByText("New session route")).toBeNull();
 +
 +      fireEvent.click(screen.getByText("No project"));
@@ -569,16 +890,57 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
 +      expect(screen.getByText("New session route")).toBeInTheDocument();
 +    });
 +
-+    it("opens the composer directly on a phone, whose landing picks the project", () => {
-+      const baseMatchMedia = window.matchMedia;
-+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
-+        ...baseMatchMedia(query),
-+        matches: query === "(max-width: 767.98px)",
-+      }));
-+      onTestFinished(() => matchMedia.mockRestore());
-+      pressNewSession();
-+      expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
-+      expect(screen.getByText("New session route")).toBeInTheDocument();
++    describe("on a phone", () => {
++      beforeEach(onPhone);
++
++      it("asks in a bottom sheet instead of the palette", () => {
++        pressNewSession();
++        const sheet = projectSheet();
++        expect(sheet).toBeInTheDocument();
++        expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
++        expect(within(sheet!).queryByRole("textbox")).toBeNull();
++        const rows = within(sheet!).getAllByRole("button");
++        expect(rows.map((row) => row.textContent)).toEqual(["No project", "omnigent"]);
++        expect(screen.queryByText("New session route")).toBeNull();
++      });
++
++      it("opens the project's composer when a project is picked", () => {
++        pressNewSession();
++        fireEvent.click(within(projectSheet()!).getByRole("button", { name: "omnigent" }));
++        expect(projectSheet()).toBeNull();
++        expect(screen.getByText("New session route")).toBeInTheDocument();
++        expect(screen.getByTestId("url-params")).toHaveTextContent("project=omnigent");
++      });
++
++      it("opens the plain composer for No project", () => {
++        pressNewSession();
++        fireEvent.click(within(projectSheet()!).getByRole("button", { name: "No project" }));
++        expect(projectSheet()).toBeNull();
++        expect(screen.getByText("New session route")).toBeInTheDocument();
++        expect(screen.getByTestId("url-params")).toBeEmptyDOMElement();
++      });
++
++      it("stays on the current session when dismissed", () => {
++        pressNewSession();
++        fireEvent.keyDown(projectSheet()!, { key: "Escape" });
++        expect(projectSheet()).toBeNull();
++        expect(screen.getByText("Session route")).toBeInTheDocument();
++      });
++
++      it("opens the sheet from the palette's New chat", () => {
++        pressNewSession();
++        fireEvent.keyDown(projectSheet()!, { key: "Escape" });
++        fireEvent.keyDown(document, { key: "k", code: "KeyK", ctrlKey: true });
++        fireEvent.click(screen.getByText("New chat"));
++        expect(projectSheet()).toBeInTheDocument();
++      });
++
++      it("opens the composer directly when the prompt is turned off", () => {
++        writeNewChatProjectPromptEnabled(false);
++        pressNewSession();
++        expect(projectSheet()).toBeNull();
++        expect(screen.getByText("New session route")).toBeInTheDocument();
++      });
 +    });
 +  });
 +
@@ -586,6 +948,7 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
 +    interface ProjectsQuery {
 +      data?: { id: string; name: string }[];
 +      isSuccess?: boolean;
++      isError?: boolean;
 +    }
 +    let projectsQuery: ProjectsQuery = {};
 +    const subscribers = new Set<() => void>();
@@ -622,6 +985,17 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
 +      expect(screen.getByText("New session route")).toBeInTheDocument();
 +    });
 +
++    it("steps aside on a phone when the list fails", () => {
++      onPhone();
++      pressNewSession();
++      expect(projectSheet()).toBeInTheDocument();
++      expect(screen.getByRole("status")).toHaveTextContent("Loading projects…");
++
++      resolveProjects({ isError: true });
++      expect(projectSheet()).toBeNull();
++      expect(screen.getByText("New session route")).toBeInTheDocument();
++    });
++
 +    it("lists the projects once they arrive", () => {
 +      pressNewSession();
 +      resolveProjects({ data: [{ id: "p1", name: "omnigent" }], isSuccess: true });
@@ -634,7 +1008,7 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001
  
  describe("AppShell desktop Close", () => {
 diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
-index 23303fac8e84b9385f2c188669affc35da88c6be..9e4afa869f293984c87177ed99111971e8a4e6db 100644
+index 23303fac8e84b9385f2c188669affc35da88c6be..29781c2c3cab51fbf2f3b0ba1758c1f43a6c61ab 100644
 --- a/web/src/shell/AppShell.tsx
 +++ b/web/src/shell/AppShell.tsx
 @@ -36,6 +36,7 @@ import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
@@ -645,15 +1019,24 @@ index 23303fac8e84b9385f2c188669affc35da88c6be..9e4afa869f293984c87177ed99111971
  import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
  import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
  import { useIsEmbedded } from "@/lib/embedded";
-@@ -1868,6 +1869,7 @@ function AppShellImpl() {
+@@ -163,6 +164,7 @@ import { PermissionsModal } from "@/components/PermissionsModal";
+ import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+ import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
+ import { CommandPalette } from "./CommandPalette";
++import { NewSessionProjectSheet } from "./NewSessionProjectSheet";
+ import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
+ import { Toaster } from "@/components/ui/sonner";
+ import { CloseShellDialog } from "./CloseShellDialog";
+@@ -1868,6 +1870,8 @@ function AppShellImpl() {
    // Bound here where the palette's open-state lives.
    const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
    const [sessionSearch, setSessionSearch] = useState(false);
 +  const [projectStep, setProjectStep] = useState(false);
++  const [projectSheetOpen, setProjectSheetOpen] = useState(false);
    // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
    // frequent re-renders (chatStore status churn during a bind). Inline
    // callbacks would give it fresh props each time and defeat the memo.
-@@ -1884,22 +1886,38 @@ function AppShellImpl() {
+@@ -1884,22 +1888,44 @@ function AppShellImpl() {
    );
    const handleOpenSearch = useCallback(() => {
      setSessionSearch(false);
@@ -661,7 +1044,8 @@ index 23303fac8e84b9385f2c188669affc35da88c6be..9e4afa869f293984c87177ed99111971
      setCommandPaletteOpen(true);
    }, []);
 +  // Every "new session" entry point lands here: with projects to choose from,
-+  // the palette asks which one first; otherwise the plain composer opens.
++  // the palette (a bottom sheet on phones) asks which one first; otherwise
++  // the plain composer opens.
 +  const shouldPromptForProject = useShouldPromptForProject();
 +  const navigate = useNavigate();
 +  const handleNewSession = useCallback(() => {
@@ -669,10 +1053,15 @@ index 23303fac8e84b9385f2c188669affc35da88c6be..9e4afa869f293984c87177ed99111971
 +      navigate("/");
 +      return;
 +    }
++    if (mobileViewport) {
++      setCommandPaletteOpen(false);
++      setProjectSheetOpen(true);
++      return;
++    }
 +    setSessionSearch(false);
 +    setProjectStep(true);
 +    setCommandPaletteOpen(true);
-+  }, [navigate, shouldPromptForProject]);
++  }, [mobileViewport, navigate, shouldPromptForProject]);
    const isEmbedded = useIsEmbedded();
    useCommandPaletteHotkey(
      () => {
@@ -695,7 +1084,7 @@ index 23303fac8e84b9385f2c188669affc35da88c6be..9e4afa869f293984c87177ed99111971
    useSettingsHotkey();
    useHistoryNavigation();
  
-@@ -2743,6 +2761,7 @@ function AppShellImpl() {
+@@ -2743,6 +2769,7 @@ function AppShellImpl() {
                dragProgress={sidebarDragProgress}
                onClose={handleSidebarClose}
                onOpenSearch={handleOpenSearch}
@@ -703,7 +1092,7 @@ index 23303fac8e84b9385f2c188669affc35da88c6be..9e4afa869f293984c87177ed99111971
              />
  
              {/* Content region (everything right of the sidebar): a relative
-@@ -3154,8 +3173,10 @@ function AppShellImpl() {
+@@ -3154,14 +3181,17 @@ function AppShellImpl() {
                there even though the ⌘K hotkey is disabled (it belongs to the
                host page). */}
            <CommandPalette
@@ -715,6 +1104,13 @@ index 23303fac8e84b9385f2c188669affc35da88c6be..9e4afa869f293984c87177ed99111971
              open={commandPaletteOpen}
              onOpenChange={setCommandPaletteOpen}
              onToggleLeftSidebar={toggleLeftSidebar}
+             onToggleRightSidebar={toggleRightPanel}
+             rightSidebarShortcutEnabled={!gridRoute}
+           />
++          <NewSessionProjectSheet open={projectSheetOpen} onOpenChange={setProjectSheetOpen} />
+           <RecentSessionsSwitcher
+             conversations={allConversations}
+             activeSessionId={serverConversationId ?? null}
 diff --git a/web/src/shell/CommandPalette.test.tsx b/web/src/shell/CommandPalette.test.tsx
 index 917d19ec7865a383df39f7bc9a23c20bbfe530f8..06bd6632d98e6aad9853233930576494b206ee0a 100644
 --- a/web/src/shell/CommandPalette.test.tsx
@@ -805,7 +1201,7 @@ index 917d19ec7865a383df39f7bc9a23c20bbfe530f8..06bd6632d98e6aad9853233930576494
    it("uses the sessions-first placeholder", () => {
      renderPalette();
 diff --git a/web/src/shell/CommandPalette.tsx b/web/src/shell/CommandPalette.tsx
-index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e84dbcb2ac 100644
+index ec708627828be71077e19e2504f84a956724e898..9ba9fccfef02e07540e9edd8dbabbc11714ca611 100644
 --- a/web/src/shell/CommandPalette.tsx
 +++ b/web/src/shell/CommandPalette.tsx
 @@ -2,6 +2,9 @@
@@ -826,7 +1222,18 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
    InboxIcon,
    type LucideIcon,
    PanelLeftIcon,
-@@ -52,6 +56,8 @@ import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav
+@@ -25,6 +29,10 @@ import {
+   useSessionSearch,
+ } from "@/hooks/useConversations";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import {
++  newSessionPath,
++  useLeaveProjectPickerWithoutProjects,
++} from "@/hooks/useNewChatProjectPrompt";
+ import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
+ import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+@@ -52,6 +60,8 @@ import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav
  
  export interface CommandPaletteProps {
    sessionsOnly?: boolean;
@@ -835,7 +1242,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
    open: boolean;
    onOpenChange: (open: boolean) => void;
    /** Flip the left (Conversations) sidebar — owned by AppShell. */
-@@ -60,6 +66,9 @@ export interface CommandPaletteProps {
+@@ -60,6 +70,9 @@ export interface CommandPaletteProps {
    onToggleRightSidebar: () => void;
    /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
    rightSidebarShortcutEnabled?: boolean;
@@ -845,7 +1252,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
  }
  
  interface ActionCommand {
-@@ -155,13 +164,25 @@ function paletteSessions(
+@@ -155,13 +168,25 @@ function paletteSessions(
    return out;
  }
  
@@ -871,7 +1278,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
  }: CommandPaletteProps) {
    const navigate = useNavigate();
    const isMobile = useIsMobileViewport();
-@@ -192,7 +213,7 @@ export function CommandPalette({
+@@ -192,7 +217,7 @@ export function CommandPalette({
          label: "New chat",
          icon: SquarePenIcon,
          keywords: ["compose", "start", "new session"],
@@ -880,7 +1287,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
          shortcut: newSessionShortcutKeys(),
        },
        {
-@@ -234,37 +255,52 @@ export function CommandPalette({
+@@ -234,37 +259,46 @@ export function CommandPalette({
          shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
        },
      ],
@@ -906,8 +1313,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
 -  }, [actions, query, sessionsOnly]);
 +  }, [actions, query, sessionsOnly, projectStep]);
  
--  const { data: projects = [] } = useProjects();
-+  const { data: projects = [], isSuccess: projectsLoaded, isError: projectsFailed } = useProjects();
+   const { data: projects = [] } = useProjects();
    // Every typed word must appear in the row label or the group heading, so
 -  // "new omni", "omni" and "project" all reach "New chat in omnigent".
 +  // "new omni", "omni" and "project" all reach "New chat in omnigent". The
@@ -927,14 +1333,8 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
 +    );
 +  }, [projects, query, sessionsOnly, projectStep]);
 +  const showNoProject = projectStep && matchesEveryWord("no project", query);
-+  // The project step may open before the list resolves. Nothing to choose
-+  // from means the plain composer, as if the prompt had never been offered.
-+  const noProjectToOffer = projectsFailed || (projectsLoaded && projects.length === 0);
-+  useEffect(() => {
-+    if (!open || !projectStep || !noProjectToOffer) return;
-+    onOpenChange(false);
-+    navigate("/");
-+  }, [open, projectStep, noProjectToOffer, onOpenChange, navigate]);
++  // The project step may open before the list resolves.
++  useLeaveProjectPickerWithoutProjects(open && projectStep, onOpenChange);
  
    const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
 -    useConversations("", false, { enabled: open });
@@ -947,7 +1347,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
    // Wait briefly for server info so a supporting server never gets the mixed
    // request; if it stalls, fall back to that request rather than never searching.
    const serverInfoLoading = serverInfo === "loading";
-@@ -314,6 +350,8 @@ export function CommandPalette({
+@@ -314,6 +348,8 @@ export function CommandPalette({
    ]);
  
    const sessions = useMemo(() => {
@@ -956,7 +1356,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
      if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
      // Rows archived after they loaded are still cached here, so drop them.
      const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
-@@ -326,7 +364,7 @@ export function CommandPalette({
+@@ -326,7 +362,7 @@ export function CommandPalette({
      }
      // The full first page would push Actions below the fold.
      return out.slice(0, IDLE_SESSION_LIMIT);
@@ -965,7 +1365,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
    // Excludes title matches again in case a rename moved a session between the
    // two groups' requests: cmdk needs each item value to be unique.
    const contentSessions = useMemo(
-@@ -341,9 +379,12 @@ export function CommandPalette({
+@@ -341,9 +377,12 @@ export function CommandPalette({
    );
    const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
    const searchGroups = [titleSearch, contentSearch];
@@ -981,7 +1381,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
    const loadMoreError = searching
      ? searchGroups.some((group) => group.isFetchNextPageError)
      : isFetchNextPageError;
-@@ -379,10 +420,16 @@ export function CommandPalette({
+@@ -379,10 +418,16 @@ export function CommandPalette({
      if (!userMovedSelection.current) setSelectedValue(firstItemValue);
    }, [firstItemValue, open, debouncedQuery]);
  
@@ -1002,16 +1402,16 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
  
    const runAction = (action: ActionCommand): void => {
      close();
-@@ -392,7 +439,7 @@ export function CommandPalette({
+@@ -392,7 +437,7 @@ export function CommandPalette({
    const queryClient = useQueryClient();
    const newChatInProject = (name: string): void => {
      close();
 -    navigate(`/?project=${encodeURIComponent(name)}`);
-+    navigate(name ? `/?project=${encodeURIComponent(name)}` : "/");
++    navigate(newSessionPath(name));
    };
  
    const goToSession = (id: string): void => {
-@@ -609,8 +656,14 @@ export function CommandPalette({
+@@ -609,8 +654,14 @@ export function CommandPalette({
                  })}
                </CommandGroup>
              )}
@@ -1028,7 +1428,7 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
                  {filteredProjects.map((project) => (
                    <CommandItem
                      key={project.name}
-@@ -618,7 +671,9 @@ export function CommandPalette({
+@@ -618,7 +669,9 @@ export function CommandPalette({
                      onSelect={() => newChatInProject(project.name)}
                    >
                      <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
@@ -1039,6 +1439,97 @@ index ec708627828be71077e19e2504f84a956724e898..c6f943ffa80eeb7bfb11af4bd03350e8
                    </CommandItem>
                  ))}
                </CommandGroup>
+diff --git a/web/src/shell/NewSessionProjectSheet.tsx b/web/src/shell/NewSessionProjectSheet.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd16fbb052a350b3b4f9e2b1cbf66a46b6eb098b
+--- /dev/null
++++ b/web/src/shell/NewSessionProjectSheet.tsx
+@@ -0,0 +1,85 @@
++// Phone form of the new-session project step: a bottom sheet listing No
++// project and every project, without a search field so the keyboard stays
++// down. Desktop asks in the command palette instead (`CommandPalette`).
++
++import type React from "react";
++import { CircleSlashIcon } from "lucide-react";
++
++import { BottomSheet, BottomSheetContent } from "@/components/ui/bottom-sheet";
++import { useProjects } from "@/hooks/useConversations";
++import {
++  newSessionPath,
++  useLeaveProjectPickerWithoutProjects,
++} from "@/hooks/useNewChatProjectPrompt";
++import { useNavigate } from "@/lib/routing";
++
++import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
++import { ProjectRowIcon } from "./ProjectPicker";
++
++export interface NewSessionProjectSheetProps {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++}
++
++function SheetRow({
++  icon,
++  label,
++  onClick,
++}: {
++  icon: React.ReactNode;
++  label: string;
++  onClick: () => void;
++}) {
++  return (
++    <button
++      type="button"
++      onClick={onClick}
++      className="flex min-h-12 w-full items-center gap-3.5 px-4 text-left text-[17px] text-foreground outline-none active:bg-foreground/[0.06] focus-visible:bg-foreground/[0.06]"
++    >
++      {icon}
++      <span className="min-w-0 flex-1 truncate">{label}</span>
++    </button>
++  );
++}
++
++export function NewSessionProjectSheet({ open, onOpenChange }: NewSessionProjectSheetProps) {
++  const navigate = useNavigate();
++  const { data: projects = [], isSuccess, isError } = useProjects();
++  // The sheet may open before the list resolves; rows arrive as it does.
++  useLeaveProjectPickerWithoutProjects(open, onOpenChange);
++  const loading = !isSuccess && !isError;
++
++  const start = (projectName: string): void => {
++    onOpenChange(false);
++    navigate(newSessionPath(projectName));
++  };
++
++  return (
++    <BottomSheet open={open} onOpenChange={onOpenChange}>
++      <BottomSheetContent title="Start a new session in" className={MOBILE_GLASS_SURFACE}>
++        <div className="min-h-0 overflow-y-auto overscroll-contain px-2 pb-2">
++          <div className="flex flex-col divide-y divide-border overflow-hidden rounded-2xl bg-foreground/[0.04]">
++            <SheetRow
++              icon={<CircleSlashIcon aria-hidden="true" className="size-5 text-muted-foreground" />}
++              label="No project"
++              onClick={() => start("")}
++            />
++            {projects.map((project) => (
++              <SheetRow
++                key={project.name}
++                icon={<ProjectRowIcon icon={project.icon} className="size-5 text-[18px]" />}
++                label={project.name}
++                onClick={() => start(project.name)}
++              />
++            ))}
++            {loading && (
++              <p role="status" className="px-4 py-3 text-[15px] text-muted-foreground">
++                Loading projects…
++              </p>
++            )}
++          </div>
++        </div>
++      </BottomSheetContent>
++    </BottomSheet>
++  );
++}
 diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
 index e08ef86976f07933986ab9d33187eb46a19a3ba2..efae8a1d4b80b3c22ba7b0fedbe5a6534f2b30ca 100644
 --- a/web/src/shell/Sidebar.test.tsx
