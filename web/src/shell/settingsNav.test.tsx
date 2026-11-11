@@ -53,12 +53,27 @@ import {
   useTrackSettingsReturn,
 } from "./settingsNav";
 
-function renderBody(opts: { onNavClick?: () => void; harnessesOffered?: boolean } = {}) {
+function renderBody(
+  opts: {
+    onNavClick?: () => void;
+    harnessesOffered?: boolean;
+    route?: string;
+    search?: ReactNode;
+    searching?: boolean;
+    onCollapse?: () => void;
+  } = {},
+) {
   const onNavClick = opts.onNavClick ?? vi.fn();
   render(
     <TooltipProvider>
-      <MemoryRouter initialEntries={["/settings/appearance"]}>
-        <SettingsSidebarBody onNavClick={onNavClick} harnessesOffered={opts.harnessesOffered} />
+      <MemoryRouter initialEntries={[opts.route ?? "/settings/appearance"]}>
+        <SettingsSidebarBody
+          onNavClick={onNavClick}
+          harnessesOffered={opts.harnessesOffered}
+          search={opts.search}
+          searching={opts.searching}
+          onCollapse={opts.onCollapse}
+        />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -292,6 +307,10 @@ describe("SettingsSidebarBody", () => {
     expect(selected.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
     expect(selected.querySelector("svg")).not.toHaveClass("text-muted-foreground");
     expect(unselected.querySelector("svg")).toHaveClass("text-muted-foreground");
+    // Desktop keeps plain sidebar rows: no phone touch floor or disclosure chevron.
+    expect(unselected).not.toHaveClass("mobile-touch-target");
+    expect(unselected.querySelectorAll("svg")).toHaveLength(1);
+    expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
   });
 
   it("renders group subtitles in sentence case at the text-sm tier", () => {
@@ -406,6 +425,94 @@ describe("SettingsSidebarBody", () => {
     expect(screen.queryByTestId("settings-nav-members")).toBeNull();
     expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
   });
+});
+
+// The mobile layout's queries: the overlay drawer matches only the max-width one,
+// the docked (side-by-side) menu also the min-width one.
+function stubMobileLayout({ docked }: { docked: boolean }): void {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: query.includes("max-width") && (docked || !query.includes("min-width")),
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }));
+}
+
+describe("SettingsSidebarBody on phones", () => {
+  beforeEach(() => {
+    stubMobileLayout({ docked: false });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders the menu as titled, grouped disclosure rows", () => {
+    renderBody({ route: "/settings/general" });
+    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeInTheDocument();
+    const back = screen.getByRole("link", { name: "Back" });
+    expect(back).toHaveClass("mobile-touch-target");
+    expect(back.querySelector("svg")).toHaveClass("lucide-chevron-left");
+    const general = screen.getByTestId("settings-nav-general");
+    expect(general).toHaveClass("mobile-touch-target", "rounded-none", "focus-visible:ring-inset");
+    expect(general.querySelectorAll("svg")).toHaveLength(2);
+    expect(general.parentElement).toHaveClass("divide-y", "rounded-xl", "overflow-hidden");
+    expect(general.parentElement).not.toHaveClass("gap-px");
+  });
+
+  // Bare /settings redirects to /settings/general, so the open section is always set.
+  it.each(["/settings/general", "/settings/appearance"])(
+    "shows no selected row at %s but keeps aria-current",
+    (route) => {
+      renderBody({ route });
+      const current = document.querySelector('[aria-current="page"]');
+      expect(current).toHaveAttribute("href", route);
+      for (const row of screen.getAllByRole("link")) {
+        expect(row).not.toHaveClass("bg-[var(--sidebar-active)]");
+        expect(row.querySelector("svg")).not.toHaveClass("text-[var(--sidebar-active-foreground)]");
+      }
+    },
+  );
+
+  it("stays the sidebar nav when the menu docks beside the page", () => {
+    stubMobileLayout({ docked: true });
+    // The sidebar passes onCollapse only while the menu docks beside the page.
+    renderBody({ route: "/settings/appearance", onCollapse: vi.fn() });
+    expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
+    const selected = screen.getByTestId("settings-nav-appearance");
+    expect(selected).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(selected).not.toHaveClass("mobile-touch-target");
+    expect(selected.querySelectorAll("svg")).toHaveLength(1);
+    expect(selected.parentElement).toHaveClass("gap-px");
+  });
+
+  it("puts the search field between the title and the pages", () => {
+    renderBody({ search: <input aria-label="Search settings" /> });
+    const title = screen.getByRole("heading", { level: 1, name: "Settings" });
+    const field = screen.getByRole("textbox", { name: "Search settings" });
+    const firstPage = screen.getByTestId("settings-nav-general");
+    expect(title.compareDocumentPosition(field)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(field.compareDocumentPosition(firstPage)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it("keeps the title and Back while search results replace the pages", () => {
+    renderBody({ search: <input aria-label="Search settings" />, searching: true });
+    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Back" })).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-nav-general")).toBeNull();
+  });
+});
+
+// Many tests mock the viewport hook's module with the hook alone; importing
+// settingsNav (as the settings search catalog does) must not need more of it.
+it("loads beside a mock of the viewport hook that has only the hook", async () => {
+  vi.resetModules();
+  vi.doMock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => true }));
+  try {
+    await expect(import("./settingsNav")).resolves.toHaveProperty("SettingsSidebarBody");
+  } finally {
+    vi.doUnmock("@/hooks/useIsMobileViewport");
+    vi.resetModules();
+  }
 });
 
 describe("useSettingsRoute", () => {

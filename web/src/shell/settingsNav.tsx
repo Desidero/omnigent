@@ -12,6 +12,8 @@ import {
   ArrowLeftIcon,
   BlocksIcon,
   BotIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -35,8 +37,10 @@ import {
   isSingleUserMode,
 } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
@@ -300,6 +304,9 @@ export function SettingsSidebarBody({
   searching?: boolean;
 }) {
   const { section } = useSettingsRoute();
+  // The phone drawer covers the page, so it reads as a list of pages; docked beside
+  // the page (the only time the sidebar passes onCollapse) it stays the sidebar nav.
+  const phoneMenu = useIsMobileViewport() && onCollapse === undefined;
   const groups = useSettingsNavGroups(harnessesOffered);
 
   return (
@@ -315,6 +322,7 @@ export function SettingsSidebarBody({
           className={cn(
             SIDEBAR_ROW,
             "w-fit justify-start border-0 font-normal text-muted-foreground",
+            phoneMenu && "mobile-touch-target",
           )}
         >
           {/* Returns to wherever the user was before entering settings (the
@@ -325,7 +333,11 @@ export function SettingsSidebarBody({
           closing onto the content behind it. On desktop onNavClick is a no-op
           (persistent card), so dropping it changes nothing there. */}
           <Link to={settingsReturnPath} componentId="settings.back_to_omnigent">
-            <ArrowLeftIcon className="ui-icon" />
+            {phoneMenu ? (
+              <ChevronLeftIcon className="ui-icon" />
+            ) : (
+              <ArrowLeftIcon className="ui-icon" />
+            )}
             Back
           </Link>
         </Button>
@@ -342,6 +354,7 @@ export function SettingsSidebarBody({
           </Button>
         )}
       </div>
+      {phoneMenu && <h1 className="px-5 pt-2 text-2xl font-semibold tracking-tight">Settings</h1>}
       {search}
       {searching ? null : (
         <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
@@ -350,10 +363,19 @@ export function SettingsSidebarBody({
               <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
                 {group.title}
               </h2>
-              <div className="mt-1 flex flex-col gap-px">
+              <div
+                className={cn(
+                  "mt-1 flex flex-col",
+                  phoneMenu
+                    ? cn(MOBILE_GLASS_SURFACE, "divide-y divide-border overflow-hidden rounded-xl")
+                    : "gap-px",
+                )}
+              >
                 {group.items.map((item) => {
                   const Icon = item.icon;
-                  const selected = section === item.id;
+                  const current = section === item.id;
+                  // No page shows beside the phone menu, so no row looks selected.
+                  const selected = current && !phoneMenu;
                   return (
                     <Button
                       key={item.id}
@@ -365,6 +387,9 @@ export function SettingsSidebarBody({
                         selected &&
                           "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
                         item.hideOnMobile && "max-md:hidden",
+                        // Inset focus ring: the rounded group clips an outer one.
+                        phoneMenu &&
+                          "mobile-touch-target rounded-none px-3 focus-visible:ring-inset",
                       )}
                     >
                       <Link
@@ -372,7 +397,7 @@ export function SettingsSidebarBody({
                         onClick={onNavClick}
                         data-testid={`settings-nav-${item.id}`}
                         componentId={`settings.nav.${item.id}`}
-                        aria-current={selected ? "page" : undefined}
+                        aria-current={current ? "page" : undefined}
                       >
                         <Icon
                           className={cn(
@@ -383,6 +408,12 @@ export function SettingsSidebarBody({
                           )}
                         />
                         {item.label}
+                        {phoneMenu && (
+                          <ChevronRightIcon
+                            aria-hidden
+                            className="ui-icon ml-auto text-muted-foreground"
+                          />
+                        )}
                       </Link>
                     </Button>
                   );
