@@ -86,7 +86,12 @@ def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
 
 
 def _open_view_submenu(page: Page, submenu_test_id: str) -> None:
+    """Open the filter menu at a submenu's choices; a phone lists them inline instead."""
     page.get_by_test_id("session-filter").press("ArrowDown")
+    viewport = page.viewport_size
+    if viewport and viewport["width"] < 768:
+        expect(page.get_by_test_id(submenu_test_id)).to_have_count(0)
+        return
     page.get_by_test_id(submenu_test_id).click()
 
 

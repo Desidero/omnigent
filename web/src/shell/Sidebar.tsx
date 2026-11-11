@@ -36,6 +36,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -154,6 +155,7 @@ import {
   DropdownMenuCheckboxItem,
   DropdownMenuLabel,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
@@ -3875,6 +3877,7 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
 };
 
 // A filter-menu submenu whose trigger shows the current pick at its right edge.
+// On phones, where a side flyout runs off-screen, its choices sit inline under a heading.
 function FilterMenuSub({
   label,
   value,
@@ -3886,6 +3889,21 @@ function FilterMenuSub({
   testId: string;
   children: ReactNode;
 }) {
+  const inline = useIsMobileViewport();
+  const headingId = useId();
+  if (inline) {
+    return (
+      <DropdownMenuGroup
+        aria-labelledby={headingId}
+        className="[&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui"
+      >
+        <DropdownMenuLabel id={headingId} className="text-muted-foreground text-sm">
+          {label}
+        </DropdownMenuLabel>
+        {children}
+      </DropdownMenuGroup>
+    );
+  }
   return (
     <DropdownMenuSub>
       <DropdownMenuSubTrigger className="mobile-touch-target" data-testid={testId}>
@@ -3916,6 +3934,8 @@ function SessionFilterMenu({
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
+  // Phones list each submenu inline (FilterMenuSub), so the sections need dividers.
+  const phoneSeparator = useIsMobileViewport() && <DropdownMenuSeparator />;
   const [menuOpen, setMenuOpen] = useState(false);
   const tooltip = useMenuGuardedTooltip(menuOpen);
   const filters = multiUser
@@ -3967,7 +3987,7 @@ function SessionFilterMenu({
           {displayOptions}
         </DropdownMenuContent>
       ) : (
-        <DropdownMenuContent align="end" className="min-w-56">
+        <DropdownMenuContent align="end" className="min-w-56 max-md:overscroll-contain">
           <FilterMenuSub
             label="Grouping"
             value={GROUPING_LABELS[view.grouping]}
@@ -3989,6 +4009,7 @@ function SessionFilterMenu({
               ))}
             </DropdownMenuRadioGroup>
           </FilterMenuSub>
+          {phoneSeparator}
           <FilterMenuSub
             label="Display"
             value={filters.find((filter) => filter.value === value)?.label}
@@ -3996,6 +4017,7 @@ function SessionFilterMenu({
           >
             {displayOptions}
           </FilterMenuSub>
+          {phoneSeparator}
           <FilterMenuSub
             label="Ordering"
             value={ORDERING_LABELS[view.ordering]}

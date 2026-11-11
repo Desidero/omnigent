@@ -4807,6 +4807,66 @@ describe("Sidebar view options", () => {
       viewer.mockRestore();
     }
   });
+
+  it("opens each choice list as a side submenu on desktop", () => {
+    mockConversations([conv("conv_a", "Codex", { status: "idle" })]);
+    renderGroupingSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+
+    expect(screen.getByTestId("session-grouping-menu")).toHaveAttribute("aria-haspopup", "menu");
+    expect(screen.queryByRole("menuitemradio", { name: "Status" })).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("session-grouping-menu"), { key: "ArrowRight" });
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+    expect(screen.getByRole("menuitemradio", { name: "Status" })).toBeInTheDocument();
+  });
+
+  it("lists every choice inline under a heading on a phone", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    try {
+      mockConversations([conv("conv_a", "Codex", { status: "idle" })]);
+      renderGroupingSidebar();
+      fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0, ctrlKey: false });
+
+      const menu = screen.getByRole("menu");
+      expect(menu).toHaveClass("max-md:overscroll-contain");
+      expect(screen.queryByTestId("session-grouping-menu")).toBeNull();
+      expect(within(menu).queryAllByRole("menuitem")).toHaveLength(0);
+      // Each submenu is a labelled section, with one divider between neighbours.
+      const sections = within(menu)
+        .getAllByRole("group")
+        .filter((group) => group.hasAttribute("aria-labelledby"));
+      expect(sections.map((section) => section.firstElementChild?.textContent)).toEqual(
+        expect.arrayContaining(["Grouping", "Display", "Ordering", "Show"]),
+      );
+      expect(within(menu).getAllByRole("separator")).toHaveLength(sections.length - 1);
+      const grouping = within(menu).getByRole("group", { name: "Grouping" });
+      expect(within(grouping).getByRole("menuitemradio", { name: "Default" })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+      expect(
+        within(menu)
+          .getByRole("group", { name: "Show" })
+          .querySelectorAll("[role=menuitemcheckbox]"),
+      ).toHaveLength(5);
+
+      // A checkbox keeps the menu open; a radio pick applies and closes it.
+      fireEvent.click(screen.getByTestId("session-show-branch"));
+      fireEvent.click(within(grouping).getByRole("menuitemradio", { name: "Status" }));
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+        grouping: "status",
+        show: ["branch"],
+      });
+    } finally {
+      matchMedia.mockRestore();
+    }
+  });
 });
 
 describe("sidebar_grouping_ui release flag", () => {
