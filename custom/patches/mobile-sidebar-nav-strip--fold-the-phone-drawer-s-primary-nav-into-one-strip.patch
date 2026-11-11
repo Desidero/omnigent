@@ -1,17 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Desidero <desidero@gmail.com>
-Date: Wed, 11 Nov 2026 01:45:38 +0000
+Date: Wed, 11 Nov 2026 02:18:02 +0000
 Subject: [PATCH] feat(web): fold the phone drawer's primary nav into one strip
 
 On a phone, New session, Automations, Inbox and Canvas render as four
 44px rows that take about 179px above the session list. At phone width
 the drawer now shows them as one strip of equal-width icon-over-label
 cells (at least 44px tall) in a rounded glass container, which gives the
-session list roughly four more rows. Usage and extension pages add cells
-and the strip scrolls sideways, bringing an active cell into view.
+session list roughly four more rows. The strip never scrolls: Usage and
+extension pages, when present, stay full-width rows directly below it.
+Cell labels follow the Appearance interface font size.
 
 Every item now renders through PrimaryNavLink, which takes a row or cell
-layout, so both layouts share one definition per destination. The cells
+layout, so both layouts share one definition per destination; a small
+PrimaryNavStrip wraps the core four only on the phone drawer. The cells
 keep their test ids, component ids, links, drawer closing and active
 highlight; New keeps the accessible name "New session" and its
 aria-keyshortcuts, and the Inbox count sits on the cell's corner with the
@@ -21,25 +23,25 @@ keep the stacked rows.
 Refs #13482
 
 [Desidero: Automations stays unconditional (this base has no
-automations_enabled gate), and New session keeps the project prompt's click
-handler from new-chat-project-prompt]
+automations_enabled gate), New session keeps the project prompt's click
+handler from new-chat-project-prompt, and the drawer test leaves out
+upstream's newer keyboard-dismissal tests]
 
 Not upstream yet: proposed from feat/mobile-sidebar-nav-strip; drop this copy once it merges.
 
 Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-(cherry picked from commit ab6877bc3454e3b0ae0121f453a51c96a02e3450)
+(cherry picked from commit 2e521c3ca025a7f26f456a788704e8ef14d3e9a4)
 ---
- feature-map/sessions.md                       |  16 ++
- .../extensions/ExtensionPrimaryNavigation.tsx |   5 +-
- web/src/shell/PrimaryNavLink.tsx              |  47 ++++-
- web/src/shell/Sidebar.mobileDrawer.test.tsx   | 136 ++++++++++++
- web/src/shell/Sidebar.test.tsx                |  19 ++
- web/src/shell/Sidebar.tsx                     | 199 +++++++-----------
- 6 files changed, 294 insertions(+), 128 deletions(-)
+ feature-map/sessions.md                     |  16 ++
+ web/src/shell/PrimaryNavLink.tsx            |  55 ++++-
+ web/src/shell/Sidebar.mobileDrawer.test.tsx | 126 +++++++++++
+ web/src/shell/Sidebar.test.tsx              |  20 ++
+ web/src/shell/Sidebar.tsx                   | 230 ++++++++------------
+ 5 files changed, 304 insertions(+), 143 deletions(-)
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index 588a557c2fc4b50e8b320962313156c5d2c526a0..b603c86839ddad2cc1b5dee3eccbdb2923991be0 100644
+index 588a557c2fc4b50e8b320962313156c5d2c526a0..6d591946ad70fbec3bc4d7862c46d2b84c6d7c05 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
 @@ -226,6 +226,10 @@ the header menu), and each place is a separate entry point.
@@ -47,9 +49,9 @@ index 588a557c2fc4b50e8b320962313156c5d2c526a0..b603c86839ddad2cc1b5dee3eccbdb29
    back. List scrolling, row taps, long-press reordering and horizontal scrollers
    keep their own touch handling.
 +- `mobile-primary-nav-strip`: on phone layouts, the drawer shows New session,
-+  Automations, Inbox, Canvas, Usage and extension pages as one strip of
-+  icon-over-label cells under the header instead of stacked rows. Cells are at
-+  least 44px tall; past four destinations the strip scrolls sideways.
++  Automations, Inbox and Canvas as one strip of equal-width icon-over-label
++  cells under the header instead of stacked rows. Cells are at least 44px tall.
++  Usage and extension pages stay full-width rows below the strip.
  
  ## How to get to it (user POV)
  
@@ -60,9 +62,9 @@ index 588a557c2fc4b50e8b320962313156c5d2c526a0..b603c86839ddad2cc1b5dee3eccbdb29
 +**Primary navigation on phones:** at phone width, open the sidebar drawer. New
 +(named New session for screen readers), Automations, Inbox and Canvas share one
 +strip under the header; the current page's cell keeps the active highlight and
-+the Inbox count sits on its cell's corner. Usage and extension pages add cells
-+and the strip scrolls sideways. Tapping a cell opens the page and closes the
-+drawer; a modifier-click leaves it open. Desktop, tablet, and a wide phone
++the Inbox count sits on its cell's corner. The strip never scrolls; Usage and
++extension pages, when present, are ordinary rows directly below it. Tapping a
++cell or row opens the page and closes the drawer; a modifier-click leaves it open. Desktop, tablet, and a wide phone
 +showing the sidebar beside the chat keep the stacked rows.
 +
  **Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
@@ -73,71 +75,57 @@ index 588a557c2fc4b50e8b320962313156c5d2c526a0..b603c86839ddad2cc1b5dee3eccbdb29
    mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
    hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
 +- **`mobile-primary-nav-strip`:** component coverage only, in
-+  `web/src/shell/Sidebar.mobileDrawer.test.tsx` (strip cells, active state, Inbox
-+  badge, drawer closing, rows on desktop and side by side) and
-+  `web/src/shell/Sidebar.test.tsx` (extension cells).
++  `web/src/shell/Sidebar.mobileDrawer.test.tsx` (strip cells, Usage as a row
++  below the strip, active state, Inbox badge, drawer closing, rows on desktop and
++  side by side) and `web/src/shell/Sidebar.test.tsx` (extension pages as rows).
  - **`archive`:**
    `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
    `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
-diff --git a/web/src/extensions/ExtensionPrimaryNavigation.tsx b/web/src/extensions/ExtensionPrimaryNavigation.tsx
-index 3125a0c5a5ae09f818b7e8d00d07757e130177bc..2e6cfe37d3e3baf21de42a125e6146e7b793cf5d 100644
---- a/web/src/extensions/ExtensionPrimaryNavigation.tsx
-+++ b/web/src/extensions/ExtensionPrimaryNavigation.tsx
-@@ -6,7 +6,7 @@ import {
-   type LucideIcon,
- } from "lucide-react";
- import type { MouseEvent } from "react";
--import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
-+import { PrimaryNavLink, type PrimaryNavLayout } from "@/shell/PrimaryNavLink";
- import { useExtensions } from "./ExtensionProvider";
- 
- const ICONS: Record<string, LucideIcon> = {
-@@ -18,9 +18,11 @@ const ICONS: Record<string, LucideIcon> = {
- 
- export function ExtensionPrimaryNavigation({
-   activePageId,
-+  layout,
-   onNavigate,
- }: {
-   activePageId: string | null;
-+  layout?: PrimaryNavLayout;
-   onNavigate?: (event: MouseEvent<HTMLAnchorElement>) => void;
- }) {
-   // V1 owns one slot between Inbox and Usage. `order` is deterministic within
-@@ -45,6 +47,7 @@ export function ExtensionPrimaryNavigation({
-         label={navigation.label}
-         icon={ICONS[navigation.icon ?? ""] ?? PuzzleIcon}
-         active={activePageId === page.id}
-+        layout={layout}
-         onClick={onNavigate}
-         componentId={`sidebar.extension.${navigation.id}`}
-         testId={`extension-nav-${navigation.id}`}
 diff --git a/web/src/shell/PrimaryNavLink.tsx b/web/src/shell/PrimaryNavLink.tsx
-index 9eef01c3d516d52d15ffdabc8845639b26633f66..16468ed155af02b7f0f13a80a599edcc6b841ead 100644
+index 9eef01c3d516d52d15ffdabc8845639b26633f66..bb3f602675068361dea702d14bbbcd7d7bb1c517 100644
 --- a/web/src/shell/PrimaryNavLink.tsx
 +++ b/web/src/shell/PrimaryNavLink.tsx
-@@ -1,4 +1,4 @@
--import type { MouseEvent, ReactNode } from "react";
-+import { useLayoutEffect, useRef, type MouseEvent, type ReactNode } from "react";
- import type { LucideIcon } from "lucide-react";
+@@ -3,12 +3,39 @@ import type { LucideIcon } from "lucide-react";
  import { Button } from "@/components/ui/button";
  import { Link } from "@/lib/routing";
-@@ -9,6 +9,14 @@ const HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-mute
+ import { cn } from "@/lib/utils";
++import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
+ import { SIDEBAR_ROW } from "./sidebarStyles";
+ 
+ const HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
  const ACTIVE_HIGHLIGHT =
    "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
  
 +/** Full-width sidebar rows, or the icon-over-label cells of the phone drawer's strip. */
 +export type PrimaryNavLayout = "row" | "cell";
 +
-+// Equal-width cells at least 44px tall; past four, the minimum width makes the strip scroll.
-+// No mobile-touch-target: its 44px min-width would override the 72px floor.
++// Equal-width cells at least 44px tall.
 +const CELL =
-+  "h-auto min-h-11 min-w-[4.5rem] flex-1 basis-0 flex-col gap-1 rounded-xl border-0 px-1 py-2.5 font-normal";
++  "h-auto min-h-11 min-w-0 flex-1 basis-0 flex-col gap-1 rounded-xl border-0 px-0.5 py-2.5 font-normal mobile-touch-target";
++
++/** On the phone drawer, wraps the core destinations in one strip; elsewhere they stay rows. */
++export function PrimaryNavStrip({
++  layout,
++  children,
++}: {
++  layout: PrimaryNavLayout;
++  children: ReactNode;
++}) {
++  if (layout === "row") return children;
++  return (
++    <div
++      data-testid="sidebar-primary-nav-strip"
++      className={cn("mb-1 flex gap-1 rounded-2xl p-1", MOBILE_GLASS_SURFACE)}
++    >
++      {children}
++    </div>
++  );
++}
 +
  export interface PrimaryNavLinkProps {
    to: string;
    label: string;
-@@ -18,6 +26,11 @@ export interface PrimaryNavLinkProps {
+@@ -18,6 +45,11 @@ export interface PrimaryNavLinkProps {
    testId?: string;
    onClick?: (event: MouseEvent<HTMLAnchorElement>) => void;
    trailing?: ReactNode;
@@ -149,7 +137,7 @@ index 9eef01c3d516d52d15ffdabc8845639b26633f66..16468ed155af02b7f0f13a80a599edcc
  }
  
  export function PrimaryNavLink({
-@@ -29,24 +42,46 @@ export function PrimaryNavLink({
+@@ -29,16 +61,24 @@ export function PrimaryNavLink({
    testId,
    onClick,
    trailing,
@@ -159,17 +147,6 @@ index 9eef01c3d516d52d15ffdabc8845639b26633f66..16468ed155af02b7f0f13a80a599edcc
 +  ariaKeyShortcuts,
  }: PrimaryNavLinkProps) {
 +  const cell = layout === "cell";
-+  const linkRef = useRef<HTMLAnchorElement>(null);
-+  // An active cell scrolled out of the strip on either side scrolls back into view.
-+  useLayoutEffect(() => {
-+    const link = linkRef.current;
-+    const strip = link?.parentElement;
-+    if (!cell || !active || !link || !strip) return;
-+    const linkBox = link.getBoundingClientRect();
-+    const stripBox = strip.getBoundingClientRect();
-+    if (linkBox.left < stripBox.left) strip.scrollLeft -= stripBox.left - linkBox.left;
-+    else if (linkBox.right > stripBox.right) strip.scrollLeft += linkBox.right - stripBox.right;
-+  }, [cell, active]);
 +  const visibleLabel = cell ? (shortLabel ?? label) : label;
    return (
      <Button
@@ -187,9 +164,7 @@ index 9eef01c3d516d52d15ffdabc8845639b26633f66..16468ed155af02b7f0f13a80a599edcc
        )}
        data-testid={testId}
      >
-       <Link
-+        ref={linkRef}
-         to={to}
+@@ -47,6 +87,8 @@ export function PrimaryNavLink({
          onClick={onClick}
          componentId={componentId}
          aria-current={active ? "page" : undefined}
@@ -198,13 +173,16 @@ index 9eef01c3d516d52d15ffdabc8845639b26633f66..16468ed155af02b7f0f13a80a599edcc
        >
          <Icon
            className={cn(
-@@ -54,7 +89,11 @@ export function PrimaryNavLink({
+@@ -54,7 +96,14 @@ export function PrimaryNavLink({
              active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
            )}
          />
 -        {label}
 +        {cell ? (
-+          <span className="max-w-full truncate text-[11px] leading-[14px]">{visibleLabel}</span>
++          // 4px under the Appearance interface size (11px at the phone default).
++          <span className="max-w-full truncate text-[calc(var(--text-ui)-4px)] leading-tight tracking-tight">
++            {visibleLabel}
++          </span>
 +        ) : (
 +          label
 +        )}
@@ -212,10 +190,10 @@ index 9eef01c3d516d52d15ffdabc8845639b26633f66..16468ed155af02b7f0f13a80a599edcc
        </Link>
      </Button>
 diff --git a/web/src/shell/Sidebar.mobileDrawer.test.tsx b/web/src/shell/Sidebar.mobileDrawer.test.tsx
-index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..f18a6ca6347bfe44daaac02c2d3de5d307d9ee9a 100644
+index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..6c911d53f2fcee01e769a07bb1bd444debd57282 100644
 --- a/web/src/shell/Sidebar.mobileDrawer.test.tsx
 +++ b/web/src/shell/Sidebar.mobileDrawer.test.tsx
-@@ -392,3 +392,139 @@ describe("mobile sidebar drawer swipe to close", () => {
+@@ -392,3 +392,129 @@ describe("mobile sidebar drawer swipe to close", () => {
      expect(onClose).not.toHaveBeenCalled();
    });
  });
@@ -237,27 +215,41 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..f18a6ca6347bfe44daaac02c2d3de5d3
 +    return within(screen.getByTestId("sidebar-primary-nav")).getByRole("link", { name });
 +  }
 +
-+  it("renders the destinations as equal-width cells of at least 44px in one scrolling strip", () => {
++  it("puts the core destinations in one strip of equal-width cells at least 44px tall", () => {
 +    stubMobileLayout(true);
 +    renderSidebar({ features: STRIP_FEATURES });
 +
-+    const strip = screen.getByTestId("sidebar-primary-nav");
-+    expect(strip).toHaveClass("flex", "overflow-x-auto", "rounded-2xl", "max-md:backdrop-blur-xl");
-+    expect(strip).not.toHaveClass("flex-col");
-+    expect(cells().map((cell) => cell.dataset.testid)).toEqual([
++    const strip = screen.getByTestId("sidebar-primary-nav-strip");
++    expect(strip).toHaveClass("flex", "rounded-2xl", "max-md:backdrop-blur-xl");
++    expect(strip).not.toHaveClass("flex-col", "overflow-x-auto");
++    const stripCells = within(strip).getAllByRole("link");
++    expect(stripCells.map((cell) => cell.dataset.testid)).toEqual([
 +      "new-chat-button",
 +      "scheduled-tasks-nav",
 +      "inbox-button",
 +      "canvas-nav",
-+      "usage-nav",
 +    ]);
-+    for (const cell of cells()) {
-+      // A fifth destination keeps the minimum width and scrolls the strip.
-+      expect(cell).toHaveClass("flex-1", "basis-0", "min-w-[4.5rem]", "flex-col", "min-h-11");
-+      // The touch-target utility's 44px min-width would override the 72px floor.
-+      expect(cell).not.toHaveClass("mobile-touch-target");
++    for (const cell of stripCells) {
++      expect(cell).toHaveClass("flex-1", "basis-0", "min-w-0", "flex-col", "min-h-11");
++      expect(cell).toHaveClass("mobile-touch-target");
 +      expect(cell).not.toHaveClass("sidebar-row", "w-full");
 +    }
++  });
++
++  it("renders optional pages as full-width rows below the strip", () => {
++    stubMobileLayout(true);
++    renderSidebar({ route: "/usage", features: STRIP_FEATURES });
++
++    const strip = screen.getByTestId("sidebar-primary-nav-strip");
++    const usage = screen.getByTestId("usage-nav");
++    expect(strip).not.toContainElement(usage);
++    expect(screen.getByTestId("sidebar-primary-nav")).toContainElement(usage);
++    expect(strip.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++    expect(usage).toHaveClass("sidebar-row", "w-full", "justify-start", "mobile-touch-target");
++    expect(usage).not.toHaveClass("flex-1", "flex-col");
++    expect(usage).toHaveTextContent(/^Usage$/);
++    expect(usage).toHaveAttribute("aria-current", "page");
++    expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
 +  });
 +
 +  it("labels New as New session and drops the hover-only shortcut hint", () => {
@@ -268,6 +260,8 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..f18a6ca6347bfe44daaac02c2d3de5d3
 +    expect(newSession).toHaveAttribute("data-testid", "new-chat-button");
 +    expect(newSession).toHaveAttribute("href", "/");
 +    expect(newSession).toHaveTextContent(/^New$/);
++    // The label follows the Appearance interface font size rather than a fixed px.
++    expect(within(newSession).getByText("New")).toHaveClass("text-[calc(var(--text-ui)-4px)]");
 +    expect(newSession).toHaveAttribute("aria-keyshortcuts");
 +    expect(newSession).toHaveAttribute("aria-current", "page");
 +    expect(newSession.querySelector('[data-slot="shortcut-keys"]')).toBeNull();
@@ -288,32 +282,6 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..f18a6ca6347bfe44daaac02c2d3de5d3
 +    const badge = within(inbox).getByLabelText("2 inbox items waiting");
 +    expect(badge).toHaveClass("absolute", "top-1", "right-1", "bg-transparent");
 +    expect(badge).not.toHaveClass("ml-auto");
-+  });
-+
-+  it("scrolls the active cell into view from either side of the strip", () => {
-+    stubMobileLayout(true);
-+    // Cells 72px wide on a 76px pitch inside a 300px strip, offset by its scroll.
-+    const rects = vi
-+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-+      .mockImplementation(function (this: HTMLElement) {
-+        const strip = this.closest<HTMLElement>('[data-testid="sidebar-primary-nav"]');
-+        if (!strip) return { left: 0, right: 0 } as DOMRect;
-+        if (this === strip) return { left: 0, right: 300 } as DOMRect;
-+        const left = Array.from(strip.children).indexOf(this) * 76 - strip.scrollLeft;
-+        return { left, right: left + 72 } as DOMRect;
-+      });
-+    try {
-+      renderSidebar({ route: "/usage", features: STRIP_FEATURES });
-+      const strip = screen.getByTestId("sidebar-primary-nav");
-+      // Usage, the fifth cell, spans 304–376px: scroll right by 76px.
-+      expect(strip.scrollLeft).toBe(76);
-+
-+      fireEvent.click(screen.getByTestId("new-chat-button"));
-+      expect(screen.getByTestId("new-chat-button")).toHaveAttribute("aria-current", "page");
-+      expect(strip.scrollLeft).toBe(0);
-+    } finally {
-+      rects.mockRestore();
-+    }
 +  });
 +
 +  it("closes the drawer on a plain tap but not on a modifier click", () => {
@@ -345,10 +313,10 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..f18a6ca6347bfe44daaac02c2d3de5d3
 +    } else stubMobileLayout(false);
 +    renderSidebar({ features: STRIP_FEATURES });
 +
-+    expect(screen.getByTestId("sidebar-primary-nav")).toHaveClass("flex-col");
++    expect(screen.queryByTestId("sidebar-primary-nav-strip")).toBeNull();
 +    for (const cell of cells()) {
 +      expect(cell).toHaveClass("sidebar-row", "w-full", "justify-start");
-+      expect(cell).not.toHaveClass("min-w-[4.5rem]");
++      expect(cell).not.toHaveClass("flex-1");
 +    }
 +    const newSession = primaryNavLink(/^New session/);
 +    expect(newSession).not.toHaveAttribute("aria-label");
@@ -356,14 +324,14 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..f18a6ca6347bfe44daaac02c2d3de5d3
 +  });
 +});
 diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
-index fbb3e1610e4bcb763695cbef15ddeeb0ef346bca..139536b7eaa04f85d9d5e43236d40f26f232d71c 100644
+index fbb3e1610e4bcb763695cbef15ddeeb0ef346bca..954c126ae8c858e992d2ac7087ac5846190e2320 100644
 --- a/web/src/shell/Sidebar.test.tsx
 +++ b/web/src/shell/Sidebar.test.tsx
-@@ -1424,6 +1424,25 @@ describe("Sidebar session list", () => {
+@@ -1424,6 +1424,26 @@ describe("Sidebar session list", () => {
      expect(onClose).toHaveBeenCalledOnce();
    });
  
-+  it("renders an extension page as a strip cell in the phone drawer", () => {
++  it("renders an extension page as a row below the phone drawer's strip", () => {
 +    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
 +    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
 +      ...mediaQuery,
@@ -375,7 +343,8 @@ index fbb3e1610e4bcb763695cbef15ddeeb0ef346bca..139536b7eaa04f85d9d5e43236d40f26
 +      renderSidebar(true, "/extensions/acme.review/inbox", undefined, undefined, [TEST_EXTENSION]);
 +
 +      const extension = screen.getByTestId("extension-nav-acme.review.primary-nav");
-+      expect(extension).toHaveClass("flex-1", "flex-col", "min-h-11");
++      expect(screen.getByTestId("sidebar-primary-nav-strip")).not.toContainElement(extension);
++      expect(extension).toHaveClass("sidebar-row", "w-full", "mobile-touch-target");
 +      expect(extension).toHaveAttribute("aria-current", "page");
 +    } finally {
 +      matchMedia.mockRestore();
@@ -386,20 +355,19 @@ index fbb3e1610e4bcb763695cbef15ddeeb0ef346bca..139536b7eaa04f85d9d5e43236d40f26
      mockConversations(THREE_TYPE_CONVERSATIONS);
      renderSidebar();
 diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
-index 3565b3b71f9bbff7649f724217a0df2d24645229..d0ec8ebd5c39784cc8a628d6736933b87ef9f016 100644
+index 3565b3b71f9bbff7649f724217a0df2d24645229..dc4dbad68d2d180371589e81edcfe31f0a78901c 100644
 --- a/web/src/shell/Sidebar.tsx
 +++ b/web/src/shell/Sidebar.tsx
-@@ -269,7 +269,8 @@ import {
+@@ -269,7 +269,7 @@ import {
    type SidebarRecency,
  } from "@/lib/sidebarFocusPreferences";
  import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 -import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
-+import { PrimaryNavLink, type PrimaryNavLayout } from "@/shell/PrimaryNavLink";
-+import { MOBILE_GLASS_SURFACE } from "@/shell/mobileGlass";
++import { PrimaryNavLink, PrimaryNavStrip, type PrimaryNavLayout } from "@/shell/PrimaryNavLink";
  import { useViewerId } from "@/hooks/useViewerId";
  import { useExtensions } from "@/extensions/ExtensionProvider";
  import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
-@@ -1034,6 +1035,8 @@ function SidebarImpl({
+@@ -1034,6 +1034,8 @@ function SidebarImpl({
    // A wide phone (unfolded foldable, landscape) docks the open sidebar beside
    // the chat instead of over it. Settings keeps its full-bleed drawer.
    const sideBySide = useIsSideBySideSidebarViewport() && !inSettings;
@@ -408,7 +376,7 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..d0ec8ebd5c39784cc8a628d6736933b8
    const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
    const openSwipeEnabled = !open && !peek && mobileLayout && !inSettings && dragProgress == null;
    useSidebarSwipeToOpen({
-@@ -1353,108 +1356,69 @@ function SidebarImpl({
+@@ -1353,159 +1355,107 @@ function SidebarImpl({
                />
              </div>
  
@@ -437,14 +405,33 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..d0ec8ebd5c39784cc8a628d6736933b8
 -              lands under "My sessions" — so snap the tab back there on click
 -              (the button stays visible on both tabs). */}
 -                <Link
--                  to="/"
++            <div
++              data-testid="sidebar-primary-nav"
++              className={cn(
++                "flex flex-col gap-px px-2",
++                navLayout === "row" ? "pt-2 pb-0" : "pb-2",
++              )}
++            >
++              {/* Phone drawer: the core destinations share one strip of cells, leaving
++            the height to the session list; optional pages stay rows below it. */}
++              <PrimaryNavStrip layout={navLayout}>
++                {/* "New session" links to the home composer ("/"), so cmd/middle-click
++            opens a new tab. The new session is the viewer's own, so a click
++            also snaps the list back to "My sessions". */}
++                <PrimaryNavLink
+                   to="/"
 -                  componentId="sidebar.new_chat"
 -                  aria-keyshortcuts={newSessionAriaShortcut()}
--                  onClick={(e) => {
--                    switchTab("mine");
--                    onNavClick(e);
--                    onNewSessionClick(e);
--                  }}
++                  label="New session"
++                  shortLabel="New"
++                  icon={MessageCirclePlusIcon}
++                  active={isNewChatPage}
++                  layout={navLayout}
+                   onClick={(e) => {
+                     switchTab("mine");
+                     onNavClick(e);
+                     onNewSessionClick(e);
+                   }}
 -                >
 -                  <MessageCirclePlusIcon
 -                    className={cn(
@@ -507,98 +494,97 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..d0ec8ebd5c39784cc8a628d6736933b8
 -                  />
 -                  Inbox
 -                  {(inboxCount > 0 || inboxCountIncomplete) && (
-+            <div
-+              data-testid="sidebar-primary-nav"
-+              className={cn(
-+                navLayout === "cell"
-+                  ? [
-+                      // Phone drawer: one strip of icon-over-label cells instead of
-+                      // stacked rows, leaving the height to the session list.
-+                      "mx-2 mb-2 flex gap-1 overflow-x-auto rounded-2xl p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-+                      MOBILE_GLASS_SURFACE,
-+                    ]
-+                  : "flex flex-col gap-px px-2 pt-2 pb-0",
-+              )}
-+            >
-+              {/* "New session" links to the home composer ("/"), so cmd/middle-click
-+            opens a new tab. The new session is the viewer's own, so a click
-+            also snaps the list back to "My sessions". */}
-+              <PrimaryNavLink
-+                to="/"
-+                label="New session"
-+                shortLabel="New"
-+                icon={MessageCirclePlusIcon}
-+                active={isNewChatPage}
-+                layout={navLayout}
-+                onClick={(e) => {
-+                  switchTab("mine");
-+                  onNavClick(e);
-+                  onNewSessionClick(e);
-+                }}
-+                componentId="sidebar.new_chat"
-+                testId="new-chat-button"
-+                ariaKeyShortcuts={newSessionAriaShortcut()}
-+                className="group/new-session"
-+                trailing={navLayout === "row" && <NewSessionShortcutHint />}
-+              />
-+              <PrimaryNavLink
-+                to="/tasks"
-+                label="Automations"
-+                icon={ClockIcon}
-+                active={isTasksPage}
-+                layout={navLayout}
-+                onClick={onNavClick}
-+                componentId="sidebar.tasks"
-+                testId="scheduled-tasks-nav"
-+              />
-+              <PrimaryNavLink
-+                to="/inbox"
-+                label="Inbox"
-+                icon={InboxIcon}
-+                active={isInboxPage}
-+                layout={navLayout}
-+                onClick={onNavClick}
-+                componentId="sidebar.inbox"
-+                testId="inbox-button"
-+                trailing={
-+                  (inboxCount > 0 || inboxCountIncomplete) && (
-                     <span
-                       title={
-                         inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
-                       }
-                       aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
-                       className={cn(
+-                    <span
+-                      title={
+-                        inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
+-                      }
+-                      aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
+-                      className={cn(
 -                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
-+                        navLayout === "cell" ? "absolute top-1 right-1" : "ml-auto",
-+                        "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
-                         // The active Inbox row already paints the translucent
-                         // --sidebar-active wash; repainting it on the nested
-                         // badge would double-composite to a darker fill.
-@@ -1464,15 +1428,16 @@ function SidebarImpl({
-                       {inboxCount > 0 ? inboxCount : ""}
-                       {inboxCountIncomplete ? "+" : ""}
-                     </span>
+-                        // The active Inbox row already paints the translucent
+-                        // --sidebar-active wash; repainting it on the nested
+-                        // badge would double-composite to a darker fill.
+-                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+-                      )}
+-                    >
+-                      {inboxCount > 0 ? inboxCount : ""}
+-                      {inboxCountIncomplete ? "+" : ""}
+-                    </span>
 -                  )}
 -                </Link>
 -              </Button>
-+                  )
-+                }
-+              />
-               {canvasEnabled && (
+-              {canvasEnabled && (
++                  componentId="sidebar.new_chat"
++                  testId="new-chat-button"
++                  ariaKeyShortcuts={newSessionAriaShortcut()}
++                  className="group/new-session"
++                  trailing={navLayout === "row" && <NewSessionShortcutHint />}
++                />
                  <PrimaryNavLink
-                   to={canvasDestination.pathname + canvasDestination.search}
-                   label="Canvas"
-                   icon={LayoutDashboardIcon}
-                   active={isCanvasPage}
+-                  to={canvasDestination.pathname + canvasDestination.search}
+-                  label="Canvas"
+-                  icon={LayoutDashboardIcon}
+-                  active={isCanvasPage}
++                  to="/tasks"
++                  label="Automations"
++                  icon={ClockIcon}
++                  active={isTasksPage}
 +                  layout={navLayout}
                    onClick={onNavClick}
-                   componentId="sidebar.canvas"
-                   testId="canvas-nav"
-@@ -1480,32 +1445,20 @@ function SidebarImpl({
-               )}
+-                  componentId="sidebar.canvas"
+-                  testId="canvas-nav"
++                  componentId="sidebar.tasks"
++                  testId="scheduled-tasks-nav"
+                 />
+-              )}
++                <PrimaryNavLink
++                  to="/inbox"
++                  label="Inbox"
++                  icon={InboxIcon}
++                  active={isInboxPage}
++                  layout={navLayout}
++                  onClick={onNavClick}
++                  componentId="sidebar.inbox"
++                  testId="inbox-button"
++                  trailing={
++                    (inboxCount > 0 || inboxCountIncomplete) && (
++                      <span
++                        title={
++                          inboxCountIncomplete
++                            ? "Open Inbox to check older automations."
++                            : undefined
++                        }
++                        aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
++                        className={cn(
++                          navLayout === "cell" ? "absolute top-1 right-1" : "ml-auto",
++                          "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
++                          // The active Inbox row already paints the translucent
++                          // --sidebar-active wash; repainting it on the nested
++                          // badge would double-composite to a darker fill.
++                          isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
++                        )}
++                      >
++                        {inboxCount > 0 ? inboxCount : ""}
++                        {inboxCountIncomplete ? "+" : ""}
++                      </span>
++                    )
++                  }
++                />
++                {canvasEnabled && (
++                  <PrimaryNavLink
++                    to={canvasDestination.pathname + canvasDestination.search}
++                    label="Canvas"
++                    icon={LayoutDashboardIcon}
++                    active={isCanvasPage}
++                    layout={navLayout}
++                    onClick={onNavClick}
++                    componentId="sidebar.canvas"
++                    testId="canvas-nav"
++                  />
++                )}
++              </PrimaryNavStrip>
                <ExtensionPrimaryNavigation
                  activePageId={activeExtensionPageId}
-+                layout={navLayout}
                  onNavigate={onNavClick}
                />
                {usagePageEnabled && (
@@ -630,7 +616,6 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..d0ec8ebd5c39784cc8a628d6736933b8
 +                  label="Usage"
 +                  icon={WalletIcon}
 +                  active={isUsagePage}
-+                  layout={navLayout}
 +                  onClick={onNavClick}
 +                  componentId="sidebar.usage"
 +                  testId="usage-nav"
