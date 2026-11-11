@@ -9,6 +9,7 @@ import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
 import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
+import { LandingProjectChip } from "./LandingProjectChip";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -7146,6 +7147,32 @@ function NewChatLandingContent({
     />
   );
 
+  // Switch to a project's visit, or a plain one for "", keeping the other
+  // params; the landing stays mounted, so the draft text survives. A project
+  // home moves to the picked project's home instead.
+  const selectLandingProject = (name: string) => {
+    if (name === projectParam) return;
+    if (onProjectHome && name !== "") {
+      navigate(projectHomePath(name));
+      return;
+    }
+    const params = new URLSearchParams(searchParams);
+    if (name === "") params.delete("project");
+    else params.set("project", name);
+    const query = params.toString();
+    navigate(query === "" ? "/" : `/?${query}`);
+  };
+
+  // Phones lead the controls under the heading with the project choice.
+  const projectChip =
+    isMobileViewport && !siblingSourceId && !onProjectHome ? (
+      <LandingProjectChip
+        projects={projectList ?? []}
+        selectedProject={selectedProject}
+        onSelect={selectLandingProject}
+      />
+    ) : null;
+
   const workspaceControls = (
     <NewChatWorkspaceControls>
       {/* Keep the tray mounted while the execution target changes. */}
@@ -7156,6 +7183,7 @@ function NewChatLandingContent({
           data-testid="new-chat-landing-workspace-controls"
           trailingContent={mcpRegistryPicker}
         >
+          {projectChip}
           {/* Sandbox repository chip — the sandbox counterpart of the
         working-directory chip. There is no filesystem to browse
         before the sandbox exists, so the workspace is specified as
@@ -7260,6 +7288,7 @@ function NewChatLandingContent({
           data-testid="new-chat-landing-workspace-controls"
           trailingContent={mcpRegistryPicker}
         >
+          {projectChip}
           {workspaceLoading && cachedWorkspace === null && (
             <NewChatPickerLoading
               label="Loading working directory"
@@ -7825,13 +7854,7 @@ function NewChatLandingContent({
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
-                          if (projectHomeName !== undefined) {
-                            navigate(projectHomePath(name));
-                          } else {
-                            const params = new URLSearchParams(searchParams);
-                            params.set("project", name);
-                            navigate(`/?${params.toString()}`);
-                          }
+                          selectLandingProject(name);
                           requestAnimationFrame(() => textareaRef.current?.focus());
                         }}
                         onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}
@@ -8159,9 +8182,9 @@ function NewChatLandingContent({
                       </span>
                     )}
 
-                    {/* The session's project membership (from a `?project=` landing)
-                is shown in the hero heading instead of a tray chip; filing on
-                create still uses `selectedProject`. */}
+                    {/* The session's project (from a `?project=` landing) is named
+                in the desktop hero heading or the phone's project chip; filing
+                on create still uses `selectedProject`. */}
                   </>
                 ),
                 trailing: (
