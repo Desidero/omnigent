@@ -6,17 +6,17 @@ Closes #13482
 
 ## Summary
 
-On a phone, the sidebar drawer's primary nav (New session, Automations, Inbox, Canvas) is four stacked 44pt rows, about 179pt above the session list. This folds them into one strip under the header, which gives the session list about 39% more height (roughly four more rows) while every target stays at least 44pt.
+On a phone, the sidebar drawer's primary nav is a stack of 44pt rows above the session list: New session, Automations and Inbox take about 134pt before any optional page. This folds those three into one strip under the header of about 68pt, giving the session list about 65pt back (roughly one and a half more rows) while every target stays at least 44pt.
 
-- **Phone drawer only:** equal-width cells, each an icon over a short label (New, Automations, Inbox, Canvas), about 58pt tall, in a rounded glass container (the existing mobile glass surface). Cell labels sit 4px under the Appearance interface font size, so they follow that setting (11px at the phone default); on the narrowest phones or at large font sizes a long label such as "Automations" truncates, while its accessible name stays whole. The active cell keeps the existing active highlight; the Inbox count sits on the cell's corner with an unchanged `aria-label`.
-- **Extra destinations:** the strip holds only the fixed core four and never scrolls. Usage and extension pages, which are conditional, render as the normal full-width rows (the same layout as desktop) directly below the strip, so every destination stays one visible tap away without a menu or sideways scrolling.
-- **Unchanged:** desktop, tablet, and the side-by-side layout on wide phones keep the stacked rows with identical classes. Links, `onNavClick` drawer closing (plain taps close, modifier-clicks don't), `componentId`s, test ids, active-route detection, and `aria-keyshortcuts` are kept. New keeps the accessible name "New session"; the hover-only shortcut hint is not rendered in the strip.
-- **Shape of the change:** every primary nav item now renders through `PrimaryNavLink`, which takes a `row` or `cell` layout, so both layouts share one definition per destination; a small `PrimaryNavStrip` wraps the core four only on the phone drawer. As a side effect, New session, Automations, Inbox and Usage now set `aria-current="page"` when active, like Canvas and extension pages already did.
+- **Phone drawer only:** equal-width cells, each an icon over a short label (New, Automations, Inbox), about 58pt tall, in a rounded glass container (the existing mobile glass surface). Cell labels sit 4px under the Appearance interface font size, so they follow that setting (11px at the phone default); with three cells, "Automations" fits on a 320px-wide phone. The active cell keeps the existing active highlight; the Inbox count sits on the cell's corner with an unchanged `aria-label`.
+- **Rule:** the strip holds the always-on destinations (New session, Automations, Inbox; Automations keeps its existing per-user gate, so the strip can have two cells). Flag-gated pages (Canvas, Usage) and extension pages render as the normal full-width rows (the same layout as desktop) directly below the strip. The strip never scrolls, and every destination stays one visible tap away without a menu.
+- **Unchanged:** the strip follows the existing overlay drawer layout (below 768px, not side by side); 768px and wider, and the side-by-side layout on wide phones, keep the stacked rows with identical classes. Links, `onNavClick` drawer closing (plain taps close, modifier-clicks don't), `componentId`s, test ids, active-route detection, and `aria-keyshortcuts` are kept. New keeps the accessible name "New session"; the hover-only shortcut hint is not rendered in the strip.
+- **Shape of the change:** every primary nav item now renders through `PrimaryNavLink`, which takes a `row` or `cell` layout, so both layouts share one definition per destination; a small `PrimaryNavStrip` wraps the always-on three only on the phone drawer. As a side effect, New session, Automations, Inbox and Usage now set `aria-current="page"` when active, like Canvas and extension pages already did.
 
 ## Test Plan
 
 - `pnpm exec vitest run src/shell/Sidebar.mobileDrawer.test.tsx src/shell/Sidebar.test.tsx src/extensions` and the other `src/shell/Sidebar*.test.tsx` files: all pass.
-- New in `Sidebar.mobileDrawer.test.tsx`: strip cells on a phone (the core four only, 44px minimum, equal width, no scrolling), New's accessible name and missing hint, active highlight with `aria-current`, the Inbox badge on the corner, drawer closing on plain taps but not modifier clicks, Usage as an active full-width row below the strip, and stacked rows on desktop and side-by-side layouts. `Sidebar.test.tsx` adds an extension page rendered as a row below the strip.
+- New in `Sidebar.mobileDrawer.test.tsx`: strip cells on a phone (the always-on three, or two with Automations off; 44px minimum, equal width, no scrolling), New's accessible name and missing hint, active highlight with `aria-current`, the Inbox badge on the corner, drawer closing on plain taps but not modifier clicks, Canvas (active) and Usage as full-width rows below the strip, and stacked rows on desktop and side-by-side layouts. `Sidebar.test.tsx` adds an extension page rendered as a row below the strip.
 - Existing desktop row assertions (classes, badge treatment, shortcut hint) pass unchanged.
 - `tsc -b` and the pre-commit hooks pass.
 - E2E UI tests that use these test ids at phone width (Canvas, Automations) still find and click the same elements; they were read, not rerun.
@@ -61,7 +61,7 @@ Should this change be included in the release notes? Choose exactly one.
 
 ## Changelog
 
-On phones, the sidebar's New session, Automations, Inbox and Canvas links share one compact strip, leaving more room for sessions
+On phones, the sidebar's New session, Automations and Inbox links share one compact strip, leaving more room for sessions
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 

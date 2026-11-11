@@ -1,88 +1,94 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Desidero <desidero@gmail.com>
-Date: Wed, 11 Nov 2026 02:18:02 +0000
+Date: Wed, 11 Nov 2026 02:29:46 +0000
 Subject: [PATCH] feat(web): fold the phone drawer's primary nav into one strip
 
-On a phone, New session, Automations, Inbox and Canvas render as four
-44px rows that take about 179px above the session list. At phone width
-the drawer now shows them as one strip of equal-width icon-over-label
-cells (at least 44px tall) in a rounded glass container, which gives the
-session list roughly four more rows. The strip never scrolls: Usage and
-extension pages, when present, stay full-width rows directly below it.
+On a phone, the drawer's primary nav is a stack of 44px rows above the
+session list. At phone width the always-on destinations (New session,
+Automations, Inbox) now share one strip of equal-width icon-over-label
+cells (at least 44px tall) in a rounded glass container: three rows of
+about 134px become a strip of about 68px. The strip never scrolls:
+flag-gated pages (Canvas, Usage) and extension pages, when enabled, stay
+full-width rows directly below it.
 Cell labels follow the Appearance interface font size.
 
 Every item now renders through PrimaryNavLink, which takes a row or cell
 layout, so both layouts share one definition per destination; a small
-PrimaryNavStrip wraps the core four only on the phone drawer. The cells
+PrimaryNavStrip wraps the always-on three only on the phone drawer. The cells
 keep their test ids, component ids, links, drawer closing and active
 highlight; New keeps the accessible name "New session" and its
 aria-keyshortcuts, and the Inbox count sits on the cell's corner with the
-same label. Desktop, tablet and the side-by-side layout on wide phones
-keep the stacked rows.
+same label. The strip follows the overlay drawer layout (below 768px);
+wider windows and the side-by-side layout on wide phones keep the
+stacked rows.
 
 Refs #13482
 
 [Desidero: Automations stays unconditional (this base has no
 automations_enabled gate), New session keeps the project prompt's click
 handler from new-chat-project-prompt, and the drawer test leaves out
-upstream's newer keyboard-dismissal tests]
+upstream's newer keyboard-dismissal tests and the test for automations
+turned off]
 
 Not upstream yet: proposed from feat/mobile-sidebar-nav-strip; drop this copy once it merges.
 
 Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-(cherry picked from commit 2e521c3ca025a7f26f456a788704e8ef14d3e9a4)
+(cherry picked from commit 55d7757d897c9123a54a86db8ca7318ea4e2dd5b)
 ---
- feature-map/sessions.md                     |  16 ++
+ feature-map/sessions.md                     |  19 ++
  web/src/shell/PrimaryNavLink.tsx            |  55 ++++-
- web/src/shell/Sidebar.mobileDrawer.test.tsx | 126 +++++++++++
+ web/src/shell/Sidebar.mobileDrawer.test.tsx | 130 ++++++++++++
  web/src/shell/Sidebar.test.tsx              |  20 ++
- web/src/shell/Sidebar.tsx                   | 230 ++++++++------------
- 5 files changed, 304 insertions(+), 143 deletions(-)
+ web/src/shell/Sidebar.tsx                   | 213 ++++++++------------
+ 5 files changed, 302 insertions(+), 135 deletions(-)
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index 588a557c2fc4b50e8b320962313156c5d2c526a0..6d591946ad70fbec3bc4d7862c46d2b84c6d7c05 100644
+index 588a557c2fc4b50e8b320962313156c5d2c526a0..5e807ab62a9e63c4b2076c8d790ddae92a063ff7 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
-@@ -226,6 +226,10 @@ the header menu), and each place is a separate entry point.
+@@ -226,6 +226,11 @@ the header menu), and each place is a separate entry point.
    a third of its width, or after a quick flick, closes it; a shorter drag springs
    back. List scrolling, row taps, long-press reordering and horizontal scrollers
    keep their own touch handling.
 +- `mobile-primary-nav-strip`: on phone layouts, the drawer shows New session,
-+  Automations, Inbox and Canvas as one strip of equal-width icon-over-label
++  Automations and Inbox as one strip of equal-width icon-over-label
 +  cells under the header instead of stacked rows. Cells are at least 44px tall.
-+  Usage and extension pages stay full-width rows below the strip.
++  Flag-gated pages (Canvas, Usage) and extension pages stay full-width rows
++  below the strip.
  
  ## How to get to it (user POV)
  
-@@ -530,6 +534,14 @@ left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
+@@ -530,6 +535,16 @@ left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
  third of the drawer's width or after a quick flick it closes on the current
  chat, otherwise it springs back. Settings and desktop widths don't use it.
  
 +**Primary navigation on phones:** at phone width, open the sidebar drawer. New
-+(named New session for screen readers), Automations, Inbox and Canvas share one
-+strip under the header; the current page's cell keeps the active highlight and
-+the Inbox count sits on its cell's corner. The strip never scrolls; Usage and
-+extension pages, when present, are ordinary rows directly below it. Tapping a
-+cell or row opens the page and closes the drawer; a modifier-click leaves it open. Desktop, tablet, and a wide phone
++(named New session for screen readers), Automations and Inbox share one strip
++under the header; the current page's cell keeps the active highlight and the
++Inbox count sits on its cell's corner. With Automations off for the user, the
++strip has two cells. The strip never scrolls; Canvas, Usage and extension pages,
++when enabled, are ordinary rows directly below it. Tapping a cell or row opens
++the page and closes the drawer; a modifier-click leaves it open. The strip
++follows the overlay drawer (narrower than 768px); wider windows and a wide phone
 +showing the sidebar beside the chat keep the stacked rows.
 +
  **Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
  sidebar menus, and message actions, and offers the same destinations as any
  other session: connected hosts and each offered sandbox provider. Sessions
-@@ -720,6 +732,10 @@ plain `uv run pytest`, which starts a private server for the test.
+@@ -720,6 +735,10 @@ plain `uv run pytest`, which starts a private server for the test.
    These touch-drive the built SPA in desktop Chromium at a phone viewport with
    mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
    hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
 +- **`mobile-primary-nav-strip`:** component coverage only, in
-+  `web/src/shell/Sidebar.mobileDrawer.test.tsx` (strip cells, Usage as a row
-+  below the strip, active state, Inbox badge, drawer closing, rows on desktop and
++  `web/src/shell/Sidebar.mobileDrawer.test.tsx` (strip cells with and
++  without Automations, Canvas and Usage as rows below the strip, active state, Inbox badge, drawer closing, rows on desktop and
 +  side by side) and `web/src/shell/Sidebar.test.tsx` (extension pages as rows).
  - **`archive`:**
    `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
    `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
 diff --git a/web/src/shell/PrimaryNavLink.tsx b/web/src/shell/PrimaryNavLink.tsx
-index 9eef01c3d516d52d15ffdabc8845639b26633f66..bb3f602675068361dea702d14bbbcd7d7bb1c517 100644
+index 9eef01c3d516d52d15ffdabc8845639b26633f66..1d9eea4663e24643017010c1e9271cea5b20f093 100644
 --- a/web/src/shell/PrimaryNavLink.tsx
 +++ b/web/src/shell/PrimaryNavLink.tsx
 @@ -3,12 +3,39 @@ import type { LucideIcon } from "lucide-react";
@@ -103,7 +109,7 @@ index 9eef01c3d516d52d15ffdabc8845639b26633f66..bb3f602675068361dea702d14bbbcd7d
 +const CELL =
 +  "h-auto min-h-11 min-w-0 flex-1 basis-0 flex-col gap-1 rounded-xl border-0 px-0.5 py-2.5 font-normal mobile-touch-target";
 +
-+/** On the phone drawer, wraps the core destinations in one strip; elsewhere they stay rows. */
++/** On the phone drawer, wraps the always-on destinations in one strip; elsewhere they stay rows. */
 +export function PrimaryNavStrip({
 +  layout,
 +  children,
@@ -190,10 +196,10 @@ index 9eef01c3d516d52d15ffdabc8845639b26633f66..bb3f602675068361dea702d14bbbcd7d
        </Link>
      </Button>
 diff --git a/web/src/shell/Sidebar.mobileDrawer.test.tsx b/web/src/shell/Sidebar.mobileDrawer.test.tsx
-index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..6c911d53f2fcee01e769a07bb1bd444debd57282 100644
+index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..3443874b30c0b89add550ec5c7316bc3c8255f16 100644
 --- a/web/src/shell/Sidebar.mobileDrawer.test.tsx
 +++ b/web/src/shell/Sidebar.mobileDrawer.test.tsx
-@@ -392,3 +392,129 @@ describe("mobile sidebar drawer swipe to close", () => {
+@@ -392,3 +392,133 @@ describe("mobile sidebar drawer swipe to close", () => {
      expect(onClose).not.toHaveBeenCalled();
    });
  });
@@ -215,7 +221,7 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..6c911d53f2fcee01e769a07bb1bd444d
 +    return within(screen.getByTestId("sidebar-primary-nav")).getByRole("link", { name });
 +  }
 +
-+  it("puts the core destinations in one strip of equal-width cells at least 44px tall", () => {
++  it("puts the always-on destinations in one strip of equal-width cells at least 44px tall", () => {
 +    stubMobileLayout(true);
 +    renderSidebar({ features: STRIP_FEATURES });
 +
@@ -227,7 +233,6 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..6c911d53f2fcee01e769a07bb1bd444d
 +      "new-chat-button",
 +      "scheduled-tasks-nav",
 +      "inbox-button",
-+      "canvas-nav",
 +    ]);
 +    for (const cell of stripCells) {
 +      expect(cell).toHaveClass("flex-1", "basis-0", "min-w-0", "flex-col", "min-h-11");
@@ -236,20 +241,25 @@ index 9c522a18a1dde1a8f4f1fb65388e2ee0c07340ab..6c911d53f2fcee01e769a07bb1bd444d
 +    }
 +  });
 +
-+  it("renders optional pages as full-width rows below the strip", () => {
++  it("renders flag-gated pages as full-width rows below the strip", () => {
 +    stubMobileLayout(true);
-+    renderSidebar({ route: "/usage", features: STRIP_FEATURES });
++    renderSidebar({ route: "/canvas", features: STRIP_FEATURES });
 +
 +    const strip = screen.getByTestId("sidebar-primary-nav-strip");
++    const canvas = screen.getByTestId("canvas-nav");
 +    const usage = screen.getByTestId("usage-nav");
-+    expect(strip).not.toContainElement(usage);
-+    expect(screen.getByTestId("sidebar-primary-nav")).toContainElement(usage);
-+    expect(strip.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-+    expect(usage).toHaveClass("sidebar-row", "w-full", "justify-start", "mobile-touch-target");
-+    expect(usage).not.toHaveClass("flex-1", "flex-col");
-+    expect(usage).toHaveTextContent(/^Usage$/);
-+    expect(usage).toHaveAttribute("aria-current", "page");
-+    expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
++    for (const row of [canvas, usage]) {
++      expect(strip).not.toContainElement(row);
++      expect(screen.getByTestId("sidebar-primary-nav")).toContainElement(row);
++      expect(row).toHaveClass("sidebar-row", "w-full", "justify-start", "mobile-touch-target");
++      expect(row).not.toHaveClass("flex-1", "flex-col");
++    }
++    expect(strip.compareDocumentPosition(canvas) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++    expect(canvas.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++    expect(canvas).toHaveTextContent(/^Canvas$/);
++    expect(canvas).toHaveAttribute("aria-current", "page");
++    expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
++    expect(usage).not.toHaveAttribute("aria-current");
 +  });
 +
 +  it("labels New as New session and drops the hover-only shortcut hint", () => {
@@ -355,7 +365,7 @@ index fbb3e1610e4bcb763695cbef15ddeeb0ef346bca..954c126ae8c858e992d2ac7087ac5846
      mockConversations(THREE_TYPE_CONVERSATIONS);
      renderSidebar();
 diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
-index 3565b3b71f9bbff7649f724217a0df2d24645229..dc4dbad68d2d180371589e81edcfe31f0a78901c 100644
+index 3565b3b71f9bbff7649f724217a0df2d24645229..629a7f5b8d6cfc9c0e065e50b7df3fcf1b55d85b 100644
 --- a/web/src/shell/Sidebar.tsx
 +++ b/web/src/shell/Sidebar.tsx
 @@ -269,7 +269,7 @@ import {
@@ -376,7 +386,7 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..dc4dbad68d2d180371589e81edcfe31f
    const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
    const openSwipeEnabled = !open && !peek && mobileLayout && !inSettings && dragProgress == null;
    useSidebarSwipeToOpen({
-@@ -1353,159 +1355,107 @@ function SidebarImpl({
+@@ -1353,120 +1355,81 @@ function SidebarImpl({
                />
              </div>
  
@@ -412,8 +422,8 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..dc4dbad68d2d180371589e81edcfe31f
 +                navLayout === "row" ? "pt-2 pb-0" : "pb-2",
 +              )}
 +            >
-+              {/* Phone drawer: the core destinations share one strip of cells, leaving
-+            the height to the session list; optional pages stay rows below it. */}
++              {/* Phone drawer: the always-on destinations share one strip of cells;
++            flag-gated and extension pages stay rows below it. */}
 +              <PrimaryNavStrip layout={navLayout}>
 +                {/* "New session" links to the home composer ("/"), so cmd/middle-click
 +            opens a new tab. The new session is the viewer's own, so a click
@@ -513,30 +523,22 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..dc4dbad68d2d180371589e81edcfe31f
 -                  )}
 -                </Link>
 -              </Button>
--              {canvasEnabled && (
 +                  componentId="sidebar.new_chat"
 +                  testId="new-chat-button"
 +                  ariaKeyShortcuts={newSessionAriaShortcut()}
 +                  className="group/new-session"
 +                  trailing={navLayout === "row" && <NewSessionShortcutHint />}
 +                />
-                 <PrimaryNavLink
--                  to={canvasDestination.pathname + canvasDestination.search}
--                  label="Canvas"
--                  icon={LayoutDashboardIcon}
--                  active={isCanvasPage}
++                <PrimaryNavLink
 +                  to="/tasks"
 +                  label="Automations"
 +                  icon={ClockIcon}
 +                  active={isTasksPage}
 +                  layout={navLayout}
-                   onClick={onNavClick}
--                  componentId="sidebar.canvas"
--                  testId="canvas-nav"
++                  onClick={onNavClick}
 +                  componentId="sidebar.tasks"
 +                  testId="scheduled-tasks-nav"
-                 />
--              )}
++                />
 +                <PrimaryNavLink
 +                  to="/inbox"
 +                  label="Inbox"
@@ -570,21 +572,11 @@ index 3565b3b71f9bbff7649f724217a0df2d24645229..dc4dbad68d2d180371589e81edcfe31f
 +                    )
 +                  }
 +                />
-+                {canvasEnabled && (
-+                  <PrimaryNavLink
-+                    to={canvasDestination.pathname + canvasDestination.search}
-+                    label="Canvas"
-+                    icon={LayoutDashboardIcon}
-+                    active={isCanvasPage}
-+                    layout={navLayout}
-+                    onClick={onNavClick}
-+                    componentId="sidebar.canvas"
-+                    testId="canvas-nav"
-+                  />
-+                )}
 +              </PrimaryNavStrip>
-               <ExtensionPrimaryNavigation
-                 activePageId={activeExtensionPageId}
+               {canvasEnabled && (
+                 <PrimaryNavLink
+                   to={canvasDestination.pathname + canvasDestination.search}
+@@ -1483,29 +1446,15 @@ function SidebarImpl({
                  onNavigate={onNavClick}
                />
                {usagePageEnabled && (
