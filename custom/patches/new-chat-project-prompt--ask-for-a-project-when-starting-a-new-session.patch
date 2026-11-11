@@ -24,42 +24,47 @@ closes for the plain composer when the list fails or comes back empty; a
 stale session fetch error stays hidden on it. E2E tests that click New
 session and expect the composer turn the prompt off
 (omnigent:new-chat-project-prompt=off), and a dedicated E2E drives the
-picker's No project and project rows. Matches
+picker's No project and project rows.
+
+Phones (below the md breakpoint) skip the project step: New session, the
+hotkey and the drawer's links open the composer directly, which picks the
+project on the landing itself, so a phone doesn't stack the palette over
+the drawer first. Desktop is unchanged. Matches
 https://github.com/omnigent-ai/omnigent/pull/11397.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 (cherry picked from commit 1401d53cc127a9668163e508b749c5c49c43e99c)
 ---
- feature-map/composer.md                       |  10 ++
+ feature-map/composer.md                       |  12 ++
  tests/e2e_ui/conftest.py                      |  10 ++
- tests/e2e_ui/sessions/test_command_palette.py |  39 +++++++
+ tests/e2e_ui/sessions/test_command_palette.py |  39 ++++++
  .../test_initial_prompt_session_switch.py     |   3 +
  .../test_sidebar_pinned_project_collapse.py   |   5 +
  .../start_session/test_start_session.py       |   4 +
- web/src/hooks/useNewChatProjectPrompt.ts      |  17 +++
+ web/src/hooks/useNewChatProjectPrompt.ts      |  23 ++++
  web/src/hooks/useNewSessionHotkey.test.tsx    |  10 ++
- web/src/hooks/useNewSessionHotkey.ts          |  13 ++-
+ web/src/hooks/useNewSessionHotkey.ts          |  13 +-
  .../newChatProjectPromptPreferences.test.ts   |  24 ++++
- .../lib/newChatProjectPromptPreferences.ts    |  26 +++++
+ .../lib/newChatProjectPromptPreferences.ts    |  26 ++++
  web/src/pages/SettingsPage.test.tsx           |  18 +++
- web/src/pages/SettingsPage.tsx                |  40 +++++++
- web/src/shell/AppShell.test.tsx               | 103 ++++++++++++++++-
+ web/src/pages/SettingsPage.tsx                |  40 ++++++
+ web/src/shell/AppShell.test.tsx               | 115 +++++++++++++++++-
  web/src/shell/AppShell.tsx                    |  29 ++++-
- web/src/shell/CommandPalette.test.tsx         |  71 ++++++++++++
- web/src/shell/CommandPalette.tsx              | 109 +++++++++++++-----
+ web/src/shell/CommandPalette.test.tsx         |  71 +++++++++++
+ web/src/shell/CommandPalette.tsx              | 109 +++++++++++++----
  web/src/shell/Sidebar.test.tsx                |  24 +++-
- web/src/shell/Sidebar.tsx                     |  20 ++++
- 19 files changed, 537 insertions(+), 38 deletions(-)
+ web/src/shell/Sidebar.tsx                     |  20 +++
+ 19 files changed, 557 insertions(+), 38 deletions(-)
  create mode 100644 web/src/hooks/useNewChatProjectPrompt.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.test.ts
  create mode 100644 web/src/lib/newChatProjectPromptPreferences.ts
 
 diff --git a/feature-map/composer.md b/feature-map/composer.md
-index e4ae3f0aba297eb8d6a68372da194c10e3db91fb..32cf99697fc4edbb4394f4467bac0b16868bf14d 100644
+index e4ae3f0aba297eb8d6a68372da194c10e3db91fb..db08c26849b26b5bd5874426f1a49e21fca478cd 100644
 --- a/feature-map/composer.md
 +++ b/feature-map/composer.md
-@@ -209,6 +209,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+@@ -209,6 +209,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
    `project`, `new omni` and `omni` all find it. Choosing a row opens the
    new-session composer with that project's defaults. The rows are hidden while
    the query is empty and absent from the sessions-only switcher.
@@ -67,19 +72,21 @@ index e4ae3f0aba297eb8d6a68372da194c10e3db91fb..32cf99697fc4edbb4394f4467bac0b16
 +  New session links, and the palette's New chat first ask for a project (or No
 +  project), then open the composer with its defaults. Settings › General ›
 +  Sessions turns it off. Modified clicks on the links still open a new tab.
++  Phones (below the `md` breakpoint) skip the step and open the composer
++  directly, where the project is picked on the landing itself.
  - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
    can be steered into the running turn. Side-chat composers queue and steer the
    same way, with their own queue strip.
-@@ -370,6 +374,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+@@ -370,6 +376,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
  - Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
    **New chat in <project>** to open the new-session composer with that
    project's host, workspace and agent prefilled.
-+- With at least one project, press the hotkey or click New session (also from
-+  the mobile drawer): a "Start a new session in…" picker opens. Type part of a
++- With at least one project, press the hotkey or click New session on a
++  desktop-width window: a "Start a new session in…" picker opens. Type part of a
 +  project name and press Enter to land on `/?project=<name>` with its defaults;
 +  choose No project for a plain composer. Turn off **Ask for a project when
 +  starting a session** in Settings and the same actions open the composer
-+  directly.
++  directly. On a phone, New session in the drawer opens the composer directly.
  - Hover the model/effort pill to see the tooltip.
  - Hover the host chip to see the selected host or sandbox and its connection.
  - Pick a harness, then open its configuration for model, effort (Codex, Claude,
@@ -236,26 +243,32 @@ index 17165e5706d1a5d94d049efef13cb178e1605244..6a252f98e27b605b2c8cd8b5408f1631
                      "omnigent:recent-workspaces",
 diff --git a/web/src/hooks/useNewChatProjectPrompt.ts b/web/src/hooks/useNewChatProjectPrompt.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..76e9364623e4a6b759da58725766cec3630fc15f
+index 0000000000000000000000000000000000000000..64c60ce5cadee30090a3b81fea7641047c940b04
 --- /dev/null
 +++ b/web/src/hooks/useNewChatProjectPrompt.ts
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,23 @@
 +import { useCallback } from "react";
 +
 +import { useProjects } from "@/hooks/useConversations";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 +import { readNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPreferences";
 +
 +/**
 + * Returns a check for whether starting a new session should first ask for a
-+ * project: the project list may hold one and the prompt isn't turned off in
-+ * Settings. Until the list resolves it counts as "may": the picker lists
++ * project: the project list may hold one, the prompt isn't turned off in
++ * Settings, and the viewport isn't a phone's, whose composer picks the project
++ * itself. Until the list resolves it counts as "may": the picker lists
 + * projects as they arrive and steps aside if none do (see `CommandPalette`).
 + * The preference is read at call time so a toggle applies at once.
 + */
 +export function useShouldPromptForProject(): () => boolean {
 +  const { data: projects } = useProjects();
++  const isMobile = useIsMobileViewport();
 +  const mayHaveProjects = projects === undefined || projects.length > 0;
-+  return useCallback(() => mayHaveProjects && readNewChatProjectPromptEnabled(), [mayHaveProjects]);
++  return useCallback(
++    () => mayHaveProjects && !isMobile && readNewChatProjectPromptEnabled(),
++    [mayHaveProjects, isMobile],
++  );
 +}
 diff --git a/web/src/hooks/useNewSessionHotkey.test.tsx b/web/src/hooks/useNewSessionHotkey.test.tsx
 index b1706fc9815305fcc7423e031af00dbcdefd0d6b..b26a41ef4cec7373eb59d9149292db0b762d4ed2 100644
@@ -416,7 +429,7 @@ index 1c66fe789bd399ce0054f94902780af9746434fa..420507b14caa4c88cacc35201a25c7dd
      renderPage("/settings/general");
      const select = screen.getByTestId("terminal-clipboard-preference-select");
 diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
-index b34af6fd7632fa71ce7990819b960a9fe9543922..64286ea773030cb50ee22a800e27ac22675537b4 100644
+index b34af6fd7632fa71ce7990819b960a9fe9543922..cfecc06b40eca7b8d55299b3451e75edef3bac09 100644
 --- a/web/src/pages/SettingsPage.tsx
 +++ b/web/src/pages/SettingsPage.tsx
 @@ -247,6 +247,10 @@ import {
@@ -451,7 +464,7 @@ index b34af6fd7632fa71ce7990819b960a9fe9543922..64286ea773030cb50ee22a800e27ac22
 +        labelId={labelId}
 +        descriptionId={descriptionId}
 +        className="flex-1"
-+        description="When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer."
++        description="When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer. Phones skip this and pick the project on the new-session screen."
 +        descriptionClassName="text-ui"
 +      />
 +      <Switch
@@ -481,7 +494,7 @@ index b34af6fd7632fa71ce7990819b960a9fe9543922..64286ea773030cb50ee22a800e27ac22
          <SettingsGroup title="Terminal" testId="settings-group-terminal">
            <TerminalClipboardControl />
 diff --git a/web/src/shell/AppShell.test.tsx b/web/src/shell/AppShell.test.tsx
-index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..730ad506fca97c0654bf2c255b8b274c92102de3 100644
+index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..c8c7b9b2bed1f11d164cb1c2c7b40001ef6fbe5c 100644
 --- a/web/src/shell/AppShell.test.tsx
 +++ b/web/src/shell/AppShell.test.tsx
 @@ -15,7 +15,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
@@ -503,7 +516,7 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..730ad506fca97c0654bf2c255b8b274c
  import {
    useCreateTerminal,
    useTerminals,
-@@ -6052,6 +6053,104 @@ describe("new-session browser shortcut", () => {
+@@ -6052,6 +6053,116 @@ describe("new-session browser shortcut", () => {
      expect(screen.getByText("New session route")).toBeInTheDocument();
      setEmbedRoot(null);
    });
@@ -551,6 +564,18 @@ index 4d6158b16b594d1a4d3c11f35180c6949f9aa186..730ad506fca97c0654bf2c255b8b274c
 +
 +    it("opens the composer directly when the prompt is turned off", () => {
 +      writeNewChatProjectPromptEnabled(false);
++      pressNewSession();
++      expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
++      expect(screen.getByText("New session route")).toBeInTheDocument();
++    });
++
++    it("opens the composer directly on a phone, whose landing picks the project", () => {
++      const baseMatchMedia = window.matchMedia;
++      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
++        ...baseMatchMedia(query),
++        matches: query === "(max-width: 767.98px)",
++      }));
++      onTestFinished(() => matchMedia.mockRestore());
 +      pressNewSession();
 +      expect(screen.queryByPlaceholderText("Start a new session in…")).toBeNull();
 +      expect(screen.getByText("New session route")).toBeInTheDocument();

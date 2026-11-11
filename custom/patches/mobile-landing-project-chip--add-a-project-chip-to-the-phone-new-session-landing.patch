@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 11 Nov 2026 01:40:27 +0000
+Subject: [PATCH] feat(web): add a project chip to the phone new-session
+ landing
+
+On phones the landing heading always reads "Start a new session in" and only
+the icon changes with the project, so the selected project goes unnamed.
+Choosing one also means finding + > Work in a project.
+
+Lead the phone controls under the heading with a chip that names the project
+(or "No project"). Its menu lists No project and every project with no search
+field, so the keyboard stays down. Picking one goes through the same
+`?project=` switch as the + menu; No project removes only that parameter, and
+the landing stays mounted so the draft is kept while the defaults reseed.
+Desktop and Add nested agent are unchanged.
+
+[Desidero: the test mocks routing without useReplaceSearchParams, which this
+base does not have yet]
+
+Not upstream yet: proposed from feat/mobile-landing-project-chip; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+(cherry picked from commit 6782299708292f950ba10a892973bcb708803ad8)
+---
+ feature-map/composer.md                       | 15 +++
+ web/src/shell/LandingProjectChip.tsx          | 77 +++++++++++++++
+ web/src/shell/NewChatDialog.tsx               | 34 +++++--
+ ...NewChatLandingScreen.mobileChrome.test.tsx | 96 +++++++++++++++++--
+ 4 files changed, 208 insertions(+), 14 deletions(-)
+ create mode 100644 web/src/shell/LandingProjectChip.tsx
+
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index cde820bdcbc3072c14157549949556b2a620baa3..724d3c28a5b58292882f6208dda960933fc6eae3 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -275,6 +275,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+   a server without agent install.
+ - `mobile-labels`: on narrow screens labels collapse to icons without
+   overlapping the stop button.
++- `mobile-project-chip`: on phones the new-session composer's controls under
++  "Start a new session in" lead with a project chip naming the selected project
++  (with its icon) or "No project". Its menu lists No project, then every
++  project, with no search field; picking one sets `?project=<name>` and its
++  defaults prefill the composer, and No project removes only that parameter.
++  The draft text and attachments stay. Desktop names the project in the
++  heading instead and has no chip; Add nested agent has none either.
+ 
+ ## How to get to it (user POV)
+ 
+@@ -422,6 +429,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+ - Open a project's actions menu in the sidebar → **Project settings**, pick
+   Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
+   Click **New session in project** and check the pill shows both.
++- On a phone, type a draft, then tap the **No project** chip under "Start a new
++  session in" and pick a project. The chip shows its name, the composer takes
++  its defaults, and the draft stays. Pick **No project** to switch back.
+ - Attach files or type `/` before the first send.
+ - For a managed sandbox, submit a prompt and close the browser once the session
+   URL appears, while provisioning is still in progress. Reopen that URL after
+@@ -947,6 +957,11 @@ Other connection providers alone do not enable the managed MCP picker.
+   server agent keeps the dialog open with the server's reason.
+ - **`mobile-labels`, new-session composer:**
+   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
++- **`mobile-project-chip`:** no browser-level coverage;
++  `web/src/shell/NewChatLandingScreen.mobileChrome.test.tsx` (project chip)
++  covers the label, the menu rows, setting and clearing `?project=`, and its
++  absence on desktop. Prefill after the switch is the `project-session-defaults`
++  path.
+ 
+ ## Gotchas
+ 
+diff --git a/web/src/shell/LandingProjectChip.tsx b/web/src/shell/LandingProjectChip.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c0d25ce33c2d88ae8f92853b2c6683d43c6afca
+--- /dev/null
++++ b/web/src/shell/LandingProjectChip.tsx
+@@ -0,0 +1,77 @@
++import { CheckIcon, ChevronDownIcon } from "lucide-react";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuItem,
++  DropdownMenuTrigger,
++} from "@/components/ui/dropdown-menu";
++import type { ProjectSummary } from "@/hooks/useConversations";
++import { cn } from "@/lib/utils";
++import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
++import { ProjectRowIcon } from "./ProjectPicker";
++
++const ROW_CLASS = "mobile-touch-target min-h-11 gap-2 px-3 text-sm";
++
++/**
++ * Phone landing chip naming the project a new session starts in. Its menu
++ * lists "No project" and every project, without a search field, so choosing
++ * one never raises the keyboard. `onSelect("")` means no project.
++ */
++export function LandingProjectChip({
++  projects,
++  selectedProject,
++  onSelect,
++}: {
++  projects: readonly ProjectSummary[];
++  selectedProject: string;
++  onSelect: (project: string) => void;
++}) {
++  const selectedIcon = projects.find((project) => project.name === selectedProject)?.icon;
++  const label = selectedProject || "No project";
++  return (
++    <DropdownMenu>
++      <DropdownMenuTrigger asChild>
++        <button
++          type="button"
++          aria-label={`Project: ${label}`}
++          className="mobile-touch-target min-w-0 cursor-pointer"
++          data-testid="new-chat-landing-project-chip"
++        >
++          <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-brand-accent/10 px-2.5 py-1 font-medium text-foreground">
++            {selectedProject !== "" && <ProjectRowIcon icon={selectedIcon} />}
++            <span className="min-w-0 truncate">{label}</span>
++            <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
++          </span>
++        </button>
++      </DropdownMenuTrigger>
++      <DropdownMenuContent
++        align="start"
++        collisionPadding={16}
++        className={cn(
++          "max-h-[60vh] w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] overflow-y-auto",
++          MOBILE_GLASS_SURFACE,
++        )}
++        data-testid="new-chat-landing-project-menu"
++      >
++        <DropdownMenuItem className={ROW_CLASS} onSelect={() => onSelect("")}>
++          <span className="flex-1 truncate">No project</span>
++          {selectedProject === "" && <CheckIcon className="size-4 shrink-0 text-primary" />}
++        </DropdownMenuItem>
++        {projects.map((project) => (
++          <DropdownMenuItem
++            key={project.name}
++            className={ROW_CLASS}
++            textValue={project.name}
++            onSelect={() => onSelect(project.name)}
++          >
++            <ProjectRowIcon icon={project.icon} />
++            <span className="flex-1 truncate">{project.name}</span>
++            {selectedProject === project.name && (
++              <CheckIcon className="size-4 shrink-0 text-primary" />
++            )}
++          </DropdownMenuItem>
++        ))}
++      </DropdownMenuContent>
++    </DropdownMenu>
++  );
++}
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index b8a9e4abf7c7ce57c3defd006d3ec654ad4cffa7..68da0549215c10f7c8509f291977f22dd5c69722 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -4,6 +4,7 @@ import { useComposerContext } from "@/hooks/useComposerContext";
+ import { useSlashCompletion } from "@/hooks/useSlashCompletion";
+ import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
+ import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
++import { LandingProjectChip } from "./LandingProjectChip";
+ import {
+   HarnessPicker,
+   HarnessPickerEntry,
+@@ -6725,6 +6726,27 @@ function NewChatLandingContent({
+     />
+   );
+ 
++  // Switch to a project's visit, or a plain one for "", keeping the other
++  // params; the landing stays mounted, so the draft text survives.
++  const selectLandingProject = (name: string) => {
++    if (name === projectParam) return;
++    const params = new URLSearchParams(searchParams);
++    if (name === "") params.delete("project");
++    else params.set("project", name);
++    const query = params.toString();
++    navigate(query === "" ? "/" : `/?${query}`);
++  };
++
++  // Phones lead the controls under the heading with the project choice.
++  const projectChip =
++    isMobileViewport && !siblingSourceId ? (
++      <LandingProjectChip
++        projects={projectList ?? []}
++        selectedProject={selectedProject}
++        onSelect={selectLandingProject}
++      />
++    ) : null;
++
+   const workspaceControls = (
+     <NewChatWorkspaceControls disabled={checkingDbcert}>
+       {/* Keep the tray mounted while the execution target changes. */}
+@@ -6735,6 +6757,7 @@ function NewChatLandingContent({
+           data-testid="new-chat-landing-workspace-controls"
+           trailingContent={mcpRegistryPicker}
+         >
++          {projectChip}
+           {/* Sandbox repository chip — the sandbox counterpart of the
+         working-directory chip. There is no filesystem to browse
+         before the sandbox exists, so the workspace is specified as
+@@ -6831,6 +6854,7 @@ function NewChatLandingContent({
+           data-testid="new-chat-landing-workspace-controls"
+           trailingContent={mcpRegistryPicker}
+         >
++          {projectChip}
+           {workspaceLoading && cachedWorkspace === null && (
+             <NewChatPickerLoading
+               label="Loading working directory"
+@@ -7350,9 +7374,7 @@ function NewChatLandingContent({
+                         labelCount={Object.keys(sessionLabels.labels).length}
+                         projects={projectList ?? []}
+                         onProjectSelect={(name) => {
+-                          const params = new URLSearchParams(searchParams);
+-                          params.set("project", name);
+-                          navigate(`/?${params.toString()}`);
++                          selectLandingProject(name);
+                           requestAnimationFrame(() => textareaRef.current?.focus());
+                         }}
+                       />
+@@ -7651,9 +7673,9 @@ function NewChatLandingContent({
+                       </span>
+                     )}
+ 
+-                    {/* The session's project membership (from a `?project=` landing)
+-                is shown in the hero heading instead of a tray chip; filing on
+-                create still uses `selectedProject`. */}
++                    {/* The session's project (from a `?project=` landing) is named
++                in the desktop hero heading or the phone's project chip; filing
++                on create still uses `selectedProject`. */}
+                   </>
+                 ),
+                 trailing: (
+diff --git a/web/src/shell/NewChatLandingScreen.mobileChrome.test.tsx b/web/src/shell/NewChatLandingScreen.mobileChrome.test.tsx
+index a27851b603a8b21c3ee1f6d67c192fe837a68d91..cb72fa2cea163af62267b00e18a82fb4ab425a62 100644
+--- a/web/src/shell/NewChatLandingScreen.mobileChrome.test.tsx
++++ b/web/src/shell/NewChatLandingScreen.mobileChrome.test.tsx
+@@ -24,9 +24,10 @@ vi.mock("@/hooks/useSidebarData", () => ({
+ vi.mock("@/hooks/useSkills", () => ({
+   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+ }));
+-// The landing screen's mobile chrome. One rule, about arriving at "/" on a
+-// phone: the composer is not focused, so landing here — including on the way
+-// back out of Settings — never throws up the keyboard unasked. (The iOS
++// The landing screen's mobile chrome. Arriving at "/" on a phone does not
++// focus the composer, so landing here — including on the way back out of
++// Settings — never throws up the keyboard unasked. The project chip under the
++// heading switches the visit's `?project=` without a search field. (The iOS
+ // shell's legacy bottom Chat/Terminal bar is kept hidden app-wide at boot by
+ // hideNativeChatTerminalBar in main.tsx, not per-screen here.)
+ 
+@@ -48,10 +49,15 @@ import { NewChatLandingScreen } from "./NewChatDialog";
+ import { MobileHeaderButtonGroup } from "./MobileHeaderButton";
+ import { MobileHeaderControlsProvider, MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
+ 
++const route = vi.hoisted(() => ({
++  navigate: vi.fn(),
++  params: new URLSearchParams(),
++  projects: [] as { id: string; name: string; icon?: string | null }[],
++}));
+ vi.mock("@/lib/routing", () => ({
+   useLocation: () => ({ hash: "", state: null }),
+-  useNavigate: () => vi.fn(),
+-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
++  useNavigate: () => route.navigate,
++  useSearchParams: () => [route.params, vi.fn()],
+ }));
+ 
+ vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
+@@ -88,7 +94,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
+ }));
+ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+   ...(await importOriginal<typeof UseConversationsModule>()),
+-  useProjects: () => ({ data: [], isLoading: false }),
++  useProjects: () => ({ data: route.projects, isLoading: false }),
+   useProjectConfig: () => ({ data: undefined, isLoading: false }),
+ }));
+ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+@@ -113,9 +119,9 @@ function setViewport(mobile: boolean): void {
+   });
+ }
+ 
+-function renderLanding(): void {
++function renderLanding() {
+   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+-  render(<NewChatLandingScreen />, {
++  return render(<NewChatLandingScreen />, {
+     wrapper: ({ children }: { children: ReactNode }) => (
+       <QueryClientProvider client={client}>
+         <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK }}>
+@@ -148,6 +154,9 @@ beforeEach(() => {
+     ],
+   } as ReturnType<typeof useAvailableAgents>);
+   setViewport(false);
++  route.navigate.mockReset();
++  route.params = new URLSearchParams();
++  route.projects = [];
+ });
+ 
+ afterEach(() => {
+@@ -220,3 +229,74 @@ describe("NewChatLandingScreen keyboard behaviour", () => {
+     expect(input).toHaveValue("Keep this draft");
+   });
+ });
++
++describe("NewChatLandingScreen project chip", () => {
++  async function openProjectMenu(): Promise<HTMLElement> {
++    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-project-chip"), {
++      button: 0,
++      ctrlKey: false,
++      pointerType: "mouse",
++    });
++    return screen.findByTestId("new-chat-landing-project-menu");
++  }
++
++  beforeEach(() => {
++    route.projects = [
++      { id: "proj_web", name: "web", icon: "🌐" },
++      { id: "proj_api", name: "api" },
++    ];
++  });
++
++  it("is not rendered on desktop, which names the project in its heading", () => {
++    route.params = new URLSearchParams("project=web");
++    renderLanding();
++    expect(screen.getByRole("heading", { name: "web" })).toBeInTheDocument();
++    expect(screen.queryByTestId("new-chat-landing-project-chip")).not.toBeInTheDocument();
++  });
++
++  it("leads the phone controls and files the visit under a picked project", async () => {
++    setViewport(true);
++    route.params = new URLSearchParams("ref=docs");
++    renderLanding();
++
++    const chip = screen.getByTestId("new-chat-landing-project-chip");
++    expect(chip).toHaveAccessibleName("Project: No project");
++    const controls = screen.getByTestId("new-chat-landing-workspace-controls");
++    expect(controls.firstElementChild).toBe(chip);
++
++    const menu = await openProjectMenu();
++    expect(within(menu).queryByRole("textbox")).not.toBeInTheDocument();
++    const rows = within(menu).getAllByRole("menuitem");
++    expect(rows.map((row) => row.textContent)).toEqual(["No project", "🌐web", "api"]);
++    for (const row of rows) expect(row).toHaveClass("min-h-11");
++    fireEvent.click(within(menu).getByRole("menuitem", { name: /api/ }));
++    expect(route.navigate).toHaveBeenCalledWith("/?ref=docs&project=api");
++  });
++
++  it("names the current project and clears only `project` for No project", async () => {
++    setViewport(true);
++    route.params = new URLSearchParams("project=web&ref=docs");
++    const { rerender } = renderLanding();
++
++    const chip = screen.getByTestId("new-chat-landing-project-chip");
++    expect(chip).toHaveAccessibleName("Project: web");
++    expect(within(chip).getByTestId("project-icon")).toHaveTextContent("🌐");
++
++    const input = screen.getByTestId("new-chat-landing-input");
++    fireEvent.change(input, { target: { value: "Keep this draft" } });
++    const menu = await openProjectMenu();
++    fireEvent.click(within(menu).getByRole("menuitem", { name: "No project" }));
++    expect(route.navigate).toHaveBeenCalledWith("/?ref=docs");
++
++    // Apply the navigation: the landing stays mounted and reseeds as a plain visit.
++    route.params = new URLSearchParams("ref=docs");
++    rerender(<NewChatLandingScreen />);
++    await waitFor(() =>
++      expect(screen.getByTestId("new-chat-landing-project-chip")).toHaveAccessibleName(
++        "Project: No project",
++      ),
++    );
++    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this draft");
++    expect(document.activeElement).not.toBe(screen.getByTestId("new-chat-landing-input"));
++  });
++});
