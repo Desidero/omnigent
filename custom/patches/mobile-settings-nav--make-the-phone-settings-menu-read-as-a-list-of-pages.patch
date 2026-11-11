@@ -11,23 +11,25 @@ while the primary navigation already has 44px touch targets.
 
 At phone widths the settings nav now shows a large Settings title, a
 chevron Back row, sections as rounded inset groups with hairline
-separators, and 44px rows with a trailing chevron. Bare /settings no
-longer marks a row as current; once a page is open its row stays
-marked. Desktop and tablet widths are unchanged.
+separators, and 44px rows with a trailing chevron. Like a phone
+settings list, no row is highlighted (bare /settings redirects to
+General, which used to look selected); the open section keeps
+aria-current for assistive tech. Desktop and tablet widths are
+unchanged.
 
 Not upstream yet: proposed from feat/mobile-settings-nav; drop this copy once it merges.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 Docs: none (layout polish of the phone Settings menu; nothing to configure)
-(cherry picked from commit 03d8aec51f884c2ceb7c2907847641ceb78d8ab8)
+(cherry picked from commit d1c7c65f0f326995c487c62ee82c6d3cb9b842d5)
 ---
- web/src/shell/settingsNav.test.tsx | 42 ++++++++++++++++++++++++++++--
- web/src/shell/settingsNav.tsx      | 38 ++++++++++++++++++++++++---
- 2 files changed, 74 insertions(+), 6 deletions(-)
+ web/src/shell/settingsNav.test.tsx | 49 ++++++++++++++++++++++++++++--
+ web/src/shell/settingsNav.tsx      | 40 +++++++++++++++++++++---
+ 2 files changed, 82 insertions(+), 7 deletions(-)
 
 diff --git a/web/src/shell/settingsNav.test.tsx b/web/src/shell/settingsNav.test.tsx
-index 1ebb5cc1cae0535131649b9b1e285d7fcce1fa05..04aece705c63e02766bf1aea4b4662d6ab1fc758 100644
+index 1ebb5cc1cae0535131649b9b1e285d7fcce1fa05..a8ba23c59b497e8a19ed9620bc965a576c36c416 100644
 --- a/web/src/shell/settingsNav.test.tsx
 +++ b/web/src/shell/settingsNav.test.tsx
 @@ -55,11 +55,11 @@ import {
@@ -55,7 +57,7 @@ index 1ebb5cc1cae0535131649b9b1e285d7fcce1fa05..04aece705c63e02766bf1aea4b4662d6
    });
  
    it("renders group subtitles in sentence case at the text-sm tier", () => {
-@@ -379,6 +383,40 @@ describe("SettingsSidebarBody", () => {
+@@ -379,6 +383,47 @@ describe("SettingsSidebarBody", () => {
    });
  });
  
@@ -72,8 +74,8 @@ index 1ebb5cc1cae0535131649b9b1e285d7fcce1fa05..04aece705c63e02766bf1aea4b4662d6
 +    vi.unstubAllGlobals();
 +  });
 +
-+  it("renders the menu as titled, grouped disclosure rows with nothing selected at the root", () => {
-+    renderBody({ route: "/settings" });
++  it("renders the menu as titled, grouped disclosure rows", () => {
++    renderBody({ route: "/settings/general" });
 +    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeInTheDocument();
 +    const back = screen.getByRole("link", { name: "Back" });
 +    expect(back).toHaveClass("mobile-touch-target");
@@ -83,21 +85,28 @@ index 1ebb5cc1cae0535131649b9b1e285d7fcce1fa05..04aece705c63e02766bf1aea4b4662d6
 +    expect(general.querySelectorAll("svg")).toHaveLength(2);
 +    expect(general.parentElement).toHaveClass("divide-y", "rounded-xl", "overflow-hidden");
 +    expect(general.parentElement).not.toHaveClass("gap-px");
-+    expect(document.querySelector('[aria-current="page"]')).toBeNull();
 +  });
 +
-+  it("still marks the open page once a section is selected", () => {
-+    renderBody({ route: "/settings/appearance" });
-+    expect(screen.getByTestId("settings-nav-appearance")).toHaveAttribute("aria-current", "page");
-+    expect(screen.getByTestId("settings-nav-general")).not.toHaveAttribute("aria-current");
-+  });
++  // Bare /settings redirects to /settings/general, so the open section is always set.
++  it.each(["/settings/general", "/settings/appearance"])(
++    "shows no selected row at %s but keeps aria-current",
++    (route) => {
++      renderBody({ route });
++      const current = document.querySelector('[aria-current="page"]');
++      expect(current).toHaveAttribute("href", route);
++      for (const row of screen.getAllByRole("link")) {
++        expect(row).not.toHaveClass("bg-[var(--sidebar-active)]");
++        expect(row.querySelector("svg")).not.toHaveClass("text-[var(--sidebar-active-foreground)]");
++      }
++    },
++  );
 +});
 +
  describe("useSettingsRoute", () => {
    it.each([false, true])("gates the admin general route on nesting=%s", (enabled) => {
      mocks.nestedAgents = enabled;
 diff --git a/web/src/shell/settingsNav.tsx b/web/src/shell/settingsNav.tsx
-index 5012a924428d2f14b4f3ce621a8d53d667df3d09..ffce659397c42b8218290562357e37ee5d6f5569 100644
+index 5012a924428d2f14b4f3ce621a8d53d667df3d09..0c1a18308602b8445f6cf725d9e9eb5e90fba860 100644
 --- a/web/src/shell/settingsNav.tsx
 +++ b/web/src/shell/settingsNav.tsx
 @@ -12,6 +12,8 @@ import {
@@ -131,17 +140,15 @@ index 5012a924428d2f14b4f3ce621a8d53d667df3d09..ffce659397c42b8218290562357e37ee
   */
  export function SettingsSidebarBody({
    onNavClick,
-@@ -259,6 +265,9 @@ export function SettingsSidebarBody({
+@@ -259,6 +265,7 @@ export function SettingsSidebarBody({
      info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
    const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
    const { section } = useSettingsRoute();
 +  const isMobile = useIsMobileViewport();
-+  // Bare /settings on a phone shows only this menu, so no row is the open page.
-+  const atSettingsRoot = useLocation().pathname.split("/").filter(Boolean).at(-1) === "settings";
    const groups = settingsNavGroups(
      hasAuthSession,
      isElectronShell(),
-@@ -283,6 +292,7 @@ export function SettingsSidebarBody({
+@@ -283,6 +290,7 @@ export function SettingsSidebarBody({
            className={cn(
              SIDEBAR_ROW,
              "w-fit justify-start border-0 font-normal text-muted-foreground",
@@ -149,7 +156,7 @@ index 5012a924428d2f14b4f3ce621a8d53d667df3d09..ffce659397c42b8218290562357e37ee
            )}
          >
            {/* Returns to wherever the user was before entering settings (the
-@@ -293,10 +303,15 @@ export function SettingsSidebarBody({
+@@ -293,10 +301,15 @@ export function SettingsSidebarBody({
            closing onto the content behind it. On desktop onNavClick is a no-op
            (persistent card), so dropping it changes nothing there. */}
            <Link to={settingsReturnPath} componentId="settings.back_to_omnigent">
@@ -166,7 +173,7 @@ index 5012a924428d2f14b4f3ce621a8d53d667df3d09..ffce659397c42b8218290562357e37ee
        </div>
        <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
          {groups.map((group) => (
-@@ -304,10 +319,17 @@ export function SettingsSidebarBody({
+@@ -304,10 +317,19 @@ export function SettingsSidebarBody({
              <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
                {group.title}
              </h2>
@@ -182,7 +189,9 @@ index 5012a924428d2f14b4f3ce621a8d53d667df3d09..ffce659397c42b8218290562357e37ee
                {group.items.map((item) => {
                  const Icon = item.icon;
 -                const selected = section === item.id;
-+                const selected = section === item.id && !(isMobile && atSettingsRoot);
++                const current = section === item.id;
++                // The phone drawer is a menu over the page, so no row looks selected.
++                const selected = current && !isMobile;
                  return (
                    <Button
                      key={item.id}
@@ -195,6 +204,15 @@ index 5012a924428d2f14b4f3ce621a8d53d667df3d09..ffce659397c42b8218290562357e37ee
                      )}
                    >
                      <Link
+@@ -326,7 +350,7 @@ export function SettingsSidebarBody({
+                       onClick={onNavClick}
+                       data-testid={`settings-nav-${item.id}`}
+                       componentId={`settings.nav.${item.id}`}
+-                      aria-current={selected ? "page" : undefined}
++                      aria-current={current ? "page" : undefined}
+                     >
+                       <Icon
+                         className={cn(
 @@ -337,6 +361,12 @@ export function SettingsSidebarBody({
                          )}
                        />

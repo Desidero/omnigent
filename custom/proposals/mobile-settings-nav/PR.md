@@ -8,7 +8,7 @@ Part of #12036 (44pt rows on touch devices), for the Settings menu only; it does
 
 On phones, the sidebar gear opens Settings in a full-screen drawer, and tapping a row closes it onto that page. The drawer looked exactly like the sidebar, so it wasn't obvious that rows open pages:
 
-- At bare `/settings`, **General** was highlighted although no page was open.
+- Opening Settings highlighted **General** (bare `/settings` redirects to `/settings/general`) although only the menu was showing.
 - Rows had no disclosure cue.
 - Rows were about 33px tall, below the 44px `mobile-touch-target` floor the primary nav already uses.
 
@@ -17,17 +17,17 @@ At phone widths (`useIsMobileViewport`), `SettingsSidebarBody` now renders:
 - a large **Settings** title under the Back row, which gets a `‹` chevron and the touch-target floor. The label and target stay the same.
 - each section as a rounded inset group (`MOBILE_GLASS_SURFACE`) with hairline separators.
 - rows with `mobile-touch-target`, a trailing `ChevronRightIcon` and an inset focus ring, since the rounded group clips an outer one.
-- no current row at bare `/settings`. Once a page is open, its row is still marked when the drawer is reopened.
+- no selected highlight on any row, like a phone settings list. The open section keeps `aria-current="page"` for assistive tech.
 
 Desktop and tablet widths render exactly as before.
 
 ## Test Plan
 
-- `settingsNav.test.tsx`: a new phone block (matchMedia stubbed below `md`) checks the title, Back chevron and touch target, the grouped container, the row chevron/touch-target/inset-focus classes, no `aria-current` at bare `/settings`, and that `/settings/appearance` keeps Appearance current. The desktop geometry test now also asserts no touch-target class, no chevron and no title.
-- `cd web && pnpm exec vitest run src/shell/settingsNav.test.tsx src/shell/Sidebar.mobileDrawer.test.tsx src/shell/Sidebar.test.tsx`: 311 passed.
-- pre-commit (prettier, oxlint, type check, custom lint) on the changed files: passed.
+- `settingsNav.test.tsx`: a new phone block (matchMedia stubbed below `md`) checks the title, Back chevron and touch target, the grouped container, the row chevron/touch-target/inset-focus classes, and that at `/settings/general` and `/settings/appearance` no row has the selected styling while the open section keeps `aria-current`. The desktop geometry test now also asserts no touch-target class, no chevron and no title, and keeps its selected-row assertions.
+- `cd web && pnpm exec vitest run src/shell/settingsNav.test.tsx src/shell/Sidebar.mobileDrawer.test.tsx src/shell/Sidebar.test.tsx`: 312 passed.
+- `pnpm exec tsc -b` and pre-commit (prettier, oxlint, type check, custom lint) on the changed files: passed.
 
-Manual check on a phone (or a touch device emulator below 768px): open the sidebar, tap the gear, and confirm that nothing is highlighted, rows are 44px with chevrons inside rounded groups, and Back returns where you came from. Tap Appearance, reopen the menu from the page header, and confirm Appearance is highlighted. At desktop width, Settings should look unchanged.
+Manual check on a phone (or a touch device emulator below 768px): open the sidebar, tap the gear, and confirm that no row is highlighted (including General), rows are 44px with chevrons inside rounded groups, and Back returns where you came from. Tap Appearance, reopen the menu from the page header, and confirm still nothing is highlighted. At desktop width, Settings should look unchanged, with the current section highlighted.
 
 ## Demo
 
@@ -58,7 +58,7 @@ Screenshots to follow from a phone build.
 
 ## Coverage notes
 
-Component tests cover the phone/desktop class and selection branches. Rendered row height and focus visibility still need the phone screenshots above.
+Component tests cover the phone/desktop class and highlight branches, using the redirected `/settings/general` route the app actually lands on. Rendered row height and focus visibility still need the phone screenshots above.
 
 ## Release notes
 

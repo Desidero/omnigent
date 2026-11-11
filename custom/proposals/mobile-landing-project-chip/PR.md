@@ -8,7 +8,7 @@ Part of #11083
 
 On a phone, the new-session landing no longer says which project you are starting in: the heading always reads "Start a new session in", only the icon above it changes, and the composer placeholder drops the name. Choosing a project is also hidden behind **+ › Work in a project**.
 
-This adds a project chip as the first control under that heading, on phones only. It reads "No project ▾" or the selected project's icon and name, tinted with the brand accent so it reads as the main choice. Tapping it opens a menu with **No project** first, then every project, and a check on the current one. Rows are at least 44px, and there is no search field, so the keyboard stays down.
+This adds a project chip as the first control under that heading, on phones only. It reads "No project ▾" or the selected project's icon and name, and reuses the tray's `ComposerWorkspaceTrigger`, so it looks the same as the working-directory chip beside it. Tapping it opens a menu with **No project** first, then every project, and a check on the current one. Rows are at least 44px, and there is no search field, so the keyboard stays down.
 
 - Picking a project goes through the same `?project=<name>` switch the + menu already uses (now one shared `selectLandingProject` helper), so the project's defaults prefill the composer as before.
 - **No project** removes only `project` from the query string and keeps the other parameters. The landing stays mounted, so the draft text and attachments are kept. The existing reseed effect on a `?project=` change resets the host, workspace and agent to the plain-visit defaults, as it does for the sidebar's **New session** button.
