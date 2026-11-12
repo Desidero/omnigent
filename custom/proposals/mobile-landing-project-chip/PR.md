@@ -1,5 +1,3 @@
-# feat(web): add a project chip to the phone new-session landing
-
 ## Related issue
 
 Part of #11083
@@ -37,9 +35,15 @@ To try it, open the app at phone width with at least one project:
 
 ## Demo
 
-Screenshots to follow from a phone build.
+Phone width, dark theme. The project chip sits first in the tray, styled like the folder and MCP chips:
 
-- [ ] Visual demo attached below
+<img src="https://raw.githubusercontent.com/Desidero/omnigent/0c1e28d0581e413946f0082d7dc04bf9dda7ae8b/custom/proposals/mobile-landing-project-chip/evidence/phone-landing-chip.png" width="320" alt="Phone new-session landing with No project, folder and MCPs chips">
+
+Tapping it opens the project menu, with No project first and a check on the current choice:
+
+<img src="https://raw.githubusercontent.com/Desidero/omnigent/0c1e28d0581e413946f0082d7dc04bf9dda7ae8b/custom/proposals/mobile-landing-project-chip/evidence/phone-landing-chip-menu.png" width="320" alt="Project chip menu open with No project checked and Foo below">
+
+- [x] Visual demo attached below
 - [ ] Non-visual evidence provided below or in Test Plan
 - [ ] Not applicable — no behavioral change
 
@@ -78,6 +82,7 @@ Should this change be included in the release notes? Choose exactly one.
 On phones, the new-session screen shows a project chip for choosing which project a session starts in
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
 
 
 
