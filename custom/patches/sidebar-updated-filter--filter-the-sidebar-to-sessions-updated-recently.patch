@@ -29,22 +29,22 @@ feat/sidebar-attention-filters. Drop this copy once merged.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- feature-map/sessions.md                     |  20 ++
+ feature-map/sessions.md                     |  21 ++
  web/src/lib/sidebarFocusPreferences.test.ts |  56 +++++
  web/src/lib/sidebarFocusPreferences.ts      |  75 +++++++
- web/src/shell/Sidebar.test.tsx              |  66 ++++++
- web/src/shell/Sidebar.tsx                   | 233 ++++++++++++++++++--
+ web/src/shell/Sidebar.test.tsx              |  99 ++++++++
+ web/src/shell/Sidebar.tsx                   | 236 ++++++++++++++++++--
  web/src/shell/sidebarNav.test.ts            |  28 +++
  web/src/shell/sidebarNav.ts                 |   7 +
- 7 files changed, 462 insertions(+), 23 deletions(-)
+ 7 files changed, 499 insertions(+), 23 deletions(-)
  create mode 100644 web/src/lib/sidebarFocusPreferences.test.ts
  create mode 100644 web/src/lib/sidebarFocusPreferences.ts
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..d5ba859c5e34fa080a8859cb122c8ae395265a78 100644
+index 685982f03aee5a0c756ad2f04721c5d8b5ee5f2c..3fbcdc3944691062ed87d6b70b00ac82ffaa100e 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
-@@ -210,6 +210,12 @@ the header menu), and each place is a separate entry point.
+@@ -212,6 +212,13 @@ the header menu), and each place is a separate entry point.
    the `sidebar_grouping_ui` release flag, on by default; with
    `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the Sessions header keeps a flat
    Display filter and the tooltip keeps its plain layout.
@@ -53,11 +53,12 @@ index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..d5ba859c5e34fa080a8859cb122c8ae3
 +  updated sessions. It is saved per device and works with any Display choice,
 +  with the grouping flag on or off. While it is on, project folders with no
 +  match are hidden, the funnel is highlighted, pins and the open session stay
-+  listed, and a chip beside the funnel clears it.
++  listed, and a chip beside the funnel clears it. With the grouping flag on,
++  phone layouts open Updated in place under a back row like the other submenus.
  - `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
    drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
    a third of its width, or after a quick flick, closes it; a shorter drag springs
-@@ -400,6 +406,11 @@ merge controls return. Unlink the last PR and verify it stays absent after refre
+@@ -402,6 +409,11 @@ merge controls return. Unlink the last PR and verify it stays absent after refre
  A session not yet imported to the server says so. Older servers retain their
  host-dependent unlink behavior.
  
@@ -69,7 +70,7 @@ index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..d5ba859c5e34fa080a8859cb122c8ae3
  **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
  a session card once. Expand navigation manually to keep it open while switching
  cards. Choosing Canvas in the sidebar returns to the selected board.
-@@ -1186,6 +1197,12 @@ plain `uv run pytest`, which starts a private server for the test.
+@@ -1189,6 +1201,12 @@ plain `uv run pytest`, which starts a private server for the test.
    under the folder while pages remain; after three automatic loads (the default
    budget), further pages need a click on it. Turn the switch back on for the
    saved count plus Show more.
@@ -82,7 +83,7 @@ index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..d5ba859c5e34fa080a8859cb122c8ae3
  
  For the desktop Close shortcut, select a side-chat tab in an ordinary
  session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
-@@ -1298,3 +1315,6 @@ its discoverability.
+@@ -1301,3 +1319,6 @@ its discoverability.
  - Grouping and ordering apply to the loaded pages only: an older session joins
    its group once it is paged in. Grouped views hide Projects, so dragging a
    session onto the list never removes it from its project there.
@@ -233,7 +234,7 @@ index 0000000000000000000000000000000000000000..56ab43737607307347eed6108f20d41d
 +  }
 +}
 diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
-index 5b56ab77c72286f6729dadc51e48306926952367..e08ef86976f07933986ab9d33187eb46a19a3ba2 100644
+index f0e01bf15d074686f741cd1b50626660d2b3efa2..62c015d89cacad4474d05857d45318b73761e42e 100644
 --- a/web/src/shell/Sidebar.test.tsx
 +++ b/web/src/shell/Sidebar.test.tsx
 @@ -23,6 +23,7 @@ import {
@@ -316,8 +317,48 @@ index 5b56ab77c72286f6729dadc51e48306926952367..e08ef86976f07933986ab9d33187eb46
    it("fills a folder from its own fetch, independent of the global list window", async () => {
      projectsMock.push("Customer X");
      // The global list holds only an unfiled chat — the project's sessions are
+@@ -4316,6 +4382,39 @@ describe("Sidebar view options", () => {
+     }
+   });
+ 
++  it("opens the Updated submenu in place on a mobile viewport", () => {
++    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
++    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
++      ...mediaQuery,
++      media: query,
++      matches: query === "(max-width: 767.98px)",
++    }));
++    try {
++      mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
++      renderGroupingSidebar();
++      fireEvent.pointerDown(screen.getByTestId("session-filter"), {
++        button: 0,
++        ctrlKey: false,
++        pointerType: "mouse",
++      });
++      const menu = screen.getByRole("menu");
++
++      fireEvent.click(within(menu).getByTestId("session-focus-recency-menu"));
++      expect(screen.getAllByRole("menu")).toEqual([menu]);
++      expect(within(menu).getByRole("menuitem", { name: "Back from Updated" })).toBeInTheDocument();
++      expect(within(menu).queryByTestId("session-display-menu")).toBeNull();
++      expect(within(menu).getAllByRole("separator")).toHaveLength(1);
++
++      fireEvent.click(within(menu).getByTestId("session-focus-recency-day"));
++      expect(screen.queryByRole("menu")).toBeNull();
++      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-focus")!)).toEqual({
++        recency: "day",
++      });
++    } finally {
++      matchMedia.mockRestore();
++    }
++  });
++
+   it.each(["default", "status", "created", "updated"])(
+     "uses Created for saved %s grouping and project folders",
+     (grouping) => {
 diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
-index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff115ff7c7b 100644
+index e02f9bbac26cb3960212fcaf67c14ef60e887ef9..8b949068c38718e018c841dd3d562db24cf0aa3d 100644
 --- a/web/src/shell/Sidebar.tsx
 +++ b/web/src/shell/Sidebar.tsx
 @@ -126,6 +126,7 @@ import {
@@ -602,7 +643,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff1
                            footer={sessionStatus}
                            collapsed={effectiveCollapsedSections.includes("Chats")}
                            onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-@@ -3810,6 +3896,92 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
+@@ -3810,6 +3896,96 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
    repo: "Repo",
    branch: "Branch",
  };
@@ -610,17 +651,20 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff1
 +function SessionFocusMenuItems({
 +  focus,
 +  onFocusChange,
++  pages,
 +}: {
 +  focus: SidebarFocus;
 +  onFocusChange: (patch: Partial<SidebarFocus>) => void;
++  pages?: FilterMenuPages;
 +}) {
 +  return (
 +    <>
-+      <DropdownMenuSeparator />
++      {!pages?.open && <DropdownMenuSeparator />}
 +      <FilterMenuSub
 +        label="Updated"
 +        value={sidebarRecencyOption(focus.recency).label}
 +        testId="session-focus-recency-menu"
++        pages={pages}
 +      >
 +        <DropdownMenuRadioGroup
 +          value={focus.recency}
@@ -628,6 +672,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff1
 +        >
 +          {SIDEBAR_RECENCY_OPTIONS.map((option) => (
 +            <DropdownMenuRadioItem
++              className="mobile-touch-target"
 +              key={option.id}
 +              value={option.id}
 +              data-testid={`session-focus-recency-${option.id}`}
@@ -693,9 +738,9 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff1
 +  );
 +}
  
- // A filter-menu submenu whose trigger shows the current pick at its right edge.
- function FilterMenuSub({
-@@ -3844,6 +4016,9 @@ function SessionFilterMenu({
+ // Mobile has no room for a side flyout, so filter submenus replace the main
+ // menu body in place. `open` is the shown submenu's test id, or null for the main list.
+@@ -3895,6 +4071,9 @@ function SessionFilterMenu({
    multiUser,
    view,
    onViewChange,
@@ -705,7 +750,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff1
  }: {
    value: SidebarTab;
    onChange: (value: SidebarTab) => void;
-@@ -3851,10 +4026,14 @@ function SessionFilterMenu({
+@@ -3902,6 +4081,9 @@ function SessionFilterMenu({
    /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
    view: SidebarViewPreferences | null;
    onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
@@ -715,12 +760,7 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff1
  }) {
    const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
    const [menuOpen, setMenuOpen] = useState(false);
-   const tooltip = useMenuGuardedTooltip(menuOpen);
-+  const focusItems = <SessionFocusMenuItems focus={focus} onFocusChange={onFocusChange} />;
-   const filters = multiUser
-     ? SIDEBAR_FILTERS
-     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
-@@ -3880,12 +4059,18 @@ function SessionFilterMenu({
+@@ -3939,12 +4121,18 @@ function SessionFilterMenu({
            <span className="inline-flex shrink-0" {...tooltip.triggerProps}>
              <DropdownMenuTrigger asChild>
                <Button
@@ -740,19 +780,19 @@ index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..c7d5bf9772cf6624eaec01e9c0579ff1
                  onClick={(event) => event.stopPropagation()}
                >
                  <ListFilterIcon className="size-3.5" />
-@@ -3902,6 +4087,7 @@ function SessionFilterMenu({
+@@ -3961,6 +4149,7 @@ function SessionFilterMenu({
          <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
            <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
            {displayOptions}
-+          {focusItems}
++          <SessionFocusMenuItems focus={focus} onFocusChange={onFocusChange} />
          </DropdownMenuContent>
        ) : (
          <DropdownMenuContent align="end" className="min-w-56">
-@@ -3933,6 +4119,7 @@ function SessionFilterMenu({
+@@ -3994,6 +4183,7 @@ function SessionFilterMenu({
            >
              {displayOptions}
            </FilterMenuSub>
-+          {focusItems}
++          <SessionFocusMenuItems focus={focus} onFocusChange={onFocusChange} pages={pages} />
            <FilterMenuSub
              label="Ordering"
              value={ORDERING_LABELS[view.ordering]}

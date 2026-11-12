@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "omni-resolve-agent[bot]"
+ <320914472+omni-resolve-agent[bot]@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:43:49 -0800
+Subject: [PATCH] fix(web): open sidebar filter submenus in place on mobile
+ (#13481)
+
+On a phone-width sidebar drawer the Grouping, Display, Ordering and Show
+submenus opened as Radix side flyouts. Neither side of the menu had room,
+so Radix flipped the flyout left and clipped its labels off the screen.
+
+On mobile viewports these submenus now replace the main menu body in
+place under a back row, matching the session row and header menus.
+Desktop keeps the side flyouts.
+
+Backport: this is upstream's merged commit a563d5a0dc
+(omnigent-ai/omnigent#13481, merged 2026-11-11), unchanged. BASE predates
+it, so the series carries it until the next refresh, where it applies as
+empty: drop this copy then.
+
+Signed-off-by: omni-resolve-agent[bot] <omni-resolve-agent[bot]@users.noreply.github.com>
+Co-authored-by: omni-resolve-agent[bot] <omni-resolve-agent[bot]@users.noreply.github.com>
+(cherry picked from commit a563d5a0dc558b6536466e9b88de4a9cab0cc86a)
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/sessions.md                       |  9 +-
+ .../sessions/test_sidebar_view_options.py     | 10 ++-
+ web/src/shell/Sidebar.test.tsx                | 53 +++++++++++
+ web/src/shell/Sidebar.tsx                     | 90 ++++++++++++++++---
+ 4 files changed, 144 insertions(+), 18 deletions(-)
+
+diff --git a/feature-map/sessions.md b/feature-map/sessions.md
+index edbad7a7eb2d3fef5744dd7cc8fc7e520600334e..685982f03aee5a0c756ad2f04721c5d8b5ee5f2c 100644
+--- a/feature-map/sessions.md
++++ b/feature-map/sessions.md
+@@ -181,7 +181,9 @@ the header menu), and each place is a separate entry point.
+ - `view-options`: the one filter menu, on the Projects header, with Grouping
+   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
+   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
+-  saved per device. Created ordering keeps sessions newest-created first as messages
++  saved per device. On phone layouts a submenu replaces the menu's list under a
++  back row with its name, and reopening the menu starts at the main list.
++  Created ordering keeps sessions newest-created first as messages
+   arrive;
+   requests, pagination, and project folders use that order too. Switching order
+   clears the cached rows and shows loading while session timestamps refresh,
+@@ -1153,13 +1155,14 @@ plain `uv run pytest`, which starts a private server for the test.
+   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
+ - **`view-options`:**
+   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_harness_grouping_persists_across_reload`
+-  (desktop and narrow-browser navigation),
++  (desktop and narrow-browser navigation, with every Grouping option inside the viewport),
+   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
+   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
+   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
+   (the flag-off case disables it by patching `GET /v1/info`). Unit tests in
+   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
+-  that the flag-off sidebar ignores stored view options.
++  that the flag-off sidebar ignores stored view options; "Sidebar view options"
++  covers the phone-layout submenus opening in place with their back row.
+ - **`project-show-more`:** no browser test drives it. Component tests in
+   `web/src/shell/Sidebar.test.tsx` ("Sidebar project Show more") cover paging,
+   the next server page, the slide and its reduced-motion skip, the open-session
+diff --git a/tests/e2e_ui/sessions/test_sidebar_view_options.py b/tests/e2e_ui/sessions/test_sidebar_view_options.py
+index c701692e6b2cd04c32e98d2f789cd2f4bc8c9987..edc7917db4c3d51b4a38259b5d1d06ae311b1015 100644
+--- a/tests/e2e_ui/sessions/test_sidebar_view_options.py
++++ b/tests/e2e_ui/sessions/test_sidebar_view_options.py
+@@ -90,6 +90,11 @@ def _open_view_submenu(page: Page, submenu_test_id: str) -> None:
+     page.get_by_test_id(submenu_test_id).click()
+ 
+ 
++def _assert_inside_viewport(items: Locator, width: int) -> None:
++    for box in (item.bounding_box() for item in items.all()):
++        assert box and box["x"] >= 0 and box["x"] + box["width"] <= width, box
++
++
+ def _section_header(page: Page, title: str) -> Locator:
+     return page.get_by_role("button", name=title, exact=True)
+ 
+@@ -106,7 +111,10 @@ def test_harness_grouping_persists_across_reload(
+     if width < 768:
+         page.get_by_role("button", name="Open sidebar", exact=True).click()
+     _open_view_submenu(page, "session-grouping-menu")
+-    page.get_by_role("menuitemradio", name="Harness", exact=True).click()
++    harness = page.get_by_role("menuitemradio", name="Harness", exact=True)
++    expect(harness).to_be_visible()
++    _assert_inside_viewport(page.get_by_role("menuitemradio"), width)
++    harness.click()
+     page.keyboard.press("Escape")
+     claude = page.locator("section").filter(has=_section_header(page, "Claude Code"))
+     codex = page.locator("section").filter(has=_section_header(page, "Codex"))
+diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
+index 5b56ab77c72286f6729dadc51e48306926952367..f0e01bf15d074686f741cd1b50626660d2b3efa2 100644
+--- a/web/src/shell/Sidebar.test.tsx
++++ b/web/src/shell/Sidebar.test.tsx
+@@ -4263,6 +4263,59 @@ describe("Sidebar view options", () => {
+     ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
+   });
+ 
++  it("opens view submenus in place of the main menu on a mobile viewport", () => {
++    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
++    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
++      ...mediaQuery,
++      media: query,
++      matches: query === "(max-width: 767.98px)",
++    }));
++    try {
++      mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
++      renderGroupingSidebar();
++      const openMenu = () => {
++        fireEvent.pointerDown(screen.getByTestId("session-filter"), {
++          button: 0,
++          ctrlKey: false,
++          pointerType: "mouse",
++        });
++        return screen.getByRole("menu");
++      };
++      const menu = openMenu();
++
++      fireEvent.click(within(menu).getByTestId("session-grouping-menu"));
++      expect(screen.getAllByRole("menu")).toEqual([menu]);
++      expect(within(menu).getByRole("menuitem", { name: "Back from Grouping" })).toHaveTextContent(
++        "Grouping",
++      );
++      expect(within(menu).getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
++      expect(within(menu).queryByTestId("session-ordering-menu")).toBeNull();
++
++      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
++      expect(within(menu).queryByRole("menuitemradio")).toBeNull();
++      fireEvent.click(within(menu).getByTestId("session-show-menu"));
++      fireEvent.click(within(menu).getByTestId("session-show-branch"));
++      expect(within(menu).getByTestId("session-show-repo")).toBeInTheDocument();
++
++      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
++      fireEvent.click(within(menu).getByTestId("session-ordering-menu"));
++      fireEvent.click(within(menu).getByRole("menuitemradio", { name: "Created" }));
++      expect(screen.queryByRole("menu")).toBeNull();
++      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
++        ordering: "created",
++        show: ["branch"],
++      });
++      // Reopening starts from the main list, not the last submenu.
++      const reopened = openMenu();
++      fireEvent.click(within(reopened).getByTestId("session-grouping-menu"));
++      fireEvent.keyDown(reopened, { key: "Escape" });
++      expect(screen.queryByRole("menu")).toBeNull();
++      expect(within(openMenu()).getByTestId("session-grouping-menu")).toBeInTheDocument();
++    } finally {
++      matchMedia.mockRestore();
++    }
++  });
++
+   it.each(["default", "status", "created", "updated"])(
+     "uses Created for saved %s grouping and project folders",
+     (grouping) => {
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index c63801d3db359ebb36320c26cf59e4b9eb87d3e6..e02f9bbac26cb3960212fcaf67c14ef60e887ef9 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -3811,30 +3811,81 @@ const SHOW_LABELS: Record<SidebarShowField, string> = {
+   branch: "Branch",
+ };
+ 
++// Mobile has no room for a side flyout, so filter submenus replace the main
++// menu body in place. `open` is the shown submenu's test id, or null for the main list.
++interface FilterMenuPages {
++  open: string | null;
++  setOpen: (testId: string | null) => void;
++}
++
++const FILTER_MENU_OPTIONS_CLASS =
++  "[&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui";
++
+ // A filter-menu submenu whose trigger shows the current pick at its right edge.
+ function FilterMenuSub({
+   label,
+   value,
+   testId,
++  pages,
+   children,
+ }: {
+   label: string;
+   value?: string;
+   testId: string;
++  pages?: FilterMenuPages;
+   children: ReactNode;
+ }) {
++  const triggerLabel = (
++    <span className="flex-1 flex justify-between">
++      {label}
++      {value && <span className="ml-auto text-muted-foreground">{value}</span>}
++    </span>
++  );
++  if (!pages) {
++    return (
++      <DropdownMenuSub>
++        <DropdownMenuSubTrigger className="mobile-touch-target" data-testid={testId}>
++          {triggerLabel}
++        </DropdownMenuSubTrigger>
++        <DropdownMenuSubContent className={cn("min-w-40", FILTER_MENU_OPTIONS_CLASS)}>
++          {children}
++        </DropdownMenuSubContent>
++      </DropdownMenuSub>
++    );
++  }
++  if (pages.open === null) {
++    return (
++      <DropdownMenuItem
++        className="mobile-touch-target"
++        data-testid={testId}
++        onSelect={(event) => {
++          event.preventDefault();
++          pages.setOpen(testId);
++        }}
++      >
++        {triggerLabel}
++        <ChevronRightIcon className="ml-auto" />
++      </DropdownMenuItem>
++    );
++  }
++  if (pages.open !== testId) return null;
+   return (
+-    <DropdownMenuSub>
+-      <DropdownMenuSubTrigger className="mobile-touch-target" data-testid={testId}>
+-        <span className="flex-1 flex justify-between">
+-          {label}
+-          {value && <span className="ml-auto text-muted-foreground">{value}</span>}
+-        </span>
+-      </DropdownMenuSubTrigger>
+-      <DropdownMenuSubContent className="min-w-40 [&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui">
+-        {children}
+-      </DropdownMenuSubContent>
+-    </DropdownMenuSub>
++    <div className={FILTER_MENU_OPTIONS_CLASS}>
++      <DropdownMenuItem
++        className="mobile-touch-target"
++        data-testid="session-filter-menu-back"
++        aria-label={`Back from ${label}`}
++        onSelect={(event) => {
++          event.preventDefault();
++          pages.setOpen(null);
++        }}
++      >
++        <ChevronLeftIcon className="size-3.5" />
++        {label}
++      </DropdownMenuItem>
++      <DropdownMenuSeparator />
++      {children}
++    </div>
+   );
+ }
+ 
+@@ -3854,6 +3905,9 @@ function SessionFilterMenu({
+ }) {
+   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
+   const [menuOpen, setMenuOpen] = useState(false);
++  const [openPage, setOpenPage] = useState<string | null>(null);
++  const isMobile = useIsMobileViewport();
++  const pages = isMobile ? { open: openPage, setOpen: setOpenPage } : undefined;
+   const tooltip = useMenuGuardedTooltip(menuOpen);
+   const filters = multiUser
+     ? SIDEBAR_FILTERS
+@@ -3873,7 +3927,12 @@ function SessionFilterMenu({
+     </DropdownMenuRadioGroup>
+   );
+   return (
+-    <DropdownMenu onOpenChange={setMenuOpen}>
++    <DropdownMenu
++      onOpenChange={(open) => {
++        setMenuOpen(open);
++        if (!open) setOpenPage(null);
++      }}
++    >
+       <Tooltip disableHoverableContent open={tooltip.open} onOpenChange={tooltip.onOpenChange}>
+         <TooltipTrigger asChild>
+           {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
+@@ -3909,6 +3968,7 @@ function SessionFilterMenu({
+             label="Grouping"
+             value={GROUPING_LABELS[view.grouping]}
+             testId="session-grouping-menu"
++            pages={pages}
+           >
+             <DropdownMenuRadioGroup
+               value={view.grouping}
+@@ -3930,6 +3990,7 @@ function SessionFilterMenu({
+             label="Display"
+             value={filters.find((filter) => filter.value === value)?.label}
+             testId="session-display-menu"
++            pages={pages}
+           >
+             {displayOptions}
+           </FilterMenuSub>
+@@ -3937,6 +3998,7 @@ function SessionFilterMenu({
+             label="Ordering"
+             value={ORDERING_LABELS[view.ordering]}
+             testId="session-ordering-menu"
++            pages={pages}
+           >
+             <DropdownMenuRadioGroup
+               value={view.ordering}
+@@ -3954,8 +4016,8 @@ function SessionFilterMenu({
+               ))}
+             </DropdownMenuRadioGroup>
+           </FilterMenuSub>
+-          <DropdownMenuSeparator />
+-          <FilterMenuSub label="Show" testId="session-show-menu">
++          {!pages?.open && <DropdownMenuSeparator />}
++          <FilterMenuSub label="Show" testId="session-show-menu" pages={pages}>
+             {SIDEBAR_SHOW_FIELDS.map((field) => (
+               <DropdownMenuCheckboxItem
+                 className="mobile-touch-target"
