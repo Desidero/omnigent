@@ -1,5 +1,3 @@
-# feat(web): fold the phone drawer's primary nav into one strip
-
 ## Related issue
 
 Closes #13482
@@ -23,9 +21,11 @@ On a phone, the sidebar drawer's primary nav is a stack of 44pt rows above the s
 
 ## Demo
 
-Screenshots to follow from a phone build.
+iPhone, dark theme. New, Automations and Inbox share one strip under the header, and the project list starts right below it:
 
-- [ ] Visual demo attached below
+<img src="https://raw.githubusercontent.com/Desidero/omnigent/16d45bfd39cac64e321962bfe65d1dd98652c59c/custom/proposals/mobile-sidebar-nav-strip/evidence/phone-drawer-strip.png" width="360" alt="Phone sidebar drawer with New, Automations and Inbox as three cells in one strip">
+
+- [x] Visual demo attached below
 - [ ] Non-visual evidence provided below or in Test Plan
 - [ ] Not applicable — no behavioral change
 
@@ -56,13 +56,11 @@ Component tests cover the layout switch, accessibility names, active state, badg
 
 Should this change be included in the release notes? Choose exactly one.
 
-- [ ] No — no noteworthy user-facing change.
-- [x] Yes — include the entry in the Changelog section.
-
-## Changelog
-
-On phones, the sidebar's New session, Automations and Inbox links share one compact strip, leaving more room for sessions
+- [x] No — no noteworthy user-facing change.
+- [ ] Yes — include the entry in the Changelog section.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
 
 
