@@ -29,45 +29,45 @@ like [A4] in an unrelated session stays plain text.
 Agents only label and close items when told to, so Omnigent adds a
 framework instruction with the labelling and closing rules. SDK
 harnesses get it every turn with the other framework instructions.
-claude-native and codex-native take instructions only at launch, so the
-static instruction is appended to the agent's own instructions on
---append-system-prompt and developer_instructions, for both
-runner-created and CLI-launched sessions. A user-supplied
+Native harnesses take instructions only at launch, so the static
+instruction joins the stable guidance of the native startup composer
+(build_native_startup_instructions), after the workspace-image guidance:
+--append-system-prompt for claude-native, developer_instructions for
+codex-native, and the startup channel of the other natives that have one,
+for both runner-created and CLI-launched sessions. A user-supplied
 --append-system-prompt is folded into the same flag by upstream's
 _merge_append_system_prompt. codex-native relies on the
 collaboration-mode fix so the always-present developer_instructions
-no longer replace Plan mode's built-in instructions. Other native
-harnesses have no instruction channel and are unchanged.
+no longer replace Plan mode's built-in instructions.
 
 Not upstream yet: proposed from feat/chat-item-citations; drop this copy once it merges.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/chat-item-labels.md                      |  48 +++
- omnigent/harnesses/claude_native/main.py      |  20 +-
- omnigent/harnesses/codex_native/main.py       |   8 +-
- omnigent/runner/native/orchestration.py       |  12 +-
- omnigent/runtime/prompt.py                    |  46 +-
+ docs/chat-item-labels.md                      |  49 +++
+ omnigent/runtime/prompt.py                    |  41 +-
  tests/e2e_ui/chat/test_item_label_chips.py    | 138 ++++++
- .../claude_native/test_claude_native.py       |   3 +
- .../codex_native/test_codex_native.py         |   3 +
- ...pp_sessions_native_terminals_autocreate.py |  25 +-
- ...t_app_sessions_native_terminals_runtime.py |   9 +-
- tests/runner/test_runner_dispatch.py          |   7 +-
- tests/runtime/test_prompt.py                  |  82 ++--
- tests/spec/test_resolve_agent_bundle.py       |   6 +-
+ .../claude_native/test_claude_native.py       |  10 +-
+ .../session/test_terminal_prepare.py          |   8 +-
+ .../codex_native/test_codex_native.py         |  10 +-
+ .../test_app_native_startup_instructions.py   |  17 +-
+ ...pp_sessions_native_terminals_autocreate.py |  44 +-
+ ...t_app_sessions_native_terminals_runtime.py |   8 +-
+ tests/runner/test_runner_dispatch.py          |   8 +-
+ tests/runtime/test_prompt.py                  |  45 +-
+ tests/spec/test_resolve_agent_bundle.py       |   8 +-
  .../blocks/ChatMarkdown.itemLabels.test.tsx   | 162 +++++++
- web/src/components/blocks/ChatMarkdown.tsx    | 198 ++++++++-
+ web/src/components/blocks/ChatMarkdown.tsx    | 199 ++++++++-
  .../components/chat/OpenItemsPanel.test.tsx   | 128 ++++++
  web/src/components/chat/OpenItemsPanel.tsx    | 182 ++++++++
- web/src/components/chat/Transcript.tsx        |  23 +-
+ web/src/components/chat/Transcript.tsx        | 297 +++++++------
  web/src/components/chat/chatBubbleParts.tsx   |  69 ++-
  web/src/hooks/useHoverPopover.test.tsx        | 130 ++++++
  web/src/hooks/useHoverPopover.ts              |  95 +++++
  web/src/lib/itemLabels.test.ts                | 276 ++++++++++++
  web/src/lib/itemLabels.ts                     | 399 ++++++++++++++++++
- 23 files changed, 1982 insertions(+), 87 deletions(-)
+ 22 files changed, 2097 insertions(+), 226 deletions(-)
  create mode 100644 docs/chat-item-labels.md
  create mode 100644 tests/e2e_ui/chat/test_item_label_chips.py
  create mode 100644 web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
@@ -80,10 +80,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
 
 diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7881ca781760c7cfc9e083aca49de413028acb7b
+index 0000000000000000000000000000000000000000..7d17b0fbb15e16807bee59f365bd36377f984bc4
 --- /dev/null
 +++ b/docs/chat-item-labels.md
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +# Item labels in chat
 +
 +Long sessions often raise several questions, risks or follow-ups in one reply
@@ -107,12 +107,13 @@ index 0000000000000000000000000000000000000000..7881ca781760c7cfc9e083aca49de413
 +a settled item by writing its label struck through (`~~[Q2]~~`) in the
 +sentence that says how it ended.
 +
-+SDK harnesses get the instruction with every turn. claude-native and
-+codex-native take instructions only at launch, so it is appended to the
++SDK harnesses get the instruction with every turn. Native harnesses take
++instructions only at launch, so it joins the stable guidance appended to the
 +agent's own instructions there: through Claude Code's `--append-system-prompt`
-+(merged with one you pass yourself, since Claude honours only the last) and
-+Codex's `developer_instructions`. Other native harnesses have no instruction
-+channel; labels still render when you or the agent write them.
++(merged with one you pass yourself, since Claude honours only the last),
++Codex's `developer_instructions`, and the startup channel of the other native
++harnesses that have one. Where a harness has none, labels still render when
++you or the agent write them.
 +
 +## What the chat shows
 +
@@ -132,141 +133,12 @@ index 0000000000000000000000000000000000000000..7881ca781760c7cfc9e083aca49de413
 +  it. The newest mention decides, so a later plain mention reopens it.
 +- **Open items:** a bar above the thread lists the open labels as chips.
 +  Expand it for every item with its title, closed ones under **Closed (N)**.
-diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
-index 82398ba50b494fd514044c55b7b6102d75595c76..902efe679f8a25c9ff4c75e6b12d764385d62df4 100644
---- a/omnigent/harnesses/claude_native/main.py
-+++ b/omnigent/harnesses/claude_native/main.py
-@@ -26,6 +26,7 @@ import uuid
- 
- from omnigent.claude_paths import claude_config_dir
- from omnigent.llms.adapters._content import redact_binary_payloads
-+from omnigent.runtime.prompt import native_startup_instructions
- from omnigent.runtime.tool_result_replay import (
-     blocks_from_parsed_list,
-     image_payloads_in_blocks,
-@@ -4031,7 +4032,9 @@ def _run_with_local_server(
-                     claude_config=claude_config,
-                     startup_profiler=startup_profiler,
-                     startup_progress=progress,
--                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
-+                    append_system_prompt=native_startup_instructions(
-+                        _wrapper_spec_raw_instructions(spec_path)
-+                    ),
-                 )
-             )
-             _mark_startup_step(
-@@ -5377,7 +5380,8 @@ async def _prepare_claude_terminal(
-         marks. ``None`` disables output.
-     :param startup_progress: Optional user-visible progress renderer,
-         e.g. a handle from :func:`runner_startup_progress`.
--    :param append_system_prompt: Raw author instructions for
-+    :param append_system_prompt: Author instructions plus static framework
-+        guidance (:func:`native_startup_instructions`) for
-         ``--append-system-prompt``, applied on fresh launch and cold
-         resume only — the hot-reattach fast path below returns before
-         this is used, so it never relaunches or duplicates the flag.
-@@ -6833,9 +6837,9 @@ async def _launch_claude_terminal(
-     :param bridge_dir: Bridge directory shared with Claude's MCP
-         MCP server and the web-chat harness.
-     :param claude_config: Optional ucode-derived Claude Code config.
--    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
--        (author-supplied, not framework-composed) for this fresh native
--        session.
-+    :param append_system_prompt: Optional author instructions plus static
-+        framework guidance (never per-turn framework text) for this fresh
-+        native session.
-     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
-         for this native session.
-     :returns: Terminal resource id.
-@@ -7012,9 +7016,9 @@ def _claude_terminal_request(
-     :param ap_auth_headers: Auth headers for the
-         ``PermissionRequest`` command hook.
-     :param claude_config: Optional ucode-derived Claude Code config.
--    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
--        (author-supplied, not framework-composed) to append to Claude
--        Code's system prompt.
-+    :param append_system_prompt: Optional author instructions plus static
-+        framework guidance (never per-turn framework text) to append to
-+        Claude Code's system prompt.
-     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
-         for this native session.
-     :returns: JSON body for ``POST /resources/terminals``.
-diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
-index d8d732928df18da5d754a64cd66a851b87cc1d91..68c2dd1de72af4c3fbf0e2e308e0c1ad4cdab159 100644
---- a/omnigent/harnesses/codex_native/main.py
-+++ b/omnigent/harnesses/codex_native/main.py
-@@ -110,6 +110,7 @@ from omnigent.native.native_terminal import post_initial_prompt, request_with_42
- from omnigent.native.native_terminal import (
-     terminal_attach_url as _attach_url,
- )
-+from omnigent.runtime.prompt import native_startup_instructions
- from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
- from omnigent.util.http_retry import jittered_retry_delay
- from omnigent.util.json_types import JsonObject as _JsonObject
-@@ -752,7 +753,9 @@ def _run_with_local_server(
-                     command=command,
-                     model=model,
-                     startup_progress=progress,
--                    developer_instructions=_wrapper_spec_raw_instructions(spec_path),
-+                    developer_instructions=native_startup_instructions(
-+                        _wrapper_spec_raw_instructions(spec_path)
-+                    ),
-                 )
-             if resolved_session_id is None:
-                 _record_launch_for_fresh_session(prepared.session_id)
-@@ -1140,7 +1143,8 @@ async def _prepare_codex_terminal(
-     :param model: Optional model id.
-     :param startup_progress: Optional user-visible progress renderer,
-         e.g. a handle from :func:`runner_startup_progress`.
--    :param developer_instructions: Raw author instructions persisted into
-+    :param developer_instructions: Author instructions plus static framework
-+        guidance (:func:`native_startup_instructions`) persisted into
-         Codex's private per-session config, applied on fresh launch and
-         cold resume only — the reattach branch below returns before this
-         is used, so it never relaunches or duplicates the value.
-diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index e491b1f2fb156bd1c4b680ca166bd8bc8d9c2f81..ad83e9083e008cb32dcf82ea6cce08ec75894694 100644
---- a/omnigent/runner/native/orchestration.py
-+++ b/omnigent/runner/native/orchestration.py
-@@ -104,6 +104,7 @@ from omnigent.runner.session_init_protocol import (
-     RunnerSessionInitEnvelope,
- )
- from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
-+from omnigent.runtime.prompt import native_startup_instructions
- from omnigent.spec.types import AgentSpec
- 
- _logger = logging.getLogger("omnigent.runner.app")
-@@ -5791,7 +5792,9 @@ async def _auto_create_codex_terminal(
-         "\n\n".join(
-             x
-             for x in [
--                _native_startup_raw_instructions_from_spec(agent_spec),
-+                native_startup_instructions(
-+                    _native_startup_raw_instructions_from_spec(agent_spec)
-+                ),
-                 _codex_routing_note,
-             ]
-             if x
-@@ -9859,7 +9862,12 @@ async def _auto_create_claude_terminal(
-         subagent_router_dir=subagent_router_dir,
-         append_system_prompt="\n\n".join(
-             x
--            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
-+            for x in [
-+                native_startup_instructions(
-+                    _native_startup_raw_instructions_from_spec(agent_spec)
-+                ),
-+                routed_spawn_note,
-+            ]
-             if x
-         )
-         or None,
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index 5e40352a6badf72da6efd9faba0de7a1c41bdc6d..71a91c2d8c351a47c5aeaf407863b60f3c859e38 100644
+index 3e043b29a2203755774ec0e25190d4b36e306f7d..a99a3f3a786ea052ba07cf95a9e36ebaab34facd 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
-@@ -58,6 +58,32 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
-     "attached) or for non-interactive bulk fetching."
+@@ -65,6 +65,32 @@ WORKSPACE_IMAGE_INSTRUCTION = (
+     "remote image URLs and files outside the workspace cannot be displayed."
  )
  
 +# The chat renders a later mention of a bracketed label as a chip that previews
@@ -298,7 +170,7 @@ index 5e40352a6badf72da6efd9faba0de7a1c41bdc6d..71a91c2d8c351a47c5aeaf407863b60f
  
  def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      """
-@@ -72,11 +98,12 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -79,7 +105,9 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      The embedded-browser priority guidance follows the ``browser_*``
      registration gate (``ToolManager._register_browser_tools``): every
      agent unless the spec sets ``tool_groups.browser: false``, in which
@@ -308,35 +180,39 @@ index 5e40352a6badf72da6efd9faba0de7a1c41bdc6d..71a91c2d8c351a47c5aeaf407863b60f
 +    renders label chips.
  
      :param spec: The parsed AgentSpec.
--    :returns: The applicable spec-level framework instructions; empty for
--        an agent with no sub-agents and the browser group disabled.
-+    :returns: The applicable spec-level framework instructions, never empty.
-     """
-     instructions: list[str] = []
-     dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
-@@ -84,9 +111,22 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
-         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
+     :returns: The applicable spec-level framework instructions.
+@@ -91,6 +119,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      if spec.tool_groups.browser:
          instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+     instructions.append(WORKSPACE_IMAGE_INSTRUCTION)
 +    instructions.append(ITEM_LABEL_INSTRUCTION)
      return instructions
  
  
-+def native_startup_instructions(author_instructions: str | None) -> str | None:
-+    """Author instructions plus the framework text a native launch channel carries.
-+
-+    Native harnesses take instructions once, at launch, so only framework
-+    instructions that hold for every turn of every session belong here.
-+
-+    :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
-+    :returns: The combined text, or ``None`` when there is nothing to send.
-+    """
-+    return append_framework_instructions(author_instructions, [ITEM_LABEL_INSTRUCTION])
-+
-+
- def append_framework_instructions(
-     instructions: str | None,
-     framework_instructions: Sequence[str],
+@@ -229,19 +258,17 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
+ 
+ 
+ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
+-    """Compose author text and stable image guidance for native session startup.
++    """Compose author text and stable guidance for native session startup.
+ 
+     Startup channels persist across turns, so they must not carry per-turn
+     framework metadata or guidance for tools the native harness does not expose.
+ 
+     :param spec: Resolved agent spec, or ``None`` when unavailable.
+-    :returns: Author instructions followed by workspace-image guidance.
++    :returns: Author instructions followed by workspace-image and item-label guidance.
+     """
+     authored = raw_author_instructions(spec) if spec is not None else None
+-    return (
+-        append_framework_instructions(authored, (WORKSPACE_IMAGE_INSTRUCTION,))
+-        or WORKSPACE_IMAGE_INSTRUCTION
+-    )
++    framework = (WORKSPACE_IMAGE_INSTRUCTION, ITEM_LABEL_INSTRUCTION)
++    return append_framework_instructions(authored, framework) or "\n\n".join(framework)
+ 
+ 
+ def _strip_output_annotations(
 diff --git a/tests/e2e_ui/chat/test_item_label_chips.py b/tests/e2e_ui/chat/test_item_label_chips.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..d4bb89de6735438a06e1e6413e3c197783361cd1
@@ -482,18 +358,19 @@ index 0000000000000000000000000000000000000000..d4bb89de6735438a06e1e6413e3c1977
 +    page.locator(_ASSISTANT).nth(1).get_by_role("button", name="Show item R1").click()
 +    expect(popover).to_contain_text("ON DELETE CASCADE")
 diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
-index d6d595931442a71319558f0d7ed70bf1c7c32d4e..8746db3e60b753ae0564593504f73ceddd06cd45 100644
+index dd538046fba40016dc39514706dcfef6803eb222..b88d1eb021b738d8a181c829e8ae90811682381c 100644
 --- a/tests/harnesses/claude_native/test_claude_native.py
 +++ b/tests/harnesses/claude_native/test_claude_native.py
-@@ -43,6 +43,7 @@ from omnigent.native import native_terminal
+@@ -43,7 +43,7 @@ from omnigent.native import native_terminal
  from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
  from omnigent.runtime import tool_result_replay as trc
  from omnigent.runtime import workflow
-+from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
  from omnigent.spec import load_omnigent_yaml
+ from omnigent.telemetry.request_headers import client_user_agent
  from omnigent.terminals.ws_common import (
-     WS_CLOSE_TERMINAL_DETACHED,
-@@ -1802,6 +1803,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+@@ -1906,6 +1906,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -501,7 +378,7 @@ index d6d595931442a71319558f0d7ed70bf1c7c32d4e..8746db3e60b753ae0564593504f73ced
  
  
  def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
-@@ -1889,6 +1891,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
+@@ -1993,6 +1994,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -509,19 +386,91 @@ index d6d595931442a71319558f0d7ed70bf1c7c32d4e..8746db3e60b753ae0564593504f73ced
  
  
  def test_local_resume_does_not_print_redundant_resume_hint(
+@@ -6892,15 +6894,15 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
+     result = claude_native._wrapper_spec_startup_instructions(spec_path)
+     assert result is not None
+     assert "Claude Code is running in the session terminal" in result
+-    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
++    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
+ 
+ 
+ def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+     """A malformed wrapper spec must not block the terminal launch."""
+     bad_spec = tmp_path / "bad.yaml"
+     bad_spec.write_text("not: [valid, agent, spec")
+-    assert (
+-        claude_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
++    assert claude_native._wrapper_spec_startup_instructions(bad_spec) == (
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+     )
+ 
+ 
+diff --git a/tests/harnesses/codex_native/session/test_terminal_prepare.py b/tests/harnesses/codex_native/session/test_terminal_prepare.py
+index 7643a08c6272a72436b35d3edb5ca6f7dd014f83..672f1c01a0cbb321339873c4c82f43c54be3935c 100644
+--- a/tests/harnesses/codex_native/session/test_terminal_prepare.py
++++ b/tests/harnesses/codex_native/session/test_terminal_prepare.py
+@@ -15,7 +15,7 @@ import pytest
+ 
+ from omnigent._runner_startup import RunnerStartupProgress
+ from omnigent.harnesses.codex_native import main as codex_native
+-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
+ from tests.harnesses.codex_native.session._support import (
+     _write_source_rollout,
+ )
+@@ -32,14 +32,16 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
+     result = codex_native._wrapper_spec_startup_instructions(spec_path)
+     assert result is not None
+     assert "Codex is running in the session terminal" in result
+-    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
++    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
+ 
+ 
+ def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+     """A malformed wrapper spec must not block the terminal launch."""
+     bad_spec = tmp_path / "bad.yaml"
+     bad_spec.write_text("not: [valid, agent, spec")
+-    assert codex_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
++    assert codex_native._wrapper_spec_startup_instructions(bad_spec) == (
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++    )
+ 
+ 
+ @pytest.mark.asyncio
 diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
-index d675f0a06c0978b24b9e7a5bf1db0b2ed86e9504..b42c0ca35bc2db650f416d82ff70e156e3a5d65d 100644
+index 4e35d55d647b52a87b7efa6558639cf67fc9144e..2534bdf2b3ee7026c17173d5ffa470f4ff151baa 100644
 --- a/tests/harnesses/codex_native/test_codex_native.py
 +++ b/tests/harnesses/codex_native/test_codex_native.py
-@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
+@@ -34,7 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
  )
  from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
  from omnigent.inner.native_attachments import attachment_cache_dir
-+from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
  from omnigent.spec import load
  
  # The default-stance auto-review override normalize_codex_permission_launch_args
-@@ -9247,6 +9248,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+@@ -9199,7 +9199,7 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
+     result = codex_native._wrapper_spec_startup_instructions(spec_path)
+     assert result is not None
+     assert "Codex is running in the session terminal" in result
+-    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
++    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
+ 
+ 
+ @pytest.mark.asyncio
+@@ -9241,7 +9241,9 @@ def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path:
+     """A malformed wrapper spec must not block the terminal launch."""
+     bad_spec = tmp_path / "bad.yaml"
+     bad_spec.write_text("not: [valid, agent, spec")
+-    assert codex_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
++    assert codex_native._wrapper_spec_startup_instructions(bad_spec) == (
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++    )
+ 
+ 
+ @pytest.mark.asyncio
+@@ -9437,6 +9439,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
  
      assert captured.get("developer_instructions") is not None
      assert "Codex is running in the session terminal" in captured["developer_instructions"]
@@ -529,7 +478,7 @@ index d675f0a06c0978b24b9e7a5bf1db0b2ed86e9504..b42c0ca35bc2db650f416d82ff70e156
  
  
  def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
-@@ -9329,6 +9331,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
+@@ -9519,6 +9522,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
  
      assert captured.get("developer_instructions") is not None
      assert "Codex is running in the session terminal" in captured["developer_instructions"]
@@ -537,22 +486,83 @@ index d675f0a06c0978b24b9e7a5bf1db0b2ed86e9504..b42c0ca35bc2db650f416d82ff70e156
  
  
  @pytest.mark.asyncio
+diff --git a/tests/runner/test_app_native_startup_instructions.py b/tests/runner/test_app_native_startup_instructions.py
+index 307352344265a7bee0c4653a40a16f4027de4f95..43079978d85b3ed1c97d4ab8c0ebb5262efde7e9 100644
+--- a/tests/runner/test_app_native_startup_instructions.py
++++ b/tests/runner/test_app_native_startup_instructions.py
+@@ -11,9 +11,12 @@ from omnigent.runner.app import (
+     _native_startup_instructions_from_spec,
+ )
+ from omnigent.runner.native.orchestration import _opencode_session_instructions_from_spec
+-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
+ from omnigent.spec.types import AgentSpec, ExecutorSpec
+ 
++# The stable guidance every native startup carries after the author text.
++_STARTUP_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++
+ 
+ def _spec(instructions: str | None) -> AgentSpec:
+     """Build a minimal agent spec carrying *instructions*."""
+@@ -28,9 +31,9 @@ def _spec(instructions: str | None) -> AgentSpec:
+ @pytest.mark.parametrize(
+     ("instructions", "expected"),
+     [
+-        ("Be a concise assistant.", f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"),
+-        (None, WORKSPACE_IMAGE_INSTRUCTION),
+-        ("   \n  ", WORKSPACE_IMAGE_INSTRUCTION),
++        ("Be a concise assistant.", f"Be a concise assistant.\n\n{_STARTUP_GUIDANCE}"),
++        (None, _STARTUP_GUIDANCE),
++        ("   \n  ", _STARTUP_GUIDANCE),
+     ],
+     ids=["present", "absent", "whitespace-only"],
+ )
+@@ -41,7 +44,7 @@ def test_native_startup_instructions_from_spec(instructions: str | None, expecte
+ 
+ def test_native_startup_instructions_from_spec_none_spec() -> None:
+     """A missing spec still receives stable image guidance."""
+-    assert _native_startup_instructions_from_spec(None) == WORKSPACE_IMAGE_INSTRUCTION
++    assert _native_startup_instructions_from_spec(None) == _STARTUP_GUIDANCE
+ 
+ 
+ @pytest.mark.parametrize("has_spec", [False, True])
+@@ -56,7 +59,7 @@ def test_native_startup_instructions_from_spec_resolved_wrapper() -> None:
+     """A ResolvedSpec wrapper unwraps to the same instructions text."""
+     wrapped = ResolvedSpec(spec=_spec("Be a concise assistant."), workdir=Path("/tmp"))
+     assert _native_startup_instructions_from_spec(wrapped) == (
+-        f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++        f"Be a concise assistant.\n\n{_STARTUP_GUIDANCE}"
+     )
+ 
+ 
+@@ -64,5 +67,5 @@ def test_native_startup_instructions_from_spec_never_returns_stripped_form() ->
+     """The original resolved text is preserved verbatim, not the stripped form."""
+     padded = "  Keep leading/trailing whitespace exactly.  "
+     assert _native_startup_instructions_from_spec(_spec(padded)) == (
+-        f"{padded}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++        f"{padded}\n\n{_STARTUP_GUIDANCE}"
+     )
 diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
-index 48b9777544176ce099fdddf8606ff20a74c90a5c..3335b38461c59692b37a5e913fbe3f40397df8bd 100644
+index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca81a9cd48 100644
 --- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
 +++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
-@@ -78,6 +78,7 @@ from omnigent.runner.resource_registry import (
+@@ -78,7 +78,7 @@ from omnigent.runner.resource_registry import (
      SessionResourceRegistry,
  )
  from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
-+from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
  from omnigent.spec.types import AgentSpec, ExecutorSpec
  from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
  from omnigent.terminals import TerminalRegistry
-@@ -168,6 +169,13 @@ def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
+@@ -170,6 +170,17 @@ def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
      return json.loads(settings_path.read_text(encoding="utf-8"))
  
  
++# What a native launch with no author text appends to the system prompt.
++_STARTUP_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++
++
 +def _appended_system_prompt(args: list[str]) -> str | None:
 +    """Return the ``--append-system-prompt`` value, or None when it is absent."""
 +    if "--append-system-prompt" not in args:
@@ -563,126 +573,156 @@ index 48b9777544176ce099fdddf8606ff20a74c90a5c..3335b38461c59692b37a5e913fbe3f40
  def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
      tmp_path: Path,
  ) -> None:
-@@ -2312,7 +2320,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+@@ -398,9 +409,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
+         path.parent == Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
+     )
+     expected = (
+-        f"{instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++        f"{instructions}\n\n{_STARTUP_GUIDANCE}"
+         if instruction_spec in {"raw", "resolved", "resolved-replace"}
+-        else WORKSPACE_IMAGE_INSTRUCTION
++        else _STARTUP_GUIDANCE
+     )
+     assert path.read_text() == expected
+     assert instructions not in args
+@@ -1537,9 +1548,9 @@ async def test_devin_image_guidance_leaves_the_rule_for_authored_sessions(
+             bridge.bridge_dir_for_session_id(session_id)
+         )
+         expected = (
+-            f"{authored}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++            f"{authored}\n\n{_STARTUP_GUIDANCE}"
+             if session_id == "fallback-session"
+-            else WORKSPACE_IMAGE_INSTRUCTION
++            else _STARTUP_GUIDANCE
+         )
+         assert preamble == expected
+         if authored is None:
+@@ -2402,7 +2413,7 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
  ) -> None:
      """
      Host-spawned launch emits ``--append-system-prompt`` with the agent's
--    raw author instructions.
-+    raw author instructions, followed by the item-label guidance.
+-    author instructions and stable image guidance.
++    author instructions, then the stable image and item-label guidance.
  
      The managed-host wiring in ``runner/native/orchestration.py``
      (``augment_claude_args(..., append_system_prompt=
-@@ -2379,10 +2387,9 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
+@@ -2469,11 +2480,9 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
          agent_spec=agent_spec,
      )
  
 -    args = captured["spec"].args
 -    assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
 -    idx = args.index("--append-system-prompt")
--    assert args[idx + 1] == "Be a concise, careful coding assistant."
+-    assert args[idx + 1] == (
+-        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
 +    assert _appended_system_prompt(captured["spec"].args) == (
-+        f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
-+    )
++        "Be a concise, careful coding assistant.\n\n"
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+     )
  
  
- @pytest.mark.asyncio
-@@ -3198,7 +3205,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+@@ -3343,11 +3352,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+     else:
+         assert len(synth_calls) == int(fork_carry_history)
  
-     # Session titles are generated by an isolated background job, so neither
-     # fresh nor resumed Claude terminals receive framework rename instructions.
--    assert "--append-system-prompt" not in launched_args
-+    assert _appended_system_prompt(launched_args) == ITEM_LABEL_INSTRUCTION
+-    # Startup gets image guidance; session-title metadata stays out of it.
+-    assert (
+-        launched_args[launched_args.index("--append-system-prompt") + 1]
+-        == WORKSPACE_IMAGE_INSTRUCTION
+-    )
++    # Startup gets the stable guidance; session-title metadata stays out of it.
++    assert _appended_system_prompt(launched_args) == _STARTUP_GUIDANCE
  
      permission_mode_index = launched_args.index("--permission-mode")
      assert launched_args[permission_mode_index + 1] == "auto"
-@@ -5890,7 +5897,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
+@@ -6039,7 +6045,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
      # early no longer cascades into "no server running" (#540).
      assert spec.keep_alive_after_exit is True
      args = spec.args
--    assert "--append-system-prompt" not in args
-+    assert _appended_system_prompt(args) == ITEM_LABEL_INSTRUCTION
+-    assert args[args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
++    assert _appended_system_prompt(args) == _STARTUP_GUIDANCE
      settings = _load_claude_invocation_settings(args)
      assert "PermissionRequest" in settings["hooks"]
      permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
-@@ -6105,7 +6112,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+@@ -6254,7 +6260,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
      assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
      # A pinned session's spawns stay on the claude family, so it gets neither
      # the routed-spawn note nor the pre-approvals the cross-family hop needs.
--    assert "--append-system-prompt" not in spec.args
-+    assert _appended_system_prompt(spec.args) == ITEM_LABEL_INSTRUCTION
+-    assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
++    assert _appended_system_prompt(spec.args) == _STARTUP_GUIDANCE
  
  
  async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
-@@ -6133,7 +6140,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
+@@ -6282,7 +6288,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
      assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
      assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
      # And the auto-harness extras, which only make sense alongside the router.
 -    assert "--append-system-prompt" in spec.args
-+    assert (_appended_system_prompt(spec.args) or "").startswith(f"{ITEM_LABEL_INSTRUCTION}\n\n")
++    assert (_appended_system_prompt(spec.args) or "").startswith(f"{_STARTUP_GUIDANCE}\n\n")
      allowed = spec.args[spec.args.index("--allowedTools") + 1]
      assert "mcp__omnigent__sys_session_create" in allowed
  
 diff --git a/tests/runner/test_app_sessions_native_terminals_runtime.py b/tests/runner/test_app_sessions_native_terminals_runtime.py
-index d95901fc546691abec9ec8bee754d21afcdb8f8c..e66513c5e566b5d379323af19c813f4a7f55d878 100644
+index 884aa4958775d798f35fed78ee7b90311420f6dd..6e94ba3b84691f5ef68a8f4165a487fb02c1e092 100644
 --- a/tests/runner/test_app_sessions_native_terminals_runtime.py
 +++ b/tests/runner/test_app_sessions_native_terminals_runtime.py
-@@ -50,6 +50,7 @@ from omnigent.runner.session_init_protocol import (
+@@ -50,7 +50,7 @@ from omnigent.runner.session_init_protocol import (
      RunnerSessionInitEnvelope,
      RunnerSessionInitSnapshot,
  )
-+from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION
+-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
  from omnigent.spec.types import AgentSpec, ExecutorSpec
  from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
  from omnigent.terminals import TerminalRegistry
-@@ -942,7 +943,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
-     assert build_calls[0]["cwd"] == tmp_path / "workspace"
+@@ -944,7 +944,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
      assert build_calls[0]["trust_project"] is True
      assert build_calls[0]["reconcile_process_registry"] is False
--    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
-+    assert build_calls[0]["developer_instructions"] == (
-+        f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
-+    )
+     assert build_calls[0]["developer_instructions"] == (
+-        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++        "Be a concise, careful coding assistant.\n\n"
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+     )
      # Persisted pass-through args must reach launch resolution (--profile layering).
      assert resolve_calls and all(
-         call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
-@@ -1914,7 +1917,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
-         "mean the session snapshot workspace was ignored."
+@@ -1918,7 +1919,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
      )
      assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
--    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
-+    assert build_calls[0]["developer_instructions"] == (
-+        f"Be a concise, careful coding assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
-+    )
+     assert build_calls[0]["developer_instructions"] == (
+-        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++        "Be a concise, careful coding assistant.\n\n"
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+     )
  
      # Sandbox-override regression: the launched Codex terminal must inherit
-     # the agent's sandbox: none rather than falling back to the platform
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index 95d12f0c85ef1d2d90c18598e83e45fe4f059398..295d52278b26babfa67a29897a3581fe70b62c12 100644
+index 5ecc8974b763dbaf1d25acb2252b2dfdf27521c7..8c30f0dd51404dc46d38ff34fd36eada020e5c11 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
-@@ -96,7 +96,10 @@ from omnigent.runtime.harnesses._executor_adapter import (
- )
- from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
+@@ -100,6 +100,7 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
  from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
--from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-+from omnigent.runtime.prompt import (
-+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+ from omnigent.runtime.prompt import (
+     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
 +    ITEM_LABEL_INSTRUCTION,
-+)
+     WORKSPACE_IMAGE_INSTRUCTION,
+ )
  from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
- from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
- from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-@@ -13081,7 +13084,7 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
- 
+@@ -13726,7 +13727,12 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
  def _contract_composed_instructions(*parts: str) -> str:
      """Compose expected author/request text with framework guidance."""
--    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
-+    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, ITEM_LABEL_INSTRUCTION))
+     return "\n\n".join(
+-        (*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION)
++        (
++            *parts,
++            EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
++            WORKSPACE_IMAGE_INSTRUCTION,
++            ITEM_LABEL_INSTRUCTION,
++        )
+     )
  
  
- async def _contract_run_no_harness(
 diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
-index bd1e19757a3bd4826e13bdc0c0077d9341eca95d..6f3b96135bde6c2aa8a12f293fde03c7fdba15db 100644
+index 9ca6cf3754a1132ff78833960d07b603c3f30119..61d849f621bcbf80a84c477df2434c73d0a8d5d8 100644
 --- a/tests/runtime/test_prompt.py
 +++ b/tests/runtime/test_prompt.py
 @@ -1,6 +1,7 @@
@@ -693,123 +733,28 @@ index bd1e19757a3bd4826e13bdc0c0077d9341eca95d..6f3b96135bde6c2aa8a12f293fde03c7
  from types import SimpleNamespace
  from typing import cast
  
-@@ -13,18 +14,21 @@ from omnigent.runner.subagent_work import (
+@@ -13,6 +14,7 @@ from omnigent.runner.subagent_work import (
  from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
  from omnigent.runtime.prompt import (
      EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
 +    ITEM_LABEL_INSTRUCTION,
      SUBAGENT_WAKE_NOTICE_INSTRUCTION,
      SUBAGENT_WAKE_NOTICE_SHAPE,
-     append_framework_instructions,
-     build_instructions,
-     build_instructions_nullable,
-     history_to_input_items,
-+    native_startup_instructions,
-     raw_author_instructions,
- )
+     WORKSPACE_IMAGE_INSTRUCTION,
+@@ -26,9 +28,9 @@ from omnigent.runtime.prompt import (
  from omnigent.spec import AgentSpec
  from tests._image_fixtures import _TINY_PNG_BASE64
  
+-_DEFAULT_FRAMEWORK_INSTRUCTIONS = (
+-    f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+-)
++# Guidance every agent gets, native launches included.
++_STABLE_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++_DEFAULT_FRAMEWORK_INSTRUCTIONS = f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_STABLE_GUIDANCE}"
  _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
-+_EVERY_AGENT_GUIDANCE = f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
  
  
- def _spec(
-@@ -260,8 +264,7 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
-     )
- 
-     assert result == (
--        "Agent prompt\n\nRequest prompt\n\n"
--        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
-+        f"Agent prompt\n\nRequest prompt\n\n{_EVERY_AGENT_GUIDANCE}\n\nFramework prompt"
-     )
- 
- 
-@@ -269,7 +272,7 @@ def test_empty_framework_instructions_do_not_change_default() -> None:
-     spec = _spec(None)
- 
-     assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
--        f"You are a helpful assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
-+        f"You are a helpful assistant.\n\n{_EVERY_AGENT_GUIDANCE}"
-     )
- 
- 
-@@ -283,7 +286,7 @@ def test_build_instructions_nullable_unauthored_never_fabricates_fallback() -> N
-     guidance applies to every agent)."""
-     spec = _spec(None)
-     result = build_instructions_nullable(spec, None, [])
--    assert result == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-+    assert result == _EVERY_AGENT_GUIDANCE
-     assert "You are a helpful assistant." not in result
- 
- 
-@@ -292,13 +295,11 @@ def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None
-     raw_author_instructions' non-empty/non-whitespace gate, so authored_present
-     and composed agree on what counts as "authored"."""
-     spec = _spec("   \n  ")
--    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-+    assert build_instructions_nullable(spec, None, []) == _EVERY_AGENT_GUIDANCE
-     result = build_instructions_nullable(
-         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
-     )
--    assert result == (
--        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
--    )
-+    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
- 
- 
- def test_build_instructions_nullable_whitespace_only_per_request_treated_as_absent() -> None:
-@@ -306,15 +307,11 @@ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_abse
-     the same non-empty/non-whitespace gate applies to both instruction
-     sources, not just spec.instructions."""
-     spec = _spec(None)
--    assert (
--        build_instructions_nullable(spec, "   \n  ", []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
--    )
-+    assert build_instructions_nullable(spec, "   \n  ", []) == _EVERY_AGENT_GUIDANCE
-     result = build_instructions_nullable(
-         spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
-     )
--    assert result == (
--        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
--    )
-+    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
- 
- 
- def test_build_instructions_nullable_authored_present() -> None:
-@@ -324,8 +321,7 @@ def test_build_instructions_nullable_authored_present() -> None:
-         spec, "Request prompt", [], framework_instructions=("Framework prompt",)
-     )
-     assert result == (
--        "Agent prompt\n\nRequest prompt\n\n"
--        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
-+        f"Agent prompt\n\nRequest prompt\n\n{_EVERY_AGENT_GUIDANCE}\n\nFramework prompt"
-     )
- 
- 
-@@ -343,9 +339,7 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
-     result = build_instructions_nullable(
-         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
-     )
--    assert result == (
--        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
--    )
-+    assert result == (f"{_EVERY_AGENT_GUIDANCE}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
-     assert "You are a helpful assistant." not in (result or "")
- 
-     # The comparison this helper replaces would have misclassified the
-@@ -378,28 +372,27 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
-     result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
-     assert result == (
-         f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
--        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nTurn note"
-+        f"{_EVERY_AGENT_GUIDANCE}\n\nTurn note"
-     )
- 
-     unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
-     assert build_instructions_nullable(unauthored, None, []) == (
--        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
-+        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{_EVERY_AGENT_GUIDANCE}"
+@@ -382,14 +384,15 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
      )
  
  
@@ -827,49 +772,43 @@ index bd1e19757a3bd4826e13bdc0c0077d9341eca95d..6f3b96135bde6c2aa8a12f293fde03c7
 +    renders item-label chips, so the labelling guidance applies equally.
      """
      authored = _spec("Agent prompt")
--    assert build_instructions(authored, None, []) == (
--        f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
--    )
-+    assert build_instructions(authored, None, []) == (f"Agent prompt\n\n{_EVERY_AGENT_GUIDANCE}")
- 
- 
- def test_embedded_browser_guidance_names_registered_tools() -> None:
-@@ -445,12 +438,16 @@ def test_raw_author_instructions_verbatim_and_none() -> None:
- def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
-     """
-     With the ``browser_*`` tools unregistered, the prompt must not steer
--    the model toward them: author text composes alone, and an unauthored
--    spec yields ``None`` rather than guidance for tools it lacks.
-+    the model toward them: only the every-agent label guidance follows the
-+    author text, and an unauthored spec yields that guidance alone.
+     assert build_instructions(authored, None, []) == (
+@@ -444,12 +447,9 @@ def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
      """
      spec = _spec("You are a helpful assistant.", browser=False)
--    assert build_instructions_nullable(spec, None, []) == "You are a helpful assistant."
--    assert build_instructions_nullable(_spec(None, browser=False), None, []) is None
-+    assert build_instructions_nullable(spec, None, []) == (
-+        f"You are a helpful assistant.\n\n{ITEM_LABEL_INSTRUCTION}"
-+    )
-+    assert build_instructions_nullable(_spec(None, browser=False), None, []) == (
-+        ITEM_LABEL_INSTRUCTION
-+    )
+     assert build_instructions_nullable(spec, None, []) == (
+-        f"You are a helpful assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+-    )
+-    assert (
+-        build_instructions_nullable(_spec(None, browser=False), None, [])
+-        == WORKSPACE_IMAGE_INSTRUCTION
++        f"You are a helpful assistant.\n\n{_STABLE_GUIDANCE}"
+     )
++    assert build_instructions_nullable(_spec(None, browser=False), None, []) == _STABLE_GUIDANCE
  
  
  def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
-@@ -458,5 +455,26 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+@@ -457,15 +457,28 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
      wake notice still rides its own dispatch gate."""
      spec = _spec(None, spawn=True, browser=False)
      result = build_instructions_nullable(spec, None, [])
--    assert result == SUBAGENT_WAKE_NOTICE_INSTRUCTION
-+    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+-    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{_STABLE_GUIDANCE}"
      assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
-+
-+
-+def test_native_startup_instructions_append_item_labels_after_author_text() -> None:
-+    """Native launch channels carry the author text first, then the label guidance."""
-+    assert native_startup_instructions("  Agent prompt  ") == (
-+        f"  Agent prompt  \n\n{ITEM_LABEL_INSTRUCTION}"
-+    )
-+    assert native_startup_instructions(None) == ITEM_LABEL_INSTRUCTION
+ 
+ 
+-def test_native_startup_instructions_keep_only_stable_image_guidance() -> None:
+-    """Native startup preserves author text without unrelated tool/turn guidance."""
++def test_native_startup_instructions_keep_only_stable_guidance() -> None:
++    """Native startup preserves author text, then image and item-label guidance only."""
+     spec = _spec("  Follow the user's directions.  ", spawn=True)
+     result = build_native_startup_instructions(spec)
+-    assert result == f"{spec.instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
++    assert result == f"{spec.instructions}\n\n{_STABLE_GUIDANCE}"
+     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+     assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in result
+-    assert build_native_startup_instructions(None) == WORKSPACE_IMAGE_INSTRUCTION
++    assert build_native_startup_instructions(None) == _STABLE_GUIDANCE
 +
 +
 +def test_item_label_examples_match_the_chat_label_shape() -> None:
@@ -884,7 +823,7 @@ index bd1e19757a3bd4826e13bdc0c0077d9341eca95d..6f3b96135bde6c2aa8a12f293fde03c7
 +    """The example puts a bold title right after the label, which the chat UI lists items by."""
 +    assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
 diff --git a/tests/spec/test_resolve_agent_bundle.py b/tests/spec/test_resolve_agent_bundle.py
-index bcf8bd62a0936d371de5206d8f870c217ea9354d..cb1702d12f8de92a141c3352afb4ef853d6083fd 100644
+index 35d50f0e103d9a39c5bc200211680612adf2536b..3fda5ebbfefec3c6de001d6dc0dc9df62ae89528 100644
 --- a/tests/spec/test_resolve_agent_bundle.py
 +++ b/tests/spec/test_resolve_agent_bundle.py
 @@ -7,7 +7,7 @@ import pytest
@@ -896,14 +835,16 @@ index bcf8bd62a0936d371de5206d8f870c217ea9354d..cb1702d12f8de92a141c3352afb4ef85
  from omnigent.server.bundles import validate_agent_bundle
  from omnigent.spec import load, materialize_bundle
  from omnigent.tools.builtins.load_skill import LoadSkillTool, list_skill_resources
-@@ -62,7 +62,9 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() ->
+@@ -62,8 +62,10 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() ->
      tool = LoadSkillTool(spec.skills, skills_filter="none")
      prompt = build_instructions(spec, None, [tool.get_schema()])
  
--    assert len(prompt.split()) < 1500
-+    # The item-label rules are framework text appended to every agent, not resolve-agent content.
+-    # Include the shared framework guidance alongside the agent's procedure index.
+-    assert len(prompt.split()) < 1600
++    # Include the shared framework guidance alongside the agent's procedure index;
++    # the item-label rules are framework text appended to every agent.
 +    assert ITEM_LABEL_INSTRUCTION in prompt
-+    assert len(prompt.split()) - len(ITEM_LABEL_INSTRUCTION.split()) < 1500
++    assert len(prompt.split()) - len(ITEM_LABEL_INSTRUCTION.split()) < 1600
      assert spec.skills
      for skill in spec.skills:
          assert skill.name in prompt
@@ -1076,10 +1017,10 @@ index 0000000000000000000000000000000000000000..57e24ef66227603143d69c6cb48ce29b
 +  });
 +});
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index b4e84c3f0119983974167e1af001c4f37a88a62b..61caf203545260a8d49f207439cfde789f7a9e91 100644
+index 423818ab8d5e583c73512856c89b7a750e601fff..a80b71138b439c289a8d38f5e5b126223d7615fd 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
-@@ -1,11 +1,12 @@
+@@ -1,18 +1,19 @@
  // Markdown rendering for chat text: assistant bubbles, user bubbles, and any
  // other surface that shows agent-authored markdown.
  //
@@ -1094,7 +1035,15 @@ index b4e84c3f0119983974167e1af001c4f37a88a62b..61caf203545260a8d49f207439cfde78
  //
  // Lives apart from `BlockRenderer` so approval cards can render agent markdown
  // without importing the block dispatcher that renders them.
-@@ -36,12 +37,27 @@ import {
+ 
+ import type React from "react";
+ import { useInRouterContext } from "react-router-dom";
+-import { Link } from "@/lib/routing";
++import { Link, useSearchParams } from "@/lib/routing";
+ import { useContext, useMemo } from "react";
+ import {
+   BotIcon,
+@@ -48,12 +49,26 @@ import {
  } from "@/components/ui/context-menu";
  import { VideoPlayer } from "@/components/VideoPlayer";
  import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
@@ -1117,12 +1066,11 @@ index b4e84c3f0119983974167e1af001c4f37a88a62b..61caf203545260a8d49f207439cfde78
 +} from "@/lib/itemLabels";
 +import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 +import { relativeTime } from "@/lib/relativeTime";
-+import { useSearchParams } from "@/lib/routing";
 +import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
  import { cn } from "@/lib/utils";
+ import { parseMentionPillTitle } from "@/lib/mentionPills";
  import {
-   useFileViewer,
-@@ -520,6 +536,163 @@ function citesSamePlace(
+@@ -572,6 +587,163 @@ function citesSamePlace(
    );
  }
  
@@ -1280,22 +1228,22 @@ index b4e84c3f0119983974167e1af001c4f37a88a62b..61caf203545260a8d49f207439cfde78
 +      </ItemLabelChip>
 +    );
 +  }
-+  return <WorkspaceFileLink {...props} />;
++  return <MarkdownLink {...props} />;
 +}
 +
  // Markdown images open in the shared lightbox on click, matching uploaded and
  // generated images. (Remote `src`s are still gated by Streamdown's image
  // security; this only adds the zoom affordance to whatever does render.)
-@@ -538,7 +711,7 @@ function ZoomableMarkdownImage({
+@@ -712,7 +884,7 @@ function SessionPillContent({
  const FILE_PATH_AWARE_COMPONENTS = {
    inlineCode: WorkspacePathInlineCode,
    img: ZoomableMarkdownImage,
--  a: WorkspaceFileLink,
+-  a: MarkdownLink,
 +  a: ChatMarkdownLink,
  };
  
  // How often the live (growing) assistant bubble re-parses its markdown. The
-@@ -642,6 +815,8 @@ function remarkHtmlAsText() {
+@@ -816,6 +988,8 @@ function remarkHtmlAsText() {
   * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
   * block rendering too, stripping `<pre>` and collapsing whitespace.
   *
@@ -1304,7 +1252,7 @@ index b4e84c3f0119983974167e1af001c4f37a88a62b..61caf203545260a8d49f207439cfde78
   * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
   * instead of collapsing to spaces per CommonMark. Used for user bubbles,
   * where people type multi-line messages without blank-line paragraph
-@@ -662,17 +837,14 @@ export function FilePathAwareMessageResponse({
+@@ -836,17 +1010,14 @@ export function FilePathAwareMessageResponse({
  }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
    const components = FILE_PATH_AWARE_COMPONENTS;
  
@@ -1652,22 +1600,22 @@ index 0000000000000000000000000000000000000000..77a05f5690427b3656f637ae80a03073
 +  );
 +}
 diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
-index 4ac340b6ddb9ec6897f10aa0c3c7e1416e68d624..e1f67c2053edc89cd3e3eb73405d31d62c584065 100644
+index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081fbb11858 100644
 --- a/web/src/components/chat/Transcript.tsx
 +++ b/web/src/components/chat/Transcript.tsx
-@@ -32,9 +32,11 @@ import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
+@@ -35,9 +35,11 @@ import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
  import { useSearchParams } from "@/lib/routing";
  import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
  import { onFindOpened } from "@/lib/nativeBridge";
 +import { ItemLabelIndexContext } from "@/lib/itemLabels";
  import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
  import { useUserMessageNav } from "@/hooks/useUserMessageNav";
- import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
+ import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 +import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
  import {
    RunnerStartingIndicator,
    McpStartupIndicator,
-@@ -45,6 +47,7 @@ import {
+@@ -48,6 +50,7 @@ import {
    type ConversationScroller,
    BubbleView,
    ConversationScrollRefBridge,
@@ -1675,7 +1623,7 @@ index 4ac340b6ddb9ec6897f10aa0c3c7e1416e68d624..e1f67c2053edc89cd3e3eb73405d31d6
    HistoryAutoLoader,
    HistoryLoadingIndicator,
    JumpToTopButton,
-@@ -367,14 +370,26 @@ function TranscriptImpl({
+@@ -412,162 +415,180 @@ function TranscriptImpl({
      !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
    const arcaWarning = useArcaShutdownBanner();
    const showArcaBanner = arcaWarning.showForHost(hostId);
@@ -1687,40 +1635,320 @@ index 4ac340b6ddb9ec6897f10aa0c3c7e1416e68d624..e1f67c2053edc89cd3e3eb73405d31d6
 +  const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
 +  const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
    return (
--    <>
-+    <ItemLabelIndexContext.Provider value={itemLabelIndex}>
-       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
+     <TaskMarkersProvider value={taskMarkers}>
+-      {/* Task preview pinned above the thread. Sibling of the viewport (not an
++      <ItemLabelIndexContext.Provider value={itemLabelIndex}>
++        {/* Task preview pinned above the thread. Sibling of the viewport (not an
        overlay) so it shrinks the scroll area rather than covering messages.
        Self-hides with no tasks. */}
-       <ChatPlanAccordion className="mt-14 md:mt-12" />
--      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
-+      {/* The first pinned row clears the header; chat-plan-accordion adds the
+-      {conversationId && (
+-        <ChatTasksPreview
+-          conversationId={conversationId}
+-          tasks={tasks}
+-          className="mt-14 md:mt-12"
++        {conversationId && (
++          <ChatTasksPreview
++            conversationId={conversationId}
++            tasks={tasks}
++            className="mt-14 md:mt-12"
++          />
++        )}
++        {/* The first pinned row clears the header; chat-tasks-preview adds the
 +      native shells' safe-area shift (index.css). */}
-+      <OpenItemsPanel
-+        className={display.hasTasks ? undefined : "chat-plan-accordion mt-14 md:mt-12"}
-+      />
-+      {showArcaBanner && (
-+        <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks || hasOpenItems} />
-+      )}
-       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
++        <OpenItemsPanel
++          className={display.hasTasks ? undefined : "chat-tasks-preview mt-14 md:mt-12"}
+         />
+-      )}
+-      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
+-      {/* Wrapper div gives us a ref to scope the SelectionPopup to the
++        {showArcaBanner && (
++          <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks || hasOpenItems} />
++        )}
++        {/* Wrapper div gives us a ref to scope the SelectionPopup to the
        conversation area without requiring Conversation to forward refs. */}
-       <div
-@@ -516,7 +531,7 @@ function TranscriptImpl({
+-      <div
+-        ref={setConversationEl}
+-        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
+-      >
+-        <Conversation
+-          className={cn(
+-            !isMobileViewport &&
+-              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
+-            "flex-1",
+-          )}
++        <div
++          ref={setConversationEl}
++          className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
+         >
+-          <ConversationContent
+-            scrollClassName="transcript-hide-native-scrollbar"
++          <Conversation
+             className={cn(
+-              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
+-              hasPinnedBanner ? "pt-4" : "pt-20",
+-              showArcaBanner && "chat-content-under-arca-banner",
+-              CHAT_COLUMN_WIDTH,
++              !isMobileViewport &&
++                (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
++              "flex-1",
+             )}
+           >
+-            {/* Scroll helpers — must live inside StickToBottom to access context. */}
+-            <ScrollToBottomOnSend nonce={sendScrollNonce} />
+-            <KeepBottomOnResize />
+-            <HistoryAutoLoader
+-              scrollElement={scroller?.el ?? null}
+-              rowCount={display.streamBubbles.length}
+-            />
+-            {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
+-              sandboxLaunching || sandboxFailed ? (
+-                <RunnerStartingIndicator variant="hero" />
++            <ConversationContent
++              scrollClassName="transcript-hide-native-scrollbar"
++              className={cn(
++                "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
++                hasPinnedBanner ? "pt-4" : "pt-20",
++                showArcaBanner && "chat-content-under-arca-banner",
++                CHAT_COLUMN_WIDTH,
++              )}
++            >
++              {/* Scroll helpers — must live inside StickToBottom to access context. */}
++              <ScrollToBottomOnSend nonce={sendScrollNonce} />
++              <KeepBottomOnResize />
++              <HistoryAutoLoader
++                scrollElement={scroller?.el ?? null}
++                rowCount={display.streamBubbles.length}
++              />
++              {display.bubbles.length === 0 &&
++              !showWorkingIndicator &&
++              !display.mcpStartupActive ? (
++                sandboxLaunching || sandboxFailed ? (
++                  <RunnerStartingIndicator variant="hero" />
++                ) : (
++                  <ConversationEmptyState>
++                    <div className="space-y-1.5">
++                      <h3 className="text-2xl font-medium tracking-[-0.02em]">
++                        What should we work on?
++                      </h3>
++                      <p className="text-muted-foreground text-ui">
++                        {agentsError
++                          ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
++                          : "Send a message to get started."}
++                      </p>
++                    </div>
++                  </ConversationEmptyState>
++                )
+               ) : (
+-                <ConversationEmptyState>
+-                  <div className="space-y-1.5">
+-                    <h3 className="text-2xl font-medium tracking-[-0.02em]">
+-                      What should we work on?
+-                    </h3>
+-                    <p className="text-muted-foreground text-ui">
+-                      {agentsError
+-                        ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
+-                        : "Send a message to get started."}
+-                    </p>
+-                  </div>
+-                </ConversationEmptyState>
+-              )
+-            ) : (
+-              <>
+-                {/* Older pages prepend here while their request is in flight. */}
+-                {display.loadingMoreHistory && <HistoryLoadingIndicator />}
+-                <VirtualBubbleList
+-                  bubbles={display.streamBubbles}
+-                  scrollEl={scroller?.el ?? null}
+-                  lastAssistantIndex={lastAssistantIndex}
+-                  showsWorking={display.showsWorking}
+-                  sessionIdle={sessionStatus === "idle"}
+-                  conversationId={display.conversationId}
+-                  hasTasks={display.hasTasks}
+-                  disableVirtualization={disableVirtualization}
+-                  messageId={messageId}
+-                  onGeometryChange={onGeometryChange}
+-                />
+-                {/* Pending elicitation cards, floated to the bottom of the chat
++                <>
++                  {/* Older pages prepend here while their request is in flight. */}
++                  {display.loadingMoreHistory && <HistoryLoadingIndicator />}
++                  <VirtualBubbleList
++                    bubbles={display.streamBubbles}
++                    scrollEl={scroller?.el ?? null}
++                    lastAssistantIndex={lastAssistantIndex}
++                    showsWorking={display.showsWorking}
++                    sessionIdle={sessionStatus === "idle"}
++                    conversationId={display.conversationId}
++                    hasTasks={display.hasTasks}
++                    disableVirtualization={disableVirtualization}
++                    messageId={messageId}
++                    onGeometryChange={onGeometryChange}
++                  />
++                  {/* Pending elicitation cards, floated to the bottom of the chat
+                 so an outstanding question stays in view. Newest renders last,
+                 nearest the composer. Above the Working… indicator. */}
+-                {display.pendingElicitations.map((item) => (
+-                  <Message
+-                    key={item.elicitationId}
+-                    from="assistant"
+-                    className="max-w-full"
+-                    data-testid="bottom-elicitation"
+-                    data-message-id={item.elicitationId}
+-                  >
+-                    <MessageContent className="w-full">
+-                      <ElicitationCard
+-                        item={item}
+-                        keyboardActive={item.elicitationId === display.keyboardActiveElicitationId}
+-                      />
+-                    </MessageContent>
+-                  </Message>
+-                ))}
+-                {/* Working… shimmer, lit for the whole busy turn. */}
+-                <WorkingIndicatorRow
+-                  key={display.conversationId ?? "landing"}
+-                  show={showWorkingIndicator}
+-                />
+-                {/* Managed-sandbox launch status; only when Working is absent. */}
+-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+-                {/* MCP-server startup band (codex-native); clears once the
++                  {display.pendingElicitations.map((item) => (
++                    <Message
++                      key={item.elicitationId}
++                      from="assistant"
++                      className="max-w-full"
++                      data-testid="bottom-elicitation"
++                      data-message-id={item.elicitationId}
++                    >
++                      <MessageContent className="w-full">
++                        <ElicitationCard
++                          item={item}
++                          keyboardActive={
++                            item.elicitationId === display.keyboardActiveElicitationId
++                          }
++                        />
++                      </MessageContent>
++                    </Message>
++                  ))}
++                  {/* Working… shimmer, lit for the whole busy turn. */}
++                  <WorkingIndicatorRow
++                    key={display.conversationId ?? "landing"}
++                    show={showWorkingIndicator}
++                  />
++                  {/* Managed-sandbox launch status; only when Working is absent. */}
++                  {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
++                  {/* MCP-server startup band (codex-native); clears once the
+                 round settles (failures stay in host logs, not the chat). */}
+-                <McpStartupIndicator />
+-              </>
+-            )}
+-            {/* Frames the initially loaded turn at the top of the viewport. */}
+-            <LatestTurnSpacer
+-              key={display.conversationId ?? "landing"}
+-              scrollElement={scroller?.el ?? null}
+-              conversationId={display.conversationId}
+-              blockCount={display.blockCount}
+-              committedUserIds={display.committedUserIds}
+-              hasCommittedAnchor={display.hasCommittedAnchor}
+-              topGapPx={display.hasTasks ? 16 : undefined}
+-              measureRef={spacerMeasureRef}
+-              remeasureNonce={spacerMeasureNonce}
++                  <McpStartupIndicator />
++                </>
++              )}
++              {/* Frames the initially loaded turn at the top of the viewport. */}
++              <LatestTurnSpacer
++                key={display.conversationId ?? "landing"}
++                scrollElement={scroller?.el ?? null}
++                conversationId={display.conversationId}
++                blockCount={display.blockCount}
++                committedUserIds={display.committedUserIds}
++                hasCommittedAnchor={display.hasCommittedAnchor}
++                topGapPx={display.hasTasks ? 16 : undefined}
++                measureRef={spacerMeasureRef}
++                remeasureNonce={spacerMeasureNonce}
++              />
++            </ConversationContent>
++            {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
++            <ConversationScrollRefBridge onScroller={setScroller} />
++            <ConversationScrollButton
++              className={
++                isMobileViewport
++                  ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
++                  : undefined
++              }
+             />
+-          </ConversationContent>
+-          {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
+-          <ConversationScrollRefBridge onScroller={setScroller} />
+-          <ConversationScrollButton
+-            className={
+-              isMobileViewport
+-                ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
+-                : undefined
+-            }
+-          />
+-        </Conversation>
+-        {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
++          </Conversation>
++          {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
+         chat-scroll-fade mask. */}
+-        <TranscriptScrollbar scroller={scroller} topInset={display.hasTasks ? 12 : undefined} />
+-        {/* Hover the top edge to reveal a pill that loads all older history. */}
+-        <JumpToTopButton
+-          containerEl={containerEl}
+-          scroller={scroller}
+-          hasMoreHistory={display.hasMoreHistory}
+-        />
+-        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+-        <FloatingBannerStack>
+-          <StreamBudgetBanner />
+-          <DbcertBanner conversationId={conversationId} hostId={hostId} />
+-          <SandboxActionBanner />
+-        </FloatingBannerStack>
+-        {/* Left-edge minimap: one tick per turn. Desktop-only. */}
+-        {!isMobileViewport && (
+-          <TurnRail
+-            turns={turns}
++          <TranscriptScrollbar scroller={scroller} topInset={display.hasTasks ? 12 : undefined} />
++          {/* Hover the top edge to reveal a pill that loads all older history. */}
++          <JumpToTopButton
++            containerEl={containerEl}
++            scroller={scroller}
+             hasMoreHistory={display.hasMoreHistory}
+-            loadingMoreHistory={display.loadingMoreHistory}
+-            ensureItemVisible={ensureItemVisible}
+-            activeTurnId={activeTurnId}
            />
-         )}
-       </div>
--    </>
-+    </ItemLabelIndexContext.Provider>
+-        )}
+-      </div>
++          {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
++          <FloatingBannerStack>
++            <StreamBudgetBanner />
++            <DbcertBanner conversationId={conversationId} hostId={hostId} />
++            <SandboxActionBanner />
++          </FloatingBannerStack>
++          {/* Left-edge minimap: one tick per turn. Desktop-only. */}
++          {!isMobileViewport && (
++            <TurnRail
++              turns={turns}
++              hasMoreHistory={display.hasMoreHistory}
++              loadingMoreHistory={display.loadingMoreHistory}
++              ensureItemVisible={ensureItemVisible}
++              activeTurnId={activeTurnId}
++            />
++          )}
++        </div>
++      </ItemLabelIndexContext.Provider>
+     </TaskMarkersProvider>
    );
  }
- 
 diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
-index f603aaf1886ad5fd2d9b650a3c4d22b50cb063cd..8bda49dded5807c291c954036af9080f2adbdb47 100644
+index 02b2167327093bf78f74703249759423a58d8734..e686079aaa199ac67c89ee1686c3218473a420fb 100644
 --- a/web/src/components/chat/chatBubbleParts.tsx
 +++ b/web/src/components/chat/chatBubbleParts.tsx
-@@ -91,6 +91,15 @@ import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
- import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+@@ -103,6 +103,15 @@ import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/compone
  import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
+ import { EditSentMessageContext } from "@/components/chat/editSentMessage";
  import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 +import {
 +  ItemLabelMessageContext,
@@ -1733,8 +1961,8 @@ index f603aaf1886ad5fd2d9b650a3c4d22b50cb063cd..8bda49dded5807c291c954036af9080f
 +} from "@/lib/itemLabels";
  import { copyText } from "@/lib/clipboard";
  import { copyMarkdown } from "@/lib/copyMarkdown";
- import { showToast } from "@/components/ui/toast";
-@@ -180,6 +189,42 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
+ import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
+@@ -238,6 +247,42 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
      .trim();
  }
  
@@ -1777,7 +2005,7 @@ index f603aaf1886ad5fd2d9b650a3c4d22b50cb063cd..8bda49dded5807c291c954036af9080f
  const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
  const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
  const MERMAID_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})mermaid(?:\s|$)/im;
-@@ -758,7 +803,13 @@ export const BubbleView = memo(
+@@ -859,7 +904,13 @@ export const BubbleView = memo(
      /** Hide retry/recovery controls when the surrounding session is sealed. */
      recoveryDisabled?: boolean;
    }) {
@@ -1792,7 +2020,7 @@ index f603aaf1886ad5fd2d9b650a3c4d22b50cb063cd..8bda49dded5807c291c954036af9080f
      if (bubble.kind === "compaction_loading") {
        return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
      }
-@@ -778,13 +829,15 @@ export const BubbleView = memo(
+@@ -879,13 +930,15 @@ export const BubbleView = memo(
        );
      }
      return (

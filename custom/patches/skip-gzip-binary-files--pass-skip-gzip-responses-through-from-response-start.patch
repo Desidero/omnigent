@@ -85,18 +85,18 @@ index 71477a690d4e3f1ec4bded4edfe3b09ec6faa1b6..bda962d011a10579fb5fbc7d8259afd1
  
  
 diff --git a/omnigent/server/routes/sessions/routes_resources.py b/omnigent/server/routes/sessions/routes_resources.py
-index 5869261c30415b64d98d58c9e6e3454e10ceae92..c32d67981b8c40a46af26169cb9471beaa648641 100644
+index 6941826e193326f682186f74bc95c3ed1bdcb8b1..2a2a37ca903a77012faa827fbb73786913322bf5 100644
 --- a/omnigent/server/routes/sessions/routes_resources.py
 +++ b/omnigent/server/routes/sessions/routes_resources.py
 @@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
  from pathlib import Path
- from typing import TYPE_CHECKING, Annotated, Any, cast
+ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
  
 +import anyio
  import httpx
  from fastapi import (
      APIRouter,
-@@ -161,6 +162,24 @@ def _runner_resource_write_payload(
+@@ -162,6 +163,24 @@ def _runner_resource_write_payload(
      )
  
  
@@ -121,7 +121,7 @@ index 5869261c30415b64d98d58c9e6e3454e10ceae92..c32d67981b8c40a46af26169cb9471be
  class _RunnerStreamResponse(StreamingResponse):
      """Stream a runner response body and close it however the send ends.
  
-@@ -168,13 +187,22 @@ class _RunnerStreamResponse(StreamingResponse):
+@@ -169,13 +188,22 @@ class _RunnerStreamResponse(StreamingResponse):
      send that fails before that, or a client that disconnects (where
      Starlette skips background tasks), would leak the tunnel request.
      Closing in ``__call__`` covers every exit.
@@ -146,7 +146,7 @@ index 5869261c30415b64d98d58c9e6e3454e10ceae92..c32d67981b8c40a46af26169cb9471be
          self._upstream = upstream
  
      async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-@@ -469,9 +497,10 @@ def register_resources_routes(
+@@ -477,9 +505,10 @@ def register_resources_routes(
          :returns: The attachment, streamed as the runner sends it, or the
              runner's own error body and status for a missing file, a
              directory, or an out-of-grant path.
@@ -160,7 +160,7 @@ index 5869261c30415b64d98d58c9e6e3454e10ceae92..c32d67981b8c40a46af26169cb9471be
          """
          try:
              runner_client = await _get_runner_client_for_resource_access(
-@@ -497,9 +526,9 @@ def register_resources_routes(
+@@ -506,9 +535,9 @@ def register_resources_routes(
                  conversation=conversation,
              )
          if runner_client is None:
@@ -173,7 +173,7 @@ index 5869261c30415b64d98d58c9e6e3454e10ceae92..c32d67981b8c40a46af26169cb9471be
              )
          try:
              resp = await runner_client.send(
-@@ -507,10 +536,16 @@ def register_resources_routes(
+@@ -516,10 +545,16 @@ def register_resources_routes(
                  stream=True,
              )
          except (httpx.HTTPError, ConnectionError) as exc:
@@ -190,7 +190,7 @@ index 5869261c30415b64d98d58c9e6e3454e10ceae92..c32d67981b8c40a46af26169cb9471be
          if resp.status_code == 200 and "content-disposition" in resp.headers:
              skip_gzip(request)
              forwarded = {
-@@ -525,9 +560,38 @@ def register_resources_routes(
+@@ -534,9 +569,38 @@ def register_resources_routes(
                  )
                  if name in resp.headers
              }
@@ -231,10 +231,10 @@ index 5869261c30415b64d98d58c9e6e3454e10ceae92..c32d67981b8c40a46af26169cb9471be
              await resp.aclose()
          if resp.status_code == 200:
 diff --git a/tests/server/routes/test_session_resources.py b/tests/server/routes/test_session_resources.py
-index 3f797e06e5025f58e39fd2aef04246c87d60d457..f8d77bc060e5f1e53d65dd33fb5366eb93ad95e0 100644
+index 75b07865c31d24fc1e4bb5e1ca690c152101248e..dbf5f2e4c4381bcc7daf4f095a13e442c2312eda 100644
 --- a/tests/server/routes/test_session_resources.py
 +++ b/tests/server/routes/test_session_resources.py
-@@ -15,6 +15,7 @@ from typing import Any, cast
+@@ -17,6 +17,7 @@ from typing import Any, cast
  from unittest.mock import Mock
  from urllib.parse import quote
  
@@ -242,8 +242,8 @@ index 3f797e06e5025f58e39fd2aef04246c87d60d457..f8d77bc060e5f1e53d65dd33fb5366eb
  import httpx
  import pytest
  from fastapi import FastAPI, HTTPException, Request
-@@ -41,6 +42,10 @@ from omnigent.server.auth import (
- )
+@@ -45,6 +46,10 @@ from omnigent.server.auth import (
+ from omnigent.server.feature_flags import Feature, FeatureFlags
  from omnigent.server.host_registry import HostRegistry
  from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 +from omnigent.server.routes.sessions.routes_resources import (
@@ -253,13 +253,14 @@ index 3f797e06e5025f58e39fd2aef04246c87d60d457..f8d77bc060e5f1e53d65dd33fb5366eb
  from omnigent.server.schemas import SessionEventInput
  from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
  from omnigent.stores.host_store import HostStore
-@@ -4468,10 +4473,384 @@ async def test_filesystem_download_streams_runner_attachment(
+@@ -4725,11 +4730,385 @@ async def test_filesystem_download_streams_runner_attachment(
      assert resp.content == payload
      assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
      assert resp.headers["content-length"] == str(len(payload))
 +    assert "content-encoding" not in resp.headers
      assert resp.headers["cache-control"] == "no-store"
-     assert seen == [("data/big.bin", True, "reach")]
+     assert resp.headers.get("X-Omnigent-File-Scope") == scope
+     assert seen == [("data/big.bin", True, scope or "reach")]
  
  
 +@pytest.mark.asyncio
@@ -638,7 +639,7 @@ index 3f797e06e5025f58e39fd2aef04246c87d60d457..f8d77bc060e5f1e53d65dd33fb5366eb
  @pytest.mark.asyncio
  async def test_filesystem_download_rejects_runner_without_download_support(
      client: httpx.AsyncClient,
-@@ -10339,6 +10718,52 @@ def _fs_binary_read_payload(size: int = 256 * 1024) -> dict[str, object]:
+@@ -10920,6 +11299,52 @@ def _fs_binary_read_payload(size: int = 256 * 1024) -> dict[str, object]:
  _FS_BASE = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
  
  
@@ -691,7 +692,7 @@ index 3f797e06e5025f58e39fd2aef04246c87d60d457..f8d77bc060e5f1e53d65dd33fb5366eb
  @pytest.mark.asyncio
  async def test_file_read_is_gzipped(client: httpx.AsyncClient) -> None:
      """A text file read is compressed, and the body survives the round-trip.
-@@ -10395,6 +10820,28 @@ async def test_binary_file_read_is_not_gzipped(client: httpx.AsyncClient) -> Non
+@@ -10976,6 +11401,28 @@ async def test_binary_file_read_is_not_gzipped(client: httpx.AsyncClient) -> Non
      assert resp.json() == payload
  
  

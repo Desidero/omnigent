@@ -18,18 +18,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/run-suggested-commands.md                |  32 +++++
- feature-map/native-harnesses.md               |  13 ++
- .../test_native_claude_shell_input.py         |  52 +++++++
- .../messages/test_native_codex_shell_input.py |  41 ++++++
- web/src/components/ai-elements/message.tsx    | 128 +++++++++++++-----
+ feature-map/native-harnesses.md               |  12 ++
+ .../test_native_claude_shell_input.py         |  52 ++++++++
+ .../messages/test_native_codex_shell_input.py |  41 +++++++
+ web/src/components/ai-elements/message.tsx    | 115 +++++++++++++-----
  web/src/components/blocks/BlockRenderer.tsx   |   1 +
  web/src/components/blocks/ChatMarkdown.tsx    |  26 +++-
- .../chat/RunCommandsProvider.test.tsx         |  89 ++++++++++++
- .../components/chat/RunCommandsProvider.tsx   |  85 ++++++++++++
- web/src/lib/runnableCommands.test.ts          |  79 +++++++++++
- web/src/lib/runnableCommands.ts               |  90 ++++++++++++
- web/src/pages/ChatPage.tsx                    |  56 ++++++--
- 12 files changed, 643 insertions(+), 49 deletions(-)
+ .../chat/RunCommandsProvider.test.tsx         |  89 ++++++++++++++
+ .../components/chat/RunCommandsProvider.tsx   |  85 +++++++++++++
+ web/src/lib/runnableCommands.test.ts          |  79 ++++++++++++
+ web/src/lib/runnableCommands.ts               |  90 ++++++++++++++
+ web/src/pages/ChatPage.tsx                    |  56 ++++++---
+ 12 files changed, 631 insertions(+), 47 deletions(-)
  create mode 100644 docs/run-suggested-commands.md
  create mode 100644 web/src/components/chat/RunCommandsProvider.test.tsx
  create mode 100644 web/src/components/chat/RunCommandsProvider.tsx
@@ -75,10 +75,10 @@ index 0000000000000000000000000000000000000000..a7471262e7e1c9c0a98f9ae4ff389a94
 +them in its shell mode; Codex runs them as shell commands in the session's
 +thread and the chat shows each one as a terminal command.
 diff --git a/feature-map/native-harnesses.md b/feature-map/native-harnesses.md
-index 96118469d141d20739d08bb620f47d89e8bd61ce..40be15de1f4dbc744a0c5283ecc0dc0561cad0be 100644
+index 2e2e9ce540a6950f0ba401101eab928b631544d8..0bd0a61bd5426734969bb77a5dd08e003b7a863d 100644
 --- a/feature-map/native-harnesses.md
 +++ b/feature-map/native-harnesses.md
-@@ -108,6 +108,9 @@ implements them separately, so a fix for one harness does not reach the others.
+@@ -122,6 +122,9 @@ implements them separately, so a fix for one harness does not reach the others.
    the command (a script's first line and "+N lines") and expands to a
    terminal panel with the command, its output and exit status, in the
    Settings terminal theme.
@@ -88,19 +88,18 @@ index 96118469d141d20739d08bb620f47d89e8bd61ce..40be15de1f4dbc744a0c5283ecc0dc05
  - `working-status`: quiet work stays working; waiting for input is explained;
    completion, interruption and process exit settle the indicator. A following
    turn and reconnect must not leave a stale idle or working state. The sidebar
-@@ -343,6 +346,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
- follow-up in the side pane, then close its tab. The parent conversation stays
- separate. See [sessions](./sessions.md) for all side-chat entry points.
- 
+@@ -428,6 +431,10 @@ working, like the TUI's skip), or when the turn ends. Cancel does not clear the
+ question in the terminal. If the answer can't be sent, a notice asks the user
+ to answer in the terminal. An open question is not restored after the
+ forwarder reconnects.
 +**Run suggested commands:** in a claude-native or codex-native session, ask
 +the agent for a shell command in a `bash` block, click the block's Run button
 +(titled **Run command**, beside Copy), check the list in the confirmation and
 +choose **Run**.
-+
+ 
  **Matrix.** "Mock" means the verification instance can drive the harness with
  the mock model; the others need their real CLI and vendor credentials. Test
- columns name one journey test per harness; "—" means none exists yet.
-@@ -1035,6 +1043,11 @@ Cross-harness journeys:
+@@ -1168,6 +1175,11 @@ Cross-harness journeys:
    `!sleep 5` followed immediately by a question; the question must receive an
    answer. Upload a text file containing `!echo file-content` with an empty
    composer and verify that it reaches the model without running a shell command.
@@ -229,7 +228,7 @@ index c121de6365eaaa2a1e9dea53d12221e8dd4c8e1b..c292dc4f692cb433ba58aaed62df535c
 +    # The shell commands never reached the model as prompts.
 +    assert page.locator(_ASSISTANT, has_text="Please run:").count() == 1
 diff --git a/web/src/components/ai-elements/message.tsx b/web/src/components/ai-elements/message.tsx
-index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c57910383cd7 100644
+index e609f9f36b2b7bd0f589454de4f33ee76be9c7f8..bdaa1554b6b9794028d0543674c989ef76195c1f 100644
 --- a/web/src/components/ai-elements/message.tsx
 +++ b/web/src/components/ai-elements/message.tsx
 @@ -6,6 +6,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
@@ -238,9 +237,9 @@ index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c579
  import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 +import { extractRunnableCommands } from "@/lib/runnableCommands";
  import { cn } from "@/lib/utils";
- import type { UIMessage } from "ai";
- import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-@@ -319,7 +320,15 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
+ import { ShellCommandContext } from "@/shell/ShellCommandContext";
+ import type { Comment } from "@/hooks/useComments";
+@@ -323,7 +324,15 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
    );
  };
  
@@ -256,22 +255,7 @@ index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c579
    /**
     * Hand file-path links to the `a` component override instead of letting the
     * harden pass turn them into app-origin navigations or " [blocked]" text.
-@@ -401,6 +410,14 @@ function extractCodeText(children: ReactNode): string {
-   return "";
- }
- 
-+/** The fence language of a code block's `<code>` child, e.g. `"bash"`. */
-+function extractCodeLanguage(children: ReactNode): string | null {
-+  if (!isValidElement(children)) return null;
-+  const { className } = children.props as { className?: unknown };
-+  if (typeof className !== "string") return null;
-+  return /(?:^|\s)language-(\S+)/.exec(className)?.[1] ?? null;
-+}
-+
- // Streamdown ships its own 16px icon set (filled, even-odd fill rule) rather
- // than lucide, so the copy/wrap buttons we overlay on a code block header use
- // the same glyphs as Streamdown's native buttons (e.g. copy/download in a
-@@ -553,6 +570,17 @@ const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
+@@ -566,6 +575,17 @@ const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
    </svg>
  );
  
@@ -289,7 +273,7 @@ index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c579
  // Shared visual style for the buttons in a chat code block header (copy, wrap
  // toggle). Keeps the frosted resting look that matches Streamdown's own button
  // pill, but pins the hover background to that same frosted fill so the ghost
-@@ -609,6 +637,31 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
+@@ -622,6 +642,31 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
    );
  }
  
@@ -321,12 +305,11 @@ index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c579
  function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
    return (
      <Button
-@@ -650,6 +703,12 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+@@ -674,6 +719,11 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
    }
    const hideSource = useCallback(() => setShowsSource(false), []);
    const { lineNumbers } = useContext(StreamdownContext);
 +  const requestRun = useContext(RunCommandsContext);
-+  const language = extractCodeLanguage(children);
 +  const commands = useMemo(
 +    () => (requestRun ? extractRunnableCommands(code, language) : []),
 +    [requestRun, code, language],
@@ -334,7 +317,7 @@ index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c579
    const block = isValidElement(children)
      ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
      : children;
-@@ -660,6 +719,9 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+@@ -690,6 +740,9 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
        {/* Match Streamdown's action-pill height and reserve its rightmost slot
            for download. All controls stay anchored to the header. */}
        <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
@@ -342,115 +325,114 @@ index 44422f7c1b45599ec024cdaa5dfca0b2cca590ce..9bd20bf6d1585e6e872891dc2492c579
 +          <RunCommandsButton commands={commands} onRun={requestRun} />
 +        )}
          <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
-         <ChatCodeBlockCopyButton getCode={getCode} />
-       </div>
-@@ -708,9 +770,11 @@ export const MessageResponse = memo(
-     markFileLinks = false,
-     allowGitHubAttachmentImages = false,
+         {showShellAction && (
+           <Button
+@@ -763,10 +816,12 @@ export const MessageResponse = memo(
+     allowWorkspaceImages = false,
+     allowShellCommands = false,
      isStreaming = false,
 +    allowRunCommands = false,
+     renderLocalReviewComment,
      ...props
    }: MessageResponseProps) => {
      const themeMode = useResolvedThemeMode();
 +    const requestRun = useContext(RunCommandsContext);
-     const messageComponents = useMemo(
-       () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
-       [components],
-@@ -720,37 +784,39 @@ export const MessageResponse = memo(
-     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
+     const shellCommands = useContext(ShellCommandContext);
+     const shellAction = useMemo(
+       () =>
+@@ -792,35 +847,37 @@ export const MessageResponse = memo(
+       rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
  
      return (
 -      <MarkdownErrorBoundary source={props.children}>
--        <StreamingTextContext.Provider value={isStreaming}>
--          {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+-        <ShellCommandContext.Provider value={shellAction}>
+-          <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
+-            <StreamingTextContext.Provider value={isStreaming}>
+-              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
 -              so remount on theme change to recolor already-rendered diagrams. */}
--          <Streamdown
--            key={themeMode}
--            // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
--            className={cn(
--              "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
--              className,
--            )}
--            plugins={STREAMDOWN_PLUGINS}
--            // Let links open on a plain click (and cmd/ctrl-click in a new tab)
--            // instead of Streamdown's default "Open external link?" modal.
--            linkSafety={CHAT_LINK_SAFETY}
--            {...props}
--            BlockComponent={StreamingTextBlock}
--            components={messageComponents}
--            controls={messageControls}
--            mermaid={mermaidOptions}
--            // Block remote image fetches that can exfiltrate data through URLs.
--            rehypePlugins={
--              markFileLinks
--                ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
--                : allowGitHubAttachmentImages
--                  ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
--                  : SECURE_STREAMDOWN_REHYPE_PLUGINS
--            }
--          />
--        </StreamingTextContext.Provider>
+-              <Streamdown
+-                key={themeMode}
+-                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+-                className={cn(
+-                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+-                  className,
+-                )}
+-                plugins={STREAMDOWN_PLUGINS}
+-                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+-                // instead of Streamdown's default "Open external link?" modal.
+-                linkSafety={CHAT_LINK_SAFETY}
+-                {...props}
+-                BlockComponent={StreamingTextBlock}
+-                components={messageComponents}
+-                controls={messageControls}
+-                mermaid={mermaidOptions}
+-                // Block remote image fetches that can exfiltrate data through URLs.
+-                rehypePlugins={rehypePlugins}
+-              />
+-            </StreamingTextContext.Provider>
+-          </LocalReviewCommentRendererContext.Provider>
+-        </ShellCommandContext.Provider>
 -      </MarkdownErrorBoundary>
 +      <RunCommandsContext.Provider value={allowRunCommands ? requestRun : null}>
 +        <MarkdownErrorBoundary source={props.children}>
-+          <StreamingTextContext.Provider value={isStreaming}>
-+            {/* Streamdown is memoized and its comparator ignores the mermaid prop,
++          <ShellCommandContext.Provider value={shellAction}>
++            <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
++              <StreamingTextContext.Provider value={isStreaming}>
++                {/* Streamdown is memoized and its comparator ignores the mermaid prop,
 +                so remount on theme change to recolor already-rendered diagrams. */}
-+            <Streamdown
-+              key={themeMode}
-+              // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-+              className={cn(
-+                "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-+                className,
-+              )}
-+              plugins={STREAMDOWN_PLUGINS}
-+              // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-+              // instead of Streamdown's default "Open external link?" modal.
-+              linkSafety={CHAT_LINK_SAFETY}
-+              {...props}
-+              BlockComponent={StreamingTextBlock}
-+              components={messageComponents}
-+              controls={messageControls}
-+              mermaid={mermaidOptions}
-+              // Block remote image fetches that can exfiltrate data through URLs.
-+              rehypePlugins={
-+                markFileLinks
-+                  ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
-+                  : allowGitHubAttachmentImages
-+                    ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
-+                    : SECURE_STREAMDOWN_REHYPE_PLUGINS
-+              }
-+            />
-+          </StreamingTextContext.Provider>
++                <Streamdown
++                  key={themeMode}
++                  // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
++                  className={cn(
++                    "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
++                    className,
++                  )}
++                  plugins={STREAMDOWN_PLUGINS}
++                  // Let links open on a plain click (and cmd/ctrl-click in a new tab)
++                  // instead of Streamdown's default "Open external link?" modal.
++                  linkSafety={CHAT_LINK_SAFETY}
++                  {...props}
++                  BlockComponent={StreamingTextBlock}
++                  components={messageComponents}
++                  controls={messageControls}
++                  mermaid={mermaidOptions}
++                  // Block remote image fetches that can exfiltrate data through URLs.
++                  rehypePlugins={rehypePlugins}
++                />
++              </StreamingTextContext.Provider>
++            </LocalReviewCommentRendererContext.Provider>
++          </ShellCommandContext.Provider>
 +        </MarkdownErrorBoundary>
 +      </RunCommandsContext.Provider>
      );
    },
  );
 diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
-index 4e18f3f5e7120698db6177f1bb73b82a5a68cead..ff59d77f3144e8d20a02beee9b51c2a024daa505 100644
+index 34cf4a29e6c0af86df9a53e9704d8b675b39847c..423b005470152f2be5821003e815d4d893d98f0d 100644
 --- a/web/src/components/blocks/BlockRenderer.tsx
 +++ b/web/src/components/blocks/BlockRenderer.tsx
-@@ -891,6 +891,7 @@ function renderItem(
+@@ -889,6 +889,7 @@ function renderItem(
            className={cn("min-w-0", followsText && "mt-2")}
          >
            <FilePathAwareMessageResponse
 +            allowRunCommands={!isTextStreaming}
              className="chat-markdown text-message"
-             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
-             isStreaming={isTextStreaming}
+             allowWorkspaceImages
+             allowShellCommands
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index dcfca48f4410fda66549efb8dda2cb72c878f001..b4e84c3f0119983974167e1af001c4f37a88a62b 100644
+index ab6d5f98cc3657c85ddf539d65357b2b9793c0e8..423818ab8d5e583c73512856c89b7a750e601fff 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
-@@ -11,13 +11,17 @@
- // without importing the block dispatcher that renders them.
- 
+@@ -13,7 +13,7 @@
  import type React from "react";
+ import { useInRouterContext } from "react-router-dom";
+ import { Link } from "@/lib/routing";
 -import { useMemo } from "react";
 +import { useContext, useMemo } from "react";
- import { CopyIcon, GitPullRequestIcon } from "lucide-react";
- import { toast } from "sonner";
+ import {
+   BotIcon,
+   CopyIcon,
+@@ -26,7 +26,11 @@ import { toast } from "sonner";
  import { defaultRemarkPlugins } from "streamdown";
  import remarkBreaks from "remark-breaks";
  import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -461,17 +443,17 @@ index dcfca48f4410fda66549efb8dda2cb72c878f001..b4e84c3f0119983974167e1af001c4f3
 +  RunCommandsContext,
 +} from "@/components/ai-elements/message";
  import {
+   sameServerSessionPath,
    shortFileCitationLabel,
-   splitWorkspaceFileCitation,
-@@ -37,6 +41,7 @@ import { withBasePath } from "@/lib/basePath";
+@@ -49,6 +53,7 @@ import { withBasePath } from "@/lib/basePath";
  import { copyText } from "@/lib/clipboard";
  import { absoluteWorkspacePath } from "@/lib/composerContext";
  import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 +import { extractInlineRunnableCommand } from "@/lib/runnableCommands";
  import { cn } from "@/lib/utils";
+ import { parseMentionPillTitle } from "@/lib/mentionPills";
  import {
-   useFileViewer,
-@@ -197,6 +202,8 @@ function WorkspacePathInlineCode({
+@@ -210,6 +215,8 @@ function WorkspacePathInlineCode({
    // non-openable one just stays styled inline code — only an explicit
    // markdown link (WorkspaceFileLink) earns dead-path feedback.
    const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
@@ -480,7 +462,7 @@ index dcfca48f4410fda66549efb8dda2cb72c878f001..b4e84c3f0119983974167e1af001c4f3
  
    if (openWorkspaceFile) {
      const shortLabel = shortFileCitationLabel(text);
-@@ -234,7 +241,7 @@ function WorkspacePathInlineCode({
+@@ -247,7 +254,7 @@ function WorkspacePathInlineCode({
    }
    // Match Streamdown's default inline-code styling so non-path inline code
    // looks unchanged.
@@ -489,7 +471,7 @@ index dcfca48f4410fda66549efb8dda2cb72c878f001..b4e84c3f0119983974167e1af001c4f3
      <code
        className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
        data-streamdown="inline-code"
-@@ -243,6 +250,19 @@ function WorkspacePathInlineCode({
+@@ -256,6 +263,19 @@ function WorkspacePathInlineCode({
        {codeChildren}
      </code>
    );
@@ -877,10 +859,10 @@ index 0000000000000000000000000000000000000000..edf73abd8b759f2a25e89fd6b2a00bd9
 +  return text.includes("\n") ? null : bangCommand(text);
 +}
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f99686664e 100644
+index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..e5d1ab6aa4cbc107d222980ec02c53efbe9fd9b6 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
-@@ -127,6 +127,7 @@ import {
+@@ -147,6 +147,7 @@ import {
  } from "@/lib/sideChat";
  import { shouldQueueSend } from "@/lib/messageQueue";
  import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
@@ -888,7 +870,7 @@ index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f9
  import { skillInvocationPrefix } from "@/lib/harnessSetup";
  import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
  import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-@@ -320,6 +321,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
+@@ -386,6 +387,7 @@ import {
  import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
  import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
  import { ConnectionIndicator } from "./ChatIndicators";
@@ -896,7 +878,7 @@ index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f9
  import { Transcript } from "@/components/chat/Transcript";
  
  /** Server-info as consumers see it: the probe's result, or "loading". */
-@@ -1075,6 +1077,22 @@ export function ChatPage() {
+@@ -1215,6 +1217,22 @@ export function ChatPage() {
      ],
    );
  
@@ -919,7 +901,7 @@ index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f9
    const onSendSlashCommand = useCallback(
      (name: string, args: string) => {
        if (!agentId) return;
-@@ -1263,6 +1281,7 @@ export function ChatPage() {
+@@ -1394,6 +1412,7 @@ export function ChatPage() {
        agentsError={agentsError}
        disabled={!agentId || agentsError !== null}
        onSend={onSend}
@@ -927,7 +909,7 @@ index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f9
        onNewSession={openNewSession}
        onSendSlashCommand={onSendSlashCommand}
        onStop={onStop}
-@@ -1413,6 +1432,8 @@ interface MainAgentSurfaceProps {
+@@ -1544,6 +1563,8 @@ interface MainAgentSurfaceProps {
    agentsError: unknown;
    disabled: boolean;
    onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
@@ -936,7 +918,7 @@ index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f9
    /**
     * Invoke a skill via the `slash_command` event path. Gated off inside
     * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
-@@ -1597,6 +1618,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+@@ -1728,6 +1749,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
    agentsError,
    disabled,
    onSend,
@@ -944,44 +926,44 @@ index da591fb00478d09d8be425579a2ff3ec6585b388..80231fcf2c101c7f1700ce44118d82f9
    onSendSlashCommand,
    onNewSession,
    onStop,
-@@ -1890,21 +1912,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
-           {/* The scrolling transcript column owns every streaming-hot store
+@@ -2029,21 +2051,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
            subscription and the bubble pipeline, so an SSE frame re-renders it
            alone — this surface's composer and chrome below bail out. */}
--          <Transcript
--            hostId={hostId}
--            setConversationEl={setConversationEl}
--            containerEl={containerEl}
--            scroller={scroller}
--            setScroller={setScroller}
--            sendScrollNonce={sendScrollNonce}
--            hasMoreHistory={hasMoreHistory}
--            loadingMoreHistory={loadingMoreHistory}
--            isMobileViewport={isMobileViewport}
--            showsWorking={showsWorking}
--            agentsError={agentsError}
--            sandboxLaunching={sandboxLaunching}
--            spacerMeasureRef={spacerMeasureRef}
--          />
-+          <RunCommandsProvider
-+            onRun={harnessRunsShellCommands(selectionSessionHarness) ? onRunCommands : null}
-+          >
-+            <Transcript
-+              hostId={hostId}
-+              setConversationEl={setConversationEl}
-+              containerEl={containerEl}
-+              scroller={scroller}
-+              setScroller={setScroller}
-+              sendScrollNonce={sendScrollNonce}
-+              hasMoreHistory={hasMoreHistory}
-+              loadingMoreHistory={loadingMoreHistory}
-+              isMobileViewport={isMobileViewport}
-+              showsWorking={showsWorking}
-+              agentsError={agentsError}
-+              sandboxLaunching={sandboxLaunching}
-+              spacerMeasureRef={spacerMeasureRef}
-+            />
-+          </RunCommandsProvider>
+           <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
+-            <Transcript
+-              hostId={hostId}
+-              setConversationEl={setConversationEl}
+-              containerEl={containerEl}
+-              scroller={scroller}
+-              setScroller={setScroller}
+-              sendScrollNonce={sendScrollNonce}
+-              hasMoreHistory={hasMoreHistory}
+-              loadingMoreHistory={loadingMoreHistory}
+-              isMobileViewport={isMobileViewport}
+-              showsWorking={showsWorking}
+-              agentsError={agentsError}
+-              sandboxLaunching={sandboxLaunching}
+-              spacerMeasureRef={spacerMeasureRef}
+-            />
++            <RunCommandsProvider
++              onRun={harnessRunsShellCommands(selectionSessionHarness) ? onRunCommands : null}
++            >
++              <Transcript
++                hostId={hostId}
++                setConversationEl={setConversationEl}
++                containerEl={containerEl}
++                scroller={scroller}
++                setScroller={setScroller}
++                sendScrollNonce={sendScrollNonce}
++                hasMoreHistory={hasMoreHistory}
++                loadingMoreHistory={loadingMoreHistory}
++                isMobileViewport={isMobileViewport}
++                showsWorking={showsWorking}
++                agentsError={agentsError}
++                sandboxLaunching={sandboxLaunching}
++                spacerMeasureRef={spacerMeasureRef}
++              />
++            </RunCommandsProvider>
+           </EditSentMessageContext.Provider>
            {/* Floating reply button — scoped to the conversation container.
            Withheld when the composer refuses quotes (read-only grant or a
-           structurally non-interactive session), as SideChatPane does. */}

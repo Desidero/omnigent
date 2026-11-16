@@ -85,8 +85,8 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/components/chat/itemCommentActions.ts |  16 +
  .../composer/ItemCommentTray.test.tsx         | 222 +++++++
  .../components/composer/ItemCommentTray.tsx   | 416 +++++++++++++
- web/src/hooks/useItemCommentMode.test.tsx     | 326 +++++++++++
- web/src/hooks/useItemCommentMode.ts           | 547 ++++++++++++++++++
+ web/src/hooks/useItemCommentMode.test.tsx     | 327 +++++++++++
+ web/src/hooks/useItemCommentMode.ts           | 550 ++++++++++++++++++
  web/src/lib/itemCommentDrafts.test.ts         | 100 ++++
  web/src/lib/itemCommentDrafts.ts              | 456 +++++++++++++++
  web/src/lib/itemCommentFiles.test.ts          |  36 ++
@@ -96,10 +96,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/lib/itemLabels.test.ts                |  92 +++
  web/src/lib/itemLabels.ts                     | 122 +++-
  web/src/pages/ChatPage.composer.test.tsx      | 149 +++++
- web/src/pages/ChatPage.tsx                    | 292 ++++++++--
+ web/src/pages/ChatPage.tsx                    | 323 +++++++---
  web/src/pages/QueuedMessagesStrip.test.tsx    |  22 +
  web/src/pages/QueuedMessagesStrip.tsx         |  29 +-
- 25 files changed, 4207 insertions(+), 155 deletions(-)
+ 25 files changed, 4236 insertions(+), 161 deletions(-)
  create mode 100644 web/src/components/chat/itemCommentActions.ts
  create mode 100644 web/src/components/composer/ItemCommentTray.test.tsx
  create mode 100644 web/src/components/composer/ItemCommentTray.tsx
@@ -113,10 +113,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/itemComments.ts
 
 diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
-index c71593c419d610591887328648523d73affe649e..58e44a58b30af3e35682ac8cdd2d71c25d6e6745 100644
+index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..1c22b6df00d1d34edd0e74d1959c68a3001384c4 100644
 --- a/docs/chat-item-labels.md
 +++ b/docs/chat-item-labels.md
-@@ -55,3 +55,54 @@ channel; labels still render when you or the agent write them.
+@@ -56,3 +56,54 @@ you or the agent write them.
    at the bottom lists it with **Restore**. An item the agent later closes shows
    as closed as usual. Dismissals are stored on the session, as the
    `omnigent.items_dismissed` label, so they follow you to other devices.
@@ -172,10 +172,10 @@ index c71593c419d610591887328648523d73affe649e..58e44a58b30af3e35682ac8cdd2d71c2
 +Drafts stay in this browser only (attachments included) and survive a reload;
 +a failed or cancelled send puts them back as drafts.
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index 71a91c2d8c351a47c5aeaf407863b60f3c859e38..4fc12c419968d46c45045330d35bf504c7740799 100644
+index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..725a92d5bb591ea1fc8df975459eb244dedd4279 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
-@@ -81,7 +81,17 @@ ITEM_LABEL_INSTRUCTION = (
+@@ -88,7 +88,17 @@ ITEM_LABEL_INSTRUCTION = (
      'rows as-is, per your answer"). Close each item once, as soon as it is '
      "settled. After that, write its label struck through whenever you mention it "
      "again; a plain mention reopens it. The chat UI pins a list of open items, so "
@@ -608,10 +608,10 @@ index 57e24ef66227603143d69c6cb48ce29baa6996f6..8ad97d4751527d12f9685d9549f25af3
  
    it("does not preview on touch", async () => {
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f14b8de0b2 100644
+index 3e6c91b785265983c91eb6e92322b2cd1bc76f36..787a15c22e21e2e777ccd22e6cd7dd8c7d3c4cff 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
-@@ -6,14 +6,15 @@
+@@ -6,7 +6,8 @@
  //
  //   1. Inline-code paths (`` `src/App.tsx` ``): see `WorkspacePathInlineCode`.
  //   2. Markdown links whose href is a file path: see `WorkspaceFileLink`.
@@ -621,15 +621,16 @@ index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f1
  //
  // Lives apart from `BlockRenderer` so approval cards can render agent markdown
  // without importing the block dispatcher that renders them.
- 
- import type React from "react";
- import { useContext, useMemo } from "react";
--import { CopyIcon, GitPullRequestIcon } from "lucide-react";
-+import { CopyIcon, GitPullRequestIcon, MessageSquarePlusIcon, PaperclipIcon } from "lucide-react";
+@@ -22,6 +23,8 @@ import {
+   FolderIcon,
+   GitPullRequestIcon,
+   MessageSquareIcon,
++  MessageSquarePlusIcon,
++  PaperclipIcon,
+ } from "lucide-react";
  import { toast } from "sonner";
  import { defaultRemarkPlugins } from "streamdown";
- import remarkBreaks from "remark-breaks";
-@@ -48,16 +49,30 @@ import {
+@@ -60,15 +63,29 @@ import {
    ITEM_LABEL_HREF_PREFIX,
    ItemLabelIndexContext,
    ItemLabelMessageContext,
@@ -654,13 +655,12 @@ index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f1
 +import { Button } from "@/components/ui/button";
  import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
  import { relativeTime } from "@/lib/relativeTime";
- import { useSearchParams } from "@/lib/routing";
  import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 +import { keyedAttachments } from "@/lib/blocks";
  import { cn } from "@/lib/utils";
+ import { parseMentionPillTitle } from "@/lib/mentionPills";
  import {
-   useFileViewer,
-@@ -539,7 +554,7 @@ function citesSamePlace(
+@@ -590,7 +607,7 @@ function citesSamePlace(
  const ITEM_LABEL_BADGE_CLASS =
    "inline-flex items-baseline rounded border border-border bg-muted px-1 font-mono text-[0.85em] leading-snug";
  const ITEM_LABEL_CLOSED_CLASS = "line-through opacity-60";
@@ -669,7 +669,7 @@ index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f1
  const ITEM_LABEL_RECENT_CLASS = "border-warning/60 bg-warning/15";
  
  /**
-@@ -555,23 +570,126 @@ export function itemLabelChipClass(closed: boolean, recent = false): string {
+@@ -606,23 +623,126 @@ export function itemLabelChipClass(closed: boolean, recent = false): string {
    );
  }
  
@@ -804,7 +804,7 @@ index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f1
    const closing = useMemo(
      () => (closedBy ? extractLabelSentence(closedBy.text, label) : null),
      [closedBy, label],
-@@ -584,32 +702,129 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -635,32 +755,129 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
        return next;
      });
    };
@@ -944,7 +944,7 @@ index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f1
                onClick={() => showMessage(closedBy.messageId)}
              >
                Show
-@@ -622,7 +837,21 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -673,7 +890,21 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
            )}
          </div>
        )}
@@ -967,7 +967,7 @@ index d305d535ffb8c3f2e99a72618ff4f5f135198d29..3cb4b2670b0ebc799130c525536f26f1
    );
  }
  
-@@ -657,36 +886,42 @@ export function ItemLabelPopover({
+@@ -708,36 +939,42 @@ export function ItemLabelPopover({
  }
  
  /**
@@ -1223,18 +1223,18 @@ index fa90a49ca033aae6929add93951b05182b4f203b..3017dcefd9e31189cbac7753a62a8a76
                  onRestore={() => restore(item.label)}
                />
 diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
-index 393a7e97dbb908a39707c282a637f7b5716a59a7..dece9fe9000858a21d2e94a40feecbe25cb50918 100644
+index e513117330ae91e3b667de68a67ab2b49eb38620..117eb861b3fcc049aed3090cf899e19d9954f7cb 100644
 --- a/web/src/components/chat/Transcript.tsx
 +++ b/web/src/components/chat/Transcript.tsx
-@@ -37,6 +37,7 @@ import {
+@@ -40,6 +40,7 @@ import {
    ItemLabelSessionContext,
    type ItemLabelIndex,
  } from "@/lib/itemLabels";
 +import { publishItemLabelIndex } from "@/lib/itemCommentDrafts";
  import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
  import { useUserMessageNav } from "@/hooks/useUserMessageNav";
- import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-@@ -378,6 +379,11 @@ function TranscriptImpl({
+ import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
+@@ -423,6 +424,11 @@ function TranscriptImpl({
      () => buildBubbleItemLabelIndex(display.bubbles),
      [display.bubbles],
    );
@@ -1246,7 +1246,7 @@ index 393a7e97dbb908a39707c282a637f7b5716a59a7..dece9fe9000858a21d2e94a40feecbe2
    const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
    const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
    return (
-@@ -539,7 +545,7 @@ function TranscriptImpl({
+@@ -597,7 +603,7 @@ function TranscriptImpl({
    );
  }
  
@@ -1256,18 +1256,18 @@ index 393a7e97dbb908a39707c282a637f7b5716a59a7..dece9fe9000858a21d2e94a40feecbe2
    index,
    sessionId,
 diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
-index 8bda49dded5807c291c954036af9080f2adbdb47..2ddea290fc76c97533c40ee3b6b6010bb516a01b 100644
+index e686079aaa199ac67c89ee1686c3218473a420fb..dff97eed6e9f52245da9717de1fa3844c4400982 100644
 --- a/web/src/components/chat/chatBubbleParts.tsx
 +++ b/web/src/components/chat/chatBubbleParts.tsx
-@@ -69,6 +69,7 @@ import {
-   imagePreview,
+@@ -80,6 +80,7 @@ import {
+   isPendingBlockingElicitation,
    isTextBlock,
    keyedAttachments,
 +  PENDING_FILE_PREFIX,
  } from "@/lib/blocks";
  import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
- import { getCurrentAuthorId } from "@/lib/identity";
-@@ -94,12 +95,12 @@ import { buildMessageDeepLink } from "@/lib/messageDeepLink";
+ import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
+@@ -106,12 +107,12 @@ import { buildMessageDeepLink } from "@/lib/messageDeepLink";
  import {
    ItemLabelMessageContext,
    buildItemLabelIndex,
@@ -1281,8 +1281,8 @@ index 8bda49dded5807c291c954036af9080f2adbdb47..2ddea290fc76c97533c40ee3b6b6010b
 +import { scanItemLabelSource } from "@/lib/itemComments";
  import { copyText } from "@/lib/clipboard";
  import { copyMarkdown } from "@/lib/copyMarkdown";
- import { showToast } from "@/components/ui/toast";
-@@ -192,35 +193,57 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
+ import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
+@@ -250,35 +251,57 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
  // Finalized bubbles are reused by reference across rebuilds, so each is scanned once.
  const itemLabelScans = new WeakMap<Bubble, ItemLabelScan>();
  
@@ -2023,10 +2023,10 @@ index 0000000000000000000000000000000000000000..3c601c6d4e39a65886428aa473f738ad
 +}
 diff --git a/web/src/hooks/useItemCommentMode.test.tsx b/web/src/hooks/useItemCommentMode.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..d1075a306c0958719741e770893b361c785159c6
+index 0000000000000000000000000000000000000000..8049c21f70d8c423edbd0d31ad16d0744e0adaac
 --- /dev/null
 +++ b/web/src/hooks/useItemCommentMode.test.tsx
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,327 @@
 +// Comment mode against a stand-in composer: drafting sets the typed message
 +// aside, submit sends one structured message through the send callback, and
 +// the drafts settle with the send path (posted, cancelled, or orphaned).
@@ -2068,9 +2068,10 @@ index 0000000000000000000000000000000000000000..d1075a306c0958719741e770893b361c
 +        composer = content;
 +      },
 +      focus: () => {},
-+      mentionPreamble: (mentions) =>
++      expandMentions: (text, mentions) =>
 +        mentions.map((mention) => `[Attached: ${mention.path}]`).join("\n") +
-+        (mentions.length > 0 ? "\n\n" : ""),
++        (mentions.length > 0 ? "\n\n" : "") +
++        text,
 +      send,
 +    });
 +  });
@@ -2355,10 +2356,10 @@ index 0000000000000000000000000000000000000000..d1075a306c0958719741e770893b361c
 +});
 diff --git a/web/src/hooks/useItemCommentMode.ts b/web/src/hooks/useItemCommentMode.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..58f4186d88ef0d396fe0705f3d70f7888ef5e6ee
+index 0000000000000000000000000000000000000000..bc7545aba612b6677490f15439754b3d9aba4450
 --- /dev/null
 +++ b/web/src/hooks/useItemCommentMode.ts
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,550 @@
 +// Comment mode for the chat composer. Commenting on an item turns the real
 +// composer into that comment's editor: whatever the user had typed is set
 +// aside and comes back when the comment is saved to the drafts tray. Submit
@@ -2427,8 +2428,8 @@ index 0000000000000000000000000000000000000000..58f4186d88ef0d396fe0705f3d70f788
 +  read: () => ComposerContent;
 +  write: (content: ComposerContent) => void;
 +  focus: () => void;
-+  /** The "[Attached: …]" lines that deliver `mentions` at send time. */
-+  mentionPreamble: (mentions: MentionItem[]) => string;
++  /** The text as sent: each `mentions` token becomes its "[Attached: …]" marker. */
++  expandMentions: (text: string, mentions: MentionItem[]) => string;
 +  send: (text: string, files?: File[]) => void;
 +  /**
 +   * Holds the composer content set aside while commenting. Owned by the
@@ -2482,8 +2483,11 @@ index 0000000000000000000000000000000000000000..58f4186d88ef0d396fe0705f3d70f788
 +  return committed ? "posted" : "missing";
 +}
 +
-+function draftComment(draft: ItemCommentDraft, preamble: (m: MentionItem[]) => string): string {
-+  return preamble(draft.mentions ?? []) + draft.text;
++function draftComment(
++  draft: ItemCommentDraft,
++  expand: (text: string, mentions: MentionItem[]) => string,
++): string {
++  return expand(draft.text, draft.mentions ?? []);
 +}
 +
 +async function loadDraftFiles(drafts: readonly ItemCommentDraft[]): Promise<{
@@ -2526,7 +2530,7 @@ index 0000000000000000000000000000000000000000..58f4186d88ef0d396fe0705f3d70f788
 +  read,
 +  write,
 +  focus,
-+  mentionPreamble,
++  expandMentions,
 +  send,
 +  setAsideRef,
 +}: UseItemCommentModeOptions) {
@@ -2534,8 +2538,8 @@ index 0000000000000000000000000000000000000000..58f4186d88ef0d396fe0705f3d70f788
 +  const targetRef = useRef(target);
 +  targetRef.current = target;
 +  const submittingRef = useRef(false);
-+  const io = useRef({ read, write, focus, mentionPreamble, send });
-+  io.current = { read, write, focus, mentionPreamble, send };
++  const io = useRef({ read, write, focus, expandMentions, send });
++  io.current = { read, write, focus, expandMentions, send };
 +
 +  const state = useItemCommentState(sessionId);
 +  const labelOrder = useItemLabelOrder(sessionId);
@@ -2750,13 +2754,13 @@ index 0000000000000000000000000000000000000000..58f4186d88ef0d396fe0705f3d70f788
 +          comments: [],
 +        };
 +        group.comments.push({
-+          text: draftComment(draft, io.current.mentionPreamble),
++          text: draftComment(draft, io.current.expandMentions),
 +          attachments: names[at],
 +        });
 +        groups.set(draft.label, group);
 +      });
 +      const generalNames = names[drafts.length];
-+      const generalText = io.current.mentionPreamble(general.mentions) + general.text;
++      const generalText = io.current.expandMentions(general.text, general.mentions);
 +      const message = buildItemCommentMessage(
 +        [...groups.values()],
 +        generalText.trim() !== "" || generalNames.length > 0
@@ -4572,10 +4576,10 @@ index 8b6814ea6f55290f1797750ed673b22cc966bf58..1b08ae22005b367f42f8685b08b0abfd
  }
  
 diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
-index a3691d9d8d6e8486ca9e566e3a6df802363ab48f..e7fee58992d0a0ca5af844867242663d6fb5b05a 100644
+index 9ad6bbdb52ab37f79fc51e4320ca70c07dfed594..ad2fa6d20d4c8c04b3bfc479e02b22bd0b6475c5 100644
 --- a/web/src/pages/ChatPage.composer.test.tsx
 +++ b/web/src/pages/ChatPage.composer.test.tsx
-@@ -35,6 +35,14 @@ import {
+@@ -45,6 +45,14 @@ import {
  import { setOmnigentHostConfig } from "@/lib/host";
  import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
  import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -4590,7 +4594,7 @@ index a3691d9d8d6e8486ca9e566e3a6df802363ab48f..e7fee58992d0a0ca5af844867242663d
  import * as host from "@/lib/host";
  import * as identity from "@/lib/identity";
  import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
-@@ -479,6 +487,147 @@ describe("Composer session drafts", () => {
+@@ -521,6 +529,147 @@ describe("Composer session drafts", () => {
    });
  });
  
@@ -4739,10 +4743,10 @@ index a3691d9d8d6e8486ca9e566e3a6df802363ab48f..e7fee58992d0a0ca5af844867242663d
    beforeEach(() => {
      clearSessionDrafts();
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325d5026173 100644
+index e5d1ab6aa4cbc107d222980ec02c53efbe9fd9b6..5f0ca553d6c66ca768cfaf0c5a278817f781ebc3 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
-@@ -25,7 +25,14 @@ import {
+@@ -32,7 +32,14 @@ import {
    useState,
    useSyncExternalStore,
  } from "react";
@@ -4758,7 +4762,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
  import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
  import {
    composerSendShortcutKeys,
-@@ -60,6 +67,8 @@ import { hasPendingOwnElicitation } from "@/lib/blocks";
+@@ -72,6 +79,8 @@ import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/bl
  import { cn } from "@/lib/utils";
  import { isInlineRenameFocused } from "@/lib/inlineRename";
  import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
@@ -4767,7 +4771,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
  import {
    serverSwitcherHiddenForSurface,
    useSurfaceFrontmost,
-@@ -98,6 +107,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
+@@ -111,6 +120,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
  import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
  import {
    takeFailedSendDraft,
@@ -4775,7 +4779,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
    composerAttachmentKey,
    consumePendingInitialPrompt,
    holdsInitialDraft,
-@@ -2862,6 +2872,9 @@ function ComposerImpl(
+@@ -3034,6 +3044,9 @@ function ComposerImpl(
    valueRef.current = fullText;
    const replyDraftRef = useRef(storedReplyDraft);
    replyDraftRef.current = storedReplyDraft;
@@ -4785,7 +4789,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
    // Guards against React StrictMode double-invoke in development:
    // setup → cleanup → setup runs cleanup before the user has touched
    // the input, which would delete the draft. Only save when the user
-@@ -2942,13 +2955,17 @@ function ComposerImpl(
+@@ -3115,14 +3128,27 @@ function ComposerImpl(
      // The store binds a clicked session a moment later; keep focus in a rename started meanwhile.
      if (!isMobileRef.current && !isInlineRenameFocused()) textareaRef.current?.focus();
  
@@ -4797,40 +4801,67 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
 -        text: valueRef.current,
 -        files: filesRef.current,
 -        replyDraft: replyDraftRef.current,
+-        mentions: taggedMentionsRef.current,
 -      });
 +      const setAside = setAsideRef.current;
 +      setSessionDraft(
 +        conversationId,
 +        setAside
-+          ? { text: setAside.text, files: setAside.files, replyDraft: setAside.replyDraft }
-+          : { text: valueRef.current, files: filesRef.current, replyDraft: replyDraftRef.current },
++          ? {
++              text: setAside.text,
++              files: setAside.files,
++              replyDraft: setAside.replyDraft,
++              mentions: { files: setAside.mentions, sessions: taggedMentionsRef.current.sessions },
++            }
++          : {
++              text: valueRef.current,
++              files: filesRef.current,
++              replyDraft: replyDraftRef.current,
++              mentions: taggedMentionsRef.current,
++            },
 +      );
      };
    }, [conversationId, replaceText]);
  
-@@ -2972,7 +2989,13 @@ function ComposerImpl(
+@@ -3160,13 +3186,25 @@ function ComposerImpl(
    // rather than only learning about a draft when this composer unmounts.
    useEffect(() => {
      if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
--    setSessionDraft(conversationId, { text: fullText, files, replyDraft: storedReplyDraft });
+-    setSessionDraft(conversationId, {
+-      text: fullText,
+-      files,
+-      replyDraft: storedReplyDraft,
+-      // Tagging always edits the text too, so fullText re-runs this effect.
+-      mentions: taggedMentionsRef.current,
+-    });
 +    const setAside = commentSetAsideRef.current;
 +    setSessionDraft(
 +      conversationId,
 +      setAside
-+        ? { text: setAside.text, files: setAside.files, replyDraft: setAside.replyDraft }
-+        : { text: fullText, files, replyDraft: storedReplyDraft },
++        ? {
++            text: setAside.text,
++            files: setAside.files,
++            replyDraft: setAside.replyDraft,
++            // Comment mode swaps only file mentions; session tags stay the draft's.
++            mentions: { files: setAside.mentions, sessions: taggedMentionsRef.current.sessions },
++          }
++        : {
++            text: fullText,
++            files,
++            replyDraft: storedReplyDraft,
++            // Tagging always edits the text too, so fullText re-runs this effect.
++            mentions: taggedMentionsRef.current,
++          },
 +    );
    }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
  
    const terminalPending = useChatStore((s) => s.terminalPending);
-@@ -3205,6 +3228,63 @@ function ComposerImpl(
+@@ -3551,6 +3589,65 @@ function ComposerImpl(
      // setMentionedItems is a stable useState setter (from useMentionBrowser).
-   }, [pendingComposerAttachments, setMentionedItems]);
+   }, [pendingComposerAttachments, setMentionedItems, editText]);
  
 +  // Comment mode: commenting on a labelled item borrows this composer, so
 +  // attachments, paste, @-mentions and dictation all work in the comment.
-+  const mentionedItemsRef = useRef(mentionedItems);
-+  mentionedItemsRef.current = mentionedItems;
 +  // Declared before the history hooks it calls back into; `write` only runs
 +  // from events and effects, after this render has defined them.
 +  const commentMode = useItemCommentMode({
@@ -4860,7 +4891,11 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
 +    focus: () => {
 +      if (!isMobileRef.current) tailTextareaRef.current?.focus();
 +    },
-+    mentionPreamble: (mentions) => buildMentionPreamble(mentions, sessionHarness),
++    expandMentions: (text, mentions) =>
++      expandMentionTokens(
++        text,
++        presentMentions(composerInlineMentions(mentions, [], sessionHarness), [text]),
++      ),
 +    send: (text, sendFiles) => onSend(text, sendFiles),
 +  });
 +  const commentTarget = commentMode.target;
@@ -4887,7 +4922,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
    // Restore the text (and attachments) of a send that failed, so the user can
    // fix and resend instead of retyping. The composer is empty in the normal
    // case — `submit` clears it optimistically — so only fill it when the user
-@@ -3221,9 +3301,17 @@ function ComposerImpl(
+@@ -3567,9 +3664,17 @@ function ComposerImpl(
      // conversation's draft and wrongly conclude the user is mid-sentence,
      // dropping the failed message on the way back to the session it failed in.
      if (settledConversationId !== conversationId) return;
@@ -4904,9 +4939,9 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
 +      !commentRestored,
 +    );
      if (!failed) return;
-     if (hasNewerInput) {
-       const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
-@@ -3239,7 +3327,14 @@ function ComposerImpl(
+     // The failed text carries expanded markers; bring its session tags back as tokens.
+     const recalled = recallComposerDraft(failed.text, failed.replyDraft);
+@@ -3590,7 +3695,14 @@ function ComposerImpl(
      dirtyRef.current = true;
      if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
      if (!isMobileRef.current) textareaRef.current?.focus();
@@ -4922,7 +4957,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
  
    // Retract a restored failed-send draft once its send proves delivered (its
    // committed item arrived over the stream or a reconnect snapshot). Edits win:
-@@ -3779,6 +3874,11 @@ function ComposerImpl(
+@@ -4220,6 +4332,11 @@ function ComposerImpl(
    }: { resetNativeInputSession?: boolean } = {}) => {
      // The /btw overlay locks the composer — never send while it's open.
      if (composerLockedByBtw) return;
@@ -4934,7 +4969,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
      const trimmed = fullText.trim();
      // Allow send if there's text, attached files, OR "@"-tagged paths.
      if (
-@@ -3942,7 +4042,7 @@ function ComposerImpl(
+@@ -4466,7 +4583,7 @@ function ComposerImpl(
  
    const handleSubmit = (e: FormEvent) => {
      e.preventDefault();
@@ -4943,7 +4978,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
        onStop();
        return;
      }
-@@ -3985,7 +4085,12 @@ function ComposerImpl(
+@@ -4519,7 +4636,12 @@ function ComposerImpl(
      // steers everything: the draft, if any, is submitted first so it joins the
      // queue tail (or sends directly when idle), then every queued message is
      // sent into the running turn in FIFO order instead of draining one per idle.
@@ -4957,7 +4992,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
        e.preventDefault();
        if (!mentionListingPending) submit();
        // While unreachable the queue waits for the host, so nothing is steered.
-@@ -4018,6 +4123,12 @@ function ComposerImpl(
+@@ -4553,6 +4675,12 @@ function ComposerImpl(
        submit();
        return;
      }
@@ -4970,7 +5005,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
      // Esc dismisses the /btw sidechat overlay if open
      if (e.key === "Escape" && btwSidechat) {
        e.preventDefault();
-@@ -4035,6 +4146,7 @@ function ComposerImpl(
+@@ -4570,6 +4698,7 @@ function ComposerImpl(
      // Recall starts from empty text; boundary checks preserve caret movement
      // through wrapped recalled entries. Modified arrows belong to global hotkeys.
      if (
@@ -4978,7 +5013,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
        (draft.quotes.length === 0 || recallingRef.current) &&
        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
        !e.metaKey &&
-@@ -4046,6 +4158,11 @@ function ComposerImpl(
+@@ -4581,6 +4710,11 @@ function ComposerImpl(
          // Empty-composer recall takes the last queued row before browsing history.
          if (composerEmptyForRecall) {
            const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -4990,7 +5025,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
            if (target !== undefined) {
              e.preventDefault();
              resetCursor();
-@@ -4123,6 +4240,21 @@ function ComposerImpl(
+@@ -4662,6 +4796,21 @@ function ComposerImpl(
            bottom corners when the surface below is at least as wide,
            otherwise page background shows and the tray floats detached. */}
        <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
@@ -5012,7 +5047,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
          {/* Queued messages — peeks above the workspace bar like the
              sub-agent tray. Lists follow-ups held while the agent is busy;
              drains FIFO on idle. Scope to this conversation so a queue held
-@@ -4130,7 +4262,12 @@ function ComposerImpl(
+@@ -4669,7 +4818,12 @@ function ComposerImpl(
          <QueuedMessagesStrip
            messages={composerQueuedMessages}
            arrowUpRecallQueueId={arrowUpRecallQueueId}
@@ -5026,7 +5061,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
            onEdit={(queueId) => {
              // Pull the queued message back into the composer for editing:
              // replace the composer's text + attachments with the queued
-@@ -4138,6 +4275,11 @@ function ComposerImpl(
+@@ -4677,6 +4831,11 @@ function ComposerImpl(
              // Re-sending re-queues it (busy) or sends it (idle).
              const target = queuedMessages.find((m) => m.queueId === queueId);
              if (!target) return;
@@ -5035,10 +5070,10 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
 +              dequeueMessage(queueId);
 +              return;
 +            }
-             replaceText(target.text, target.replyDraft);
-             dirtyRef.current = true;
-             resetCursor();
-@@ -4160,7 +4302,7 @@ function ComposerImpl(
+             dequeueMessage(queueId);
+             loadIntoComposer(target.text, target.files ?? [], { replyDraft: target.replyDraft });
+           }}
+@@ -4693,7 +4852,7 @@ function ComposerImpl(
            <ComposerWorkspaceBar
              data-testid="composer-workspace-controls"
              className={cn(
@@ -5047,7 +5082,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
                  "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
              )}
            >
-@@ -4241,19 +4383,21 @@ function ComposerImpl(
+@@ -4774,19 +4933,21 @@ function ComposerImpl(
            "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
            placeholder: composerLockedByBtw
              ? "Side chat open — press Esc to close"
@@ -5082,10 +5117,10 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
            rows: 1,
            disabled: inputDisabled,
            "data-slash-command": composerIsCommand ? "true" : undefined,
-@@ -4299,6 +4443,17 @@ function ComposerImpl(
-             ) : undefined,
-           beforeInput: (
-             <>
+@@ -4848,6 +5009,17 @@ function ComposerImpl(
+                   }}
+                 />
+               )}
 +              {commentTarget && (
 +                <ItemCommentModeHeader
 +                  key={`${commentTarget.label}:${commentTarget.draftId ?? "new"}`}
@@ -5100,7 +5135,7 @@ index 80231fcf2c101c7f1700ce44118d82f99686664e..0bd2452cefb56091df15097c9c3db325
                {/* Slash-command suggestions — floats above the composer box */}
                {slashCompletion.open && (
                  <SlashCommandMenu
-@@ -4573,41 +4728,60 @@ function ComposerImpl(
+@@ -5124,41 +5296,60 @@ function ComposerImpl(
                    resetCursor();
                  }}
                />

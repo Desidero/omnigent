@@ -380,15 +380,11 @@ request carries it, and the series holds a copy until it merges).
 
 | Series | What it does | Status |
 |---|---|---|
-| `backport-sidebar-filter-submenus` | On phones the sidebar filter menu's submenus open in place under a back row instead of as clipped side flyouts. | merged upstream ([#13481](https://github.com/omnigent-ai/omnigent/pull/13481)) after `BASE`; carried unchanged, drop at the next refresh |
 | `claude-config-dir` | claude-native and claude-sdk follow `CLAUDE_CONFIG_DIR` instead of assuming `~/.claude`. | issue open ([#7124](https://github.com/omnigent-ai/omnigent/issues/7124); the PR this copied, [#9617](https://github.com/omnigent-ai/omnigent/pull/9617), was closed) |
 | `subscription-accounts` | Several Claude or Codex subscription logins per host: pick the account for a new session, switch a running session's account from the harness menu, accounts that share sessions through account tokens, and agents can start a child session on another account. Docs in `docs/providers.md`. Needs `claude-config-dir`. | issue open ([#503](https://github.com/omnigent-ai/omnigent/issues/503)) |
-| `toast-safe-area` | Toasts stay below the iOS status bar and Dynamic Island. | PR open ([#11390](https://github.com/omnigent-ai/omnigent/pull/11390)) |
-| `session-history-paging` | Agents can page through a session's history and list recently updated sessions. | proposed |
-| `terminal-touch` | The terminal on phones and tablets: a Termux-style extra-keys row, long-press select, copy and paste, and native iOS clipboard reads for Paste. | PR open for the extra-keys row ([#6136](https://github.com/omnigent-ai/omnigent/pull/6136), carried copy of its head, which includes our two iOS fixes); the rest proposed (issue drafted) |
+| `session-history-paging` | Agents can page through a session's history and list recently updated sessions; `ownership` stays an alias of upstream's `visibility` until 0.24.0. | proposed |
 | `telemetry-attribution` | Exported spans carry the acting user (opt-in), the runner and the host. | PR open ([#11380](https://github.com/omnigent-ai/omnigent/pull/11380); issue [#10794](https://github.com/omnigent-ai/omnigent/issues/10794)) |
 | `session-telemetry` | Every span of a turn carries the session's metadata (labels, project, agent, git, workspace, host) and the model and reasoning effort the turn ran with. | PR open ([#11384](https://github.com/omnigent-ai/omnigent/pull/11384), then [#11434](https://github.com/omnigent-ai/omnigent/pull/11434) stacked on it, draft) |
-| `sidebar-updated-filter` | A sidebar filter for sessions updated recently (24 hours, 3, 7 or 30 days), with a chip while it is on. Needs `backport-sidebar-filter-submenus`. | proposed |
 | `claude-sdk-web-tools` | claude-sdk agents can opt into Claude Code's WebSearch and WebFetch. | proposed |
 | `run-suggested-commands` | A Run button on shell commands an agent suggests in chat (the web half; Codex shell routing is upstream since [#11396](https://github.com/omnigent-ai/omnigent/pull/11396)). | proposed |
 | `claude-native-teammates` | Claude Code agent-team teammates show up as child sessions, and their deliveries no longer appear as raw `<teammate-message>` bubbles. | PR open ([#11388](https://github.com/omnigent-ai/omnigent/pull/11388) for the child sessions, [#11389](https://github.com/omnigent-ai/omnigent/pull/11389) for the deliveries; issue [#10745](https://github.com/omnigent-ai/omnigent/issues/10745)) |
@@ -396,25 +392,56 @@ request carries it, and the series holds a copy until it merges).
 | `claude-native-coordinator-messages` | A parent agent's follow-ups appear in the sub-agent's chat. | proposed |
 | `skip-gzip-binary-files` | Images and PDFs load in the file viewer again instead of failing with a 500. | PR open ([#10585](https://github.com/omnigent-ai/omnigent/pull/10585), carried copy) |
 | `codex-native-mode-instructions` | A Default-mode Codex turn keeps Codex's own Default mode instructions instead of having them replaced by the session's developer instructions (the Plan toggle is upstream since [#11570](https://github.com/omnigent-ai/omnigent/pull/11570)). | proposed |
-| `chat-item-labels` | Bracketed labels like `[Q2]` in chat become chips that preview the item they refer to; `~~[Q2]~~` closes it, and an Open items panel lists what is still open. Adds the labelling rules to agents' instructions. Needs `run-suggested-commands` and `codex-native-mode-instructions`. | proposed |
+| `chat-item-labels` | Bracketed labels like `[Q2]` in chat become chips that preview the item they refer to; `~~[Q2]~~` closes it, and an Open items panel lists what is still open. Adds the labelling rules to agents' instructions. Needs `run-suggested-commands`, `codex-native-mode-instructions` and `session-labels-ui`. | proposed |
 | `web-reconnect-shell-inputs` | A queued `!command` no longer stays stuck at the bottom of the chat after the connection drops. | PR open ([#11395](https://github.com/omnigent-ai/omnigent/pull/11395)) |
 | `chat-item-comments` | Comment on labelled items and send the comments together as one structured message. Needs `chat-item-labels`. | proposed |
-| `palette-new-chat-in-project` | The command palette can start a new chat in a chosen project. | PR open ([#11394](https://github.com/omnigent-ai/omnigent/pull/11394), draft; issue [#4409](https://github.com/omnigent-ai/omnigent/issues/4409)) |
-| `new-chat-project-prompt` | When projects exist, starting a new session first asks which project, with a setting to turn it off; phones get a bottom sheet (No project, then each project, no search field). Needs `palette-new-chat-in-project`. | PR open ([#11397](https://github.com/omnigent-ai/omnigent/pull/11397), stacked on #11394; issue [#11083](https://github.com/omnigent-ai/omnigent/issues/11083)) |
 | `session-labels-ui` | View and edit a session's labels in the web UI, delete labels through the API, and default labels per project. Needs `subscription-accounts`. | PR open ([#11398](https://github.com/omnigent-ai/omnigent/pull/11398) for the server, [#11399](https://github.com/omnigent-ai/omnigent/pull/11399) for the web UI (draft)) |
 | `gateway-request-tags` | Requests to a Databricks Unity Gateway carry the session id and labels as request tags. Needs `chat-item-labels`. | proposed (issue drafted) |
-| `chat-features` | Per-session toggles for chat features that need both an agent instruction and a renderer, starting with Run suggested commands. Needs several of the series above. | proposed |
-| `pr-watch` | Watch a session's pull requests and wake the agent on failed checks, conflicts and reviews until they are green. Behind the default-off `pr_watch` feature flag. Needs `subscription-accounts`. | proposed |
-| `claude-native-delegate-idle` | A Claude session stops showing Working, and takes follow-ups without Steer, once its turn ends while a background agent or teammate keeps running. Covers the default OSC status path and agent-team teammates, including lead turns a teammate's message starts. Needs `claude-native-teammates`. | PR open for the status-file part ([#10849](https://github.com/omnigent-ai/omnigent/pull/10849), carried copy); OSC and teammate parts proposed |
+| `claude-native-delegate-idle` | A Claude lead stops showing Working, and takes follow-ups without Steer, once its turn ends while agent-team teammates keep running: teammates count as background agents for upstream's background-agent hold ([#12561](https://github.com/omnigent-ai/omnigent/pull/12561)). Needs `claude-native-teammates`. | proposed (the status-file and OSC parts landed upstream as #12561) |
 | `delete-stops-runner` | Deleting a session stops its host-launched runner once no remaining session uses it, instead of leaving the process running until its idle timeout. | PR open ([#11391](https://github.com/omnigent-ai/omnigent/pull/11391)) |
 | `app-error-boundary` | Upstream's render error fallback also shows the error, component stack and path, with Copy details and Reload. | proposed |
-| `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. Needs `chat-features` and `chat-item-comments`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
-| `queue-combine` | The queue strip's Combine merges the messages queued behind a running turn into one (texts joined by a blank line, attachments kept), and Send all combines and steers them; `!` commands, `/`-led messages, Codex `$` skills, failed sends and item-comment messages stay separate. Needs `chat-item-comments`. | proposed (related issues [#10986](https://github.com/omnigent-ai/omnigent/issues/10986), [#4426](https://github.com/omnigent-ai/omnigent/issues/4426), [#8326](https://github.com/omnigent-ai/omnigent/issues/8326)) |
-| `mobile-settings-nav` | On phones the Settings menu reads as a list of pages: title, Back row, inset groups and 44px rows with a chevron. | PR open ([#13484](https://github.com/omnigent-ai/omnigent/pull/13484), draft) |
-| `mobile-landing-project-chip` | On phones the new-session landing names its project in a chip whose menu switches it, keeping the draft. | PR open ([#13487](https://github.com/omnigent-ai/omnigent/pull/13487), draft) |
-| `mobile-sidebar-nav-strip` | On phones the drawer's New session, Automations and Inbox fold into one strip of icon-over-label cells; other pages stay rows below it. Needs `new-chat-project-prompt`. | PR open ([#13488](https://github.com/omnigent-ai/omnigent/pull/13488), draft; issue [#13482](https://github.com/omnigent-ai/omnigent/issues/13482)) |
+| `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. Needs `chat-item-labels`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
 | `custom-docs-index` | `docs/custom/README.md`, the index of the series: what each changes, how to turn it on, and where its docs are. | custom only |
 
+### Parked series
+
+These series are out of the series for now. Their patch files and index
+sections are on the patches commit that release `custom/2026-11-09.1` was
+built from (the tag's `Patches-Commit:` line); their proposals stay under
+`proposals/`. "Optional" means kept out to keep the series small, not that
+anything is wrong with it.
+
+| Series | Why parked |
+|---|---|
+| `backport-sidebar-filter-submenus` | landed upstream (#13481) |
+| `toast-safe-area` | superseded by upstream #13607 |
+| `terminal-touch` | mobile |
+| `composer-send-tap` | mobile |
+| `mobile-settings-nav` | mobile |
+| `mobile-landing-project-chip` | mobile |
+| `mobile-sidebar-nav-strip` | mobile |
+| `pr-watch` | optional |
+| `queue-combine` | optional |
+| `sidebar-updated-filter` | optional |
+| `sidebar-sticky-toolbar` | optional |
+| `new-chat-project-prompt` | optional |
+| `palette-new-chat-in-project` | optional |
+| `chat-features` | optional |
+| `lean-history-items` | optional |
+| `history-prefetch` | optional |
+
+To restore one, apply it from that commit onto a working branch built from
+the current series, together with any other parked series its `# needs:`
+lines name (before it), then export and check it as in
+[Developing a change](#developing-a-change); a conflict is resolved as in a
+refresh.
+
+```bash
+old=$(git tag -l --format='%(contents)' custom/2026-11-09.1 | sed -n 's/^Patches-Commit: //p')
+git worktree add --detach /tmp/parked "$old"
+custom/scripts/build-custom.sh work/restore   # then work on work/restore
+git am -3 $(/tmp/parked/custom/scripts/series-files.sh <series>)
+```
 
 ## Deploying your own
 
