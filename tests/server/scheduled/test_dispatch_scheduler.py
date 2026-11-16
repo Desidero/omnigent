@@ -60,6 +60,18 @@ def _task(
     return store.get(task.id)
 
 
+def _create_tasks_half_past_the_hour(monkeypatch) -> None:
+    """Pin task creation to half past an hour.
+
+    ``store.create`` schedules from the wall clock, so a test clock a minute past
+    ``created_at`` reaches the next hourly occurrence whenever the test runs in the
+    last minute of an hour, and that occurrence fires beside the run under test.
+    """
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000 + 30 * 60)
+
+
 def _events(caplog, event_name: str) -> list[dict]:
     return [
         {**record.attributes, "session_id": getattr(record, "session_id", None)}
@@ -136,9 +148,12 @@ async def test_unfinished_fire_return_warns_and_leaves_run_for_recovery(store, c
     assert store.list_runs(task.id)[0][0].status == "failed"
 
 
-async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
+# COUNT=1 is a reminder whose minute passed during an outage: it still runs once,
+# completes, and is never replayed.
+@pytest.mark.parametrize("rrule", ["FREQ=HOURLY", "FREQ=HOURLY;COUNT=1"])
+async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store, rrule) -> None:
     with workspace_scope(42):
-        task = _task(store)
+        task = _task(store, rrule=rrule)
     clock = FakeClock(task.next_run_at + 7200)
     fired = []
 
@@ -160,11 +175,71 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
     assert fired[0].scheduled_at == task.next_run_at
     with workspace_scope(42):
-        assert store.get(task.id).next_run_at > clock.now()
+        saved = store.get(task.id)
+        if rrule.endswith("COUNT=1"):
+            assert (saved.state, saved.next_run_at) == ("completed", None)
+        else:
+            assert saved.next_run_at > clock.now()
         assert len(store.list_runs(task.id)[0]) == 1
     await schedulers[0].poll_once()
     await _drain(schedulers[0])
     assert len(fired) == 1
+    if rrule.endswith("COUNT=1"):
+        # Even an hour later, when the rule would match again, nothing replays.
+        clock.advance(3600)
+        await schedulers[0].poll_once()
+        await _drain(schedulers[0])
+        assert len(fired) == 1
+
+
+async def test_a_pending_reminder_survives_a_restart_and_fires_once(db_uri, store) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    when = (datetime.now(UTC) + timedelta(hours=2)).replace(second=0, microsecond=0)
+    task = _task(
+        store,
+        rrule=reminder_rrule(when),
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="reminder",
+    )
+    assert task.next_run_at == int(when.timestamp())
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run)
+        await lease.attach_session(snapshot.session_id)
+        await lease.finish("running")
+
+    def restarted(clock: FakeClock) -> PersistentTaskScheduler:
+        # A new process: a fresh store and scheduler over the same database.
+        fresh = SqlAlchemyScheduledTaskStore(db_uri)
+        fresh.configure_dispatch(True)
+        return PersistentTaskScheduler(fresh, fire, AsyncMock(), now=clock.now)
+
+    clock = FakeClock(task.next_run_at - 60)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == []
+
+    clock.advance(120)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert [run.scheduled_at for run in fired] == [task.next_run_at]
+    saved = store.get(task.id)
+    assert (saved.state, saved.next_run_at, saved.kind) == ("completed", None, "reminder")
+
+    # Another restart a year later, when the rule's date comes round again, replays nothing.
+    clock.advance(366 * 86400)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(fired) == 1
+    assert len(store.list_runs(task.id)[0]) == 1
 
 
 async def test_scan_pages_past_unowned_tasks_and_ownership_errors(
@@ -2014,11 +2089,14 @@ async def test_changed_session_is_logged_again(store, caplog):
     assert store.list_runs(task.id)[0][0].conversation_id == second
 
 
-async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch):
+# COUNT=1 is a one-time schedule such as a reminder, which the dispatcher's own
+# validation must not pause as "fires only once".
+@pytest.mark.parametrize("count", [1, 2])
+async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch, count):
     store.configure_dispatch(False)
     ended = _task(store, "ended", rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
     store.configure_dispatch(True)
-    counted = _task(store, "counted", rrule="FREQ=HOURLY;COUNT=2")
+    counted = _task(store, "counted", rrule=f"FREQ=HOURLY;COUNT={count}")
     clock = FakeClock(counted.next_run_at)
 
     async def fire(task, lease):
@@ -2033,7 +2111,7 @@ async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeyp
         assert store.get(ended.id).state == "completed"
         assert store.list_runs(ended.id)[0] == []
         assert store.get(counted.id).state == "completed"
-        assert len(store.list_runs(counted.id)[0]) == 2
+        assert len(store.list_runs(counted.id)[0]) == count
         assert store.list_uninitialized_tasks() == []
     finally:
         await scheduler.stop()
@@ -2083,7 +2161,8 @@ async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> 
     assert store.get(task.id).next_run_at is None
 
 
-async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
+async def test_run_now_waits_for_the_host_owner_to_start_it(store, monkeypatch) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store)
     clock = FakeClock(task.created_at + 60)
     owned = False
@@ -2195,10 +2274,11 @@ async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) 
 
 
 async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_owner(
-    store,
+    store, monkeypatch
 ) -> None:
     """Replica A holds the session's host and B owns the workspace key. Once the
     first run records the session, its host is pinned, so A claims every run."""
+    _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store, "continue_unpinned", session_mode="continue")
     assert task.host_id is None
     session_host = uuid.uuid4().hex
