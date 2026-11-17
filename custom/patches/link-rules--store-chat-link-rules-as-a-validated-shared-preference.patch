@@ -58,10 +58,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  omnigent/server/schemas.py                   |  51 ++
  omnigent/stores/preference_store/__init__.py |  40 +
  openapi.json                                 | 219 ++++++
- tests/server/routes/test_link_rules.py       | 191 +++++
+ tests/server/routes/test_link_rules.py       | 222 ++++++
  tests/stores/test_preference_store.py        |  29 +-
  tests/test_link_rules.py                     | 356 +++++++++
- 15 files changed, 1961 insertions(+), 13 deletions(-)
+ 15 files changed, 1992 insertions(+), 13 deletions(-)
  create mode 100644 docs/chat-link-rules.md
  create mode 100644 omnigent/link_rules.py
  create mode 100644 tests/server/routes/test_link_rules.py
@@ -1693,15 +1693,18 @@ index c35cd69165e275e493350460bc18c7b7020f6c3b..c722abbe5261e0881c2f7ea5f95648f9
          "operationId": "gateway_v1_mcp__service_id__post",
 diff --git a/tests/server/routes/test_link_rules.py b/tests/server/routes/test_link_rules.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a9ee0b93c4270891e33bb8f0db27d8fd30709354
+index 0000000000000000000000000000000000000000..48f08ddc771eb202123eaf86d84f2e507fbc1eea
 --- /dev/null
 +++ b/tests/server/routes/test_link_rules.py
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,222 @@
 +"""``/v1/link-rules``: the caller's chat link rules over shared preferences."""
++
++import json
 +
 +import httpx
 +import pytest
 +
++from omnigent.db.db_models import SqlPreference
 +from omnigent.link_rules import DEFAULT_LINK_RULES
 +from omnigent.runtime.agent_cache import AgentCache
 +from omnigent.server.app import create_app
@@ -1799,6 +1802,34 @@ index 0000000000000000000000000000000000000000..a9ee0b93c4270891e33bb8f0db27d8fd
 +        assert len(reset.json()["rules"]) == len(DEFAULT_LINK_RULES)
 +
 +
++async def test_a_stored_preference_of_a_retired_kind_does_not_break_the_rules(
++    client_factory, db_uri
++):
++    """A row another build saved (here a retired kind) is skipped, not a 500."""
++    store = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
++    entry = {"key": {"kind": "chat_features", "name": "default"}, "version": 1, "value": []}
++    with store._session("seed_retired_kind") as session:
++        session.add(
++            SqlPreference(
++                workspace_id=0,
++                user_id=store.identity("alice@example.test").user_id,
++                key="shared.v1.value." + "f" * 64,
++                value=json.dumps(entry),
++            )
++        )
++    async with client_factory() as client:
++        read = await client.get("/v1/link-rules", headers=ALICE)
++        assert read.status_code == 200, read.text
++        assert read.json()["saved"] is False
++        saved = await client.put(
++            "/v1/link-rules", headers=ALICE, json={"rules": [JIRA], "expected_version": 0}
++        )
++        assert saved.status_code == 200, saved.text
++        assert (await client.get("/v1/link-rules", headers=ALICE)).json()["rules"] == [
++            _served(JIRA)
++        ]
++
++
 +async def test_stale_version_is_refused_without_storing_a_conflict(client_factory):
 +    async with client_factory() as client:
 +        first = {"rules": [JIRA], "expected_version": 0}
@@ -1889,7 +1920,7 @@ index 0000000000000000000000000000000000000000..a9ee0b93c4270891e33bb8f0db27d8fd
 +        [entry] = [item for item in shared["entries"] if item["key"]["kind"] == "link_rules"]
 +        assert '"kind":"git"' in entry["value"] and '"github"' in entry["value"]
 diff --git a/tests/stores/test_preference_store.py b/tests/stores/test_preference_store.py
-index 51f8cb60d1bf0cc1b0781ffc6d683f555c7c5804..f3a90812187730fd7ac7d4830fda1cfd56d4a7ca 100644
+index 64f6cd680363b21fd4d321fcf56780ffe81d508c..4203f0558fcf5d8a0626e2a4f922bd3bfda94116 100644
 --- a/tests/stores/test_preference_store.py
 +++ b/tests/stores/test_preference_store.py
 @@ -10,7 +10,8 @@ from sqlalchemy import LargeBinary, event, func, select, type_coerce
@@ -1902,7 +1933,7 @@ index 51f8cb60d1bf0cc1b0781ffc6d683f555c7c5804..f3a90812187730fd7ac7d4830fda1cfd
  from omnigent.stores.preference_store.sqlalchemy_store import (
      SqlAlchemyPreferenceStore,
      _fingerprint,
-@@ -530,3 +531,29 @@ def test_configuration_snapshot_is_atomic_bounded_and_isolated(store, db_uri):
+@@ -578,3 +579,29 @@ def test_configuration_snapshot_is_atomic_bounded_and_isolated(store, db_uri):
      with store._session("count_configuration_rows") as session:
          assert session.scalar(select(func.count()).select_from(SqlPreference)) == 1
      assert store.read(user_id="alice").revision == 0
