@@ -37,7 +37,7 @@ Docs: none (documented with its series in docs/providers.md)
  omnigent/server/routes/_sessions/helpers.py   |   4 +
  omnigent/server/routes/host_providers.py      |   4 +
  omnigent/server/routes/sessions/__init__.py   |  11 +
- .../server/routes/sessions/routes_core.py     |  39 +-
+ .../server/routes/sessions/routes_core.py     |  42 ++-
  .../server/routes/sessions/routes_provider.py | 353 ++++++++++++++++++
  .../stores/conversation_store/__init__.py     |  13 +
  .../conversation_store/sqlalchemy_store.py    |  35 ++
@@ -47,15 +47,15 @@ Docs: none (documented with its series in docs/providers.md)
  tests/server/routes/test_host_providers.py    |   5 +-
  .../routes/test_session_provider_switch.py    | 194 ++++++++++
  tests/stores/test_conversation_store.py       |  19 +
- 15 files changed, 832 insertions(+), 20 deletions(-)
+ 15 files changed, 835 insertions(+), 20 deletions(-)
  create mode 100644 omnigent/server/routes/sessions/routes_provider.py
  create mode 100644 tests/server/routes/test_session_provider_switch.py
 
 diff --git a/omnigent/host/frames.py b/omnigent/host/frames.py
-index 0d60f54df2ca09e38f4a07eb2c6b926548d25cdb..1fb4f4fb6fb78c0500b22fb091c86427ec4f2550 100644
+index 065e439ecf2a34d7b4630fa5152e9a1e47af9032..d9137e88ac53bb4edcfc62f2fd3e5410844e5254 100644
 --- a/omnigent/host/frames.py
 +++ b/omnigent/host/frames.py
-@@ -1416,7 +1416,7 @@ class HostProvidersResultFrame:
+@@ -1557,7 +1557,7 @@ class HostProvidersResultFrame:
  
      request_id: str
      status: str
@@ -64,7 +64,7 @@ index 0d60f54df2ca09e38f4a07eb2c6b926548d25cdb..1fb4f4fb6fb78c0500b22fb091c86427
      error: str | None = None
  
  
-@@ -3497,13 +3497,15 @@ def _decode_providers_result(msg: _JsonObject) -> HostProvidersResultFrame:
+@@ -3801,13 +3801,15 @@ def _decode_providers_result(msg: _JsonObject) -> HostProvidersResultFrame:
      raw = msg.get("providers", [])
      if not isinstance(raw, list):
          raise ValueError("frame field must be a list of providers: 'providers'")
@@ -150,11 +150,11 @@ index d7c98c163e0b5421c54b631de0c85e0c715b76e8..c045f621c731bad34f2bd3bbc5d17281
          )
      return rows
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index 6461d93cbf67a8bc364bea03cf63dc029a6e5750..d5e2a0d56bdcc6ad2e4e215898099ac15746e09a 100644
+index 980ecd8f5009f4646e03e2a18fa4e7e69b0f96b4..0d099da4dc7ab5c3a14210f7c3742368fec80489 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -5220,6 +5220,10 @@ def _publish_status(
-     _set_blocked_on(session_id, blocked_on)
+@@ -5335,6 +5335,10 @@ def _publish_status(
+         _session_background_agents_cache.pop(session_id, None)
      if previous_status != status:
          _publish_child_status_to_parent(session_id, status)
 +        # A provider switch waits for its runner's sessions to finish their turns.
@@ -187,10 +187,10 @@ index e6887885dd8b77ee1805bcf5ec2da1c72b53f48f..00312154e4e47cac7b9dbd39f9011bcf
  
  class HostProvidersResponse(BaseModel):
 diff --git a/omnigent/server/routes/sessions/__init__.py b/omnigent/server/routes/sessions/__init__.py
-index 8ec5c6e5ea94346a28ce8d65f04385f5e8779cb4..b2f977b3da2322d544a9e092b5bcf6bbce9fabad 100644
+index 172166d8a5e6d70bb627c51bd96327f08707630d..469e1ff4c83fe68bbd3fe3c35a4cfb1c5306c6a9 100644
 --- a/omnigent/server/routes/sessions/__init__.py
 +++ b/omnigent/server/routes/sessions/__init__.py
-@@ -911,6 +911,7 @@ def create_sessions_router(
+@@ -912,6 +912,7 @@ def create_sessions_router(
      from omnigent.server.routes.sessions.routes_hooks import register_hooks_routes
      from omnigent.server.routes.sessions.routes_items import register_items_routes
      from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
@@ -198,7 +198,7 @@ index 8ec5c6e5ea94346a28ce8d65f04385f5e8779cb4..b2f977b3da2322d544a9e092b5bcf6bb
      from omnigent.server.routes.sessions.routes_resources import register_resources_routes
      from omnigent.server.routes.sessions.routes_ui import register_ui_routes
  
-@@ -936,6 +937,16 @@ def create_sessions_router(
+@@ -937,6 +938,16 @@ def create_sessions_router(
          pull_request_refresher=pull_request_refresher,
      )
  
@@ -216,10 +216,10 @@ index 8ec5c6e5ea94346a28ce8d65f04385f5e8779cb4..b2f977b3da2322d544a9e092b5bcf6bb
          router,
          conversation_store=conversation_store,
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index c41ba86e3887529ad6ed86539be1d6768575e0ca..8efb684773b1972447645430d6b0fa74d4cc5051 100644
+index 05d6c1370221bfebe7ca35cba2aed1062a54e686..4c253f91dd055c4acc57babdf55b0409f415bf0b 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -323,27 +323,54 @@ async def _wake_runner_for_model_change(
+@@ -394,28 +394,58 @@ async def _wake_runner_for_model_change(
      runner_router: RunnerRouter | None,
  ) -> Conversation:
      """Restore a sleeping native session before applying an explicit model pick."""
@@ -231,6 +231,7 @@ index c41ba86e3887529ad6ed86539be1d6768575e0ca..8efb684773b1972447645430d6b0fa74
 +        offline_message=(
 +            "Cannot switch models while the session host is offline. Reconnect the host and retry."
 +        ),
++        request=request,
 +    )
 +
 +
@@ -241,6 +242,7 @@ index c41ba86e3887529ad6ed86539be1d6768575e0ca..8efb684773b1972447645430d6b0fa74
 +    runner_router: RunnerRouter | None,
 +    *,
 +    offline_message: str,
++    request: Request | None = None,
 +) -> Conversation:
 +    """Bring a native session's runner and terminal up if it is not running.
 +
@@ -249,6 +251,7 @@ index c41ba86e3887529ad6ed86539be1d6768575e0ca..8efb684773b1972447645430d6b0fa74
 +    :param conversation_store: Store for the runner binding.
 +    :param runner_router: Routes requests to the session's runner.
 +    :param offline_message: Error message when the host is offline.
++    :param request: The client's HTTP request, or ``None`` for a server-internal wake.
 +    :returns: The refreshed conversation.
 +    :raises OmnigentError: ``runner_unavailable`` when the host is offline or
 +        the terminal does not start.
@@ -263,6 +266,7 @@ index c41ba86e3887529ad6ed86539be1d6768575e0ca..8efb684773b1972447645430d6b0fa74
          conversation_store=conversation_store,
          runner_router=runner_router,
          raise_host_refusal=True,
+         request=request,
      )
      if runner_client is None:
 -        raise OmnigentError(
@@ -640,10 +644,10 @@ index 0000000000000000000000000000000000000000..2233bde5d391a82d5641c11f262f2768
 +            host_registry=host_registry,
 +        )
 diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
-index b0a56626cb95b93c7f1890cff98345947e08b1b7..1272a8c688f21a3caff877a29ce6918e75b3f153 100644
+index f60093a4dbe0a85cde098d0939902bdf28741433..164f931a37ecbcfadb140bd707e249ee5bf64a84 100644
 --- a/omnigent/stores/conversation_store/__init__.py
 +++ b/omnigent/stores/conversation_store/__init__.py
-@@ -1175,6 +1175,19 @@ class ConversationStore(ABC):
+@@ -1244,6 +1244,19 @@ class ConversationStore(ABC):
          """
          ...
  
@@ -664,10 +668,10 @@ index b0a56626cb95b93c7f1890cff98345947e08b1b7..1272a8c688f21a3caff877a29ce6918e
      def update_conversation_with_changes(
          self,
 diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
-index 9762063b4f00c80ec0133d0f66de2d8e32f33cdc..6b551fda60a793a06c06cf619a1533153c5a21b4 100644
+index 30189b88011ea2504e557cedca374f1464c09fdf..99b003dbfb11a293df6967416c34a31c73d041e6 100644
 --- a/omnigent/stores/conversation_store/sqlalchemy_store.py
 +++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
-@@ -4117,6 +4117,41 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4479,6 +4479,41 @@ class SqlAlchemyConversationStore(ConversationStore):
          descending_scan = is_desc if forward else not is_desc
          return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
  
@@ -710,10 +714,10 @@ index 9762063b4f00c80ec0133d0f66de2d8e32f33cdc..6b551fda60a793a06c06cf619a153315
          self,
          conversation_id: str,
 diff --git a/openapi.json b/openapi.json
-index cde2e17430372d11467b24795a33ab7b324549ed..3346d7ec84a54f7ce11bff40800fac25293e8042 100644
+index f230da8f14d53fd8099fc029caa129793e05a39a..4b37ca969de7d9c6e9c87525bb150b7925f187e6 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -3347,6 +3347,18 @@
+@@ -4168,6 +4168,18 @@
              "description": "`False` when a subscription account is not logged in.",
              "title": "Ready",
              "type": "boolean"
@@ -732,7 +736,7 @@ index cde2e17430372d11467b24795a33ab7b324549ed..3346d7ec84a54f7ce11bff40800fac25
            }
          },
          "required": [
-@@ -8242,6 +8254,60 @@
+@@ -11849,6 +11861,60 @@
          "title": "SessionProjectSummary",
          "type": "object"
        },
@@ -793,7 +797,7 @@ index cde2e17430372d11467b24795a33ab7b324549ed..3346d7ec84a54f7ce11bff40800fac25
        "SessionPullRequest": {
          "description": "A pull request linked to a session, as `GET /v1/sessions/{id}/pull-requests` lists it.",
          "properties": {
-@@ -17091,6 +17157,59 @@
+@@ -24353,6 +24419,59 @@
          ]
        }
      },
@@ -854,10 +858,10 @@ index cde2e17430372d11467b24795a33ab7b324549ed..3346d7ec84a54f7ce11bff40800fac25
        "delete": {
          "description": "Unlink a pull request from the session, whether or not its host is online.\n\nThe server's unlink stands on its own; it is also passed to the runner\nor host when one is reachable, so its local list stops reporting the PR.\n\n**Returns:** The first page of the session's remaining linked PRs.",
 diff --git a/tests/host/test_frames.py b/tests/host/test_frames.py
-index a5404464f64eb15ccacde442c00b8e32c9714bb9..7d2caa0251e09e0dbe00603b11a59eb4b385248d 100644
+index bd506700dd1e256f4b11f730c08b43cec867ba42..4af7656d2227974dca8c594ead72946b5a874cc3 100644
 --- a/tests/host/test_frames.py
 +++ b/tests/host/test_frames.py
-@@ -458,9 +458,10 @@ def test_mcp_servers_result_validates_reported_account_state(
+@@ -460,9 +460,10 @@ def test_mcp_servers_result_validates_reported_account_state(
                  {
                      "name": "claude-max2",
                      "kind": "subscription",
@@ -869,7 +873,7 @@ index a5404464f64eb15ccacde442c00b8e32c9714bb9..7d2caa0251e09e0dbe00603b11a59eb4
                  }
              ],
          ),
-@@ -489,7 +490,8 @@ def test_providers_result_drops_unknown_fields() -> None:
+@@ -491,7 +492,8 @@ def test_providers_result_drops_unknown_fields() -> None:
          )
      )
      assert isinstance(frame, HostProvidersResultFrame)
@@ -880,10 +884,10 @@ index a5404464f64eb15ccacde442c00b8e32c9714bb9..7d2caa0251e09e0dbe00603b11a59eb4
  
  def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
 diff --git a/tests/onboarding/test_subscription_accounts.py b/tests/onboarding/test_subscription_accounts.py
-index b02658a8006cba624ee5d4dd4accb12b3dde3f83..539225e50fc92cbe78b0c0302c54425fa00e3eb8 100644
+index 61be3381c16668a471f927bbf3d29eeb29427cf1..0bd69acb57231819211792faa414338542c73703 100644
 --- a/tests/onboarding/test_subscription_accounts.py
 +++ b/tests/onboarding/test_subscription_accounts.py
-@@ -372,10 +372,11 @@ def test_token_account_signs_in_with_its_token(monkeypatch: pytest.MonkeyPatch)
+@@ -373,10 +373,11 @@ def test_token_account_signs_in_with_its_token(monkeypatch: pytest.MonkeyPatch)
      assert subscription_token_env(entry) == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-max2"}
      # A token account shares the default login directory, so it sets none.
      assert subscription_home_env(entry) == {}
@@ -898,7 +902,7 @@ index b02658a8006cba624ee5d4dd4accb12b3dde3f83..539225e50fc92cbe78b0c0302c54425f
      assert row["ready"] is True
      assert "sk-ant-oat01" not in json.dumps(row)
  
-@@ -421,7 +422,11 @@ def test_provider_choices_list_family_providers_without_secrets(tmp_path: Path)
+@@ -422,7 +423,11 @@ def test_provider_choices_list_family_providers_without_secrets(tmp_path: Path)
      _write_claude_login(tmp_path / "m1")
  
      rows = provider_choices(_session_config(tmp_path), "claude-native")
@@ -1131,10 +1135,10 @@ index 0000000000000000000000000000000000000000..24f8a4df3142f347497a8b1708b71684
 +    assert store.conv.provider_override == before
 +    assert calls["stop"] == []
 diff --git a/tests/stores/test_conversation_store.py b/tests/stores/test_conversation_store.py
-index abb8b380cf2e57353ee977cabcd65a67e713e999..ce6da6a40849fb102477a0688f0352bc3486e7ac 100644
+index 275c70a43c0580f036556cb65a55724621f65d7e..3514506a82064a749d38ba697d49d6a57b7e0c8e 100644
 --- a/tests/stores/test_conversation_store.py
 +++ b/tests/stores/test_conversation_store.py
-@@ -289,6 +289,25 @@ def test_create_persists_initial_labels_and_overrides(
+@@ -491,6 +491,25 @@ def test_create_persists_initial_labels_and_overrides(
      assert fetched.harness_override == "codex-native"
  
  

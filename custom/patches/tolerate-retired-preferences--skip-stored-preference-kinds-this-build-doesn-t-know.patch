@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 17 Nov 2026 02:25:35 +0000
+Subject: [PATCH] fix(preferences): skip stored preference kinds this build
+ doesn't know
+
+A shared preference saved by a build that knows a kind (a newer release,
+or one whose kind has since been retired) made every read of that user's
+preferences fail: decoding the page validated each entry's key kind, so
+one unknown row turned GET /v1/preferences/shared, and every feature
+built on reading the set, into a 500.
+
+Reads now leave out entries and conflicts whose kind this build doesn't
+know, and log each such kind once. The rows stay stored, so a build that
+knows the kind again reads them back unchanged. Writing an unknown kind
+is still refused.
+
+Not upstream yet: proposed from fix/tolerate-retired-preferences; drop
+this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (fix: unknown stored kinds are skipped on read; no setting)
+---
+ .../preference_store/sqlalchemy_store.py      | 40 +++++++++++++++-
+ tests/stores/test_preference_store.py         | 48 +++++++++++++++++++
+ 2 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/omnigent/stores/preference_store/sqlalchemy_store.py b/omnigent/stores/preference_store/sqlalchemy_store.py
+index 7c9a4abc27d458747eed573861b0216c55e42a24..6a618e7240221f70c3f7cc7cd5e96a8671307cf6 100644
+--- a/omnigent/stores/preference_store/sqlalchemy_store.py
++++ b/omnigent/stores/preference_store/sqlalchemy_store.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ import base64
+ import hashlib
+ import json
++import logging
+ from typing import Annotated, TypeVar
+ 
+ from pydantic import BaseModel, Field
+@@ -42,8 +43,11 @@ from omnigent.preference_sync import (
+     SharedPreferenceEntry,
+     Version,
+ )
++from omnigent.preferences import PreferenceKind
+ from omnigent.server.auth import RESERVED_USER_LOCAL
+ 
++_logger = logging.getLogger(__name__)
++
+ _PREFIX = "shared.v1."
+ _META = _PREFIX + "meta"
+ _CONFIGURATION = "configuration.v1"
+@@ -104,6 +108,36 @@ def _decode(raw: bytes | str | memoryview, model: type[_Model]) -> _Model:
+     return model.model_validate_json(decode(raw, max_decoded_bytes=MAX_RECORD_BYTES) or "null")
+ 
+ 
++_KNOWN_KINDS = frozenset(kind.value for kind in PreferenceKind)
++# Retired kinds already logged, so a page read doesn't repeat the warning.
++_logged_unknown_kinds: set[str] = set()
++
++
++def _decode_known(raw: bytes | str | memoryview, model: type[_Model]) -> _Model | None:
++    """
++    Decode a stored entry or conflict, or ``None`` when its key kind is unknown here.
++
++    A kind written by another build, or retired from this one, stays stored, so
++    a build that knows it again reads it back; this build just leaves it out.
++
++    :param raw: The stored record.
++    :param model: ``SharedPreferenceEntry`` or ``PreferenceMutation``.
++    :returns: The decoded record, or ``None`` for an unknown kind.
++    """
++    text = decode(raw, max_decoded_bytes=MAX_RECORD_BYTES) or "null"
++    try:
++        key = json.loads(text).get("key")
++    except (ValueError, AttributeError):
++        key = None
++    kind = key.get("kind") if isinstance(key, dict) else None
++    if isinstance(kind, str) and kind not in _KNOWN_KINDS:
++        if kind not in _logged_unknown_kinds:
++            _logged_unknown_kinds.add(kind)
++            _logger.warning("Skipping stored preferences of unknown kind %r", kind)
++        return None
++    return model.model_validate_json(text)
++
++
+ class SqlAlchemyPreferenceStore:
+     def __init__(self, storage_location: str, *, authority_id: str) -> None:
+         self._authority = _Metadata(authority_id=authority_id).authority_id
+@@ -195,14 +229,16 @@ class SqlAlchemyPreferenceStore:
+             revision=metadata.revision,
+             next_cursor=next_cursor,
+             entries=[
+-                _decode(value, SharedPreferenceEntry)
++                entry
+                 for key, value in rows
+                 if key.startswith(_VALUE)
++                and (entry := _decode_known(value, SharedPreferenceEntry)) is not None
+             ],
+             conflicts=[
+-                _decode(value, PreferenceMutation)
++                conflict
+                 for key, value in rows
+                 if key.startswith(_CONFLICT)
++                and (conflict := _decode_known(value, PreferenceMutation)) is not None
+             ],
+         )
+ 
+diff --git a/tests/stores/test_preference_store.py b/tests/stores/test_preference_store.py
+index 51f8cb60d1bf0cc1b0781ffc6d683f555c7c5804..64f6cd680363b21fd4d321fcf56780ffe81d508c 100644
+--- a/tests/stores/test_preference_store.py
++++ b/tests/stores/test_preference_store.py
+@@ -253,6 +253,54 @@ def test_isolation_and_read_does_not_initialize(store, db_uri):
+     assert store.read(user_id="alice").entries[0].value == "model-a"
+ 
+ 
++def _store_retired_entry(store, user_id: str) -> None:
++    """Seed an entry and a conflict of a kind this build no longer knows."""
++    entry = {"key": {"kind": "retired_kind", "name": "default"}, "version": 1, "value": ["a"]}
++    conflict = {
++        "protocol_version": 1,
++        "identity": store.identity(user_id).model_dump(),
++        "operation_id": str(uuid4()),
++        "installation_id": "laptop",
++        "key": entry["key"],
++        "expected_version": 0,
++        "value": ["b"],
++    }
++    with store._session("seed_retired_kind") as session:
++        session.add_all(
++            [
++                SqlPreference(
++                    workspace_id=0,
++                    user_id=user_id,
++                    key="shared.v1.value." + "f" * 64,
++                    value=json.dumps(entry),
++                ),
++                SqlPreference(
++                    workspace_id=0,
++                    user_id=user_id,
++                    key="shared.v1.conflict." + "f" * 32,
++                    value=json.dumps(conflict),
++                ),
++            ]
++        )
++
++
++def test_read_skips_stored_kinds_this_build_does_not_know(store):
++    store.apply(mutation(store), user_id="alice")
++    _store_retired_entry(store, "alice")
++
++    page = store.read(user_id="alice")
++
++    assert [entry.key.kind for entry in page.entries] == ["model"]
++    assert page.conflicts == []
++    # The rows stay stored for a build that knows the kind.
++    with store._session("count_retired_kind") as session:
++        keys = session.scalars(select(SqlPreference.key).where(SqlPreference.user_id == "alice"))
++        assert {"shared.v1.value." + "f" * 64, "shared.v1.conflict." + "f" * 32} <= set(keys)
++    # Writing an unknown kind is still refused.
++    with pytest.raises(ValueError):
++        mutation(store, key={"kind": "retired_kind", "name": "default"}, value=["a"])
++
++
+ @pytest.mark.parametrize("same_operation", [False, True])
+ def test_concurrent_stores_preserve_competing_edits(store, db_uri, same_operation):
+     second = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")

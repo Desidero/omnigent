@@ -6,24 +6,25 @@ Subject: [PATCH] fix(claude-native): count agent-team teammates as background
 
 Claude Code lists an in-process teammate in a Stop hook's background_tasks
 with type "teammate". It was counted as a background shell, so the shell
-indicator over-counted, and a lead whose teammates were still running
-never got the delegate holdover, so it stayed Working after its turn.
+indicator over-counted, and a lead whose teammates were still running never
+got the background-agent hold, so it stayed Working after its turn.
 
-Not upstream yet: proposed alongside upstream PR #10849.
+Not upstream yet: extends upstream's background-agent hold (#12561) to
+teammates; drop this copy once it merges.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: mhavant <matthew.hoelting@avant.com>
 Docs: none (fix: teammates count as background agents for the idle fix; no setting)
 ---
  omnigent/harnesses/claude_native/bridge.py    |  5 +++-
- .../test_claude_native_bridge.py              | 26 +++++++++++++++++++
- 2 files changed, 30 insertions(+), 1 deletion(-)
+ .../test_claude_native_bridge.py              | 24 +++++++++++++++++++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
 
 diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
-index a087626af162a1e0b984c5676cdad679b9b6b173..b88f1ecad5e973915c9fd4de35bff56422a1f645 100644
+index 8a276911d0b16ad4779ff60d893c4fb44abd8513..b500267237a477d261d0f04759d95f68cf4742af 100644
 --- a/omnigent/harnesses/claude_native/bridge.py
 +++ b/omnigent/harnesses/claude_native/bridge.py
-@@ -4149,7 +4149,10 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
+@@ -4514,7 +4514,10 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
  _BACKGROUND_TASK_FORWARD_LIMIT = 100
  _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
  _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
@@ -32,22 +33,28 @@ index a087626af162a1e0b984c5676cdad679b9b6b173..b88f1ecad5e973915c9fd4de35bff564
 +_BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset(
 +    {"agent", "local_agent", "subagent", "teammate"}
 +)
+ _TURN_END_SCAN_BYTES = 256 * 1024
  
  
- def _is_background_shell(raw: object) -> bool:
 diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
-index 5332103702d003143b3013f0b713d17034ac1059..6d4d1680ac9db387431254e7c8e4f3545e52f6fb 100644
+index 42f2558ac098454b5e1432ec90a2f64dc90fc01b..b7066949675f8edde9953c34344d75ddcc56d097 100644
 --- a/tests/harnesses/claude_native/test_claude_native_bridge.py
 +++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
-@@ -12078,6 +12078,32 @@ def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
+@@ -881,6 +881,8 @@ def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
+     [
+         ([{"id": "a1", "type": "subagent", "status": "running"}], True),
+         ([{"id": "a1", "type": "local_agent"}], True),
++        # An agent-team teammate keeps the lead waiting like a sub-agent.
++        ([{"id": "t1", "type": "teammate", "status": "running"}], True),
+         ([{"id": "a1", "type": "agent", "status": "completed"}], False),
+         ([{"id": "b1", "type": "local_bash", "status": "running"}], False),
+         (None, False),
+@@ -12616,6 +12618,28 @@ def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
      ]
  
  
-+def test_hook_record_stop_counts_running_teammates_as_background_agents() -> None:
-+    """Agent-team teammates keep the lead busy like a background sub-agent.
-+
-+    They must mark a background agent running and stay out of the shell tally.
-+    """
++def test_hook_record_stop_keeps_running_teammates_out_of_the_shell_tally() -> None:
++    """Agent-team teammates are background agents, not background shells."""
 +    record = _hook_record_from_jsonl_record(
 +        _make_jsonl_record(
 +            {
@@ -65,7 +72,6 @@ index 5332103702d003143b3013f0b713d17034ac1059..6d4d1680ac9db387431254e7c8e4f354
 +    )
 +
 +    assert record.background_task_count == 0
-+    assert record.background_agent_running is True
 +    assert record.background_tasks is None
 +
 +

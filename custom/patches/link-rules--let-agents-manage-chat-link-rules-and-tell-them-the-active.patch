@@ -28,6 +28,11 @@ references in the form the chat links instead of wrapping them in code.
   a minute; native Claude and Codex get it at launch, from the runner or from
   omnigent claude/codex, so a rule changed mid-session reaches their prompt
   on the next launch. A failed read just leaves it out.
+- The instruction follows the item-label one: the native startup composer
+  (build_native_startup_instructions) takes the rules and the git workspace
+  for runner launches of Claude and Codex, and omnigent claude/codex append
+  it to the instructions they are handed, reading the rules with the client
+  they already hold.
 
 Not upstream yet: proposed from feat/chat-link-rules, the git-reference part from
 feat/git-ref-notation; drop this copy once they merge.
@@ -38,16 +43,16 @@ Signed-off-by: Desidero <desidero@gmail.com>
  docs/AGENT_YAML_SPEC.md                       |   1 +
  docs/chat-link-rules.md                       |  47 +++++
  feature-map/preferences.md                    |  19 +-
- omnigent/harnesses/claude_native/main.py      |  12 +-
- omnigent/harnesses/codex_native/main.py       |   9 +-
+ omnigent/harnesses/claude_native/main.py      |  16 +-
+ omnigent/harnesses/codex_native/main.py       |  18 +-
  omnigent/native/native_terminal.py            |  36 ++++
  omnigent/policies/builtins/safety.py          |  37 ++++
- omnigent/runner/app.py                        |  38 ++++
- omnigent/runner/native/orchestration.py       |  17 ++
+ omnigent/runner/app.py                        |  50 +++++-
+ omnigent/runner/native/orchestration.py       |  38 +++-
  omnigent/runner/pr_resource.py                |  25 +++
- omnigent/runner/tool_dispatch.py              | 121 +++++++++++++
+ omnigent/runner/tool_dispatch.py              | 120 +++++++++++++
  omnigent/runtime/policies/builder.py          |  24 ++-
- omnigent/runtime/prompt.py                    |  76 +++++++-
+ omnigent/runtime/prompt.py                    |  81 ++++++++-
  omnigent/spec/types.py                        |   2 +
  omnigent/tools/builtins/link_rules.py         |  98 ++++++++++
  omnigent/tools/manager.py                     |  15 ++
@@ -56,21 +61,21 @@ Signed-off-by: Desidero <desidero@gmail.com>
  tests/runtime/policies/test_builder.py        |  16 +-
  .../policies/test_builder_session_policies.py |   6 +-
  .../policies/test_yaml_full_roundtrip.py      |   1 +
- tests/runtime/test_prompt.py                  |  97 ++++++++++
+ tests/runtime/test_prompt.py                  |  96 ++++++++++
  tests/test_native_terminal.py                 |  26 +++
- tests/tools/test_manager.py                   |  10 +-
- 24 files changed, 909 insertions(+), 17 deletions(-)
+ tests/tools/test_manager.py                   |   9 +-
+ 24 files changed, 948 insertions(+), 26 deletions(-)
  create mode 100644 omnigent/tools/builtins/link_rules.py
  create mode 100644 tests/runner/test_link_rules_tool_dispatch.py
 
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
-index fe0f6b4c241a8775e1a9f1b73ff1f8a9d37b592f..0306ef972d1c82b50b468eac9c69c34684ce0ce9 100644
+index d8c5663b7443fe3a9704cfc868345f424f08d4d4..552a96d09d94586996e11ae2c7008368a9e4f23a 100644
 --- a/docs/AGENT_YAML_SPEC.md
 +++ b/docs/AGENT_YAML_SPEC.md
-@@ -1014,6 +1014,7 @@ tool_groups:
-   comments: false         # list_comments / update_comment
-   policies: false         # sys_add_policy / sys_policy_registry
+@@ -1178,6 +1178,7 @@ tool_groups:
    agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+   journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
+   projects: false         # sys_project_* / sys_session_update
 +  link_rules: false       # sys_link_rules (chat link rules)
  ```
  
@@ -131,10 +136,10 @@ index 98d8be8bdf83b51dc9724f6658ab8b00079609ae..97ab65eb9f6d44676cbb25c969167ff5
 +Native Claude and Codex sessions get their instructions once, at launch, so
 +they see a changed rule in their prompt only after their next launch.
 diff --git a/feature-map/preferences.md b/feature-map/preferences.md
-index a373949db27550c375bcbfea820c9a22b4558c31..143213a709e5db6624a024f965c3f7d85376858e 100644
+index 39266fe214310ac491b0698055d8d9a4fe9cb0f6..296b13b9964aa2a82b0e5864e6be4419c5fa361a 100644
 --- a/feature-map/preferences.md
 +++ b/feature-map/preferences.md
-@@ -30,7 +30,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
+@@ -27,7 +27,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
  - `chat-link-rules`: the user's [chat link rules](../docs/chat-link-rules.md),
    the `link_rules` shared preference, validated on save and served with the
    defaults by `GET`/`PUT /v1/link-rules`, edited in Settings → General → Chat
@@ -144,7 +149,7 @@ index a373949db27550c375bcbfea820c9a22b4558c31..143213a709e5db6624a024f965c3f7d8
  
  - `configuration-copy`: review, save, show and import model defaults, harness
    selection/arguments and launcher plugin opt-outs; preserve local-only values.
-@@ -106,6 +107,22 @@ cd web && npx vitest run src/lib/linkRules.test.ts \
+@@ -96,6 +97,22 @@ cd web && npx vitest run src/lib/linkRules.test.ts \
    src/pages/settings/LinkRulesSettingsGroup.test.tsx
  ```
  
@@ -168,64 +173,107 @@ index a373949db27550c375bcbfea820c9a22b4558c31..143213a709e5db6624a024f965c3f7d8
  saving machine overrides, removing a machine override,
  resolving conflicts, or continuing with temporary defaults. The API above can
 diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
-index 7e253db6ddbbe524027c4d3bdef3f135ebd34420..613b6fdf0ed9d31e6b6de677a8c2da09291af6e3 100644
+index 4969d97b3746f3becb10f60adbed56a2fd17a67b..bef3074a7f1557be1b86656bfe43cf226c6eb7fb 100644
 --- a/omnigent/harnesses/claude_native/main.py
 +++ b/omnigent/harnesses/claude_native/main.py
-@@ -157,7 +157,12 @@ from omnigent.native.native_terminal import (
+@@ -26,6 +26,7 @@ import uuid
+ 
+ from omnigent.claude_paths import claude_config_dir
+ from omnigent.llms.adapters._content import redact_binary_payloads
++from omnigent.runtime.prompt import append_framework_instructions, link_rule_instructions
+ from omnigent.runtime.tool_result_replay import (
+     blocks_from_parsed_list,
+     image_payloads_in_blocks,
+@@ -157,10 +158,14 @@ from omnigent.native.native_terminal import (
  from omnigent.native.native_terminal import (
      bind_session_runner as _bind_session_runner,
  )
--from omnigent.native.native_terminal import fetch_session_chat_features, post_initial_prompt
 +from omnigent.native.native_terminal import (
 +    fetch_git_workspace,
 +    fetch_link_rules,
-+    fetch_session_chat_features,
 +    post_initial_prompt,
 +)
  from omnigent.native.native_terminal import (
      normalize_extra_args as _normalize_extra_args,
  )
-@@ -5569,7 +5574,10 @@ async def _prepare_claude_terminal(
-                 claude_config, session_id=session_id, labels=session_labels
-             ),
-             append_system_prompt=native_startup_instructions(
--                author_instructions, await fetch_session_chat_features(client, session_id)
-+                author_instructions,
-+                await fetch_session_chat_features(client, session_id),
-+                await fetch_link_rules(client),
-+                await fetch_git_workspace(Path.cwd()),
-             ),
+-from omnigent.native.native_terminal import post_initial_prompt
+ from omnigent.native.native_terminal import (
+     request_with_429_retry as _request_with_429_retry,
+ )
+@@ -5416,7 +5421,8 @@ async def _prepare_claude_terminal(
+     :param startup_progress: Optional user-visible progress renderer,
+         e.g. a handle from :func:`runner_startup_progress`.
+     :param append_system_prompt: Session startup instructions for
+-        ``--append-system-prompt``, applied on fresh launch and cold
++        ``--append-system-prompt``, to which the user's chat-links
++        instructions are added here, applied on fresh launch and cold
+         resume only — the hot-reattach fast path below returns before
+         this is used, so it never relaunches or duplicates the flag.
+     :returns: Prepared terminal details.
+@@ -5553,6 +5559,12 @@ async def _prepare_claude_terminal(
+             "transcript forward state reset",
+             startup_progress=startup_progress,
          )
-         record_startup_event("terminal_available", session_id=session_id)
++        append_system_prompt = append_framework_instructions(
++            append_system_prompt,
++            link_rule_instructions(
++                await fetch_link_rules(client), await fetch_git_workspace(Path.cwd())
++            ),
++        )
+         # Cold-resume args first so user-supplied tail args keep their relative position.
+         _mark_startup_step(
+             startup_profiler,
 diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
-index 8ea4e4b8f3a20227853d35bb403f799ddf6ea961..7ee0abc1c1bb97c71e3e82124b5e262d04b50b5c 100644
+index 0de020a7d657af038843554d03484ec2fe1be928..417a104f82ea4cbcc55c7151a43cc2b2423f9e8b 100644
 --- a/omnigent/harnesses/codex_native/main.py
 +++ b/omnigent/harnesses/codex_native/main.py
-@@ -104,6 +104,8 @@ from omnigent.native.native_terminal import (
+@@ -103,13 +103,19 @@ from omnigent.native.native_terminal import (
+ from omnigent.native.native_terminal import (
      bind_session_runner as _bind_session_runner,
  )
- from omnigent.native.native_terminal import (
++from omnigent.native.native_terminal import (
 +    fetch_git_workspace,
 +    fetch_link_rules,
-     fetch_session_chat_features,
-     post_initial_prompt,
-     request_with_429_retry,
-@@ -1261,7 +1263,12 @@ async def _prepare_codex_terminal(
++    post_initial_prompt,
++    request_with_429_retry,
++)
+ from omnigent.native.native_terminal import (
+     normalize_extra_args as _normalize_extra_args,
+ )
+-from omnigent.native.native_terminal import post_initial_prompt, request_with_429_retry
+ from omnigent.native.native_terminal import (
+     terminal_attach_url as _attach_url,
+ )
++from omnigent.runtime.prompt import append_framework_instructions, link_rule_instructions
+ from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
+ from omnigent.util.http_retry import jittered_retry_delay
+ from omnigent.util.json_types import JsonObject as _JsonObject
+@@ -1138,7 +1144,8 @@ async def _prepare_codex_terminal(
+     :param model: Optional model id.
+     :param startup_progress: Optional user-visible progress renderer,
+         e.g. a handle from :func:`runner_startup_progress`.
+-    :param developer_instructions: Session startup instructions persisted into
++    :param developer_instructions: Session startup instructions, plus the user's
++        chat-links instructions, persisted into
+         Codex's private per-session config, applied on fresh launch and
+         cold resume only — the reattach branch below returns before this
+         is used, so it never relaunches or duplicates the value.
+@@ -1249,7 +1256,12 @@ async def _prepare_codex_terminal(
              bridge_dir=bridge_dir,
              ap_server_url=base_url,
              ap_auth_headers=headers,
--            developer_instructions=native_startup_instructions(author_instructions, chat_features),
-+            developer_instructions=native_startup_instructions(
-+                author_instructions,
-+                chat_features,
-+                await fetch_link_rules(client),
-+                await fetch_git_workspace(Path.cwd()),
+-            developer_instructions=developer_instructions,
++            developer_instructions=append_framework_instructions(
++                developer_instructions,
++                link_rule_instructions(
++                    await fetch_link_rules(client), await fetch_git_workspace(Path.cwd())
++                ),
 +            ),
              terminal_launch_args=codex_args,
              session_labels=session_labels,
          )
 diff --git a/omnigent/native/native_terminal.py b/omnigent/native/native_terminal.py
-index 6d54778392e0a440974f4ae476661ba987a7f512..dc46ed0075b3883055334333d3ca7d83405f30be 100644
+index dbb220911284746057e30f19b2d6d984c088269e..25b1e936c2963bbdcca3fa92ce7d2bf7be86b1fa 100644
 --- a/omnigent/native/native_terminal.py
 +++ b/omnigent/native/native_terminal.py
 @@ -6,11 +6,13 @@ import asyncio
@@ -239,11 +287,11 @@ index 6d54778392e0a440974f4ae476661ba987a7f512..dc46ed0075b3883055334333d3ca7d83
  
  from omnigent.host.daemon_launch import error_text
 +from omnigent.link_rules import GitWorkspace, LinkRule, LinkRuleError, validate_link_rules
- from omnigent.runtime.chat_features import (
-     DEFAULT_CHAT_FEATURES,
-     ChatFeature,
-@@ -206,6 +208,40 @@ async def fetch_session_chat_features(
-     return chat_features_from_wire(payload.get("chat_features"))
+ from omnigent.util.http_retry import bounded_retry_after_seconds
+ 
+ DAEMON_HOST_ONLINE_TIMEOUT_S = 30.0
+@@ -178,6 +180,40 @@ def terminal_attach_url(base_url: str, session_id: str, terminal_id: str) -> str
+     return urllib.parse.urlunsplit((scheme, parsed.netloc, path, "", ""))
  
  
 +async def fetch_link_rules(client: httpx.AsyncClient) -> tuple[LinkRule, ...]:
@@ -284,10 +332,10 @@ index 6d54778392e0a440974f4ae476661ba987a7f512..dc46ed0075b3883055334333d3ca7d83
      client: httpx.AsyncClient,
      session_id: str,
 diff --git a/omnigent/policies/builtins/safety.py b/omnigent/policies/builtins/safety.py
-index 05ea0428e8944e668813f24324b2e9a4d0b97422..4033c7bd2402eede77c77296e7376f89b998f4d4 100644
+index 15326413d18530486f47684a2d5889e059baaeed..7cea50906ca5e80fcbb3df3e9287f3df1baa72d4 100644
 --- a/omnigent/policies/builtins/safety.py
 +++ b/omnigent/policies/builtins/safety.py
-@@ -570,6 +570,43 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+@@ -614,6 +614,43 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
      }
  
  
@@ -332,10 +380,10 @@ index 05ea0428e8944e668813f24324b2e9a4d0b97422..4033c7bd2402eede77c77296e7376f89
  
  
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index ec17d47242341f8cf7d2ba0c98d6616694e4213d..d76d29f5801042acbd38da3a5d99601517ede43c 100644
+index 12459debb8747793b3cfdf052de31db7cb2d4026..4906bdb249739b82592740398746c4507886a8f8 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
-@@ -71,12 +71,14 @@ from omnigent.harness_plugins import (
+@@ -72,12 +72,14 @@ from omnigent.harness_plugins import (
      model_env_keys,
      spawn_env_builders,
  )
@@ -350,7 +398,7 @@ index ec17d47242341f8cf7d2ba0c98d6616694e4213d..d76d29f5801042acbd38da3a5d996015
  from omnigent.runner import native as _native
  from omnigent.runner import pending_approvals, pr_reports
  from omnigent.runner import subagent_work as _subagent_work
-@@ -216,6 +218,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
+@@ -219,6 +221,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
  from omnigent.runtime.prompt import (
      build_instructions,
      build_instructions_nullable,
@@ -358,7 +406,7 @@ index ec17d47242341f8cf7d2ba0c98d6616694e4213d..d76d29f5801042acbd38da3a5d996015
      raw_author_instructions,
  )
  from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
-@@ -233,6 +236,8 @@ _BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="run
+@@ -237,6 +240,8 @@ _BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="run
  
  # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
  _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
@@ -367,20 +415,20 @@ index ec17d47242341f8cf7d2ba0c98d6616694e4213d..d76d29f5801042acbd38da3a5d996015
  
  
  # Pending questions outlive prompt delivery; poll outside the turn watchdog.
-@@ -1398,6 +1403,10 @@ def create_runner_app(
-     # session_id → enabled chat features, seeded from the session-init snapshot
-     # and refreshed by every forwarded turn body, so a PATCH applies next turn.
-     _session_chat_features: dict[str, frozenset[ChatFeature]] = {}
+@@ -1474,6 +1479,10 @@ def create_runner_app(
+     # snapshot and updated by ``effort_change``. In-process harnesses learn the
+     # effort only from the forwarded turn body, which is built field by field.
+     _session_reasoning_effort: dict[str, str] = {}
 +    # (fetched at, rules): the user's chat link rules, re-read after a TTL.
 +    _link_rules_cache: list[tuple[float, tuple[LinkRule, ...]]] = []
 +    # workspace path → (resolved at, its git remote or None outside a checkout).
 +    _git_workspace_cache: dict[str, tuple[float, GitWorkspace | None]] = {}
-     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
+     _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool]] = {}
      _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
      _session_cursor_model_names: dict[str, dict[str, str]] = {}
-@@ -5739,6 +5748,29 @@ def create_runner_app(
-         """
-         return _resolve_turn_chat_features(_session_chat_features, conv, msg_body)
+@@ -6132,6 +6141,29 @@ def create_runner_app(
+                 if _turn_message_bodies.get(conv) is msg_body:
+                     _turn_message_bodies.pop(conv, None)
  
 +    async def _turn_link_rule_instructions(conv: str) -> list[str]:
 +        """The chat-links instructions for this turn, from rules cached briefly.
@@ -408,84 +456,91 @@ index ec17d47242341f8cf7d2ba0c98d6616694e4213d..d76d29f5801042acbd38da3a5d996015
      def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
          """Reasoning block to forward on a turn, or ``None`` when unset.
  
-@@ -5863,12 +5895,14 @@ def create_runner_app(
+@@ -6255,15 +6287,20 @@ def create_runner_app(
+             )
              # Gated harnesses use nullable to avoid the fallback literal.
              _authored_bg = raw_author_instructions(cached_spec) is not None
-             _bg_chat_features = _turn_chat_features(conv, msg_body)
 +            _bg_link_rules = await _turn_link_rule_instructions(conv)
              if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                  instructions = build_instructions_nullable(
-                     cached_spec,
-                     _raw_per_request_instructions,
-                     [],
-                     chat_features=_bg_chat_features,
+-                    cached_spec, _raw_per_request_instructions, []
++                    cached_spec,
++                    _raw_per_request_instructions,
++                    [],
 +                    framework_instructions=_bg_link_rules,
                  )
              else:
                  instructions = build_instructions(
-@@ -5876,6 +5910,7 @@ def create_runner_app(
+                     cached_spec,
                      _raw_per_request_instructions,
                      [],
-                     chat_features=_bg_chat_features,
 +                    framework_instructions=_bg_link_rules,
                  )
              # Warn once per (conversation, harness, delivery) if the agent has
              # authored instructions but the harness can't deliver them.
-@@ -6555,6 +6590,7 @@ def create_runner_app(
+@@ -6962,10 +6999,14 @@ def create_runner_app(
+                     if _instr_spec_ds is not None:
                          _per_req_instr = cast(str | None, body.get("instructions"))
                          _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
-                         _ds_chat_features = _turn_chat_features(conv_id, body)
 +                        _ds_link_rules = await _turn_link_rule_instructions(conv_id)
                          _ic_ds = InstructionComposition(
                              authored_present=_authored_ds,
                              composed=build_instructions_nullable(
-@@ -6562,6 +6598,7 @@ def create_runner_app(
-                                 _per_req_instr,
-                                 [],
-                                 chat_features=_ds_chat_features,
+-                                _instr_spec_ds, _per_req_instr, []
++                                _instr_spec_ds,
++                                _per_req_instr,
++                                [],
 +                                framework_instructions=_ds_link_rules,
                              ),
                          )
                          # Gated harnesses get nullable — skip the fallback literal.
-@@ -6577,6 +6614,7 @@ def create_runner_app(
-                                     _per_req_instr,
-                                     [],
-                                     chat_features=_ds_chat_features,
+@@ -6977,7 +7018,10 @@ def create_runner_app(
+                             _instr_body = {
+                                 **body,
+                                 "instructions": build_instructions(
+-                                    _instr_spec_ds, _per_req_instr, []
++                                    _instr_spec_ds,
++                                    _per_req_instr,
++                                    [],
 +                                    framework_instructions=_ds_link_rules,
                                  ),
                              }
                          if _authored_ds and harness_name:
 diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index a158406e3144fb6ae226149313089ceddec087c6..1f10a7a03fe324bcbd65904655b00a60cf9ae1d8 100644
+index 872b585d2d953210c0c975a9e9d5d70713a4f1da..7105fd8a29fccc08d111aac72f6e6b1e579334a0 100644
 --- a/omnigent/runner/native/orchestration.py
 +++ b/omnigent/runner/native/orchestration.py
-@@ -70,6 +70,7 @@ from omnigent.harness_plugins import native_provider_for_key
+@@ -75,6 +75,7 @@ from omnigent.harness_plugins import native_provider_for_key
  from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
  from omnigent.inference_config import ModelNotAllowedError
  from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
-+from omnigent.link_rules import LinkRule
++from omnigent.link_rules import GitWorkspace, LinkRule
  from omnigent.models.model_override import validate_model_override
  from omnigent.native.failure_telemetry import (
      FailureContext,
-@@ -81,6 +82,7 @@ from omnigent.native.native_coding_agents import (
+@@ -86,6 +87,7 @@ from omnigent.native.native_coding_agents import (
      native_coding_agent_for_terminal_name,
  )
  from omnigent.native.native_dispatch import resolve_hook
 +from omnigent.native.native_terminal import fetch_git_workspace, fetch_link_rules
  from omnigent.pi_prompt import pi_prompt_args
  from omnigent.process_logging import process_log_reference
- from omnigent.runner.resource_registry import (
-@@ -5813,6 +5815,8 @@ async def _auto_create_codex_terminal(
-                 native_startup_instructions(
-                     _native_startup_raw_instructions_from_spec(agent_spec),
-                     launch_config.chat_features,
-+                    await _launch_link_rules(server_client),
-+                    await fetch_git_workspace(workspace),
-                 ),
-                 _codex_routing_note,
-             ]
-@@ -7798,6 +7802,17 @@ def _session_init_chat_features(
-     return chat_features_from_wire(getattr(session_init.snapshot, "chat_features", None))
+ from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
+@@ -5884,7 +5886,11 @@ async def _auto_create_codex_terminal(
+     _codex_developer_instructions = "\n\n".join(
+         x
+         for x in [
+-            _native_startup_instructions_from_spec(agent_spec),
++            _native_startup_instructions_from_spec(
++                agent_spec,
++                await _launch_link_rules(server_client),
++                await fetch_git_workspace(workspace),
++            ),
+             _codex_routing_note,
+         ]
+         if x
+@@ -7870,8 +7876,21 @@ def _claude_native_pinned_provider(agent_spec: AgentSpec | ResolvedSpec | None)
+     return auth.name if isinstance(auth, ProviderAuth) else None
  
  
 +async def _launch_link_rules(
@@ -499,23 +554,62 @@ index a158406e3144fb6ae226149313089ceddec087c6..1f10a7a03fe324bcbd65904655b00a60
 +    return () if server_client is None else await fetch_link_rules(server_client)
 +
 +
- def _native_startup_raw_instructions_from_spec(
+ def _native_startup_instructions_from_spec(
      agent_spec: AgentSpec | ResolvedSpec | None,
- ) -> str | None:
-@@ -9908,6 +9923,8 @@ async def _auto_create_claude_terminal(
-                 native_startup_instructions(
-                     _native_startup_raw_instructions_from_spec(agent_spec),
-                     launch_metadata.chat_features,
++    link_rules: Sequence[LinkRule] = (),
++    git_workspace: GitWorkspace | None = None,
+ ) -> str:
+     """Compose native startup instructions without turn-bound framework metadata.
+ 
+@@ -7881,12 +7900,14 @@ def _native_startup_instructions_from_spec(
+ 
+     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+         ``spec`` attribute. ``None`` means no spec was available.
++    :param link_rules: The user's chat link rules at launch.
++    :param git_workspace: The session's git checkout, or ``None`` outside one.
+     :returns: Author instructions followed by stable framework guidance.
+     """
+     from omnigent.runtime.prompt import build_native_startup_instructions
+ 
+     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+-    return build_native_startup_instructions(spec)
++    return build_native_startup_instructions(spec, link_rules, git_workspace)
+ 
+ 
+ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+@@ -9281,8 +9302,8 @@ async def _auto_create_claude_terminal(
+     from omnigent.harnesses.claude_native.bridge import (
+         BRIDGE_ID_LABEL_KEY,
+         augment_claude_args,
+-        claude_terminal_relay_env,
+         claude_launch_config_dir,
++        claude_terminal_relay_env,
+         ensure_claude_workspace_trusted,
+         prepare_bridge_dir,
+         validate_claude_hook_interpreter_compatibility,
+@@ -9979,7 +10000,16 @@ async def _auto_create_claude_terminal(
+         model_overrides=claude_config.model_overrides if claude_config is not None else None,
+         subagent_router_dir=subagent_router_dir,
+         append_system_prompt="\n\n".join(
+-            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
++            x
++            for x in [
++                _native_startup_instructions_from_spec(
++                    agent_spec,
 +                    await _launch_link_rules(server_client),
 +                    await fetch_git_workspace(workspace),
-                 ),
-                 routed_spawn_note,
-             ]
++                ),
++                routed_spawn_note,
++            ]
++            if x
+         ),
+         allowed_tools=routed_spawn_tools,
+         # The route-turn hook is registered only when this session can
 diff --git a/omnigent/runner/pr_resource.py b/omnigent/runner/pr_resource.py
-index f78fa4a29a70c82a9ff0d455392c7f2f28653bc4..a106b06aad72fc8aaed40619fae990f3553c987b 100644
+index a44cdf0eb70529772b23e5953685a9231ea26ae6..dbd1e590da81733f5d99660dd44c6fa19d3ec8bb 100644
 --- a/omnigent/runner/pr_resource.py
 +++ b/omnigent/runner/pr_resource.py
-@@ -22,6 +22,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
+@@ -23,6 +23,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
  from contextlib import contextmanager, suppress
  from contextvars import ContextVar
  from dataclasses import dataclass
@@ -523,7 +617,7 @@ index f78fa4a29a70c82a9ff0d455392c7f2f28653bc4..a106b06aad72fc8aaed40619fae990f3
  from threading import Lock
  from typing import Any
  
-@@ -35,6 +36,7 @@ from omnigent.git_providers import (
+@@ -36,6 +37,7 @@ from omnigent.git_providers import (
      providers,
      resolve_remote,
  )
@@ -531,7 +625,7 @@ index f78fa4a29a70c82a9ff0d455392c7f2f28653bc4..a106b06aad72fc8aaed40619fae990f3
  from omnigent.runner import pr_reports
  from omnigent.runner.git_providers import (
      PR_DIFF_OBJECT,
-@@ -204,6 +206,29 @@ def resolve_provider(
+@@ -208,6 +210,29 @@ def resolve_provider(
      return _resolve(root, _default_pr(session_id, pr_url))
  
  
@@ -562,10 +656,10 @@ index f78fa4a29a70c82a9ff0d455392c7f2f28653bc4..a106b06aad72fc8aaed40619fae990f3
      """Return the provider's pull request facet, or ``None`` when it has none."""
      return load_facet(provider_id, "pull_requests") if provider_id else None
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index 3fad8be40857012417f89f48870eae4d1ea097c4..2d7e3955ff88deda1f54a246425fc44fa66187f7 100644
+index b35ba0a8cd04c26d59b2902b19ed7231a47d5b02..bd94bfa9ac26874ac95ebe1e0a47216da1cf34af 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
-@@ -36,6 +36,7 @@ from datetime import UTC, datetime
+@@ -37,6 +37,7 @@ from datetime import UTC, datetime
  from pathlib import Path
  from typing import TYPE_CHECKING, Protocol, cast
  
@@ -573,35 +667,34 @@ index 3fad8be40857012417f89f48870eae4d1ea097c4..2d7e3955ff88deda1f54a246425fc44f
  from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
  from omnigent.util.json_serialization import json_dumps_transport_safe
  from omnigent.util.json_types import JsonObject as _JsonObject
-@@ -450,6 +451,10 @@ _SCHEDULED_TASK_TOOLS = frozenset(
-     }
- )
- 
-+# Priority 5l.2: Chat link rules — the runner proxies the Omnigent server's
+@@ -489,6 +490,9 @@ _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
+ # Priority 5l.2: Owner Inbox — the runner proxies /v1/inbox/items. Registered
+ # only for agents that opt into ``tool_groups.user_inbox``.
+ _USER_INBOX_TOOLS = frozenset({"sys_user_inbox_post", "sys_user_inbox_list"})
++# Priority 5l.3: Chat link rules — the runner proxies the Omnigent server's
 +# /v1/link-rules endpoints, which validate every rule.
 +_LINK_RULE_TOOLS = frozenset({"sys_link_rules"})
-+
+ 
  # Priority 5m: Embedded-browser tools.
  # Runner dispatch POSTs a blocking action request to the server, which parks a
- # Future + publishes ``browser.action_request`` on the session stream; the
-@@ -503,6 +508,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
-     | _AGENT_TOOLS
-     | _POLICY_TOOLS
+@@ -546,6 +550,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
      | _SCHEDULED_TASK_TOOLS
+     | _JOURNAL_TOOLS
+     | _USER_INBOX_TOOLS
 +    | _LINK_RULE_TOOLS
      | _TERMINAL_TOOLS
      # ``browser_*`` must ride the native relay: the Omnigent desktop app
      # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
-@@ -915,6 +921,7 @@ _ALL_LOCAL_TOOLS = (
-     | _AGENT_TOOLS
-     | _POLICY_TOOLS
+@@ -990,6 +995,7 @@ _ALL_LOCAL_TOOLS = (
      | _SCHEDULED_TASK_TOOLS
+     | _JOURNAL_TOOLS
+     | _USER_INBOX_TOOLS
 +    | _LINK_RULE_TOOLS
  )
  _PLACEHOLDER_CWDS = (None, "", ".", "./")
  
-@@ -5218,6 +5225,118 @@ async def _execute_scheduled_task_tool(
-     return json.dumps(resp.json())
+@@ -5866,6 +5872,118 @@ async def _execute_user_inbox_tool(
+         return json.dumps({"error": f"{tool_name} failed: {exc}"})
  
  
 +_LINK_RULE_FIELDS = ("kind", "pattern", "url", "enabled", "provider", "host")
@@ -719,7 +812,7 @@ index 3fad8be40857012417f89f48870eae4d1ea097c4..2d7e3955ff88deda1f54a246425fc44f
  @dataclass
  class _ParsedTitle:
      """
-@@ -7511,6 +7630,8 @@ async def execute_tool(
+@@ -8424,6 +8542,8 @@ async def execute_tool(
                  server_client=server_client,
                  conversation_id=conversation_id,
              )
@@ -729,12 +822,12 @@ index 3fad8be40857012417f89f48870eae4d1ea097c4..2d7e3955ff88deda1f54a246425fc44f
              output = await _execute_browser_tool(
                  tool_name,
 diff --git a/omnigent/runtime/policies/builder.py b/omnigent/runtime/policies/builder.py
-index f819b7cdef27ce524e951397832c2b2724847647..abfb22df3376901ce3ed0ab838248754dc5ba6f9 100644
+index 5424ab5d925e62b1ac7a41a0eda7615d63358505..12bb073e3e3c4b0320ad3cb033b32b141bdb871a 100644
 --- a/omnigent/runtime/policies/builder.py
 +++ b/omnigent/runtime/policies/builder.py
-@@ -31,7 +31,10 @@ from omnigent.entities import Policy as StoredPolicy
- from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+@@ -32,7 +32,10 @@ from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
  from omnigent.llms.context_window import fetch_model_pricing_with_provider
+ from omnigent.models.model_override import is_databricks_model_id
  from omnigent.policies.base import Policy
 -from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 +from omnigent.policies.builtins.safety import (
@@ -744,7 +837,7 @@ index f819b7cdef27ce524e951397832c2b2724847647..abfb22df3376901ce3ed0ab838248754
  from omnigent.policies.function import resolve_function_policy
  from omnigent.policies.schema import (
      SESSION_COST_ASK_APPROVED_STATE_KEY,
-@@ -97,10 +100,21 @@ _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
+@@ -98,10 +101,21 @@ _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
      ),
  )
  
@@ -766,7 +859,7 @@ index f819b7cdef27ce524e951397832c2b2724847647..abfb22df3376901ce3ed0ab838248754
  )
  
  # The policy caches below are pure caches over the DB and are reached from
-@@ -449,10 +463,12 @@ def any_policies_apply(
+@@ -450,10 +464,12 @@ def any_policies_apply(
          ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
      """
      # The engine unconditionally injects _REQUIRED_APPROVAL_SPECS, so their
@@ -783,13 +876,13 @@ index f819b7cdef27ce524e951397832c2b2724847647..abfb22df3376901ce3ed0ab838248754
          return True
      if spec.guardrails and spec.guardrails.policies:
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..c34758f5f4d99c78c8bfca3d629f6ad0379e7f65 100644
+index 725a92d5bb591ea1fc8df975459eb244dedd4279..73ab77957a648c7537f38cb41d8a3957d3f110d7 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
 @@ -5,6 +5,7 @@ from __future__ import annotations
  import json
  import re
- from collections.abc import Iterable, Sequence
+ from collections.abc import Sequence
 +from pathlib import Path
  from typing import Any
  
@@ -806,10 +899,10 @@ index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..c34758f5f4d99c78c8bfca3d629f6ad0
 +    enabled_link_rules,
 +    git_reference_instruction,
 +)
- from omnigent.runtime.chat_features import ChatFeature, chat_feature_instructions
  from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
  from omnigent.runtime.tool_result_replay import (
-@@ -96,6 +105,60 @@ ITEM_LABEL_INSTRUCTION = (
+     image_omitted_placeholder,
+@@ -102,6 +111,60 @@ ITEM_LABEL_INSTRUCTION = (
  )
  
  
@@ -870,53 +963,55 @@ index 4e8feb6655dcdc6407a5ab0192e1b40ca8a17915..c34758f5f4d99c78c8bfca3d629f6ad0
  def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      """
      Framework instructions that apply to every turn of ``spec``.
-@@ -129,19 +192,28 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
- def native_startup_instructions(
-     author_instructions: str | None,
-     chat_features: Iterable[ChatFeature],
+@@ -267,17 +330,29 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
+     return None
+ 
+ 
+-def build_native_startup_instructions(spec: AgentSpec | None) -> str:
++def build_native_startup_instructions(
++    spec: AgentSpec | None,
 +    link_rules: Sequence[LinkRule] = (),
 +    git_workspace: GitWorkspace | None = None,
- ) -> str | None:
-     """Author instructions plus the framework text a native launch channel carries.
++) -> str:
+     """Compose author text and stable guidance for native session startup.
  
-     Native harnesses take instructions once, at launch, so only framework
--    instructions that hold for every turn of the session belong here.
-+    instructions that hold for every turn of the session belong here. A link
-+    rule changed later reaches the agent on its next launch.
+     Startup channels persist across turns, so they must not carry per-turn
+     framework metadata or guidance for tools the native harness does not expose.
++    A link rule changed later reaches the agent on its next launch.
  
-     :param author_instructions: Raw ``AgentSpec.instructions``, or ``None``.
-     :param chat_features: The session's enabled chat features.
+     :param spec: Resolved agent spec, or ``None`` when unavailable.
+-    :returns: Author instructions followed by workspace-image and item-label guidance.
 +    :param link_rules: The user's chat link rules at launch.
 +    :param git_workspace: The session's git checkout, or ``None`` outside one.
-     :returns: The combined text, or ``None`` when there is nothing to send.
++    :returns: Author instructions followed by workspace-image, item-label and
++        chat-links guidance.
      """
-     return append_framework_instructions(
-         author_instructions,
--        [ITEM_LABEL_INSTRUCTION, *chat_feature_instructions(chat_features)],
-+        [
-+            ITEM_LABEL_INSTRUCTION,
-+            *chat_feature_instructions(chat_features),
-+            *link_rule_instructions(link_rules, git_workspace),
-+        ],
-     )
+     authored = raw_author_instructions(spec) if spec is not None else None
+-    framework = (WORKSPACE_IMAGE_INSTRUCTION, ITEM_LABEL_INSTRUCTION)
++    framework = (
++        WORKSPACE_IMAGE_INSTRUCTION,
++        ITEM_LABEL_INSTRUCTION,
++        *link_rule_instructions(link_rules, git_workspace),
++    )
+     return append_framework_instructions(authored, framework) or "\n\n".join(framework)
  
  
 diff --git a/omnigent/spec/types.py b/omnigent/spec/types.py
-index d46050d81ae5357ce61b9a11472581c20ef803f5..c4f3d54c185d0239729756fe5288d89990d3560e 100644
+index ccd93ba1281a7c6827aa4104cfe07001b82eb121..a23841c3f4bd36d2fd2f91a3faf7fff10abe157b 100644
 --- a/omnigent/spec/types.py
 +++ b/omnigent/spec/types.py
-@@ -890,6 +890,7 @@ class ToolGroupsConfig:
-     :param comments: ``list_comments`` and ``update_comment``.
-     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
-     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+@@ -899,6 +899,7 @@ class ToolGroupsConfig:
+         ``sys_session_update``.
+     :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
+         which write to and read the owner's Inbox. Off by default.
 +    :param link_rules: ``sys_link_rules``, for the user's chat link rules.
      """
  
      browser: bool = True
-@@ -897,6 +898,7 @@ class ToolGroupsConfig:
-     comments: bool = True
-     policies: bool = True
-     agent_discovery: bool = True
+@@ -909,6 +910,7 @@ class ToolGroupsConfig:
+     journal: bool = True
+     projects: bool = True
+     user_inbox: bool = False
 +    link_rules: bool = True
  
  
@@ -1026,19 +1121,19 @@ index 0000000000000000000000000000000000000000..d3fd975990ef9e7e537ec4d09b5cc6dd
 +            },
 +        }
 diff --git a/omnigent/tools/manager.py b/omnigent/tools/manager.py
-index 86a4c5f773263ece4593607947beeb4d055721fa..d6aae6201adc96a259b307c70db8abd7c96e1cba 100644
+index cc8fdf8c68c2f6a02dd96640763c18975dcabb7d..ea0887a16cbebf25e45ae232f8b16a916cd95f85 100644
 --- a/omnigent/tools/manager.py
 +++ b/omnigent/tools/manager.py
-@@ -190,6 +190,7 @@ class ToolManager:
-         self._register_comment_tools()
-         self._register_policy_tools()
+@@ -200,6 +200,7 @@ class ToolManager:
          self._register_scheduled_task_tools()
+         self._register_journal_tools()
+         self._register_user_inbox_tools()
 +        self._register_link_rule_tools()
          self._register_browser_tools()
  
      def _register_policy_tools(self) -> None:
-@@ -229,6 +230,20 @@ class ToolManager:
-         ):
+@@ -262,6 +263,20 @@ class ToolManager:
+         for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
              self._tools[tool.name()] = tool
  
 +    def _register_link_rule_tools(self) -> None:
@@ -1235,7 +1330,7 @@ index 0000000000000000000000000000000000000000..c84dbf4c1eb3e673d6ae148ab73cb030
 +    }
 +    assert "provider=gitlab, host=g.example" in ask_on_link_rule_change(_event(git))["reason"]
 diff --git a/tests/runner/test_pr_resource.py b/tests/runner/test_pr_resource.py
-index 5d5293efc839e4b2a985ecd26cb8b0f720337cbc..d09b435d4c6db313169415ae3931a70c71d1b5da 100644
+index 90b31ae979ed6c26b00dd1c63fd9a69aeddbd4ca..c9bcf0bbb05e3356e63c9fd2e3e67eedf6591351 100644
 --- a/tests/runner/test_pr_resource.py
 +++ b/tests/runner/test_pr_resource.py
 @@ -21,6 +21,7 @@ from omnigent.git_providers import (
@@ -1246,7 +1341,7 @@ index 5d5293efc839e4b2a985ecd26cb8b0f720337cbc..d09b435d4c6db313169415ae3931a70c
  from omnigent.runner import github_resource, pr_resource
  from omnigent.runner.pr_resource import ProviderResolution
  from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
-@@ -471,3 +472,25 @@ def test_the_github_facet_loads_without_the_panel_module() -> None:
+@@ -484,3 +485,25 @@ def test_the_github_facet_loads_without_the_panel_module() -> None:
      )
  
      assert result.returncode == 0, result.stderr
@@ -1398,7 +1493,7 @@ index f8c4d4c643534f783cffac5e3505b6c601f1bf78..776377ab2bd9d8da5d710daae6ac9b78
  
      from omnigent.spec.types import FunctionPolicySpec
 diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
-index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..f88da7ccf6475e1f2e482c1080ba13ae7a3be85d 100644
+index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..bce089c01bb0117c4ee353cff69cae9f79563d8f 100644
 --- a/tests/runtime/test_prompt.py
 +++ b/tests/runtime/test_prompt.py
 @@ -2,12 +2,15 @@
@@ -1417,17 +1512,17 @@ index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..f88da7ccf6475e1f2e482c1080ba13ae
  from omnigent.runner.subagent_work import (
      _format_subagent_wake_notice,
  )
-@@ -22,6 +25,8 @@ from omnigent.runtime.prompt import (
-     build_instructions,
+@@ -23,6 +26,8 @@ from omnigent.runtime.prompt import (
      build_instructions_nullable,
+     build_native_startup_instructions,
      history_to_input_items,
 +    is_git_checkout,
 +    link_rule_instructions,
-     native_startup_instructions,
      raw_author_instructions,
  )
-@@ -460,6 +465,98 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
-     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+ from omnigent.spec import AgentSpec
+@@ -471,6 +476,97 @@ def test_native_startup_instructions_keep_only_stable_guidance() -> None:
+     assert build_native_startup_instructions(None) == _STABLE_GUIDANCE
  
  
 +def test_link_rule_instructions_name_each_enabled_syntax() -> None:
@@ -1446,9 +1541,8 @@ index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..f88da7ccf6475e1f2e482c1080ba13ae
 +def test_native_startup_instructions_carry_link_rules_last() -> None:
 +    """A native launch appends the chat-links instruction after the other framework text."""
 +    workspace = GitWorkspace("github", "github.com")
-+    text = native_startup_instructions("Agent prompt", frozenset(), DEFAULT_LINK_RULES, workspace)
-+    assert text is not None
-+    assert text.startswith(f"Agent prompt\n\n{ITEM_LABEL_INSTRUCTION}")
++    text = build_native_startup_instructions(_spec("Agent prompt"), DEFAULT_LINK_RULES, workspace)
++    assert text.startswith(f"Agent prompt\n\n{_STABLE_GUIDANCE}")
 +    assert text.endswith("\n\n".join(link_rule_instructions(DEFAULT_LINK_RULES, workspace)))
 +
 +
@@ -1522,17 +1616,17 @@ index 282ef96825ce1a7710ea9b4c55dbbe59a8809074..f88da7ccf6475e1f2e482c1080ba13ae
 +    assert azure is not None and "owner/repo#123" not in azure
 +
 +
- def test_native_startup_instructions_append_item_labels_after_author_text() -> None:
-     """Native launch channels carry the author text first, then the label guidance."""
-     assert native_startup_instructions("  Agent prompt  ", frozenset()) == (
+ def test_item_label_examples_match_the_chat_label_shape() -> None:
+     """Every example label must match the shape web/src/lib/itemLabels.ts renders as a chip."""
+     examples = re.findall(r"\[[^\]]*\]", ITEM_LABEL_INSTRUCTION)
 diff --git a/tests/test_native_terminal.py b/tests/test_native_terminal.py
-index 360d46aba343903a8f0f53d14e6d776255fe33ee..ab223ae891d39465f862bcfc5562fa05bc261b65 100644
+index 193c63819c81de8249ce788604b75d4f709a777b..fd60e817645d5fc8ba22bd4248dfbe0366040927 100644
 --- a/tests/test_native_terminal.py
 +++ b/tests/test_native_terminal.py
-@@ -426,3 +426,29 @@ async def test_fetch_session_chat_features(
- 
-     assert features == expected
-     assert paths == ["/v1/sessions/conv%2Fabc"]
+@@ -395,3 +395,29 @@ def test_normalize_extra_args_extra_args_wins_over_legacy_with_warning() -> None
+             extra_args=("--new",), legacy_args=("--old",), legacy_param="pi_args"
+         )
+     assert result == ("--new",)
 +
 +
 +@pytest.mark.parametrize(
@@ -1560,49 +1654,48 @@ index 360d46aba343903a8f0f53d14e6d776255fe33ee..ab223ae891d39465f862bcfc5562fa05
 +
 +    assert tuple(rule.name for rule in rules) == expected
 diff --git a/tests/tools/test_manager.py b/tests/tools/test_manager.py
-index 2e2281e4667cd0551da9243b3ed6797eabcd87cd..66db7b3f80dce2ac8165b7985784cc9a90e440e7 100644
+index 5e9b2584c452eba532da102b2b273f165364895d..c34dd813d2acfcaf677fa87e07f39922bd6fe37f 100644
 --- a/tests/tools/test_manager.py
 +++ b/tests/tools/test_manager.py
-@@ -88,6 +88,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
-         "sys_scheduled_task_list",
-         "sys_scheduled_task_update",
-         "sys_scheduled_task_delete",
+@@ -106,6 +106,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
+         "sys_workflow_save",
+         "sys_workflow_load",
+         "sys_workflow_list",
 +        # The chat link-rule tool is auto-registered like the
 +        # scheduled-task tools; every change asks the user first.
 +        "sys_link_rules",
          # Embedded-browser tools are always auto-registered (framework-
          # owned) so any agent can drive the desktop app's browser without
          # the spec opting in. Schema-only; runner-dispatched.
-@@ -1725,6 +1728,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
-     "comments": frozenset({"list_comments", "update_comment"}),
-     "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
-     "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
+@@ -1748,6 +1751,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
+     "projects": frozenset(
+         {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
+     ),
 +    "link_rules": frozenset({"sys_link_rules"}),
  }
  
  
-@@ -1739,7 +1743,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
- 
+@@ -1763,6 +1767,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
  
  def test_tool_groups_default_registers_every_group() -> None:
--    """An absent ``tool_groups:`` block changes nothing: all 16 register."""
+     """An absent ``tool_groups:`` block changes nothing: all 19 register."""
 +    """An absent ``tool_groups:`` block changes nothing: all 17 register."""
      names = _tool_names(_grouped_spec())
      for group, members in _TOOL_GROUP_MEMBERS.items():
          assert members <= names, f"{group} members missing by default: {members - names}"
-@@ -1757,13 +1761,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
+@@ -1780,13 +1785,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
  
  def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
      """
--    With every group off, the 16 gated tools are gone but the session
-+    With every group off, the 17 gated tools are gone but the session
+-    With every group off, the 20 gated tools are gone but the session
++    With every group off, the 22 gated tools are gone but the session
      reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
      participation and async handles depend on them, so they have no key.
      """
      names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
      gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
--    assert len(gated) == 16
-+    assert len(gated) == 17
+-    assert len(gated) == 21
++    assert len(gated) == 22
      assert not (gated & names)
      assert {
          "sys_session_list",

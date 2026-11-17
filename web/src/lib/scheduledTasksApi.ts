@@ -10,7 +10,9 @@
 // at fire time. Sandbox tasks instead accept a repository URL as workspace.
 
 import { authenticatedFetch } from "./identity";
+import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 
 export const RANDOM_WORKTREE_BASE_REF = "HEAD";
 
@@ -57,6 +59,8 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** MCP services every session the automation creates starts with. */
+  mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
@@ -71,6 +75,12 @@ export interface ScheduledTask {
   executionTarget: ScheduledTaskExecutionTarget;
   /** Project every fired session is filed into, or `null` to leave them unfiled. */
   projectId: string | null;
+  /**
+   * The session every run copies: a session the server copied when
+   * the automation was created from a session. Each run starts a new session
+   * with this session's history. `null`/absent for ordinary automations.
+   */
+  sourceSessionId?: string | null;
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
@@ -106,6 +116,11 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /**
+   * The server's description of the failure, e.g. a sandbox provider's recovery
+   * steps, capped server-side; `null` when the run recorded none.
+   */
+  errorDetail: string | null;
   /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
   conversationUpdatedAt: number | null;
   /**
@@ -153,6 +168,8 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
+  /** MCP services every run starts with; omit for none. */
+  mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
@@ -168,6 +185,13 @@ export interface CreateScheduledTaskInput {
   executionTarget?: ScheduledTaskExecutionTarget;
   /** File every fired session into this existing project. */
   projectId?: string | null;
+  /**
+   * Create the automation from this session: the server copies it into the
+   * automation's project, and every run starts a new
+   * session from that copy. `prompt` then holds only additional instructions
+   * and may be empty. The created task's `sourceSessionId` is the copy's id.
+   */
+  sourceSessionId?: string;
 }
 
 /**
@@ -190,6 +214,8 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  /** Replaces the MCP services; `[]` clears them. */
+  mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
   /** `null` makes a `"continue"` task's next run start the session later runs continue. */
   sessionId?: string | null;
@@ -222,6 +248,7 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
@@ -230,6 +257,7 @@ interface ScheduledTaskWire {
   execution_target: ScheduledTaskExecutionTarget;
   // Absent on servers that predate task projects.
   project_id?: string | null;
+  source_session_id?: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
@@ -249,6 +277,7 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  error_detail?: string | null;
   conversation_updated_at: number | null;
   conversation_status: string | null;
   viewer_last_seen: number | null;
@@ -309,6 +338,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
@@ -316,6 +346,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
     projectId: wire.project_id ?? null,
+    sourceSessionId: wire.source_session_id ?? null,
     state: wire.state,
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
@@ -336,6 +367,7 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    errorDetail: wire.error_detail ?? null,
     conversationUpdatedAt: wire.conversation_updated_at ?? null,
     conversationStatus: wire.conversation_status ?? null,
     viewerLastSeen: wire.viewer_last_seen ?? null,
@@ -363,6 +395,59 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
   return (body.runs ?? []).map(runFromWire);
 }
 
+/** The latest plan within a run: its steps and each step's newest status. */
+export interface ScheduledTaskRunSteps {
+  runId: string;
+  planId: string | null;
+  /** Graph ID, or latest legacy plan position; absent on older servers. */
+  planGraphRevision?: string | number;
+  isCurrent: boolean;
+  /** The saved workflow the plan runs, when it named one. */
+  workflowId: string | null;
+  planName: string | null;
+  steps: JournalPlanStep[];
+  statuses: JournalEntry[];
+}
+
+/**
+ * The plan steps of one page of a task's runs, most recent first, paged like
+ * {@link listScheduledTaskRuns}. Runs that wrote no plan are left out.
+ *
+ * @param after - The ID of the run before the page, e.g. the previous page's last.
+ */
+export async function listScheduledTaskRunSteps(
+  id: string,
+  { limit, after }: { limit: number; after?: string },
+): Promise<ScheduledTaskRunSteps[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/run-steps?${params}`,
+  );
+  const body = await readJsonOrThrow<{
+    runs?: {
+      run_id: string;
+      plan_id?: string;
+      plan_graph_revision?: string | number | null;
+      is_current?: boolean;
+      workflow_id: string | null;
+      plan_name?: string | null;
+      steps: JournalPlanStep[];
+      statuses: JournalEntry[];
+    }[];
+  }>(res);
+  return (body.runs ?? []).map((run) => ({
+    runId: run.run_id,
+    planId: run.plan_id ?? null,
+    planGraphRevision: run.plan_graph_revision ?? undefined,
+    isCurrent: run.is_current === true,
+    workflowId: run.workflow_id,
+    planName: run.plan_name ?? null,
+    steps: run.steps,
+    statuses: run.statuses,
+  }));
+}
+
 /**
  * Create a scheduled task. Only the fields the user actually set are sent, so
  * the server applies its own defaults (`timezone` → UTC) and the optional
@@ -380,12 +465,14 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.projectId != null) body.project_id = input.projectId;
+  if (input.sourceSessionId != null) body.source_session_id = input.sourceSessionId;
   const templateId = input.templateId ?? "custom";
   const interaction = startTimedInteraction("create_scheduled_task", undefined, templateId);
   try {
@@ -395,6 +482,8 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
         "Content-Type": "application/json",
         "x-omnigent-automation-source": "ui",
         "x-omnigent-automation-template": templateId,
+        // The source copy takes its browser tools mode from this request.
+        ...browserAgentToolsRequestHeaders(),
       },
       body: JSON.stringify(body),
     });
@@ -425,6 +514,7 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.sessionId !== undefined) body.session_id = input.sessionId;

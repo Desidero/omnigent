@@ -44,17 +44,17 @@ Docs: none (documented with its series in docs/providers.md)
  omnigent/runtime/workflow.py                  |   6 +
  tests/cli/test_configure_models.py            |  45 +++-
  tests/onboarding/test_harness_install.py      |   2 +-
- .../onboarding/test_subscription_accounts.py  | 240 ++++++++++++++++++
+ .../onboarding/test_subscription_accounts.py  | 241 ++++++++++++++++++
  tests/runtime/test_provider_spawn_env.py      |  59 +++++
- 15 files changed, 766 insertions(+), 36 deletions(-)
+ 15 files changed, 767 insertions(+), 36 deletions(-)
  create mode 100644 omnigent/onboarding/subscription_accounts.py
  create mode 100644 tests/onboarding/test_subscription_accounts.py
 
 diff --git a/omnigent/cli_config.py b/omnigent/cli_config.py
-index 41059a47d572b650e8de324ff6394eac51f61009..098607e7a1266efa15b62d66a0b8f6b26fc6ee1a 100644
+index 775ef2b0594e0d254c2156c18873529e2e9a4521..fca55671acb814d9d69879fd5dab80c3b4cf4782 100644
 --- a/omnigent/cli_config.py
 +++ b/omnigent/cli_config.py
-@@ -622,6 +622,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
+@@ -621,6 +621,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
          OPENAI_FAMILY,
          PI_SURFACE,
          RESPONSES_WIRE_API,
@@ -62,7 +62,7 @@ index 41059a47d572b650e8de324ff6394eac51f61009..098607e7a1266efa15b62d66a0b8f6b2
          SUBSCRIPTION_KIND,
          load_providers,
          provider_entry_settings,
-@@ -825,22 +826,41 @@ def _configure_harness_add(family: str | None = None) -> str | None:
+@@ -824,22 +825,41 @@ def _configure_harness_add(family: str | None = None) -> str | None:
              raise click.ClickException("internal: subscription option missing a cli login")
          from omnigent.onboarding.configure_models import cli_display_name
  
@@ -112,7 +112,7 @@ index 41059a47d572b650e8de324ff6394eac51f61009..098607e7a1266efa15b62d66a0b8f6b2
                  return None
          # CLIs listed in _CLI_LOGIN_BRAND (claude / codex) require a login step.
          # CLIs not listed (pi) manage their own auth — no login step needed.
-@@ -857,8 +877,13 @@ def _configure_harness_add(family: str | None = None) -> str | None:
+@@ -856,8 +876,13 @@ def _configure_harness_add(family: str | None = None) -> str | None:
              # once the CLI is actually authenticated — otherwise we'd persist a
              # phantom subscription that strands the user at the harness's own login
              # screen at run time (the exact bug this whole flow fixes).
@@ -127,10 +127,10 @@ index 41059a47d572b650e8de324ff6394eac51f61009..098607e7a1266efa15b62d66a0b8f6b2
                  return f"✗ {disp} login not completed — subscription not added"
          # Drop the existing subscription(s) now that we know we're proceeding.
          # Done after any login so a failed login leaves the existing entry intact.
-@@ -867,9 +892,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
-             if isinstance(block, dict):
-                 remaining = {k: v for k, v in block.items() if k not in existing_subs}
+@@ -868,9 +893,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
                  _save_global_config({"providers": remaining})
+         # Signing in again re-enables a login dismissed when setup removed an invalid entry.
+         _clear_detection_dismissal(cli_name)
 -        # Subscription name is derived from the CLI — no prompt.
 -        name = f"{cli_name}-subscription"
 -        entry = build_subscription_provider_entry(cli_name)
@@ -140,7 +140,7 @@ index 41059a47d572b650e8de324ff6394eac51f61009..098607e7a1266efa15b62d66a0b8f6b2
  
      elif kind == "gateway":
          gemini_gateway = family == GEMINI_FAMILY
-@@ -3258,6 +3283,13 @@ def _remove_subscription(provider: str, family: str) -> str | None:
+@@ -3259,6 +3284,13 @@ def _remove_subscription(provider: str, family: str) -> str | None:
          if spec is not None and spec.logout_args is not None
          else "logout"
      )
@@ -154,7 +154,7 @@ index 41059a47d572b650e8de324ff6394eac51f61009..098607e7a1266efa15b62d66a0b8f6b2
      choice = select(
          f"Remove {disp} subscription?",
          [f"Yes — sign out of {disp} and remove", "No — keep it"],
-@@ -3271,7 +3303,7 @@ def _remove_subscription(provider: str, family: str) -> str | None:
+@@ -3272,7 +3304,7 @@ def _remove_subscription(provider: str, family: str) -> str | None:
      )
      if choice != 0:
          return None
@@ -164,7 +164,7 @@ index 41059a47d572b650e8de324ff6394eac51f61009..098607e7a1266efa15b62d66a0b8f6b2
      # we say so, since the standalone login may persist (and be re-detected).
      _remove_credential(provider)
 diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
-index 536e2f6b971311ae54feb591c07ed1d3ab5bd82d..82398ba50b494fd514044c55b7b6102d75595c76 100644
+index 5a789de93d06af63b3a69846bf110da05586e3bc..6726b8d032ad699902d1070595ad1d05ab0f385d 100644
 --- a/omnigent/harnesses/claude_native/main.py
 +++ b/omnigent/harnesses/claude_native/main.py
 @@ -24,6 +24,7 @@ import subprocess
@@ -175,7 +175,7 @@ index 536e2f6b971311ae54feb591c07ed1d3ab5bd82d..82398ba50b494fd514044c55b7b6102d
  from omnigent.llms.adapters._content import redact_binary_payloads
  from omnigent.runtime.tool_result_replay import (
      blocks_from_parsed_list,
-@@ -1832,6 +1833,10 @@ def run_claude_native(
+@@ -1837,6 +1838,10 @@ def run_claude_native(
      # the in-process claude-sdk harness. ``use_claude_config`` forces the
      # CLI's own ~/.claude config (skips all of it).
      startup_profiler.mark("resolving claude config")
@@ -186,7 +186,7 @@ index 536e2f6b971311ae54feb591c07ed1d3ab5bd82d..82398ba50b494fd514044c55b7b6102d
      claude_config = None if use_claude_config else resolve_native_claude_config(spec=None)
      startup_profiler.mark(
          "claude config resolved",
-@@ -3737,7 +3742,7 @@ def resolve_native_claude_config(
+@@ -3742,7 +3747,7 @@ def resolve_native_claude_config(
          load_config,
      )
      from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
@@ -195,7 +195,7 @@ index 536e2f6b971311ae54feb591c07ed1d3ab5bd82d..82398ba50b494fd514044c55b7b6102d
  
      inference_config = load_runtime_inference_config(load_config())
      binding = binding_for_harness(inference_config, "claude-native")
-@@ -3764,6 +3769,14 @@ def resolve_native_claude_config(
+@@ -3769,6 +3774,14 @@ def resolve_native_claude_config(
          entry = _resolve_provider_for_build(
              spec, harness_type="claude-sdk", actual_harness="claude-native"
          )
@@ -211,10 +211,10 @@ index 536e2f6b971311ae54feb591c07ed1d3ab5bd82d..82398ba50b494fd514044c55b7b6102d
              return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
          ucode_config = _ucode_config_for_profile(
 diff --git a/omnigent/harnesses/codex_native/app_server.py b/omnigent/harnesses/codex_native/app_server.py
-index e1ac9aa556ca89ba7e4c57f497f18325e3324016..9d8d47afba0841e85e471c59349f0301c3f95150 100644
+index e51eb280dabadb0ef71be4b6ee9b8af553593387..d94ab08e17d2aa217e322c59a494a275313c2a88 100644
 --- a/omnigent/harnesses/codex_native/app_server.py
 +++ b/omnigent/harnesses/codex_native/app_server.py
-@@ -4608,6 +4608,15 @@ def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
+@@ -4762,6 +4762,15 @@ def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
      return effective_self_sufficient_builtin_provider(config)
  
  
@@ -230,8 +230,8 @@ index e1ac9aa556ca89ba7e4c57f497f18325e3324016..9d8d47afba0841e85e471c59349f0301
  def _resolve_subscription_launch(
      entry: ProviderEntry, model: str | None, explicit: dict[str, object]
  ) -> NativeCodexLaunch:
-@@ -4634,7 +4643,7 @@ def _resolve_subscription_launch(
-     # Gateway), which would silently hijack a Subscription selection. A
+@@ -4788,7 +4797,7 @@ def _resolve_subscription_launch(
+     # Gateway provider), which would silently hijack a Subscription selection. A
      # no-op when the user's config sets no custom default.
      subscription_overrides = ['model_provider="openai"']
 -    if _codex_login_usable():
@@ -239,7 +239,7 @@ index e1ac9aa556ca89ba7e4c57f497f18325e3324016..9d8d47afba0841e85e471c59349f0301
          log_info_once(
              _logger,
              "native-codex routing: Codex CLI login (subscription provider %r; Codex is logged in)",
-@@ -4646,7 +4655,14 @@ def _resolve_subscription_launch(
+@@ -4800,7 +4809,14 @@ def _resolve_subscription_launch(
              profile=None,
              summary=f"Codex CLI login (subscription provider {entry.name!r}; Codex is logged in)",
          )
@@ -255,7 +255,7 @@ index e1ac9aa556ca89ba7e4c57f497f18325e3324016..9d8d47afba0841e85e471c59349f0301
      if fallback is not None:
          return fallback
      log_info_once(
-@@ -4780,6 +4796,11 @@ def resolve_native_codex_launch(
+@@ -4934,6 +4950,11 @@ def resolve_native_codex_launch(
          )
          if spec_entry is not None:
              if spec_entry.kind == SUBSCRIPTION_KIND:
@@ -268,7 +268,7 @@ index e1ac9aa556ca89ba7e4c57f497f18325e3324016..9d8d47afba0841e85e471c59349f0301
                  # logged in or not. The machine-default path would substitute
                  # the first OTHER routable provider on a logged-out Codex
 diff --git a/omnigent/harnesses/codex_native/main.py b/omnigent/harnesses/codex_native/main.py
-index 7a1fb7790aad25f97b5d2fd429533d33d33b028f..d8d732928df18da5d754a64cd66a851b87cc1d91 100644
+index 74dd42919c5f9705f63790986a60bc5b653e4e87..f185579db847d0cc3891a75f5b50a8b5b927b738 100644
 --- a/omnigent/harnesses/codex_native/main.py
 +++ b/omnigent/harnesses/codex_native/main.py
 @@ -467,6 +467,9 @@ def run_codex_native(
@@ -282,10 +282,10 @@ index 7a1fb7790aad25f97b5d2fd429533d33d33b028f..d8d732928df18da5d754a64cd66a851b
          raise click.ClickException(
              "Codex requires a resolved Omnigent server URL. The CLI should call "
 diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
-index be33f18be4a02af4bb2c2ab91dd65e17bc00d3e6..4a62becb0d334626ff5e1cbd642cd32e181a490b 100644
+index 09c52b79756aa4328ba9077cee9d082aa7958e8a..325a9a4bf51b4d9d4206817448e6b292c94ea459 100644
 --- a/omnigent/host/connect.py
 +++ b/omnigent/host/connect.py
-@@ -2187,6 +2187,13 @@ class HostProcess:
+@@ -2216,6 +2216,13 @@ class HostProcess:
                      frame, f"Cannot install session inference config: {exc}"
                  )
              env["OMNIGENT_INFERENCE_CONFIG"] = str(inference_path)
@@ -300,7 +300,7 @@ index be33f18be4a02af4bb2c2ab91dd65e17bc00d3e6..4a62becb0d334626ff5e1cbd642cd32e
          # pass it so runner-level log records can be attributed to that session.
          if frame.session_id:
 diff --git a/omnigent/onboarding/configure_models.py b/omnigent/onboarding/configure_models.py
-index 414ff5f34912b3573c8e05dc72f28eab194fbbf5..c3ba5b6cf19084a94a26851446b7a47ff9453187 100644
+index 5d34e0ecd749e90423780d8408868fbde51b6429..33706ff0c437311032886b4f77e8ad1aff334d80 100644
 --- a/omnigent/onboarding/configure_models.py
 +++ b/omnigent/onboarding/configure_models.py
 @@ -726,6 +726,9 @@ def _subscription_auth_summary(entry: ProviderEntry) -> str:
@@ -339,7 +339,7 @@ index 414ff5f34912b3573c8e05dc72f28eab194fbbf5..c3ba5b6cf19084a94a26851446b7a47f
  
  def build_cli_config_provider_entry(
 diff --git a/omnigent/onboarding/harness_install.py b/omnigent/onboarding/harness_install.py
-index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e64882201 100644
+index 9a805ade0ee674526bb38387167a9ae44f631419..32647d003aaf2e3ccc193cf4df86cf4b2eef1dda 100644
 --- a/omnigent/onboarding/harness_install.py
 +++ b/omnigent/onboarding/harness_install.py
 @@ -45,6 +45,7 @@ import sys
@@ -350,7 +350,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
  from pathlib import Path
  from typing import NamedTuple
  
-@@ -842,7 +843,7 @@ READINESS_CLI_PROBE_TIMEOUT_S = 10.0
+@@ -843,7 +844,7 @@ READINESS_CLI_PROBE_TIMEOUT_S = 10.0
  # Cache successful probes to limit subprocess churn during readiness checks.
  # Launchers can delegate to an updated executable without changing themselves.
  _VERSION_PROBE_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
@@ -401,7 +401,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
      with _PROBE_CACHE_LOCK:
          if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
              return True
-@@ -1449,6 +1467,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
+@@ -1448,6 +1466,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
              capture_output=True,
              text=True,
              cwd=probe_cwd,
@@ -409,7 +409,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
          )
      except (OSError, subprocess.TimeoutExpired):
          return False
-@@ -1475,7 +1494,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
+@@ -1474,7 +1493,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
      return logged_in
  
  
@@ -418,7 +418,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
      """Run the harness CLI's interactive subscription login; return logged-in state.
  
      Lets ``configure harnesses`` be the single place to sign in: when the user
-@@ -1489,6 +1508,8 @@ def harness_login(key: str) -> bool:
+@@ -1488,6 +1507,8 @@ def harness_login(key: str) -> bool:
  
      :param key: A harness family, ``"anthropic"`` (Claude), ``"openai"``
          (Codex), or ``"gemini"`` (Antigravity).
@@ -427,7 +427,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
      :returns: ``True`` when the harness CLI is logged in after the attempt
          (including the already-logged-in short-circuit); ``False`` when the key
          has no login command, the CLI binary is missing, the login process
-@@ -1501,7 +1522,7 @@ def harness_login(key: str) -> bool:
+@@ -1500,7 +1521,7 @@ def harness_login(key: str) -> bool:
      if binary is None:
          return False
      argv_binary = binary if key == GEMINI_FAMILY else spec.binary
@@ -436,7 +436,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
          return True
      try:
          # Open /dev/tty explicitly so the child process sees a real TTY even
-@@ -1520,19 +1541,25 @@ def harness_login(key: str) -> bool:
+@@ -1519,19 +1540,25 @@ def harness_login(key: str) -> bool:
          try:
              if tty_fd is not None:
                  subprocess.run(
@@ -466,7 +466,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
      """Run the harness CLI's logout; return whether it is now logged out.
  
      Drives the harness's own logout command (``claude auth logout`` /
-@@ -1543,6 +1570,8 @@ def harness_logout(key: str) -> bool:
+@@ -1542,6 +1569,8 @@ def harness_logout(key: str) -> bool:
  
      :param key: A harness family, ``"anthropic"`` (Claude) or ``"openai"``
          (Codex).
@@ -475,7 +475,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
      :returns: ``True`` when the harness CLI is logged out after the attempt;
          ``False`` when the key has no logout command, the binary is missing, the
          process failed to spawn, or a login still resolves afterward.
-@@ -1553,7 +1582,9 @@ def harness_logout(key: str) -> bool:
+@@ -1552,7 +1581,9 @@ def harness_logout(key: str) -> bool:
      if shutil.which(spec.binary) is None:
          return False
      try:
@@ -486,7 +486,7 @@ index 0c8d977a9b9f2d18701a5acef0e6e99e5f4b1edd..ea85e12d9d49484b1bb6ba2f9597de5e
      except (OSError, subprocess.TimeoutExpired):
          return False
      # Drop cached logged-in verdicts so the confirmation below re-probes —
-@@ -1561,4 +1592,4 @@ def harness_logout(key: str) -> bool:
+@@ -1560,4 +1591,4 @@ def harness_logout(key: str) -> bool:
      with _PROBE_CACHE_LOCK:
          for cache_key in [k for k in _LOGIN_PROBE_CACHE if k[0] == key]:
              del _LOGIN_PROBE_CACHE[cache_key]
@@ -546,7 +546,7 @@ index fd8a47586a5ec3b6f841a08aa72392b5b58ce9d8..bb73763a4f87268ca8211c95909204ae
          True
          if harness_cli_logged_in(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
 diff --git a/omnigent/onboarding/provider_config.py b/omnigent/onboarding/provider_config.py
-index 77d6d52fe2d1a8f1526e069a01d4208673b46136..f2b23ff6d46876d11ed758820943aee4c4ecf459 100644
+index f532745ff8d9f0428be6d35999529fdcacb25f46..2217bac7801483ef89df8e1d85b6a01b543e1ab9 100644
 --- a/omnigent/onboarding/provider_config.py
 +++ b/omnigent/onboarding/provider_config.py
 @@ -48,6 +48,7 @@ from __future__ import annotations
@@ -859,10 +859,10 @@ index 0000000000000000000000000000000000000000..4c73e577e24fb04662217fcb5140ef0d
 +    if entry is not None:
 +        target.update(subscription_home_env(entry))
 diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
-index 65380a1327e4c6535d5b9a14ca94f2c23fff0aa0..0f6dcf430ab7a268ae0b465efff85c896417cb36 100644
+index c2d2841b5c5a2fa238546217a3fe79cb63edd644..ae39624722493d1bcf1d76b9d51ba4057990a942 100644
 --- a/omnigent/runtime/workflow.py
 +++ b/omnigent/runtime/workflow.py
-@@ -690,6 +690,12 @@ def configure_agent_harness_with_provider(
+@@ -694,6 +694,12 @@ def configure_agent_harness_with_provider(
              # the ChatGPT login — a no-op when the user's config sets no
              # custom default.
              env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
@@ -876,7 +876,7 @@ index 65380a1327e4c6535d5b9a14ca94f2c23fff0aa0..0f6dcf430ab7a268ae0b465efff85c89
  
      if entry.kind == CLI_CONFIG_KIND:
 diff --git a/tests/cli/test_configure_models.py b/tests/cli/test_configure_models.py
-index f144413c6e620ce0acb9e7ef2e5a98df7d65da26..a8e17e8fd186244f455b65f6df9eca8815f288a2 100644
+index fb5d866cdf5f6c2005ae84d93e7d7dcd497fd1d5..bb84d85788bf9ae16fcd7661780f36efc793e030 100644
 --- a/tests/cli/test_configure_models.py
 +++ b/tests/cli/test_configure_models.py
 @@ -126,11 +126,11 @@ def _harnesses_installed(monkeypatch):
@@ -893,16 +893,16 @@ index f144413c6e620ce0acb9e7ef2e5a98df7d65da26..a8e17e8fd186244f455b65f6df9eca88
      )
      monkeypatch.setattr(
          "omnigent.onboarding.harness_install.harness_cli_logged_in",
-@@ -821,7 +821,7 @@ def test_add_subscription_invokes_harness_login(isolated_config, monkeypatch) ->
+@@ -822,7 +822,7 @@ def test_add_subscription_invokes_harness_login(isolated_config, monkeypatch) ->
      calls: list[str] = []
      monkeypatch.setattr(
          "omnigent.onboarding.harness_install.harness_login",
 -        lambda family: calls.append(family) or True,
 +        lambda family, **_: calls.append(family) or True,
      )
-     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"  # Claude → +Add → subscription
-     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
-@@ -839,7 +839,9 @@ def test_add_subscription_aborts_when_login_fails(isolated_config, monkeypatch)
+     (isolated_config / "config.yaml").write_text(
+         yaml.safe_dump({"dismissed_detections": ["claude", "ollama"]})
+@@ -845,7 +845,9 @@ def test_add_subscription_aborts_when_login_fails(isolated_config, monkeypatch)
      must not persist a subscription entry — otherwise routing would later strand
      the user at the harness's own login screen, exactly what we're fixing.
      """
@@ -913,7 +913,7 @@ index f144413c6e620ce0acb9e7ef2e5a98df7d65da26..a8e17e8fd186244f455b65f6df9eca88
      stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"  # Claude → +Add → subscription
      result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
      assert result.exit_code == 0, result.output
-@@ -863,7 +865,7 @@ def test_remove_subscription_signs_out_and_removes(isolated_config, monkeypatch)
+@@ -869,7 +871,7 @@ def test_remove_subscription_signs_out_and_removes(isolated_config, monkeypatch)
      calls: list[str] = []
      monkeypatch.setattr(
          "omnigent.onboarding.harness_install.harness_logout",
@@ -922,7 +922,7 @@ index f144413c6e620ce0acb9e7ef2e5a98df7d65da26..a8e17e8fd186244f455b65f6df9eca88
      )
      # L1 1=Claude → L2 1=select the subscription → L3 2=Remove → confirm 1=Yes
      # (sign out + remove) → L2 q → L1 q.
-@@ -1154,6 +1156,39 @@ def test_add_subscription_keep_current_aborts(isolated_config) -> None:
+@@ -1160,6 +1162,39 @@ def test_add_subscription_keep_current_aborts(isolated_config) -> None:
      assert get_default_provider(cfg, "anthropic").name == "claude"
  
  
@@ -963,10 +963,10 @@ index f144413c6e620ce0acb9e7ef2e5a98df7d65da26..a8e17e8fd186244f455b65f6df9eca88
      """A second API key from a new source coexists with the first.
  
 diff --git a/tests/onboarding/test_harness_install.py b/tests/onboarding/test_harness_install.py
-index 8509e59cbac16f9b0496c3424a6b4b97052cd060..95c698a700d71848fc041d73a8e885b6a0f6e7fa 100644
+index 4f55c6885c661a384856d971f0952878453ddad2..416748156d56be31e91ea24955dc429dac484c7e 100644
 --- a/tests/onboarding/test_harness_install.py
 +++ b/tests/onboarding/test_harness_install.py
-@@ -1532,7 +1532,7 @@ def test_harness_logout_runs_cli_logout_then_verifies(
+@@ -1534,7 +1534,7 @@ def test_harness_logout_runs_cli_logout_then_verifies(
          lambda k: state["logged_in"],
      )
  
@@ -977,10 +977,10 @@ index 8509e59cbac16f9b0496c3424a6b4b97052cd060..95c698a700d71848fc041d73a8e885b6
          return subprocess.CompletedProcess(args=argv, returncode=0)
 diff --git a/tests/onboarding/test_subscription_accounts.py b/tests/onboarding/test_subscription_accounts.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2e706b5059e19128afa226a54115b1561d272db5
+index 0000000000000000000000000000000000000000..b81d0d09b151b6d414bfbe12543f8fd57eb299cf
 --- /dev/null
 +++ b/tests/onboarding/test_subscription_accounts.py
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,241 @@
 +"""Tests for subscription accounts with their own login directory."""
 +
 +from __future__ import annotations
@@ -1164,6 +1164,7 @@ index 0000000000000000000000000000000000000000..2e706b5059e19128afa226a54115b156
 +
 +    monkeypatch.setattr(harness_install.shutil, "which", lambda _b: "/usr/bin/claude")
 +    monkeypatch.setattr(harness_install.subprocess, "run", fake_run)
++    monkeypatch.setattr(harness_install, "run_isolated", fake_run)
 +    monkeypatch.setattr(harness_install.sys.stdin, "isatty", lambda: True)
 +
 +    harness_install.harness_login("anthropic", env={"CLAUDE_CONFIG_DIR": "/tmp/acct"})
@@ -1222,10 +1223,10 @@ index 0000000000000000000000000000000000000000..2e706b5059e19128afa226a54115b156
 +
 +    assert launch.login_required
 diff --git a/tests/runtime/test_provider_spawn_env.py b/tests/runtime/test_provider_spawn_env.py
-index e96895cc520dcb88cf54267d77af066e434f269a..a8b52e6d9c9bdfbe4f0f509a9fa1a5a0524e8878 100644
+index 7222a279a557cc29c843795dc49060c4adf66d71..c6ee7f9d1d1dff5d1b7bfdbaeb7dfaf9969cb9a6 100644
 --- a/tests/runtime/test_provider_spawn_env.py
 +++ b/tests/runtime/test_provider_spawn_env.py
-@@ -1705,6 +1705,65 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
+@@ -1891,6 +1891,65 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
      assert "HARNESS_CODEX_GATEWAY" not in env
  
  

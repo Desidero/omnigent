@@ -12,10 +12,12 @@ sessions in creation order with no timestamps, and could only read the
 last 50 items of a session, so walking a long transcript or finding what
 changed since the previous run was impossible.
 
-- sys_session_list: optional updated_after (ISO-8601), order_by
-  (created|updated) and ownership (any|mine|shared) filters for the
-  global view; each row now reports created_at, updated_at and owner.
-  Backed by a new updated_after query param on GET /v1/sessions.
+- sys_session_list: optional updated_after (ISO-8601) and order_by
+  (created|updated) for the global view, on top of upstream's visibility;
+  each row now reports created_at and updated_at. Backed by a new
+  updated_after query param on GET /v1/sessions. The earlier ownership
+  argument (any|mine|shared) stays as an alias of visibility, any meaning
+  all, until 0.24.0.
 - sys_session_get_history: optional order='asc' and an 'after' item
   cursor read forward from the start or from a saved position, reusing
   GET /v1/sessions/{id}/items. Results carry next_cursor and has_more,
@@ -27,32 +29,35 @@ changed since the previous run was impossible.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/AGENT_YAML_SPEC.md                       |  11 +
- omnigent/runner/tool_dispatch.py              | 211 ++++++++++-----
+ docs/AGENT_YAML_SPEC.md                       |  13 +
+ omnigent/runner/tool_dispatch.py              | 207 +++++++++++++--
  omnigent/server/API.md                        |   4 +
  .../server/routes/sessions/routes_core.py     |   5 +
  .../stores/conversation_store/__init__.py     |   5 +
  .../conversation_store/sqlalchemy_store.py    |   5 +
- omnigent/tools/builtins/spawn.py              | 210 ++++++++++++---
+ omnigent/tools/builtins/spawn.py              | 196 +++++++++++---
  openapi.json                                  |  18 ++
- tests/runner/test_runner_dispatch.py          | 244 ++++++++++++++++++
+ .../runner/test_discovery_list_pagination.py  |   2 +
+ tests/runner/test_runner_dispatch.py          | 245 ++++++++++++++++++
  .../integration/test_sessions_endpoints.py    |  22 ++
  tests/stores/test_conversation_store.py       |  35 +++
- tests/tools/builtins/test_sys_session.py      | 113 ++++++++
- 12 files changed, 787 insertions(+), 96 deletions(-)
+ tests/tools/builtins/test_sys_session.py      | 114 ++++++++
+ 13 files changed, 813 insertions(+), 58 deletions(-)
 
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
-index b653b343f758d15e3901bb91385e9eaba916305c..9f91ab1cc3f609a44c41b6bfcb98d899281a47ee 100644
+index cd13eab5a8706cf83804ffe3b5b290fdd38f3bb1..29fed756cdccaa5bcbbec77c835dda19a2f0ecc0 100644
 --- a/docs/AGENT_YAML_SPEC.md
 +++ b/docs/AGENT_YAML_SPEC.md
-@@ -1014,6 +1014,17 @@ have no key: any agent in a multi-agent session needs the reads, and async work
+@@ -1182,6 +1182,19 @@ have no key: any agent in a multi-agent session needs the reads, and async work
  handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
  session viewers to open a workspace-relative file without switching sessions.
  
 +`sys_session_list` can narrow its session view with `updated_after` (an
-+ISO-8601 time; sessions active since then), `order_by` (`created`, the
-+default, or `updated`) and `ownership` (`any`, `mine` or `shared`); each row
-+reports `created_at`, `updated_at` and `owner`. `sys_session_get_history`
++ISO-8601 time; sessions active since then) and sort it with `order_by`
++(`created`, the default, or `updated`); each row reports `created_at` and
++`updated_at`. The older `ownership` argument (`any`, `mine` or `shared`) is
++still accepted as an alias of `visibility` (`any` is `all`) until 0.24.0.
++`sys_session_get_history`
 +returns the most recent items by default. With `order: "asc"` it reads forward
 +from the first item, and `after` set to a `next_cursor` from an earlier read
 +resumes just after it, so an agent can walk a long transcript in pages or pick
@@ -64,18 +69,10 @@ index b653b343f758d15e3901bb91385e9eaba916305c..9f91ab1cc3f609a44c41b6bfcb98d899
  
  ```yaml
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index 4bb57141a666ff6da9d1864c768b6ec562703653..3fad8be40857012417f89f48870eae4d1ea097c4 100644
+index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231a47d5b02 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
-@@ -32,6 +32,7 @@ import uuid
- import weakref
- from collections.abc import Awaitable, Callable, Mapping
- from dataclasses import dataclass
-+from datetime import UTC, datetime
- from pathlib import Path
- from typing import TYPE_CHECKING, Protocol, cast
- 
-@@ -105,6 +106,8 @@ from omnigent.tools.builtins.spawn import (
+@@ -128,6 +128,8 @@ from omnigent.tools.builtins.spawn import (
      _clamp_history_content_chars,
      _clamp_history_offset_chars,
      _clamp_tail_items,
@@ -84,62 +81,93 @@ index 4bb57141a666ff6da9d1864c768b6ec562703653..3fad8be40857012417f89f48870eae4d
  )
  from omnigent.tools.builtins.sys_terminal import (
      SysTerminalCloseTool,
-@@ -5413,22 +5416,17 @@ async def _execute_session_query_tool(
-         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
- 
-     if tool_name == "sys_session_list":
--        agent_name = args.get("agent_name")
--        include_archived = args.get("include_archived") is True
--        window = _discovery_list_window(
--            args,
--            tool_name,
--            ("sessions",),
--            _session_list_filters(agent_name, include_archived),
--        )
-+        session_filters = _parse_session_list_filters(args)
-+        if isinstance(session_filters, str):
-+            return session_filters
-+        window = _discovery_list_window(args, tool_name, ("sessions",), session_filters)
+@@ -6068,6 +6070,17 @@ async def _execute_session_query_tool(
+         agent_name = args.get("agent_name")
+         include_archived = args.get("include_archived") is True
+         visibility = args.get("visibility", _SESSION_LIST_DEFAULT_VISIBILITY)
++        if "ownership" in args:
++            if not _session_list_ownership_is_valid(args):
++                return json.dumps(
++                    {
++                        "error": (
++                            "sys_session_list: ownership must be 'any', 'mine' or 'shared', "
++                            "and must agree with visibility"
++                        )
++                    }
++                )
++            visibility = _SESSION_LIST_OWNERSHIP_VISIBILITY[str(args["ownership"])]
+         if visibility not in _SESSION_LIST_VISIBILITIES:
+             return json.dumps(
+                 {
+@@ -6077,11 +6090,22 @@ async def _execute_session_query_tool(
+                     )
+                 }
+             )
++        recency = _parse_session_list_recency(args)
++        if isinstance(recency, str):
++            return recency
++        updated_after, order_by = recency
+         window = _discovery_list_window(
+             args,
+             tool_name,
+             ("sessions",),
+-            _session_list_filters(agent_name, include_archived, visibility, project),
++            _session_list_filters(
++                agent_name,
++                include_archived,
++                visibility,
++                project,
++                updated_after=updated_after,
++                order_by=order_by,
++            ),
+         )
          if isinstance(window, str):
              return window
-         limit, cursor_state, continued = window
-         return await _session_list_via_rest(
-             conversation_id,
-             server_client,
--            agent_name,
--            include_archived=include_archived,
-+            session_filters,
+@@ -6093,6 +6117,8 @@ async def _execute_session_query_tool(
+             include_archived=include_archived,
+             visibility=visibility,
+             project=project,
++            updated_after=updated_after,
++            order_by=order_by,
              limit=limit,
              cursor_state=cursor_state,
              continued=continued,
-@@ -6372,31 +6370,73 @@ def _project_agent_list(
+@@ -7054,22 +7080,85 @@ def _project_agent_list(
      }
  
  
--def _session_list_filters(agent_name: object, include_archived: bool) -> _JsonObject:
-+def _parse_session_list_filters(args: _JsonObject) -> _JsonObject | str:
-     """
--    The ``sys_session_list`` filters a continuation cursor is bound to.
-+    Validate the ``sys_session_list`` filters for the global ``sessions`` view.
- 
--    ``include_archived`` is recorded only when set, so cursors issued before
--    the flag existed still match a call that omits it.
++# ``ownership`` predates ``visibility`` and stays accepted as an alias of it.
++# @deprecated: remove the alias in 0.24.0.
++_SESSION_LIST_OWNERSHIP_VISIBILITY = {"any": "all", "mine": "mine", "shared": "shared"}
++
++
++def _session_list_ownership_is_valid(args: _JsonObject) -> bool:
++    """
++    Whether ``sys_session_list``'s ``ownership`` names a visibility that agrees.
++
++    :param args: Parsed tool arguments, e.g. ``{"ownership": "any"}``.
++    :returns: ``True`` for a known ``ownership`` that matches any explicit
++        ``visibility`` (``"any"`` is ``"all"``).
++    """
++    ownership = args.get("ownership")
++    if not isinstance(ownership, str) or ownership not in _SESSION_LIST_OWNERSHIP_VISIBILITY:
++        return False
++    alias = _SESSION_LIST_OWNERSHIP_VISIBILITY[ownership]
++    return args.get("visibility", alias) == alias
++
++
++def _parse_session_list_recency(args: _JsonObject) -> tuple[int | None, str] | str:
++    """
++    Validate ``sys_session_list``'s ``updated_after`` and ``order_by``.
++
 +    ``updated_after`` is accepted as ISO-8601 (a naive value is read as UTC)
-+    and normalized to epoch seconds for ``GET /v1/sessions``. The result is
-+    also what a continuation cursor is bound to, so a cursor cannot be
-+    replayed under different filters.
- 
--    :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
--    :param include_archived: Whether archived sessions are listed.
--    :returns: The filter mapping, e.g. ``{"agent_name": None}``.
++    and normalized to epoch seconds for ``GET /v1/sessions``.
++
 +    :param args: Parsed tool arguments, e.g.
-+        ``{"agent_name": "researcher", "updated_after": "2026-09-01T00:00:00Z"}``.
-+    :returns: ``{"agent_name", "updated_after", "order_by", "ownership"}``
-+        with defaults filled in, plus ``include_archived`` only when set (so
-+        cursors issued before that flag still match), or a JSON error string
-+        for the model.
-     """
-+    agent_name = args.get("agent_name")
++        ``{"updated_after": "2026-09-01T00:00:00Z", "order_by": "updated"}``.
++    :returns: ``(updated_after, order_by)``, e.g. ``(1788220800, "updated")``,
++        or a JSON error string for the model.
++    """
 +    raw_updated_after = args.get("updated_after")
 +    updated_after: int | None = None
 +    if raw_updated_after is not None:
@@ -162,21 +190,45 @@ index 4bb57141a666ff6da9d1864c768b6ec562703653..3fad8be40857012417f89f48870eae4d
 +    order_by = args.get("order_by", "created")
 +    if order_by not in ("created", "updated"):
 +        return json.dumps({"error": "sys_session_list: 'order_by' must be 'created' or 'updated'"})
-+    ownership = args.get("ownership", "any")
-+    if ownership not in ("any", "mine", "shared"):
-+        return json.dumps(
-+            {"error": "sys_session_list: 'ownership' must be 'any', 'mine', or 'shared'"}
-+        )
++    return updated_after, order_by
++
++
+ def _session_list_filters(
+     agent_name: object,
+     include_archived: bool,
+     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+     project: str | None = None,
++    *,
++    updated_after: int | None = None,
++    order_by: str = "created",
+ ) -> _JsonObject:
+     """
+     The ``sys_session_list`` filters a continuation cursor is bound to.
+ 
+-    ``include_archived`` and a non-default ``visibility`` are recorded only
+-    when set, so cursors issued before those arguments existed still match a
+-    call that omits them.
++    ``include_archived``, a non-default ``visibility``, ``updated_after`` and
++    ``order_by="updated"`` are recorded only when set, so cursors issued
++    before those arguments existed still match a call that omits them.
+ 
+     :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
+     :param include_archived: Whether archived sessions are listed.
+     :param visibility: Which sessions the global view covers, e.g. ``"mine"``.
++    :param project: Optional project name filter.
++    :param updated_after: Epoch seconds the sessions must be updated after.
++    :param order_by: ``"created"`` or ``"updated"``, newest first.
+     :returns: The filter mapping, e.g. ``{"agent_name": None}``.
+     """
      filters: _JsonObject = {
--        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None
-+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
-+        "updated_after": updated_after,
-+        "order_by": order_by,
-+        "ownership": ownership,
-     }
--    if include_archived:
-+    if args.get("include_archived") is True:
-         filters["include_archived"] = True
+@@ -7081,9 +7170,20 @@ def _session_list_filters(
+         filters["visibility"] = visibility
+     if project is not None:
+         filters["project"] = project
++    if updated_after is not None:
++        filters["updated_after"] = updated_after
++    if order_by != "created":
++        filters["order_by"] = order_by
      return filters
  
  
@@ -190,140 +242,118 @@ index 4bb57141a666ff6da9d1864c768b6ec562703653..3fad8be40857012417f89f48870eae4d
  async def _session_list_via_rest(
      conversation_id: str,
      server_client: httpx.AsyncClient,
--    agent_name: object = None,
-+    filters: _JsonObject,
-     *,
--    include_archived: bool = False,
+@@ -7092,6 +7192,8 @@ async def _session_list_via_rest(
+     include_archived: bool = False,
+     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+     project: str | None = None,
++    updated_after: int | None = None,
++    order_by: str = "created",
      limit: int | None,
      cursor_state: dict[str, _DiscoveryState],
      continued: bool,
-@@ -6408,16 +6448,15 @@ async def _session_list_via_rest(
-     parent/siblings when the caller is itself a child) — see
-     :func:`_collect_sub_agents`. ``sessions`` is the **global**,
-     permission-bounded list of every session the caller can access, each
--    annotated with status + runner connectivity, optionally filtered by
--    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
--    best-effort: a failure in either view yields an empty list for it
--    rather than failing the whole call.
-+    annotated with status + runner connectivity, optionally filtered —
-+    see :func:`_collect_global_sessions`. Both are best-effort: a failure
-+    in either view yields an empty list for it rather than failing the
-+    whole call.
- 
-     :param conversation_id: The caller session id, e.g. ``"conv_root1"``.
-     :param server_client: HTTP client pointed at the Omnigent server.
--    :param agent_name: Optional agent-name filter for the global
--        ``sessions`` view; ignored for ``sub_agents``.
--    :param include_archived: Also list archived sessions in the global view.
-+    :param filters: Global ``sessions`` view filters from
-+        :func:`_parse_session_list_filters`; ignored for ``sub_agents``.
-     :param limit: Optional maximum rows returned from the global sessions view. When
-         omitted, the complete legacy result is preserved while it fits.
+@@ -7116,6 +7218,8 @@ async def _session_list_via_rest(
+     :param include_archived: Also list archived sessions in the global view.
+     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
+         ownership filter for the global view.
++    :param updated_after: Only list sessions updated after these epoch seconds.
++    :param order_by: ``"created"`` or ``"updated"``, newest first.
+     :param limit: Optional maximum rows returned from the global sessions view;
+         :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
      :param cursor_state: Opaque continuation position for the global sessions view.
-@@ -6430,8 +6469,7 @@ async def _session_list_via_rest(
-         if cursor_state["sessions"][0] == _DISCOVERY_END
-         else await _collect_global_sessions(
-             server_client,
--            agent_name,
--            include_archived=include_archived,
-+            filters,
+@@ -7133,6 +7237,8 @@ async def _session_list_via_rest(
+             include_archived=include_archived,
+             visibility=visibility,
+             project=project,
++            updated_after=updated_after,
++            order_by=order_by,
              after=cursor_state["sessions"][1],
-             limit=limit or _AGENT_LIST_PAGE_LIMIT,
+             limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
          )
-@@ -6442,7 +6480,7 @@ async def _session_list_via_rest(
+@@ -7143,7 +7249,14 @@ async def _session_list_via_rest(
          cursor_state=cursor_state,
          continued=continued,
          tool_name="sys_session_list",
--        filters=_session_list_filters(agent_name, include_archived),
-+        filters=filters,
+-        filters=_session_list_filters(agent_name, include_archived, visibility, project),
++        filters=_session_list_filters(
++            agent_name,
++            include_archived,
++            visibility,
++            project,
++            updated_after=updated_after,
++            order_by=order_by,
++        ),
          source_pages={"sessions": sessions_page},
          page_sections=("sessions",),
-     )
-@@ -6692,9 +6730,8 @@ async def _resolve_runner_online_map(
- 
- async def _collect_global_sessions(
-     server_client: httpx.AsyncClient,
--    agent_name: object,
-+    filters: _JsonObject,
-     *,
--    include_archived: bool = False,
+         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
+@@ -7394,6 +7507,8 @@ async def _collect_global_sessions(
+     include_archived: bool = False,
+     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+     project: str | None = None,
++    updated_after: int | None = None,
++    order_by: str = "created",
      after: str | None,
      limit: int,
  ) -> _DiscoveryPage:
-@@ -6702,28 +6739,40 @@ async def _collect_global_sessions(
+@@ -7401,11 +7516,12 @@ async def _collect_global_sessions(
      Fetch the global session list via ``GET /v1/sessions``.
  
-     Projects each accessible session to ``{session_id, agent_name, title,
+     Projects each listed session to ``{session_id, agent_name, title,
 -    status, runner_id, runner_online, parent_session_id}``.
--    ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
-+    status, runner_id, runner_online, parent_session_id,
-+    created_by_session_id, created_at, updated_at, owner}`` (timestamps as
-+    ISO-8601 UTC). ``runner_online`` holds
-+    :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
++    status, runner_id, runner_online, parent_session_id, created_at,
++    updated_at}`` (timestamps as ISO-8601 UTC).
+     ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
      :func:`_fill_returned_runner_online` resolves it for the rows that
 -    survive paging. An optional ``agent_name``
 -    filters the list server-side. Permission-bounded by the server (the
--    runner's request carries the owning user's identity). Best-effort:
--    returns ``[]`` on a fetch failure.
-+    survive paging. The ``agent_name``, ``updated_after``, ``order_by`` and
-+    ``ownership`` filters are applied server-side. Permission-bounded by the
-+    server (the runner's request carries the owning user's identity).
-+    Best-effort: returns ``[]`` on a fetch failure.
++    survive paging. The ``agent_name``, ``updated_after`` and ``order_by``
++    filters are applied server-side. Permission-bounded by the server (the
+     runner's request carries the owning user's identity). Best-effort:
+     returns ``[]`` on a fetch failure.
  
-     :param server_client: HTTP client pointed at the Omnigent server.
--    :param agent_name: Optional agent-name filter; applied only when a
--        non-empty string.
--    :param include_archived: Also return archived sessions, each marked
--        ``archived``.
-+    :param filters: Normalized filters from :func:`_parse_session_list_filters`;
-+        with ``include_archived`` archived sessions are returned too, each
-+        marked ``archived``.
+@@ -7422,6 +7538,9 @@ async def _collect_global_sessions(
+     :param visibility: The server's ownership filter. ``"mine"`` (the
+         sidebar's default) keeps other users' sessions out of an agent's
+         view; ``"shared"`` / ``"all"`` rows also carry ``owner``.
++    :param project: Optional project name filter.
++    :param updated_after: Only list sessions updated after these epoch seconds.
++    :param order_by: ``"created"`` or ``"updated"``, newest first.
      :param after: Server cursor from the previous page, if any.
      :param limit: Maximum number of source rows to fetch.
      :returns: Projected global session entries and continuation metadata.
-     """
--    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
-+    ownership = filters.get("ownership")
-+    params: dict[str, str | int] = {
-+        "limit": limit,
-+        "order": "desc",
-+        "sort_by": "updated_at" if filters.get("order_by") == "updated" else "created_at",
-+        "visibility": ownership if ownership in ("mine", "shared") else "all",
-+    }
-+    agent_name = filters.get("agent_name")
-     if isinstance(agent_name, str) and agent_name:
+@@ -7446,6 +7565,7 @@ async def _collect_global_sessions(
+     params: dict[str, str | int] = {
+         "limit": limit,
+         "order": "desc",
++        "sort_by": "updated_at" if order_by == "updated" else "created_at",
+         "visibility": server_visibility,
+     }
+     if project is not None:
+@@ -7454,6 +7574,8 @@ async def _collect_global_sessions(
          params["agent_name"] = agent_name
-+    include_archived = filters.get("include_archived") is True
      if include_archived:
          params["include_archived"] = "true"
-+    updated_after = filters.get("updated_after")
-+    if isinstance(updated_after, int):
++    if updated_after is not None:
 +        params["updated_after"] = updated_after
      if after is not None:
          params["after"] = after
      try:
-@@ -6760,6 +6809,9 @@ async def _collect_global_sessions(
+@@ -7499,6 +7621,8 @@ async def _collect_global_sessions(
+                     if visibility != _SESSION_LIST_DEFAULT_VISIBILITY
+                     else {}
                  ),
-                 # Only an archive-inclusive listing can return archived rows.
-                 **({"archived": r.get("archived") is True} if include_archived else {}),
 +                "created_at": _epoch_to_iso(r.get("created_at")),
 +                "updated_at": _epoch_to_iso(r.get("updated_at")),
-+                "owner": _optional_string(r.get("owner")),
              }
              for r in rows
          ],
-@@ -6822,6 +6874,19 @@ async def _session_parent_id(
+@@ -7630,6 +7754,15 @@ async def _session_parent_id(
      return parent if isinstance(parent, str) and parent else None
  
  
 +async def _session_exists(target_id: str, server_client: httpx.AsyncClient) -> bool:
 +    """Return whether ``GET /v1/sessions/{id}`` resolves the session."""
 +    try:
-+        resp = await server_client.get(
-+            _session_url(target_id),
-+            params={"include_items": "false", "include_liveness": "false"},
-+            timeout=30.0,
-+        )
++        resp = await _get_session_metadata(server_client, target_id, timeout=30.0)
 +    except Exception:  # noqa: BLE001
 +        return False
 +    return resp.status_code == 200
@@ -332,7 +362,7 @@ index 4bb57141a666ff6da9d1864c768b6ec562703653..3fad8be40857012417f89f48870eae4d
  async def _session_get_history_via_rest(
      args: _JsonObject,
      server_client: httpx.AsyncClient,
-@@ -6838,8 +6903,8 @@ async def _session_get_history_via_rest(
+@@ -7646,8 +7779,8 @@ async def _session_get_history_via_rest(
      may read).
  
      :param args: Parsed tool arguments; requires ``conversation_id``,
@@ -343,7 +373,7 @@ index 4bb57141a666ff6da9d1864c768b6ec562703653..3fad8be40857012417f89f48870eae4d
      :param server_client: HTTP client pointed at the Omnigent server.
      :returns: JSON peek result, or a JSON error object.
      """
-@@ -6863,44 +6928,68 @@ async def _session_get_history_via_rest(
+@@ -7671,44 +7804,68 @@ async def _session_get_history_via_rest(
      content_offset_chars = _clamp_history_offset_chars(args.get("content_offset_chars", 0))
      if isinstance(content_offset_chars, str):
          return content_offset_chars
@@ -428,10 +458,10 @@ index 4bb57141a666ff6da9d1864c768b6ec562703653..3fad8be40857012417f89f48870eae4d
      )
  
 diff --git a/omnigent/server/API.md b/omnigent/server/API.md
-index 4f89d92fe36c524d6fc83225c7c55e0075897162..9dd546d783410828f8c2974f4e3ee07c653e37c2 100644
+index 3504001529ec5a84405ece7bb8f792c3ba880489..13ac730e1475b9fa36ea466006ce51025f912a0d 100644
 --- a/omnigent/server/API.md
 +++ b/omnigent/server/API.md
-@@ -721,6 +721,10 @@ minus `items` and snapshot-only fields.
+@@ -732,6 +732,10 @@ minus `items` and snapshot-only fields.
  Supports cursor pagination and filters such as `search_query` and
  `include_archived`.
  
@@ -443,10 +473,10 @@ index 4f89d92fe36c524d6fc83225c7c55e0075897162..9dd546d783410828f8c2974f4e3ee07c
  active sessions, `shared` lists accessible active sessions owned by someone
  else, `archived` lists accessible archived sessions, and `all` lists all
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index 8efb684773b1972447645430d6b0fa74d4cc5051..41b76df2e9e881f9eaede49cc61c471eb1d7a372 100644
+index 4c253f91dd055c4acc57babdf55b0409f415bf0b..63565c82ff3ee813d135153c2dc8604d9a8c1713 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -2126,6 +2126,7 @@ def register_core_routes(
+@@ -2622,6 +2622,7 @@ def register_core_routes(
          pinned: bool = Query(default=False),
          expand_families: bool = Query(default=False),
          visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
@@ -454,29 +484,29 @@ index 8efb684773b1972447645430d6b0fa74d4cc5051..41b76df2e9e881f9eaede49cc61c471e
      ) -> dict[str, Any]:
          """
          List sessions with cursor-based pagination.
-@@ -2191,6 +2192,9 @@ def register_core_routes(
-             project names resolve within the caller's projects.
+@@ -2688,6 +2689,9 @@ def register_core_routes(
              ``"all"`` (default) returns all accessible non-archived
-             sessions, matching the legacy behaviour.
+             sessions, matching the legacy behaviour. ``include_archived``
+             adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
 +        :param updated_after: When set, only return sessions whose
 +            ``updated_at`` (Unix epoch seconds of last activity) is
 +            strictly later than this value. ``None`` disables the filter.
          :returns: A :class:`PaginatedList` of
              :class:`SessionListItem`.
          """
-@@ -2280,6 +2284,7 @@ def register_core_routes(
-             pinned=pinned,
-             # Pins are per-user: filter to the caller's own pin key.
-             pinned_owner=user_id,
-+            updated_after=updated_after,
-         )
-         # Side chats surface only as Workspace-rail tabs, so drop any
-         # side-chat-labeled fork from the sidebar list (it is still a normal
+@@ -2784,6 +2788,7 @@ def register_core_routes(
+                     pinned=pinned,
+                     # Pins are per-user: filter to the caller's own pin key.
+                     pinned_owner=user_id,
++                    updated_after=updated_after,
+                 )
+                 # Side chats surface only as Workspace-rail tabs, so drop any
+                 # side-chat-labeled fork from the sidebar list (it is still a
 diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
-index 1272a8c688f21a3caff877a29ce6918e75b3f153..65b9ce5b576035ed5bb83bbe6f057829b77eddfb 100644
+index 164f931a37ecbcfadb140bd707e249ee5bf64a84..74846860dbf95defa7d2ffa8c099d37e7d0be8f7 100644
 --- a/omnigent/stores/conversation_store/__init__.py
 +++ b/omnigent/stores/conversation_store/__init__.py
-@@ -941,6 +941,7 @@ class ConversationStore(ABC):
+@@ -1010,6 +1010,7 @@ class ConversationStore(ABC):
          pinned: bool = False,
          pinned_owner: str | None = None,
          title: str | None = None,
@@ -484,7 +514,7 @@ index 1272a8c688f21a3caff877a29ce6918e75b3f153..65b9ce5b576035ed5bb83bbe6f057829
      ) -> PagedList[Conversation]:
          """
          List conversations with cursor-based pagination.
-@@ -1060,6 +1061,10 @@ class ConversationStore(ABC):
+@@ -1129,6 +1130,10 @@ class ConversationStore(ABC):
              Powers the ``(agent, title)`` child-session lookup in
              ``sys_session_send`` so the server can resolve the target
              in a single indexed query instead of fetching all children.
@@ -496,10 +526,10 @@ index 1272a8c688f21a3caff877a29ce6918e75b3f153..65b9ce5b576035ed5bb83bbe6f057829
              objects.
          :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
 diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
-index 6b551fda60a793a06c06cf619a1533153c5a21b4..72e5a9cc508e19ad567245c08a8d404e9a27e5fd 100644
+index 99b003dbfb11a293df6967416c34a31c73d041e6..c1a15a6ff72c7093953e3cc18f6f133cb20eb126 100644
 --- a/omnigent/stores/conversation_store/sqlalchemy_store.py
 +++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
-@@ -3474,6 +3474,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3786,6 +3786,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          pinned: bool = False,
          pinned_owner: str | None = None,
          title: str | None = None,
@@ -507,7 +537,7 @@ index 6b551fda60a793a06c06cf619a1533153c5a21b4..72e5a9cc508e19ad567245c08a8d404e
      ) -> PagedList[Conversation]:
          """
          List conversations with cursor-based pagination.
-@@ -3546,6 +3547,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -3858,6 +3859,8 @@ class SqlAlchemyConversationStore(ConversationStore):
              can access but does NOT own — i.e. sessions shared with them
              by another user. Requires ``accessible_by`` to be set.
              ``False`` (default) disables the filter.
@@ -516,7 +546,7 @@ index 6b551fda60a793a06c06cf619a1533153c5a21b4..72e5a9cc508e19ad567245c08a8d404e
          :returns: A :class:`PagedList` of :class:`Conversation`
              objects.
          :raises ValueError: If ``search_scope`` is not a known scope.
-@@ -3751,6 +3754,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4066,6 +4069,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                  stmt = stmt.where(SqlConversation.agent_id == agent_id)
              if title is not None:
                  stmt = stmt.where(SqlConversation.title == title)
@@ -526,7 +556,7 @@ index 6b551fda60a793a06c06cf619a1533153c5a21b4..72e5a9cc508e19ad567245c08a8d404e
                  pattern = _like_contains_pattern(search_query)
                  title_match = func.lower(SqlConversation.title).like(pattern, escape=_LIKE_ESCAPE)
 diff --git a/omnigent/tools/builtins/spawn.py b/omnigent/tools/builtins/spawn.py
-index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a1e1a8922 100644
+index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d3009c69d4cc 100644
 --- a/omnigent/tools/builtins/spawn.py
 +++ b/omnigent/tools/builtins/spawn.py
 @@ -16,6 +16,7 @@ from omnigent.entities import (
@@ -537,37 +567,32 @@ index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a
  from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
  from omnigent.spec import AgentSpec
  from omnigent.stores import ConversationStore
-@@ -514,8 +515,9 @@ class SysSessionListTool(Tool):
-       ``sys_session_get_info`` / ``sys_session_close``.
-     - ``sessions`` — a **global** view of every session the caller can
-       access (bounded by the server's per-user permission model), each
--      with its status and runner connectivity. An optional
+@@ -517,8 +518,9 @@ class SysSessionListTool(Tool):
+       (``visibility="mine"``, the UI sidebar's default), each with its
+       status and runner connectivity. ``visibility="shared"`` lists
+       sessions other users shared with the caller instead, and ``"all"``
+-      lists both; those rows carry ``owner``. An optional
 -      ``agent_name`` filter narrows this list. This powers
-+      with its status, runner connectivity, timestamps and owner.
-+      Optional ``agent_name`` / ``updated_after`` / ``ownership``
-+      filters narrow this list and ``order_by`` sorts it. This powers
++      lists both; those rows carry ``owner``. Each row has its
++      timestamps. Optional ``agent_name`` / ``updated_after`` filters
++      narrow this list and ``order_by`` sorts it. This powers
        orchestration: discovering sessions to inspect
        (``sys_agent_get`` / ``sys_session_get_info``) or drive
        (``sys_session_send`` by ``session_id``).
-@@ -544,9 +546,14 @@ class SysSessionListTool(Tool):
-             "Match that field to your session ID to find workers you created. "
-             "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
+@@ -552,7 +554,11 @@ class SysSessionListTool(Tool):
              "for children or sys_session_message for independent sessions. "
--            "Pass agent_name to filter the global list to "
--            "sessions running that agent, and include_archived to also list "
--            "archived sessions (marked archived). Calls without pagination keep "
-+            "Each global entry carries created_at and "
-+            "updated_at (last activity, ISO-8601 UTC) and its owner. "
-+            "Filter the global list with agent_name, updated_after "
-+            "(sessions active since a time — e.g. to review what changed "
-+            "since your last check), and ownership (mine/shared); "
-+            "order_by='updated' lists the most recently active first. "
-+            "Pass include_archived to also list archived sessions "
-+            "(marked archived). Calls without pagination keep "
-             "the complete result while it fits the tool-output budget; "
-             "larger global session lists return a page with has_more "
-             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
-@@ -586,6 +593,34 @@ class SysSessionListTool(Tool):
+             "Pass agent_name to filter the global list to "
+             "sessions running that agent, and include_archived to also list "
+-            "archived sessions (marked archived). 'sessions' returns the newest 50 by "
++            "archived sessions (marked archived). Each global entry carries "
++            "created_at and updated_at (last activity, ISO-8601 UTC). Pass "
++            "updated_after for sessions active since a time (e.g. to review "
++            "what changed since your last check); order_by='updated' lists "
++            "the most recently active first. 'sessions' returns the newest 50 by "
+             "default; when more remain, pass page.next_cursor as cursor to continue. "
+             "sub_agents stays complete."
+         )
+@@ -607,6 +613,25 @@ class SysSessionListTool(Tool):
                                  "'archived'. Defaults to false."
                              ),
                          },
@@ -590,19 +615,10 @@ index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a
 +                                "activity ('updated')."
 +                            ),
 +                        },
-+                        "ownership": {
-+                            "type": "string",
-+                            "enum": ["any", "mine", "shared"],
-+                            "description": (
-+                                "Restrict 'sessions' to ones you own "
-+                                "('mine'), ones another user shared with "
-+                                "you ('shared'), or both ('any', default)."
-+                            ),
-+                        },
                          "limit": {
                              "type": "integer",
                              "minimum": 1,
-@@ -1552,6 +1587,58 @@ def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) ->
+@@ -1644,6 +1669,58 @@ def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) ->
      return min(content_max_chars, _HISTORY_MAX_TOTAL_CHARS // tail_items)
  
  
@@ -661,7 +677,7 @@ index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a
  class SysSessionGetHistoryTool(Tool):
      """
      Return the recent conversation items (history) of a session.
-@@ -1591,14 +1678,22 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1683,14 +1760,22 @@ class SysSessionGetHistoryTool(Tool):
      def description(cls) -> str:
          """:returns: Human-readable description of the tool."""
          return (
@@ -692,7 +708,7 @@ index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a
          )
  
      def get_schema(self) -> dict[str, Any]:
-@@ -1632,12 +1727,34 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1724,12 +1809,34 @@ class SysSessionGetHistoryTool(Tool):
                              "minimum": 1,
                              "maximum": _HISTORY_MAX_TAIL,
                              "description": (
@@ -728,7 +744,7 @@ index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a
                          "content_max_chars": {
                              "type": "integer",
                              "minimum": 1,
-@@ -1707,34 +1824,51 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1799,34 +1906,51 @@ class SysSessionGetHistoryTool(Tool):
          )
          if isinstance(content_offset_chars, str):
              return content_offset_chars
@@ -801,7 +817,7 @@ index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a
          labelled = _agent_title_from_conversation(resolution.child)
          return json.dumps(
              {
-@@ -1742,6 +1876,12 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1834,6 +1958,12 @@ class SysSessionGetHistoryTool(Tool):
                  "agent": labelled.agent,
                  "title": labelled.title,
                  "items": items,
@@ -815,10 +831,10 @@ index 65f5caa7cd0b14635915b16eaae64cf61e9ea748..64857b72326d47e3b215a3dad511752a
          )
  
 diff --git a/openapi.json b/openapi.json
-index 3346d7ec84a54f7ce11bff40800fac25293e8042..a32d0d9a210952e2da9105002aebdf0089521318 100644
+index 4b37ca969de7d9c6e9c87525bb150b7925f187e6..044ba7b664b549bd0e27d3f4bd2fe460f8702703 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -15002,6 +15002,24 @@
+@@ -21530,6 +21530,24 @@
                "title": "Visibility",
                "type": "string"
              }
@@ -843,11 +859,24 @@ index 3346d7ec84a54f7ce11bff40800fac25293e8042..a32d0d9a210952e2da9105002aebdf00
            }
          ],
          "responses": {
+diff --git a/tests/runner/test_discovery_list_pagination.py b/tests/runner/test_discovery_list_pagination.py
+index 89a4d9dac0e4f1e2f9712b3dfdfb3300e235d194..7e35088bb80a07ac2bc4947f4e773ee98b1ab9cb 100644
+--- a/tests/runner/test_discovery_list_pagination.py
++++ b/tests/runner/test_discovery_list_pagination.py
+@@ -650,6 +650,8 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
+         "created_by_session_id": "conv_caller",
+         "archived": True,
+         "family": None,
++        "created_at": None,
++        "updated_at": None,
+     }
+     assert first["sessions"][1]["archived"] is False
+     assert second["sessions"][0]["archived"] is True
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index 7f41995361926f44fbc985fbe4c8a39da9a04388..95d12f0c85ef1d2d90c18598e83e45fe4f059398 100644
+index 7047d9b020bfe0d2b71a384c3cd91b6d0f47a7ae..5ecc8974b763dbaf1d25acb2252b2dfdf27521c7 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
-@@ -7134,6 +7134,127 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
+@@ -7649,6 +7649,127 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
      ]
  
  
@@ -975,27 +1004,25 @@ index 7f41995361926f44fbc985fbe4c8a39da9a04388..95d12f0c85ef1d2d90c18598e83e45fe
  @pytest.mark.asyncio
  async def test_session_peek_rest_projects_tool_calls_and_unknown_items() -> None:
      """REST history preserves tool-call/result items and unknown item types."""
-@@ -8072,6 +8193,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+@@ -8587,6 +8708,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
              "parent_session_id": None,
              "created_by_session_id": "conv_x",
              "family": None,
 +            "created_at": None,
 +            "updated_at": None,
-+            "owner": None,
          },
          {
              "session_id": "s2",
-@@ -8083,6 +8207,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+@@ -8598,6 +8721,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
              "parent_session_id": None,
              "created_by_session_id": None,
              "family": None,
 +            "created_at": None,
 +            "updated_at": None,
-+            "owner": None,
          },
      ]
      # Connectivity resolved once per UNIQUE runner — two sessions share
-@@ -8091,6 +8218,123 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+@@ -8606,6 +8731,126 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
      assert runner_status_calls == ["r1"]
  
  
@@ -1068,7 +1095,7 @@ index 7f41995361926f44fbc985fbe4c8a39da9a04388..95d12f0c85ef1d2d90c18598e83e45fe
 +
 +@pytest.mark.asyncio
 +async def test_session_list_defaults_keep_legacy_query() -> None:
-+    """Without the new filters the list query is unchanged (created order, all)."""
++    """Without the new filters the list query is unchanged (created order, own sessions)."""
 +    from omnigent.runner.tool_dispatch import _execute_session_query_tool
 +
 +    sessions_params: dict[str, str] = {}
@@ -1080,7 +1107,7 @@ index 7f41995361926f44fbc985fbe4c8a39da9a04388..95d12f0c85ef1d2d90c18598e83e45fe
 +            server_client=client,
 +        )
 +    assert sessions_params["sort_by"] == "created_at"
-+    assert sessions_params["visibility"] == "all"
++    assert sessions_params["visibility"] == "mine"
 +    assert "updated_after" not in sessions_params
 +
 +
@@ -1090,7 +1117,10 @@ index 7f41995361926f44fbc985fbe4c8a39da9a04388..95d12f0c85ef1d2d90c18598e83e45fe
 +        pytest.param({"updated_after": "yesterday"}, "not a valid ISO-8601", id="bad-iso"),
 +        pytest.param({"updated_after": 1788000000}, "must be an ISO-8601", id="number"),
 +        pytest.param({"order_by": "title"}, "'order_by' must be", id="bad-order-by"),
-+        pytest.param({"ownership": "theirs"}, "'ownership' must be", id="bad-ownership"),
++        pytest.param({"ownership": "theirs"}, "ownership", id="bad-ownership"),
++        pytest.param(
++            {"ownership": "any", "visibility": "mine"}, "must agree", id="ownership-conflict"
++        ),
 +    ],
 +)
 +@pytest.mark.asyncio
@@ -1120,10 +1150,10 @@ index 7f41995361926f44fbc985fbe4c8a39da9a04388..95d12f0c85ef1d2d90c18598e83e45fe
  async def test_sys_agent_download_rejects_path_in_dest_filename(tmp_path: Path) -> None:
      """
 diff --git a/tests/server/integration/test_sessions_endpoints.py b/tests/server/integration/test_sessions_endpoints.py
-index 6b8df0e242a58ebc4713ae1f0e2612e897c6154f..329137c1fced3e9d878203686328a2f16f80b4c3 100644
+index b165a090864bc7c72c63f327f627e179de52cd28..ff11a11c0faf7013544b2bdf25efaa826445f143 100644
 --- a/tests/server/integration/test_sessions_endpoints.py
 +++ b/tests/server/integration/test_sessions_endpoints.py
-@@ -1008,6 +1008,28 @@ async def test_list_sessions_pagination(
+@@ -1013,6 +1013,28 @@ async def test_list_sessions_pagination(
      assert page2["data"][0]["id"] != page1["data"][0]["id"]
  
  
@@ -1153,10 +1183,10 @@ index 6b8df0e242a58ebc4713ae1f0e2612e897c6154f..329137c1fced3e9d878203686328a2f1
      client: httpx.AsyncClient,
  ) -> None:
 diff --git a/tests/stores/test_conversation_store.py b/tests/stores/test_conversation_store.py
-index ce6da6a40849fb102477a0688f0352bc3486e7ac..8a41872ac9f5e022212a0c57928a5529b48b0071 100644
+index 3514506a82064a749d38ba697d49d6a57b7e0c8e..6c7934f2f24ffdf94c14bf1d7b454742dd2e05af 100644
 --- a/tests/stores/test_conversation_store.py
 +++ b/tests/stores/test_conversation_store.py
-@@ -3155,6 +3155,41 @@ def test_list_conversations_sort_by_updated_at(
+@@ -3373,6 +3373,41 @@ def test_list_conversations_sort_by_updated_at(
      )
  
  
@@ -1199,7 +1229,7 @@ index ce6da6a40849fb102477a0688f0352bc3486e7ac..8a41872ac9f5e022212a0c57928a5529
      conversation_store: SqlAlchemyConversationStore,
      monkeypatch: pytest.MonkeyPatch,
 diff --git a/tests/tools/builtins/test_sys_session.py b/tests/tools/builtins/test_sys_session.py
-index 465b8215911a455b392ebc795cd70e3659b629b9..63a72d105b674f90a87167e4ffec6fcbe161beb8 100644
+index 61a9b67c3b4065c6f3822357d304cd98f06132d8..577acbc09ae9ed5a2f55abc344a274f850408767 100644
 --- a/tests/tools/builtins/test_sys_session.py
 +++ b/tests/tools/builtins/test_sys_session.py
 @@ -16,6 +16,7 @@ from __future__ import annotations
@@ -1334,13 +1364,14 @@ index 465b8215911a455b392ebc795cd70e3659b629b9..63a72d105b674f90a87167e4ffec6fcb
  def test_peek_default_tail_when_omitted(session_fixture: _Fixture) -> None:
      """
      Omitting ``tail_items`` falls back to ``_HISTORY_DEFAULT_TAIL``.
-@@ -1440,6 +1550,9 @@ def test_session_list_schema_exposes_bounded_pagination() -> None:
-     assert properties["cursor"]["type"] == "string"
-     # Trigger-template managers pass it to find workers they archived.
+@@ -1442,6 +1552,10 @@ def test_session_list_schema_exposes_bounded_pagination() -> None:
      assert properties["include_archived"]["type"] == "boolean"
+     # Own sessions by default; other users' shared sessions only on request.
+     assert properties["visibility"]["enum"] == ["mine", "shared", "all"]
 +    assert properties["updated_after"]["type"] == "string"
 +    assert properties["order_by"]["enum"] == ["created", "updated"]
-+    assert properties["ownership"]["enum"] == ["any", "mine", "shared"]
++    # ``ownership`` is only a deprecated alias of ``visibility``.
++    assert "ownership" not in properties
  
  
  def test_close_unknown_conversation_id_returns_not_found(
