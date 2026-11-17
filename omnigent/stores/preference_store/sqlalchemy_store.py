@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 from typing import Annotated, TypeVar
 
 from pydantic import BaseModel, Field
@@ -42,7 +43,10 @@ from omnigent.preference_sync import (
     SharedPreferenceEntry,
     Version,
 )
+from omnigent.preferences import PreferenceKind
 from omnigent.server.auth import RESERVED_USER_LOCAL
+
+_logger = logging.getLogger(__name__)
 
 _PREFIX = "shared.v1."
 _META = _PREFIX + "meta"
@@ -102,6 +106,36 @@ def _serialize(value: BaseModel) -> str:
 
 def _decode(raw: bytes | str | memoryview, model: type[_Model]) -> _Model:
     return model.model_validate_json(decode(raw, max_decoded_bytes=MAX_RECORD_BYTES) or "null")
+
+
+_KNOWN_KINDS = frozenset(kind.value for kind in PreferenceKind)
+# Retired kinds already logged, so a page read doesn't repeat the warning.
+_logged_unknown_kinds: set[str] = set()
+
+
+def _decode_known(raw: bytes | str | memoryview, model: type[_Model]) -> _Model | None:
+    """
+    Decode a stored entry or conflict, or ``None`` when its key kind is unknown here.
+
+    A kind written by another build, or retired from this one, stays stored, so
+    a build that knows it again reads it back; this build just leaves it out.
+
+    :param raw: The stored record.
+    :param model: ``SharedPreferenceEntry`` or ``PreferenceMutation``.
+    :returns: The decoded record, or ``None`` for an unknown kind.
+    """
+    text = decode(raw, max_decoded_bytes=MAX_RECORD_BYTES) or "null"
+    try:
+        key = json.loads(text).get("key")
+    except (ValueError, AttributeError):
+        key = None
+    kind = key.get("kind") if isinstance(key, dict) else None
+    if isinstance(kind, str) and kind not in _KNOWN_KINDS:
+        if kind not in _logged_unknown_kinds:
+            _logged_unknown_kinds.add(kind)
+            _logger.warning("Skipping stored preferences of unknown kind %r", kind)
+        return None
+    return model.model_validate_json(text)
 
 
 class SqlAlchemyPreferenceStore:
@@ -195,14 +229,16 @@ class SqlAlchemyPreferenceStore:
             revision=metadata.revision,
             next_cursor=next_cursor,
             entries=[
-                _decode(value, SharedPreferenceEntry)
+                entry
                 for key, value in rows
                 if key.startswith(_VALUE)
+                and (entry := _decode_known(value, SharedPreferenceEntry)) is not None
             ],
             conflicts=[
-                _decode(value, PreferenceMutation)
+                conflict
                 for key, value in rows
                 if key.startswith(_CONFLICT)
+                and (conflict := _decode_known(value, PreferenceMutation)) is not None
             ],
         )
 

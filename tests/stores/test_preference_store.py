@@ -254,6 +254,54 @@ def test_isolation_and_read_does_not_initialize(store, db_uri):
     assert store.read(user_id="alice").entries[0].value == "model-a"
 
 
+def _store_retired_entry(store, user_id: str) -> None:
+    """Seed an entry and a conflict of a kind this build no longer knows."""
+    entry = {"key": {"kind": "retired_kind", "name": "default"}, "version": 1, "value": ["a"]}
+    conflict = {
+        "protocol_version": 1,
+        "identity": store.identity(user_id).model_dump(),
+        "operation_id": str(uuid4()),
+        "installation_id": "laptop",
+        "key": entry["key"],
+        "expected_version": 0,
+        "value": ["b"],
+    }
+    with store._session("seed_retired_kind") as session:
+        session.add_all(
+            [
+                SqlPreference(
+                    workspace_id=0,
+                    user_id=user_id,
+                    key="shared.v1.value." + "f" * 64,
+                    value=json.dumps(entry),
+                ),
+                SqlPreference(
+                    workspace_id=0,
+                    user_id=user_id,
+                    key="shared.v1.conflict." + "f" * 32,
+                    value=json.dumps(conflict),
+                ),
+            ]
+        )
+
+
+def test_read_skips_stored_kinds_this_build_does_not_know(store):
+    store.apply(mutation(store), user_id="alice")
+    _store_retired_entry(store, "alice")
+
+    page = store.read(user_id="alice")
+
+    assert [entry.key.kind for entry in page.entries] == ["model"]
+    assert page.conflicts == []
+    # The rows stay stored for a build that knows the kind.
+    with store._session("count_retired_kind") as session:
+        keys = session.scalars(select(SqlPreference.key).where(SqlPreference.user_id == "alice"))
+        assert {"shared.v1.value." + "f" * 64, "shared.v1.conflict." + "f" * 32} <= set(keys)
+    # Writing an unknown kind is still refused.
+    with pytest.raises(ValueError):
+        mutation(store, key={"kind": "retired_kind", "name": "default"}, value=["a"])
+
+
 @pytest.mark.parametrize("same_operation", [False, True])
 def test_concurrent_stores_preserve_competing_edits(store, db_uri, same_operation):
     second = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
