@@ -43,6 +43,7 @@ class Feature(StrEnum):
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
+    AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
@@ -52,6 +53,7 @@ class Feature(StrEnum):
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
+    PROACTIVE_AGENT = "proactive_agent"
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,14 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.24.0",
+        frontend_visible=False,
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.AUTOMATIONS,
+        description="Automations across the API, UI, agent tools and background schedulers",
+        owner="server",
+        review_by_release="0.27.0",
         frontend_visible=False,
         default_enabled=True,
     ),
@@ -261,6 +271,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.27.0",
         frontend_visible=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.PROACTIVE_AGENT,
+        description="Agent-posted Inbox suggestions and the proactive agent that writes them",
+        owner="server",
+        review_by_release="0.25.0",
+        # Clients probe proactive_agent_available in GET /v1/info; the settings
+        # decide whether it is enabled.
+        frontend_visible=False,
     ),
 )
 

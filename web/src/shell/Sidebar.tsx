@@ -792,10 +792,11 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored, ownedIds]);
 }
 
-function inboxBadgeLabel(count: number, incomplete: boolean): string {
-  const label = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
-  if (incomplete) return `${label}; more automations not yet checked`;
-  return label;
+function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): string {
+  const items = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
+  // The server stops counting suggestions at its limit, so the total is a floor.
+  const label = capped ? `At least ${items}` : items;
+  return incomplete ? `${label}; more automations not yet checked` : label;
 }
 
 function SidebarImpl({
@@ -917,6 +918,7 @@ function SidebarImpl({
   );
   const inboxCount = sidebarData.inboxCount + unreadInboxCount;
   const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
+  const inboxCountCapped = sidebarData.inboxCountCapped;
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
@@ -1529,7 +1531,11 @@ function SidebarImpl({
                       title={
                         inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
                       }
-                      aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
+                      aria-label={inboxBadgeLabel(
+                        inboxCount,
+                        inboxCountIncomplete,
+                        inboxCountCapped,
+                      )}
                       className={cn(
                         "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
                         // The active Inbox row already paints the translucent
@@ -1539,7 +1545,7 @@ function SidebarImpl({
                       )}
                     >
                       {inboxCount > 0 ? inboxCount : ""}
-                      {inboxCountIncomplete ? "+" : ""}
+                      {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
                     </span>
                   )}
                 </Link>
@@ -1693,6 +1699,7 @@ function ProjectFolder({
   selectedIds,
   onToggleSelected,
   onProjectAssigned,
+  onProjectRenamed,
   onConversationsLoaded,
   reorderable,
   ordering,
@@ -1745,6 +1752,7 @@ function ProjectFolder({
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  onProjectRenamed?: (oldName: string, newName: string) => void;
   /** Report this folder's own loaded sessions to the parent, and how many of
       them it lists above "Show more". The folder paginates independently of the
       global window, so bulk-selection in the projects scope must resolve
@@ -1881,6 +1889,7 @@ function ProjectFolder({
     name,
     projectId,
     icon,
+    onProjectRenamed,
   );
 
   const headerDrag = useSortable({
@@ -2780,6 +2789,16 @@ function ConversationList({
       return next;
     });
   }, []);
+  // Expansion is keyed by name, so carry it over a rename; otherwise the
+  // renamed folder reopens collapsed, listing only the open session.
+  const renameExpandedProject = useCallback((oldName: string, newName: string) => {
+    setExpandedProjects((prev) => {
+      if (!prev.includes(oldName)) return prev;
+      const next = [...prev.filter((n) => n !== oldName && n !== newName), newName];
+      writeExpandedProjectSections(next);
+      return next;
+    });
+  }, []);
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
@@ -3585,6 +3604,7 @@ function ConversationList({
                             selectedIds={selectedIds}
                             onToggleSelected={onToggleSelected}
                             onProjectAssigned={expandProject}
+                            onProjectRenamed={renameExpandedProject}
                             onConversationsLoaded={handleFolderConversationsLoaded}
                             reorderable={reorderable}
                           />
@@ -7135,6 +7155,7 @@ function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
   icon?: string | null,
+  onRenamed?: (oldName: string, newName: string) => void,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -7255,6 +7276,7 @@ function useProjectFolderMenu(
                     oldName: projectName,
                     newName,
                   });
+                  onRenamed?.(projectName, newName);
                 }
                 if (iconChanged) {
                   const next = { ...(iconConfig ?? {}) };
