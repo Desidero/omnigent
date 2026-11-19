@@ -13,7 +13,7 @@ Answering several items in one long hand-typed reply loses the structure: the ag
 
 - **Comment mode.** Clicking a chip (in a message, in the Open items panel, or the label in its own defining message, which is now clickable) opens the item popover, which gains a Comment button. Comment switches the real composer into comment mode for that item: a header card names it, and any text already typed is set aside until the comment is saved, so attachments, paste, @-mentions and dictation work as usual.
 - **Drafts tray.** Enter or the check button saves the comment to a tray above the composer, styled like the queued-messages strip. It can be minimized to one line, and drafts can be edited or deleted (with undo). Chips show an amber dot for unsent drafts and a count for sent comments.
-- **Submit together.** "Submit comments (N)" sends every draft as one plain-markdown user message through the normal send path, so it queues like any message while the agent is busy (the queue row reads "3 comments on Q2 R1"). Text typed in the composer goes along as a General section:
+- **Submit together.** Outside comment mode, the composer's ordinary send (Enter, or its send button, which then reads "Send N comments + message") and the tray's "Send N comments" button send every draft as one plain-markdown user message through the normal send path, so it queues like any message while the agent is busy (the queue row reads "3 comments on Q2 R1"). Text typed in the composer goes along as a General section:
 
   ```markdown
   Comments on 2 items:
@@ -36,6 +36,7 @@ Answering several items in one long hand-typed reply loses the structure: the ag
   ```
 
   Sections follow the order the items were defined; comments are numbered only when an item has several; headings inside a comment are demoted to bold. Attachments are real file blocks, renamed to be unique within the message (a pasted `image.png` on Q2 becomes `q2-1.png`) and listed by name, since native harnesses drop file blocks on the transcript round trip.
+- **Commands go alone.** A slash command or skill, or a `!` shell input, must lead its message, so it is sent on its own and the drafts stay in the tray. A menu beside the tray's button sends only the comments (keeping the typed message) or only the message (keeping the drafts).
 - **Threading without new storage.** The label index parses the sections back out of user messages, and the popover lists each comment with its files and the first sentence about the item in the next agent message, on any device and after reload. A comment heading counts as a mention but leaves an item open or closed; a plain mention still reopens it.
 - **Drafts are local.** Drafts live in this browser: localStorage keyed by session, synced between tabs with the `storage` event, with attachment bytes in IndexedDB. Submitted drafts stay marked as sent until the message posts; cancelling or editing the queued message, a failed send, or closing the page while it waited in the in-memory queue restores them as drafts.
 - **Agent instruction.** The item-label instruction in `omnigent/runtime/prompt.py` gains the reply rule: answer each commented item by its label, and a comment on a closed item does not reopen it. If maintainers prefer, this PR can be split into a renderer-only change plus a separate instruction change.

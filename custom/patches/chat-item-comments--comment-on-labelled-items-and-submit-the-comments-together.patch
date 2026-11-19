@@ -20,10 +20,17 @@ above the composer, styled like the queued-messages strip; it can be
 minimized to one line, and drafts can be edited or deleted (with undo).
 Chips with unsent drafts show an amber dot, chips with sent comments a count.
 
-Submit comments (N) in the action row sends every draft as one plain-markdown
-user message through the normal send path, so it queues like any message
-while the agent is busy (the queue row reads "3 comments on Q2 R1"). A
-message typed in the composer goes along as a General section. The format:
+Outside comment mode the composer's ordinary send (Enter, or its send button,
+which then reads "Send 3 comments + message") sends every draft as one
+plain-markdown user message through the normal send path, so it queues like
+any message while the agent is busy (the queue row reads "3 comments on Q2
+R1"); the tray's send button does the same. Reviewers type a general reply and
+press Enter expecting it all to go; sending the reply alone and steering the
+comments in after it splits one review into two turns. A message typed in the
+composer goes along as a General section, with any attached file review
+comments after it. Slash commands, skills and `!` shell inputs must lead their
+message, so they still go alone and leave the drafts, and a menu on the tray
+sends only the comments or only the message. The format:
 
   Comments on 2 items:
 
@@ -74,7 +81,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 (cherry picked from commit f757c407a12081227a7e9eb0de906bc17dfa26a8)
 ---
- docs/chat-item-labels.md                      |  54 ++
+ docs/chat-item-labels.md                      |  66 ++
  omnigent/runtime/prompt.py                    |  12 +-
  tests/e2e_ui/chat/test_item_label_chips.py    | 160 ++++-
  .../blocks/ChatMarkdown.itemLabels.test.tsx   | 151 ++++-
@@ -84,22 +91,22 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/components/chat/chatBubbleParts.tsx   |  45 +-
  web/src/components/chat/itemCommentActions.ts |  16 +
  .../composer/ItemCommentTray.test.tsx         | 222 +++++++
- .../components/composer/ItemCommentTray.tsx   | 416 ++++++++++++
- web/src/hooks/useItemCommentMode.test.tsx     | 383 ++++++++++++
- web/src/hooks/useItemCommentMode.ts           | 590 ++++++++++++++++++
+ .../components/composer/ItemCommentTray.tsx   | 456 +++++++++++++
+ web/src/hooks/useItemCommentMode.test.tsx     | 455 +++++++++++++
+ web/src/hooks/useItemCommentMode.ts           | 618 ++++++++++++++++++
  web/src/lib/itemCommentDrafts.test.ts         | 100 +++
- web/src/lib/itemCommentDrafts.ts              | 463 ++++++++++++++
- web/src/lib/itemCommentFiles.test.ts          |  36 ++
+ web/src/lib/itemCommentDrafts.ts              | 463 +++++++++++++
+ web/src/lib/itemCommentFiles.test.ts          |  36 +
  web/src/lib/itemCommentFiles.ts               | 136 ++++
  web/src/lib/itemComments.test.ts              | 238 +++++++
- web/src/lib/itemComments.ts                   | 348 +++++++++++
+ web/src/lib/itemComments.ts                   | 348 ++++++++++
  web/src/lib/itemLabels.test.ts                |  92 +++
  web/src/lib/itemLabels.ts                     | 122 +++-
- web/src/pages/ChatPage.composer.test.tsx      | 149 +++++
- web/src/pages/ChatPage.tsx                    | 328 ++++++++--
+ web/src/pages/ChatPage.composer.test.tsx      | 337 ++++++++++
+ web/src/pages/ChatPage.tsx                    | 431 +++++++++---
  web/src/pages/QueuedMessagesStrip.test.tsx    |  22 +
  web/src/pages/QueuedMessagesStrip.tsx         |  29 +-
- 25 files changed, 4347 insertions(+), 161 deletions(-)
+ 25 files changed, 4778 insertions(+), 173 deletions(-)
  create mode 100644 web/src/components/chat/itemCommentActions.ts
  create mode 100644 web/src/components/composer/ItemCommentTray.test.tsx
  create mode 100644 web/src/components/composer/ItemCommentTray.tsx
@@ -113,10 +120,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/itemComments.ts
 
 diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
-index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..b7f2bfed5b7a97ec72207b7b4939bb6f25d15a62 100644
+index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..dffbf892fc99a75f9d41490cf57d98ce62a72ea0 100644
 --- a/docs/chat-item-labels.md
 +++ b/docs/chat-item-labels.md
-@@ -56,3 +56,57 @@ you or the agent write them.
+@@ -56,3 +56,69 @@ you or the agent write them.
    at the bottom lists it with **Restore**. An item the agent later closes shows
    as closed as usual. Dismissals are stored on the session, as the
    `omnigent.items_dismissed` label, so they follow you to other devices.
@@ -134,10 +141,22 @@ index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..b7f2bfed5b7a97ec72207b7b4939bb6f
 +   its tags.
 +3. Press Enter or the check button to save the comment to **Comment drafts**,
 +   a tray above the composer. Drafts can be edited or deleted (with Undo), and
-+   the tray can be collapsed to one line.
-+4. Choose **Send N comments** (or **Send N comments + message** when you have
-+   also typed a message) to send every draft as one message. It queues like any
-+   message while the agent is busy.
++   the tray can be collapsed to one line. In comment mode, Enter always saves;
++   it never sends.
++4. Send as usual: outside comment mode, Enter or the composer's send button
++   (which then reads **Send N comments + message**) sends every draft, with
++   anything you typed as the General section, as one message. With nothing
++   typed it sends just the drafts. The tray's own **Send N comments** button
++   does the same, also from comment mode. It queues like any message while the
++   agent is busy, and a failed or cancelled send puts the drafts back.
++
++A slash command or skill (including `/btw` and `/side`) or a `!` shell input
++always goes on its own and leaves the drafts in the tray. To send only one
++part, open the **⋯** menu beside the tray's send button (shown once you have
++typed something): **Send comments only** leaves what you typed in the
++composer, and **Send message only** sends what you typed and keeps the drafts.
++File review comments attached to the composer go in the General section, after
++the typed message.
 +
 +The message is plain markdown that the agent is instructed to answer item by
 +item:
@@ -1604,16 +1623,17 @@ index 0000000000000000000000000000000000000000..149030e2243af5e6ef006f62e0fec4a3
 +});
 diff --git a/web/src/components/composer/ItemCommentTray.tsx b/web/src/components/composer/ItemCommentTray.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..3c601c6d4e39a65886428aa473f738ad75b52234
+index 0000000000000000000000000000000000000000..cf344fae712c84464e04e1fcce94036b09951322
 --- /dev/null
 +++ b/web/src/components/composer/ItemCommentTray.tsx
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,456 @@
 +import { useId, useState } from "react";
 +import {
 +  ArrowUpIcon,
 +  CheckIcon,
 +  ChevronDownIcon,
 +  ChevronUpIcon,
++  EllipsisIcon,
 +  MessageSquareTextIcon,
 +  PaperclipIcon,
 +  PencilIcon,
@@ -1623,6 +1643,12 @@ index 0000000000000000000000000000000000000000..3c601c6d4e39a65886428aa473f738ad
 +
 +import { ItemLabelDefinition, itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
 +import { Button } from "@/components/ui/button";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuItem,
++  DropdownMenuTrigger,
++} from "@/components/ui/dropdown-menu";
 +import {
 +  ITEM_COMMENT_TRAY_ID,
 +  useItemCommentTrayExpanded,
@@ -1743,6 +1769,10 @@ index 0000000000000000000000000000000000000000..3c601c6d4e39a65886428aa473f738ad
 +  /** Why sending is unavailable right now; null when it can send. */
 +  sendDisabledReason?: string | null;
 +  onSend: () => void;
++  /** Sends the drafts and leaves the typed message; offered with `onSendMessageOnly`. */
++  onSendCommentsOnly?: () => void;
++  /** Sends the typed message and leaves the drafts. */
++  onSendMessageOnly?: () => void;
 +  onEdit: (draftId: string) => void;
 +  onDelete: (draftId: string) => void;
 +  onDiscardAll: () => void;
@@ -1765,6 +1795,8 @@ index 0000000000000000000000000000000000000000..3c601c6d4e39a65886428aa473f738ad
 +  withMessage = false,
 +  sendDisabledReason = null,
 +  onSend,
++  onSendCommentsOnly,
++  onSendMessageOnly,
 +  onEdit,
 +  onDelete,
 +  onDiscardAll,
@@ -1881,6 +1913,33 @@ index 0000000000000000000000000000000000000000..3c601c6d4e39a65886428aa473f738ad
 +              <span id={messageNoteId} className="sr-only">
 +                The message you typed goes along as a General note.
 +              </span>
++            )}
++            {onSendCommentsOnly && onSendMessageOnly && (
++              <DropdownMenu>
++                <DropdownMenuTrigger asChild>
++                  <Button
++                    type="button"
++                    variant="ghost"
++                    size="icon-xs"
++                    aria-label="More send options"
++                    title="More send options"
++                    className={ACTION_BUTTON_CLASS}
++                    disabled={sendDisabledReason !== null}
++                  >
++                    <EllipsisIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
++                  </Button>
++                </DropdownMenuTrigger>
++                <DropdownMenuContent side="top" align="end">
++                  <DropdownMenuItem onSelect={onSendCommentsOnly}>
++                    <MessageSquareTextIcon aria-hidden="true" />
++                    Send comments only
++                  </DropdownMenuItem>
++                  <DropdownMenuItem onSelect={onSendMessageOnly}>
++                    <ArrowUpIcon viewBox="4 4 16 16" aria-hidden="true" />
++                    Send message only
++                  </DropdownMenuItem>
++                </DropdownMenuContent>
++              </DropdownMenu>
 +            )}
 +          </>
 +        )}
@@ -2026,10 +2085,10 @@ index 0000000000000000000000000000000000000000..3c601c6d4e39a65886428aa473f738ad
 +}
 diff --git a/web/src/hooks/useItemCommentMode.test.tsx b/web/src/hooks/useItemCommentMode.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..90d490a4760d146d0a3401eae8dfc527918582b9
+index 0000000000000000000000000000000000000000..6b938e847b29ebdc4a45f27e1b6564f6a814892c
 --- /dev/null
 +++ b/web/src/hooks/useItemCommentMode.test.tsx
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,455 @@
 +// Comment mode against a stand-in composer: drafting sets the typed message
 +// aside, submit sends one structured message through the send callback, and
 +// the drafts settle with the send path (posted, cancelled, or orphaned).
@@ -2216,6 +2275,78 @@ index 0000000000000000000000000000000000000000..90d490a4760d146d0a3401eae8dfc527
 +    // Sent, but kept until the message posts.
 +    expect(getItemCommentState(SESSION_ID).drafts).toHaveLength(3);
 +    expect(unsent(getItemCommentState(SESSION_ID))).toEqual([]);
++  });
++
++  it("sends only the drafts when asked, leaving the typed message in the composer", async () => {
++    const { result } = renderCommentMode();
++    comment(result, "R1", "Batch it.");
++    const typed: ComposerContent = {
++      text: "Still deciding.",
++      files: [new File(["x"], "notes.txt", { type: "text/plain" })],
++      mentions: [],
++      sessions: [],
++    };
++    composer = typed;
++
++    let sent = false;
++    await act(async () => {
++      sent = await result.current.submitComments({ withMessage: false });
++    });
++
++    expect(sent).toBe(true);
++    expect(send).toHaveBeenCalledWith(
++      buildItemCommentMessage(
++        [
++          {
++            label: "R1",
++            title: "Backfill locking",
++            comments: [{ text: "Batch it.", attachments: [] }],
++          },
++        ],
++        null,
++      ),
++      undefined,
++    );
++    expect(composer).toBe(typed);
++    expect(getItemCommentState(SESSION_ID).submissions[0]?.general).toBeUndefined();
++  });
++
++  it("appends extra General text after the typed message and gives it back on cancel", async () => {
++    const { result } = renderCommentMode();
++    comment(result, "R1", "Batch it.");
++    composer = { text: "Thanks.", files: [], mentions: [], sessions: [] };
++
++    await act(() => result.current.submitComments({ appendGeneral: "Review context" }));
++
++    const [text] = send.mock.calls[0];
++    expect(text).toBe(
++      buildItemCommentMessage(
++        [
++          {
++            label: "R1",
++            title: "Backfill locking",
++            comments: [{ text: "Batch it.", attachments: [] }],
++          },
++        ],
++        { text: "Thanks.\n\nReview context", attachments: [] },
++      ),
++    );
++    act(() => {
++      expect(result.current.restoreQueuedMessage(text)).toBe(true);
++    });
++    expect(composer.text).toBe("Thanks.\n\nReview context");
++  });
++
++  it("resolves false without sending when there are no drafts", async () => {
++    const { result } = renderCommentMode();
++    composer = { text: "Thanks.", files: [], mentions: [], sessions: [] };
++    let sent = true;
++    await act(async () => {
++      sent = await result.current.submitComments();
++    });
++    expect(sent).toBe(false);
++    expect(send).not.toHaveBeenCalled();
++    expect(composer.text).toBe("Thanks.");
 +  });
 +
 +  it("keeps session tags with comments and sends them with one tool hint", async () => {
@@ -2415,10 +2546,10 @@ index 0000000000000000000000000000000000000000..90d490a4760d146d0a3401eae8dfc527
 +});
 diff --git a/web/src/hooks/useItemCommentMode.ts b/web/src/hooks/useItemCommentMode.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..f9ff7b2a9410283a332c39e36ebe724e81815467
+index 0000000000000000000000000000000000000000..47981055c57a296582e07bbb768724da51f5e7e9
 --- /dev/null
 +++ b/web/src/hooks/useItemCommentMode.ts
-@@ -0,0 +1,590 @@
+@@ -0,0 +1,618 @@
 +// Comment mode for the chat composer. Commenting on an item turns the real
 +// composer into that comment's editor: whatever the user had typed is set
 +// aside and comes back when the comment is saved to the drafts tray. Submit
@@ -2515,6 +2646,13 @@ index 0000000000000000000000000000000000000000..f9ff7b2a9410283a332c39e36ebe724e
 +   * composer, which saves it as the session draft in place of the comment.
 +   */
 +  setAsideRef: MutableRefObject<ComposerContent | null>;
++}
++
++export interface SubmitCommentsOptions {
++  /** Whether the typed message goes along as the General section (default true). */
++  withMessage?: boolean;
++  /** Text sent after the typed message in the General section. */
++  appendGeneral?: string;
 +}
 +
 +const EMPTY_CONTENT: ComposerContent = { text: "", files: [], mentions: [], sessions: [] };
@@ -2809,96 +2947,117 @@ index 0000000000000000000000000000000000000000..f9ff7b2a9410283a332c39e36ebe724e
 +    [sessionId, restoreSubmission],
 +  );
 +
-+  const submitComments = useCallback(async () => {
-+    if (sessionId === null || submittingRef.current) return;
-+    submittingRef.current = true;
-+    try {
-+      const inComment = targetRef.current !== null;
-+      if (inComment) commitComment();
-+      const general = inComment ? (setAsideRef.current ?? EMPTY_CONTENT) : io.current.read();
-+      const index = getPublishedItemLabelIndex(sessionId);
-+      const order = index?.enabled ? [...index.items.keys()] : [];
-+      const drafts = orderByItemDefinition(
-+        getItemCommentState(sessionId)
-+          .drafts.filter((d) => !d.submissionId)
-+          .sort((a, b) => a.createdAt - b.createdAt),
-+        order,
-+      );
-+      if (drafts.length === 0) return;
-+      const { files: draftFiles, missing } = await loadDraftFiles(drafts);
-+      const names = uniqueItemCommentFilenames([
-+        ...drafts.map((draft, at) => ({
-+          prefix: draft.label,
-+          names: draftFiles[at].map(attachmentFilename),
-+        })),
-+        { prefix: "general", names: general.files.map(attachmentFilename) },
-+      ]);
-+      const groups = new Map<string, ItemCommentGroup & { comments: ItemCommentBody[] }>();
-+      let tagsSessions = false;
-+      drafts.forEach((draft, at) => {
-+        const entry = index?.items.get(draft.label);
-+        const group = groups.get(draft.label) ?? {
-+          label: draft.label,
-+          title: entry ? itemCommentTitle(entry.source.text, draft.label) : draft.title,
-+          comments: [],
++  /**
++   * Sends every unsent draft as one message; resolves whether it sent one.
++   * The typed message goes along as the General section, with `appendGeneral`
++   * after it, unless `withMessage` is false, which leaves it where it is.
++   */
++  const submitComments = useCallback(
++    async (options: SubmitCommentsOptions = {}) => {
++      const { withMessage = true, appendGeneral = "" } = options;
++      if (sessionId === null || submittingRef.current) return false;
++      submittingRef.current = true;
++      try {
++        const inComment = targetRef.current !== null;
++        if (inComment) commitComment();
++        const typed = inComment ? (setAsideRef.current ?? EMPTY_CONTENT) : io.current.read();
++        const general: ComposerContent = !withMessage
++          ? EMPTY_CONTENT
++          : appendGeneral.trim() === ""
++            ? typed
++            : {
++                ...typed,
++                text: [typed.text, appendGeneral].filter((part) => part.trim() !== "").join("\n\n"),
++              };
++        const index = getPublishedItemLabelIndex(sessionId);
++        const order = index?.enabled ? [...index.items.keys()] : [];
++        const drafts = orderByItemDefinition(
++          getItemCommentState(sessionId)
++            .drafts.filter((d) => !d.submissionId)
++            .sort((a, b) => a.createdAt - b.createdAt),
++          order,
++        );
++        if (drafts.length === 0) return false;
++        const { files: draftFiles, missing } = await loadDraftFiles(drafts);
++        const names = uniqueItemCommentFilenames([
++          ...drafts.map((draft, at) => ({
++            prefix: draft.label,
++            names: draftFiles[at].map(attachmentFilename),
++          })),
++          { prefix: "general", names: general.files.map(attachmentFilename) },
++        ]);
++        const groups = new Map<string, ItemCommentGroup & { comments: ItemCommentBody[] }>();
++        let tagsSessions = false;
++        drafts.forEach((draft, at) => {
++          const entry = index?.items.get(draft.label);
++          const group = groups.get(draft.label) ?? {
++            label: draft.label,
++            title: entry ? itemCommentTitle(entry.source.text, draft.label) : draft.title,
++            comments: [],
++          };
++          const comment = draftComment(draft, io.current.expandMentions);
++          tagsSessions ||= comment.tagsSessions;
++          group.comments.push({ text: comment.text, attachments: names[at] });
++          groups.set(draft.label, group);
++        });
++        const generalNames = names[drafts.length];
++        const expandedGeneral = io.current.expandMentions(
++          general.text,
++          general.mentions,
++          general.sessions,
++        );
++        const generalText = expandedGeneral.text;
++        // One session tool hint for the whole message, as an ordinary send adds.
++        const message = withSessionMentionHint(
++          buildItemCommentMessage(
++            [...groups.values()],
++            generalText.trim() !== "" || generalNames.length > 0
++              ? { text: generalText, attachments: generalNames }
++              : null,
++          ),
++          tagsSessions || expandedGeneral.tagsSessions,
++        );
++        const files = [
++          ...drafts.flatMap((_, at) =>
++            draftFiles[at].map((file, i) => renamed(file, names[at][i])),
++          ),
++          ...general.files.map((file, i) => renamed(file, generalNames[i])),
++        ];
++        const submission: ItemCommentSubmission = {
++          id: newDraftId(),
++          text: message,
++          ...(general.text.trim() !== ""
++            ? {
++                general: {
++                  text: general.text,
++                  ...(general.replyDraft ? { replyDraft: general.replyDraft } : {}),
++                  ...(general.mentions.length > 0 ? { mentions: general.mentions } : {}),
++                  ...(general.sessions.length > 0 ? { sessions: general.sessions } : {}),
++                },
++              }
++            : {}),
 +        };
-+        const comment = draftComment(draft, io.current.expandMentions);
-+        tagsSessions ||= comment.tagsSessions;
-+        group.comments.push({ text: comment.text, attachments: names[at] });
-+        groups.set(draft.label, group);
-+      });
-+      const generalNames = names[drafts.length];
-+      const expandedGeneral = io.current.expandMentions(
-+        general.text,
-+        general.mentions,
-+        general.sessions,
-+      );
-+      const generalText = expandedGeneral.text;
-+      // One session tool hint for the whole message, as an ordinary send adds.
-+      const message = withSessionMentionHint(
-+        buildItemCommentMessage(
-+          [...groups.values()],
-+          generalText.trim() !== "" || generalNames.length > 0
-+            ? { text: generalText, attachments: generalNames }
-+            : null,
-+        ),
-+        tagsSessions || expandedGeneral.tagsSessions,
-+      );
-+      const files = [
-+        ...drafts.flatMap((_, at) => draftFiles[at].map((file, i) => renamed(file, names[at][i]))),
-+        ...general.files.map((file, i) => renamed(file, generalNames[i])),
-+      ];
-+      const submission: ItemCommentSubmission = {
-+        id: newDraftId(),
-+        text: message,
-+        ...(general.text.trim() !== ""
-+          ? {
-+              general: {
-+                text: general.text,
-+                ...(general.replyDraft ? { replyDraft: general.replyDraft } : {}),
-+                ...(general.mentions.length > 0 ? { mentions: general.mentions } : {}),
-+                ...(general.sessions.length > 0 ? { sessions: general.sessions } : {}),
-+              },
-+            }
-+          : {}),
-+      };
-+      if (general.files.length > 0) generalFilesBySubmission.set(submission.id, general.files);
-+      markItemCommentsSubmitted(
-+        sessionId,
-+        drafts.map((draft) => draft.id),
-+        submission,
-+      );
-+      setAsideRef.current = null;
-+      setTarget(null);
-+      targetRef.current = null;
-+      io.current.write(EMPTY_CONTENT);
-+      if (missing > 0)
-+        toast.error("Some draft attachments were no longer available and were left out.");
-+      io.current.send(message, files.length > 0 ? files : undefined);
-+    } finally {
-+      submittingRef.current = false;
-+    }
-+  }, [sessionId, commitComment, setAsideRef]);
++        if (general.files.length > 0) generalFilesBySubmission.set(submission.id, general.files);
++        markItemCommentsSubmitted(
++          sessionId,
++          drafts.map((draft) => draft.id),
++          submission,
++        );
++        setAsideRef.current = null;
++        setTarget(null);
++        targetRef.current = null;
++        // A message kept out of the send stays in the composer.
++        if (withMessage || inComment) io.current.write(withMessage ? EMPTY_CONTENT : typed);
++        if (missing > 0)
++          toast.error("Some draft attachments were no longer available and were left out.");
++        io.current.send(message, files.length > 0 ? files : undefined);
++        return true;
++      } finally {
++        submittingRef.current = false;
++      }
++    },
++    [sessionId, commitComment, setAsideRef],
++  );
 +
 +  // Leaving the session ends comment mode; the comment is kept as a draft
 +  // there, and the composer's own cleanup saves the set-aside text.
@@ -4682,10 +4841,10 @@ index 8b6814ea6f55290f1797750ed673b22cc966bf58..1b08ae22005b367f42f8685b08b0abfd
  }
  
 diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
-index 9ad6bbdb52ab37f79fc51e4320ca70c07dfed594..ad2fa6d20d4c8c04b3bfc479e02b22bd0b6475c5 100644
+index 9ad6bbdb52ab37f79fc51e4320ca70c07dfed594..ce7a14f1857fbe67ce6eeddcf482ddc217832c9a 100644
 --- a/web/src/pages/ChatPage.composer.test.tsx
 +++ b/web/src/pages/ChatPage.composer.test.tsx
-@@ -45,6 +45,14 @@ import {
+@@ -45,6 +45,15 @@ import {
  import { setOmnigentHostConfig } from "@/lib/host";
  import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
  import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -4694,13 +4853,14 @@ index 9ad6bbdb52ab37f79fc51e4320ca70c07dfed594..ad2fa6d20d4c8c04b3bfc479e02b22bd
 +  publishItemLabelIndex,
 +  requestItemComment,
 +  resetItemCommentDraftsForTests,
++  saveItemCommentDraft,
 +} from "@/lib/itemCommentDrafts";
 +import { scanItemLabelSource } from "@/lib/itemComments";
 +import { buildItemLabelIndex } from "@/lib/itemLabels";
  import * as host from "@/lib/host";
  import * as identity from "@/lib/identity";
  import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
-@@ -521,6 +529,147 @@ describe("Composer session drafts", () => {
+@@ -521,6 +530,334 @@ describe("Composer session drafts", () => {
    });
  });
  
@@ -4825,7 +4985,7 @@ index 9ad6bbdb52ab37f79fc51e4320ca70c07dfed594..ad2fa6d20d4c8c04b3bfc479e02b22bd
 +    fireEvent.click(screen.getByRole("button", { name: "Save comment" }));
 +    fireEvent.change(textarea(), { target: { value: "Thanks." } });
 +
-+    fireEvent.click(screen.getByRole("button", { name: "Send 1 comment + message" }));
++    fireEvent.click(screen.getByTestId("submit-item-comments"));
 +
 +    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
 +    const [text, files] = onSend.mock.calls[0];
@@ -4843,13 +5003,200 @@ index 9ad6bbdb52ab37f79fc51e4320ca70c07dfed594..ad2fa6d20d4c8c04b3bfc479e02b22bd
 +    expect(textarea()).toHaveValue("");
 +    expect(screen.queryByTestId("item-comment-tray")).toBeNull();
 +  });
++
++  describe("the composer's own send", () => {
++    function saveDraft(id: string, label: string, text: string) {
++      act(() =>
++        saveItemCommentDraft("conv_comments", {
++          id,
++          label,
++          title: `${label} title`,
++          text,
++          files: [],
++          createdAt: Number(id.slice(1)),
++        }),
++      );
++    }
++    const unsentDrafts = () =>
++      getItemCommentState("conv_comments").drafts.filter((d) => !d.submissionId);
++    const composerSend = () =>
++      within(screen.getByTestId("composer-action-row")).getByRole("button", { name: /^Send/ });
++    const openSendOptions = () =>
++      fireEvent.pointerDown(screen.getByRole("button", { name: "More send options" }), {
++        button: 0,
++      });
++
++    it("sends the drafts and the typed message as one comment message on Enter", async () => {
++      const onSend = vi.fn();
++      render(<Composer {...composerProps({ onSend })} />);
++      saveDraft("d1", "Q2", "Use the account's zone.");
++      saveDraft("d2", "R1", "Batch it.");
++      fireEvent.change(textarea(), { target: { value: "Thanks." } });
++      expect(composerSend()).toHaveAccessibleName("Send 2 comments + message");
++
++      fireEvent.keyDown(textarea(), { key: "Enter" });
++
++      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
++      expect(onSend.mock.calls[0][0]).toBe(
++        [
++          "Comments on 2 items:",
++          "#### [Q2] Q2 title",
++          "Use the account's zone.",
++          "#### [R1] R1 title",
++          "Batch it.",
++          "#### General",
++          "Thanks.",
++        ].join("\n\n"),
++      );
++      expect(textarea()).toHaveValue("");
++      expect(unsentDrafts()).toEqual([]);
++    });
++
++    it("sends the drafts from an empty composer, even while the agent works", async () => {
++      const onSend = vi.fn();
++      const onStop = vi.fn();
++      render(
++        <Composer {...composerProps({ onSend, onStop, isWorking: true, status: "streaming" })} />,
++      );
++      saveDraft("d1", "R1", "Batch it.");
++      const send = composerSend();
++      expect(send).toHaveAccessibleName("Send 1 comment");
++      expect(send).toBeEnabled();
++
++      fireEvent.click(send);
++
++      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
++      expect(onSend.mock.calls[0][0]).toBe(
++        ["Comments on 1 item:", "#### [R1] R1 title", "Batch it."].join("\n\n"),
++      );
++      expect(onStop).not.toHaveBeenCalled();
++    });
++
++    it("folds attached file review comments into the General section", async () => {
++      const onSend = vi.fn();
++      render(
++        <QueryClientProvider client={new QueryClient()}>
++          <Composer {...composerProps({ onSend })} />
++        </QueryClientProvider>,
++      );
++      saveDraft("d1", "R1", "Batch it.");
++      const review = {
++        id: "rc1",
++        conversation_id: "conv_comments",
++        path: "src/example.ts",
++        start_index: 0,
++        end_index: 0,
++        body: "Preserve the public API.",
++        status: "draft" as const,
++        created_at: 1,
++        updated_at: 1,
++        anchor_content: null,
++        created_by: null,
++        anchor_metadata: {
++          pr_url: "https://github.com/acme/repo/pull/1",
++          side: "RIGHT" as const,
++          line: 12,
++          start_line: null,
++          head_sha: "a".repeat(40),
++          base_sha: "b".repeat(40),
++        },
++      };
++      act(() => requestLocalReviewContext(review));
++      fireEvent.change(textarea(), { target: { value: "Thanks." } });
++
++      fireEvent.keyDown(textarea(), { key: "Enter" });
++
++      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
++      expect(onSend.mock.calls[0][0]).toBe(
++        [
++          "Comments on 1 item:",
++          "#### [R1] R1 title",
++          "Batch it.",
++          "#### General",
++          "Thanks.",
++          formatLocalReviewComments([review], { includeInstruction: false }),
++        ].join("\n\n"),
++      );
++      await waitFor(() =>
++        expect(getSessionDraft("conv_comments")?.reviewComments ?? []).toEqual([]),
++      );
++    });
++
++    it.each(["/compact-notes now", "!git status"])(
++      "sends %s on its own and keeps the drafts",
++      (command) => {
++        const onSend = vi.fn();
++        render(<Composer {...composerProps({ onSend })} />);
++        saveDraft("d1", "R1", "Batch it.");
++        fireEvent.change(textarea(), { target: { value: command } });
++        expect(composerSend()).toHaveAccessibleName("Send");
++
++        fireEvent.keyDown(textarea(), { key: "Enter" });
++
++        expect(onSend).toHaveBeenCalledTimes(1);
++        expect(onSend.mock.calls[0][0]).toBe(command);
++        expect(unsentDrafts().map((d) => d.id)).toEqual(["d1"]);
++        expect(screen.getByTestId("item-comment-tray")).toBeInTheDocument();
++      },
++    );
++
++    it("sends only the message from the tray's menu and keeps the drafts", async () => {
++      const onSend = vi.fn();
++      render(<Composer {...composerProps({ onSend })} />);
++      saveDraft("d1", "R1", "Batch it.");
++      fireEvent.change(textarea(), { target: { value: "Thanks." } });
++
++      openSendOptions();
++      fireEvent.click(await screen.findByRole("menuitem", { name: "Send message only" }));
++
++      expect(onSend).toHaveBeenCalledTimes(1);
++      expect(onSend.mock.calls[0][0]).toBe("Thanks.");
++      expect(textarea()).toHaveValue("");
++      expect(unsentDrafts().map((d) => d.id)).toEqual(["d1"]);
++    });
++
++    it("sends only the comments from the tray's menu and keeps the typed message", async () => {
++      const onSend = vi.fn();
++      render(<Composer {...composerProps({ onSend })} />);
++      saveDraft("d1", "R1", "Batch it.");
++      expect(screen.queryByRole("button", { name: "More send options" })).toBeNull();
++      fireEvent.change(textarea(), { target: { value: "Thanks." } });
++
++      openSendOptions();
++      fireEvent.click(await screen.findByRole("menuitem", { name: "Send comments only" }));
++
++      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
++      expect(onSend.mock.calls[0][0]).toBe(
++        ["Comments on 1 item:", "#### [R1] R1 title", "Batch it."].join("\n\n"),
++      );
++      expect(textarea()).toHaveValue("Thanks.");
++      expect(unsentDrafts()).toEqual([]);
++    });
++
++    it("still saves the comment on Enter in comment mode, sending nothing", async () => {
++      const onSend = vi.fn();
++      render(<Composer {...composerProps({ onSend })} />);
++      saveDraft("d1", "R1", "Batch it.");
++      startComment("Q2", "Report cutoff timezone");
++      await screen.findByTestId("item-comment-mode");
++      expect(screen.queryByRole("button", { name: "More send options" })).toBeNull();
++      fireEvent.change(textarea(), { target: { value: "Use the account's zone." } });
++
++      fireEvent.keyDown(textarea(), { key: "Enter" });
++
++      expect(screen.queryByTestId("item-comment-mode")).toBeNull();
++      expect(unsentDrafts().map((d) => d.label)).toEqual(["R1", "Q2"]);
++      await act(async () => {});
++      expect(onSend).not.toHaveBeenCalled();
++    });
++  });
 +});
 +
  describe("Composer starting-session cancellation", () => {
    beforeEach(() => {
      clearSessionDrafts();
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f3b852245 100644
+index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..983e7332c5a1dfdc3339dbde61ded7a213641c2a 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
 @@ -32,7 +32,14 @@ import {
@@ -4868,16 +5215,20 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
  import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
  import {
    composerSendShortcutKeys,
-@@ -72,6 +79,8 @@ import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/bl
+@@ -72,6 +79,12 @@ import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/bl
  import { cn } from "@/lib/utils";
  import { isInlineRenameFocused } from "@/lib/inlineRename";
  import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-+import { ItemCommentModeHeader, ItemCommentTray } from "@/components/composer/ItemCommentTray";
++import {
++  ItemCommentModeHeader,
++  ItemCommentTray,
++  itemCommentSendLabel,
++} from "@/components/composer/ItemCommentTray";
 +import { useItemCommentMode, type ComposerContent } from "@/hooks/useItemCommentMode";
  import {
    serverSwitcherHiddenForSurface,
    useSurfaceFrontmost,
-@@ -111,6 +120,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
+@@ -111,6 +124,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
  import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
  import {
    takeFailedSendDraft,
@@ -4885,7 +5236,28 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
    composerAttachmentKey,
    consumePendingInitialPrompt,
    holdsInitialDraft,
-@@ -3008,6 +3018,9 @@ function ComposerImpl(
+@@ -478,6 +492,20 @@ export function splitSlashCommand(
+   return { before, token, after: value.slice(before.length + token.length) };
+ }
+ 
++/**
++ * Whether a composer send goes out on its own, leaving the comment drafts:
++ * a slash command or skill (built-in or plaintext, /btw and /side included)
++ * or a `!` shell input, which must lead the message to work.
++ */
++export function sendsWithoutCommentDrafts(text: string, commands: Iterable<string>): boolean {
++  const trimmed = text.trim();
++  return (
++    trimmed.startsWith("!") ||
++    isSlashCommandText(trimmed) ||
++    matchSlashCommandInvocation(trimmed, commands) !== null
++  );
++}
++
+ // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
+ // prefer the last word boundary within 10 chars of the limit so we don't
+ // chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
+@@ -3008,6 +3036,9 @@ function ComposerImpl(
    valueRef.current = fullText;
    const replyDraftRef = useRef(storedReplyDraft);
    replyDraftRef.current = storedReplyDraft;
@@ -4895,7 +5267,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
    // Guards against React StrictMode double-invoke in development:
    // setup → cleanup → setup runs cleanup before the user has touched
    // the input, which would delete the draft. Only save when the user
-@@ -3089,14 +3102,27 @@ function ComposerImpl(
+@@ -3089,14 +3120,27 @@ function ComposerImpl(
      // The store binds a clicked session a moment later; keep focus in a rename started meanwhile.
      if (!isMobileRef.current && !isInlineRenameFocused()) textareaRef.current?.focus();
  
@@ -4929,7 +5301,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
      };
    }, [conversationId, replaceText]);
  
-@@ -3134,13 +3160,24 @@ function ComposerImpl(
+@@ -3134,13 +3178,24 @@ function ComposerImpl(
    // rather than only learning about a draft when this composer unmounts.
    useEffect(() => {
      if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
@@ -4961,7 +5333,20 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
    }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
  
    const terminalPending = useChatStore((s) => s.terminalPending);
-@@ -3525,6 +3562,71 @@ function ComposerImpl(
+@@ -3462,12 +3517,6 @@ function ComposerImpl(
+   useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
+   const hasDraft =
+     fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
+-  const showInterruptButton =
+-    isWorking &&
+-    (!hasDraft ||
+-      hasPendingElicitation ||
+-      isTempConvId(conversationId) ||
+-      hasPendingInitialMessage);
+ 
+   // Drain externally-queued attachments (file viewer "Attach to agent") into
+   // tagged items and inline tokens, deduping against what's already tagged,
+@@ -3525,6 +3574,86 @@ function ComposerImpl(
      // setMentionedItems is a stable useState setter (from useMentionBrowser).
    }, [pendingComposerAttachments, setMentionedItems, editText]);
  
@@ -5017,7 +5402,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
 +  const generalContent = commentTarget ? commentSetAsideRef.current : null;
 +  const hasGeneralMessage = commentTarget
 +    ? (generalContent?.text.trim() ?? "") !== "" || (generalContent?.files.length ?? 0) > 0
-+    : fullText.trim() !== "" || files.length > 0;
++    : hasDraft;
 +  const showCommentTray =
 +    commentMode.unsentDrafts.length > 0 || commentMode.sendingElsewhere.length > 0;
 +  const commentSendDisabledReason =
@@ -5029,11 +5414,26 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
 +        : disabled
 +          ? "Waiting for agents…"
 +          : null);
++  // Outside comment mode an ordinary send takes the unsent drafts along,
++  // unless what's typed is a command or shell input that has to go alone.
++  const sendCarriesCommentDrafts =
++    !commentTarget &&
++    commentMode.unsentDrafts.length > 0 &&
++    !sendsWithoutCommentDrafts(fullText, slashCommandNames);
++  const sendLabel = sendCarriesCommentDrafts
++    ? itemCommentSendLabel(commentMode.unsentDrafts.length, hasDraft)
++    : "Send";
++  const showInterruptButton =
++    isWorking &&
++    ((!hasDraft && !sendCarriesCommentDrafts) ||
++      hasPendingElicitation ||
++      isTempConvId(conversationId) ||
++      hasPendingInitialMessage);
 +
    // Restore the text (and attachments) of a send that failed, so the user can
    // fix and resend instead of retyping. The composer is empty in the normal
    // case — `submit` clears it optimistically — so only fill it when the user
-@@ -3541,9 +3643,17 @@ function ComposerImpl(
+@@ -3541,9 +3670,17 @@ function ComposerImpl(
      // conversation's draft and wrongly conclude the user is mid-sentence,
      // dropping the failed message on the way back to the session it failed in.
      if (settledConversationId !== conversationId) return;
@@ -5052,7 +5452,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
      if (!failed) return;
      // The failed text carries expanded markers; bring its session tags back as tokens.
      const recalled = recallComposerDraft(failed.text, failed.replyDraft);
-@@ -3564,7 +3674,14 @@ function ComposerImpl(
+@@ -3564,7 +3701,14 @@ function ComposerImpl(
      dirtyRef.current = true;
      if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
      if (!isMobileRef.current) textareaRef.current?.focus();
@@ -5068,8 +5468,44 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
  
    // Retract a restored failed-send draft once its send proves delivered (its
    // committed item arrived over the stream or a reconnect snapshot). Edits win:
-@@ -4194,6 +4311,11 @@ function ComposerImpl(
-   }: { resetNativeInputSession?: boolean } = {}) => {
+@@ -4189,18 +4333,59 @@ function ComposerImpl(
+     textareaRef.current = tailTextareaRef.current;
+   };
+ 
++  /**
++   * Sends the unsent comment drafts as one message. Outside comment mode the
++   * typed message and any file review comments go along as its General
++   * section, unless `withMessage` is false, which leaves them in the composer.
++   */
++  const sendCommentDrafts = (withMessage = true): Promise<void> => {
++    setCommandError(null);
++    const hasAuthoredText =
++      !!draft.text.trim() || draft.quotes.some((quote) => quote.before.trim());
++    const reviewContext =
++      withMessage && !commentTarget && localReviewComments.length > 0
++        ? formatLocalReviewComments(localReviewComments, { includeInstruction: !hasAuthoredText })
++        : "";
++    const reviewSessionId = conversationId;
++    return commentMode
++      .submitComments({ withMessage, appendGeneral: reviewContext })
++      .then((sent) => {
++        if (sent && reviewContext && reviewSessionId) clearLocalReviewContexts(reviewSessionId);
++      });
++  };
++
++  /**
++   * Sends what the composer holds. Outside comment mode the unsent comment
++   * drafts go along as one comment message unless `withCommentDrafts` is
++   * false; that send resolves the returned promise once it's queued.
++   */
+   const submit = ({
+     resetNativeInputSession = false,
+-  }: { resetNativeInputSession?: boolean } = {}) => {
++    withCommentDrafts = true,
++  }: {
++    resetNativeInputSession?: boolean;
++    withCommentDrafts?: boolean;
++  } = {}): Promise<void> | void => {
      // The /btw overlay locks the composer — never send while it's open.
      if (composerLockedByBtw) return;
 +    // In comment mode, Enter and ✓ save the comment to the drafts tray.
@@ -5078,9 +5514,37 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
 +      return;
 +    }
      const trimmed = fullText.trim();
-     // Allow send if there's text, attached files, OR "@"-tagged paths.
+-    // Allow send if there's text, attached files, OR "@"-tagged paths.
++    const withDrafts = withCommentDrafts && sendCarriesCommentDrafts;
++    // Allow send if there's text, attached files, "@"-tagged paths, or comment drafts.
      if (
-@@ -4440,7 +4562,7 @@ function ComposerImpl(
+-      (!trimmed && files.length === 0 && !hasMentions && localReviewComments.length === 0) ||
++      (!trimmed &&
++        files.length === 0 &&
++        !hasMentions &&
++        localReviewComments.length === 0 &&
++        !withDrafts) ||
+       disabled ||
+       sendDisabledReason !== null ||
+-      hasPendingElicitation
++      hasPendingElicitation ||
++      (withDrafts && (commentSendDisabledReason !== null || inputDisabled))
+     )
+       return;
+ 
+@@ -4209,6 +4394,11 @@ function ComposerImpl(
+     // guard so guarded no-ops don't emit, matching the disabled Send button.
+     trackClick("chat.composer.send", "button");
+ 
++    if (withDrafts) {
++      setMention(null);
++      return sendCommentDrafts();
++    }
++
+     // A generic (non-Codex) side chat forks the conversation and runs it on the
+     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
+     // tab; the typed text seeds the new side chat's composer so it isn't fired
+@@ -4440,7 +4630,7 @@ function ComposerImpl(
  
    const handleSubmit = (e: FormEvent) => {
      e.preventDefault();
@@ -5089,7 +5553,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
        onStop();
        return;
      }
-@@ -4493,7 +4615,12 @@ function ComposerImpl(
+@@ -4493,11 +4683,21 @@ function ComposerImpl(
      // steers everything: the draft, if any, is submitted first so it joins the
      // queue tail (or sends directly when idle), then every queued message is
      // sent into the running turn in FIFO order instead of draining one per idle.
@@ -5101,9 +5565,20 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
 +      shouldSteerAllFromKeyboard
 +    ) {
        e.preventDefault();
-       if (!mentionListingPending) submit();
+-      if (!mentionListingPending) submit();
++      const sent = mentionListingPending ? undefined : submit();
        // While unreachable the queue waits for the host, so nothing is steered.
-@@ -4527,6 +4654,12 @@ function ComposerImpl(
+-      if (!unreachable) steerAllQueuedMessages(conversationId);
++      const steer = () => {
++        if (!unreachable) steerAllQueuedMessages(conversationId);
++      };
++      // A comment message joins the queue once its draft files load.
++      if (sent) void sent.then(steer);
++      else steer();
+       return;
+     }
+     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
+@@ -4527,6 +4727,12 @@ function ComposerImpl(
        submit();
        return;
      }
@@ -5116,7 +5591,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
      // Esc dismisses the /btw sidechat overlay if open
      if (e.key === "Escape" && btwSidechat) {
        e.preventDefault();
-@@ -4544,6 +4677,7 @@ function ComposerImpl(
+@@ -4544,6 +4750,7 @@ function ComposerImpl(
      // Recall starts from empty text; boundary checks preserve caret movement
      // through wrapped recalled entries. Modified arrows belong to global hotkeys.
      if (
@@ -5124,7 +5599,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
        (draft.quotes.length === 0 || recallingRef.current) &&
        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
        !e.metaKey &&
-@@ -4555,6 +4689,11 @@ function ComposerImpl(
+@@ -4555,6 +4762,11 @@ function ComposerImpl(
          // Empty-composer recall takes the last queued row before browsing history.
          if (composerEmptyForRecall) {
            const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -5136,7 +5611,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
            if (target !== undefined) {
              e.preventDefault();
              resetCursor();
-@@ -4636,6 +4775,21 @@ function ComposerImpl(
+@@ -4636,6 +4848,27 @@ function ComposerImpl(
            bottom corners when the surface below is at least as wide,
            otherwise page background shows and the tray floats detached. */}
        <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
@@ -5147,7 +5622,13 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
 +          composingLabel={composingCommentLabel}
 +          withMessage={hasGeneralMessage}
 +          sendDisabledReason={commentSendDisabledReason}
-+          onSend={() => void commentMode.submitComments()}
++          onSend={() => void sendCommentDrafts()}
++          {...(!commentTarget && hasDraft
++            ? {
++                onSendCommentsOnly: () => void sendCommentDrafts(false),
++                onSendMessageOnly: () => void submit({ withCommentDrafts: false }),
++              }
++            : {})}
 +          onEdit={commentMode.editDraft}
 +          onDelete={commentMode.deleteDraft}
 +          onDiscardAll={commentMode.discardAll}
@@ -5158,7 +5639,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
          {/* Queued messages — peeks above the workspace bar like the
              sub-agent tray. Lists follow-ups held while the agent is busy;
              drains FIFO on idle. Scope to this conversation so a queue held
-@@ -4643,7 +4797,12 @@ function ComposerImpl(
+@@ -4643,7 +4876,12 @@ function ComposerImpl(
          <QueuedMessagesStrip
            messages={composerQueuedMessages}
            arrowUpRecallQueueId={arrowUpRecallQueueId}
@@ -5172,7 +5653,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
            onEdit={(queueId) => {
              // Pull the queued message back into the composer for editing:
              // replace the composer's text + attachments with the queued
-@@ -4651,6 +4810,11 @@ function ComposerImpl(
+@@ -4651,6 +4889,11 @@ function ComposerImpl(
              // Re-sending re-queues it (busy) or sends it (idle).
              const target = queuedMessages.find((m) => m.queueId === queueId);
              if (!target) return;
@@ -5184,7 +5665,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
              dequeueMessage(queueId);
              loadIntoComposer(target.text, target.files ?? [], { replyDraft: target.replyDraft });
            }}
-@@ -4667,7 +4831,7 @@ function ComposerImpl(
+@@ -4667,7 +4910,7 @@ function ComposerImpl(
            <ComposerWorkspaceBar
              data-testid="composer-workspace-controls"
              className={cn(
@@ -5193,7 +5674,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
                  "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
              )}
            >
-@@ -4748,19 +4912,21 @@ function ComposerImpl(
+@@ -4748,19 +4991,21 @@ function ComposerImpl(
            "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
            placeholder: composerLockedByBtw
              ? "Side chat open — press Esc to close"
@@ -5228,7 +5709,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
            rows: 1,
            disabled: inputDisabled,
            "data-slash-command": composerIsCommand ? "true" : undefined,
-@@ -4822,6 +4988,17 @@ function ComposerImpl(
+@@ -4822,6 +5067,17 @@ function ComposerImpl(
                    }}
                  />
                )}
@@ -5246,7 +5727,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
                {/* Slash-command suggestions — floats above the composer box */}
                {slashCompletion.open && (
                  <SlashCommandMenu
-@@ -5098,41 +5275,60 @@ function ComposerImpl(
+@@ -5098,41 +5354,60 @@ function ComposerImpl(
                    resetCursor();
                  }}
                />
@@ -5303,14 +5784,14 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
 +                        disabled={
 +                          showInterruptButton
 +                            ? isReadOnly
-+                            : !hasDraft ||
++                            : (!hasDraft && !(sendCarriesCommentDrafts && !inputDisabled)) ||
 +                              disabled ||
 +                              isReadOnly ||
 +                              sendDisabledReason !== null ||
 +                              hasPendingElicitation
 +                        }
 +                        title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
-+                        label={showInterruptButton ? "Interrupt" : "Send"}
++                        label={showInterruptButton ? "Interrupt" : sendLabel}
 +                      />
 +                    </TooltipTrigger>
 +                    {showInterruptButton ? (
@@ -5329,7 +5810,7 @@ index dc060904e6ca5c2ee51b205e4d03440e2a5ab323..a2cac505b9a96fddc0f3ffc398ba2f9f
 +                    ) : (
 +                      !preventsKeyboardSubmit && (
 +                        <KeyboardShortcutTooltipContent
-+                          label="Send"
++                          label={sendLabel}
 +                          keys={composerSendShortcutKeys(submitWithModEnter)}
 +                        />
 +                      )
