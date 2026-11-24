@@ -40,13 +40,13 @@ Docs: none (documented with its series in docs/providers.md)
  omnigent/onboarding/harness_readiness.py      | 10 +-
  omnigent/onboarding/provider_config.py        | 44 ++++++++-
  omnigent/onboarding/subscription_accounts.py  | 95 +++++++++++++++++--
- omnigent/runner/native/orchestration.py       | 30 +++++-
+ omnigent/runner/native/orchestration.py       | 32 ++++++-
  omnigent/runtime/workflow.py                  |  6 +-
  tests/cli/test_configure_models.py            | 67 ++++++++++++-
  .../onboarding/test_subscription_accounts.py  | 83 +++++++++++++++-
- .../test_app_claude_native_launch_args.py     | 63 ++++++++++++
+ .../test_app_claude_native_launch_args.py     | 65 ++++++++++++-
  tests/runtime/test_provider_spawn_env.py      | 25 +++++
- 11 files changed, 475 insertions(+), 31 deletions(-)
+ 11 files changed, 476 insertions(+), 34 deletions(-)
 
 diff --git a/omnigent/cli_config.py b/omnigent/cli_config.py
 index fca55671acb814d9d69879fd5dab80c3b4cf4782..5ab171813143556c5b25e523efdb2469a5403425 100644
@@ -524,10 +524,10 @@ index 9c15f3ea556f6772cb8eda8f173e5eef1d288e43..d7c98c163e0b5421c54b631de0c85e0c
          return f"Databricks profile {entry.profile}" if entry.profile else "Databricks"
      if entry.kind == CLI_CONFIG_KIND:
 diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index 10159f581e18465752626b44866ef9ed2a2443eb..5811861d7572a4f1d1f90002661cdd89448eb7d4 100644
+index d521524912a42599cbc752b99ed68c728f34e036..1c31e1ba0d128bf827d85340621c89b7722ae3a6 100644
 --- a/omnigent/runner/native/orchestration.py
 +++ b/omnigent/runner/native/orchestration.py
-@@ -7847,6 +7847,21 @@ def _opencode_session_instructions_from_spec(
+@@ -8025,6 +8025,21 @@ def _opencode_session_instructions_from_spec(
      return build_instructions_nullable(spec, None, [])
  
  
@@ -549,9 +549,9 @@ index 10159f581e18465752626b44866ef9ed2a2443eb..5811861d7572a4f1d1f90002661cdd89
  def _native_startup_instructions_from_spec(
      agent_spec: AgentSpec | ResolvedSpec | None,
  ) -> str:
-@@ -9262,7 +9277,10 @@ async def _auto_create_claude_terminal(
-     )
+@@ -9507,7 +9522,10 @@ async def _auto_create_claude_terminal(
      from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
+     from omnigent.inner.bundle_skills import claude_agents_skill_overlay
      from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 -    from omnigent.onboarding.subscription_accounts import require_session_account_dir
 +    from omnigent.onboarding.subscription_accounts import (
@@ -561,7 +561,7 @@ index 10159f581e18465752626b44866ef9ed2a2443eb..5811861d7572a4f1d1f90002661cdd89
  
      workspace = str(
          _claude_session_workspace(
-@@ -10030,9 +10048,17 @@ async def _auto_create_claude_terminal(
+@@ -10290,12 +10308,18 @@ async def _auto_create_claude_terminal(
      # Seed trust and onboarding in the config selected by the terminal's launch
      # environment, once that environment is known to log in to the session's account.
      try:
@@ -574,17 +574,20 @@ index 10159f581e18465752626b44866ef9ed2a2443eb..5811861d7572a4f1d1f90002661cdd89
          launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
          launch_env = _claude_terminal_launch_env(env_spec)
 -        require_session_account_dir("claude", claude_launch_config_dir(launch_cwd, launch_env))
+-        ensure_claude_workspace_trusted(
+-            launch_cwd, env=launch_env, added_dirs=trusted_added_dirs
 +        require_session_account_dir(
 +            "claude", claude_launch_config_dir(launch_cwd, launch_env), launch_env
-+        )
-         ensure_claude_workspace_trusted(launch_cwd, env=launch_env)
+         )
++        ensure_claude_workspace_trusted(launch_cwd, env=launch_env, added_dirs=trusted_added_dirs)
      except BaseException as seed_error:
          # No forwarder owns the routers yet, so release the ones this launch started.
+         # A ``None`` handle would shut down whichever router is registered now.
 diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
-index ae39624722493d1bcf1d76b9d51ba4057990a942..c75dfcdf4409bfd3ad9fbff088b97fe6472feaa1 100644
+index 999de7e9a2c052d34c1c76b3889b5c3711f54be4..d9aa5b29a753866ca9a899e2026891c4ea1ae8f3 100644
 --- a/omnigent/runtime/workflow.py
 +++ b/omnigent/runtime/workflow.py
-@@ -697,9 +697,13 @@ def configure_agent_harness_with_provider(
+@@ -695,9 +695,13 @@ def configure_agent_harness_with_provider(
          # An account with its own login directory: the harness process (and
          # the CLI it drives) reads CLAUDE_CONFIG_DIR / the source CODEX_HOME.
          if (harness_type, entry.cli) in (("claude-sdk", "claude"), ("codex", "codex")):
@@ -820,10 +823,19 @@ index c2fbbd281502e67f007528d60c4f9cbe815a5a0f..61be3381c16668a471f927bbf3d29eeb
  
  
 diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
-index f7770941d4a610f92136304ebefb58ce0f82b631..079ac991b50e9d284f1d52af5bb779620f023001 100644
+index b57008c7ab38a2364e5c1e2e04de7bd1dd9bc0a5..8b9dde596d02489243b36de8ec0bb386dbe86a92 100644
 --- a/tests/runner/test_app_claude_native_launch_args.py
 +++ b/tests/runner/test_app_claude_native_launch_args.py
-@@ -1560,6 +1560,69 @@ async def test_auto_create_claude_terminal_keeps_the_session_account(
+@@ -1558,7 +1558,7 @@ async def test_auto_create_claude_terminal_keeps_the_session_account(
+     monkeypatch.setattr("omnigent.onboarding.subscription_accounts.load_config", lambda: config)
+     monkeypatch.setattr(
+         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+-        lambda workspace, env=None: seeded.append(workspace),
++        lambda workspace, env=None, **_kwargs: seeded.append(workspace),
+     )
+     monkeypatch.setattr(
+         "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+@@ -1589,6 +1589,69 @@ async def test_auto_create_claude_terminal_keeps_the_session_account(
          registry.launch_required_terminal.assert_not_called()
  
  
@@ -858,7 +870,7 @@ index f7770941d4a610f92136304ebefb58ce0f82b631..079ac991b50e9d284f1d52af5bb77962
 +    monkeypatch.setattr("omnigent.onboarding.subscription_accounts.load_config", lambda: config)
 +    monkeypatch.setattr(
 +        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
-+        lambda workspace, env=None: seeded.append(env),
++        lambda workspace, env=None, **_kwargs: seeded.append(env),
 +    )
 +    if wrapper_token is not None:
 +        monkeypatch.setattr(
@@ -894,10 +906,10 @@ index f7770941d4a610f92136304ebefb58ce0f82b631..079ac991b50e9d284f1d52af5bb77962
      "subagent_started,turn_started",
      [(True, True), (True, False), (False, True), (False, False)],
 diff --git a/tests/runtime/test_provider_spawn_env.py b/tests/runtime/test_provider_spawn_env.py
-index c6ee7f9d1d1dff5d1b7bfdbaeb7dfaf9969cb9a6..7bb1a92df16ddfab7be333441ed371ef06135b3a 100644
+index 8cfbda36173a8898999ac442a2a0e9039f246dcc..8a70a5e8f8feaec495a778c3b49380e42cbc55b8 100644
 --- a/tests/runtime/test_provider_spawn_env.py
 +++ b/tests/runtime/test_provider_spawn_env.py
-@@ -1938,6 +1938,31 @@ def test_spec_pinned_codex_account_sets_source_codex_home(
+@@ -2186,6 +2186,31 @@ def test_spec_pinned_codex_account_sets_source_codex_home(
      assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "openai"
  
  

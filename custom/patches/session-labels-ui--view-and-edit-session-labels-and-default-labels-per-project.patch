@@ -82,7 +82,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/lib/projectsApi.ts                    |   9 +-
  web/src/lib/sessionLabels.test.ts             | 109 ++++++
  web/src/lib/sessionLabels.ts                  |  90 +++++
- web/src/lib/sessionListCache.test.ts          |  29 ++
+ web/src/lib/sessionListCache.test.ts          |  28 ++
  web/src/lib/sessionListCache.ts               |  81 +++--
  web/src/lib/sessionsApi.ts                    |  12 +-
  .../NewChatDialog.projectCreate.test.tsx      |  89 ++++-
@@ -90,7 +90,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/shell/NewChatDialog.tsx               |  49 ++-
  web/src/shell/ProjectSettingsDialog.test.tsx  | 194 +++++++++-
  web/src/shell/ProjectSettingsDialog.tsx       | 117 ++++--
- 34 files changed, 2016 insertions(+), 130 deletions(-)
+ 34 files changed, 2015 insertions(+), 130 deletions(-)
  create mode 100644 web/src/components/LabelEditor.tsx
  create mode 100644 web/src/components/composer/NewSessionLabels.tsx
  create mode 100644 web/src/hooks/useSessionLabels.ts
@@ -98,10 +98,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/lib/sessionLabels.ts
 
 diff --git a/feature-map/sessions.md b/feature-map/sessions.md
-index 3641e17814ce2a5340c37d042275489248f167aa..8f4296f96e6b4ef439877b2d9762102ee20ebbab 100644
+index 5ca6a023bf2e6d7f41c62f0363c868bbea98f58e..96d9494a3d859de708863a557b0a4176bcb6afda 100644
 --- a/feature-map/sessions.md
 +++ b/feature-map/sessions.md
-@@ -132,6 +132,12 @@ the header menu), and each place is a separate entry point.
+@@ -166,6 +166,12 @@ the header menu), and each place is a separate entry point.
    device); turning off "Collapse project sessions behind "Show more"" lists
    every loaded session and loads more as the sidebar scrolls, with no Show more
    row.
@@ -114,9 +114,9 @@ index 3641e17814ce2a5340c37d042275489248f167aa..8f4296f96e6b4ef439877b2d9762102e
  - `bulk-actions`: select several rows, then mark as read or unread, archive,
    unarchive, or delete them.
  - `fork`: fork the whole session or from a message; the fork keeps images and
-@@ -372,6 +378,15 @@ a collapsed folder holding the open, unpinned session lists just that row under
- its header until you open another session. Moving a session into a project
- still opens that folder.
+@@ -479,6 +485,15 @@ its family under its header until you open another session, so nested agents
+ stay reachable; a family you collapsed stays collapsed. Moving a session into a
+ project still opens that folder.
  
 +**Labels:** open a session and hover or click the header's info icon (on
 +mobile, the header menu's Agent info). The Labels section offers Add label and,
@@ -130,10 +130,10 @@ index 3641e17814ce2a5340c37d042275489248f167aa..8f4296f96e6b4ef439877b2d9762102e
  **Pinned section drag:** drag a pinned row onto another pinned row to reorder
  the Pinned section, or drop an unpinned row onto a pinned row to pin it into
  that slot: the line marks whether it lands above or below the row. Release it
-@@ -869,6 +884,18 @@ plain `uv run pytest`, which starts a private server for the test.
-   `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
-   Repeat from the header menu's Add to project by hand and expect the row to
-   regroup under that project.
+@@ -1007,6 +1022,18 @@ plain `uv run pytest`, which starts a private server for the test.
+   desktop widths in `web/src/shell/Sidebar.heldFamily.test.tsx`. Open a nested
+   session's parent while its project folder is collapsed and expect its nested
+   rows under the folder header, on a phone and on desktop.
 +- **`labels`, info popover and project settings:** component coverage in
 +  `web/src/components/AgentInfo.test.tsx` and
 +  `web/src/shell/ProjectSettingsDialog.test.tsx`; server coverage of deletion
@@ -150,10 +150,10 @@ index 3641e17814ce2a5340c37d042275489248f167aa..8f4296f96e6b4ef439877b2d9762102e
    `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
  - **`project-rename`, project header right-click and three-dot menus:**
 diff --git a/omnigent/db/db_models.py b/omnigent/db/db_models.py
-index 4c845f19f3c3ce246bf9751792dbaee437f9d3ca..c98cc65cee0c08df064e30431ea76647ba907ae9 100644
+index 469bee5d9290c087d3f58485934cb5804d2af76d..646cd9c8f8a75d2b73c46bc2b82101f54c01d576 100644
 --- a/omnigent/db/db_models.py
 +++ b/omnigent/db/db_models.py
-@@ -1075,6 +1075,8 @@ class SqlConversationItem(ConversationBase):
+@@ -1167,6 +1167,8 @@ class SqlConversationItem(ConversationBase):
  # (and the session-status error-label path) can clamp values to fit instead
  # of letting an over-length write raise ``DataError`` on PostgreSQL.
  LABEL_VALUE_MAX_LEN = 256
@@ -162,7 +162,7 @@ index 4c845f19f3c3ce246bf9751792dbaee437f9d3ca..c98cc65cee0c08df064e30431ea76647
  
  
  class SqlConversationLabel(ConversationBase):
-@@ -1121,7 +1123,7 @@ class SqlConversationLabel(ConversationBase):
+@@ -1213,7 +1215,7 @@ class SqlConversationLabel(ConversationBase):
          Uuid16(),
          primary_key=True,
      )
@@ -172,7 +172,7 @@ index 4c845f19f3c3ce246bf9751792dbaee437f9d3ca..c98cc65cee0c08df064e30431ea76647
      updated_at: Mapped[int] = mapped_column(Integer)
  
 diff --git a/omnigent/server/API.md b/omnigent/server/API.md
-index 13ac730e1475b9fa36ea466006ce51025f912a0d..b43b3054b6597d8bff62f5f4da0748a65f0cba47 100644
+index d48ccf6d9797cd994acfe25333dfeaff75919e8f..56d6123836b0d0d51a5de96899c3c421a1891dc0 100644
 --- a/omnigent/server/API.md
 +++ b/omnigent/server/API.md
 @@ -714,6 +714,12 @@ already uploaded or registered an agent. The response is the full
@@ -200,10 +200,10 @@ index 13ac730e1475b9fa36ea466006ce51025f912a0d..b43b3054b6597d8bff62f5f4da0748a6
    reasoning_effort (string or null, optional)
      Per-session reasoning-effort hint. Accepted metadata values are
 diff --git a/omnigent/server/routes/_session_create_validation.py b/omnigent/server/routes/_session_create_validation.py
-index 8e915bb9503b85f8386e3fbe0e171fd3ba19e8e4..53be69b677ee1f4e35c2917f1938734680cda16e 100644
+index 01d652970568998522493735d98a66ee853cfad0..595cf283187eb1eae815ba1e2f2ded2daeaf7bc3 100644
 --- a/omnigent/server/routes/_session_create_validation.py
 +++ b/omnigent/server/routes/_session_create_validation.py
-@@ -10,18 +10,20 @@ from __future__ import annotations
+@@ -10,12 +10,13 @@ from __future__ import annotations
  
  import asyncio
  import logging
@@ -218,14 +218,15 @@ index 8e915bb9503b85f8386e3fbe0e171fd3ba19e8e4..53be69b677ee1f4e35c2917f19387346
  from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
  from omnigent.models.model_override import validate_model_override
  from omnigent.runtime.agent_cache import AgentCache
- from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_user_enabled
+@@ -23,6 +24,7 @@ from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_u
+ from omnigent.server.proactive_agent import reject_proactive_agent_id
  from omnigent.server.routes._auth_helpers import require_access
  from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 +from omnigent.stores.conversation_store import is_internal_label_key
  from omnigent.stores.host_store import host_is_live
  from omnigent.stores.project_store import ProjectStore
  from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
-@@ -37,6 +39,48 @@ class ProjectCreateResolution:
+@@ -38,6 +40,48 @@ class ProjectCreateResolution:
      project_id: str | None = None
  
  
@@ -274,7 +275,7 @@ index 8e915bb9503b85f8386e3fbe0e171fd3ba19e8e4..53be69b677ee1f4e35c2917f19387346
  def server_sandbox_providers(request: Any) -> tuple[str, ...]:
      """The sandbox providers this server can launch, to check a saved provider against.
  
-@@ -67,6 +111,8 @@ async def resolve_project_session_create(
+@@ -68,6 +112,8 @@ async def resolve_project_session_create(
      if "project_id" not in fields_set or project_id is None:
          if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
              raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
@@ -283,7 +284,7 @@ index 8e915bb9503b85f8386e3fbe0e171fd3ba19e8e4..53be69b677ee1f4e35c2917f19387346
          return ProjectCreateResolution(body=body)
      if project_store is None:
          raise OmnigentError(
-@@ -101,6 +147,8 @@ async def resolve_project_session_create(
+@@ -102,6 +148,8 @@ async def resolve_project_session_create(
          and saved_provider in launchable_sandbox_providers
      ):
          updates["sandbox_provider"] = saved_provider
@@ -293,10 +294,10 @@ index 8e915bb9503b85f8386e3fbe0e171fd3ba19e8e4..53be69b677ee1f4e35c2917f19387346
      resolved_data.update(updates)
      # Re-validate project hints because config is intentionally stored as
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6206cd2d6 100644
+index 632b0da9a53fbc80f458edd2902486393d023eb6..6f58a82d4d8a552ab3b682adc57bdd624c3faa46 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -43,6 +43,7 @@ from pydantic import ValidationError
+@@ -42,6 +42,7 @@ from pydantic import ValidationError
  from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
  
  from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
@@ -304,7 +305,7 @@ index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6
  from omnigent.db.utils import generate_task_id
  from omnigent.db.workspace_cache import WorkspaceScopedCache
  from omnigent.debug_logging import debug_event, runner_log_scope
-@@ -148,6 +149,7 @@ from omnigent.server.routes._auth_helpers import (
+@@ -153,6 +154,7 @@ from omnigent.server.routes._auth_helpers import (
  )
  from omnigent.server.routes._host_worktree import CreatedWorktree
  from omnigent.server.routes._session_create_validation import (
@@ -312,7 +313,7 @@ index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6
      validate_existing_host_workspace,
      validate_session_model_metadata,
  )
-@@ -11315,7 +11317,7 @@ def _repl_terminal_ui_labels(
+@@ -11703,7 +11705,7 @@ def _repl_terminal_ui_labels(
      return {_CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
  
  
@@ -321,7 +322,7 @@ index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6
      """
      Reject a session-create body that seeds policy-owned labels.
  
-@@ -11339,7 +11341,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
+@@ -11727,7 +11729,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
  
  
  def _reject_server_reserved_label_seed(
@@ -330,7 +331,7 @@ index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6
  ) -> None:
      """
      Reject a client-supplied label map that touches server-internal keys.
-@@ -11490,6 +11492,24 @@ def _reject_server_reserved_label_seed(
+@@ -11889,6 +11891,24 @@ def _reject_server_reserved_label_seed(
          )
  
  
@@ -355,7 +356,7 @@ index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6
  def _require_cost_control_label_authority(
      *,
      reserved_keys: Sequence[str],
-@@ -11590,7 +11610,7 @@ def _persist_stored_session_bundle(
+@@ -11989,7 +12009,7 @@ def _persist_stored_session_bundle(
              agent_bundle_location=agent_bundle_location,
              agent_description=agent_description,
              title=metadata.title,
@@ -364,7 +365,7 @@ index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6
              reasoning_effort=metadata.reasoning_effort,
              workspace=metadata.workspace,
              git_branch=git_branch,
-@@ -11679,7 +11699,7 @@ def _persist_session_for_uploaded_agent(
+@@ -12078,7 +12098,7 @@ def _persist_session_for_uploaded_agent(
              terminal_launch_args=metadata.terminal_launch_args,
              project_id=metadata.project_id,
              inference_snapshot=inference_snapshot,
@@ -374,10 +375,10 @@ index 0d099da4dc7ab5c3a14210f7c3742368fec80489..8f546b1c3af1b6d82b02336a90b21dc6
              model_override=inference_model,
          )
 diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
-index 592d2690ec89b93da64222d5a8225ccd20767f49..9d98ace946d42649490a1dc01dc09b802e2f281a 100644
+index de07d51c26c810954e04d61260fcf99d42a5bb98..14808b15e24573acf82c9052d92d867946a5ecce 100644
 --- a/omnigent/server/routes/_sessions/orchestration.py
 +++ b/omnigent/server/routes/_sessions/orchestration.py
-@@ -356,6 +356,7 @@ from omnigent.server.routes._sessions.helpers import (
+@@ -362,6 +362,7 @@ from omnigent.server.routes._sessions.helpers import (
      _query_host_runner_status,
      _read_state_entry,
      _record_daily_cost,
@@ -385,8 +386,8 @@ index 592d2690ec89b93da64222d5a8225ccd20767f49..9d98ace946d42649490a1dc01dc09b80
      _reject_reserved_cost_control_label_seed,
      _reject_server_reserved_label_seed,
      _relay_persist,
-@@ -12502,6 +12503,11 @@ async def _create_session_from_existing_agent(
-             conversation_store, body.workflow_id, user_id=user_id
+@@ -13016,6 +13017,11 @@ async def _create_session_from_existing_agent(
+             permission_store=getattr(request.app.state, "permission_store", None),
          )
  
 +    # Checked before the project merge: a null (a default left off this
@@ -397,7 +398,7 @@ index 592d2690ec89b93da64222d5a8225ccd20767f49..9d98ace946d42649490a1dc01dc09b80
      project_resolution = await resolve_project_session_create(
          body=body,
          user_id=user_id,
-@@ -12531,8 +12537,6 @@ async def _create_session_from_existing_agent(
+@@ -13045,8 +13051,6 @@ async def _create_session_from_existing_agent(
      )
      assert body.agent_id is not None
  
@@ -420,10 +421,10 @@ index 2aaba1c313efe0a7ba09f7b0ab69567215fbe217..3b036cd13b941ced638d49e5868f1cf2
                  IMPORT_SOURCE_LABEL_KEY: source,
                  IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b41dbffff 100644
+index f5f1edd1206ace2af5635830d1892d67260f5de1..2bbd8e9453c99c30cf5aade2adc9bc6f8bc2ecf8 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -200,6 +200,7 @@ from omnigent.server.routes._sessions.helpers import (
+@@ -203,6 +203,7 @@ from omnigent.server.routes._sessions.helpers import (
      _publish_sandbox_status,
      _publish_session_superseded,
      _publish_terminal_pending,
@@ -431,7 +432,7 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
      _reject_reserved_cost_control_label_seed,
      _reject_server_reserved_label_seed,
      _remove_session_worktree_best_effort,
-@@ -1992,6 +1993,9 @@ def register_core_routes(
+@@ -2038,6 +2039,9 @@ def register_core_routes(
              parent_session_id=parsed_metadata.parent_session_id,
              host_type=parsed_metadata.host_type,
          )
@@ -441,7 +442,7 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
          from omnigent.server.routes._session_create_validation import (
              resolve_project_session_create,
              server_sandbox_providers,
-@@ -2017,8 +2021,6 @@ def register_core_routes(
+@@ -2063,8 +2067,6 @@ def register_core_routes(
              parent_session_id=parsed_metadata.parent_session_id,
              host_type=parsed_metadata.host_type,
          )
@@ -450,7 +451,7 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
          from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
  
          apply_browser_agent_tools_creation_labels(parsed_metadata.labels, request.headers)
-@@ -3746,6 +3748,7 @@ def register_core_routes(
+@@ -3818,6 +3820,7 @@ def register_core_routes(
                      code=ErrorCode.FORBIDDEN,
                  )
          if body.labels:
@@ -458,7 +459,7 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
              _reject_server_reserved_label_seed(body.labels)
              # Advisor-owned cost_control.* labels are written only by the
              # session's bound runner; gate them on runner proof BEFORE any
-@@ -3870,7 +3873,7 @@ def register_core_routes(
+@@ -3942,7 +3945,7 @@ def register_core_routes(
                  require_owned_session, session_id, user_id, conversation_store, permission_store
              )
              family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
@@ -467,7 +468,7 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
          if PROJECT_LABEL_KEY in labels_to_set and (
              not set_project or labels_to_set[PROJECT_LABEL_KEY]
          ):
-@@ -3907,13 +3910,15 @@ def register_core_routes(
+@@ -3979,13 +3982,15 @@ def register_core_routes(
                  active = [member for member in members if not member.archived]
                  retained = active or members
                  if retained and retained[0].id == session_id:
@@ -484,8 +485,8 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
 +        # a null.
          if PINNED_LABEL_KEY in labels_to_set:
              labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
-         if requested_codex_collaboration_mode is not None:
-@@ -4726,30 +4731,37 @@ def register_core_routes(
+         if MUTED_LABEL_KEY in labels_to_set:
+@@ -4832,30 +4837,37 @@ def register_core_routes(
              # Cancel local teardown immediately; the deferred flag check handles
              # Undo arriving on another replica.
              _cancel_pending_archive_stop(normalize_uuid(session_id) or session_id)
@@ -497,10 +498,10 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
 -        # The pinned key was rewritten to the caller's per-user key above, so
 -        # clear that one (not the canonical bare key) on an empty value.
 +        # A null value deletes its label. The project membership and the
-+        # caller's per-user pin key also treat an empty string as delete
-+        # ("remove from project" / "unpin"), so it never lingers as a value.
-+        # Reserved keys were rejected above whether set or deleted.
-         for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
++        # caller's per-user pin and mute keys also treat an empty string as
++        # delete ("remove from project" / "unpin" / "unmute"), so it never
++        # lingers as a value. Reserved keys were rejected above whether set or deleted.
+         for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id), muted_label_key(user_id)):
              if labels_to_set.get(_clear_key) == "":
 -                labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
 -                await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
@@ -539,7 +540,7 @@ index 63565c82ff3ee813d135153c2dc8604d9a8c1713..e4152ca62737ad5eb84e8065a163830b
          # Archiving means "get this out of my way", which contradicts a pin
          # ("keep it at the top"), so drop the archiver's own pin — otherwise the
 diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
-index fb3b506261d89a909dfd8cbbdc1c79bf17a17da4..f7a2b7153b90211f4b26513bb6c8cc2855412ede 100644
+index d11f2d514518fb7e03456d1ee1ef7a2c7bde65d4..6f20a61e8762b50d37f22563d918cb72b4b2a63c 100644
 --- a/omnigent/server/schemas.py
 +++ b/omnigent/server/schemas.py
 @@ -1632,7 +1632,9 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
@@ -582,7 +583,7 @@ index fb3b506261d89a909dfd8cbbdc1c79bf17a17da4..f7a2b7153b90211f4b26513bb6c8cc28
      reasoning_effort: str | None = None
      model_override: str | None = None
      host_id: str | None = None
-@@ -2707,7 +2711,9 @@ class UpdateSessionRequest(BaseModel):
+@@ -2719,7 +2723,9 @@ class UpdateSessionRequest(BaseModel):
      :param title: New title, e.g. ``"debugging auth flow"``.
          ``None`` leaves unchanged.
      :param labels: Guardrails labels to upsert. Merges with existing
@@ -593,16 +594,16 @@ index fb3b506261d89a909dfd8cbbdc1c79bf17a17da4..f7a2b7153b90211f4b26513bb6c8cc28
      :param reasoning_effort: Per-session reasoning-effort hint.
          Accepted metadata values are ``"none"``, ``"minimal"``,
          ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
-@@ -2810,7 +2816,7 @@ class UpdateSessionRequest(BaseModel):
-     runner_id: str | None = None
+@@ -2823,7 +2829,7 @@ class UpdateSessionRequest(BaseModel):
      family_pinned: bool | None = None
+     nest_source_id: str | None = None
      title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
 -    labels: dict[str, str] | None = None
 +    labels: dict[str, str | None] | None = None
      reasoning_effort: str | None = None
      model_override: str | None = None
      collaboration_mode: str | None = None
-@@ -6359,7 +6365,10 @@ class ProjectObject(BaseModel):
+@@ -6457,7 +6463,10 @@ class ProjectObject(BaseModel):
          workspace, harness, model, reasoning effort, git base-branch, …). Empty
          when the project stores no defaults. The key vocabulary is owned by the
          client; the server persists and returns it whole. Values are hints the
@@ -615,7 +616,7 @@ index fb3b506261d89a909dfd8cbbdc1c79bf17a17da4..f7a2b7153b90211f4b26513bb6c8cc28
  
      id: str
 diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
-index 74846860dbf95defa7d2ffa8c099d37e7d0be8f7..7ac8b895b923e0d4b6e99247f27d6f0d274eb794 100644
+index 6ef7dbae777b058cfa5017bb07ca3028d22dcd46..cbfaf4a7b6a4e061240a7de5cfa2baec704d366e 100644
 --- a/omnigent/stores/conversation_store/__init__.py
 +++ b/omnigent/stores/conversation_store/__init__.py
 @@ -4,7 +4,7 @@ import hashlib
@@ -627,7 +628,7 @@ index 74846860dbf95defa7d2ffa8c099d37e7d0be8f7..7ac8b895b923e0d4b6e99247f27d6f0d
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Any, Literal, TypedDict
  
-@@ -20,6 +20,7 @@ from omnigent.stores.conversation_store.activity_error import (
+@@ -21,6 +21,7 @@ from omnigent.stores.conversation_store.activity_error import (
      LATEST_ACTIVITY_ERROR_LABEL_KEY,
      LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
  )
@@ -635,7 +636,7 @@ index 74846860dbf95defa7d2ffa8c099d37e7d0be8f7..7ac8b895b923e0d4b6e99247f27d6f0d
  from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
  
  # Pending inputs share the item store, but are not harness transcript history yet.
-@@ -96,6 +97,20 @@ CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration
+@@ -100,6 +101,20 @@ CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration
  # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
  PROJECT_LABEL_KEY = "omni_project"
  
@@ -656,7 +657,7 @@ index 74846860dbf95defa7d2ffa8c099d37e7d0be8f7..7ac8b895b923e0d4b6e99247f27d6f0d
  
  class DailyCostState(TypedDict):
      """Daily cost state record returned by list_daily_cost_states.
-@@ -1375,12 +1390,17 @@ class ConversationStore(ABC):
+@@ -1430,12 +1445,17 @@ class ConversationStore(ABC):
          conversation_id: str,
          updates: dict[str, str],
          updated_at: int | None = None,
@@ -674,7 +675,7 @@ index 74846860dbf95defa7d2ffa8c099d37e7d0be8f7..7ac8b895b923e0d4b6e99247f27d6f0d
          Overwrites existing rows for the same keys;
          non-mentioned keys are left untouched. The caller is
          responsible for schema validation (``values`` /
-@@ -1411,6 +1431,9 @@ class ConversationStore(ABC):
+@@ -1466,6 +1486,9 @@ class ConversationStore(ABC):
              audit trails aligned with the enforcement site
              rather than wall-clock drift between evaluate()
              and the actual DB write.
@@ -685,7 +686,7 @@ index 74846860dbf95defa7d2ffa8c099d37e7d0be8f7..7ac8b895b923e0d4b6e99247f27d6f0d
          ...
  
 diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
-index c1a15a6ff72c7093953e3cc18f6f133cb20eb126..41f2dacfe0fb989c6c97fbd5734a8c1c71fb8640 100644
+index 8be2fe904eb3ba4c9f3b7462556a98ef402dcbb2..08f44fd4ebf76f58d04cb47ca2aae9ed9c507863 100644
 --- a/omnigent/stores/conversation_store/sqlalchemy_store.py
 +++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
 @@ -5,7 +5,7 @@ from __future__ import annotations
@@ -695,9 +696,9 @@ index c1a15a6ff72c7093953e3cc18f6f133cb20eb126..41f2dacfe0fb989c6c97fbd5734a8c1c
 -from collections.abc import Iterator, Mapping
 +from collections.abc import Iterable, Iterator, Mapping
  from contextlib import contextmanager, suppress
+ from dataclasses import asdict, fields, replace
  from itertools import batched
- from pathlib import PureWindowsPath
-@@ -1750,6 +1750,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -1851,6 +1851,8 @@ class SqlAlchemyConversationStore(ConversationStore):
          conversation_id: str,
          updates: dict[str, str],
          updated_at: int | None = None,
@@ -706,7 +707,7 @@ index c1a15a6ff72c7093953e3cc18f6f133cb20eb126..41f2dacfe0fb989c6c97fbd5734a8c1c
      ) -> None:
          """
          Upsert guardrails labels on a conversation.
-@@ -1759,25 +1761,39 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -1860,19 +1862,24 @@ class SqlAlchemyConversationStore(ConversationStore):
          path dispatches to ``INSERT ... ON CONFLICT`` on
          SQLite / PostgreSQL; other dialects fall back to
          SELECT-then-INSERT/UPDATE inside the same transaction.
@@ -735,8 +736,10 @@ index c1a15a6ff72c7093953e3cc18f6f133cb20eb126..41f2dacfe0fb989c6c97fbd5734a8c1c
              return
          stamp = updated_at if updated_at is not None else now_epoch()
          stable_updates = dict(updates)
- 
-         def write(session: Session) -> None:
+@@ -1885,7 +1892,16 @@ class SqlAlchemyConversationStore(ConversationStore):
+                     _write_session_recovery(
+                         session, conversation_id, replace(recovery, phase="stopped")
+                     )
 -            _upsert_labels(session, conversation_id, stable_updates, stamp)
 +            if stable_deletes:
 +                session.execute(
@@ -765,10 +768,10 @@ index 20aaadf64e88f0250355cf57f8bec965caeccc54..9482e5654c1c3bc31d2eaa303a162048
      Return the policy-owned ``cost_control.*`` keys present in *labels*.
  
 diff --git a/openapi.json b/openapi.json
-index 044ba7b664b549bd0e27d3f4bd2fe460f8702703..c35cd69165e275e493350460bc18c7b7020f6c3b 100644
+index 5269ed082ed8a5773fe0df1f8e6472981e0de46d..c6ad08913509c4db78c48d1a1d5b1e2ca28519a0 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -15900,7 +15900,14 @@
+@@ -16276,7 +16276,14 @@
              "anyOf": [
                {
                  "additionalProperties": {
@@ -784,7 +787,7 @@ index 044ba7b664b549bd0e27d3f4bd2fe460f8702703..c35cd69165e275e493350460bc18c7b7
                  },
                  "type": "object"
                },
-@@ -15908,7 +15915,7 @@
+@@ -16284,7 +16291,7 @@
                  "type": "null"
                }
              ],
@@ -794,10 +797,10 @@ index 044ba7b664b549bd0e27d3f4bd2fe460f8702703..c35cd69165e275e493350460bc18c7b7
            },
            "model_override": {
 diff --git a/tests/server/routes/test_session_create_project_consistency.py b/tests/server/routes/test_session_create_project_consistency.py
-index 450cb2e9f34be75d759c63bd06c2d8f8611f8a1d..980e177287d08da563326e7b509b81a0cdd6887f 100644
+index a316abce54b26cf477c1a9706b1b23807ccbbf73..a1e24fa184ec9447946f0838eb9bf567d0c11e0a 100644
 --- a/tests/server/routes/test_session_create_project_consistency.py
 +++ b/tests/server/routes/test_session_create_project_consistency.py
-@@ -132,6 +132,115 @@ async def test_explicit_values_are_not_overridden(
+@@ -133,6 +133,115 @@ async def test_explicit_values_are_not_overridden(
      assert response.json()["workspace"] == "/work/project/subdir"
  
  
@@ -913,7 +916,7 @@ index 450cb2e9f34be75d759c63bd06c2d8f8611f8a1d..980e177287d08da563326e7b509b81a0
  async def test_explicit_null_is_not_defaulted(
      project_create_client: httpx.AsyncClient,
  ) -> None:
-@@ -483,7 +592,8 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
+@@ -494,7 +603,8 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
      explicit_git: bool,
  ) -> None:
      project_id = await _project(
@@ -923,7 +926,7 @@ index 450cb2e9f34be75d759c63bd06c2d8f8611f8a1d..980e177287d08da563326e7b509b81a0
      )
      response = await project_create_client.post(
          "/v1/sessions",
-@@ -508,6 +618,34 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
+@@ -519,6 +629,34 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
      assert session.status_code == 200, session.text
      assert session.json()["workspace"] == "/work/upload"
      assert session.json()["project_id"] == project_id
@@ -958,7 +961,7 @@ index 450cb2e9f34be75d759c63bd06c2d8f8611f8a1d..980e177287d08da563326e7b509b81a0
  
  
  async def test_multipart_malformed_project_config_is_structured_400(
-@@ -582,7 +720,9 @@ async def test_import_with_project_defaults_workspace_and_files_session(
+@@ -624,7 +762,9 @@ async def test_import_with_project_defaults_workspace_and_files_session(
  ) -> None:
      """An import naming a project consumes the resolver's decisions for real."""
      _seed_claude_import_agent(db_uri)
@@ -969,7 +972,7 @@ index 450cb2e9f34be75d759c63bd06c2d8f8611f8a1d..980e177287d08da563326e7b509b81a0
      response = await project_create_client.post(
          "/v1/imports",
          json=_import_payload("project-import-1", project_id=project_id),
-@@ -595,6 +735,7 @@ async def test_import_with_project_defaults_workspace_and_files_session(
+@@ -637,6 +777,7 @@ async def test_import_with_project_defaults_workspace_and_files_session(
      assert session.status_code == 200, session.text
      assert session.json()["workspace"] == "/work/import"
      assert session.json()["project_id"] == project_id
@@ -1035,10 +1038,10 @@ index 5d0f7e4efd1edc33406ebf250458de874f78d2a4..a4918748fcd0d7ae95ca6800c26d0c3a
  
  # ── PATCH: the bound runner's write keeps working ────────────────────────────
 diff --git a/tests/server/routes/test_sessions_crud.py b/tests/server/routes/test_sessions_crud.py
-index 3d6471bb5e4d12ee6a0671c733173ce56c1f1d79..640cee472c20383bfe084b4832c44463b782fc12 100644
+index ffe9f283393b3ac6d2acf5ebe22319fb35aece03..49f5a2bda16b97a91c0a983127aefb12af3dcc18 100644
 --- a/tests/server/routes/test_sessions_crud.py
 +++ b/tests/server/routes/test_sessions_crud.py
-@@ -882,19 +882,22 @@ async def test_patch_session_sets_project_label(
+@@ -1133,19 +1133,22 @@ async def test_patch_session_sets_project_label(
      assert conv.labels.get("omni_project") == "Sprint 42"
  
  
@@ -1064,7 +1067,7 @@ index 3d6471bb5e4d12ee6a0671c733173ce56c1f1d79..640cee472c20383bfe084b4832c44463
          headers={"Content-Type": "application/json"},
      )
      assert resp.status_code == 200
-@@ -904,18 +907,133 @@ async def test_patch_session_empty_project_removes_label(
+@@ -1155,18 +1158,133 @@ async def test_patch_session_empty_project_removes_label(
      assert "omni_project" not in conv.labels
  
  
@@ -1199,7 +1202,7 @@ index 3d6471bb5e4d12ee6a0671c733173ce56c1f1d79..640cee472c20383bfe084b4832c44463
      from omnigent.stores.conversation_store import pinned_label_key
  
      conv_store = SqlAlchemyConversationStore(db_uri)
-@@ -936,10 +1054,10 @@ async def test_patch_session_pins_and_unpins(
+@@ -1187,10 +1305,10 @@ async def test_patch_session_pins_and_unpins(
      # …but the response collapses it back to the canonical key for the caller.
      assert resp.json()["labels"].get("omnigent.pinned") == "1721760000000"
  
@@ -1449,7 +1452,7 @@ index 0360dd8c69f88a2bd9160d1886d7375cd8492398..2b3e4a720acae3b2af0b7450b014be90
    beforeEach(() => {
      createMcpMutate.mockClear();
 diff --git a/web/src/components/AgentInfo.tsx b/web/src/components/AgentInfo.tsx
-index 20d81b0cbf3d0a781d32aa0572207c0b2c5abb12..ab2f0d3f5c7d8c3192786770d1d7e34e8d409223 100644
+index 5355819353f9fd0b62928cec37b03f633b10b3f6..9a681d7827ef3b84d2d1e8bc8ab8a1383482f62c 100644
 --- a/web/src/components/AgentInfo.tsx
 +++ b/web/src/components/AgentInfo.tsx
 @@ -35,7 +35,7 @@ import {
@@ -1472,7 +1475,7 @@ index 20d81b0cbf3d0a781d32aa0572207c0b2c5abb12..ab2f0d3f5c7d8c3192786770d1d7e34e
  
  const MCP_SERVERS_UPDATED_TOAST = (
    <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>
-@@ -1208,6 +1212,35 @@ function McpServersSection({
+@@ -1204,6 +1208,35 @@ function McpServersSection({
    );
  }
  
@@ -1508,7 +1511,7 @@ index 20d81b0cbf3d0a781d32aa0572207c0b2c5abb12..ab2f0d3f5c7d8c3192786770d1d7e34e
  // ---------------------------------------------------------------------------
  // Session policies section (user-editable only)
  // ---------------------------------------------------------------------------
-@@ -1482,6 +1515,9 @@ export function AgentInfoContent({
+@@ -1478,6 +1511,9 @@ export function AgentInfoContent({
              )}
            </div>
          )}
@@ -1860,7 +1863,7 @@ index 0000000000000000000000000000000000000000..097f99f52a64089a74bbd97d2a2745cf
 +  );
 +}
 diff --git a/web/src/components/composer/ComposerAddMenu.tsx b/web/src/components/composer/ComposerAddMenu.tsx
-index 03f40865b5d28a04b49502a4c5d401f746ffb61a..c21413efbff6a6894217fffb1f2ee1ce774ec67c 100644
+index 695f388822dc16746cd3058fab9593f97b483d98..86d6cd082b028c4508a8e3ea1cde0779aa9eda7d 100644
 --- a/web/src/components/composer/ComposerAddMenu.tsx
 +++ b/web/src/components/composer/ComposerAddMenu.tsx
 @@ -5,6 +5,7 @@ import {
@@ -1871,26 +1874,26 @@ index 03f40865b5d28a04b49502a4c5d401f746ffb61a..c21413efbff6a6894217fffb1f2ee1ce
    TargetIcon,
    WorkflowIcon,
  } from "lucide-react";
-@@ -56,6 +57,8 @@ export function ComposerAddMenu({
-   onOpen,
+@@ -64,6 +65,8 @@ export function ComposerAddMenu({
    projects = EMPTY_PROJECTS,
    onProjectSelect,
+   paletteSource,
 +  onLabels,
 +  labelCount = 0,
  }: {
    disabled: boolean;
    onAttach: () => void;
-@@ -87,6 +90,9 @@ export function ComposerAddMenu({
-   onOpen?: () => void;
-   projects?: readonly { name: string }[];
+@@ -97,6 +100,9 @@ export function ComposerAddMenu({
    onProjectSelect?: (name: string) => void;
+   /** Where ⌘K offers these actions too, with quick_pick_palette on; one composer sets it. */
+   paletteSource?: string;
 +  /** Edit the labels a new session starts with. */
 +  onLabels?: () => void;
 +  labelCount?: number;
  }) {
    const [open, setOpen] = useState(false);
    const [showProjects, setShowProjects] = useState(false);
-@@ -222,7 +228,7 @@ export function ComposerAddMenu({
+@@ -265,7 +271,7 @@ export function ComposerAddMenu({
                  <span>Files and images</span>
                </DropdownMenuItem>
              </div>
@@ -1899,7 +1902,7 @@ index 03f40865b5d28a04b49502a4c5d401f746ffb61a..c21413efbff6a6894217fffb1f2ee1ce
                <div className="flex flex-col gap-0.5">
                  <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                  <div className="flex flex-col gap-px">
-@@ -305,6 +311,24 @@ export function ComposerAddMenu({
+@@ -348,6 +354,24 @@ export function ComposerAddMenu({
                        />
                      </DropdownMenuItem>
                    )}
@@ -2121,7 +2124,7 @@ index 0000000000000000000000000000000000000000..564a5d965120a7644f5cdc9b959a337d
 +  };
 +}
 diff --git a/web/src/lib/projectsApi.ts b/web/src/lib/projectsApi.ts
-index fda56cd4f44d18577103ae9a03a2a93ee27e6b2c..956fe509211e57ce871852e1f9601c83e1e8af2c 100644
+index 0d6fbd6fca059f57e0614aa4eefea8583d3aecd3..0dbe266384581a83410211fb1438197f22ee3b56 100644
 --- a/web/src/lib/projectsApi.ts
 +++ b/web/src/lib/projectsApi.ts
 @@ -17,7 +17,8 @@ import { apiErrorFromResponse } from "./sessionsApi";
@@ -2134,7 +2137,7 @@ index fda56cd4f44d18577103ae9a03a2a93ee27e6b2c..956fe509211e57ce871852e1f9601c83
   */
  export interface ProjectConfig {
    /** Default host id, or the sandbox sentinel. */
-@@ -70,6 +71,12 @@ export interface ProjectConfig {
+@@ -75,6 +76,12 @@ export interface ProjectConfig {
     * harness on it, the composer falls back to the host default and says so.
     */
    provider?: string;
@@ -2359,22 +2362,18 @@ index 0000000000000000000000000000000000000000..3d0966183ad66c0aa896bbe234d1aa38
 +  return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
 +}
 diff --git a/web/src/lib/sessionListCache.test.ts b/web/src/lib/sessionListCache.test.ts
-index c699d71153e7fa33dbc5644ff5dcad09ccd81383..4061d3ef48199edf2fd81e340756078eb9d60927 100644
+index d4857a655a640c2bcbb0c195c4dc3a36cfa3159d..46e9fe39aeb9448e20f4c55e6194a00856eae238 100644
 --- a/web/src/lib/sessionListCache.test.ts
 +++ b/web/src/lib/sessionListCache.test.ts
-@@ -12,9 +12,11 @@ import {
-   nullsToUndefined,
+@@ -17,6 +17,7 @@ import {
    overlayArchivedIntoCaches,
+   settleUpdatedAtIntoCaches,
    overlayTitleIntoCaches,
 +  overlayLabelsIntoCaches,
+   recentlyCreatedSessions,
    removeIdsFromPages,
    settleOpenSessionRow,
- } from "./sessionListCache";
-+import type { Session } from "@/lib/types";
- 
- function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
-   return {
-@@ -605,6 +607,33 @@ describe("overlayArchivedIntoCaches", () => {
+@@ -631,6 +632,33 @@ describe("settleUpdatedAtIntoCaches", () => {
    });
  });
  
@@ -2409,10 +2408,10 @@ index c699d71153e7fa33dbc5644ff5dcad09ccd81383..4061d3ef48199edf2fd81e340756078e
    const candidate = (id: string, extra: Partial<Conversation> = {}) =>
      new Map<string, SessionListWireItem>([[id, { id, updated_at: 100, ...extra }]]);
 diff --git a/web/src/lib/sessionListCache.ts b/web/src/lib/sessionListCache.ts
-index 9960f24ff9a909583da37060671dae14ceb99357..ab330a10633e8c0bf997045cbecef82ba89431f0 100644
+index 94f1794e44a2db8685e2ce9c49c75ccb7c3753fd..852a03fdfc002f788aea1f50a3cd77e53cc92e9e 100644
 --- a/web/src/lib/sessionListCache.ts
 +++ b/web/src/lib/sessionListCache.ts
-@@ -559,6 +559,30 @@ export function filtersFromProjectQueryKey(key: readonly unknown[]): Conversatio
+@@ -603,6 +603,30 @@ export function filtersFromProjectQueryKey(key: readonly unknown[]): Conversatio
    };
  }
  
@@ -2443,7 +2442,7 @@ index 9960f24ff9a909583da37060671dae14ceb99357..ab330a10633e8c0bf997045cbecef82b
  /**
   * Overlay a title into every cache that holds a row for one session.
   *
-@@ -591,23 +615,7 @@ export function overlayTitleIntoCaches(
+@@ -635,23 +659,7 @@ export function overlayTitleIntoCaches(
      title,
      ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
    };
@@ -2468,7 +2467,7 @@ index 9960f24ff9a909583da37060671dae14ceb99357..ab330a10633e8c0bf997045cbecef82b
    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
      old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
    );
-@@ -638,23 +646,7 @@ export function overlayArchivedIntoCaches(
+@@ -682,23 +690,7 @@ export function overlayArchivedIntoCaches(
    id: string,
    archived: boolean,
  ): void {
@@ -2493,7 +2492,7 @@ index 9960f24ff9a909583da37060671dae14ceb99357..ab330a10633e8c0bf997045cbecef82b
    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
      old ? { ...old, archived } : old,
    );
-@@ -694,3 +686,24 @@ export function settleOpenSessionRow(
+@@ -767,3 +759,24 @@ export function settleOpenSessionRow(
    }
    if (fetching) void queryClient.invalidateQueries({ queryKey, exact: true });
  }
@@ -2519,10 +2518,10 @@ index 9960f24ff9a909583da37060671dae14ceb99357..ab330a10633e8c0bf997045cbecef82b
 +  queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
 +}
 diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
-index 4639f6f6b1846832498608161043114a6b853d3a..fcbd81e33759973a8df0b896e50a42fe2a1aa825 100644
+index 25e01ca4d79af42dab4e0b18f090de2a010395a4..dd098e8054750bfbd48c1d5805bb74b8a27d954d 100644
 --- a/web/src/lib/sessionsApi.ts
 +++ b/web/src/lib/sessionsApi.ts
-@@ -936,7 +936,8 @@ export async function createBundledSession(
+@@ -943,7 +943,8 @@ export async function createBundledSession(
      sandbox_profile_revision?: string;
      project_id?: string;
      sibling_source_id?: string;
@@ -2532,7 +2531,7 @@ index 4639f6f6b1846832498608161043114a6b853d3a..fcbd81e33759973a8df0b896e50a42fe
      initial_input?: SessionEventInput;
      terminal_launch_args?: string[];
      git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean } | null;
-@@ -1459,10 +1460,11 @@ export async function updateSession(
+@@ -1466,10 +1467,11 @@ export async function updateSession(
      shareWorkspaceFiles?: boolean;
      runnerId?: string;
      silent?: boolean;
@@ -2546,7 +2545,7 @@ index 4639f6f6b1846832498608161043114a6b853d3a..fcbd81e33759973a8df0b896e50a42fe
    if ("reasoningEffort" in updates) {
      body.reasoning_effort = updates.reasoningEffort ?? "default";
    }
-@@ -1491,8 +1493,8 @@ export async function updateSession(
+@@ -1498,8 +1500,8 @@ export async function updateSession(
      body.runner_id = updates.runnerId;
    }
    if (updates.labels !== undefined) {
@@ -2558,19 +2557,19 @@ index 4639f6f6b1846832498608161043114a6b853d3a..fcbd81e33759973a8df0b896e50a42fe
    }
    if (updates.silent) {
 diff --git a/web/src/shell/NewChatDialog.projectCreate.test.tsx b/web/src/shell/NewChatDialog.projectCreate.test.tsx
-index 248264402a9562811c5d58a9243700ad1535c5b7..d273b3a4d0d449bc318a6e7e6e5518d272a55560 100644
+index 4339dad0dedc7064b24f3d57e4d3bd68ca5b007e..feacb928ef27fff97412700bc3aabf88d224cb2b 100644
 --- a/web/src/shell/NewChatDialog.projectCreate.test.tsx
 +++ b/web/src/shell/NewChatDialog.projectCreate.test.tsx
-@@ -44,7 +44,7 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
- import type * as SessionHostModule from "@/lib/sessionHost";
+@@ -45,7 +45,7 @@ import type * as SessionHostModule from "@/lib/sessionHost";
  
  import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
--import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import { discardNestedSessionDraft, type NestedSessionDraft } from "@/lib/nestedSessionDrafts";
+-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
  import type { ReactNode } from "react";
  
  import { authenticatedFetch } from "@/lib/identity";
-@@ -617,6 +617,93 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
+@@ -623,6 +623,93 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
      });
    });
  
@@ -2665,10 +2664,10 @@ index 248264402a9562811c5d58a9243700ad1535c5b7..d273b3a4d0d449bc318a6e7e6e5518d2
      const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
      setProjectConfig(config);
 diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
-index b6561f7c3bd62e7d528e2f00c1f889aa731de93f..2493db10e49f710b63be780008a2b1cf0e196514 100644
+index bb6cb560f96d70f7c35f5606533df854f114ebd7..b4d0c00f9339b3df43ff7e1cdfea7ff9098ea6b5 100644
 --- a/web/src/shell/NewChatDialog.test.tsx
 +++ b/web/src/shell/NewChatDialog.test.tsx
-@@ -217,6 +217,25 @@ describe("ComposerAddMenu", () => {
+@@ -226,6 +226,25 @@ describe("ComposerAddMenu", () => {
      expect(onProjectSelect).toHaveBeenCalledWith("docs");
    });
  
@@ -2695,10 +2694,10 @@ index b6561f7c3bd62e7d528e2f00c1f889aa731de93f..2493db10e49f710b63be780008a2b1cf
      const onPlan = vi.fn();
      render(
 diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
-index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c0945370145a 100644
+index 8ba97c8c13742307c49dac02e75e09dd0086602a..4ef2c92f40f1bc9c3e5fc92100b78d9975b463d6 100644
 --- a/web/src/shell/NewChatDialog.tsx
 +++ b/web/src/shell/NewChatDialog.tsx
-@@ -82,6 +82,12 @@ import {
+@@ -86,6 +86,12 @@ import {
    type SandboxProfileSelection,
  } from "@/components/SandboxProfilePicker";
  import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
@@ -2721,7 +2720,7 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
  }
  
  const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed";
-@@ -2614,6 +2623,11 @@ function NewChatLandingContent({
+@@ -2634,6 +2643,11 @@ function NewChatLandingContent({
            // the other visit's workspace — drop the marker with it so the
            // seed/retract machinery starts clean for this visit.
            autoSeededBranch: "",
@@ -2733,7 +2732,7 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
          };
  
    // Restore from storage only without a parked draft. A parked draft with the
-@@ -2973,6 +2987,17 @@ function NewChatLandingContent({
+@@ -3026,6 +3040,17 @@ function NewChatLandingContent({
    // Pre-filled from the `?project=` param so the sidebar's per-project
    // "new session" pencil lands here with the project already selected.
    const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
@@ -2751,7 +2750,7 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
    // The landing screen stays mounted while the `?project=` param changes (e.g.
    // clicking a different project's pencil), so the lazy initializer above won't
    // re-run — sync the selection to the param whenever it changes.
-@@ -3147,6 +3172,7 @@ function NewChatLandingContent({
+@@ -3208,6 +3233,7 @@ function NewChatLandingContent({
      costControlMode,
      agentFromConfig: agentFromConfigRef.current,
      workspaceFromConfig: workspaceFromConfigRef.current,
@@ -2759,7 +2758,7 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
    };
    useEffect(() => {
      // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
-@@ -6451,7 +6477,9 @@ function NewChatLandingContent({
+@@ -6514,7 +6540,9 @@ function NewChatLandingContent({
          } else if (startInExistingWorktree) {
            bundledGitOptions = { branchName: activeWorktree!.branch!, existingWorktree: true };
          }
@@ -2768,9 +2767,9 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
 +          labels: { ...sessionLabels.requestLabels, ...createLabels },
 +        };
          if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
-         if (sandboxSelected) {
-           // Bundle creates send no host id until the server's multipart host_id is deployed.
-@@ -6612,7 +6640,10 @@ function NewChatLandingContent({
+         // The new sandbox's host id, minted client-side as the JSON create does.
+         const managedBundleHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
+@@ -6684,7 +6712,10 @@ function NewChatLandingContent({
            // placeholder, so the placeholder's wrapper labels, launch args and
            // model would all describe a CLI the router may not pick. The
            // server stamps the routed wrapper's labels once it has rebound.
@@ -2781,7 +2780,7 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
              ...(smartRoutingHarnessSelected ? {} : createLabels),
              [CLIENT_CREATE_TOKEN_LABEL]: createToken,
            },
-@@ -7645,6 +7676,11 @@ function NewChatLandingContent({
+@@ -7772,6 +7803,11 @@ function NewChatLandingContent({
                          }
                        }}
                      />
@@ -2793,7 +2792,7 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
                      {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                      <ComposerAttachments files={files} onRemove={removeFile} />
                      {/* Rejected-attachment feedback: unsupported type or too large */}
-@@ -7690,6 +7726,8 @@ function NewChatLandingContent({
+@@ -7821,6 +7857,8 @@ function NewChatLandingContent({
                                  : undefined
                              : undefined
                          }
@@ -2801,8 +2800,8 @@ index f74c2c20cc5b98ec80bc06022dfe9acb47adc6ab..1499ca4dcc19b3db82c3b26113d8c094
 +                        labelCount={Object.keys(sessionLabels.labels).length}
                          projects={projectList ?? []}
                          onProjectSelect={(name) => {
-                           const params = new URLSearchParams(searchParams);
-@@ -8527,6 +8565,15 @@ function NewChatLandingContent({
+                           if (projectHomeName !== undefined) {
+@@ -8637,6 +8675,15 @@ function NewChatLandingContent({
              : undefined
          }
        />
@@ -3048,7 +3047,7 @@ index d65081d4e0181f49659a17a7bc626a33bb08f654..cd580974db466b14a9dc3da0ab021d16
    });
  
 diff --git a/web/src/shell/ProjectSettingsDialog.tsx b/web/src/shell/ProjectSettingsDialog.tsx
-index e7a87ba7bdfa829349e983db28a2bba1b5e87624..3e3523cc093714f120595fae8ac5978715913f54 100644
+index b6052d942bad9cf9c8a14cbc1bc5213623f96928..ee032b9644a8e977e61d9811c5bd2e45757af202 100644
 --- a/web/src/shell/ProjectSettingsDialog.tsx
 +++ b/web/src/shell/ProjectSettingsDialog.tsx
 @@ -1,11 +1,13 @@
@@ -3137,8 +3136,8 @@ index e7a87ba7bdfa829349e983db28a2bba1b5e87624..3e3523cc093714f120595fae8ac59787
 +    <Dialog open={open} onOpenChange={onDialogOpenChange}>
        <DialogContent
          onClick={(e) => e.stopPropagation()}
--        className="sm:max-w-lg"
-+        className="flex max-h-[85vh] flex-col sm:max-w-lg"
+-        className="max-h-[85dvh] overflow-y-auto sm:max-w-lg"
++        className="flex max-h-[85dvh] flex-col sm:max-w-lg"
          // Keep a nested dropdown's dismiss (pick an option, or click the modal
          // body while it's open) from closing the whole Dialog. See
          // `guardDialogDismiss`; real backdrop clicks and Escape still close.

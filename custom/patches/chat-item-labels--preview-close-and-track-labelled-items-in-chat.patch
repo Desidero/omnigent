@@ -51,23 +51,23 @@ Signed-off-by: Desidero <desidero@gmail.com>
  .../claude_native/test_claude_native.py       |  10 +-
  .../session/test_terminal_prepare.py          |   8 +-
  .../codex_native/test_codex_native.py         |  10 +-
- .../test_app_native_startup_instructions.py   |  17 +-
+ .../test_app_native_startup_instructions.py   |  20 +-
  ...pp_sessions_native_terminals_autocreate.py |  44 +-
  ...t_app_sessions_native_terminals_runtime.py |   8 +-
  tests/runner/test_runner_dispatch.py          |   8 +-
  tests/runtime/test_prompt.py                  |  45 +-
  tests/spec/test_resolve_agent_bundle.py       |   8 +-
  .../blocks/ChatMarkdown.itemLabels.test.tsx   | 162 +++++++
- web/src/components/blocks/ChatMarkdown.tsx    | 201 ++++++++-
+ web/src/components/blocks/ChatMarkdown.tsx    | 211 ++++++++-
  .../components/chat/OpenItemsPanel.test.tsx   | 128 ++++++
  web/src/components/chat/OpenItemsPanel.tsx    | 182 ++++++++
- web/src/components/chat/Transcript.tsx        | 297 +++++++------
+ web/src/components/chat/Transcript.tsx        | 299 +++++++------
  web/src/components/chat/chatBubbleParts.tsx   |  69 ++-
  web/src/hooks/useHoverPopover.test.tsx        | 130 ++++++
  web/src/hooks/useHoverPopover.ts              |  95 +++++
  web/src/lib/itemLabels.test.ts                | 276 ++++++++++++
  web/src/lib/itemLabels.ts                     | 399 ++++++++++++++++++
- 22 files changed, 2098 insertions(+), 227 deletions(-)
+ 22 files changed, 2104 insertions(+), 236 deletions(-)
  create mode 100644 docs/chat-item-labels.md
  create mode 100644 tests/e2e_ui/chat/test_item_label_chips.py
  create mode 100644 web/src/components/blocks/ChatMarkdown.itemLabels.test.tsx
@@ -358,7 +358,7 @@ index 0000000000000000000000000000000000000000..d4bb89de6735438a06e1e6413e3c1977
 +    page.locator(_ASSISTANT).nth(1).get_by_role("button", name="Show item R1").click()
 +    expect(popover).to_contain_text("ON DELETE CASCADE")
 diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
-index dd538046fba40016dc39514706dcfef6803eb222..b88d1eb021b738d8a181c829e8ae90811682381c 100644
+index d55a074807682f045f41a6e820bd7aa4ca0b7850..3540a77e1d675a2383cafaf884fb0463c251cbf8 100644
 --- a/tests/harnesses/claude_native/test_claude_native.py
 +++ b/tests/harnesses/claude_native/test_claude_native.py
 @@ -43,7 +43,7 @@ from omnigent.native import native_terminal
@@ -370,7 +370,7 @@ index dd538046fba40016dc39514706dcfef6803eb222..b88d1eb021b738d8a181c829e8ae9081
  from omnigent.spec import load_omnigent_yaml
  from omnigent.telemetry.request_headers import client_user_agent
  from omnigent.terminals.ws_common import (
-@@ -1906,6 +1906,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+@@ -1952,6 +1952,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -378,7 +378,7 @@ index dd538046fba40016dc39514706dcfef6803eb222..b88d1eb021b738d8a181c829e8ae9081
  
  
  def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
-@@ -1993,6 +1994,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
+@@ -2039,6 +2040,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
      assert (
          "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
      )
@@ -386,7 +386,7 @@ index dd538046fba40016dc39514706dcfef6803eb222..b88d1eb021b738d8a181c829e8ae9081
  
  
  def test_local_resume_does_not_print_redundant_resume_hint(
-@@ -6892,15 +6894,15 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
+@@ -7079,15 +7081,15 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
      result = claude_native._wrapper_spec_startup_instructions(spec_path)
      assert result is not None
      assert "Claude Code is running in the session terminal" in result
@@ -487,7 +487,7 @@ index 4e35d55d647b52a87b7efa6558639cf67fc9144e..2534bdf2b3ee7026c17173d5ffa470f4
  
  @pytest.mark.asyncio
 diff --git a/tests/runner/test_app_native_startup_instructions.py b/tests/runner/test_app_native_startup_instructions.py
-index 307352344265a7bee0c4653a40a16f4027de4f95..43079978d85b3ed1c97d4ab8c0ebb5262efde7e9 100644
+index b2b1bac04dfd5c64c09b3c0c165d265befce55b5..122874e9df04cc361d94251c49625db039a37828 100644
 --- a/tests/runner/test_app_native_startup_instructions.py
 +++ b/tests/runner/test_app_native_startup_instructions.py
 @@ -11,9 +11,12 @@ from omnigent.runner.app import (
@@ -535,15 +535,27 @@ index 307352344265a7bee0c4653a40a16f4027de4f95..43079978d85b3ed1c97d4ab8c0ebb526
      )
  
  
-@@ -64,5 +67,5 @@ def test_native_startup_instructions_from_spec_never_returns_stripped_form() ->
+@@ -64,7 +67,7 @@ def test_native_startup_instructions_from_spec_never_returns_stripped_form() ->
      """The original resolved text is preserved verbatim, not the stripped form."""
      padded = "  Keep leading/trailing whitespace exactly.  "
      assert _native_startup_instructions_from_spec(_spec(padded)) == (
 -        f"{padded}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
 +        f"{padded}\n\n{_STARTUP_GUIDANCE}"
      )
+ 
+ 
+@@ -98,8 +101,7 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
+     )
+ 
+     assert text == (
+-        f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+-        "\n\nROUTING NOTE\n\nMEMORY GUIDANCE"
++        f"Be a concise assistant.\n\n{_STARTUP_GUIDANCE}\n\nROUTING NOTE\n\nMEMORY GUIDANCE"
+     )
+     # The workspace reaches the guidance, which names the session's project from it.
+     assert memory_guidance == [(client, "sess", spec, "/work/omnigent")]
 diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
-index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca81a9cd48 100644
+index 8bf03e8dada8b80caae892c8ea0ee65d5a4508c3..c866c4b656a69ef6032833b0013ce216dd830ffd 100644
 --- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
 +++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
 @@ -78,7 +78,7 @@ from omnigent.runner.resource_registry import (
@@ -552,7 +564,7 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
  from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 -from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 +from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
- from omnigent.spec.types import AgentSpec, ExecutorSpec
+ from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
  from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
  from omnigent.terminals import TerminalRegistry
 @@ -170,6 +170,17 @@ def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
@@ -573,7 +585,7 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
  def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
      tmp_path: Path,
  ) -> None:
-@@ -398,9 +409,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
+@@ -416,9 +427,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
          path.parent == Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
      )
      expected = (
@@ -583,9 +595,9 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
 -        else WORKSPACE_IMAGE_INSTRUCTION
 +        else _STARTUP_GUIDANCE
      )
-     assert path.read_text() == expected
-     assert instructions not in args
-@@ -1537,9 +1548,9 @@ async def test_devin_image_guidance_leaves_the_rule_for_authored_sessions(
+     if memory_guidance is not None:
+         expected = f"{expected}\n\n{memory_guidance}"
+@@ -1557,9 +1568,9 @@ async def test_devin_image_guidance_leaves_the_rule_for_authored_sessions(
              bridge.bridge_dir_for_session_id(session_id)
          )
          expected = (
@@ -597,7 +609,7 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
          )
          assert preamble == expected
          if authored is None:
-@@ -2402,7 +2413,7 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
+@@ -2422,7 +2433,7 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
  ) -> None:
      """
      Host-spawned launch emits ``--append-system-prompt`` with the agent's
@@ -606,7 +618,7 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
  
      The managed-host wiring in ``runner/native/orchestration.py``
      (``augment_claude_args(..., append_system_prompt=
-@@ -2469,11 +2480,9 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
+@@ -2489,11 +2500,9 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
          agent_spec=agent_spec,
      )
  
@@ -621,9 +633,9 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
      )
  
  
-@@ -3343,11 +3352,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
-     else:
-         assert len(synth_calls) == int(fork_carry_history)
+@@ -3527,11 +3536,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+         # A fork's rebuild starts its own count.
+         assert synth_costs == [None] * int(fork_carry_history)
  
 -    # Startup gets image guidance; session-title metadata stays out of it.
 -    assert (
@@ -635,7 +647,7 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
  
      permission_mode_index = launched_args.index("--permission-mode")
      assert launched_args[permission_mode_index + 1] == "auto"
-@@ -6039,7 +6045,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
+@@ -6522,7 +6528,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
      # early no longer cascades into "no server running" (#540).
      assert spec.keep_alive_after_exit is True
      args = spec.args
@@ -644,8 +656,8 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
      settings = _load_claude_invocation_settings(args)
      assert "PermissionRequest" in settings["hooks"]
      permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
-@@ -6254,7 +6260,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
-     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+@@ -6748,7 +6754,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+     )
      # A pinned session's spawns stay on the claude family, so it gets neither
      # the routed-spawn note nor the pre-approvals the cross-family hop needs.
 -    assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
@@ -653,9 +665,9 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
  
  
  async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
-@@ -6282,7 +6288,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
-     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
-     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+@@ -6777,7 +6783,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
+     # The custom-slot pin tracks the launched 1M-capable Opus and carries [1m].
+     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
      # And the auto-harness extras, which only make sense alongside the router.
 -    assert "--append-system-prompt" in spec.args
 +    assert (_appended_system_prompt(spec.args) or "").startswith(f"{_STARTUP_GUIDANCE}\n\n")
@@ -663,7 +675,7 @@ index 02b41548ba27d6b5016e45232a6cc6bccd9aa5c3..22fdea23a7463e8ef9ea7e82db6148ca
      assert "mcp__omnigent__sys_session_create" in allowed
  
 diff --git a/tests/runner/test_app_sessions_native_terminals_runtime.py b/tests/runner/test_app_sessions_native_terminals_runtime.py
-index 884aa4958775d798f35fed78ee7b90311420f6dd..6e94ba3b84691f5ef68a8f4165a487fb02c1e092 100644
+index 642f2833d931ca79ce118f9d0faddf1af205dcc3..efc6ac8da01c0f91c3e401c08893b278dc38162a 100644
 --- a/tests/runner/test_app_sessions_native_terminals_runtime.py
 +++ b/tests/runner/test_app_sessions_native_terminals_runtime.py
 @@ -50,7 +50,7 @@ from omnigent.runner.session_init_protocol import (
@@ -675,7 +687,7 @@ index 884aa4958775d798f35fed78ee7b90311420f6dd..6e94ba3b84691f5ef68a8f4165a487fb
  from omnigent.spec.types import AgentSpec, ExecutorSpec
  from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
  from omnigent.terminals import TerminalRegistry
-@@ -944,7 +944,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+@@ -993,7 +993,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
      assert build_calls[0]["trust_project"] is True
      assert build_calls[0]["reconcile_process_registry"] is False
      assert build_calls[0]["developer_instructions"] == (
@@ -685,7 +697,7 @@ index 884aa4958775d798f35fed78ee7b90311420f6dd..6e94ba3b84691f5ef68a8f4165a487fb
      )
      # Persisted pass-through args must reach launch resolution (--profile layering).
      assert resolve_calls and all(
-@@ -1918,7 +1919,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
+@@ -1978,7 +1979,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
      )
      assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
      assert build_calls[0]["developer_instructions"] == (
@@ -696,10 +708,10 @@ index 884aa4958775d798f35fed78ee7b90311420f6dd..6e94ba3b84691f5ef68a8f4165a487fb
  
      # Sandbox-override regression: the launched Codex terminal must inherit
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index 5ecc8974b763dbaf1d25acb2252b2dfdf27521c7..8c30f0dd51404dc46d38ff34fd36eada020e5c11 100644
+index f6000c367e1c4e43c87abc7471f8b1e668ea09a2..53b48f5e5b8c0cb78c698c319f2c41da4ec042a4 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
-@@ -100,6 +100,7 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
+@@ -102,6 +102,7 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
  from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
  from omnigent.runtime.prompt import (
      EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
@@ -707,7 +719,7 @@ index 5ecc8974b763dbaf1d25acb2252b2dfdf27521c7..8c30f0dd51404dc46d38ff34fd36eada
      WORKSPACE_IMAGE_INSTRUCTION,
  )
  from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
-@@ -13726,7 +13727,12 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
+@@ -14477,7 +14478,12 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
  def _contract_composed_instructions(*parts: str) -> str:
      """Compose expected author/request text with framework guidance."""
      return "\n\n".join(
@@ -1017,10 +1029,10 @@ index 0000000000000000000000000000000000000000..57e24ef66227603143d69c6cb48ce29b
 +  });
 +});
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index ab6d5f98cc3657c85ddf539d65357b2b9793c0e8..72943843d84d588889344a98c8ccce296042b36d 100644
+index 0620cde188059f9a3710aa79eab41aae3c556e60..55e1048481425b253fe3dac642d4ac7eb08998b4 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
-@@ -1,19 +1,20 @@
+@@ -1,18 +1,19 @@
  // Markdown rendering for chat text: assistant bubbles, user bubbles, and any
  // other surface that shows agent-authored markdown.
  //
@@ -1039,13 +1051,11 @@ index ab6d5f98cc3657c85ddf539d65357b2b9793c0e8..72943843d84d588889344a98c8ccce29
  import type React from "react";
  import { useInRouterContext } from "react-router-dom";
 -import { Link } from "@/lib/routing";
--import { useMemo } from "react";
 +import { Link, useSearchParams } from "@/lib/routing";
-+import { useContext, useMemo } from "react";
+ import { useContext, useMemo } from "react";
  import {
    BotIcon,
-   CopyIcon,
-@@ -44,11 +45,25 @@ import {
+@@ -52,11 +53,25 @@ import {
  } from "@/components/ui/context-menu";
  import { VideoPlayer } from "@/components/VideoPlayer";
  import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
@@ -1071,7 +1081,7 @@ index ab6d5f98cc3657c85ddf539d65357b2b9793c0e8..72943843d84d588889344a98c8ccce29
  import { cn } from "@/lib/utils";
  import { parseMentionPillTitle } from "@/lib/mentionPills";
  import {
-@@ -552,6 +567,163 @@ function citesSamePlace(
+@@ -607,6 +622,163 @@ function citesSamePlace(
    );
  }
  
@@ -1235,7 +1245,7 @@ index ab6d5f98cc3657c85ddf539d65357b2b9793c0e8..72943843d84d588889344a98c8ccce29
  // Markdown images open in the shared lightbox on click, matching uploaded and
  // generated images. (Remote `src`s are still gated by Streamdown's image
  // security; this only adds the zoom affordance to whatever does render.)
-@@ -692,7 +864,7 @@ function SessionPillContent({
+@@ -754,7 +926,7 @@ function SessionPillContent({
  const FILE_PATH_AWARE_COMPONENTS = {
    inlineCode: WorkspacePathInlineCode,
    img: ZoomableMarkdownImage,
@@ -1243,8 +1253,8 @@ index ab6d5f98cc3657c85ddf539d65357b2b9793c0e8..72943843d84d588889344a98c8ccce29
 +  a: ChatMarkdownLink,
  };
  
- // How often the live (growing) assistant bubble re-parses its markdown. The
-@@ -796,6 +968,8 @@ function remarkHtmlAsText() {
+ function LeadingCommandToken({ children }: WithHastNode<React.ComponentPropsWithoutRef<"kbd">>) {
+@@ -884,6 +1056,8 @@ function remarkHtmlAsText() {
   * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
   * block rendering too, stripping `<pre>` and collapsing whitespace.
   *
@@ -1253,29 +1263,41 @@ index ab6d5f98cc3657c85ddf539d65357b2b9793c0e8..72943843d84d588889344a98c8ccce29
   * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
   * instead of collapsing to spaces per CommonMark. Used for user bubbles,
   * where people type multi-line messages without blank-line paragraph
-@@ -816,17 +990,14 @@ export function FilePathAwareMessageResponse({
- }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
-   const components = FILE_PATH_AWARE_COMPONENTS;
+@@ -918,23 +1092,20 @@ export function FilePathAwareMessageResponse({
+   const components =
+     leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
  
 -  // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
--  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
+-  // no option set we pass `undefined` so Streamdown uses its defaults unchanged.
 +  // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
    const remarkPlugins = useMemo(
 -    () =>
--      breaks || literalHtml
+-      breaks || literalHtml || linkPullRequestRefs || leadingCommand !== undefined
 -        ? [
 -            ...Object.values(defaultRemarkPlugins),
+-            // Before the leading command split: PR splitting rebuilds text nodes, which
+-            // would drop its `kbd` tag, and its new nodes have no source position.
+-            ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
 -            ...(literalHtml ? [remarkHtmlAsText] : []),
+-            ...(leadingCommand !== undefined
+-              ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
+-              : []),
 -            ...(breaks ? [remarkBreaks] : []),
 -          ]
 -        : undefined,
 +    () => [
 +      ...Object.values(defaultRemarkPlugins),
++      // Before the leading command split: PR and label splitting rebuild text nodes,
++      // which would drop its `kbd` tag, and their new nodes have no source position.
++      ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
 +      ...(literalHtml ? [remarkHtmlAsText] : []),
 +      remarkItemLabels,
++      ...(leadingCommand !== undefined
++        ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
++        : []),
 +      ...(breaks ? [remarkBreaks] : []),
 +    ],
-     [breaks, literalHtml],
+     [breaks, literalHtml, linkPullRequestRefs, leadingCommand],
    );
  
 diff --git a/web/src/components/chat/OpenItemsPanel.test.tsx b/web/src/components/chat/OpenItemsPanel.test.tsx
@@ -1601,10 +1623,10 @@ index 0000000000000000000000000000000000000000..77a05f5690427b3656f637ae80a03073
 +  );
 +}
 diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
-index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081fbb11858 100644
+index 519a68749dc0df7d1000ffeed6d76b32cb7da417..9637747daa986608f117907dae1576423f37b77d 100644
 --- a/web/src/components/chat/Transcript.tsx
 +++ b/web/src/components/chat/Transcript.tsx
-@@ -35,9 +35,11 @@ import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
+@@ -32,9 +32,11 @@ import { useSessionTasks } from "@/hooks/useSessionTasks";
  import { useSearchParams } from "@/lib/routing";
  import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
  import { onFindOpened } from "@/lib/nativeBridge";
@@ -1616,7 +1638,7 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
  import {
    RunnerStartingIndicator,
    McpStartupIndicator,
-@@ -48,6 +50,7 @@ import {
+@@ -45,6 +47,7 @@ import {
    type ConversationScroller,
    BubbleView,
    ConversationScrollRefBridge,
@@ -1624,17 +1646,17 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
    HistoryAutoLoader,
    HistoryLoadingIndicator,
    JumpToTopButton,
-@@ -412,162 +415,180 @@ function TranscriptImpl({
+@@ -409,165 +412,181 @@ function TranscriptImpl({
+ 
+   const showWorkingIndicator =
      !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
-   const arcaWarning = useArcaShutdownBanner();
-   const showArcaBanner = arcaWarning.showForHost(hostId);
--  const hasPinnedBanner = display.hasTasks || showArcaBanner;
+-  const hasPinnedBanner = display.hasTasks;
 +  const itemLabelIndex = useMemo(
 +    () => buildBubbleItemLabelIndex(display.bubbles),
 +    [display.bubbles],
 +  );
 +  const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
-+  const hasPinnedBanner = display.hasTasks || hasOpenItems || showArcaBanner;
++  const hasPinnedBanner = display.hasTasks || hasOpenItems;
    return (
      <TaskMarkersProvider value={taskMarkers}>
 -      {/* Task preview pinned above the thread. Sibling of the viewport (not an
@@ -1660,11 +1682,7 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
 +          className={display.hasTasks ? undefined : "chat-tasks-preview mt-14 md:mt-12"}
          />
 -      )}
--      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
 -      {/* Wrapper div gives us a ref to scope the SelectionPopup to the
-+        {showArcaBanner && (
-+          <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks || hasOpenItems} />
-+        )}
 +        {/* Wrapper div gives us a ref to scope the SelectionPopup to the
        conversation area without requiring Conversation to forward refs. */}
 -      <div
@@ -1687,7 +1705,8 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
              className={cn(
 -              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
 -              hasPinnedBanner ? "pt-4" : "pt-20",
--              showArcaBanner && "chat-content-under-arca-banner",
+-              // In a chat pane, the panes view and the pane's strip already clear the header.
+-              "in-data-chat-pane-body-host:pt-4",
 -              CHAT_COLUMN_WIDTH,
 +              !isMobileViewport &&
 +                (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
@@ -1709,7 +1728,8 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
 +              className={cn(
 +                "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
 +                hasPinnedBanner ? "pt-4" : "pt-20",
-+                showArcaBanner && "chat-content-under-arca-banner",
++                // In a chat pane, the panes view and the pane's strip already clear the header.
++                "in-data-chat-pane-body-host:pt-4",
 +                CHAT_COLUMN_WIDTH,
 +              )}
 +            >
@@ -1846,13 +1866,6 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
 -            <LatestTurnSpacer
 -              key={display.conversationId ?? "landing"}
 -              scrollElement={scroller?.el ?? null}
--              conversationId={display.conversationId}
--              blockCount={display.blockCount}
--              committedUserIds={display.committedUserIds}
--              hasCommittedAnchor={display.hasCommittedAnchor}
--              topGapPx={display.hasTasks ? 16 : undefined}
--              measureRef={spacerMeasureRef}
--              remeasureNonce={spacerMeasureNonce}
 +                  <McpStartupIndicator />
 +                </>
 +              )}
@@ -1871,16 +1884,23 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
 +            </ConversationContent>
 +            {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
 +            <ConversationScrollRefBridge onScroller={setScroller} />
-+            <ConversationScrollButton
-+              className={
-+                isMobileViewport
-+                  ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
-+                  : undefined
-+              }
++            <TranscriptPaletteCommands
+               conversationId={display.conversationId}
+-              blockCount={display.blockCount}
+-              committedUserIds={display.committedUserIds}
+-              hasCommittedAnchor={display.hasCommittedAnchor}
+-              topGapPx={display.hasTasks ? 16 : undefined}
+-              measureRef={spacerMeasureRef}
+-              remeasureNonce={spacerMeasureNonce}
++              bubbles={display.streamBubbles}
              />
 -          </ConversationContent>
 -          {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
 -          <ConversationScrollRefBridge onScroller={setScroller} />
+-          <TranscriptPaletteCommands
+-            conversationId={display.conversationId}
+-            bubbles={display.streamBubbles}
+-          />
 -          <ConversationScrollButton
 -            className={
 -              isMobileViewport
@@ -1890,6 +1910,13 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
 -          />
 -        </Conversation>
 -        {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
++            <ConversationScrollButton
++              className={
++                isMobileViewport
++                  ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
++                  : undefined
++              }
++            />
 +          </Conversation>
 +          {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
          chat-scroll-fade mask. */}
@@ -1900,10 +1927,9 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
 -          scroller={scroller}
 -          hasMoreHistory={display.hasMoreHistory}
 -        />
--        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+-        {/* Too-many-tabs and sandbox-launch warnings, siblings of Conversation. */}
 -        <FloatingBannerStack>
 -          <StreamBudgetBanner />
--          <DbcertBanner conversationId={conversationId} hostId={hostId} />
 -          <SandboxActionBanner />
 -        </FloatingBannerStack>
 -        {/* Left-edge minimap: one tick per turn. Desktop-only. */}
@@ -1922,10 +1948,9 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
            />
 -        )}
 -      </div>
-+          {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
++          {/* Too-many-tabs and sandbox-launch warnings, siblings of Conversation. */}
 +          <FloatingBannerStack>
 +            <StreamBudgetBanner />
-+            <DbcertBanner conversationId={conversationId} hostId={hostId} />
 +            <SandboxActionBanner />
 +          </FloatingBannerStack>
 +          {/* Left-edge minimap: one tick per turn. Desktop-only. */}
@@ -1944,10 +1969,10 @@ index 8f98f69cf6cfe1be723d7283245da05222580af9..d8240c2741fb874cac0e245c706ec081
    );
  }
 diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
-index 02b2167327093bf78f74703249759423a58d8734..e686079aaa199ac67c89ee1686c3218473a420fb 100644
+index 66b4025e73faeda3bfa18d99c54fbfb91f3c2809..85c5192a56927dc9fcbed026334b97bd65a7082f 100644
 --- a/web/src/components/chat/chatBubbleParts.tsx
 +++ b/web/src/components/chat/chatBubbleParts.tsx
-@@ -103,6 +103,15 @@ import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/compone
+@@ -119,6 +119,15 @@ import { FailedAttachment, PendingAttachment } from "./PendingAttachment";
  import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
  import { EditSentMessageContext } from "@/components/chat/editSentMessage";
  import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -1963,7 +1988,7 @@ index 02b2167327093bf78f74703249759423a58d8734..e686079aaa199ac67c89ee1686c32184
  import { copyText } from "@/lib/clipboard";
  import { copyMarkdown } from "@/lib/copyMarkdown";
  import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
-@@ -238,6 +247,42 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
+@@ -253,6 +262,42 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
      .trim();
  }
  
@@ -2006,7 +2031,7 @@ index 02b2167327093bf78f74703249759423a58d8734..e686079aaa199ac67c89ee1686c32184
  const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
  const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
  const MERMAID_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})mermaid(?:\s|$)/im;
-@@ -859,7 +904,13 @@ export const BubbleView = memo(
+@@ -895,7 +940,13 @@ export const BubbleView = memo(
      /** Hide retry/recovery controls when the surrounding session is sealed. */
      recoveryDisabled?: boolean;
    }) {
@@ -2021,7 +2046,7 @@ index 02b2167327093bf78f74703249759423a58d8734..e686079aaa199ac67c89ee1686c32184
      if (bubble.kind === "compaction_loading") {
        return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
      }
-@@ -879,13 +930,15 @@ export const BubbleView = memo(
+@@ -915,13 +966,15 @@ export const BubbleView = memo(
        );
      }
      return (

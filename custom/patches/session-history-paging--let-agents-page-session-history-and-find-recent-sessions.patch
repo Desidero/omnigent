@@ -30,7 +30,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/AGENT_YAML_SPEC.md                       |  13 +
- omnigent/runner/tool_dispatch.py              | 207 +++++++++++++--
+ omnigent/runner/tool_dispatch.py              | 213 +++++++++++++--
  omnigent/server/API.md                        |   4 +
  .../server/routes/sessions/routes_core.py     |   5 +
  .../stores/conversation_store/__init__.py     |   5 +
@@ -42,13 +42,13 @@ Signed-off-by: Desidero <desidero@gmail.com>
  .../integration/test_sessions_endpoints.py    |  22 ++
  tests/stores/test_conversation_store.py       |  35 +++
  tests/tools/builtins/test_sys_session.py      | 114 ++++++++
- 13 files changed, 813 insertions(+), 58 deletions(-)
+ 13 files changed, 819 insertions(+), 58 deletions(-)
 
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
-index cd13eab5a8706cf83804ffe3b5b290fdd38f3bb1..29fed756cdccaa5bcbbec77c835dda19a2f0ecc0 100644
+index d3f49b8d500e40f131df6e75ce8af9d6730cb0f9..a3711b98d1a70bee5c4e1843d263208e91a79cc0 100644
 --- a/docs/AGENT_YAML_SPEC.md
 +++ b/docs/AGENT_YAML_SPEC.md
-@@ -1182,6 +1182,19 @@ have no key: any agent in a multi-agent session needs the reads, and async work
+@@ -1417,6 +1417,19 @@ have no key: any agent in a multi-agent session needs the reads, and async work
  handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
  session viewers to open a workspace-relative file without switching sessions.
  
@@ -69,10 +69,10 @@ index cd13eab5a8706cf83804ffe3b5b290fdd38f3bb1..29fed756cdccaa5bcbbec77c835dda19
  
  ```yaml
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231a47d5b02 100644
+index ad6f86fe225d031133719662326e7587f251db42..de8846ea313b467eae966e42319e24bd7c2cf263 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
-@@ -128,6 +128,8 @@ from omnigent.tools.builtins.spawn import (
+@@ -132,6 +132,8 @@ from omnigent.tools.builtins.spawn import (
      _clamp_history_content_chars,
      _clamp_history_offset_chars,
      _clamp_tail_items,
@@ -81,7 +81,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
  )
  from omnigent.tools.builtins.sys_terminal import (
      SysTerminalCloseTool,
-@@ -6068,6 +6070,17 @@ async def _execute_session_query_tool(
+@@ -6438,6 +6440,17 @@ async def _execute_session_query_tool(
          agent_name = args.get("agent_name")
          include_archived = args.get("include_archived") is True
          visibility = args.get("visibility", _SESSION_LIST_DEFAULT_VISIBILITY)
@@ -99,10 +99,10 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
          if visibility not in _SESSION_LIST_VISIBILITIES:
              return json.dumps(
                  {
-@@ -6077,11 +6090,22 @@ async def _execute_session_query_tool(
-                     )
+@@ -6448,12 +6461,22 @@ async def _execute_session_query_tool(
                  }
              )
+         created_by_this_session = args.get("created_by_this_session") is True
 +        recency = _parse_session_list_recency(args)
 +        if isinstance(recency, str):
 +            return recency
@@ -111,28 +111,28 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
              args,
              tool_name,
              ("sessions",),
--            _session_list_filters(agent_name, include_archived, visibility, project),
-+            _session_list_filters(
+             _session_list_filters(
+-                agent_name, include_archived, visibility, project, created_by_this_session
 +                agent_name,
 +                include_archived,
 +                visibility,
 +                project,
++                created_by_this_session,
 +                updated_after=updated_after,
 +                order_by=order_by,
-+            ),
+             ),
          )
          if isinstance(window, str):
-             return window
-@@ -6093,6 +6117,8 @@ async def _execute_session_query_tool(
-             include_archived=include_archived,
+@@ -6467,6 +6490,8 @@ async def _execute_session_query_tool(
              visibility=visibility,
              project=project,
+             created_by_this_session=created_by_this_session,
 +            updated_after=updated_after,
 +            order_by=order_by,
              limit=limit,
              cursor_state=cursor_state,
              continued=continued,
-@@ -7054,22 +7080,85 @@ def _project_agent_list(
+@@ -7444,24 +7469,87 @@ def _project_agent_list(
      }
  
  
@@ -198,6 +198,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      include_archived: bool,
      visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
      project: str | None = None,
+     created_by_this_session: bool = False,
 +    *,
 +    updated_after: int | None = None,
 +    order_by: str = "created",
@@ -216,15 +217,16 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      :param include_archived: Whether archived sessions are listed.
      :param visibility: Which sessions the global view covers, e.g. ``"mine"``.
 +    :param project: Optional project name filter.
+     :param created_by_this_session: Whether only the caller's workers are listed.
 +    :param updated_after: Epoch seconds the sessions must be updated after.
 +    :param order_by: ``"created"`` or ``"updated"``, newest first.
      :returns: The filter mapping, e.g. ``{"agent_name": None}``.
      """
      filters: _JsonObject = {
-@@ -7081,9 +7170,20 @@ def _session_list_filters(
-         filters["visibility"] = visibility
-     if project is not None:
+@@ -7475,9 +7563,20 @@ def _session_list_filters(
          filters["project"] = project
+     if created_by_this_session:
+         filters["created_by_this_session"] = True
 +    if updated_after is not None:
 +        filters["updated_after"] = updated_after
 +    if order_by != "created":
@@ -242,50 +244,85 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
  async def _session_list_via_rest(
      conversation_id: str,
      server_client: httpx.AsyncClient,
-@@ -7092,6 +7192,8 @@ async def _session_list_via_rest(
-     include_archived: bool = False,
+@@ -7487,6 +7586,8 @@ async def _session_list_via_rest(
      visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
      project: str | None = None,
+     created_by_this_session: bool = False,
 +    updated_after: int | None = None,
 +    order_by: str = "created",
      limit: int | None,
      cursor_state: dict[str, _DiscoveryState],
      continued: bool,
-@@ -7116,6 +7218,8 @@ async def _session_list_via_rest(
-     :param include_archived: Also list archived sessions in the global view.
-     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
+@@ -7513,6 +7614,8 @@ async def _session_list_via_rest(
          ownership filter for the global view.
+     :param created_by_this_session: List only sessions the caller started, and
+         skip the ``sub_agents`` view.
 +    :param updated_after: Only list sessions updated after these epoch seconds.
 +    :param order_by: ``"created"`` or ``"updated"``, newest first.
      :param limit: Optional maximum rows returned from the global sessions view;
          :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
      :param cursor_state: Opaque continuation position for the global sessions view.
-@@ -7133,6 +7237,8 @@ async def _session_list_via_rest(
+@@ -7543,6 +7646,8 @@ async def _session_list_via_rest(
+                     include_archived=include_archived,
+                     visibility=visibility,
+                     project=project,
++                    updated_after=updated_after,
++                    order_by=order_by,
+                     after=cursor_state["sessions"][1],
+                     limit=page_limit,
+                 ),
+@@ -7555,6 +7660,8 @@ async def _session_list_via_rest(
+                 include_archived=include_archived,
+                 visibility=visibility,
+                 project=project,
++                updated_after=updated_after,
++                order_by=order_by,
+                 after=cursor_state["sessions"][1],
+                 limit=page_limit,
+             )
+@@ -7571,7 +7678,13 @@ async def _session_list_via_rest(
+         continued=continued,
+         tool_name="sys_session_list",
+         filters=_session_list_filters(
+-            agent_name, include_archived, visibility, project, created_by_this_session
++            agent_name,
++            include_archived,
++            visibility,
++            project,
++            created_by_this_session,
++            updated_after=updated_after,
++            order_by=order_by,
+         ),
+         page_sections=("sessions",),
+         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
+@@ -7587,6 +7700,8 @@ async def _collect_created_sessions(
+     include_archived: bool,
+     visibility: str,
+     project: str | None,
++    updated_after: int | None = None,
++    order_by: str = "created",
+     after: str | None,
+     limit: int,
+ ) -> _DiscoveryPage:
+@@ -7605,6 +7720,8 @@ async def _collect_created_sessions(
+     :param include_archived: Also list archived sessions.
+     :param visibility: The server's ownership filter, e.g. ``"mine"``.
+     :param project: Optional project-name filter.
++    :param updated_after: Only list sessions updated after these epoch seconds.
++    :param order_by: ``"created"`` or ``"updated"``, newest first.
+     :param after: Server cursor to resume from, if any.
+     :param limit: Rows the caller asked for; one extra match proves more remain.
+     :returns: The matching rows and the source continuation state.
+@@ -7618,6 +7735,8 @@ async def _collect_created_sessions(
              include_archived=include_archived,
              visibility=visibility,
              project=project,
 +            updated_after=updated_after,
 +            order_by=order_by,
-             after=cursor_state["sessions"][1],
-             limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
+             after=after,
+             limit=_AGENT_LIST_PAGE_LIMIT,
          )
-@@ -7143,7 +7249,14 @@ async def _session_list_via_rest(
-         cursor_state=cursor_state,
-         continued=continued,
-         tool_name="sys_session_list",
--        filters=_session_list_filters(agent_name, include_archived, visibility, project),
-+        filters=_session_list_filters(
-+            agent_name,
-+            include_archived,
-+            visibility,
-+            project,
-+            updated_after=updated_after,
-+            order_by=order_by,
-+        ),
-         source_pages={"sessions": sessions_page},
-         page_sections=("sessions",),
-         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
-@@ -7394,6 +7507,8 @@ async def _collect_global_sessions(
+@@ -7881,6 +8000,8 @@ async def _collect_global_sessions(
      include_archived: bool = False,
      visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
      project: str | None = None,
@@ -294,7 +331,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      after: str | None,
      limit: int,
  ) -> _DiscoveryPage:
-@@ -7401,11 +7516,12 @@ async def _collect_global_sessions(
+@@ -7888,11 +8009,12 @@ async def _collect_global_sessions(
      Fetch the global session list via ``GET /v1/sessions``.
  
      Projects each listed session to ``{session_id, agent_name, title,
@@ -310,7 +347,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      runner's request carries the owning user's identity). Best-effort:
      returns ``[]`` on a fetch failure.
  
-@@ -7422,6 +7538,9 @@ async def _collect_global_sessions(
+@@ -7909,6 +8031,9 @@ async def _collect_global_sessions(
      :param visibility: The server's ownership filter. ``"mine"`` (the
          sidebar's default) keeps other users' sessions out of an agent's
          view; ``"shared"`` / ``"all"`` rows also carry ``owner``.
@@ -320,7 +357,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      :param after: Server cursor from the previous page, if any.
      :param limit: Maximum number of source rows to fetch.
      :returns: Projected global session entries and continuation metadata.
-@@ -7446,6 +7565,7 @@ async def _collect_global_sessions(
+@@ -7933,6 +8058,7 @@ async def _collect_global_sessions(
      params: dict[str, str | int] = {
          "limit": limit,
          "order": "desc",
@@ -328,7 +365,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
          "visibility": server_visibility,
      }
      if project is not None:
-@@ -7454,6 +7574,8 @@ async def _collect_global_sessions(
+@@ -7941,6 +8067,8 @@ async def _collect_global_sessions(
          params["agent_name"] = agent_name
      if include_archived:
          params["include_archived"] = "true"
@@ -337,7 +374,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      if after is not None:
          params["after"] = after
      try:
-@@ -7499,6 +7621,8 @@ async def _collect_global_sessions(
+@@ -7986,6 +8114,8 @@ async def _collect_global_sessions(
                      if visibility != _SESSION_LIST_DEFAULT_VISIBILITY
                      else {}
                  ),
@@ -346,7 +383,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
              }
              for r in rows
          ],
-@@ -7630,6 +7754,15 @@ async def _session_parent_id(
+@@ -8119,6 +8249,15 @@ async def _session_parent_id(
      return parent if isinstance(parent, str) and parent else None
  
  
@@ -362,7 +399,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
  async def _session_get_history_via_rest(
      args: _JsonObject,
      server_client: httpx.AsyncClient,
-@@ -7646,8 +7779,8 @@ async def _session_get_history_via_rest(
+@@ -8135,8 +8274,8 @@ async def _session_get_history_via_rest(
      may read).
  
      :param args: Parsed tool arguments; requires ``conversation_id``,
@@ -373,7 +410,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      :param server_client: HTTP client pointed at the Omnigent server.
      :returns: JSON peek result, or a JSON error object.
      """
-@@ -7671,44 +7804,68 @@ async def _session_get_history_via_rest(
+@@ -8160,44 +8299,68 @@ async def _session_get_history_via_rest(
      content_offset_chars = _clamp_history_offset_chars(args.get("content_offset_chars", 0))
      if isinstance(content_offset_chars, str):
          return content_offset_chars
@@ -458,7 +495,7 @@ index a5288cbf52dcd7882ba60a0b2b4bb7e0883a118b..b35ba0a8cd04c26d59b2902b19ed7231
      )
  
 diff --git a/omnigent/server/API.md b/omnigent/server/API.md
-index 3504001529ec5a84405ece7bb8f792c3ba880489..13ac730e1475b9fa36ea466006ce51025f912a0d 100644
+index b6dd3b6a8e387ace7dfbb880679815e08599d26e..d48ccf6d9797cd994acfe25333dfeaff75919e8f 100644
 --- a/omnigent/server/API.md
 +++ b/omnigent/server/API.md
 @@ -732,6 +732,10 @@ minus `items` and snapshot-only fields.
@@ -473,10 +510,10 @@ index 3504001529ec5a84405ece7bb8f792c3ba880489..13ac730e1475b9fa36ea466006ce5102
  active sessions, `shared` lists accessible active sessions owned by someone
  else, `archived` lists accessible archived sessions, and `all` lists all
 diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
-index 4c253f91dd055c4acc57babdf55b0409f415bf0b..63565c82ff3ee813d135153c2dc8604d9a8c1713 100644
+index a3837ccdcaab29108091db66f0d495f9656b4f64..f5f1edd1206ace2af5635830d1892d67260f5de1 100644
 --- a/omnigent/server/routes/sessions/routes_core.py
 +++ b/omnigent/server/routes/sessions/routes_core.py
-@@ -2622,6 +2622,7 @@ def register_core_routes(
+@@ -2679,6 +2679,7 @@ def register_core_routes(
          pinned: bool = Query(default=False),
          expand_families: bool = Query(default=False),
          visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
@@ -484,7 +521,7 @@ index 4c253f91dd055c4acc57babdf55b0409f415bf0b..63565c82ff3ee813d135153c2dc8604d
      ) -> dict[str, Any]:
          """
          List sessions with cursor-based pagination.
-@@ -2688,6 +2689,9 @@ def register_core_routes(
+@@ -2745,6 +2746,9 @@ def register_core_routes(
              ``"all"`` (default) returns all accessible non-archived
              sessions, matching the legacy behaviour. ``include_archived``
              adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
@@ -494,7 +531,7 @@ index 4c253f91dd055c4acc57babdf55b0409f415bf0b..63565c82ff3ee813d135153c2dc8604d
          :returns: A :class:`PaginatedList` of
              :class:`SessionListItem`.
          """
-@@ -2784,6 +2788,7 @@ def register_core_routes(
+@@ -2841,6 +2845,7 @@ def register_core_routes(
                      pinned=pinned,
                      # Pins are per-user: filter to the caller's own pin key.
                      pinned_owner=user_id,
@@ -503,10 +540,10 @@ index 4c253f91dd055c4acc57babdf55b0409f415bf0b..63565c82ff3ee813d135153c2dc8604d
                  # Side chats surface only as Workspace-rail tabs, so drop any
                  # side-chat-labeled fork from the sidebar list (it is still a
 diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
-index 164f931a37ecbcfadb140bd707e249ee5bf64a84..74846860dbf95defa7d2ffa8c099d37e7d0be8f7 100644
+index 34092b392ab868d221454cbe80c710aeabe1c51d..6ef7dbae777b058cfa5017bb07ca3028d22dcd46 100644
 --- a/omnigent/stores/conversation_store/__init__.py
 +++ b/omnigent/stores/conversation_store/__init__.py
-@@ -1010,6 +1010,7 @@ class ConversationStore(ABC):
+@@ -1061,6 +1061,7 @@ class ConversationStore(ABC):
          pinned: bool = False,
          pinned_owner: str | None = None,
          title: str | None = None,
@@ -514,7 +551,7 @@ index 164f931a37ecbcfadb140bd707e249ee5bf64a84..74846860dbf95defa7d2ffa8c099d37e
      ) -> PagedList[Conversation]:
          """
          List conversations with cursor-based pagination.
-@@ -1129,6 +1130,10 @@ class ConversationStore(ABC):
+@@ -1180,6 +1181,10 @@ class ConversationStore(ABC):
              Powers the ``(agent, title)`` child-session lookup in
              ``sys_session_send`` so the server can resolve the target
              in a single indexed query instead of fetching all children.
@@ -526,10 +563,10 @@ index 164f931a37ecbcfadb140bd707e249ee5bf64a84..74846860dbf95defa7d2ffa8c099d37e
              objects.
          :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
 diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
-index 99b003dbfb11a293df6967416c34a31c73d041e6..c1a15a6ff72c7093953e3cc18f6f133cb20eb126 100644
+index d4c04281e6a3e5bf2634a3d6cd820bd68a11b113..8be2fe904eb3ba4c9f3b7462556a98ef402dcbb2 100644
 --- a/omnigent/stores/conversation_store/sqlalchemy_store.py
 +++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
-@@ -3786,6 +3786,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4234,6 +4234,7 @@ class SqlAlchemyConversationStore(ConversationStore):
          pinned: bool = False,
          pinned_owner: str | None = None,
          title: str | None = None,
@@ -537,7 +574,7 @@ index 99b003dbfb11a293df6967416c34a31c73d041e6..c1a15a6ff72c7093953e3cc18f6f133c
      ) -> PagedList[Conversation]:
          """
          List conversations with cursor-based pagination.
-@@ -3858,6 +3859,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4306,6 +4307,8 @@ class SqlAlchemyConversationStore(ConversationStore):
              can access but does NOT own — i.e. sessions shared with them
              by another user. Requires ``accessible_by`` to be set.
              ``False`` (default) disables the filter.
@@ -546,7 +583,7 @@ index 99b003dbfb11a293df6967416c34a31c73d041e6..c1a15a6ff72c7093953e3cc18f6f133c
          :returns: A :class:`PagedList` of :class:`Conversation`
              objects.
          :raises ValueError: If ``search_scope`` is not a known scope.
-@@ -4066,6 +4069,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+@@ -4514,6 +4517,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                  stmt = stmt.where(SqlConversation.agent_id == agent_id)
              if title is not None:
                  stmt = stmt.where(SqlConversation.title == title)
@@ -556,7 +593,7 @@ index 99b003dbfb11a293df6967416c34a31c73d041e6..c1a15a6ff72c7093953e3cc18f6f133c
                  pattern = _like_contains_pattern(search_query)
                  title_match = func.lower(SqlConversation.title).like(pattern, escape=_LIKE_ESCAPE)
 diff --git a/omnigent/tools/builtins/spawn.py b/omnigent/tools/builtins/spawn.py
-index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d3009c69d4cc 100644
+index 6a4ae86194114318ba90046872b49415b2fa7520..579e68d09167d3830a8d4a973cfbf06921508a23 100644
 --- a/omnigent/tools/builtins/spawn.py
 +++ b/omnigent/tools/builtins/spawn.py
 @@ -16,6 +16,7 @@ from omnigent.entities import (
@@ -579,7 +616,7 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
        orchestration: discovering sessions to inspect
        (``sys_agent_get`` / ``sys_session_get_info``) or drive
        (``sys_session_send`` by ``session_id``).
-@@ -552,7 +554,11 @@ class SysSessionListTool(Tool):
+@@ -553,7 +555,11 @@ class SysSessionListTool(Tool):
              "for children or sys_session_message for independent sessions. "
              "Pass agent_name to filter the global list to "
              "sessions running that agent, and include_archived to also list "
@@ -592,8 +629,8 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
              "default; when more remain, pass page.next_cursor as cursor to continue. "
              "sub_agents stays complete."
          )
-@@ -607,6 +613,25 @@ class SysSessionListTool(Tool):
-                                 "'archived'. Defaults to false."
+@@ -617,6 +623,25 @@ class SysSessionListTool(Tool):
+                                 "sub_agents is then empty. Defaults to false."
                              ),
                          },
 +                        "updated_after": {
@@ -618,7 +655,7 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
                          "limit": {
                              "type": "integer",
                              "minimum": 1,
-@@ -1644,6 +1669,58 @@ def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) ->
+@@ -1665,6 +1690,58 @@ def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) ->
      return min(content_max_chars, _HISTORY_MAX_TOTAL_CHARS // tail_items)
  
  
@@ -677,7 +714,7 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
  class SysSessionGetHistoryTool(Tool):
      """
      Return the recent conversation items (history) of a session.
-@@ -1683,14 +1760,22 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1704,14 +1781,22 @@ class SysSessionGetHistoryTool(Tool):
      def description(cls) -> str:
          """:returns: Human-readable description of the tool."""
          return (
@@ -708,7 +745,7 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
          )
  
      def get_schema(self) -> dict[str, Any]:
-@@ -1724,12 +1809,34 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1745,12 +1830,34 @@ class SysSessionGetHistoryTool(Tool):
                              "minimum": 1,
                              "maximum": _HISTORY_MAX_TAIL,
                              "description": (
@@ -744,7 +781,7 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
                          "content_max_chars": {
                              "type": "integer",
                              "minimum": 1,
-@@ -1799,34 +1906,51 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1820,34 +1927,51 @@ class SysSessionGetHistoryTool(Tool):
          )
          if isinstance(content_offset_chars, str):
              return content_offset_chars
@@ -817,7 +854,7 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
          labelled = _agent_title_from_conversation(resolution.child)
          return json.dumps(
              {
-@@ -1834,6 +1958,12 @@ class SysSessionGetHistoryTool(Tool):
+@@ -1855,6 +1979,12 @@ class SysSessionGetHistoryTool(Tool):
                  "agent": labelled.agent,
                  "title": labelled.title,
                  "items": items,
@@ -831,10 +868,10 @@ index ebb74cbc49a4d95c0ddd949c65a088baa1692585..967934e88ea0d1682491acbb1498d300
          )
  
 diff --git a/openapi.json b/openapi.json
-index 4b37ca969de7d9c6e9c87525bb150b7925f187e6..044ba7b664b549bd0e27d3f4bd2fe460f8702703 100644
+index 1fe001689f31b99835f27a70d52f1f397d0f54f4..5269ed082ed8a5773fe0df1f8e6472981e0de46d 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -21530,6 +21530,24 @@
+@@ -22646,6 +22646,24 @@
                "title": "Visibility",
                "type": "string"
              }
@@ -860,10 +897,10 @@ index 4b37ca969de7d9c6e9c87525bb150b7925f187e6..044ba7b664b549bd0e27d3f4bd2fe460
          ],
          "responses": {
 diff --git a/tests/runner/test_discovery_list_pagination.py b/tests/runner/test_discovery_list_pagination.py
-index 89a4d9dac0e4f1e2f9712b3dfdfb3300e235d194..7e35088bb80a07ac2bc4947f4e773ee98b1ab9cb 100644
+index 45ed096bb8203df40bdf9360c2028e03855d8f81..73ef93a827ac7d5c0bfafa2219ca08971495c0b6 100644
 --- a/tests/runner/test_discovery_list_pagination.py
 +++ b/tests/runner/test_discovery_list_pagination.py
-@@ -650,6 +650,8 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
+@@ -743,6 +743,8 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
          "created_by_session_id": "conv_caller",
          "archived": True,
          "family": None,
@@ -873,10 +910,10 @@ index 89a4d9dac0e4f1e2f9712b3dfdfb3300e235d194..7e35088bb80a07ac2bc4947f4e773ee9
      assert first["sessions"][1]["archived"] is False
      assert second["sessions"][0]["archived"] is True
 diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index 7047d9b020bfe0d2b71a384c3cd91b6d0f47a7ae..5ecc8974b763dbaf1d25acb2252b2dfdf27521c7 100644
+index cf2a4202a6a6e414be7c27795b295f85e0d95aa8..f6000c367e1c4e43c87abc7471f8b1e668ea09a2 100644
 --- a/tests/runner/test_runner_dispatch.py
 +++ b/tests/runner/test_runner_dispatch.py
-@@ -7649,6 +7649,127 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
+@@ -8251,6 +8251,127 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
      ]
  
  
@@ -1004,7 +1041,7 @@ index 7047d9b020bfe0d2b71a384c3cd91b6d0f47a7ae..5ecc8974b763dbaf1d25acb2252b2dfd
  @pytest.mark.asyncio
  async def test_session_peek_rest_projects_tool_calls_and_unknown_items() -> None:
      """REST history preserves tool-call/result items and unknown item types."""
-@@ -8587,6 +8708,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+@@ -9189,6 +9310,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
              "parent_session_id": None,
              "created_by_session_id": "conv_x",
              "family": None,
@@ -1013,7 +1050,7 @@ index 7047d9b020bfe0d2b71a384c3cd91b6d0f47a7ae..5ecc8974b763dbaf1d25acb2252b2dfd
          },
          {
              "session_id": "s2",
-@@ -8598,6 +8721,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+@@ -9200,6 +9323,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
              "parent_session_id": None,
              "created_by_session_id": None,
              "family": None,
@@ -1022,7 +1059,7 @@ index 7047d9b020bfe0d2b71a384c3cd91b6d0f47a7ae..5ecc8974b763dbaf1d25acb2252b2dfd
          },
      ]
      # Connectivity resolved once per UNIQUE runner — two sessions share
-@@ -8606,6 +8731,126 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+@@ -9208,6 +9333,126 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
      assert runner_status_calls == ["r1"]
  
  
@@ -1150,10 +1187,10 @@ index 7047d9b020bfe0d2b71a384c3cd91b6d0f47a7ae..5ecc8974b763dbaf1d25acb2252b2dfd
  async def test_sys_agent_download_rejects_path_in_dest_filename(tmp_path: Path) -> None:
      """
 diff --git a/tests/server/integration/test_sessions_endpoints.py b/tests/server/integration/test_sessions_endpoints.py
-index b165a090864bc7c72c63f327f627e179de52cd28..ff11a11c0faf7013544b2bdf25efaa826445f143 100644
+index bf4be561ca3d4b06795849a8c7118f2276b92507..0d24105c213105df0e4931bc6826200a6398774d 100644
 --- a/tests/server/integration/test_sessions_endpoints.py
 +++ b/tests/server/integration/test_sessions_endpoints.py
-@@ -1013,6 +1013,28 @@ async def test_list_sessions_pagination(
+@@ -1024,6 +1024,28 @@ async def test_list_sessions_pagination(
      assert page2["data"][0]["id"] != page1["data"][0]["id"]
  
  
@@ -1183,10 +1220,10 @@ index b165a090864bc7c72c63f327f627e179de52cd28..ff11a11c0faf7013544b2bdf25efaa82
      client: httpx.AsyncClient,
  ) -> None:
 diff --git a/tests/stores/test_conversation_store.py b/tests/stores/test_conversation_store.py
-index 3514506a82064a749d38ba697d49d6a57b7e0c8e..6c7934f2f24ffdf94c14bf1d7b454742dd2e05af 100644
+index 54451ddccb046ea9b5cc3c0a0aac39cf85a6962a..f503780281171b8da333a6a70c5d95efe5de63e0 100644
 --- a/tests/stores/test_conversation_store.py
 +++ b/tests/stores/test_conversation_store.py
-@@ -3373,6 +3373,41 @@ def test_list_conversations_sort_by_updated_at(
+@@ -3456,6 +3456,41 @@ def test_list_conversations_sort_by_updated_at(
      )
  
  

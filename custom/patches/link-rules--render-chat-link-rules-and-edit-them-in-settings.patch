@@ -39,17 +39,17 @@ feat/git-ref-notation; drop this copy once they merge.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/chat-link-rules.md                       |  77 ++
+ docs/chat-link-rules.md                       |  81 ++
  feature-map/preferences.md                    |  20 +-
  omnigent/runner/git_providers/azure_devops.py |   9 +-
  omnigent/runner/git_providers/gitlab.py       |   9 +-
- omnigent/runner/github_resource.py            |  11 +-
+ omnigent/runner/github_resource.py            |   3 +
  tests/runner/test_azure_devops_provider.py    |  20 +-
- tests/runner/test_github_resource.py          |  35 +
+ tests/runner/test_github_resource.py          |  42 +-
  tests/runner/test_gitlab_provider.py          |   2 +
  tests/runner/test_pr_resource_azure_devops.py |  10 +-
  .../blocks/ChatMarkdown.linkRules.test.tsx    | 247 +++++
- web/src/components/blocks/ChatMarkdown.tsx    |  52 +-
+ web/src/components/blocks/ChatMarkdown.tsx    |  65 +-
  .../components/chat/LinkRulesScope.test.ts    |  69 ++
  web/src/components/chat/LinkRulesScope.tsx    |  88 ++
  web/src/components/chat/Transcript.tsx        |   3 +-
@@ -62,7 +62,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/pages/SettingsPage.tsx                |   2 +
  .../settings/LinkRulesSettingsGroup.test.tsx  | 180 ++++
  .../pages/settings/LinkRulesSettingsGroup.tsx | 384 ++++++++
- 23 files changed, 2582 insertions(+), 17 deletions(-)
+ 23 files changed, 2594 insertions(+), 21 deletions(-)
  create mode 100644 web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
  create mode 100644 web/src/components/chat/LinkRulesScope.test.ts
  create mode 100644 web/src/components/chat/LinkRulesScope.tsx
@@ -74,10 +74,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/pages/settings/LinkRulesSettingsGroup.tsx
 
 diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
-index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..98d8be8bdf83b51dc9724f6658ab8b00079609ae 100644
+index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..6b8affd161533cb023967ede2e1cd234f5ef1274 100644
 --- a/docs/chat-link-rules.md
 +++ b/docs/chat-link-rules.md
-@@ -4,6 +4,83 @@ Link rules turn short references in chat messages, such as `BST-2135` or
+@@ -4,6 +4,87 @@ Link rules turn short references in chat messages, such as `BST-2135` or
  `PR #123`, into links. Each user has one list of rules, saved as a shared
  preference, so every session and device shows the same links.
  
@@ -102,6 +102,10 @@ index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..98d8be8bdf83b51dc9724f6658ab8b00
 +file links have been found, and never inside links, inline code, code blocks
 +or raw HTML. Where two rules match overlapping text, the match that starts
 +first wins, then the rule listed first. A link's tooltip names its rule.
++While any rule is on, the rules also take the place of Omnigent's built-in
++pull request links (`#1234` and `owner/repo#12` in github.com sessions), so
++the `git` rules decide where those references go; with every rule off or
++removed, the built-in links apply again.
 +
 +- `url` and `git` links open in a new tab like any other web link.
 +- `git` references link as described in [Git references](#git-references).
@@ -200,10 +204,10 @@ index b7b264b23736521bb04ff6ee44a6eac6c261deee..39266fe214310ac491b0698055d8d9a4
  saving machine overrides, removing a machine override,
  resolving conflicts, or continuing with temporary defaults. The API above can
 diff --git a/omnigent/runner/git_providers/azure_devops.py b/omnigent/runner/git_providers/azure_devops.py
-index 06dc33f9f9e89090d7a872bfc5e391177bcf3eac..a5867183ff492f5d23bf9a62c02abc4a45ca5e88 100644
+index 79666037ea3e07d389101529faf1b585cfc7621c..0f22410df4fc7653c411bbd81714bf3492d70520 100644
 --- a/omnigent/runner/git_providers/azure_devops.py
 +++ b/omnigent/runner/git_providers/azure_devops.py
-@@ -430,6 +430,13 @@ def _name(repo: AzureRepo) -> str:
+@@ -431,6 +431,13 @@ def _name(repo: AzureRepo) -> str:
      return f"{repo.org}/{repo.project}/{repo.repo}"
  
  
@@ -217,7 +221,7 @@ index 06dc33f9f9e89090d7a872bfc5e391177bcf3eac..a5867183ff492f5d23bf9a62c02abc4a
  def _branch_pr(
      client: AzureDevOpsClient, repo: AzureRepo, branch: str | None
  ) -> dict[str, Any] | None:
-@@ -758,7 +765,7 @@ class AzureDevOpsPullRequests:
+@@ -759,7 +766,7 @@ class AzureDevOpsPullRequests:
              authenticated=token is not None,
              branch=branch,
              base_ref=None,
@@ -227,10 +231,10 @@ index 06dc33f9f9e89090d7a872bfc5e391177bcf3eac..a5867183ff492f5d23bf9a62c02abc4a
          )
          if repo is None or token is None:
 diff --git a/omnigent/runner/git_providers/gitlab.py b/omnigent/runner/git_providers/gitlab.py
-index f93dee0ab509f4b89f4dd5d162cbf56b93bfc8f3..22bbcb7b144d8169bb304d944490bffaab701447 100644
+index 1b91da26883e4d2ebd00bbc71592ffed85aef67e..0b991d959ee7e33d493f94b38b8f6ac568392bb3 100644
 --- a/omnigent/runner/git_providers/gitlab.py
 +++ b/omnigent/runner/git_providers/gitlab.py
-@@ -182,6 +182,11 @@ def _resolved(
+@@ -183,6 +183,11 @@ def _resolved(
      return None
  
  
@@ -242,7 +246,7 @@ index f93dee0ab509f4b89f4dd5d162cbf56b93bfc8f3..22bbcb7b144d8169bb304d944490bffa
  def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
      from omnigent.runner.gitlab_client import env_token_for_host
  
-@@ -195,7 +200,7 @@ def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str,
+@@ -196,7 +201,7 @@ def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str,
          "provider_display": provider_display("gitlab"),
          "branch": _branch(root),
          "base_ref": None,
@@ -251,7 +255,7 @@ index f93dee0ab509f4b89f4dd5d162cbf56b93bfc8f3..22bbcb7b144d8169bb304d944490bffa
          "pr": None,
          "selected_pr_url": reference.url if reference else None,
          "capabilities": _CAPABILITIES.to_json(),
-@@ -331,7 +336,7 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
+@@ -332,7 +337,7 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
          info["auth"]["hint"] = None
          if resolved:
              client, ref, mr = resolved
@@ -261,35 +265,21 @@ index f93dee0ab509f4b89f4dd5d162cbf56b93bfc8f3..22bbcb7b144d8169bb304d944490bffa
              info["base_ref"] = info["pr"]["base_ref"]
      except ValueError as exc:
 diff --git a/omnigent/runner/github_resource.py b/omnigent/runner/github_resource.py
-index 2dcd5073190d76e21b0ede406974d92ed5b27997..7cdedc9e73135fb6f7aeeeac08e794ad2a042baa 100644
+index a7cb1d7c184226fe3c6e25795aac045d7c56af43..7af14b10ec956370c60f45a7cb93a54883b193ef 100644
 --- a/omnigent/runner/github_resource.py
 +++ b/omnigent/runner/github_resource.py
-@@ -1064,15 +1064,20 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
-         return payload
- 
-     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
--    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root, token=token)
-+    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner,url"], cwd=root, token=token)
-     if rc == 0:
-         try:
--            nwo = json.loads(out).get("nameWithOwner")
-+            view = json.loads(out)
-+            nwo = view.get("nameWithOwner")
-+            repo_url = view.get("url")
-         except (ValueError, AttributeError):
--            nwo = None
-+            nwo = repo_url = None
-         if nwo:
+@@ -1144,6 +1144,9 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
              payload["authenticated"] = True
-             payload["repo"] = {"name_with_owner": nwo}
-+            # The repository's host, for linking #123 in chat without a PR.
-+            if isinstance(repo_url, str) and repo_url.startswith(("https://", "http://")):
-+                payload["repo"]["url"] = repo_url
+             payload["repo"] = _repo_payload(nwo, url)
+             payload["workspace_repo"] = dict(payload["repo"])
++            # The repository's web URL, for linking #123 in chat without a PR.
++            if isinstance(url, str) and url.startswith(("https://", "http://")):
++                payload["repo"]["url"] = url
              return payload  # -> no-pr
  
      # Repo unreachable / not signed in — enumerate accounts so the panel can offer
 diff --git a/tests/runner/test_azure_devops_provider.py b/tests/runner/test_azure_devops_provider.py
-index f7992ddb8ffa69ebdeabc40b8e278006b8969853..121b1d6ab6069ab9ab24152c58e4ce591a815195 100644
+index bf42368b2e089a2f5783740a5b1efcc228b5338c..84b1af7ed3dc0e5ca3bb2a4c64007fe74117d7e4 100644
 --- a/tests/runner/test_azure_devops_provider.py
 +++ b/tests/runner/test_azure_devops_provider.py
 @@ -365,7 +365,10 @@ def test_workspace_info_shows_the_branch_pr_without_legacy_fields(
@@ -341,11 +331,21 @@ index f7992ddb8ffa69ebdeabc40b8e278006b8969853..121b1d6ab6069ab9ab24152c58e4ce59
      assert info["pr"]["url"] == "https://dev.azure.com/contoso/my%20web/_git/app/pullrequest/7"
  
 diff --git a/tests/runner/test_github_resource.py b/tests/runner/test_github_resource.py
-index 703f3f0ac7d89bd7bb7e68dc5a55f3973ba1f6d3..b04e02d6d3c737a053edead4e703fc2eccc25986 100644
+index 5ccc06a558b2161784c4b615f84521a43309b498..8e6ce88fcd7df63a1ce842eba25865cfea5454c9 100644
 --- a/tests/runner/test_github_resource.py
 +++ b/tests/runner/test_github_resource.py
-@@ -189,6 +189,41 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@@ -357,7 +357,8 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch, host: st
+     assert info["pr"] is None
+     assert info["base_ref"] is None
      assert sum(c[:2] == ("pr", "view") for c in calls) == 1
+-    assert info["repo"] == info["workspace_repo"] == {"name_with_owner": "corp/app", "host": host}
++    assert info["workspace_repo"] == {"name_with_owner": "corp/app", "host": host}
++    assert info["repo"] == {**info["workspace_repo"], "url": f"https://{host}/corp/app"}
+ 
+ 
+ def test_reference_info_without_gh_reports_repo_host(
+@@ -377,6 +378,45 @@ def test_reference_info_without_gh_reports_repo_host(
+     assert info["repo"] == {"name_with_owner": "corp/app", "host": "ghe.example.com"}
  
  
 +@pytest.mark.parametrize(
@@ -353,7 +353,11 @@ index 703f3f0ac7d89bd7bb7e68dc5a55f3973ba1f6d3..b04e02d6d3c737a053edead4e703fc2e
 +    [
 +        (
 +            {"nameWithOwner": "o/r", "url": "https://git.example.com/o/r"},
-+            {"name_with_owner": "o/r", "url": "https://git.example.com/o/r"},
++            {
++                "name_with_owner": "o/r",
++                "host": "git.example.com",
++                "url": "https://git.example.com/o/r",
++            },
 +        ),
 +        ({"nameWithOwner": "o/r", "url": "javascript:x"}, {"name_with_owner": "o/r"}),
 +        ({"nameWithOwner": "o/r"}, {"name_with_owner": "o/r"}),
@@ -387,7 +391,7 @@ index 703f3f0ac7d89bd7bb7e68dc5a55f3973ba1f6d3..b04e02d6d3c737a053edead4e703fc2e
      repo: Path, monkeypatch: pytest.MonkeyPatch
  ) -> None:
 diff --git a/tests/runner/test_gitlab_provider.py b/tests/runner/test_gitlab_provider.py
-index bca726fd0f629d5de9fe8ccaf28e58f7baf03c21..0f82fb5bb105b7fd2abbc4a060a2f6e94853d546 100644
+index 8c6c14803c3142f346e9fc1e38df19afc3a2385b..3f963db39cab9819c81222585676f8fb536b23e8 100644
 --- a/tests/runner/test_gitlab_provider.py
 +++ b/tests/runner/test_gitlab_provider.py
 @@ -174,6 +174,8 @@ def test_workspace_fork_mr_keeps_target_identity_and_details(
@@ -681,10 +685,10 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +  });
 +});
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index 7202e9e3561e05ee272474b0d2117bb07d50ef85..323678f662d97136d3210eabf8bc2c466cbdf80f 100644
+index 94387f70e6b991f7c6aa0fc12830cd80446fc490..f61ea79be3d627eb052777add3a315f0962462b1 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
-@@ -79,6 +79,13 @@ import { SessionImage } from "@/components/SessionImage";
+@@ -87,6 +87,13 @@ import { SessionImage } from "@/components/SessionImage";
  import { Button } from "@/components/ui/button";
  import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
  import { relativeTime } from "@/lib/relativeTime";
@@ -698,7 +702,7 @@ index 7202e9e3561e05ee272474b0d2117bb07d50ef85..323678f662d97136d3210eabf8bc2c46
  import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
  import { keyedAttachments } from "@/lib/blocks";
  import { cn } from "@/lib/utils";
-@@ -960,7 +967,34 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
+@@ -1015,7 +1022,34 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
    );
  }
  
@@ -734,7 +738,7 @@ index 7202e9e3561e05ee272474b0d2117bb07d50ef85..323678f662d97136d3210eabf8bc2c46
  function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
    if (props.href?.startsWith(ITEM_LABEL_HREF_PREFIX)) {
      return (
-@@ -969,6 +1003,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
+@@ -1024,6 +1058,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
        </ItemLabelChip>
      );
    }
@@ -744,7 +748,7 @@ index 7202e9e3561e05ee272474b0d2117bb07d50ef85..323678f662d97136d3210eabf8bc2c46
    return <MarkdownLink {...props} />;
  }
  
-@@ -1216,7 +1253,9 @@ function remarkHtmlAsText() {
+@@ -1304,7 +1341,9 @@ function remarkHtmlAsText() {
   * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
   * block rendering too, stripping `<pre>` and collapsing whitespace.
   *
@@ -755,35 +759,51 @@ index 7202e9e3561e05ee272474b0d2117bb07d50ef85..323678f662d97136d3210eabf8bc2c46
   *
   * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
   * instead of collapsing to spaces per CommonMark. Used for user bubbles,
-@@ -1237,6 +1276,7 @@ export function FilePathAwareMessageResponse({
-   ...props
- }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
-   const components = FILE_PATH_AWARE_COMPONENTS;
+@@ -1339,22 +1378,29 @@ export function FilePathAwareMessageResponse({
+ }) {
+   const components =
+     leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
 +  const linkMatchers = useContext(LinkRuleMatchersContext);
++  // The user's link rules own `#123` and `owner/repo#123` wherever they are active;
++  // the built-in pull request links apply only without them.
++  const builtInPullRequestRefs = linkPullRequestRefs && linkMatchers.length === 0;
  
    // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
    const remarkPlugins = useMemo(
-@@ -1244,9 +1284,12 @@ export function FilePathAwareMessageResponse({
+     () => [
        ...Object.values(defaultRemarkPlugins),
+-      // Before the leading command split: PR and label splitting rebuild text nodes,
+-      // which would drop its `kbd` tag, and their new nodes have no source position.
+-      ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
++      // Before the leading command split: PR, label and link-rule splitting rebuild text
++      // nodes, which would drop its `kbd` tag, and their new nodes have no source position.
++      ...(builtInPullRequestRefs ? [remarkPullRequestRefs] : []),
        ...(literalHtml ? [remarkHtmlAsText] : []),
        remarkItemLabels,
 +      ...(linkMatchers.length > 0
 +        ? [[remarkLinkRules, linkMatchers] as [typeof remarkLinkRules, typeof linkMatchers]]
 +        : []),
+       ...(leadingCommand !== undefined
+         ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
+         : []),
        ...(breaks ? [remarkBreaks] : []),
      ],
--    [breaks, literalHtml],
-+    [breaks, literalHtml, linkMatchers],
+-    [breaks, literalHtml, linkPullRequestRefs, leadingCommand],
++    [breaks, literalHtml, builtInPullRequestRefs, linkMatchers, leadingCommand],
    );
  
    // Throttle the markdown so the live (still-growing) bubble re-parses a few
-@@ -1277,6 +1320,9 @@ export function FilePathAwareMessageResponse({
+@@ -1385,9 +1431,10 @@ export function FilePathAwareMessageResponse({
  
    return (
      <MessageResponse
-+      // Streamdown's memo ignores `remarkPlugins`: remount when the link rules
-+      // or the session's repository arrive after the message rendered.
-+      key={linkMatchersKey(linkMatchers)}
+-      // Streamdown's memo ignores plugin changes, so a command published after
+-      // the first render needs a fresh tree.
+-      key={leadingCommand}
++      // Streamdown's memo ignores `remarkPlugins`: remount when the link rules or
++      // the session's repository arrive after the message rendered, or a command
++      // is published after the first render.
++      key={`${leadingCommand ?? ""}\n${linkMatchersKey(linkMatchers)}`}
        {...props}
        components={components}
        remarkPlugins={remarkPlugins}
@@ -957,10 +977,10 @@ index 0000000000000000000000000000000000000000..02e55e65c27d10313a220c603d86adaf
 +  );
 +}
 diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
-index 117eb861b3fcc049aed3090cf899e19d9954f7cb..2f6ea1a3649408666d49ea653c0ba6e86d99ca94 100644
+index 4479079f58ebb2e246622ff745638c92f997cead..4a0862baafd8eaad80c358ad07ddc2b80fc57a93 100644
 --- a/web/src/components/chat/Transcript.tsx
 +++ b/web/src/components/chat/Transcript.tsx
-@@ -45,6 +45,7 @@ import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
+@@ -42,6 +42,7 @@ import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
  import { useUserMessageNav } from "@/hooks/useUserMessageNav";
  import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
  import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
@@ -968,7 +988,7 @@ index 117eb861b3fcc049aed3090cf899e19d9954f7cb..2f6ea1a3649408666d49ea653c0ba6e8
  import {
    RunnerStartingIndicator,
    McpStartupIndicator,
-@@ -616,7 +617,7 @@ function ItemLabelScope({
+@@ -614,7 +615,7 @@ function ItemLabelScope({
    return (
      <ItemLabelIndexContext.Provider value={index}>
        <ItemLabelSessionContext.Provider value={sessionId}>
@@ -998,13 +1018,13 @@ index 0000000000000000000000000000000000000000..94151ca2ce887f27a28f2e89db4c6d84
 +  });
 +}
 diff --git a/web/src/hooks/usePullRequests.ts b/web/src/hooks/usePullRequests.ts
-index 27c42a2456c8969fb445d9e9e8b6b151a59a11de..f33a817f9a2ba5259a7db768b5bf66f07324bbe5 100644
+index 8f88b564e3402b5d02a0f29970aad78a7fb41041..615b615e1f50adb1cd05f6e4821dd46526fa8a1e 100644
 --- a/web/src/hooks/usePullRequests.ts
 +++ b/web/src/hooks/usePullRequests.ts
-@@ -188,6 +188,8 @@ export interface PullRequest {
- 
- export interface PullRequestRepo {
-   name_with_owner: string | null;
+@@ -191,6 +191,8 @@ export interface PullRequestRepo {
+   /** Host of the repo's forge instance, e.g. "github.com"; absent from older hosts and
+    *  providers that don't report it. */
+   host?: string;
 +  /** The repository's web URL, when the host reports it; chat links read its host. */
 +  url?: string | null;
  }
@@ -2390,10 +2410,10 @@ index 0000000000000000000000000000000000000000..c67e65adecd29ad7d511edffb93ef5d6
 +  return normalize((await res.json()) as LinkRuleSettings);
 +}
 diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
-index ddc34517c51b226906e370f9e3bb224f91d42b94..f42db868dc6582e48ecd193882840146bf312d0c 100644
+index 30eaaeb5c49e2a5bcbd0de9a787dad93fc2703e1..e00968839b990945fe4db8e74154364470831192 100644
 --- a/web/src/pages/SettingsPage.test.tsx
 +++ b/web/src/pages/SettingsPage.test.tsx
-@@ -237,6 +237,10 @@ vi.mock("@/pages/PoliciesPage", () => ({
+@@ -282,6 +282,10 @@ vi.mock("@/pages/PoliciesPage", () => ({
  vi.mock("@/pages/AdminGeneralPage", () => ({
    AdminGeneralPage: () => <div>admin-general-page-stub</div>,
  }));
@@ -2405,10 +2425,10 @@ index ddc34517c51b226906e370f9e3bb224f91d42b94..f42db868dc6582e48ecd193882840146
    McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
  }));
 diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
-index e608441e2b722e614b31a2f77aab520d75f8ccf4..708c410fca820513b812fef2904a0a07b7210b7d 100644
+index 08213b34e792a9770e5e68d90d7df4e3ee5037ee..e8c3a793747f0b1d3cbe97a2285c5b5bcedc2442 100644
 --- a/web/src/pages/SettingsPage.tsx
 +++ b/web/src/pages/SettingsPage.tsx
-@@ -46,6 +46,7 @@ import {
+@@ -44,6 +44,7 @@ import {
  } from "react";
  import { useViewerId } from "@/hooks/useViewerId";
  import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
@@ -2416,7 +2436,7 @@ index e608441e2b722e614b31a2f77aab520d75f8ccf4..708c410fca820513b812fef2904a0a07
  import {
    ArchiveRestoreIcon,
    AlertTriangleIcon,
-@@ -2101,6 +2102,7 @@ function GeneralSection() {
+@@ -2240,6 +2241,7 @@ function GeneralSection() {
              <OpenSubagentsInPanelControl />
            </div>
          </SettingsGroup>

@@ -387,9 +387,8 @@ request carries it, and the series holds a copy until it merges).
 | `session-telemetry` | Every span of a turn carries the session's metadata (labels, project, agent, git, workspace, host) and the model and reasoning effort the turn ran with. | PR open ([#11384](https://github.com/omnigent-ai/omnigent/pull/11384), then [#11434](https://github.com/omnigent-ai/omnigent/pull/11434) stacked on it, draft) |
 | `claude-sdk-web-tools` | claude-sdk agents can opt into Claude Code's WebSearch and WebFetch. | proposed |
 | `claude-native-teammates` | Claude Code agent-team teammates show up as child sessions, and their deliveries no longer appear as raw `<teammate-message>` bubbles. | PR open ([#11388](https://github.com/omnigent-ai/omnigent/pull/11388) for the child sessions, [#11389](https://github.com/omnigent-ai/omnigent/pull/11389) for the deliveries; issue [#10745](https://github.com/omnigent-ai/omnigent/issues/10745)) |
-| `claude-native-subagent-status` | Quiet sub-agents stay "running" until their turn actually ends. | covered by open PR [#12411](https://github.com/omnigent-ai/omnigent/pull/12411) (not ours); drop when it merges |
+| `claude-native-subagent-status` | A sub-agent still shown as working when its parent records its result is settled then (idle, or failed for a failed result). | not filed; upstream fixed the other half (long tool calls) in [#13811](https://github.com/omnigent-ai/omnigent/pull/13811), and open PR [#12411](https://github.com/omnigent-ai/omnigent/pull/12411) (not ours) touches the same code |
 | `claude-native-coordinator-messages` | A parent agent's follow-ups appear in the sub-agent's chat. | proposed |
-| `skip-gzip-binary-files` | Images and PDFs load in the file viewer again instead of failing with a 500. | PR open ([#10585](https://github.com/omnigent-ai/omnigent/pull/10585), carried copy) |
 | `codex-native-mode-instructions` | A Default-mode Codex turn keeps Codex's own Default mode instructions instead of having them replaced by the session's developer instructions (the Plan toggle is upstream since [#11570](https://github.com/omnigent-ai/omnigent/pull/11570)). | proposed |
 | `chat-item-labels` | Bracketed labels like `[Q2]` in chat become chips that preview the item they refer to; `~~[Q2]~~` closes it, and an Open items panel lists what is still open. Adds the labelling rules to agents' instructions. Needs `codex-native-mode-instructions` and `session-labels-ui`. | proposed |
 | `web-reconnect-shell-inputs` | A queued `!command` no longer stays stuck at the bottom of the chat after the connection drops. | PR open ([#11395](https://github.com/omnigent-ai/omnigent/pull/11395)) |
@@ -400,7 +399,7 @@ request carries it, and the series holds a copy until it merges).
 | `delete-stops-runner` | Deleting a session stops its host-launched runner once no remaining session uses it, instead of leaving the process running until its idle timeout. | PR open ([#11391](https://github.com/omnigent-ai/omnigent/pull/11391)) |
 | `app-error-boundary` | Upstream's render error fallback also shows the error, component stack and path, with Copy details and Reload. | proposed |
 | `tolerate-retired-preferences` | A stored shared preference of a kind this build doesn't know (one a parked or newer series saved) is skipped on read instead of failing every preferences read with a 500; the row stays stored. | proposed |
-| `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. Needs `chat-item-labels`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
+| `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. While any rule is on, the rules replace upstream's built-in pull request links ([#14191](https://github.com/omnigent-ai/omnigent/pull/14191)). Needs `chat-item-labels`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
 | `custom-docs-index` | `docs/custom/README.md`, the index of the series: what each changes, how to turn it on, and where its docs are. | custom only |
 
 ### Parked series
@@ -415,6 +414,7 @@ anything is wrong with it.
 |---|---|
 | `backport-sidebar-filter-submenus` | landed upstream (#13481) |
 | `toast-safe-area` | superseded by upstream #13607 |
+| `skip-gzip-binary-files` | landed upstream (#12362); dropped at the 2026-11-24 refresh |
 | `terminal-touch` | mobile |
 | `composer-send-tap` | mobile |
 | `mobile-settings-nav` | mobile |
