@@ -174,5 +174,36 @@ class InstalledVersion(unittest.TestCase):
         self.assertIn("done", out.stdout)
 
 
+class InstallHostExtras(unittest.TestCase):
+    def installed(self, constraints: str) -> str:
+        """The requirement install-host.sh hands to a stub `uv tool install`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            release, stubs, tools = Path(tmp, "release dir"), Path(tmp, "stubs"), Path(tmp, "tools")
+            for folder in (release, stubs, tools / "omnigent" / "bin"):
+                folder.mkdir(parents=True)
+            (release / "install-host.sh").write_bytes((RELEASE / "install-host.sh").read_bytes())
+            (release / "omnigent-1.0-py3-none-any.whl").write_text("")
+            (release / "constraints.txt").write_text(constraints)
+            for stub, body in ((stubs / "uv", 'for arg; do last=$arg; done; echo "$last" > "$UV_STUB_OUT"'),
+                               (tools / "omnigent" / "bin" / "omnigent", "echo omnigent 1.0")):
+                stub.write_text(f"#!/bin/sh\n{body}\n")
+                stub.chmod(0o755)
+            # HOME is the temp dir, so the PATH the script prepends holds no real uv.
+            env = {"HOME": tmp, "PATH": f"{stubs}:/usr/bin:/bin", "UV_TOOL_DIR": str(tools),
+                   "UV_STUB_OUT": str(Path(tmp, "requirement"))}
+            result = subprocess.run(["sh", str(release / "install-host.sh")], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return Path(tmp, "requirement").read_text().strip().removeprefix(str(release) + "/")
+
+    def test_takes_the_antigravity_extra_when_the_release_pins_the_sdk(self):
+        pinned = "absl-py==2.4.0\ngoogle-antigravity==0.1.23\n    # via omnigent\nprotobuf==7.35.1\n"
+        self.assertEqual(self.installed(pinned), "omnigent-1.0-py3-none-any.whl[antigravity]")
+
+    def test_installs_the_bare_wheel_with_constraints_that_do_not_pin_it(self):
+        # An older release, or a rollback copy with an empty constraints.txt.
+        self.assertEqual(self.installed("protobuf==6.33.6\n"), "omnigent-1.0-py3-none-any.whl")
+        self.assertEqual(self.installed(""), "omnigent-1.0-py3-none-any.whl")
+
+
 if __name__ == "__main__":
     unittest.main()

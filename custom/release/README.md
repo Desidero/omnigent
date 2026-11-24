@@ -12,7 +12,7 @@ host service.
 | `plan.py` | Picks the release tag and finds the previous release |
 | `notes.py` | Release notes, `custom-docs.md`, the series list for the manifest |
 | `publish.sh` | Pushes the tag and the image, creates the release, then updates `custom` |
-| `install-host.sh` | Installs a release folder's wheels as the `omnigent` uv tool |
+| `install-host.sh` | Installs a release folder's wheels as the `omnigent` uv tool, with the `antigravity` extra when the release pins it ([Extras](#extras)) |
 | `upgrade-host.sh` | Installs a release on a host, applies the service environment, restarts and verifies; `--rollback` |
 | `check-host.sh` | Read-only drift check of a host against its release |
 | `host-common.sh`, `hostlib.py` | Shared shell helpers; stdlib Python helper (manifest, env files, systemd drop-ins, launchd plists) |
@@ -34,6 +34,24 @@ with the checkout's commit as the patches commit and a `.dirty` build id
 when `custom/BASE`, `custom/series`, `custom/patches/` or `custom/release/`
 has uncommitted changes. `/tmp/install-set/release/` is the folder to
 install.
+
+## Extras
+
+`constraints.txt` pins the base dependencies plus the extras listed in
+`build.sh` (`constraint_extras`): `postgres` and `vault`, and `antigravity`,
+the Google Antigravity SDK. Only hosts install that last one: the
+`antigravity` harness runs in a harness process the host's runner starts and
+imports the SDK there on the first turn, so `install-host.sh` installs
+`omnigent[antigravity]` whenever the release's `constraints.txt` pins
+`google-antigravity` (an older release's does not, and gets the bare wheel).
+The server never imports the SDK and its image still installs
+`omnigent[postgres]`.
+
+The extras have to resolve together, and one file serves hosts and server:
+`antigravity` needs `protobuf>=7`, so with it the file pins protobuf 7.x for
+the server too (the base allows `>=6,<8`), and `cwsandbox` and `modal`, which
+need `protobuf<7`, cannot be added beside it. To build without the SDK, take
+`antigravity` out of `constraint_extras`; nothing else changes.
 
 ## Why the image has its own Dockerfile
 

@@ -27,8 +27,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # custom/
 tree="" out="" tag="" patches_commit="" previous="" note=""
 fork="${FORK_REPO:-Desidero/omnigent}"
 image_name="${IMAGE_NAME:-ghcr.io/desidero/omnigent-server}"
-# Extras whose dependencies constraints.txt pins too (server: postgres).
-constraint_extras=(postgres vault)
+# Extras whose dependencies constraints.txt pins too (server: postgres; hosts:
+# antigravity, see install-host.sh). They must resolve together: antigravity
+# needs protobuf 7, so cwsandbox and modal (protobuf<7) cannot join this list.
+constraint_extras=(postgres vault antigravity)
 
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 while [[ $# -gt 0 ]]; do
