@@ -310,6 +310,25 @@ export function presentMentions<T extends InlineMention>(
   return mentions.filter((m) => found.has(m.token));
 }
 
+/**
+ * The tags whose token still appears in ``texts``; a tag whose token was deleted
+ * drops out, so retyping that text later stays literal.
+ */
+export function presentTaggedMentions(
+  mentions: TaggedMentions | undefined,
+  texts: readonly string[],
+): TaggedMentions | undefined {
+  if (!mentions) return undefined;
+  const inline = composerInlineMentions(mentions.files, mentions.sessions, null);
+  const present = new Set(presentMentions(inline, texts).map((mention) => mention.token));
+  const fileCount = mentions.files.length;
+  const files = mentions.files.filter((_, index) => present.has(inline[index]!.token));
+  const sessions = mentions.sessions.filter((_, index) =>
+    present.has(inline[fileCount + index]!.token),
+  );
+  return files.length > 0 || sessions.length > 0 ? { files, sessions } : undefined;
+}
+
 /** Replace each token in ``text`` with its marker, in place. */
 export function expandMentionTokens(text: string, mentions: readonly InlineMention[]): string {
   const markerFor = new Map(mentions.map((m) => [m.token, m.marker]));
@@ -354,6 +373,31 @@ function stripTrailingHint(text: string): string | null {
   const start = end.lastIndexOf(SENT_HINT_PREFIX);
   if (start < 0 || end.indexOf("]", start) !== end.length - 1) return null;
   return end.slice(0, start).trimEnd();
+}
+
+/** A piece of a sent answer: literal text, or a session marker. */
+export type SentSessionPart = string | { id: string; title: string; isSubagent: boolean };
+
+/**
+ * A sent answer split into its text and its session markers, with the tool hint removed. Only a
+ * hint that follows at least one session marker counts, so every other character, attachment-like
+ * text included, stays as typed.
+ */
+export function splitSentSessionMentions(text: string): SentSessionPart[] {
+  const withoutHint = stripTrailingHint(text);
+  if (withoutHint === null) return [text];
+  const parts: SentSessionPart[] = [];
+  let last = 0;
+  for (const match of withoutHint.matchAll(SENT_SESSION_RE)) {
+    const [whole, title, id, subagent] = match;
+    const at = match.index;
+    if (at > last) parts.push(withoutHint.slice(last, at));
+    parts.push({ id, title, isSubagent: subagent === "yes" });
+    last = at + whole.length;
+  }
+  if (parts.length === 0) return [text];
+  if (last < withoutHint.length) parts.push(withoutHint.slice(last));
+  return parts;
 }
 
 /**

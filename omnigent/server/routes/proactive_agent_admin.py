@@ -105,11 +105,13 @@ def create_proactive_agent_admin_router(
     async def require_admin(request: Request) -> None:
         if not offered():
             raise HTTPException(status_code=404, detail="not found")
+        # Authenticate first: a server without a permission store still checks
+        # who is calling, it just has no admins to compare against.
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         # The CLI gives a local single-user server a permission store too, and
         # its one user is no administrator in it; the settings routes agree.
         if permission_store is None or local_single_user_enabled():
             return
-        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         if not await asyncio.to_thread(permission_store.is_admin, user_id):
             raise OmnigentError(
                 "Admin privileges required to manage the proactive agent",
@@ -134,8 +136,16 @@ def create_proactive_agent_admin_router(
     @router.put("/proactive-agent/prompt", response_model=ProactiveAgentPrompt)
     async def set_prompt(request: Request, body: SetProactiveAgentPrompt) -> ProactiveAgentPrompt:
         prompt = body.prompt if body.prompt and body.prompt.strip() else None
+        actor = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         try:
-            await asyncio.to_thread(store.set_prompt_override, prompt)
+            # The store re-checks the actor under its account lock as it writes.
+            await asyncio.to_thread(
+                lambda: store.set_prompt_override(
+                    prompt,
+                    actor=actor,
+                    require_admin=permission_store is not None and not local_single_user_enabled(),
+                )
+            )
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         # A new bundle version: the next run of every user's task uses it.
@@ -161,10 +171,7 @@ def create_proactive_agent_admin_router(
                     'Use "*" alone to run for every user', code=ErrorCode.INVALID_INPUT
                 )
             targets = [
-                (
-                    user_id,
-                    await asyncio.to_thread(find_proactive_task, tasks_store, _owner(user_id)),
-                )
+                (user_id, await asyncio.to_thread(_find_task, tasks_store, user_id))
                 for user_id in dict.fromkeys(user.strip() for user in body.users if user.strip())
             ]
         for user_id, task in targets:
@@ -185,9 +192,17 @@ def create_proactive_agent_admin_router(
     return router
 
 
-def _owner(user_id: str) -> str | None:
-    """Single-user mode stores its tasks without an owner."""
-    return None if user_id == RESERVED_USER_LOCAL else user_id
+def _find_task(store: Any, user_id: str) -> ScheduledTask | None:
+    """Return *user_id*'s live proactive task.
+
+    The local user's task is owned by ``None`` on a server without an auth
+    provider, and by the reserved local name under a local single-user
+    provider, so both are tried for that name.
+    """
+    task = find_proactive_task(store, user_id)
+    if task is None and user_id == RESERVED_USER_LOCAL:
+        task = find_proactive_task(store, None)
+    return task
 
 
 def _display_user(user_id: str | None) -> str:
