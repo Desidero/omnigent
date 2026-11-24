@@ -197,7 +197,8 @@ git clone https://github.com/omnigent-ai/omnigent
 cd omnigent
 uv sync --extra databricks
 
-# Set targets.prod.workspace.host in deploy/databricks/databricks.yml, then run
+# Set targets.prod.workspace.host in deploy/databricks/databricks.yml (or `host`
+# in a `--overlay` file, which leaves the tracked bundle untouched), then run
 # the deploy orchestrator — it builds the wheels and runs `databricks bundle
 # deploy` + `bundle run` for you:
 #   uv run python deploy/databricks/deploy.py --app-name omnigent --profile <profile> ...
@@ -209,6 +210,13 @@ creation, service principal permissions) lives in
 [`deploy/databricks/README.md`](../deploy/databricks/README.md). Treat
 that as canonical for the deploy details. The rest of this page covers
 the integration knobs you set on top of that deploy.
+
+Values that belong to one deployment (the workspace host, extra `omnigent`
+extras such as `kms`, app env vars, secret-backed env vars and config files
+for the app source) go in one untracked file passed with
+`deploy.py --overlay <file>`, so no tracked file has to be edited. The format
+is in the README's
+[Deployment overlay](../deploy/databricks/README.md#deployment-overlay) section.
 
 ### What you get on Databricks vs DIY
 

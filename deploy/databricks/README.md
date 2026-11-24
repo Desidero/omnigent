@@ -46,7 +46,8 @@ Runs unchanged from a laptop. Re-runnable; every step is idempotent.
 Set your workspace URL in `databricks.yml` under
 `targets.prod.workspace.host` (it ships as a `https://example.databricks.com`
 placeholder; DAB reads `workspace.host` before resolving variables, so it
-must be a literal).
+must be a literal). To leave the tracked file alone, set `host` in a
+[deployment overlay](#deployment-overlay) instead.
 
 ## One-time bootstrap
 
@@ -317,6 +318,84 @@ uv run python deploy/databricks/deploy.py --no-otel ...
 > deploy warns when `--no-otel` is paired with a target that lacks those
 > overrides, since OTel then stays on.
 
+## Deployment overlay
+
+A deployment has a handful of values that are its own and cannot be committed:
+the workspace host, extra `omnigent` extras, env vars for the app, secrets, and
+config files that must sit beside `app.py`. Keep them in one untracked YAML file
+and pass it with `--overlay`, instead of editing `databricks.yml`, `deploy.py`
+or `src/`:
+
+```bash
+uv run python deploy/databricks/deploy.py \
+    --overlay deploy/databricks/deploy.local.yml ...
+```
+
+```yaml
+# deploy/databricks/deploy.local.yml
+host: https://<workspace-host>
+extras: [kms]
+env:
+  OMNIGENT_CONFIG: server-config.yml
+  OMNIGENT_SHARING_MODE: read_only
+  OMNIGENT_PUBLIC_SHARING: "off"
+secret_env:
+  OMNIGENT_DATABRICKS_CLIENT_SECRET:
+    scope: <secret-scope>
+    key: <secret-key>
+files:
+  server-config.yml: server-config.local.yml
+```
+
+| Key | What it does |
+|---|---|
+| `host` | The workspace URL the deploy targets, in place of the placeholder in `databricks.yml`. |
+| `extras` | Extras of `omnigent` installed in the app besides `databricks` and `tracing`, e.g. `kms` for the AWS KMS credential store. Each must be an extra the package declares. |
+| `env` | App env vars, name to value, added after the ones the target already sets. Values are strings: quote `on`/`off`, `yes`/`no` and numbers. |
+| `secret_env` | App env vars whose value comes from a secret scope: `scope` and `key`, plus an optional `resource` (the app resource's name; default: the variable name in lower case). Each adds an app `secret` resource with `READ` permission and an env entry that reads it. |
+| `files` | Files copied into the app source: the name in `src/`, then the source path, relative to the overlay file. |
+
+All five keys are optional, and any other key is an error.
+
+**How it is applied.** The overlay is read and checked before the build starts.
+
+- `extras` go into the generated `src/pyproject.toml`.
+- For `host`, `env` and `secret_env`, `deploy.py` writes
+  `overlay.generated.yml` beside `databricks.yml`, which includes it. It defines
+  a target named `<target>-overlay`: a copy of the selected target (`prod`, or
+  `prod-no-otel` with `--no-otel`) with your host, the target's env list
+  followed by yours, and your secret resources. The deploy then binds, deploys
+  and runs that target. It keeps the base target's `root_path`, so it works on
+  the same deployment state. The file is rewritten on every overlay deploy and
+  removed by a deploy without one; an overlay with only `extras` or `files`
+  deploys the selected target as it is.
+- `files` are copied into `src/` after the dependency files are generated, are
+  uploaded with the rest of the app source, and are removed again when
+  `deploy.py` exits.
+
+**Rules.**
+
+- `env` and `secret_env` cannot name a variable the target already sets
+  (`AP_LAKEBASE_ENDPOINT`, `AP_ARTIFACT_VOLUME_PATH`, `OMNIGENT_FEATURES`, and
+  `OTEL_TRACES_SAMPLER` on `prod`); the feature list stays with `--features`.
+  A name cannot be in both.
+- A variable whose name ends in `_SECRET`, `_TOKEN`, `_PASSWORD` or `_API_KEY`
+  is refused under `env`, because a plain value is readable in the bundle and
+  in the app's settings; put it under `secret_env`.
+- A file's name in `src/` is a plain file name. It cannot be one `deploy.py`
+  writes itself (`pyproject.toml`, `uv.lock`, the wheels, the web UI archive),
+  cannot already exist in `src/`, and cannot match a `.gitignore` pattern,
+  because `bundle deploy` does not upload gitignored files. A source over the
+  10 MB per-file cap is refused.
+- Values are never printed: the deploy log names the variables only.
+  `overlay.generated.yml` holds the plain `env` values, so it is gitignored and
+  not uploaded.
+
+`.gitignore` covers `deploy/databricks/*.local.yml`, so an overlay kept there,
+and config files named like `server-config.local.yml` beside it, do not show
+up as uncommitted changes. An `env` value is written into the bundle as it
+is, so the Databricks CLI reads `${...}` inside it as a bundle substitution.
+
 ## Server-managed Databricks Sandboxes
 
 The `databricks` sandbox provider runs managed sessions (`host_type: "managed"`, or
@@ -400,6 +479,8 @@ reconnects. Otherwise, or to remove it sooner, a workspace admin deletes it by i
 | `src/app.py` | The app process. SQLAlchemy `do_connect` token hook + Alembic-on-boot + uvicorn. |
 | `src/app.yaml` | App startup config — command + env-var wiring. |
 | `src/pyproject.toml` / `src/uv.lock` | Regenerated per deploy; not committed (they pin the per-deploy wheel version). |
+| `*.local.yml` | Yours: a [deployment overlay](#deployment-overlay) and the files it names. Gitignored. |
+| `overlay.generated.yml` | Written by `deploy.py --overlay` from the overlay. Gitignored. |
 
 ## See also
 
