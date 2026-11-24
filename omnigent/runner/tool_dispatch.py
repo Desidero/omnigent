@@ -7079,8 +7079,9 @@ async def _spawn_family(
 ) -> str | None:
     """Return the model family a session's spawns are confined to.
 
-    Only a session running Smart Routing on a PINNED harness confines
-    them: its spawns are routed inside its own family, so an agent from
+    Only a session routing its spawns on a PINNED harness confines them
+    (Smart Routing, or sub-agent routing on a model the user picked):
+    its spawns are routed inside its own family, so an agent from
     another family has no candidate model it could be routed onto and
     must never be offered as spawnable in the first place. An
     auto-harness session hands the family choice to the router, and a
@@ -7114,7 +7115,7 @@ async def _spawn_family(
     if conversation_id is None:
         return None
     local = session_routing_class(conversation_id)
-    if not local.routing_enabled or local.auto_harness:
+    if not (local.routing_enabled or local.subagent_routing) or local.auto_harness:
         return None
     if conversation_id in _spawn_family_cache:
         return _spawn_family_cache[conversation_id]

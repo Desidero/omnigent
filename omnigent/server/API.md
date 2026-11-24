@@ -487,6 +487,13 @@ Fields:
     `PATCH /v1/sessions/{id}` (the web "Cost Optimized" toggle) and
     read by the cost-control advisor pipeline at turn start.
 
+  subagent_routing_override (string or null)
+    Whether Smart Routing picks the model of each sub-agent this
+    session starts: `"on"` routes them, `"off"` and `null` leave them
+    to the harness. Independent of the session's own model. A session
+    created on Smart Routing is stamped `"on"`. Set at create or via
+    `PATCH /v1/sessions/{id}`.
+
   git_branch (string or null)
     Git branch checked out in the session's worktree, e.g.
     `"feature/login"`. Set only when the session was created with a
@@ -702,6 +709,17 @@ already uploaded or registered an agent. The response is the full
     starts the runner in it. Shape: `{branch_name: string,
     base_branch?: string | null}`. `branch_name` is validated against
     git ref-format rules. See `designs/SESSION_GIT_WORKTREE.md`.
+
+  subagent_routing_override (string or null)
+    `"on"` routes the sub-agents this session starts while the session
+    keeps the `model_override` (or default model) it was created with;
+    it needs no `cost_control_mode_override`. On a native Claude Code or
+    Codex session the create also stamps the label
+    `omnigent.routing.subagent_routing: "1"`, and every launch of the
+    session then installs the gate that routes the CLI's own sub-agents
+    (Claude Code's `Agent`/`Task`, Codex's `spawn_agent`). Spawns stay in
+    the session's model family. Fails with 400 `invalid_input` on a
+    session with a bound inference profile.
 
   terminal_launch_args (array of strings or null)
     Optional pass-through CLI args for a native terminal wrapper
@@ -980,6 +998,17 @@ Request body:
     unchanged (`"off"` is a real value here, so field presence — not
     a clear alias — is the clear signal). Any other value fails with
     400 `invalid_input`.
+
+  subagent_routing_override (string or null, optional)
+    `"on"` or `"off"`; explicit `null` clears it, which reads as off.
+    Read per spawn, so a change applies to the next sub-agent. Omnigent
+    child sessions follow it on any session. The CLI's own sub-agents
+    on a native Claude Code or Codex session follow it only when the
+    session's launch installed the routing gate: it was created with
+    `subagent_routing_override: "on"` or on Smart Routing. Turning it
+    on later for a session created without it routes child sessions
+    only. `"on"` fails with 400 `invalid_input` on a session with a
+    bound inference profile.
 
   external_session_id (string, optional)
     Runtime-native session id this conversation wraps (e.g. Claude

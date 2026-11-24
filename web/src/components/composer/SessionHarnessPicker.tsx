@@ -27,6 +27,7 @@ import {
 } from "@/components/composer/composerSectionSettings";
 import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
+import { SubagentRoutingItem } from "@/components/composer/SubagentRoutingItem";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import {
   compactModelTriggerLabel,
@@ -506,6 +507,14 @@ export function SessionHarnessPicker({
           <DropdownMenuSeparator />
         </>
       )}
+      <SubagentRoutingItem
+        sessionId={sessionId}
+        conversationId={conversationId}
+        disabled={busy || pendingModelChange !== null}
+        onChange={(mode) =>
+          void apply(() => useChatStore.getState().setSubagentRouting(mode, ...target))
+        }
+      />
       <ComposerConfigSections
         models={modelSection}
         efforts={effortSection}

@@ -1516,9 +1516,10 @@ export interface ChatActions {
    * Set the active session's sub-agent routing switch — optimistic local
    * write, then PATCH; the server's canonical value (or a rollback on
    * failure) settles the state. Two-state: ``"off"`` is the way back to
-   * unrouted sub-agents. No-ops when there is no active conversation.
+   * unrouted sub-agents. Targets *sessionId* when given; otherwise no-ops
+   * when there is no active conversation.
    */
-  setSubagentRouting: (mode: "on" | "off") => Promise<void>;
+  setSubagentRouting: (mode: "on" | "off", sessionId?: string) => Promise<void>;
   /**
    * Re-read the active session's routing switches (cost control + sub-agent
    * routing) from the server and apply them.
@@ -4397,10 +4398,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setSubagentRouting: async (mode) => {
-    const { conversationId } = get();
-    if (!conversationId) return;
-    const previous = get().subagentRoutingOverride;
+  setSubagentRouting: async (mode, sessionId) => {
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    const conversationId = sessionId ?? target?.conversationId;
+    if (!target || !conversationId) return;
+    const previous = target.subagentRoutingOverride;
     // Optimistic write so the select responds instantly; the PATCH response
     // (or the rollback below) is the settled truth. Unlike the session's own
     // routing switch this never touches `model_override` — it governs the

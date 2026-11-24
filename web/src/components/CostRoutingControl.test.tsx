@@ -5,6 +5,8 @@ import {
   isCostRoutingSession,
   isSubagentRoutingSession,
   shortModelName,
+  SUBAGENT_ROUTING_LABEL_KEY,
+  subagentRoutingReach,
 } from "./CostRoutingControl";
 
 afterEach(cleanup);
@@ -67,6 +69,28 @@ describe("isSubagentRoutingSession", () => {
     }
   });
 
+  it("matches a native session created with sub-agent routing on its own model", () => {
+    // The create stamps the label and every launch installs the spawn gate,
+    // while the session's own routing stays off.
+    for (const harness of ["claude-native", "codex-native"]) {
+      expect(
+        isSubagentRoutingSession({
+          ...top,
+          harness,
+          labels: { [SUBAGENT_ROUTING_LABEL_KEY]: "1" },
+        }),
+      ).toBe(true);
+    }
+    // A native wrapper with no spawn hook has nothing to install.
+    expect(
+      isSubagentRoutingSession({
+        ...top,
+        harness: "cursor-native",
+        labels: { [SUBAGENT_ROUTING_LABEL_KEY]: "1" },
+      }),
+    ).toBe(false);
+  });
+
   it("matches non-native sessions whatever their harness (spawns go through create)", () => {
     // An SDK/bundle agent spawns children through the session-create path, which
     // routes off this switch regardless of the harness the parent runs.
@@ -107,6 +131,40 @@ describe("isSubagentRoutingSession", () => {
   it("rejects a missing session", () => {
     expect(isSubagentRoutingSession(null)).toBe(false);
     expect(isSubagentRoutingSession(undefined)).toBe(false);
+  });
+});
+
+describe("subagentRoutingReach", () => {
+  const top = { agentName: "claude-native-ui", parentSessionId: null };
+
+  it("covers every sub-agent where the launch installed the spawn gate", () => {
+    const session = {
+      ...top,
+      harness: "claude-native",
+      labels: { [SUBAGENT_ROUTING_LABEL_KEY]: "1" },
+    };
+    // The control stays while the switch is off, so it can be turned back on.
+    for (const override of ["on", "off", null] as const) {
+      expect(subagentRoutingReach(session, override)).toBe("spawns");
+    }
+    expect(subagentRoutingReach({ ...top, harness: "pi" }, null)).toBe("spawns");
+  });
+
+  it("covers child sessions only on a plain native session switched on afterwards", () => {
+    for (const harness of ["claude-native", "codex-native"]) {
+      expect(subagentRoutingReach({ ...top, harness }, "on")).toBe("child-sessions");
+      // Off or unset there is nothing to say and nothing to turn off.
+      expect(subagentRoutingReach({ ...top, harness }, "off")).toBeNull();
+      expect(subagentRoutingReach({ ...top, harness }, null)).toBeNull();
+    }
+  });
+
+  it("offers no control where nothing routes", () => {
+    expect(subagentRoutingReach({ ...top, harness: "cursor-native" }, "on")).toBeNull();
+    expect(
+      subagentRoutingReach({ ...top, parentSessionId: "conv_parent987", harness: "pi" }, "on"),
+    ).toBeNull();
+    expect(subagentRoutingReach(null, "on")).toBeNull();
   });
 });
 

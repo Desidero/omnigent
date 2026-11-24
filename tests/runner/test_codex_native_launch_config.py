@@ -315,6 +315,45 @@ async def test_happy_path_parses_full_config(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
+@pytest.mark.parametrize(
+    ("labels", "subagent_routing"),
+    [
+        ({"omnigent.routing.subagent_routing": "1"}, True),
+        # Switched on after a plain create: the launch stays a plain one.
+        ({}, False),
+    ],
+    ids=["created-on", "switched-on-later"],
+)
+async def test_subagent_only_routing_is_read_from_the_create_label(
+    monkeypatch: pytest.MonkeyPatch,
+    use_envelope: bool,
+    labels: dict[str, str],
+    subagent_routing: bool,
+) -> None:
+    """The session keeps its own model: only the spawn gate is switched on."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot = {
+        "workspace": "/tmp/repo",
+        "model_override": "gpt-5.4-mini",
+        "subagent_routing_override": "on",
+        "labels": labels,
+    }
+    cfg = await _codex_native_launch_config(
+        session_id="conv_1",
+        server_client=_Client(_Resp(200, snapshot)),
+        session_init=(
+            parse_runner_session_init_envelope(_init_payload(snapshot)) if use_envelope else None
+        ),
+    )
+    assert cfg.subagent_routing is subagent_routing
+    assert cfg.model_override == "gpt-5.4-mini"
+    assert cfg.routing_enabled is False
+    assert cfg.turn_routing is False
+    assert cfg.auto_harness is False
+
+
+@pytest.mark.asyncio
 async def test_complete_envelope_avoids_timed_out_metadata_read(
     retry_sleeps: list[float],
 ) -> None:

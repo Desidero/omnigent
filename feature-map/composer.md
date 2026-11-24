@@ -103,6 +103,26 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (`restrict_to_agent_names`, see `native-harnesses.md`) does not offer, which
   New Chat reports as unavailable until the user picks an offered agent while
   project settings keeps storing it.
+- `route-sub-agents`: on a server with Smart Routing, a Claude Code or Codex
+  session can keep the model picked for it and let Smart Routing choose the
+  model of each sub-agent it starts. In the new-session composer the model menu
+  shows **Route sub-agents** under Smart Routing while Smart Routing itself is
+  unchecked; checking it creates the session with
+  `subagent_routing_override: "on"` and nothing else of Smart Routing, so the
+  session's own model, effort and first message are not routed. In the session
+  the same row in the model menu turns routing of later spawns off and on.
+  Spawns stay in the session's own model family, and a Claude Code spawn takes a
+  routed model only when the session has an alias for it, otherwise it keeps
+  the model it asked for. A session created without the option has no row,
+  because the gate that routes the CLI's own sub-agents is installed at launch.
+  If its switch is turned on later through the API, the row appears and says
+  **Child sessions only**: Omnigent child sessions are routed, the CLI's own
+  sub-agents are not. Hosts need a build with this option for the gate; an older
+  host routes child sessions only. The row is not offered on a sandbox with a
+  bound inference profile, where the API refuses the switch
+  (`web/src/components/composer/SubagentRoutingItem.test.tsx`,
+  `web/src/components/CostRoutingControl.test.tsx`,
+  `tests/runner/test_subagent_router_launch.py`).
 - `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
   in both composers (Ctrl on every platform). The relevant menu briefly opens
   with the selected choice highlighted, preserving draft and input focus. In an
