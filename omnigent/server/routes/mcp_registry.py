@@ -57,6 +57,7 @@ def create_mcp_registry_router(
                     "id": entry.id,
                     "title": entry.title,
                     "description": entry.description,
+                    "icon": entry.icon,
                     "auth": entry.auth,
                     "connected": connected,
                     "tools": entry.tools,

@@ -59,6 +59,32 @@ function connectAccount(service: RegistryService) {
   );
 }
 
+/** Operator-supplied connector icon; SVGs are masked so they follow the theme's text colour. */
+function RegistryServiceIcon({ icon }: { icon?: string | null }) {
+  if (icon?.startsWith("data:image/svg+xml;base64,")) {
+    const mask = `url("${icon}") center / contain no-repeat`;
+    return (
+      <span
+        aria-hidden="true"
+        data-testid="mcp-service-icon"
+        className="size-4 shrink-0 bg-muted-foreground"
+        style={{ mask, WebkitMask: mask }}
+      />
+    );
+  }
+  if (icon?.startsWith("data:image/png;base64,")) {
+    return (
+      <img
+        src={icon}
+        alt=""
+        data-testid="mcp-service-icon"
+        className="size-4 shrink-0 object-contain"
+      />
+    );
+  }
+  return <PlugIcon className="size-4 shrink-0 text-muted-foreground" />;
+}
+
 function ServiceConnection({
   service,
   onChanged,
@@ -310,7 +336,7 @@ export function McpRegistryPicker({
             <li key={service.id} className="px-3 py-1.5">
               <label className="flex items-center gap-3" title={service.description}>
                 <span className="flex min-w-0 flex-1 items-center gap-2">
-                  <PlugIcon className="size-4 shrink-0 text-muted-foreground" />
+                  <RegistryServiceIcon icon={service.icon} />
                   <span className="min-w-0">
                     <span className="block truncate text-sm text-foreground">{service.title}</span>
                     <span

@@ -111,6 +111,41 @@ describe("MCP service selection", () => {
     );
   });
 
+  it.each([
+    ["an SVG as a mask in the text colour", "data:image/svg+xml;base64,PHN2Zy8+", "SPAN"],
+    ["a PNG as an image", "data:image/png;base64,iVBORw0KGgo=", "IMG"],
+  ])("shows a service's icon: %s", async (_name, icon, tagName) => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, icon }] });
+    render(<McpRegistryPicker attached={[]} onToggle={vi.fn()} busy={false} />);
+    await screen.findByRole("switch", { name: "Work tracker" });
+    const shown = screen.getByTestId("mcp-service-icon");
+    expect(shown.tagName).toBe(tagName);
+    if (shown instanceof HTMLImageElement) {
+      expect(shown.getAttribute("src")).toBe(icon);
+      expect(shown.getAttribute("alt")).toBe("");
+    } else {
+      expect(shown.style.mask).toContain(`url("${icon}")`);
+      expect(shown).toHaveClass("bg-muted-foreground");
+      expect(shown).toHaveAttribute("aria-hidden", "true");
+    }
+    expect(document.querySelector(".lucide-plug")).toBeNull();
+  });
+
+  it.each([
+    ["no icon", undefined],
+    ["a null icon", null],
+    ["a remote address", "https://cdn.example.test/icon.svg"],
+    ["another media type", "data:text/html;base64,PGI+"],
+    ["an SVG that is not base64", "data:image/svg+xml,%3Csvg/%3E"],
+  ])("shows the plug for %s and loads nothing", async (_name, icon) => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, icon }] });
+    render(<McpRegistryPicker attached={[]} onToggle={vi.fn()} busy={false} />);
+    await screen.findByRole("switch", { name: "Work tracker" });
+    expect(screen.queryByTestId("mcp-service-icon")).toBeNull();
+    expect(document.querySelector("img")).toBeNull();
+    expect(document.querySelector(".lucide-plug")).not.toBeNull();
+  });
+
   it("reports a sign-in starting and finishing to its owner", async () => {
     const oauth = { ...service, auth: "oauth" };
     vi.mocked(registryRequest).mockResolvedValueOnce({ data: [oauth] });

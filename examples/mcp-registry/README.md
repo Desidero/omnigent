@@ -288,6 +288,7 @@ admin database/UI. Settings shows users only the entries they can access.
 | --- | --- |
 | `public_url` | External Omnigent base URL used for OAuth callbacks; HTTPS except localhost. |
 | `services[].id` | Stable service key, also used in agent bundles and `service__tool` names. |
+| `icon` | Optional icon shown beside the service in the launch picker: a `data:image/svg+xml;base64,` or `data:image/png;base64,` URI, at most 16,384 characters. |
 | `url` | Administrator-approved Streamable HTTP MCP destination. |
 | `tools` | Required, nonempty list of allowed upstream tool names. |
 | `allowed_users` | Optional list of authenticated user IDs; omitted permits all users. |
@@ -295,6 +296,17 @@ admin database/UI. Settings shows users only the entries they can access.
 | `oauth` | Authorization/token URLs, client ID, scopes, optional `resource` and `client_secret_env`. |
 | `timeout` | Overall MCP request timeout in seconds; default 60, maximum 300. |
 | `allow_http` | Explicit local-development opt-in for upstream HTTP URLs. |
+
+`icon` must embed the image. A remote URL is rejected, so the web app never
+loads an address from the registry file. The value must be strict base64 that
+decodes to an SVG document or a PNG; anything else, including an empty payload,
+fails startup like any other invalid field. The launch picker draws an SVG as a
+mask in the muted text colour, so it follows light and dark themes and works
+best as a monochrome shape; a PNG is shown as it is. A service without `icon`
+shows a plug. `GET /v1/mcp-registry/services` returns the value as `icon`,
+`null` when unset. A server from before this field rejects it as an unknown key
+and fails startup, so upgrade the server before adding `icon` to the registry
+file, and remove it before rolling back.
 
 For generic OAuth, register the callback
 `<public_url>/v1/connections/mcp-<service-id>/callback` with the provider.
