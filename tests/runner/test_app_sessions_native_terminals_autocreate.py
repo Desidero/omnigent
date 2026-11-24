@@ -6853,6 +6853,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     session_id: str,
     routed: bool,
     auto_harness: bool = False,
+    subagent_routing: bool = False,
     custom_slot: str = "workspace-picker-row",
 ) -> Any:
     """Drive the claude-native launch and return the captured terminal spec.
@@ -6862,6 +6863,8 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     :param auto_harness: Stamp the auto-harness label and sentinel WITHOUT the
         cost-control field, which is the shape a sub-agent child of a routed
         parent is created with.
+    :param subagent_routing: Stamp the sub-agent routing label, as the create
+        path does for a session that routes only the sub-agents it starts.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
@@ -6931,6 +6934,11 @@ async def _run_auto_create_claude_terminal_for_routing_class(
 
         snapshot["labels"][AUTO_HARNESS_LABEL_KEY] = "1"
         snapshot["harness_override"] = "auto"
+    if subagent_routing:
+        from omnigent.runner.subagent_routing import SUBAGENT_ROUTING_LABEL_KEY
+
+        snapshot["labels"][SUBAGENT_ROUTING_LABEL_KEY] = "1"
+        snapshot["subagent_routing_override"] = "on"
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
         transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
@@ -7033,6 +7041,44 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
     # A pinned session's spawns stay on the claude family, so it gets neither
     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
     assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
+
+
+async def test_a_subagent_only_claude_native_launch_gates_spawns_and_keeps_its_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sub-agent routing on a model the user picked: the spawn gate and nothing else."""
+    for launch_dir in ("plain", "subagent-only"):
+        (tmp_path / launch_dir).mkdir()
+    plain = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path / "plain",
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f605",
+        routed=False,
+    )
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path / "subagent-only",
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f606",
+        routed=False,
+        subagent_routing=True,
+    )
+
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    # The session's own model is not routed: no first-message hook, and the
+    # model flags and alias pins are exactly a plain launch's.
+    assert all("route-turn" not in command for command in _claude_hook_commands(spec))
+    assert spec.args[spec.args.index("--model") + 1] == plain.args[plain.args.index("--model") + 1]
+    model_env = {key: value for key, value in spec.env.items() if key.startswith("ANTHROPIC_")}
+    assert model_env == {
+        key: value for key, value in plain.env.items() if key.startswith("ANTHROPIC_")
+    }
+    # In-family spawns only, so neither the routed-spawn note nor pre-approvals.
+    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+
+    spawn_note = smart_routing_spawn_note("claude-native")
+    assert all(spawn_note not in arg for arg in spec.args)
+    assert "--allowedTools" not in spec.args
 
 
 async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(

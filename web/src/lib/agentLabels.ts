@@ -152,6 +152,9 @@ export const AUTO_NATIVE_HARNESS_ID = "auto-native";
  */
 export const SMART_ROUTING_LABEL = "Smart Routing";
 
+/** User-facing name for routing only the sub-agents a session starts. */
+export const SUBAGENT_ROUTING_LABEL = "Route sub-agents";
+
 /**
  * Whether a harness id is one of the fully-auto sentinels, i.e. the router owns
  * the harness pick. Use the individual ids where the two flavors differ.

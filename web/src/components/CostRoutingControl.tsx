@@ -29,6 +29,9 @@ const SUBAGENT_ROUTING_HARNESSES: ReadonlySet<string> = new Set(["claude-native"
 /** Session label recording that Smart Routing owns this session's harness. */
 export const AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness";
 
+/** Session label recording a create that asked for sub-agent routing on a model the user picked. */
+export const SUBAGENT_ROUTING_LABEL_KEY = "omnigent.routing.subagent_routing";
+
 /** Whether Smart Routing owns this session's harness (so its spawns may cross families). */
 function isAutoHarnessSession(
   session: Pick<Session, "harness" | "labels"> | null | undefined,
@@ -52,6 +55,8 @@ function isAutoHarnessSession(
  *   Routing, pinned harness included: the launch starts the spawn-routing
  *   endpoint either way, and on codex that advertisement is what turns on the
  *   generated ``hooks.json`` gate and the routed-spawn tool pre-approvals;
+ * - a Claude- or Codex-family session created with sub-agent routing on has
+ *   it too, on the model the user picked ({@link SUBAGENT_ROUTING_LABEL_KEY});
  * - a plain native session of either family never has it.
  *
  * That last case would present "Smart Routing" as choosable while nothing
@@ -80,8 +85,37 @@ export function isSubagentRoutingSession(
   if (isAutoHarnessSession(session)) return true;
   return (
     SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "") &&
-    session?.costControlModeOverride === "on"
+    (session?.costControlModeOverride === "on" ||
+      session?.labels?.[SUBAGENT_ROUTING_LABEL_KEY] === "1")
   );
+}
+
+/** What the sub-agent routing switch reaches on a session. */
+export type SubagentRoutingReach = "spawns" | "child-sessions";
+
+/**
+ * What a session's sub-agent routing control governs, or `null` for no control.
+ *
+ * `"spawns"` is every sub-agent ({@link isSubagentRoutingSession}).
+ * `"child-sessions"` is a native Claude or Codex session launched without the
+ * spawn gate whose switch was turned on afterwards: only the Omnigent child
+ * sessions it creates are routed, so the control says so and can turn it off.
+ *
+ * Callers must also check ``ServerInfo.smart_routing_enabled``.
+ */
+export function subagentRoutingReach(
+  session: Parameters<typeof isSubagentRoutingSession>[0],
+  subagentRoutingOverride: "on" | "off" | null | undefined,
+): SubagentRoutingReach | null {
+  if (isSubagentRoutingSession(session)) return "spawns";
+  if (
+    isCostRoutingSession(session) &&
+    SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "") &&
+    subagentRoutingOverride === "on"
+  ) {
+    return "child-sessions";
+  }
+  return null;
 }
 
 // The tier-defining token of Claude model ids ("databricks-claude-haiku-4-5" → "haiku").

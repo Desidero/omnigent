@@ -115,6 +115,11 @@ CREATE_ROUTE_PROMPT_LABEL_KEY = "omnigent.routing.create_prompt"
 #: may still move this session's subagents across harness families.
 AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
 
+#: Conversation label marking a native session created with sub-agent routing
+#: on. The spawn gate is installed at launch only, so every launch reads this
+#: durable record instead of the switch, which can change mid-session.
+SUBAGENT_ROUTING_LABEL_KEY = "omnigent.routing.subagent_routing"
+
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
 #: Task label scored for a codex spawn that carries no prompt and no
@@ -143,6 +148,9 @@ _CODEX_HOOK_HARNESSES = frozenset({"codex", "codex-native"})
 # codex app-server spawns through session-create, which already routes off the
 # stamped switch, so the in-harness gate would only add a round trip.
 _PINNED_CODEX_HOOK_HARNESSES = frozenset({"codex-native"})
+# Harnesses that take the spawn gate without Smart Routing owning their own
+# model: the native terminals, whose in-harness spawns reach no other gate.
+SUBAGENT_ONLY_HOOK_HARNESSES = frozenset({"claude-native", "codex-native"})
 
 # Cross-harness counterpart used to offer the router a second family, and
 # to name the redirect target when it picks from that family.
@@ -214,7 +222,7 @@ class SessionRoutingClass:
     """Which Smart Routing additions one session is entitled to.
 
     Three classes, and the codex paths treat them differently (the product
-    ruling): a **plain** session (both flags false) must be
+    ruling): a **plain** session (every flag false) must be
     byte-for-byte a plain codex session — no catalog replacement, no
     spawn-routing hooks, no extra tool pre-approvals. A **pinned**
     Smart Routing session (``routing_enabled`` only) adds the extended
@@ -224,6 +232,11 @@ class SessionRoutingClass:
     to run at all. An **auto-harness** session (both) additionally lets
     those spawns cross into the counterpart harness family; a pinned one
     routes within its own.
+
+    A fourth, **sub-agent-only** session (``subagent_routing`` alone) keeps
+    the model the user picked and takes only what its routed spawns need: the
+    spawn gate, and on codex the pre-approvals and the extended catalog.
+    Nothing that routes or re-pins its own model.
 
     :param routing_enabled: The session launched with Smart Routing as its
         model.
@@ -236,11 +249,25 @@ class SessionRoutingClass:
         answer is "already routed", paid for with a round trip per prompt.
         Independent of ``routing_enabled``: a routed session keeps the
         extended catalog and its spawn routing.
+    :param subagent_routing: The session was created with sub-agent routing
+        on (:data:`SUBAGENT_ROUTING_LABEL_KEY`), whatever its own model is.
     """
 
     routing_enabled: bool = False
     auto_harness: bool = False
     turn_routing: bool = False
+    subagent_routing: bool = False
+
+    def routes_spawns(self, harness: str | None) -> bool:
+        """Report whether a launch on *harness* installs the spawn gate.
+
+        :param harness: Harness being launched, e.g. ``"claude-native"``.
+        :returns: ``True`` for a Smart Routing session on any harness, and
+            for a sub-agent-only session on a native terminal.
+        """
+        if self.routing_enabled:
+            return True
+        return self.subagent_routing and harness in SUBAGENT_ONLY_HOOK_HARNESSES
 
 
 #: The class a session with no recorded routing state is treated as. Read by
@@ -263,8 +290,9 @@ def routing_class_from_snapshot(
     :param harness_override: ``harness_override``; the ``"auto"`` sentinel
         marks auto-harness until first-message routing replaces it.
     :param labels: Conversation labels, which carry the durable
-        :data:`AUTO_HARNESS_LABEL_KEY` record and the
-        :data:`ROUTING_DECISION_LABEL_KEY` a completed route stamps.
+        :data:`AUTO_HARNESS_LABEL_KEY` record, the
+        :data:`ROUTING_DECISION_LABEL_KEY` a completed route stamps and the
+        :data:`SUBAGENT_ROUTING_LABEL_KEY` a sub-agent-only create stamps.
     :returns: The session's class.
     """
     auto = harness_override == "auto" or (
@@ -283,6 +311,9 @@ def routing_class_from_snapshot(
         routing_enabled=routes,
         auto_harness=auto,
         turn_routing=routes and not already_routed,
+        subagent_routing=bool(
+            labels is not None and labels.get(SUBAGENT_ROUTING_LABEL_KEY) == "1"
+        ),
     )
 
 
@@ -1431,9 +1462,10 @@ def ensure_session_router_quietly(
         pinned Smart Routing session could not spawn at all. The codex
         *SDK* arm still needs :attr:`~SessionRoutingClass.auto_harness`:
         its spawns go through the session-create path, which routes off the
-        stamped switch without any in-harness gate. Stamped at create, so
-        flipping the gear's subagent-routing toggle on for a plain session
-        stays inert until it is recreated.
+        stamped switch without any in-harness gate. A **sub-agent-only**
+        session on a native terminal gets one too, and nothing else of
+        Smart Routing's. Stamped at create, so flipping the subagent-routing
+        switch on for a plain session later routes its child sessions only.
     :returns: The running router handle, or ``None`` when it could not
         start.
     """
@@ -1442,7 +1474,7 @@ def ensure_session_router_quietly(
         return None
     if harness not in _CLAUDE_HOOK_HARNESSES and harness not in _CODEX_HOOK_HARNESSES:
         return None
-    if not routing_class.routing_enabled:
+    if not routing_class.routes_spawns(harness):
         return None
     if (
         harness in _CODEX_HOOK_HARNESSES

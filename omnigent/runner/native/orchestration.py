@@ -804,6 +804,10 @@ class _CodexNativeLaunchConfig:
         still has work to do. False on a session something already routed —
         a web create that pinned the model before the pane launched — so the
         ``UserPromptSubmit`` hook is never registered and no prompt is held.
+    :param subagent_routing: ``True`` when the session was created with
+        sub-agent routing on while keeping the model the user picked. It gets
+        the spawn-routing endpoint and the extended catalog a routed spawn may
+        need, and no turn routing.
     :param reasoning_effort: Persisted per-session effort, e.g. ``"ultra"``,
         pinned into the private ``config.toml`` at launch so the thread (and
         the TUI footer) start at it instead of the shared config's default.
@@ -828,6 +832,7 @@ class _CodexNativeLaunchConfig:
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
+    subagent_routing: bool = False
     reasoning_effort: str | None = None
     bridge_id: str | None = None
     #: The session is a child whose replies its parent receives, so one-time user
@@ -915,6 +920,7 @@ def _start_subagent_router_for_native_session(
     server_client: httpx.AsyncClient | None,
     routing_enabled: bool,
     auto_harness: bool,
+    subagent_routing: bool = False,
 ) -> _NativeRouterLaunch:
     """Start the subagent-routing endpoint for a native session.
 
@@ -922,9 +928,10 @@ def _start_subagent_router_for_native_session(
     launch, so the endpoint has to be live (and advertised in the bridge
     dir the hooks read) before the CLI starts.
 
-    Installed for Smart Routing sessions only, on both families: a plain
-    session launches like a plain one, with no loopback server, no bearer
-    token on disk and no spawn hook on its argv. On the codex family the
+    Installed for Smart Routing sessions and for sessions created with
+    sub-agent routing on, on both families: a plain session launches like a
+    plain one, with no loopback server, no bearer token on disk and no spawn
+    hook on its argv. On the codex family the
     advertisement additionally turns on a generated ``hooks.json`` and the
     routed-spawn tool pre-approvals — which is why a pinned Smart Routing
     codex session needs it too: without them its spawn tools are neither
@@ -943,6 +950,8 @@ def _start_subagent_router_for_native_session(
     :param auto_harness: Whether Smart Routing also owns this session's
         harness, so its spawns may cross families. Not required for the
         endpoint; it decides what the router may offer.
+    :param subagent_routing: Whether the session was created with sub-agent
+        routing on. Enough for the endpoint without ``routing_enabled``.
     :returns: The advertisement directory to point hooks at (``None`` when
         the endpoint could not start) paired with the router handle.
     """
@@ -959,6 +968,7 @@ def _start_subagent_router_for_native_session(
         routing_class=SessionRoutingClass(
             routing_enabled=routing_enabled,
             auto_harness=auto_harness,
+            subagent_routing=subagent_routing,
         ),
     )
     return _NativeRouterLaunch(bridge_dir if router is not None else None, router)
@@ -1651,6 +1661,7 @@ async def _codex_native_launch_config(
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
+        subagent_routing=routing_class.subagent_routing,
         reasoning_effort=reasoning_effort,
         bridge_id=bridge_id,
         has_parent=bool(snapshot.get("parent_session_id")),
@@ -6147,6 +6158,7 @@ async def _auto_create_codex_terminal(
         server_client=server_client,
         routing_enabled=launch_config.routing_enabled,
         auto_harness=launch_config.auto_harness,
+        subagent_routing=launch_config.subagent_routing,
     )
     if _codex_router_dir is not None:
         from omnigent.runner.subagent_routing import router_env
@@ -6156,7 +6168,10 @@ async def _auto_create_codex_terminal(
     # (GLM), which its own client-side validation then refuses — so a Smart
     # Routing session (pinned or auto) gets the extended catalog. A plain
     # session keeps codex's bundled catalog and never pays the probe.
-    app_server.env.update(codex_extended_catalog_env(launch_config.routing_enabled))
+    # A sub-agent-only session's routed spawn can land on such an arm too.
+    app_server.env.update(
+        codex_extended_catalog_env(launch_config.routing_enabled or launch_config.subagent_routing)
+    )
     app_server.env.update(resource_registry.client_surface_env(session_id))
     # First-message model routing. Advertised in the same bridge dir the
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
@@ -9355,6 +9370,9 @@ class _ClaudeSessionLaunchMetadata:
     #: The session is a child (sub-agent, worker or side chat) whose replies its
     #: parent receives, so one-time user offers are left to top-level sessions.
     has_parent: bool = False
+    #: Created with sub-agent routing on while keeping the model the user
+    #: picked: the launch adds the spawn gate and none of the model pins.
+    subagent_routing: bool = False
 
 
 def _claude_launch_metadata_from_envelope(
@@ -9378,6 +9396,7 @@ def _claude_launch_metadata_from_envelope(
         routing_enabled=routing_class.routing_enabled,
         auto_harness=routing_class.auto_harness,
         turn_routing=routing_class.turn_routing,
+        subagent_routing=routing_class.subagent_routing,
         reasoning_effort=snapshot.reasoning_effort,
         model_override=snapshot.model_override,
         terminal_launch_args=snapshot.terminal_launch_args,
@@ -9437,6 +9456,7 @@ async def _load_legacy_claude_launch_metadata(
         routing_enabled=routing_class.routing_enabled,
         auto_harness=routing_class.auto_harness,
         turn_routing=routing_class.turn_routing,
+        subagent_routing=routing_class.subagent_routing,
         reasoning_effort=effort if isinstance(effort, str) and effort else None,
         model_override=(
             model_override if isinstance(model_override, str) and model_override else None
@@ -10271,10 +10291,11 @@ async def _auto_create_claude_terminal(
     # ``api_key_helper`` (ucode) registers Claude's gateway token command.
     # Gate natively spawned subagents (the Task/Agent tool): start the loopback
     # endpoint in the bridge dir the PreToolUse hook already discovers. Smart
-    # Routing sessions only — a plain session would otherwise carry a loopback
-    # server, a bearer token on disk and a hook subprocess on every spawn for a
-    # verdict the server never routes. Claude routes spawns whether or not the
-    # harness is auto-picked, so ``auto_harness`` is not required here.
+    # Routing and sub-agent-routing sessions only — a plain session would
+    # otherwise carry a loopback server, a bearer token on disk and a hook
+    # subprocess on every spawn for a verdict the server never routes. Claude
+    # routes spawns whether or not the harness is auto-picked, so
+    # ``auto_harness`` is not required here.
     subagent_router_dir, _subagent_router = _start_subagent_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
@@ -10282,6 +10303,7 @@ async def _auto_create_claude_terminal(
         server_client=server_client,
         routing_enabled=launch_metadata.routing_enabled,
         auto_harness=launch_metadata.auto_harness,
+        subagent_routing=launch_metadata.subagent_routing,
     )
     # First-message model routing. Advertised in the same bridge dir the
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its

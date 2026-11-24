@@ -136,7 +136,11 @@ async def prepare_create_inference(
             "The agent's Databricks profile conflicts with the configured harness provider",
             code=ErrorCode.INVALID_INPUT,
         )
-    if getattr(body, "cost_control_mode_override", None) == "on" or harness_override == "auto":
+    if (
+        getattr(body, "cost_control_mode_override", None) == "on"
+        or getattr(body, "subagent_routing_override", None) == "on"
+        or harness_override == "auto"
+    ):
         raise OmnigentError(
             "Automatic provider routing is unavailable for a bound inference profile",
             code=ErrorCode.INVALID_INPUT,
