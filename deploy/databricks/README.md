@@ -163,6 +163,11 @@ after the redeploy:
 The Canvas page is off by default; include `canvas` in `--features` for the
 apps that should show it.
 
+`deploy.py` hands the list to the bundle as the `BUNDLE_VAR_features`
+environment variable rather than as a `--var` pair, because the Databricks CLI
+splits `--var` values on commas. Set it the same way when you run
+`databricks bundle` by hand.
+
 See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
 inventory and rollback procedure. Runner overrides such as `-claude_osc_status`
 also need to be set on separately running hosts; restart their host/runners

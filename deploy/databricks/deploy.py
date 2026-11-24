@@ -34,7 +34,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from packaging.version import InvalidVersion, Version
 
@@ -970,21 +970,10 @@ def _ensure_bound(args: argparse.Namespace) -> None:
         return
 
     _log(f"binding bundle resource {_BUNDLE_RESOURCE_KEY!r} → app {args.app_name!r}")
-    result = subprocess.run(
-        [
-            "databricks",
-            "bundle",
-            "deployment",
-            "bind",
-            _BUNDLE_RESOURCE_KEY,
-            args.app_name,
-            "--target",
-            args.target,
-            "--auto-approve",
-            *_profile_arg(args),
-            *_bundle_vars(args),
-        ],
-        cwd=_deploy_dir(),
+    result = _run_bundle(
+        args,
+        ["deployment", "bind", _BUNDLE_RESOURCE_KEY, args.app_name],
+        ["--auto-approve"],
         capture_output=True,
         text=True,
     )
@@ -1033,11 +1022,10 @@ def _ensure_compute_size(
 
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
-    """CLI args to pass to `databricks bundle` as --var pairs."""
-    # The Apps API rejects an environment entry with an empty source. A single
-    # space is trimmed by the feature parser and therefore preserves the
-    # documented "no features" behavior while providing a valid value source.
-    features = args.features if args.features.strip() else " "
+    """CLI args to pass to `databricks bundle` as --var pairs.
+
+    ``features`` is not among them: see :func:`_bundle_env`.
+    """
     return [
         "--var",
         f"app_name={args.app_name}",
@@ -1049,9 +1037,51 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
-        "--var",
-        f"features={features}",
     ]
+
+
+def _bundle_env(args: argparse.Namespace) -> dict[str, str]:
+    """Environment for `databricks bundle`, carrying the ``features`` variable.
+
+    The CLI splits ``--var`` values on commas, so a list of features cannot go
+    through ``--var``; ``BUNDLE_VAR_<name>`` takes the value verbatim.
+    """
+    # The Apps API rejects an environment entry with an empty source. A single
+    # space is trimmed by the feature parser and therefore preserves the
+    # documented "no features" behavior while providing a valid value source.
+    features = args.features if args.features.strip() else " "
+    return {**os.environ, "BUNDLE_VAR_features": features}
+
+
+def _run_bundle(
+    args: argparse.Namespace,
+    command: list[str],
+    options: Iterable[str] = (),
+    **run_kwargs: Any,
+) -> subprocess.CompletedProcess:
+    """Run one `databricks bundle` command against the deploy's target.
+
+    :param command: Words after ``databricks bundle``, e.g. ``["deploy"]`` or
+        ``["run", "omnigent"]``.
+    :param options: Extra options placed after ``--target``, e.g.
+        ``["--auto-approve"]``.
+    :param run_kwargs: Passed to :func:`subprocess.run`, e.g. ``check=True``.
+    """
+    return subprocess.run(
+        [
+            "databricks",
+            "bundle",
+            *command,
+            "--target",
+            args.target,
+            *options,
+            *_profile_arg(args),
+            *_bundle_vars(args),
+        ],
+        cwd=_deploy_dir(),
+        env=_bundle_env(args),
+        **run_kwargs,
+    )
 
 
 def _profile_arg(args: argparse.Namespace) -> list[str]:
@@ -1238,37 +1268,12 @@ def main() -> int:
     # 5) databricks bundle deploy --target <target> (syncs src/ to the
     # bundle workspace folder and creates/updates the app resource).
     _log(f"databricks bundle deploy --target {args.target}")
-    subprocess.run(
-        [
-            "databricks",
-            "bundle",
-            "deploy",
-            "--target",
-            args.target,
-            *_profile_arg(args),
-            *_bundle_vars(args),
-        ],
-        cwd=_deploy_dir(),
-        check=True,
-    )
+    _run_bundle(args, ["deploy"], check=True)
 
     # 5) databricks bundle run <key> --target <target> (starts/restarts
     # the app with the just-deployed source).
     _log(f"databricks bundle run {_BUNDLE_RESOURCE_KEY} --target {args.target}")
-    subprocess.run(
-        [
-            "databricks",
-            "bundle",
-            "run",
-            _BUNDLE_RESOURCE_KEY,
-            "--target",
-            args.target,
-            *_profile_arg(args),
-            *_bundle_vars(args),
-        ],
-        cwd=_deploy_dir(),
-        check=True,
-    )
+    _run_bundle(args, ["run", _BUNDLE_RESOURCE_KEY], check=True)
 
     # 6) Resolve URL + smoke-check.
     app = wc.apps.get(name=args.app_name)
