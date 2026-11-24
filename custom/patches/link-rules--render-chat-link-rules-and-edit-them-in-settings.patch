@@ -33,13 +33,20 @@ Settings group to edit them.
   edits, toggles, deletes and resets rules, shows each rule's error, and
   previews sample text with the rules being edited.
 
+- The group is one Settings search entry (chat-link-rules): its buttons and
+  the preview field are its parts, the rules are a data region whose fields
+  are named after their rule, and the preview is a content area that renders
+  the sample as markdown with the rules being edited, so Settings search
+  finds it and upstream's Settings ownership guards pass. The page audit
+  answers GET /v1/link-rules.
+
 Not upstream yet: proposed from feat/chat-link-rules, the git-reference part from
 feat/git-ref-notation; drop this copy once they merge.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/chat-link-rules.md                       |  81 ++
+ docs/chat-link-rules.md                       |  82 ++
  feature-map/preferences.md                    |  20 +-
  omnigent/runner/git_providers/azure_devops.py |   9 +-
  omnigent/runner/git_providers/gitlab.py       |   9 +-
@@ -61,8 +68,11 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/pages/SettingsPage.test.tsx           |   4 +
  web/src/pages/SettingsPage.tsx                |   2 +
  .../settings/LinkRulesSettingsGroup.test.tsx  | 180 ++++
- .../pages/settings/LinkRulesSettingsGroup.tsx | 384 ++++++++
- 23 files changed, 2594 insertions(+), 21 deletions(-)
+ .../pages/settings/LinkRulesSettingsGroup.tsx | 436 +++++++++
+ .../pages/settings/search/catalog/general.ts  |  52 ++
+ .../search/settingsPageAudit.test.tsx         |  52 +-
+ .../search/settingsUnownedBaseline.ts         |   8 +
+ 26 files changed, 2756 insertions(+), 24 deletions(-)
  create mode 100644 web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
  create mode 100644 web/src/components/chat/LinkRulesScope.test.ts
  create mode 100644 web/src/components/chat/LinkRulesScope.tsx
@@ -74,16 +84,17 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/pages/settings/LinkRulesSettingsGroup.tsx
 
 diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
-index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..6b8affd161533cb023967ede2e1cd234f5ef1274 100644
+index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..7cfd38670bd7669ed8c2d114dc5e1238711485ff 100644
 --- a/docs/chat-link-rules.md
 +++ b/docs/chat-link-rules.md
-@@ -4,6 +4,87 @@ Link rules turn short references in chat messages, such as `BST-2135` or
+@@ -4,6 +4,88 @@ Link rules turn short references in chat messages, such as `BST-2135` or
  `PR #123`, into links. Each user has one list of rules, saved as a shared
  preference, so every session and device shows the same links.
  
 +## Setting them up
 +
-+Settings → General → **Chat links** lists the rules. Each one can be turned on
++Settings → General → **Chat links** lists the rules (Settings search finds it
++under "Chat links"). Each one can be turned on
 +or off, renamed, edited (pattern and URL for a `url` rule, provider and host
 +for a `git` rule) or deleted; **Add rule** adds a `url` rule, **Add git host**
 +a `git` rule (for GitHub Enterprise or a self-managed GitLab, say), and a
@@ -2632,23 +2643,17 @@ index 0000000000000000000000000000000000000000..34ffaa7964822fa54fa2e21e12c725f0
 +});
 diff --git a/web/src/pages/settings/LinkRulesSettingsGroup.tsx b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068af1d30a8d
+index 0000000000000000000000000000000000000000..21fba8aaf59ed1ee1f7f77c96217b3aa7cbd631b
 --- /dev/null
 +++ b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,436 @@
 +import { useQueryClient } from "@tanstack/react-query";
 +import { useMemo, useState } from "react";
-+import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
++import ReactMarkdown, { type Components } from "react-markdown";
++import remarkGfm from "remark-gfm";
 +import { SettingsGroup } from "@/components/SettingsGroup";
 +import { Button } from "@/components/ui/button";
 +import { Input } from "@/components/ui/input";
-+import {
-+  Select,
-+  SelectContent,
-+  SelectItem,
-+  SelectTrigger,
-+  SelectValue,
-+} from "@/components/ui/select";
 +import { Switch } from "@/components/ui/switch";
 +import { Textarea } from "@/components/ui/textarea";
 +import { LINK_RULES_QUERY_KEY, useLinkRules } from "@/hooks/useLinkRules";
@@ -2657,12 +2662,16 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +  GIT_PROVIDERS,
 +  type GitProviderId,
 +  type LinkRule,
-+  LinkRuleMatchersContext,
 +  linkRuleErrors,
 +  MAX_LINK_RULES,
++  remarkLinkRules,
 +} from "@/lib/linkRules";
 +import { saveLinkRules } from "@/lib/linkRulesApi";
 +import { ApiError } from "@/lib/sessionsApi";
++import { CHAT_LINK_RULES_ENTRY } from "@/pages/settings/search/catalog/general";
++import { SettingsItem } from "@/pages/settings/search/SettingsItem";
++import { settingsControlProps } from "@/pages/settings/search/settingsControl";
++import { SettingsContent, SettingsDataRegion } from "@/pages/settings/search/settingsOwnership";
 +
 +const DEFAULT_SAMPLE =
 +  "Fixes acme/web#12 and ABC-345 (see ENG-6). Earlier: session:0123456789abcdef. `ABC-1` in code stays text.";
@@ -2716,14 +2725,22 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +  const rules = useMemo(() => draft ?? current?.rules ?? [], [draft, current]);
 +  const errors = useMemo(() => linkRuleErrors(rules), [rules]);
 +  // The preview has no session, so only GitHub's owner/repo#123 links there.
-+  const matchers = useMemo(() => compileLinkRules(rules, null), [rules]);
++  const previewPlugins = useMemo(
++    () => [
++      remarkGfm,
++      [remarkLinkRules, compileLinkRules(rules, null)] as [typeof remarkLinkRules, unknown],
++    ],
++    [rules],
++  );
 +
 +  if (!current) {
 +    return (
 +      <SettingsGroup title="Chat links" testId="settings-group-link-rules">
-+        <p className="text-sm text-muted-foreground">
-+          {query.isError ? "Chat links are unavailable." : "Loading chat links…"}
-+        </p>
++        <SettingsItem entry={CHAT_LINK_RULES_ENTRY}>
++          <p className="text-sm text-muted-foreground">
++            {query.isError ? "Chat links are unavailable." : "Loading chat links…"}
++          </p>
++        </SettingsItem>
 +      </SettingsGroup>
 +    );
 +  }
@@ -2754,143 +2771,183 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +
 +  return (
 +    <SettingsGroup title="Chat links" testId="settings-group-link-rules">
-+      <p className="text-sm text-muted-foreground">
-+        Turn short references in chat messages into links. A pattern is a short form such as{" "}
-+        <code>BST-{"{num}"}</code> (also <code>{"{key}"}</code> and <code>{"{id}"}</code>) or a{" "}
-+        <code>/regex/</code>; the URL fills in the same placeholders.
-+      </p>
-+      {!current.supported && (
-+        <p className="mt-2 text-sm text-muted-foreground" role="note">
-+          These are the defaults. Saving rules needs shared preferences enabled on the server.
++      <SettingsItem entry={CHAT_LINK_RULES_ENTRY}>
++        <p className="text-sm text-muted-foreground">
++          Turn short references in chat messages into links. A pattern is a short form such as{" "}
++          <code>BST-{"{num}"}</code> (also <code>{"{key}"}</code> and <code>{"{id}"}</code>) or a{" "}
++          <code>/regex/</code>; the URL fills in the same placeholders.
 +        </p>
-+      )}
-+      <div className="mt-2 flex flex-col">
-+        {rules.map((rule, index) => (
-+          <LinkRuleRow
-+            // Rules have no stable id; the position is the identity while editing.
-+            // oxlint-disable-next-line react/no-array-index-key
-+            key={index}
-+            index={index}
-+            rule={rule}
-+            error={errors[index]}
-+            disabled={!editable}
-+            onChange={(change) => update(index, change)}
-+            onDelete={() => setDraft(rules.filter((_rule, at) => at !== index))}
-+          />
-+        ))}
-+        {rules.length === 0 && (
-+          <p className="mt-4 text-sm text-muted-foreground">
-+            No rules: messages show no extra links.
++        {!current.supported && (
++          <p className="mt-2 text-sm text-muted-foreground" role="note">
++            These are the defaults. Saving rules needs shared preferences enabled on the server.
 +          </p>
 +        )}
-+      </div>
-+      <div className="mt-4 flex flex-wrap gap-2">
-+        <Button
-+          variant="outline"
-+          size="sm"
-+          disabled={!editable || rules.length >= MAX_LINK_RULES}
-+          onClick={() => setDraft([...rules, newUrlRule(rules)])}
-+          data-testid="link-rules-add"
-+          componentId="settings.general.link_rules.add"
++        <SettingsDataRegion
++          entry={CHAT_LINK_RULES_ENTRY}
++          region="rules"
++          className="mt-2 flex flex-col"
 +        >
-+          Add rule
-+        </Button>
-+        <Button
-+          variant="outline"
-+          size="sm"
-+          disabled={!editable || rules.length >= MAX_LINK_RULES}
-+          onClick={() => setDraft([...rules, newGitRule(rules)])}
-+          data-testid="link-rules-add-git"
-+          componentId="settings.general.link_rules.add_git"
-+        >
-+          Add git host
-+        </Button>
-+        {missingSession && (
++          {rules.map((rule, index) => (
++            <LinkRuleRow
++              // Rules have no stable id; the position is the identity while editing.
++              // oxlint-disable-next-line react/no-array-index-key
++              key={index}
++              index={index}
++              rule={rule}
++              error={errors[index]}
++              disabled={!editable}
++              onChange={(change) => update(index, change)}
++              onDelete={() => setDraft(rules.filter((_rule, at) => at !== index))}
++            />
++          ))}
++          {rules.length === 0 && (
++            <p className="mt-4 text-sm text-muted-foreground">
++              No rules: messages show no extra links.
++            </p>
++          )}
++        </SettingsDataRegion>
++        <div className="mt-4 flex flex-wrap gap-2">
 +          <Button
++            {...settingsControlProps(CHAT_LINK_RULES_ENTRY, "addRule")}
 +            variant="outline"
 +            size="sm"
 +            disabled={!editable || rules.length >= MAX_LINK_RULES}
-+            onClick={() =>
-+              setDraft([
-+                ...rules,
-+                { name: "Sessions", kind: "session", pattern: "", url: null, enabled: true },
-+              ])
-+            }
-+            data-testid="link-rules-add-session"
-+            componentId="settings.general.link_rules.add_session"
++            onClick={() => setDraft([...rules, newUrlRule(rules)])}
++            data-testid="link-rules-add"
++            componentId="settings.general.link_rules.add"
 +          >
-+            Add session references
++            Add rule
 +          </Button>
-+        )}
-+        <span className="flex-1" />
-+        {draft !== null && (
 +          <Button
-+            variant="ghost"
++            {...settingsControlProps(CHAT_LINK_RULES_ENTRY, "addGitHost")}
++            variant="outline"
 +            size="sm"
-+            disabled={saving}
-+            onClick={() => {
-+              setDraft(null);
-+              setMessage(null);
-+            }}
-+            data-testid="link-rules-discard"
-+            componentId="settings.general.link_rules.discard"
++            disabled={!editable || rules.length >= MAX_LINK_RULES}
++            onClick={() => setDraft([...rules, newGitRule(rules)])}
++            data-testid="link-rules-add-git"
++            componentId="settings.general.link_rules.add_git"
 +          >
-+            Discard
++            Add git host
 +          </Button>
-+        )}
-+        <Button
-+          variant="outline"
-+          size="sm"
-+          disabled={!editable || (!current.saved && draft === null)}
-+          onClick={() => void save(null)}
-+          data-testid="link-rules-reset"
-+          componentId="settings.general.link_rules.reset"
-+        >
-+          Reset to defaults
-+        </Button>
-+        <Button
-+          size="sm"
-+          disabled={!editable || draft === null || errors.some((error) => error !== null)}
-+          onClick={() => void save(rules)}
-+          data-testid="link-rules-save"
-+          componentId="settings.general.link_rules.save"
-+        >
-+          Save
-+        </Button>
-+      </div>
-+      {message && (
-+        <p role="alert" className="mt-2 text-sm text-destructive">
-+          {message}
-+        </p>
-+      )}
-+      <div className="mt-4 border-t border-border pt-4">
-+        <label className="text-sm font-medium" htmlFor="link-rules-preview-input">
-+          Preview
-+        </label>
-+        <Textarea
-+          id="link-rules-preview-input"
-+          className="mt-2"
-+          rows={2}
-+          value={sample}
-+          onChange={(event) => setSample(event.target.value)}
-+          data-testid="link-rules-preview-input"
-+        />
-+        <div
-+          className="mt-2 rounded-md border border-border p-3 text-sm"
-+          data-testid="link-rules-preview"
-+        >
-+          <LinkRuleMatchersContext.Provider value={matchers}>
-+            <FilePathAwareMessageResponse>{sample}</FilePathAwareMessageResponse>
-+          </LinkRuleMatchersContext.Provider>
++          {missingSession && (
++            <Button
++              {...settingsControlProps(CHAT_LINK_RULES_ENTRY, "addSessions")}
++              variant="outline"
++              size="sm"
++              disabled={!editable || rules.length >= MAX_LINK_RULES}
++              onClick={() =>
++                setDraft([
++                  ...rules,
++                  { name: "Sessions", kind: "session", pattern: "", url: null, enabled: true },
++                ])
++              }
++              data-testid="link-rules-add-session"
++              componentId="settings.general.link_rules.add_session"
++            >
++              Add session references
++            </Button>
++          )}
++          <span className="flex-1" />
++          {draft !== null && (
++            <Button
++              {...settingsControlProps(CHAT_LINK_RULES_ENTRY, "discard")}
++              variant="ghost"
++              size="sm"
++              disabled={saving}
++              onClick={() => {
++                setDraft(null);
++                setMessage(null);
++              }}
++              data-testid="link-rules-discard"
++              componentId="settings.general.link_rules.discard"
++            >
++              Discard
++            </Button>
++          )}
++          <Button
++            {...settingsControlProps(CHAT_LINK_RULES_ENTRY, "reset")}
++            variant="outline"
++            size="sm"
++            disabled={!editable || (!current.saved && draft === null)}
++            onClick={() => void save(null)}
++            data-testid="link-rules-reset"
++            componentId="settings.general.link_rules.reset"
++          >
++            Reset to defaults
++          </Button>
++          <Button
++            {...settingsControlProps(CHAT_LINK_RULES_ENTRY, "save")}
++            size="sm"
++            disabled={!editable || draft === null || errors.some((error) => error !== null)}
++            onClick={() => void save(rules)}
++            data-testid="link-rules-save"
++            componentId="settings.general.link_rules.save"
++          >
++            Save
++          </Button>
 +        </div>
-+        <p className="mt-1 text-xs text-muted-foreground">
-+          The preview has no session, so only GitHub&rsquo;s owner/repo#123 links here. Bare #123,
-+          PR #123 and !123 link in a session whose repository is on a listed git host.
-+        </p>
-+      </div>
++        {message && (
++          <p role="alert" className="mt-2 text-sm text-destructive">
++            {message}
++          </p>
++        )}
++        <div className="mt-4 border-t border-border pt-4">
++          <label className="text-sm font-medium" htmlFor="link-rules-preview-input">
++            Preview
++          </label>
++          <Textarea
++            {...settingsControlProps(CHAT_LINK_RULES_ENTRY, "preview")}
++            id="link-rules-preview-input"
++            className="mt-2"
++            rows={2}
++            value={sample}
++            onChange={(event) => setSample(event.target.value)}
++            data-testid="link-rules-preview-input"
++          />
++          <div data-testid="link-rules-preview">
++            <SettingsContent
++              entry={CHAT_LINK_RULES_ENTRY}
++              area="preview"
++              className="mt-2 rounded-md border border-border p-3 text-sm [&_code]:font-mono [&_code]:text-xs"
++            >
++              <ReactMarkdown
++                remarkPlugins={previewPlugins}
++                skipHtml
++                components={LINK_PREVIEW_COMPONENTS}
++              >
++                {sample}
++              </ReactMarkdown>
++            </SettingsContent>
++          </div>
++          <p className="mt-1 text-xs text-muted-foreground">
++            The preview has no session, so only GitHub&rsquo;s owner/repo#123 links here. Bare #123,
++            PR #123 and !123 link in a session whose repository is on a listed git host.
++          </p>
++        </div>
++      </SettingsItem>
 +    </SettingsGroup>
 +  );
 +}
++
++// The preview's element map: a rule's link opens in a new tab; a session reference, which
++// only the chat can open, shows as text.
++const LINK_PREVIEW_COMPONENTS: Components = {
++  img: ({ alt }) => <span>{alt}</span>,
++  a: ({ href, title, children }) =>
++    href && /^[a-z][a-z\d+.-]*:/i.test(href) ? (
++      <a
++        href={href}
++        title={title ?? undefined}
++        rel="noreferrer"
++        target="_blank"
++        className="text-primary underline underline-offset-2"
++      >
++        {children}
++      </a>
++    ) : (
++      <span className="underline underline-offset-2">{children}</span>
++    ),
++};
 +
 +function LinkRuleRow({
 +  index,
@@ -2908,23 +2965,32 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +  onDelete: () => void;
 +}) {
 +  const errorId = `link-rule-${index}-error`;
++  // Every rule shows the same fields, so each is named after its own rule.
++  const ruleName = rule.name.trim() || `rule ${index + 1}`;
 +  return (
-+    <div className="mt-4 border-t border-border pt-4" data-testid={`link-rule-${index}`}>
++    <section
++      data-settings-region-row
++      aria-label={`Chat link rule ${ruleName}`}
++      className="mt-4 border-t border-border pt-4"
++      data-testid={`link-rule-${index}`}
++    >
 +      <div className="flex items-center gap-3">
 +        <Switch
++          data-settings-row-action="use"
 +          checked={rule.enabled}
 +          disabled={disabled}
 +          onCheckedChange={(enabled) => onChange({ enabled })}
-+          aria-label={`Use ${rule.name || "this rule"}`}
++          aria-label="Use rule"
 +          data-testid={`link-rule-${index}-enabled`}
 +          componentId="settings.general.link_rules.enabled"
 +        />
 +        <Input
++          data-settings-row-field="name"
 +          className="h-8 max-w-48"
 +          value={rule.name}
 +          disabled={disabled}
 +          onChange={(event) => onChange({ name: event.target.value })}
-+          aria-label="Rule name"
++          aria-label={`Name of rule ${index + 1}`}
 +          aria-describedby={error ? errorId : undefined}
 +          data-testid={`link-rule-${index}-name`}
 +        />
@@ -2933,11 +2999,12 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +        </span>
 +        <span className="flex-1" />
 +        <Button
++          data-settings-row-action="delete"
 +          variant="ghost"
 +          size="sm"
 +          disabled={disabled}
 +          onClick={onDelete}
-+          aria-label={`Delete ${rule.name || "this rule"}`}
++          aria-label="Delete rule"
 +          data-testid={`link-rule-${index}-delete`}
 +          componentId="settings.general.link_rules.delete"
 +        >
@@ -2947,22 +3014,24 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +      {rule.kind === "url" ? (
 +        <div className="mt-2 grid gap-2 sm:grid-cols-2">
 +          <Input
++            data-settings-row-field="pattern"
 +            className="h-8 font-mono"
 +            value={rule.pattern}
 +            disabled={disabled}
 +            placeholder="BST-{num} or /regex/"
 +            onChange={(event) => onChange({ pattern: event.target.value })}
-+            aria-label="Pattern"
++            aria-label={`Pattern for ${ruleName}`}
 +            aria-describedby={error ? errorId : undefined}
 +            data-testid={`link-rule-${index}-pattern`}
 +          />
 +          <Input
++            data-settings-row-field="url"
 +            className="h-8 font-mono"
 +            value={rule.url ?? ""}
 +            disabled={disabled}
 +            placeholder="https://jira.example.com/browse/BST-{num}"
 +            onChange={(event) => onChange({ url: event.target.value })}
-+            aria-label="Link URL"
++            aria-label={`Link URL for ${ruleName}`}
 +            aria-describedby={error ? errorId : undefined}
 +            data-testid={`link-rule-${index}-url`}
 +          />
@@ -2970,35 +3039,29 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +      ) : rule.kind === "git" ? (
 +        <>
 +          <div className="mt-2 grid gap-2 sm:grid-cols-2">
-+            <Select
-+              value={rule.provider ?? undefined}
++            <select
++              data-settings-row-field="provider"
++              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
++              value={rule.provider ?? ""}
 +              disabled={disabled}
-+              onValueChange={(provider) => onChange({ provider: provider as GitProviderId })}
-+              componentId="settings.general.link_rules.provider"
-+              valueHasNoPii
++              onChange={(event) => onChange({ provider: event.target.value as GitProviderId })}
++              aria-label={`Git provider for ${ruleName}`}
++              data-testid={`link-rule-${index}-provider`}
 +            >
-+              <SelectTrigger
-+                className="h-8"
-+                aria-label="Git provider"
-+                data-testid={`link-rule-${index}-provider`}
-+              >
-+                <SelectValue />
-+              </SelectTrigger>
-+              <SelectContent>
-+                {(Object.keys(GIT_PROVIDERS) as GitProviderId[]).map((provider) => (
-+                  <SelectItem key={provider} value={provider}>
-+                    {GIT_PROVIDERS[provider].label}
-+                  </SelectItem>
-+                ))}
-+              </SelectContent>
-+            </Select>
++              {(Object.keys(GIT_PROVIDERS) as GitProviderId[]).map((provider) => (
++                <option key={provider} value={provider}>
++                  {GIT_PROVIDERS[provider].label}
++                </option>
++              ))}
++            </select>
 +            <Input
++              data-settings-row-field="host"
 +              className="h-8 font-mono"
 +              value={rule.host ?? ""}
 +              disabled={disabled}
 +              placeholder="gitlab.example.com"
 +              onChange={(event) => onChange({ host: event.target.value })}
-+              aria-label="Host"
++              aria-label={`Host for ${ruleName}`}
 +              aria-describedby={error ? errorId : undefined}
 +              data-testid={`link-rule-${index}-host`}
 +            />
@@ -3017,6 +3080,185 @@ index 0000000000000000000000000000000000000000..b88c6e6429d09d611c7726792dc0068a
 +          {error}
 +        </p>
 +      )}
-+    </div>
++    </section>
 +  );
 +}
+diff --git a/web/src/pages/settings/search/catalog/general.ts b/web/src/pages/settings/search/catalog/general.ts
+index ebf855b7d6f9f187fced7917ecd3a8b6e829b9ca..0693b6db77c6ea938e95da7671d59cde6787cfd3 100644
+--- a/web/src/pages/settings/search/catalog/general.ts
++++ b/web/src/pages/settings/search/catalog/general.ts
+@@ -56,6 +56,57 @@ export const SESSION_TITLE_INSTRUCTIONS_ENTRY = settingsEntry({
+   },
+ });
+ 
++export const CHAT_LINK_RULES_ENTRY = settingsEntry({
++  id: "chat-link-rules",
++  section: "general",
++  label: "Chat links",
++  description:
++    "Turn short references in chat messages, such as an issue key, PR #123 or session:<id>, into links.",
++  keywords: [
++    "link rules",
++    "references",
++    "issue links",
++    "ticket",
++    "jira",
++    "git host",
++    "github",
++    "gitlab",
++    "azure devops",
++    "pull request",
++    "session links",
++  ],
++  parts: {
++    addRule: "Add rule",
++    addGitHost: "Add git host",
++    addSessions: "Add session references",
++    discard: "Discard chat link changes",
++    reset: "Reset chat links to defaults",
++    save: "Save chat links",
++    preview: "Preview text",
++  },
++  // Discard shows once a rule is edited; session references can be added back while none is listed.
++  presence: {
++    addSessions: { states: ["no session rule"] },
++    discard: { states: ["edited"] },
++  },
++  // The user's rules; none of their data is searchable. A field is named after its rule.
++  regions: {
++    rules: {
++      rowActions: { use: "Use rule", delete: "Delete rule" },
++      rowFields: {
++        name: { before: "Name of rule " },
++        pattern: { before: "Pattern for " },
++        url: { before: "Link URL for " },
++        provider: { before: "Git provider for " },
++        host: { before: "Host for " },
++      },
++    },
++  },
++  // The sample text rendered with the rules being edited.
++  contentAreas: ["preview"],
++  focus: "addRule",
++});
++
+ export const OPEN_SUBAGENTS_IN_PANEL_ENTRY = settingsEntry({
+   id: "open-subagents-in-panel",
+   section: "general",
+@@ -219,6 +270,7 @@ export const GENERAL_SETTINGS = [
+   BACKGROUND_SESSION_TITLES_ENTRY,
+   SESSION_TITLE_INSTRUCTIONS_ENTRY,
+   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
++  CHAT_LINK_RULES_ENTRY,
+   TERMINAL_CLIPBOARD_ENTRY,
+   OPEN_LINKS_IN_APP_ENTRY,
+   OPEN_IN_DESKTOP_APP_ENTRY,
+diff --git a/web/src/pages/settings/search/settingsPageAudit.test.tsx b/web/src/pages/settings/search/settingsPageAudit.test.tsx
+index acbd23382ab164c966bbc69bf300213663d12f08..987a237d76734e20e01383d6c35d674cf00c8d5d 100644
+--- a/web/src/pages/settings/search/settingsPageAudit.test.tsx
++++ b/web/src/pages/settings/search/settingsPageAudit.test.tsx
+@@ -170,6 +170,26 @@ const ROUTES: readonly SettingsRoute[] = [
+     },
+   },
+   { url: "/v1/settings/session-title-instructions", body: { instructions: null, max_chars: 500 } },
++  {
++    url: "/v1/link-rules",
++    body: {
++      supported: true,
++      saved: false,
++      version: 0,
++      rules: [
++        { name: "GitHub", kind: "git", provider: "github", host: "github.com", enabled: true },
++        {
++          name: "Tracker",
++          kind: "url",
++          pattern: "ABC-{num}",
++          url: "https://tracker.example.com/browse/ABC-{num}",
++          enabled: true,
++        },
++        { name: "Sessions", kind: "session", enabled: true },
++      ],
++      defaults: [],
++    },
++  },
+   {
+     url: "/v1/mcp-registry/services",
+     body: {
+@@ -415,6 +435,8 @@ const GENERAL_WEB_HIDES = {
+ const TITLES_LOADED = "0 / 500 characters";
+ const TITLES_SAVED = "16 / 500 characters";
+ const TITLES_FAILED = "Couldn't load your title instructions.";
++// What shows the chat link rules loaded.
++const CHAT_LINKS_LOADED = { label: "Name of rule 1" };
+ const NO_CONNECTIONS = "The server lists no GitHub or Databricks connection.";
+ 
+ /** A managed MCP service as the registry lists it. */
+@@ -659,14 +681,38 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
+   {
+     section: "general",
+     scenario: "web",
+-    ready: [TITLES_LOADED],
++    ready: [TITLES_LOADED, CHAT_LINKS_LOADED],
+     hides: GENERAL_WEB_HIDES,
+     states: { "session-title-instructions": ["loaded"] },
++    inlineActions: [
++      {
++        name: "a chat link rule added",
++        open: () => userEvent.click(screen.getByRole("button", { name: "Add rule" })),
++        witness: { label: "Discard chat link changes" },
++        states: { "chat-link-rules": ["edited"] },
++        close: () =>
++          userEvent.click(screen.getByRole("button", { name: "Discard chat link changes" })),
++      },
++      {
++        name: "session references removed",
++        open: () =>
++          userEvent.click(
++            within(screen.getByRole("region", { name: "Chat link rule Sessions" })).getByRole(
++              "button",
++              { name: "Delete rule" },
++            ),
++          ),
++        witness: { label: "Add session references" },
++        states: { "chat-link-rules": ["edited", "no session rule"] },
++        close: () =>
++          userEvent.click(screen.getByRole("button", { name: "Discard chat link changes" })),
++      },
++    ],
+   },
+   {
+     section: "general",
+     scenario: "web › title instructions saved",
+-    ready: [TITLES_SAVED],
++    ready: [TITLES_SAVED, CHAT_LINKS_LOADED],
+     hides: GENERAL_WEB_HIDES,
+     states: { "session-title-instructions": ["saved"] },
+     routes: [
+@@ -679,7 +725,7 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
+   {
+     section: "general",
+     scenario: "web › title instructions failed to load",
+-    ready: [TITLES_FAILED],
++    ready: [TITLES_FAILED, CHAT_LINKS_LOADED],
+     hides: GENERAL_WEB_HIDES,
+     states: { "session-title-instructions": ["load failed"] },
+     routes: [
+diff --git a/web/src/pages/settings/search/settingsUnownedBaseline.ts b/web/src/pages/settings/search/settingsUnownedBaseline.ts
+index b0a4c1c05c46ca339f31788efde5cc4c6f511b39..7b1b6965385ab5e0d8b025d5a5f3d8ce58fc4ba6 100644
+--- a/web/src/pages/settings/search/settingsUnownedBaseline.ts
++++ b/web/src/pages/settings/search/settingsUnownedBaseline.ts
+@@ -41,6 +41,14 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason:
+     count: 1,
+     reason: "Skill content area's entry is picked at runtime, which the guard can't read.",
+   },
++  "src/pages/settings/LinkRulesSettingsGroup.tsx › LINK_PREVIEW_COMPONENTS › a": {
++    count: 1,
++    reason: "Link inside the chat links preview's rendered sample.",
++  },
++  "src/pages/settings/LinkRulesSettingsGroup.tsx › LinkRulesSettingsGroup › SettingsContent": {
++    count: 1,
++    reason: "Chat links preview; its markdown's element map is a plain object.",
++  },
+   "src/pages/settings/SettingsHarnessesSection.tsx › CredentialCard › button": {
+     count: 1,
+     reason:

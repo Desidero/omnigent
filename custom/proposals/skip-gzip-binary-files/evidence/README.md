@@ -11,4 +11,4 @@ sharing.
 
 To capture:
 
-- N/A for this carried copy; evidence lives on #10585.
+- N/A: the series was dropped at the 2026-11-24 refresh (the fix landed upstream as #12362); evidence for the rest lives on #10585.
