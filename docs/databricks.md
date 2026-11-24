@@ -218,6 +218,13 @@ for the app source) go in one untracked file passed with
 is in the README's
 [Deployment overlay](../deploy/databricks/README.md#deployment-overlay) section.
 
+What a running app needs beyond the first deploy is in the README's
+[Configuring the app](../deploy/databricks/README.md#configuring-the-app)
+section: how the server config and the MCP registry reach the app and which
+config keys the Apps entry point honours, turning on smart routing, the
+per-user Databricks connection and its credential store, sharing defaults,
+and why sessions need a host.
+
 ### What you get on Databricks vs DIY
 
 Self-hosting the omnigent server (e.g., on a VM or in a container)
