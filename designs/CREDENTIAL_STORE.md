@@ -139,6 +139,46 @@ credential key. No AWS credentials sit in the pod; the KMS key ARN is passed as
 plain config (`OMNIGENT_CREDENTIAL_KMS_KEY_ID`), not a secret. The key + role +
 policy are provisioned in the infra repo (Pulumi, `cloud-infra/core`).
 
+### Databricks identity → KMS (Unity Catalog service credential)
+
+A server that runs as a Databricks identity and has no AWS identity of its own
+(a Databricks App's service principal, for one) has nothing in boto3's default
+credential chain. Without static IAM-user keys, it can still reach KMS through
+a Unity Catalog **service credential** that wraps an IAM role:
+
+```
+server (Databricks identity) → Unity Catalog: temporary credential for <name>
+Unity Catalog → AWS STS: assume the wrapped IAM role → short-lived AWS credentials
+server → AWS KMS: Encrypt / Decrypt, signed with them
+```
+
+Set `OMNIGENT_CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL=<service credential name>`
+next to `OMNIGENT_CREDENTIAL_KMS_KEY_ID`. The KMS client then takes its AWS
+credentials only from
+`WorkspaceClient().credentials.generate_temporary_service_credential(...)`,
+called with the server's ambient Databricks credentials
+(`uc_service_credential.py`): the default chain (`AWS_ACCESS_KEY_ID`, profiles,
+instance roles) is not consulted, nothing is fetched until the first
+encrypt/decrypt, and botocore fetches new credentials shortly before the
+current ones expire. If the workspace reports no expiry, a 20-minute lifetime is
+assumed. Unset, the cipher uses the default chain exactly as before.
+
+What the deployment provides:
+
+- **AWS:** a symmetric `ENCRYPT_DECRYPT` key, and an IAM role allowed
+  `kms:Encrypt` and `kms:Decrypt` on it (the cipher calls nothing else), with
+  the trust policy Unity Catalog asks for when the service credential is
+  created.
+- **Databricks:** a service credential wrapping that role, with `ACCESS`
+  granted to the server's identity only.
+- **Server:** the two variables above, an AWS region (`AWS_DEFAULT_REGION`),
+  and both the `kms` and `databricks` extras: the option needs the Databricks
+  SDK, which the `kms` extra does not pull in.
+
+Use one key and one role per deployment: the key protects that deployment's
+stored tokens, and changing it makes them unreadable, so every connected user
+reconnects once.
+
 ## Layers
 
 The stack has four layers, each with one job:
@@ -216,7 +256,9 @@ depth on the storage, not the session boundary.
 The credential store is backend-agnostic; each `SecretCipher` backend declares its
 own extra, both imported lazily:
 
-- **AWS KMS** (`KmsSecretCipher`) needs boto3 — `omnigent[kms]`.
+- **AWS KMS** (`KmsSecretCipher`) needs boto3 — `omnigent[kms]`. Signing with a
+  Unity Catalog service credential also needs the Databricks SDK
+  (`omnigent[databricks]`), imported lazily like boto3.
 - **HashiCorp Vault** (`VaultSecretCipher`, Transit) needs hvac — `omnigent[vault]`.
 
 boto3 / hvac load only when the matching backend is selected

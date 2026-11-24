@@ -12,7 +12,10 @@ by a key the server derives, and there is no global-key path.
 
 A deployment selects the key with ``OMNIGENT_CREDENTIAL_KMS_KEY_ID``; unset ⇒
 the credential store, and every integration built on it, is disabled. There is
-no non-KMS fallback. See ``designs/CREDENTIAL_STORE.md``.
+no non-KMS fallback. A server with no AWS identity of its own can name a Unity
+Catalog service credential in ``OMNIGENT_CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL``
+to get its AWS credentials from Databricks instead of boto3's default chain. See
+``designs/CREDENTIAL_STORE.md``.
 """
 
 from __future__ import annotations
@@ -79,10 +82,18 @@ def build_kms_secret_cipher() -> KmsSecretCipher | None:
 
     ``None`` when the key is unset — the KMS backend is simply not configured.
     boto3 stays lazy: this only reads env and constructs (no SDK import and no AWS
-    call until the first encrypt/decrypt).
+    call until the first encrypt/decrypt). ``OMNIGENT_CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL``
+    optionally names the Unity Catalog service credential to sign with.
     """
+    from omnigent.stores.credential_store.uc_service_credential import (
+        CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL_ENV_VAR,
+    )
+
     key_id = os.environ.get(CREDENTIAL_KMS_KEY_ENV_VAR, "").strip()
-    return KmsSecretCipher(key_id) if key_id else None
+    if not key_id:
+        return None
+    service_credential = os.environ.get(CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL_ENV_VAR, "").strip()
+    return KmsSecretCipher(key_id, uc_service_credential=service_credential or None)
 
 
 def build_secret_cipher() -> SecretCipher | None:
@@ -183,11 +194,21 @@ class KmsSecretCipher:
 
     :param key_id: KMS key id, ARN, or ``alias/…``.
     :param client: Optional pre-built boto3 KMS client (tests inject a fake).
+    :param uc_service_credential: Optional Unity Catalog service credential, e.g.
+        ``"omnigent-kms"``, whose AWS credentials the client signs with instead
+        of boto3's default chain.
     """
 
-    def __init__(self, key_id: str, *, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        key_id: str,
+        *,
+        client: Any | None = None,
+        uc_service_credential: str | None = None,
+    ) -> None:
         self._key_id = key_id
         self._client = client
+        self._uc_service_credential = uc_service_credential
 
     @property
     def _kms(self) -> Any:
@@ -200,7 +221,14 @@ class KmsSecretCipher:
                     "`pip install 'omnigent[kms]'`."
                 ) from exc
 
-            self._client = boto3.client("kms")
+            if self._uc_service_credential:
+                from omnigent.stores.credential_store.uc_service_credential import (
+                    build_kms_client,
+                )
+
+                self._client = build_kms_client(self._uc_service_credential)
+            else:
+                self._client = boto3.client("kms")
         return self._client
 
     def encrypt(self, plaintext: str, *, context: SecretContext) -> str:
