@@ -58,7 +58,12 @@ import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import {
+  isFunctionCallOutputItem,
+  isMessageItem,
+  type ConversationItem,
+  type MessageItem,
+} from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -75,7 +80,7 @@ import {
   createSession,
   getSessionSlim,
   getSessionUsage,
-  fetchSessionItemsPage,
+  fetchSessionItem,
   HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
@@ -108,7 +113,7 @@ import {
   isConversationStateKey,
   unsentWorkOf,
 } from "./conversationState";
-import { fetchConversationSnapshot } from "./conversationSnapshot";
+import { fetchConversationSnapshot, fetchHistoryPage } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -1560,6 +1565,13 @@ export interface ChatActions {
    * the same cursor, or while a page is in flight, is a no-op.
    */
   prefetchMoreHistory: (sessionId?: string) => void;
+  /**
+   * Fetch a lean history page's tool result in full and swap it into
+   * `blocks`. `itemId` is the result item (`resultItemId` on the tool's
+   * render item). Concurrent calls for one item share a single request;
+   * a result already loaded is a no-op.
+   */
+  loadToolOutput: (itemId: string, sessionId?: string) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -1641,7 +1653,7 @@ const prefetchedHistoryPages = new Map<
 conversationRegistry.subscribeDisposed((id) => prefetchedHistoryPages.delete(id));
 
 function fetchOlderHistoryPage(conversationId: string, cursor: string): Promise<SessionItemsPage> {
-  return fetchSessionItemsPage(conversationId, {
+  return fetchHistoryPage(conversationId, {
     olderThan: cursor,
     limit: OLDER_HISTORY_PAGE_ITEMS,
   });
@@ -4558,7 +4570,45 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     });
   },
+
+  loadToolOutput: async (itemId, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
+    if (!conversationId) return;
+    const current = setterForState(conversationId);
+    const block = current?.blocks.find((b) => b.type === "tool_result" && b.ctx.itemId === itemId);
+    if (
+      block === undefined ||
+      block.type !== "tool_result" ||
+      !("truncatedOutputLength" in block)
+    ) {
+      return;
+    }
+    const key = `${conversationId}:${itemId}`;
+    const inFlight = toolOutputLoads.get(key);
+    if (inFlight) return inFlight;
+    const load = (async () => {
+      const item = await fetchSessionItem(conversationId, itemId);
+      if (!isFunctionCallOutputItem(item)) return;
+      // Pinned like `loadMoreHistory`: the result belongs to this conversation
+      // even if the reader has switched away before it lands.
+      setterFor(conversationId)((s) => ({
+        blocks: s.blocks.map((b) => {
+          if (b.type !== "tool_result" || b.ctx.itemId !== itemId) return b;
+          const { truncatedOutputLength: _preview, ...full } = b;
+          return { ...full, output: item.output };
+        }),
+      }));
+    })().finally(() => {
+      toolOutputLoads.delete(key);
+    });
+    toolOutputLoads.set(key, load);
+    return load;
+  },
 }));
+
+// Full tool outputs in flight, keyed by `${conversationId}:${itemId}`, so a
+// row expanded twice (or two cards for one result) share one request.
+const toolOutputLoads = new Map<string, Promise<void>>();
 
 // ── Store-action setter ──────────────────────────────────
 //
@@ -6855,7 +6905,7 @@ async function rehydrateWindowOnReconnect(
   let fresh: SessionItemsPage;
   try {
     fresh = await withReadTimeout((signal) =>
-      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+      fetchHistoryPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
     );
   } catch {
     return "failed";
@@ -7034,7 +7084,7 @@ async function reconcileOnReconnect(
         client.setQueryData(["session", id], fresh);
         return fresh;
       }),
-      withReadTimeout((signal) => fetchSessionItemsPage(id, { signal })),
+      withReadTimeout((signal) => fetchHistoryPage(id, { signal })),
     ]);
   } catch {
     return "failed";
@@ -7069,7 +7119,7 @@ async function reconcileOnReconnect(
     let older: SessionItemsPage;
     try {
       older = await withReadTimeout((signal) =>
-        fetchSessionItemsPage(id, { olderThan: cursor, signal }),
+        fetchHistoryPage(id, { olderThan: cursor, signal }),
       );
     } catch (error) {
       // A cursor whose item was deleted can never be paged past. Stop the
