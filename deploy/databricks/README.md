@@ -438,6 +438,18 @@ and a credential-store key (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or
 `OMNIGENT_CREDENTIAL_VAULT_KEY`) to encrypt the stored tokens. The Apps entry
 point (`src/app.py`), `omnigent server`, and the Docker entry point all read these.
 
+**Credential store on an App (AWS KMS).** A Databricks App has no AWS identity,
+so the KMS backend cannot find credentials on its own. Create a Unity Catalog
+service credential that wraps an IAM role allowed `kms:Encrypt` and
+`kms:Decrypt` on the key, grant
+`ACCESS` on it to the app's service principal, and set
+`OMNIGENT_CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL` to its name, together with
+`OMNIGENT_CREDENTIAL_KMS_KEY_ID` (the key ARN) and `AWS_DEFAULT_REGION`. The app
+install also needs the `kms` extra. The server then exchanges its own identity
+for short-lived AWS credentials and renews them before they expire; no helper
+script, AWS config file or static key is involved. Details:
+[CREDENTIAL_STORE.md](../../designs/CREDENTIAL_STORE.md#databricks-identity--kms-unity-catalog-service-credential).
+
 **Stop and resume.** A Sandbox stopped by its idle timeout is started in place on
 the session's next turn, and its host is re-bootstrapped. While a runner is
 connected, the keepalive runs a command in the Sandbox so it does not idle-stop,
