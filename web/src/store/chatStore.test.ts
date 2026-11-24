@@ -21610,6 +21610,22 @@ describe("chatStore — setSubagentRouting", () => {
     expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
   });
 
+  it("targets a given session and leaves the active one alone", async () => {
+    seedSession("conv_sr_cell", []);
+    seedSession("conv_sr_active", []);
+    await useChatStore.getState().switchTo("conv_sr_cell");
+    await useChatStore.getState().switchTo("conv_sr_active");
+
+    await useChatStore.getState().setSubagentRouting("on", "conv_sr_cell");
+
+    expect(patchBodies("conv_sr_cell")).toEqual([{ subagent_routing_override: "on" }]);
+    expect(patchBodies("conv_sr_active")).toEqual([]);
+    expect(conversationRegistry.peek("conv_sr_cell")!.getState().subagentRoutingOverride).toBe(
+      "on",
+    );
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+
   it("hydrates from the session snapshot on bind and resets on switch-away", async () => {
     seedSession("conv_sr4", []);
     seedSession("conv_sr5", []);

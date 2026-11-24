@@ -948,6 +948,57 @@ async def test_create_stamps_subagent_routing_for_routed_sessions(
     assert snapshot.json()["subagent_routing_override"] == expected
 
 
+@pytest.mark.parametrize(
+    ("agent", "body", "marked"),
+    [
+        # Asked for on a model the caller picked: every launch installs the spawn gate.
+        (_WRAPPER, {"subagent_routing_override": "on"}, True),
+        (_CODEX_WRAPPER, {"subagent_routing_override": "on"}, True),
+        # Not asked for: a plain native create stays plain.
+        (_WRAPPER, {}, False),
+        (_WRAPPER, {"subagent_routing_override": "off"}, False),
+        # An SDK agent's spawns go through session create, which reads the switch.
+        (_BUNDLE, {"subagent_routing_override": "on"}, False),
+    ],
+)
+async def test_create_marks_a_native_session_that_asks_for_subagent_routing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    agent: str,
+    body: dict[str, Any],  # type: ignore[explicit-any]
+    marked: bool,
+) -> None:
+    from omnigent.runner.subagent_routing import (
+        SUBAGENT_ROUTING_LABEL_KEY,
+        routing_class_from_snapshot,
+    )
+
+    wrappers = await _native_wrappers(client, db_uri)
+    bundle = await create_test_agent(client, name=f"mark-{len(body)}-{marked}")
+    agent_ids = {
+        _WRAPPER: wrappers["claude-native"],
+        _CODEX_WRAPPER: wrappers["codex-native"],
+        _BUNDLE: str(bundle["id"]),
+    }
+
+    created = await client.post("/v1/sessions", json={**body, "agent_id": agent_ids[agent]})
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    assert (conv.labels.get(SUBAGENT_ROUTING_LABEL_KEY) == "1") is marked
+    # The session's own model is never routed by this switch.
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode=conv.cost_control_mode_override,
+        harness_override=conv.harness_override,
+        labels=conv.labels,
+    )
+    assert routing_class.subagent_routing is marked
+    assert routing_class.routing_enabled is False
+    assert routing_class.turn_routing is False
+    assert conv.cost_control_mode_override is None
+
+
 async def test_unrouted_create_writes_no_subagent_routing_key(
     client: httpx.AsyncClient,
     db_uri: str,

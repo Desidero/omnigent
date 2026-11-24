@@ -99,6 +99,7 @@ import {
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
+  NetworkIcon,
   PlusIcon,
   ShuffleIcon,
   WandSparklesIcon,
@@ -284,6 +285,7 @@ import {
   AUTO_NATIVE_HARNESS_ID,
   isAutoHarness,
   SMART_ROUTING_LABEL,
+  SUBAGENT_ROUTING_LABEL,
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
 import {
@@ -3117,6 +3119,9 @@ function NewChatLandingContent({
     _setCostControlMode(mode);
     if (mode === "on") _setPickedModel("");
   }, []);
+  // "Route sub-agents": Smart Routing picks the model of each sub-agent the
+  // session starts, while the session keeps the model picked here.
+  const [routeSubagents, setRouteSubagents] = useState(false);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
@@ -4538,6 +4543,8 @@ function NewChatLandingContent({
       !creating &&
       (!pickerLoading || pickerInteractiveWhileLoading),
   );
+  // Offered beside a picked model: with Smart Routing on, sub-agents route anyway.
+  const subagentRoutingOffered = smartRoutingEligible && !routingOn;
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
       <>
@@ -4556,6 +4563,17 @@ function NewChatLandingContent({
               <WandSparklesIcon className="size-4" aria-hidden="true" />
               {SMART_ROUTING_LABEL}
             </DropdownMenuCheckboxItem>
+            {subagentRoutingOffered && (
+              <DropdownMenuCheckboxItem
+                checked={routeSubagents}
+                onCheckedChange={setRouteSubagents}
+                onSelect={(event) => event.preventDefault()}
+                data-testid="new-chat-landing-agent-subagent-routing"
+              >
+                <NetworkIcon className="size-4" aria-hidden="true" />
+                {SUBAGENT_ROUTING_LABEL}
+              </DropdownMenuCheckboxItem>
+            )}
             <DropdownMenuSeparator />
           </>
         )}
@@ -6360,6 +6378,9 @@ function NewChatLandingContent({
       // sending both would silently disable routing for the whole session. Never
       // pin a model or an effort alongside routing, whatever the UI state says.
       const routingOwnsModel = costControlOverride === "on";
+      // Sub-agent routing on a session whose own model is the one picked here.
+      const subagentRoutingOverride =
+        subagentRoutingOffered && routeSubagents && !routingOwnsModel ? "on" : undefined;
       // A pinned native pane routes its MODEL at create too: the terminal
       // launches with the session row and its turns start in the TUI, so
       // routing after the fact means blocking the first prompt and replaying
@@ -6605,6 +6626,7 @@ function NewChatLandingContent({
                   ? null
                   : (selectedNativeHarness ?? pickedHarness ?? null),
                 costControlModeOverride: costControlOverride ?? null,
+                ...(subagentRoutingOverride ? { subagentRoutingOverride } : {}),
                 boundAgentId: effectiveAgentId,
                 // Name (not just id) so the in-session temp composer can evaluate
                 // routing eligibility (isCostRoutingSession needs a bound agent).
@@ -6715,6 +6737,7 @@ function NewChatLandingContent({
           model_override: normalizedModelOverride ?? undefined,
           reasoning_effort: normalizedReasoningEffort ?? undefined,
           cost_control_mode_override: costControlOverride,
+          subagent_routing_override: subagentRoutingOverride,
           // Top-level Smart Routing sends the same "auto" sentinel the bundle
           // path does; the server tells them apart by the bound agent being a
           // native wrapper, and routes at create time (the terminal launches

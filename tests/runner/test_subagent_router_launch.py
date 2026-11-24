@@ -15,13 +15,21 @@ from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner import subagent_routing
 from omnigent.runner.app import _build_spawn_env_from_spec, _ensure_session_subagent_router
 from omnigent.runner.native.orchestration import _start_subagent_router_for_native_session
-from omnigent.runner.subagent_routing import SessionRoutingClass
+from omnigent.runner.subagent_routing import (
+    AUTO_HARNESS_LABEL_KEY,
+    ROUTING_DECISION_LABEL_KEY,
+    SUBAGENT_ROUTING_LABEL_KEY,
+    SessionRoutingClass,
+    routing_class_from_snapshot,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 # The three session classes the codex launch paths distinguish.
 _PLAIN = SessionRoutingClass()
 _PINNED = SessionRoutingClass(routing_enabled=True)
 _AUTO = SessionRoutingClass(routing_enabled=True, auto_harness=True)
+# Created with sub-agent routing on while keeping the model the user picked.
+_SUBAGENT_ONLY = SessionRoutingClass(subagent_routing=True)
 
 
 class _DeadClient:
@@ -81,6 +89,62 @@ async def test_a_plain_native_launch_gets_no_router(tmp_path: Path, harness: str
         auto_harness=False,
     ) == (None, None)
     assert read_router_endpoint(tmp_path) is None
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_a_subagent_only_native_launch_installs_the_router(
+    tmp_path: Path, harness: str
+) -> None:
+    """A session that routes only its sub-agents gets the spawn gate too."""
+    advertised, router = _start_subagent_router_for_native_session(
+        "conv_native_launch",
+        bridge_dir=tmp_path,
+        harness=harness,
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=False,
+        auto_harness=False,
+        subagent_routing=True,
+    )
+    assert advertised == tmp_path
+    assert router is not None
+    assert read_router_endpoint(tmp_path) is not None
+
+
+@pytest.mark.parametrize(
+    ("labels", "cost_control_mode", "expected"),
+    [
+        ({}, None, _PLAIN),
+        # The coordinator's own model is not routed: no turn routing.
+        ({SUBAGENT_ROUTING_LABEL_KEY: "1"}, None, _SUBAGENT_ONLY),
+        ({SUBAGENT_ROUTING_LABEL_KEY: "0"}, None, _PLAIN),
+        (
+            {SUBAGENT_ROUTING_LABEL_KEY: "1"},
+            "on",
+            SessionRoutingClass(routing_enabled=True, turn_routing=True, subagent_routing=True),
+        ),
+        (
+            {AUTO_HARNESS_LABEL_KEY: "1", ROUTING_DECISION_LABEL_KEY: "dec_1"},
+            None,
+            _AUTO,
+        ),
+    ],
+)
+def test_the_routing_class_reads_the_subagent_routing_label(
+    labels: dict[str, str], cost_control_mode: str | None, expected: SessionRoutingClass
+) -> None:
+    assert (
+        routing_class_from_snapshot(
+            cost_control_mode=cost_control_mode, harness_override=None, labels=labels
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("harness", ["claude-sdk", "codex", "pi-native"])
+def test_subagent_only_routing_is_for_the_claude_and_codex_terminals(harness: str) -> None:
+    """Elsewhere the label alone changes nothing: those spawns have other gates."""
+    assert not _SUBAGENT_ONLY.routes_spawns(harness)
+    assert _PINNED.routes_spawns(harness)
 
 
 async def test_a_pinned_codex_sdk_session_gets_no_router(tmp_path: Path) -> None:
@@ -175,6 +239,16 @@ async def test_a_routed_claude_sdk_launch_installs_the_router(
     )
     env = subagent_routing.session_router_env("conv_sdk_launch", "claude-sdk")
     assert env["OMNIGENT_SUBAGENT_ROUTER_SESSION_ID"] == "conv_sdk_launch"
+
+
+async def test_a_subagent_only_claude_sdk_launch_gets_no_router() -> None:
+    await _ensure_session_subagent_router(
+        "conv_sdk_launch",
+        "claude-sdk",
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=_SUBAGENT_ONLY,
+    )
+    assert subagent_routing.session_router_env("conv_sdk_launch", "claude-sdk") == {}
 
 
 async def test_a_plain_claude_sdk_launch_gets_no_router() -> None:

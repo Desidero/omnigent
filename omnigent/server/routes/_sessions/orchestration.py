@@ -109,6 +109,8 @@ from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
+    SUBAGENT_ONLY_HOOK_HARNESSES,
+    SUBAGENT_ROUTING_LABEL_KEY,
     auto_harness_session,
     harness_family,
     subagent_routing_enabled,
@@ -13832,6 +13834,14 @@ async def _create_session_from_existing_agent(
         from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 
         initial_labels[AUTO_HARNESS_LABEL_KEY] = "1"
+    # A native create that asks for sub-agent routing itself is marked, so its
+    # launches install the spawn gate whether or not its own model is routed.
+    if (
+        body.subagent_routing_override == "on"
+        and (native_agent.harness if native_agent is not None else selected_harness)
+        in SUBAGENT_ONLY_HOOK_HARNESSES
+    ):
+        initial_labels[SUBAGENT_ROUTING_LABEL_KEY] = "1"
     # A managed create's chosen sandbox host id is born with the row: the caller
     # routes the session by it until the host binds, and a sidebar list read
     # racing the create must never return the row without it.

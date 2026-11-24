@@ -109,6 +109,23 @@ async def test_pinned_routed_session_sees_only_its_own_family() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subagent_only_session_sees_only_its_own_family() -> None:
+    """The family rule follows the switch, not who picked the session's model."""
+    remember_session_routing_class("conv_parent", SessionRoutingClass(subagent_routing=True))
+    seen: list[str] = []
+    listing = await _agent_list(
+        {
+            "id": "conv_parent",
+            "harness": "codex-native",
+            "subagent_routing_override": "on",
+            "labels": {"omnigent.routing.subagent_routing": "1"},
+        },
+        seen,
+    )
+    assert _names(listing) == ["codex", "mystery"]
+
+
+@pytest.mark.asyncio
 async def test_auto_harness_session_sees_every_family() -> None:
     remember_session_routing_class("conv_parent", _AUTO)
     seen: list[str] = []
