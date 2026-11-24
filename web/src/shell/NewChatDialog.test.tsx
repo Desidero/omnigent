@@ -11460,6 +11460,70 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  // "Route sub-agents" keeps the model picked here for the session itself and
+  // lets the router pick only the models of the sub-agents it starts.
+  it.each([
+    ["Claude Code", "a1", "Opus 4.8", true],
+    // The Codex default row is its own pick and pins nothing.
+    ["Codex", "a2", "GPT-5.5", false],
+  ] as const)(
+    "sends subagent_routing_override 'on' beside a picked %s model",
+    async (_label, agentId, model, pinsModel) => {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_subagent_routed" }),
+      } as unknown as Response);
+      renderLanding({ smart_routing_enabled: true });
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
+      openAgentModels(agentId);
+      pickPrimaryOption("model", model);
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Route sub-agents" }));
+      expect(screen.getByRole("menuitemcheckbox", { name: "Route sub-agents" })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+      closePrimaryPicker();
+
+      const { body } = await submitAndReadBody("refactor the auth module");
+      expect(body.agent_id).toBe(agentId);
+      expect(body.subagent_routing_override).toBe("on");
+      // The session's own model is the user's pick, never the router's.
+      expect(body.model_override !== undefined).toBe(pinsModel);
+      expect(body.cost_control_mode_override).toBeUndefined();
+      expect(body.smart_routing_message).toBeUndefined();
+      expect(body.harness_override).not.toBe("auto");
+    },
+  );
+
+  it("offers Route sub-agents only beside a model the user picks", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_routed" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentModels("a1");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Route sub-agents" }));
+    // Smart Routing routes the session and its sub-agents, so the row goes.
+    pickPrimaryOption("model", "Smart Routing");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Route sub-agents" })).toBeNull();
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body.cost_control_mode_override).toBe("on");
+    expect(body.subagent_routing_override).toBeUndefined();
+  });
+
+  it("offers no Route sub-agents on a server that cannot route", () => {
+    renderLanding({ smart_routing_enabled: false });
+    openAgentModels("a1");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Route sub-agents" })).toBeNull();
+  });
+
   // The prompt rides along on a PINNED native create too, so the server routes
   // the model before the pane launches. Routing after the fact means holding
   // the first prompt inside the harness and replaying it, which the user sees

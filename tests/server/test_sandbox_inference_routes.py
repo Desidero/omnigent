@@ -709,6 +709,38 @@ async def test_stale_revision_rejects_before_rows_artifacts_or_provisioning(env:
     env.launch.assert_not_called()
 
 
+@pytest.mark.parametrize("switch", ["cost_control_mode_override", "subagent_routing_override"])
+async def test_routing_switches_are_refused_on_a_bound_profile(env: _Env, switch: str):
+    """Neither the session's own routing nor its sub-agents' can leave the bound provider."""
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+        include_llm=False,
+    )
+    body = {
+        "agent_id": agent["id"],
+        "host_type": "managed",
+        "sandbox_provider": "agent_sandbox",
+        "inference_configuration_revision": "revision-1",
+    }
+    before = env.persisted()
+    refused = await env.client.post("/v1/sessions", json={**body, switch: "on"})
+    assert refused.status_code == 400, refused.text
+    assert "unavailable for a bound inference profile" in refused.text
+    assert env.persisted() == before
+    env.launch.assert_not_awaited()
+
+    created = await env.client.post("/v1/sessions", json=body)
+    assert created.status_code == 201, created.text
+    patched = await env.client.patch(f"/v1/sessions/{created.json()['id']}", json={switch: "on"})
+    assert patched.status_code == 400, patched.text
+    assert "unavailable for a bound inference profile" in patched.text
+    saved = env.store.get_conversation(created.json()["id"])
+    assert saved is not None
+    assert saved.cost_control_mode_override is None
+    assert saved.subagent_routing_override is None
+
+
 async def test_unlisted_patch_rejects_before_any_metadata_change(env: _Env):
     created = await _json_create(env, model_override="gateway/main", title="Original")
     assert created.status_code == 201, created.text
