@@ -1,13 +1,15 @@
 """Plan a release: its tag, and the previous release to compare with.
 
   plan.py --fork OWNER/NAME --custom SHA --patches-commit SHA [--date YYYY-MM-DD]
-          [--previous-manifest-out FILE]
+          [--set NAME] [--previous-manifest-out FILE]
 
 Prints shell assignments: tag, resume (1 when this exact build already has a
 tag, e.g. a re-run after a failed publish) and previous_tag. Tags are
 custom/<date>.<n>, n counting up from 1 per UTC day; existing tags are never
-reused for a different build. Reads the fork through `gh api` (GH_TOKEN) and
-`git ls-remote`; it never writes.
+reused for a different build. A build set (--set NAME, custom/sets/NAME.txt)
+has its own tags, custom/<date>.<n>-NAME, with their own count and their own
+previous release, so the two kinds never resume or follow each other. Reads
+the fork through `gh api` (GH_TOKEN) and `git ls-remote`; it never writes.
 """
 
 from __future__ import annotations
@@ -23,6 +25,16 @@ import urllib.parse
 from pathlib import Path
 
 TAG_RE = re.compile(r"^custom/(\d{4}-\d{2}-\d{2})\.(\d+)$")
+SET_NAME_RE = re.compile(r"^[a-z][a-z0-9]{0,19}$")
+
+
+def tag_pattern(set_name: str = "") -> re.Pattern[str]:
+    """Matches the release tags of one build set, or of the whole series."""
+    if not set_name:
+        return TAG_RE
+    if not SET_NAME_RE.match(set_name) or set_name == "dirty":
+        sys.exit(f"error: '{set_name}' is not a set name (see custom/scripts/series-files.sh)")
+    return re.compile(TAG_RE.pattern[:-1] + f"-{set_name}$")
 
 
 def gh_api(path: str) -> object:
@@ -65,25 +77,28 @@ def main() -> None:
     parser.add_argument("--custom", required=True)
     parser.add_argument("--patches-commit", required=True)
     parser.add_argument("--date", default=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d"))
+    parser.add_argument("--set", dest="set_name", default="")
     parser.add_argument("--previous-manifest-out")
     args = parser.parse_args()
 
-    tags = remote_tags(args.fork)
+    tag_re = tag_pattern(args.set_name)
+    suffix = f"-{args.set_name}" if args.set_name else ""
+    tags = {name: commit for name, commit in remote_tags(args.fork).items() if tag_re.match(name)}
     tag, resume = "", ""
     for name, commit in sorted(tags.items()):
         if commit == args.custom and f"Patches-Commit: {args.patches_commit}" in tag_message(args.fork, name):
             tag, resume = name, "1"
             break
     if not tag:
-        numbers = [int(m.group(2)) for m in map(TAG_RE.match, tags) if m and m.group(1) == args.date]
-        tag = f"custom/{args.date}.{max(numbers, default=0) + 1}"
+        numbers = [int(m.group(2)) for m in map(tag_re.match, tags) if m and m.group(1) == args.date]
+        tag = f"custom/{args.date}.{max(numbers, default=0) + 1}{suffix}"
 
-    # The previous release: the newest custom/* release other than this one.
+    # The previous release: the newest release of this kind other than this one.
     previous = ""
     releases = gh_api(f"repos/{args.fork}/releases?per_page=50")
     for release in sorted(releases, key=lambda r: r.get("created_at") or "", reverse=True):
         name = release.get("tag_name", "")
-        if TAG_RE.match(name) and name != tag and not release.get("draft"):
+        if tag_re.match(name) and name != tag and not release.get("draft"):
             previous = name
             if args.previous_manifest_out:
                 assets = {a["name"]: a for a in release.get("assets", [])}

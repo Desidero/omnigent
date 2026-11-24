@@ -28,6 +28,11 @@ custom/release/build.sh --tree /tmp/custom-tree --out /tmp/install-set
 custom/release/build-image.sh /tmp/install-set     # optional: loads the image locally
 ```
 
+For a [build set](../README.md#named-build-sets), pass `--set <name>` to both
+`build-custom.sh` and `build.sh`; `build.sh --tree <dir> --names-only [--set
+<name>]` prints the version, tag and image a build would get without building
+anything.
+
 Needs `uv`, Node 22 and pnpm (the web UI is built into the wheel), and Docker
 with buildx for the image. A local build gets the tag `build/<build-id>`,
 with the checkout's commit as the patches commit and a `.dirty` build id
@@ -85,6 +90,16 @@ or on a manual run with `dry_run=false` on `patches`. In order, it:
    which is why it is CI-owned and never a base for work.
 
 It never moves a tag or edits a published release.
+
+A build set is published only by a manual run with the `set` input
+(`gh workflow run custom-release.yml -R Desidero/omnigent --ref patches -f set=<name>`,
+plus `-f dry_run=false` for a real one). `plan.py --set` gives it the tag
+`custom/<date>.<n>-<set>`, counted, resumed and compared within that set, so
+it never takes or follows one of the whole series' tags; the tag message has
+a `Set:` line and the manifest a `set` field. Step 5 is skipped: `custom`
+stays on the latest release of the whole series. With `prerelease=false` the
+release is a full release but not the latest one. On a host its folder is
+`~/omnigent-deploy/<date>.<n>-<set>/`.
 
 Tokens: the workflow token by default; `CUSTOM_DEPLOY_KEY` or
 `CUSTOM_PUBLISH_TOKEN` in the `custom-release` environment replace it for

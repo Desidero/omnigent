@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build Omnigent with the series applied: BASE plus one commit per patch.
 #
-#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] [--only <series>,...] [--force] <branch>
-#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] [--only <series>,...] --worktree <dir>
+#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] [--only <series>,... | --set <name>] [--force] <branch>
+#   custom/scripts/build-custom.sh [--repo <clone>] [--fetch <url>] [--only <series>,... | --set <name>] --worktree <dir>
 #
 # <branch>     create (or with --force, reset) this branch in the clone to the
 #              built result, e.g. a local working branch to develop on.
@@ -15,6 +15,9 @@
 #              every series they need and custom-docs-index, in series order
 #              (series-files.sh --only prints what it adds). The index commit
 #              drops the sections of the series left out.
+# --set NAME   --only with the series custom/sets/NAME.txt lists: a named
+#              build set, which check.sh, select-tests.py and custom/release/
+#              take with the same option.
 #
 # The build is reproducible: patches are applied with a fixed committer
 # ($CUSTOM_COMMITTER_NAME / $CUSTOM_COMMITTER_EMAIL, default the GitHub Actions
@@ -40,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --fetch) fetch_url="$2"; shift 2 ;;
     --force) force=1; shift ;;
     --only) [[ $# -ge 2 ]] || usage 2; only+=(--only "$2"); shift 2 ;;
+    --set) [[ $# -ge 2 ]] || usage 2; only+=(--set "$2"); shift 2 ;;
     -h|--help) usage 0 ;;
     -*) echo "unknown option: $1" >&2; usage 2 ;;
     *) [[ -z "$branch" ]] || usage 2; branch="$1"; shift ;;

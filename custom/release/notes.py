@@ -85,10 +85,13 @@ def patch_id(path: Path) -> str:
     return result.stdout.decode().split(" ", 1)[0]
 
 
-def series_json(custom_dir: Path) -> list[dict]:
+def series_json(custom_dir: Path, only: set[str] | None = None) -> list[dict]:
+    """The series with their patch ids; `only` keeps the named ones (a build set)."""
     patches_dir = custom_dir / "patches"
     out = []
     for entry in parse_series(custom_dir):
+        if only is not None and entry["name"] not in only:
+            continue
         out.append(
             {
                 "name": entry["name"],
@@ -374,6 +377,13 @@ def render(args: argparse.Namespace) -> None:
         f"- **Series:** {len(manifest.get('series', []))}, "
         f"{sum(len(s['patches']) for s in manifest.get('series', []))} patches",
     ]
+    if manifest.get("set"):
+        header.append(
+            f"- **Set:** `{manifest['set']}`, a part of the series "
+            f"([`custom/sets/{manifest['set']}.txt`](https://github.com/{patches_repo}/blob/"
+            f"{manifest.get('patches_commit')}/custom/sets/{manifest['set']}.txt)); "
+            "the `custom` branch holds the whole series, not this build"
+        )
     if args.note:
         header.append(f"- {args.note}")
     header += [
@@ -411,9 +421,10 @@ def custom_docs(manifest: dict, tree: Path, custom_dir: Path, fork: str, ref: st
         f"(custom `{short(manifest['commit'])}`). Whole files are shown when the series adds "
         "them; otherwise the headed sections that hold its added lines. Links point at the fork.",
     ]
+    built = {entry["name"] for entry in manifest.get("series", [])} if manifest.get("set") else None
     for entry in parse_series(custom_dir):
         name = entry["name"]
-        if name == INDEX_SERIES:
+        if name == INDEX_SERIES or (built is not None and name not in built):
             continue
         per_file: dict[str, dict] = {}
         for patch in entry["patches"]:
@@ -468,6 +479,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("series")
     p.add_argument("--custom", required=True, help="the custom/ folder: series and patches/")
+    p.add_argument("--names", help="only these series, comma-separated (a build set)")
     p = sub.add_parser("render")
     for name in ("--manifest", "--tree", "--custom", "--fork", "--notes", "--docs"):
         p.add_argument(name, required=True)
@@ -478,7 +490,8 @@ def main() -> None:
         p.add_argument(name, required=True)
     args = parser.parse_args()
     if args.command == "series":
-        json.dump(series_json(Path(args.custom)), sys.stdout, indent=2)
+        only = set(filter(None, args.names.split(","))) if args.names else None
+        json.dump(series_json(Path(args.custom), only), sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.command == "render":
         render(args)

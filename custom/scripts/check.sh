@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Apply the series onto BASE and check the result.
 #
-#   custom/scripts/check.sh [--repo <clone>] [--tree <dir>] [--custom <ref>]
+#   custom/scripts/check.sh [--repo <clone>] [--tree <dir>] [--custom <ref>] [--set <name>]
 #
 # Besides applying cleanly, every patch must carry usage docs (touch a path in
 # DOC_PATHS) or a "Docs: none (<reason>)" trailer, every "# series:" needs a
 # "## <series>" section in docs/custom/README.md of the applied tree, and the
 # last series must be custom-docs-index, the commit that holds that index.
-# Each series must be one block that comes after every series it "# needs:".
+# Each series must be one block that comes after every series it "# needs:",
+# and every set file (custom/sets/<name>.txt) must name series that exist.
 #
 # --repo     Omnigent clone that has (or can fetch) the BASE commit
 #            (default: $OMNIGENT_REPO, else the clone this script is in).
@@ -15,12 +16,16 @@
 #            instead of applying the series again.
 # --custom   Also require the applied tree to equal <ref>'s tree, e.g. the
 #            working branch you exported from.
+# --set      Check the build of that set (build-custom.sh --set): the whole
+#            series still passes the rules above, but only the set's patches
+#            are applied (or expected in --tree) and indexed.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 repo="${OMNIGENT_REPO:-}"
 custom_ref=""
 tree_dir=""
+set_name=""
 
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 
@@ -29,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --repo) repo="$2"; shift 2 ;;
     --tree) tree_dir="$2"; shift 2 ;;
     --custom) custom_ref="$2"; shift 2 ;;
+    --set) set_name="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
@@ -97,16 +103,34 @@ mapfile -t -O "${#problems[@]}" problems < <(awk '
     if (!(need in seen)) print "series " current " needs " need ", which does not come before it"
   }
 ' "$here/series")
+# Every set file resolves: a set that names a dropped series fails here.
+for file in "$here"/sets/*.txt; do
+  name="$(basename "$file" .txt)"
+  reason="$("$here/scripts/series-files.sh" --set "$name" --names 2>&1 >/dev/null | tail -n 1)" \
+    || problems+=("set $name: ${reason#error: }")
+done
 if [[ ${#problems[@]} -gt 0 ]]; then
   printf '%s\n' "${problems[@]}" >&2
   fail "series check failed: ${problems[0]}"
+fi
+
+set_args=()
+left_out=()
+if [[ -n "$set_name" ]]; then
+  # From here on, only what the set builds: its series and what they need.
+  set_args=(--set "$set_name")
+  chosen="$("$here/scripts/series-files.sh" "${set_args[@]}" --names 2>/dev/null)" \
+    || { "$here/scripts/series-files.sh" "${set_args[@]}" --names >/dev/null || true; exit 2; }
+  mapfile -t left_out < <(printf '%s\n' "${series_names[@]}" | grep -vxF -f <(printf '%s\n' "$chosen") || true)
+  mapfile -t series_names <<< "$chosen"
+  mapfile -t patches < <("$here/scripts/series-files.sh" "${set_args[@]}" 2>/dev/null | xargs -r -n1 basename)
 fi
 
 if [[ -n "$tree_dir" ]]; then
   work="$(cd "$tree_dir" && pwd)"
   count="$(git -C "$work" rev-list --count "$base..HEAD")"
   [[ "$count" == "${#patches[@]}" ]] \
-    || fail "$work has $count commits on BASE, the series has ${#patches[@]}; rebuild it"
+    || fail "$work has $count commits on BASE, the series${set_name:+ in set $set_name} has ${#patches[@]}; rebuild it"
 else
   repo="$(cd "$repo" && pwd)"
   work="$(mktemp -d)/check"
@@ -115,8 +139,8 @@ else
     rm -rf "$(dirname "$work")"
   }
   trap cleanup EXIT
-  "$here/scripts/build-custom.sh" --repo "$repo" --worktree "$work" >/dev/null \
-    || fail "the series does not apply on ${base:0:12}"
+  "$here/scripts/build-custom.sh" --repo "$repo" "${set_args[@]}" --worktree "$work" >/dev/null \
+    || fail "the series${set_name:+ in set $set_name} does not apply on ${base:0:12}"
 fi
 
 # Quick sanity: no conflict markers, and changed Python and JSON files parse.
@@ -147,6 +171,12 @@ for name in "${series_names[@]}"; do
     problems+=("series $name has no '## $name' section in $INDEX_PATH")
   fi
 done
+# A set's build drops the sections of the series it leaves out.
+for name in "${left_out[@]}"; do
+  if grep -qxF -- "$name" <<< "$(printf '%s\n' "${indexed[@]}")"; then
+    problems+=("$INDEX_PATH has a '## $name' section, but set $set_name leaves $name out; rebuild with --set $set_name")
+  fi
+done
 if [[ ${#problems[@]} -gt 0 ]]; then
   printf '%s\n' "${problems[@]}" >&2
   fail "index check failed: ${problems[0]}"
@@ -160,7 +190,7 @@ if [[ -n "$custom_ref" ]]; then
     git -C "$ref_repo" diff --stat "$custom_ref" "$tip" >&2 || true
     fail "${#patches[@]} patches apply, but the tree differs from $custom_ref; re-run export.sh"
   fi
-  echo "${#patches[@]} patches apply on ${base:0:12} as ${tip:0:12} and match $custom_ref"
+  echo "${#patches[@]} patches${set_name:+ of set $set_name} apply on ${base:0:12} as ${tip:0:12} and match $custom_ref"
 else
-  echo "${#patches[@]} patches apply on ${base:0:12} as ${tip:0:12}"
+  echo "${#patches[@]} patches${set_name:+ of set $set_name} apply on ${base:0:12} as ${tip:0:12}"
 fi

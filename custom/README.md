@@ -24,6 +24,7 @@ are dropped from the series.
 | `custom/BASE` | The upstream commit the series applies to. The branch merges upstream up to exactly this commit. |
 | `custom/series` | The patches in apply order, grouped into named series (`# series: <name>`), one block per series. A `# needs: <name>` line means that series expects another one first, and it comes earlier in the file. |
 | `custom/patches/*.patch` | `git format-patch` files, one per commit, named `<series>--<subject>.patch`. |
+| `custom/sets/<name>.txt` | Named [build sets](#named-build-sets): the series one kind of build holds, one per line. Without a set, a build is the whole series. |
 | `custom/proposals/<series>/` | The draft upstream PR description (`PR.md`), a draft issue where useful (`issue.md`), and `evidence/` (screenshots and logs to attach). `_reviews/` and `_watch/` hold review notes and drafts for upstream threads we only follow. |
 | `custom/scripts/` | Build, export, check, refresh and the upstream-workflow switch (below). |
 | `custom/release/` | Install set, server image, release publishing, host install scripts ([`release/README.md`](release/README.md)). |
@@ -174,6 +175,51 @@ series instead of their files. A `# needs:` line also covers a series that
 only conflicts without another one (two rows added next to each other in the
 same table, say), so that every set applies.
 
+A partial build is for building and running. Export (`export.sh`) only from a
+working branch that holds the whole series: it writes `custom/patches/` to
+match the branch, so the series a partial branch leaves out would be removed.
+
+### Named build sets
+
+When the same series feeds more than one kind of build, give each kind a set
+file instead of repeating an `--only` list: `custom/sets/<name>.txt` lists the
+series that build holds, one per line (`#` starts a comment). As with
+`--only`, the series they need and `custom-docs-index` are added and
+`custom/series` gives the order. [`sets/fixes.txt`](sets/fixes.txt), the
+bug-fix series only, is an example.
+
+```bash
+custom/scripts/series-files.sh --set fixes --names     # what the set resolves to
+custom/scripts/build-custom.sh --set fixes work/fixes   # build it
+custom/scripts/check.sh --set fixes                     # apply and check just the set
+custom/scripts/select-tests.py --set fixes --tree <dir> --out <dir> --all
+custom/release/build.sh --set fixes --tree <dir> --out <dir>
+```
+
+Every command without `--set` works on the whole series, exactly as before,
+and nothing about the whole series' builds, tags or `custom` changes when a
+set exists.
+
+- **Names.** A set name is lowercase letters and digits, starts with a
+  letter, is at most 20 characters and is not `dirty`, because it becomes
+  part of a version, a git tag and an image tag.
+- **Checks.** `check.sh` (and so CI on every pull request) fails when a set
+  file names a series that does not exist, so dropping a series means
+  editing the sets that list it; CI also applies each set. `check.sh --set`
+  checks that set's build: its patches apply, the index has a section for
+  each of its series and none for the ones left out.
+- **Tests.** `select-tests.py --set` selects from the set's patches only; a
+  change to the set file selects all of them.
+- **Releases.** A set is released by a manual run of the workflow with the
+  `set` input, never by a merge. Its names carry the set and cannot collide
+  with the whole series' ([Releases](#releases)): version
+  `<upstream version>+oss<BASE:8>.p<patches commit:7>.<set>`, tag
+  `custom/<date>.<n>-<set>` (its own count per day), image tag
+  `custom-<date>.<n>-<set>`. Its notes are compared with the same set's
+  previous release. `custom` is not moved, since it stands for the whole
+  series: the tag is what holds a set's built commit. A set release is never
+  marked as the latest release.
+
 ## What CI does
 
 `.github/workflows/custom-release.yml`, on this fork only:
@@ -182,7 +228,7 @@ same table, say), so that every set applies.
 | --- | --- |
 | Pull request into `patches` | `apply` (the required check: tree rule, build with `build-custom.sh`, `check.sh --tree`, unit tests of `scripts/` and `release/`, test selection), `web` (`tsc -b` and the selected vitest files), `python` (the selected pytest files), `package` (the install set as an artifact, the server image built and smoke-tested but not pushed; the notes go to the job summary), `upstream-workflows` (below) |
 | Push to `patches` that changes `custom/BASE`, `custom/series`, `custom/patches/**`, `custom/release/**` (not its Markdown), `custom/scripts/build-custom.sh`, `check.sh`, `check-tree.sh` or `select-tests.py`, the workflow, or its action | The same, then `publish`: tags the build, pushes the image to GHCR, creates the pre-release and then moves `custom` to it. A merge that only changes docs, proposals or the tracker makes no release. |
-| Manual run (`workflow_dispatch`) | Inputs: `dry_run` (default true: everything, with `publish` printing the pushes, tag, image push and release instead of doing them; a run on any ref other than `patches` is always dry), `prerelease` (default true; false marks a real run's release as the latest full release), `all_tests` (default false; true runs the tests of every patch) |
+| Manual run (`workflow_dispatch`) | Inputs: `dry_run` (default true: everything, with `publish` printing the pushes, tag, image push and release instead of doing them; a run on any ref other than `patches` is always dry), `prerelease` (default true; false marks a real run's release as the latest full release), `all_tests` (default false; true runs the tests of every patch), `set` (default empty: the whole series; a name builds, tests and releases that [build set](#named-build-sets) and leaves `custom` alone) |
 | Daily schedule | Only `upstream-workflows`. Schedules run from the default branch only, so this needs `patches` to be the default branch. |
 
 Test selection (`scripts/select-tests.py`): for each patch whose content
@@ -322,7 +368,9 @@ Done on 2026-10-28, in this order:
   built commit, `n` counting from 1 per UTC day. Tags are never moved or
   reused: a re-run of the same build resumes its tag, anything else gets the
   next number. The date says how old a build is and sorts; the `custom/`
-  prefix keeps it apart from upstream's version tags.
+  prefix keeps it apart from upstream's version tags. A
+  [build set](#named-build-sets)'s tag ends in `-<set>` and has its own
+  count; its version ends in `.<set>`.
 - **Version** `<upstream version>+oss<BASE:8>.p<patches commit:7>`, a PEP 440
   local version, where the patches commit is the `patches` branch commit the
   build is from, e.g. `0.20.0.dev0+oss65be0f24.p0123abc` (illustrative). It

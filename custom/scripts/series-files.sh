@@ -3,6 +3,7 @@
 #
 #   custom/scripts/series-files.sh [--needs] <series>...
 #   custom/scripts/series-files.sh --only <series>[,<series>...] [--names]
+#   custom/scripts/series-files.sh --set <name> [--names]
 #   custom/scripts/series-files.sh --all
 #
 # Paths are absolute, one per line, in the order custom/series lists them.
@@ -15,6 +16,10 @@
 # space-separated, the option may repeat), every series they need, and always
 # custom-docs-index. It prints each series it added, and why, on stderr.
 # --names prints the chosen series' names instead of their files.
+# --set is --only with the series a set file lists: custom/sets/<name>.txt,
+# one series per line, '#' starts a comment. A set name is lowercase letters
+# and digits, starting with a letter, at most 20 characters, and not "dirty":
+# it becomes part of a build's version and tags.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,6 +40,18 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || usage 2
       only=1; needs=1
       read -r -a listed <<< "${2//,/ }"
+      wanted+=("${listed[@]}")
+      shift 2 ;;
+    --set)
+      [[ $# -ge 2 ]] || usage 2
+      if [[ ! "$2" =~ ^[a-z][a-z0-9]{0,19}$ || "$2" == dirty ]]; then
+        echo "error: '$2' is not a set name (lowercase letters and digits, starting with a letter, at most 20, not 'dirty')" >&2
+        exit 2
+      fi
+      [[ -f "$here/sets/$2.txt" ]] || { echo "error: no set named $2 (custom/sets/$2.txt)" >&2; exit 2; }
+      mapfile -t listed < <(awk '{ sub(/#.*/, "") } NF { for (i = 1; i <= NF; i++) print $i }' "$here/sets/$2.txt")
+      [[ ${#listed[@]} -gt 0 ]] || { echo "error: set $2 lists no series" >&2; exit 2; }
+      only=1; needs=1
       wanted+=("${listed[@]}")
       shift 2 ;;
     --names) names=1; shift ;;

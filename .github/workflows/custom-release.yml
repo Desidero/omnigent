@@ -19,6 +19,9 @@ name: custom-release
 #
 # Manual run: a dry run by default (and always on a ref other than patches):
 # everything, with publish printing the pushes, tag, image push and release.
+# With `set`, it builds, tests and releases that build set
+# (custom/sets/<name>.txt) instead of the whole series, as
+# custom/<date>.<n>-<set>, and leaves the custom branch alone.
 # Daily schedule (runs only while patches is the default branch): only the
 # job that switches upstream's workflows off.
 
@@ -55,6 +58,10 @@ on:
         description: Run the tests for every patch, not only the changed ones
         type: boolean
         default: false
+      set:
+        description: Build this set (custom/sets/<name>.txt) instead of the whole series
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -69,6 +76,8 @@ env:
   PATCHES_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
   # A release run: a push to patches, or a manual run (dry or not).
   RELEASE_RUN: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+  # The build set of a manual run; empty (the whole series) everywhere else.
+  CUSTOM_SET: ${{ inputs.set }}
 
 jobs:
   upstream-workflows:
@@ -118,9 +127,19 @@ jobs:
 
       - id: tree
         uses: ./.github/actions/custom-build-tree
+        with:
+          set: ${{ env.CUSTOM_SET }}
 
       - name: Check docs, sanity and the index
-        run: custom/scripts/check.sh --tree "$RUNNER_TEMP/tree"
+        run: custom/scripts/check.sh --tree "$RUNNER_TEMP/tree" ${CUSTOM_SET:+--set "$CUSTOM_SET"}
+
+      - name: Check that every build set applies
+        if: env.CUSTOM_SET == ''
+        run: |
+          shopt -s nullglob
+          for file in custom/sets/*.txt; do
+            custom/scripts/check.sh --repo . --set "$(basename "$file" .txt)"
+          done
 
       - name: Unit-test the scripts and the release tooling
         run: |
@@ -138,19 +157,23 @@ jobs:
           # since the previous release. No previous release, or a moved BASE
           # (select-tests.py sees it), means every patch.
           since=""
+          set_args=()
+          [[ -z "$CUSTOM_SET" ]] || set_args=(--set "$CUSTOM_SET")
           if [[ "$ALL_TESTS" != true && "$EVENT" == pull_request ]]; then
             since="$PR_BASE"
           elif [[ "$ALL_TESTS" != true ]]; then
-            previous="$(git for-each-ref --sort=-creatordate --count=1 --format='%(refname)' 'refs/tags/custom/*')"
+            # The newest release of the same kind: custom/<date>.<n>, or this set's custom/<date>.<n>-<set>.
+            previous="$(git for-each-ref --sort=-creatordate --format='%(refname)' 'refs/tags/custom/*' \
+              | grep -E "^refs/tags/custom/[0-9-]+\.[0-9]+${CUSTOM_SET:+-$CUSTOM_SET}\$" | head -n 1 || true)"
             if [[ -n "$previous" ]]; then
               since="$(git for-each-ref --format='%(contents)' "$previous" | sed -n 's/^Patches-Commit: //p' | head -n 1)"
               echo "previous release: ${previous#refs/tags/} (patches ${since:0:12})"
             fi
           fi
           if [[ -n "$since" ]] && git cat-file -e "$since^{commit}" 2>/dev/null; then
-            custom/scripts/select-tests.py --tree "$RUNNER_TEMP/tree" --out selection --since "$since"
+            custom/scripts/select-tests.py --tree "$RUNNER_TEMP/tree" --out selection --since "$since" "${set_args[@]}"
           else
-            custom/scripts/select-tests.py --tree "$RUNNER_TEMP/tree" --out selection --all
+            custom/scripts/select-tests.py --tree "$RUNNER_TEMP/tree" --out selection --all "${set_args[@]}"
           fi
           for kind in pytest vitest-run vitest-related; do
             echo "$kind=$(tr '\n' ' ' < "selection/$kind.txt")" >> "$GITHUB_OUTPUT"
@@ -173,6 +196,8 @@ jobs:
           ref: ${{ env.PATCHES_COMMIT }}
           persist-credentials: false
       - uses: ./.github/actions/custom-build-tree
+        with:
+          set: ${{ env.CUSTOM_SET }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -211,6 +236,8 @@ jobs:
           ref: ${{ env.PATCHES_COMMIT }}
           persist-credentials: false
       - uses: ./.github/actions/custom-build-tree
+        with:
+          set: ${{ env.CUSTOM_SET }}
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.13.4"
@@ -257,6 +284,8 @@ jobs:
           persist-credentials: false
       - id: tree
         uses: ./.github/actions/custom-build-tree
+        with:
+          set: ${{ env.CUSTOM_SET }}
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.13.4"
@@ -280,7 +309,7 @@ jobs:
         run: |
           python3 -I custom/release/plan.py --fork "$GITHUB_REPOSITORY" --custom "$CUSTOM_COMMIT" \
             --patches-commit "$PATCHES_COMMIT" --previous-manifest-out previous-manifest.json \
-            | tee plan.env
+            ${CUSTOM_SET:+--set "$CUSTOM_SET"} | tee plan.env
           cat plan.env >> "$GITHUB_OUTPUT"
 
       - name: Build the install set
@@ -293,6 +322,7 @@ jobs:
           args=(--tree "$RUNNER_TEMP/tree" --out out --patches-commit "$PATCHES_COMMIT"
             --fork "$GITHUB_REPOSITORY" --image "$IMAGE_NAME")
           [[ -z "$TAG" ]] || args+=(--tag "$TAG")
+          [[ -z "$CUSTOM_SET" ]] || args+=(--set "$CUSTOM_SET")
           [[ ! -s previous-manifest.json ]] || args+=(--previous-manifest previous-manifest.json)
           if [[ -n "$PR_NUMBER" ]]; then
             args+=(--note "**Pull request:** https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER (a build to try, not a release)")
@@ -357,6 +387,8 @@ jobs:
           persist-credentials: false
       - id: tree
         uses: ./.github/actions/custom-build-tree
+        with:
+          set: ${{ env.CUSTOM_SET }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ needs.package.outputs.artifact }}
