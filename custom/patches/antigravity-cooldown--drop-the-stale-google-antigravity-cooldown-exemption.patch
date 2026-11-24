@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Sun, 22 Nov 2026 03:22:09 +0000
+Subject: [PATCH] build(deps): drop the stale google-antigravity cooldown
+ exemption
+
+uv.toml exempted google-antigravity from the 7-day dependency cooldown
+with a fixed `exclude-newer-package` date (2026-06-12) so the then-new
+SDK could resolve. A fixed date also excludes every later release, so
+uv.lock stayed on 0.1.2 while PyPI moved on. The package is well past
+the cooldown, so remove the exemption as its comment asked and re-lock
+with `uv lock --upgrade-package google-antigravity`, which picks
+0.1.23 (the newest release older than 7 days). No other locked
+package changes: 0.1.23's new `protobuf>=7.35` floor is already met by
+the locked protobuf 7.35.1.
+
+0.1.23 no longer fills `Step.usage_metadata` (it is deprecated, and
+usage now arrives as conversation-level updates), so the antigravity
+executor would report no token usage for a turn. After the step stream
+ends, read `conversation.last_turn_usage`, which both 0.1.2 and 0.1.23
+expose as the per-turn total, and keep the per-step value as a
+fallback. The rest of the SDK surface the executor uses is unchanged.
+
+Upstream pull request: https://github.com/omnigent-ai/omnigent/pull/14704.
+
+Not upstream yet: proposed from fix/antigravity-cooldown; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (dependency re-lock and a token-usage fix in the antigravity harness; no setting)
+---
+ omnigent/inner/antigravity_executor.py   |  9 ++++-
+ tests/inner/test_antigravity_executor.py | 49 ++++++++++++++++++++++--
+ uv.lock                                  | 14 +++----
+ uv.toml                                  |  5 +--
+ 4 files changed, 61 insertions(+), 16 deletions(-)
+
+diff --git a/omnigent/inner/antigravity_executor.py b/omnigent/inner/antigravity_executor.py
+index 5b76d3f47fd92aa7a1e7abf1896399c93166c40c..d747d8e8a713d5de1e545d2fc83b31ab0e007b41 100644
+--- a/omnigent/inner/antigravity_executor.py
++++ b/omnigent/inner/antigravity_executor.py
+@@ -19,7 +19,9 @@ Streaming model:
+ 
+ - ``agent.conversation.receive_steps()`` yields :class:`Step` objects as the
+   turn runs (``content_delta``, ``thinking_delta``, ``tool_calls``,
+-  ``status``, ``usage_metadata``), ending once the turn goes idle. A producer
++  ``status``), ending once the turn goes idle. Token usage comes from
++  ``conversation.last_turn_usage``, or ``Step.usage_metadata`` on SDKs that
++  still set it. A producer
+   task drives ``send()`` + ``receive_steps()`` and feeds a per-turn
+   :class:`asyncio.Queue`; :meth:`run_turn` drains it and yields mapped events.
+ - Tool *requests* derive from ``Step.tool_calls`` (deduped by call id); tool
+@@ -647,6 +649,11 @@ class AntigravityExecutor(Executor):
+                     )
+                     queue.put_nowait(ExecutorError(message=message, retryable=(status == "ERROR")))
+                     return
++            # Newer SDKs leave ``Step.usage_metadata`` unset and track usage on
++            # the conversation, so prefer its per-turn total when it exposes one.
++            turn_usage = getattr(conversation, "last_turn_usage", None)
++            if turn_usage is not None:
++                state.last_usage = turn_usage
+         except asyncio.CancelledError:
+             # Consumer teardown; conversation.cancel() already requested by
+             # interrupt_session, nothing to emit.
+diff --git a/tests/inner/test_antigravity_executor.py b/tests/inner/test_antigravity_executor.py
+index 33e9780795bd890cf12b27a36d0916e719d9492b..316fab2baf2b8d18e76f61cae62886531d1891b6 100644
+--- a/tests/inner/test_antigravity_executor.py
++++ b/tests/inner/test_antigravity_executor.py
+@@ -168,11 +168,17 @@ _TurnAction = _YieldStep | _FireToolResult | _RaiseCancelled | _RaiseGeneric
+ class _FakeConversation:
+     """Mirror of ``google.antigravity.conversation.Conversation`` (read paths)."""
+ 
+-    def __init__(self, hooks: list[Any], scripts: collections.deque[list[_TurnAction]]) -> None:
++    def __init__(
++        self,
++        hooks: list[Any],
++        scripts: collections.deque[list[_TurnAction]],
++        turn_usage: _FakeUsage | None = None,
++    ) -> None:
+         self._hooks = hooks
+         self._scripts = scripts
+         self.sends: list[str] = []
+         self.cancel_called = 0
++        self.last_turn_usage = turn_usage
+ 
+     async def send(self, prompt: Any, **_kwargs: Any) -> None:
+         self.sends.append(prompt)
+@@ -195,9 +201,16 @@ class _FakeConversation:
+ 
+ 
+ class _FakeAgent:
+-    def __init__(self, config: Any, scripts: collections.deque[list[_TurnAction]]) -> None:
++    def __init__(
++        self,
++        config: Any,
++        scripts: collections.deque[list[_TurnAction]],
++        turn_usage: _FakeUsage | None = None,
++    ) -> None:
+         self.config = config
+-        self._conversation = _FakeConversation(list(getattr(config, "hooks", []) or []), scripts)
++        self._conversation = _FakeConversation(
++            list(getattr(config, "hooks", []) or []), scripts, turn_usage
++        )
+         self.closed = False
+ 
+     @property
+@@ -251,12 +264,15 @@ def _install_fake_sdk(
+     monkeypatch: pytest.MonkeyPatch,
+     *,
+     scripts: list[list[_TurnAction]],
++    turn_usage: _FakeUsage | None = None,
+ ) -> dict[str, Any]:
+     """Patch ``_ensure_antigravity_sdk`` to return a fake module.
+ 
+     :param monkeypatch: pytest monkeypatch fixture.
+     :param scripts: One turn-script (list of actions) per ``receive_steps`` call,
+         consumed front-to-back across turns / agent rebuilds.
++    :param turn_usage: The conversation's ``last_turn_usage``, or ``None`` for an
++        SDK that reports usage only on steps.
+     :returns: A ``captured`` dict exposing the agents / configs built, so tests
+         can assert on what the executor passed to the SDK.
+     """
+@@ -276,7 +292,7 @@ def _install_fake_sdk(
+ 
+         @staticmethod
+         def Agent(config: Any) -> _FakeAgent:
+-            agent = _FakeAgent(config, queue)
++            agent = _FakeAgent(config, queue, turn_usage)
+             captured["agents"].append(agent)
+             captured["configs"].append(config)
+             return agent
+@@ -369,6 +385,31 @@ async def test_streaming_maps_text_reasoning_and_usage(monkeypatch: pytest.Monke
+     }
+ 
+ 
++@pytest.mark.asyncio
++async def test_turn_usage_comes_from_conversation_when_steps_carry_none(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """SDKs that leave ``Step.usage_metadata`` unset still report the turn's usage."""
++    script: list[_TurnAction] = [
++        _text_step("Hello"),
++        _YieldStep(_FakeStep(step_type=_StepType.FINISH, status=_StepStatus.DONE)),
++    ]
++    _install_fake_sdk(monkeypatch, scripts=[script], turn_usage=_FakeUsage())
++    executor = AntigravityExecutor(model="gemini-3-pro", api_key="k")
++
++    events = await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
++
++    completes = [e for e in events if isinstance(e, TurnComplete)]
++    assert len(completes) == 1
++    assert completes[0].usage == {
++        "input_tokens": 9,
++        "output_tokens": 7,
++        "total_tokens": 18,
++        "cache_read_input_tokens": 2,
++        "model": "gemini-3-pro",
++    }
++
++
+ def test_extract_usage_subtracts_cached_to_avoid_double_billing() -> None:
+     """``input_tokens`` excludes cached tokens so cache reads aren't billed twice.
+ 
+diff --git a/uv.lock b/uv.lock
+index 3750ff8807fcc055f261ec17d2f4c9e2ae8610bf..5345e2039d2c21707e9455e0982a8bc73fa305b0 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -40,7 +40,6 @@ exclude-newer-span = "P7D"
+ 
+ [options.exclude-newer-package]
+ cwsandbox = "2026-06-12T00:00:00Z"
+-google-antigravity = "2026-06-12T00:00:00Z"
+ nimble-python = "2026-07-29T00:00:00Z"
+ 
+ [manifest]
+@@ -1697,7 +1696,7 @@ wheels = [
+ 
+ [[package]]
+ name = "google-antigravity"
+-version = "0.1.2"
++version = "0.1.23"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "absl-py" },
+@@ -1709,11 +1708,12 @@ dependencies = [
+     { name = "websockets" },
+ ]
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/03/d5/c6dc9b06d8248059c4ebba3489f620be1e53b03528f822c0fcf9b2dcc1bf/google_antigravity-0.1.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:129f370b44320aefc00999ccf7c97418cd40252c5d3c07c3569843224500ffc5", size = 30044136, upload-time = "2026-06-04T21:19:14.18Z" },
+-    { url = "https://files.pythonhosted.org/packages/ca/b0/a2cd625471f365601f45315b21ec02c4f9499180c00a88544bb88be567ec/google_antigravity-0.1.2-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:e888b2aa0b39d4526eb4add020c6bd5c1a2bfc8e4a3e5c228fc1698af2de4011", size = 32525913, upload-time = "2026-06-04T21:19:17.176Z" },
+-    { url = "https://files.pythonhosted.org/packages/73/af/36b933c23f9114c58185ea18c7c12ab40e862f06a3074bdcc6ab6208fcc6/google_antigravity-0.1.2-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:5e7a7d88f3f6401b8efbf45477184874c60e387990e9ddb52686aad0da0be5f2", size = 35584793, upload-time = "2026-06-04T21:19:20.61Z" },
+-    { url = "https://files.pythonhosted.org/packages/77/e4/d51b1003c03a2acb35919bf1e681974ec584f4354d3529bcaa79856d3c1c/google_antigravity-0.1.2-py3-none-win_amd64.whl", hash = "sha256:000fc0d3c0ef35551c7fc683a090ff2a61a20c5fedaad4d5e482239499d63207", size = 34671491, upload-time = "2026-06-04T21:19:23.747Z" },
+-    { url = "https://files.pythonhosted.org/packages/4f/c4/0acbd66d9150f25ab693c3bfa14d440c48fa1e6dd32cdfe243f901cc1b61/google_antigravity-0.1.2-py3-none-win_arm64.whl", hash = "sha256:40cc33c30469008ee3f78e6cc8130cff9ad4e1d66c0a82b59740965a901d8b62", size = 31367318, upload-time = "2026-06-04T21:19:26.763Z" },
++    { url = "https://files.pythonhosted.org/packages/78/1e/71a0db889bdc339ae2ddbf7875366959660dc108c803c6b17242fcca41bc/google_antigravity-0.1.23-py3-none-macosx_11_0_arm64.whl", hash = "sha256:92dc71a52afde0ff8424534e728cc6e168489773b61457b88dcd1c634af4ff6c", size = 40142117, upload-time = "2026-10-28T16:50:40.579Z" },
++    { url = "https://files.pythonhosted.org/packages/fe/8d/2f489370d5c47c887ba5c9107f009f428eb6b7b9e2e5e96df0f4c8ace29c/google_antigravity-0.1.23-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:5a99fd8993f13f03e43a7da9ba62b4114c05d952f6f933e86f33c3fc79e80b8e", size = 42390102, upload-time = "2026-10-28T16:50:44.189Z" },
++    { url = "https://files.pythonhosted.org/packages/55/74/fe20c9b0301c9fd3fdaf4f4f92ed43fd3f1ab59c7c6b64ebbc793ec04578/google_antigravity-0.1.23-py3-none-manylinux_2_17_aarch64.musllinux_1_1_aarch64.whl", hash = "sha256:17b2d26575ef168bb3ccd74ddf39ebfe4c528ea426e4bedee8621ea7a41cf527", size = 41215880, upload-time = "2026-10-28T16:50:48.235Z" },
++    { url = "https://files.pythonhosted.org/packages/9a/53/ea087398e44a3deb216a7a87bb88832b182a4a66489ec6cb43db22b5abda/google_antigravity-0.1.23-py3-none-manylinux_2_17_x86_64.musllinux_1_1_x86_64.whl", hash = "sha256:6b1dfa14090ce8cf10395074eecab2bf20cb49ceed3a2603d39803951c9884e2", size = 45219152, upload-time = "2026-10-28T16:50:56.987Z" },
++    { url = "https://files.pythonhosted.org/packages/47/77/53b2c4bd11df1ace856fd67ad2e378151193eb2f99e10dc6e6f46087fb82/google_antigravity-0.1.23-py3-none-win_amd64.whl", hash = "sha256:e587980e3e220b7f24fcddbaa8af55a7b46a9e59443c13e782458718a67c2fba", size = 46149708, upload-time = "2026-10-28T16:51:09.079Z" },
++    { url = "https://files.pythonhosted.org/packages/48/c1/af3a1354977e8d16fd3bbd2e4c9a5bd55f5963578d33eaa37b61965a7e66/google_antigravity-0.1.23-py3-none-win_arm64.whl", hash = "sha256:cbbcbf920b433b2c6db7ea9ed5b4b234a72f574647effa5e3e67f0d97c1793df", size = 42115847, upload-time = "2026-10-28T16:51:24.113Z" },
+ ]
+ 
+ [[package]]
+diff --git a/uv.toml b/uv.toml
+index 4c17d8e8d7077fc7dc5512c243e72c82ada33a02..6753e372b1c882894dfa8fccbf087696e71f4944 100644
+--- a/uv.toml
++++ b/uv.toml
+@@ -25,9 +25,6 @@ exclude-newer = "P7D"
+ # guards every other dependency):
+ # - cwsandbox: first-party CoreWeave SDK pinned to an exact, tested version
+ #   (the `cwsandbox` extra), published 2026-06-11. Drop once aged past P7D.
+-# - google-antigravity: the SDK the `antigravity` harness drives (the
+-#   `antigravity` extra in pyproject), published 2026-06-11. Drop once aged
+-#   past P7D.
+ # - nimble-python: the verified Agent API V2 1.2 contract release, required by
+ #   nimble_research for typed run fields. Drop once it has aged past P7D.
+-exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z" }
++exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z" }
