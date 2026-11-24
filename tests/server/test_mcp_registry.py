@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 from builtins import ExceptionGroup
@@ -211,6 +212,74 @@ async def test_oauth_exchange_requests_json(registry, monkeypatch, grant_type):
 def test_invalid_operator_configuration_fails_early(override):
     with pytest.raises(ValidationError):
         service(**override)
+
+
+def _icon(media_type: str, payload: bytes) -> str:
+    return f"data:{media_type};base64,{base64.b64encode(payload).decode()}"
+
+
+_SVG_ICON = _icon(
+    "image/svg+xml", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"/>'
+)
+_PNG_ICON = _icon("image/png", b"\x89PNG\r\n\x1a\n" + bytes(16))
+
+
+@pytest.mark.parametrize("icon", [_SVG_ICON, _PNG_ICON, _icon("image/svg+xml", b"<svg/>")])
+def test_icon_accepts_a_self_contained_svg_or_png(icon):
+    assert service(icon=icon).icon == icon
+
+
+def test_icon_defaults_to_none():
+    assert service().icon is None
+
+
+@pytest.mark.parametrize(
+    "icon",
+    [
+        "https://cdn.example.test/icon.svg",
+        "data:image/svg+xml,%3Csvg/%3E",
+        "data:text/html;base64,PGI+",
+        "data:image/png;base64,not base64!",
+        "data:image/png;base64," + "A" * (16 * 1024),
+        # Well-formed data URIs that hold no image of their type.
+        "data:image/png;base64,",
+        "data:image/svg+xml;base64,",
+        _icon("image/png", b"<svg/>"),
+        _icon("image/png", b"not an image"),
+        _icon("image/svg+xml", b"<b>not an image</b>"),
+        _icon("image/svg+xml", b"<svgfoo/>"),
+        _icon("image/svg+xml", b"\x89PNG\r\n\x1a\n" + bytes(16)),
+    ],
+)
+def test_icon_rejects_remote_malformed_oversize_and_non_image_values(icon):
+    with pytest.raises(ValidationError, match="icon"):
+        service(icon=icon)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("icon", [_SVG_ICON, _PNG_ICON, None])
+async def test_catalog_returns_each_services_icon(db_uri, icon):
+    entry = service() if icon is None else service(icon=icon)
+    registry = McpRegistry(
+        McpRegistryConfig(services=[entry]), CredentialStore(db_uri, _FakeCipher())
+    )
+    app = FastAPI()
+    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as client:
+        catalog = await client.get("/v1/mcp-registry/services")
+    assert catalog.status_code == 200, catalog.text
+    assert catalog.json()["data"][0]["icon"] == icon
+
+
+def test_a_registry_file_with_an_icon_loads(tmp_path, monkeypatch):
+    catalog = tmp_path / "mcp-registry.yaml"
+    catalog.write_text(json.dumps({"services": [service(icon=_PNG_ICON).model_dump()]}))
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
+    assert McpRegistryConfig.from_env().services[0].icon == _PNG_ICON
 
 
 @pytest.mark.parametrize("url", ["http://public.example.test", "https://user:pass@example.test"])

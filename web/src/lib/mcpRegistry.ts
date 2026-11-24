@@ -6,6 +6,8 @@ export interface RegistryService {
   id: string;
   title: string;
   description: string;
+  /** Base64 `data:image/svg+xml` or `data:image/png` URI; absent falls back to the plug. */
+  icon?: string | null;
   auth: "none" | "bearer" | "oauth" | "github" | "databricks";
   connected: boolean;
   tools: string[];

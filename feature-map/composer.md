@@ -694,6 +694,11 @@ picker is hidden or the catalog is empty. Host and sandbox runners must support
 managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
+A service whose registry entry sets `icon` shows it in the picker in place of
+the plug: an SVG as a mask in the muted text colour, a PNG as it is. The
+[registry's administrator configuration](../examples/mcp-registry/README.md#administrator-configuration)
+describes the field; `web/src/components/McpRegistry.test.tsx` covers both
+forms and the fallback to the plug.
 
 - **`touch-targets`, new-session and in-session composers:**
   `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`

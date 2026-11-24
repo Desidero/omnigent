@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import logging
 import math
 import os
+import re
 import secrets
 import time
 from builtins import ExceptionGroup
@@ -85,6 +87,42 @@ class OAuthConfig(BaseModel):
     resource: str | None = None
 
 
+_SVG_ICON_PREFIX = "data:image/svg+xml;base64,"
+_PNG_ICON_PREFIX = "data:image/png;base64,"
+_ICON_MAX_LENGTH = 16 * 1024
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_SVG_ELEMENT = re.compile(r"<svg[\s/>]")
+
+
+def _require_embedded_icon(icon: str) -> None:
+    """Accept only a base64 SVG or PNG data URI that holds such an image.
+
+    Self-contained images only, so clients never fetch an operator-supplied URL.
+    The payload is checked for its format's marker, not rendered or parsed.
+
+    :raises ValueError: Naming what is wrong with the icon.
+    """
+    prefix = next((p for p in (_SVG_ICON_PREFIX, _PNG_ICON_PREFIX) if icon.startswith(p)), None)
+    if prefix is None:
+        raise ValueError("icon must be a base64 data:image/svg+xml or data:image/png URI")
+    if len(icon) > _ICON_MAX_LENGTH:
+        raise ValueError(f"icon data URI exceeds {_ICON_MAX_LENGTH} characters")
+    try:
+        payload = base64.b64decode(icon[len(prefix) :], validate=True)
+    except binascii.Error:
+        raise ValueError("icon data URI is not valid base64") from None
+    if prefix == _PNG_ICON_PREFIX:
+        is_image = payload.startswith(_PNG_SIGNATURE)
+    else:
+        try:
+            is_image = _SVG_ELEMENT.search(payload.decode("utf-8")) is not None
+        except UnicodeDecodeError:
+            is_image = False
+    if not is_image:
+        kind = "a PNG" if prefix == _PNG_ICON_PREFIX else "an SVG"
+        raise ValueError(f"icon data URI does not hold {kind} image")
+
+
 class McpService(BaseModel):
     """A catalog entry. Only the server operator can choose upstream destinations."""
 
@@ -92,6 +130,7 @@ class McpService(BaseModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")
     title: str
     description: str = ""
+    icon: str | None = None
     url: str
     auth: Literal["none", "bearer", "oauth", "github", "databricks"] = "bearer"
     oauth: OAuthConfig | None = None
@@ -106,6 +145,8 @@ class McpService(BaseModel):
             raise ValueError("MCP service ids cannot contain the tool namespace separator '__'")
         if (self.auth == "oauth") != (self.oauth is not None):
             raise ValueError("oauth configuration is required only for auth=oauth")
+        if self.icon is not None:
+            _require_embedded_icon(self.icon)
         urls = [self.url]
         if self.oauth:
             urls += [self.oauth.authorize_url, self.oauth.token_url]
