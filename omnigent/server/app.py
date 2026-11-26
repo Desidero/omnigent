@@ -85,6 +85,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
     managed_host_keepalive,
+    open_items,
     session_journal,
     session_live_state,
     session_pull_requests,
@@ -423,6 +424,9 @@ class ServerInfoResponse(BaseModel):
     # GET/POST /v1/sessions/{id}/journal and session.journal.appended; absent on
     # older servers, which clients treat as unsupported.
     session_journal: bool = False
+    # GET/POST/PATCH /v1/sessions/{id}/open-items and session.open_items.changed;
+    # absent on older servers, which clients treat as unsupported.
+    open_items: bool = False
     # /v1/workflows, the caller's saved workflows; absent on older servers, which
     # clients treat as unsupported.
     workflows: bool = False
@@ -4232,6 +4236,7 @@ def create_app(
                 is not None,
                 "session_journal": frontend_features[Feature.WORKFLOWS.value]
                 and session_journal.open_store(conversation_store) is not None,
+                "open_items": open_items.open_store(conversation_store) is not None,
                 "workflows": workflows_available,
                 "workflow_sharing": workflows_available
                 and stores_workflow_grants(permission_store),
@@ -4529,6 +4534,17 @@ def create_app(
         ),
         prefix="/v1",
         tags=["session_journal"],
+    )
+    app.include_router(
+        open_items.create_open_items_router(
+            conversation_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["open_items"],
     )
     app.include_router(
         workflows.create_workflows_router(
