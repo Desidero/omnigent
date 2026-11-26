@@ -491,6 +491,14 @@ function NavProbe() {
       <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
         to-home
       </button>
+      <button
+        type="button"
+        data-testid="nav-settings-appearance"
+        onClick={() => navigate("/settings/appearance")}
+      >
+        to-settings-appearance
+      </button>
+      <span data-testid="nav-path">{useLocation().pathname}</span>
     </div>
   );
 }
@@ -2779,12 +2787,18 @@ describe("Workspace rail maximize", () => {
 describe("Sidebar across the md breakpoint", () => {
   // Resizable viewport: matchMedia answers the md queries from `width` and
   // fires change listeners for the queries a resize flips.
-  function mockViewportWidth(initialWidth: number) {
+  // A height makes the mobile layout dock the sidebar beside the page (600px wide and 3:4 or
+  // wider); the default is tall enough to keep the overlay drawer at every mobile width.
+  function mockViewportWidth(initialWidth: number, initialHeight = 2000) {
     let width = initialWidth;
+    let height = initialHeight;
     const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
     const matches = (query: string) => {
       if (query === "(min-width: 1181px)") return width >= 1181;
       if (query === "(max-width: 1180.98px)") return width < 1181;
+      if (query.includes("min-aspect-ratio: 3/4")) {
+        return width >= 600 && width < 1181 && width / height >= 3 / 4;
+      }
       return false;
     };
     const baseMatchMedia = window.matchMedia;
@@ -2800,10 +2814,11 @@ describe("Sidebar across the md breakpoint", () => {
       },
     }));
     onTestFinished(() => matchMedia.mockRestore());
-    return (nextWidth: number) =>
+    return (nextWidth: number, nextHeight = height) =>
       act(() => {
         const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
         width = nextWidth;
+        height = nextHeight;
         for (const [query, queryListeners] of listeners) {
           const event = { matches: matches(query), media: query } as MediaQueryListEvent;
           if (before.get(query) === event.matches) continue;
@@ -2917,6 +2932,74 @@ describe("Sidebar across the md breakpoint", () => {
 
     resize(740);
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  // Where the Settings menu covers the page (a phone, or a tablet held upright), bare /settings
+  // is the menu on its own and every page opens with the menu closed.
+  describe.each([
+    ["a phone", 390, 844],
+    ["a portrait tablet", 820, 1180],
+  ])("on %s", (_name, width, height) => {
+    it("opens the menu from the drawer's cog and closes it onto the page chosen", () => {
+      mockViewportWidth(width, height);
+      mockConversations([{ id: "conv_abc", permission_level: null }]);
+      renderShell("/c/conv_abc");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+
+      fireEvent.click(screen.getByTestId("nav-settings"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+      fireEvent.click(screen.getByTestId("nav-settings-appearance"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    });
+
+    it("opens a deep-linked page with the menu closed, even from an open drawer", () => {
+      mockViewportWidth(width, height);
+      mockConversations([{ id: "conv_abc", permission_level: null }]);
+      renderShell("/c/conv_abc");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+      fireEvent.click(screen.getByTestId("nav-settings-appearance"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    });
+
+    it("reloads a page with the menu closed and goes Back to the list", () => {
+      mockViewportWidth(width, height);
+      mockConversations([]);
+      renderShell("/settings/appearance");
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      expect(screen.queryByRole("button", { name: "Open settings menu" })).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Back to Settings" }));
+      expect(screen.getByTestId("nav-path")).toHaveTextContent(/^\/settings$/);
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    });
+  });
+
+  describe("where the menu docks beside the page", () => {
+    it("keeps the menu the user had open on a page, and the menu toggle", () => {
+      mockViewportWidth(900, 700);
+      mockConversations([{ id: "conv_abc", permission_level: null }]);
+      renderShell("/c/conv_abc");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+
+      fireEvent.click(screen.getByTestId("nav-settings-appearance"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      expect(screen.queryByRole("button", { name: "Back to Settings" })).toBeNull();
+    });
+
+    it("closes the menu over a page once turning upright makes it cover the page", () => {
+      const resize = mockViewportWidth(900, 700);
+      mockConversations([]);
+      renderShell("/settings/appearance");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+      resize(700, 1000);
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      expect(screen.getByRole("button", { name: "Back to Settings" })).toBeInTheDocument();
+    });
   });
 });
 

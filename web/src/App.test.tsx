@@ -10,15 +10,19 @@ vi.mock("@/lib/analytics", () => ({
   useOmnigentPageView: vi.fn(),
   useOmnigentAnalytics: () => ({ trackClick: vi.fn() }),
 }));
-vi.mock("@/shell/AppShell", () => ({
-  AppShell: () => (
-    <div>
-      <span>app shell</span>
-      <Link to="/inbox">Inbox</Link>
-      <Outlet />
-    </div>
-  ),
-}));
+vi.mock("@/shell/AppShell", async () => {
+  const { useLocation } = await import("react-router-dom");
+  return {
+    AppShell: () => (
+      <div>
+        <span>app shell</span>
+        <span data-testid="shell-location">{useLocation().pathname}</span>
+        <Link to="/inbox">Inbox</Link>
+        <Outlet />
+      </div>
+    ),
+  };
+});
 vi.mock("@/pages/ChatPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
@@ -537,6 +541,36 @@ describe("Settings routes", () => {
     renderRoute("/settings");
 
     expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
+  });
+
+  describe("on the mobile layout", () => {
+    // Matches the overlay drawer's query, and with `docked` the side-by-side one too.
+    function stubMobileLayout({ docked }: { docked: boolean }) {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: query.includes("max-width") && (docked || !query.includes("min-width")),
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }));
+    }
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("keeps bare settings as the page list where the menu covers the page", () => {
+      stubMobileLayout({ docked: false });
+      renderRoute("/settings");
+
+      expect(screen.getByTestId("shell-location")).toHaveTextContent(/^\/settings$/);
+      expect(screen.queryByTestId("settings-location")).toBeNull();
+    });
+
+    it("opens General where the menu docks beside the page", async () => {
+      stubMobileLayout({ docked: true });
+      renderRoute("/settings");
+
+      expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
+    });
   });
 
   it("preserves an explicit settings section", async () => {
