@@ -78,6 +78,7 @@ vi.mock("@/components/blocks/TerminalSession", async (importOriginal) => ({
     setTheme() {}
     setFont() {}
     setClipboardEnabled() {}
+    setInputTransform() {}
     pasteCommand() {
       return () => {};
     }
