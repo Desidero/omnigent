@@ -1,7 +1,7 @@
 # session-labels-ui
 
 Needs: none
-Covers: 426383d3476acbec
+Covers: 5215bd827299dae1
 
 View and edit a session's labels in the web UI, delete labels through the API
 (a `null` value), and give projects default labels for the sessions created in
