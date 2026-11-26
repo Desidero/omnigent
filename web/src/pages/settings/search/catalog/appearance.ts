@@ -116,6 +116,17 @@ export const CODE_FONT_WEIGHT_ENTRY = settingsEntry({
   focus: "toggle",
 });
 
+export const TERMINAL_EXTRA_KEYS_ENTRY = settingsEntry({
+  id: "terminal-extra-keys",
+  section: "appearance",
+  label: "Extra keys row",
+  description:
+    "Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.",
+  keywords: ["terminal", "touch", "mobile", "phone", "tablet", "keyboard", "escape", "arrows"],
+  // As the select names them.
+  choices: ["Auto (touch devices)", "Always", "Never"],
+});
+
 export const APPEARANCE_DATA_ENTRY = settingsEntry({
   id: "appearance-data",
   section: "appearance",
@@ -276,6 +287,7 @@ export const APPEARANCE_SETTINGS = [
   CODE_FONT_SIZE_ENTRY,
   CODE_FONT_FAMILY_ENTRY,
   CODE_FONT_WEIGHT_ENTRY,
+  TERMINAL_EXTRA_KEYS_ENTRY,
   APPEARANCE_DATA_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
   HIDE_UNCONFIGURED_HARNESSES_ENTRY,
