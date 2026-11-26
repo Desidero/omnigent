@@ -21,12 +21,14 @@ are dropped from the series.
 
 | Path | What |
 | --- | --- |
-| `custom/BASE` | The upstream commit the series applies to. The branch merges upstream up to exactly this commit. |
-| `custom/series` | The patches in apply order, grouped into named series (`# series: <name>`), one block per series. A `# needs: <name>` line means that series expects another one first, and it comes earlier in the file. |
-| `custom/patches/*.patch` | `git format-patch` files, one per commit, named `<series>--<subject>.patch`. |
+| `custom/BASE` | The upstream commit the series are cut from. The branch merges upstream up to exactly this commit. |
+| `custom/patches/<series>/` | One directory per series: `NOTE.md` and its patches, `git format-patch` files named `NN-<subject>.patch`, one per commit, applied in name order. The patches are cut from the series' foundation: `BASE` plus the series it needs, nothing else. |
+| `custom/patches/<series>/NOTE.md` | The series' [note](#notes): its name, a `Needs:` line (the series it is cut on top of, or `none`), a `Covers:` line, the text of its section in the index, and what must hold, the key code and the tests. |
+| `custom/index-intro.md` | The text above the sections of the built index, `docs/custom/README.md`. |
+| `custom/glue/<first>+<second>/` | [Glue](#glue) between two series that do not need each other: a `NOTE.md` with a `Joins:` line (the files where both insert at the same spot) and the reason, and optional patches that go on top of the two combined. Used only when both series are in a build. |
 | `custom/sets/<name>.txt` | Named [build sets](#named-build-sets): the series one kind of build holds, one per line. Without a set, a build is the whole series. |
 | `custom/proposals/<series>/` | The draft upstream PR description (`PR.md`), a draft issue where useful (`issue.md`), and `evidence/` (screenshots and logs to attach). `_reviews/` and `_watch/` hold review notes and drafts for upstream threads we only follow. |
-| `custom/scripts/` | Build, export, check, refresh and the upstream-workflow switch (below). |
+| `custom/scripts/` | Build, export, check, refresh and the upstream-workflow switch (below). `serieslib.py` is the one reader of the layout above and holds the build engine; the other scripts go through it. |
 | `custom/release/` | Install set, server image, release publishing, host install scripts ([`release/README.md`](release/README.md)). |
 | `custom/tracker.yaml` | Upstream links and relationships per series, for `scripts/tracker.py`. |
 | `.github/workflows/custom-release.yml` | The only workflow of ours. |
@@ -48,12 +50,126 @@ change to an upstream file can only arrive as a patch under
 deriving the base from history: the merge of upstream and the `BASE` bump
 travel together in one pull request and the check proves they agree.
 
+## How the series build
+
+Each series is independent of the others except for the ones its `Needs:`
+line names. Its patches are cut from its **foundation**, `BASE` plus the
+series it needs (and what those need), so a series reads, applies and is
+changed without the rest.
+
+A build takes a selection of series (all of them, `--only`, or a
+[set](#named-build-sets)) and
+
+1. applies each chosen series **exactly** on its own foundation: no fuzz, no
+   three-way fallback, and every file must come out with the blob id the
+   patch recorded when it was exported;
+2. **combines** the series by cherry-picking their commits onto `BASE` in a
+   fixed order: a series after the series it needs, the second series of a
+   [glue](#glue) pair after the first, otherwise by name;
+3. adds one last commit, the **index**: `docs/custom/README.md`, written
+   from the [notes](#notes) of the series in the build, one section each.
+
+The combination is a three-way merge per commit, so two series that touch
+the same file combine as long as they do not change the same or adjacent
+lines. The committer, the dates (committer date = author date) and the merge
+settings are pinned: the same `BASE`, patch files and selection give the same
+commit ids on every machine with the same git. `check.sh` builds every series
+alone on its foundation, every glue pair, and the whole build in two orders
+(ties by name and by name reversed), which must give the same tree: nothing
+may depend on the order of series that do not need each other.
+`check.sh --pairs` also builds every two series that touch a common file, so
+that any two of them are known to build together.
+
+**Needs.** B needs A when B, written fresh against upstream, would import,
+extend or rely at run time on what A adds; B is then cut on top of A, and a
+build of B includes A. Touching the same file is not a need.
+
+### Glue
+
+Two series that do not need each other can still meet in a file. Where they
+change lines that are apart, the build combines them and nothing has to be
+said. Where they meet, `custom/glue/<first>+<second>/` says how they fit, and
+it is used only in a build that holds both:
+
+- **A join**, for insertions at the same spot (two rows at the end of one
+  table, two helpers before the same function). `NOTE.md` lists the files on
+  a `Joins:` line; in those files a conflict between the two is resolved by
+  keeping both insertions whole, the first-named series' lines first. The
+  name of the directory is therefore also an order: the second series is
+  combined after the first. A join is declared per pair and per file, never
+  assumed, and `check.sh` fails on a join the two series do not need.
+- **A glue patch**, `NN-<subject>.patch` in the same directory, for what has
+  to change when both are present. It is cut on top of the two series
+  combined (joins made), applied exactly there, and cherry-picked after the
+  second series. Export it with `export.sh --glue <first>+<second> <branch>`
+  from a branch started with `build-custom.sh --only <first>,<second>
+  --no-index`.
+
+A join does not cover two series that edit the same lines: the build stops
+and says so. Then one of them really needs the other, or one can leave those
+lines alone (`session-labels-ui` no longer rewords a comment that
+`subscription-accounts` rewords).
+
+`NOTE.md` starts with `# <first>+<second>`, then the `Joins:` line if any,
+then says what the two series add at that place and that neither uses the
+other.
+
+### Notes
+
+`custom/patches/<series>/NOTE.md` is what a reader needs before the patches,
+and what whoever rebases the series or resolves a conflict in it has to keep
+true. At most 60 lines:
+
+```markdown
+# <series>
+
+Needs: <series>, <series>        (or: none)
+Covers: <hash>
+
+One paragraph: what the series changes for the user.
+
+- **Turn on:** how, or "on by default".
+- **Docs:** where its usage docs are, or "none (<reason>)".
+- **Upstream:** the branch it is proposed from, its issue or pull request as a full link.
+
+## Must hold
+
+- A behaviour the series guarantees, as a user or caller sees it.
+
+## Key code
+
+- `path/the/series/changes.py`: `symbol`, `another_symbol`
+
+## Tests
+
+- `tests/path/test_x.py::test_name`
+```
+
+- The part between `Covers:` and `## Must hold` is the series' section of
+  the index, word for word. Links there are relative to `docs/custom/` in
+  the built tree. Issues and pull requests are written as full links.
+- **Must hold** lists behaviours, not code. A bullet that is a guess starts
+  with `TODO(owner):`, so that it gets confirmed instead of trusted.
+- **Key code** names files the series changes and symbols in them;
+  **Tests** names test files, with `::<test name>` where it helps. `check.sh`
+  looks each one up in the series' own build (its foundation plus its
+  patches), so a rename shows up as a stale note. A series without code or
+  tests says `- none (<reason>)`.
+- **Covers** is a hash of the lines the patches add and remove (not of their
+  context, so re-cutting a series on another foundation keeps it). When it
+  no longer matches, the series does something else than the note was
+  written for: read the note again, fix it, then
+  `custom/scripts/serieslib.py covers --write <series>`. `export.sh` says
+  when that is due and never updates the line itself.
+
+`custom/scripts/serieslib.py index` prints the index a build would hold.
+
 ## How a change gets in
 
 ```
-develop on a working branch  ->  export to patch files  ->  pull request into patches
-  (build-custom.sh)               (export.sh, check.sh,     (CI: tree rule, apply, docs,
-                                   check-tree.sh)            tsc, tests, install set)
+develop a series on its branch  ->  export it to patch files  ->  pull request into patches
+  (build-custom.sh --series)        (export.sh, check.sh,          (CI: tree rule, build, docs,
+                                     check-tree.sh)                 tsc, tests, install set)
         -> merge  ->  CI: tag custom/<date>.<n>, GHCR image, pre-release
                       with the install set, then move custom to it
 ```
@@ -61,7 +177,8 @@ develop on a working branch  ->  export to patch files  ->  pull request into pa
 Merging a pull request into `patches` is the only way the series changes.
 `patches` is never rebased or force-pushed; an upstream refresh is a pull
 request too (a merge of upstream plus the refreshed patches). `custom` and
-the `custom/*` tags are written only by the workflow.
+the `custom/*` tags are written only by the workflow. A pull request that
+changes one series touches one directory.
 
 ## Developing a change
 
@@ -72,35 +189,51 @@ scripts default to the clone they are checked out in; `--repo` or
 `patches` ambiguous to git commands that take a revision: write
 `refs/heads/patches` or `origin/patches`, or end the arguments with `--`.
 
-1. **Build a working branch** from the series:
-   `custom/scripts/build-custom.sh work/<topic>`. The commits are
-   reproducible: the same `BASE` and patch files give the same commit ids
-   everywhere (fixed committer, committer date = author date), so the branch
-   matches what CI builds and what `custom` holds.
+1. **Build the series' branch**:
+   `custom/scripts/build-custom.sh --series <series> work/<series>` gives the
+   series it needs and then its own commits, nothing else. For a new series,
+   start on the foundation it will have: the commit in `custom/BASE`, or
+   `build-custom.sh --only <needs> --no-index work/<series>` when it needs
+   other series.
 2. **Change it** like any branch: add commits, amend or `git rebase -i` the
-   patch you are fixing (keep fixups squashed into the patch they fix, and
-   each series' commits together, after the series it needs), drop a patch
-   that landed upstream. Develop a fix headed upstream on a
+   patch you are fixing (keep fixups squashed into the patch they fix; leave
+   the foundation's commits alone). Develop a fix headed upstream on a
    contribution branch cut from `upstream/main`, never from `custom`, and
-   cherry-pick it here. Try it with the repo's tests, or install the pull
-   request's build (below).
+   cherry-pick it here. To try it with the other series, build them all with
+   your working copy of the patch files (`build-custom.sh work/all` after the
+   export), or install the pull request's build (below).
 3. **Export**, on a branch cut from `patches`:
-   `custom/scripts/export.sh work/<topic> upstream/main` rewrites
-   `custom/BASE`, `custom/series` and `custom/patches/`. Series are matched by
-   each commit's subject; a new commit joins the previous commit's series
-   with a warning, so move it in `custom/series` if it belongs elsewhere and
-   run the export again. `# needs:` lines and other comments in a series are
-   kept. `BASE` must not move here; moving it is a [refresh](#refreshing-the-base).
-4. **Check**: `custom/scripts/check.sh --custom work/<topic>` checks that
-   each series is one block that comes after every series it needs, applies
-   the series in a throwaway worktree, runs the [docs rule](#docs-rule), a
-   quick sanity check (no conflict markers, changed Python and JSON parse) and
-   confirms the result has exactly your branch's tree. After committing,
+   `custom/scripts/export.sh <series> work/<series>` rewrites
+   `custom/patches/<series>/` from the commits after the foundation, rebuilds
+   the series from the files it wrote and requires the branch's tree.
+   `--needs a,b` names the needs of a new series or changes them (the branch
+   must sit on the foundation they give); a new series gets a `NOTE.md` to
+   fill in. `BASE` does not move here; moving it is a
+   [refresh](#refreshing-the-base).
+4. **Re-cut what sits on top.** A series that needs the one you changed is cut
+   from a foundation that just moved. `export.sh` names the ones that no
+   longer apply exactly; `custom/scripts/serieslib.py recut <series>...`
+   cherry-picks each (as committed at `HEAD`, or `--from <commit>`) onto its
+   new foundation and rewrites its files, or stops on a conflict and prints
+   the commands to finish by hand.
+5. **Check**: `custom/scripts/check.sh` runs the rules that need no build
+   (`serieslib.py lint`: layout, notes, the [docs rule](#docs-rule), needs,
+   sets), applies every series exactly on its foundation, builds the whole in
+   both tie orders, and runs a quick sanity check on the built tree (no
+   conflict markers, changed Python and JSON parse). `--custom
+   <ref>` also requires the build to have exactly `<ref>`'s tree, for a
+   change that must not alter the result. After committing,
    `custom/scripts/check-tree.sh` confirms the [tree rule](#the-tree-rule).
-5. **Open a pull request into `patches`**, from a branch named
-   `series/<topic>` (`refresh/<date>` for a refresh), with the regenerated files, plus
-   `custom/proposals/<series>/PR.md` for a new series and a fixup to the
-   index (`docs/custom/README.md`, series `custom-docs-index`).
+6. **Open a pull request into `patches`**, from a branch named
+   `series/<topic>` (`refresh/<date>` for a refresh), with the regenerated
+   files and the series' `NOTE.md` (the index follows from it), plus
+   `custom/proposals/<series>/PR.md` for a new series.
+
+When two series that do not need each other change the same lines, the build
+stops and names the series, the commit and the paths. If both only insert at
+the same spot, declare a [join](#glue). Otherwise one really needs the other
+(say so in `Needs:` and re-export it on that foundation), or one of them can
+be written to keep clear of the other.
 
 Commit on `patches` branches without upstream's pre-commit hooks
 (`git commit --no-verify` if you installed them): they would rewrite
@@ -116,25 +249,31 @@ see [`release/README.md`](release/README.md)).
 
 ### Refreshing the base
 
-`custom/scripts/refresh.sh` does the whole refresh on a branch cut from
-`patches`:
+`custom/scripts/refresh.sh` rebased one linear branch and is not converted to
+per-series patches yet; it refuses to run. Until it is, a refresh is the same
+steps by hand, on a branch cut from `patches`:
 
 ```bash
 git fetch origin upstream
 git switch -c refresh/$(date -u +%F) origin/patches
-custom/scripts/refresh.sh                 # merges upstream/main, rebases the series
-# on a conflict: resolve in the worktree it names, `git rebase --continue`, then
-custom/scripts/refresh.sh --continue
-git push origin refresh/$(date -u +%F)    # and open the pull request into patches
+old=$(git rev-parse HEAD)
+git merge --no-ff upstream/main            # only upstream paths change
+git rev-parse upstream/main > custom/BASE
+custom/scripts/serieslib.py recut --from "$old" $(custom/scripts/series-files.sh --all --names)
+custom/scripts/check.sh && git add -A custom && git commit --no-verify
+custom/scripts/check-tree.sh --upstream upstream/main
 ```
 
-It merges `upstream/main` into the branch (only upstream paths change, so the
-merge does not conflict), builds the old series as `work/refresh-<sha>`,
-rebases it onto the new upstream commit (`rerere` remembers resolutions;
-patches that landed upstream drop out as empty), exports, runs `check.sh` and
-`check-tree.sh`, and commits `custom/`. Remove dropped series from the index
-patch in the same pull request. The pull request moves `BASE`, so CI runs
-the tests of every patch.
+`recut` takes each series as it was at `$old` (built on the old `BASE`) and
+cherry-picks it onto its new foundation, in build order, so a series is moved
+after the ones it needs. A series whose files upstream did not touch is
+already exact and is left alone. On a conflict it stops and prints the
+commands to finish that series by hand (a branch on the new foundation, `git
+cherry-pick` of the old commits, `export.sh`); run `recut` again for the
+rest. A patch that landed upstream comes out empty: drop its file, or the
+directory when the whole series landed (its index section goes with its
+note). The pull
+request moves `BASE`, so CI runs the tests of every patch.
 
 The merge brings upstream's workflow changes onto the branch, so pushing it
 needs a credential that may write workflow files (`gh auth login` asks for
@@ -147,45 +286,42 @@ needs a person anyway.
 ### Applying a series to your own checkout
 
 ```bash
-git am -3 $(custom/scripts/series-files.sh --needs toast-safe-area)
+git am -3 $(custom/scripts/series-files.sh --needs link-rules)
 ```
 
-`series-files.sh` prints a series' files in apply order (a shell glob of
-`<series>--*.patch` sorts them by name instead) and, with `--needs`, the
-series it needs first; `--all` prints the whole series. If
-your branch is ahead of `BASE` and a patch conflicts, `-3` falls back to a
-three-way merge; resolve it and `git am --continue`. `git config
-rerere.enabled true` means you resolve each conflict only once.
+`series-files.sh` prints a series' files in apply order and, with `--needs`,
+the series it needs first; that list is cut as one stack from `BASE`, so on
+`BASE` it applies exactly. If your branch is ahead of `BASE` and a patch
+conflicts, `-3` falls back to a three-way merge; resolve it and `git am
+--continue`. `git config rerere.enabled true` means you resolve each conflict
+only once. Series that do not need each other are each cut from `BASE`: apply
+them one after the other with `-3`, or let `build-custom.sh --only` combine
+them and take the branch it builds.
 
 ### Building a set of features
 
 Each series is one feature, and any set of them builds:
 
 ```bash
-custom/scripts/build-custom.sh --only link-rules,toast-safe-area work/mine
-custom/scripts/series-files.sh --only link-rules,toast-safe-area   # just list the files
+custom/scripts/build-custom.sh --only link-rules,app-error-boundary work/mine
+custom/scripts/series-files.sh --only link-rules,app-error-boundary --names   # just list them
 ```
 
 `--only` takes series names, comma-separated (or repeat the option), adds
-every series they need, recursively, and always `custom-docs-index`, and keeps
-the order of `custom/series`; it prints each series it added and why. In the
-built tree, the index (`docs/custom/README.md`) keeps only the sections of the
-series that were built. `series-files.sh --only ... --names` prints the chosen
-series instead of their files. A `# needs:` line also covers a series that
-only conflicts without another one (two rows added next to each other in the
-same table, say), so that every set applies.
+every series they need, recursively; it prints each series it added and why.
+In the built tree, the index (`docs/custom/README.md`) has the sections of
+the series that were built. `series-files.sh --only ... --names` prints the
+chosen series instead of their files.
 
-A partial build is for building and running. Export (`export.sh`) only from a
-working branch that holds the whole series: it writes `custom/patches/` to
-match the branch, so the series a partial branch leaves out would be removed.
+A partial build is for building and running. A branch to export from is one
+series on its foundation (`build-custom.sh --series`).
 
 ### Named build sets
 
 When the same series feeds more than one kind of build, give each kind a set
 file instead of repeating an `--only` list: `custom/sets/<name>.txt` lists the
 series that build holds, one per line (`#` starts a comment). As with
-`--only`, the series they need and `custom-docs-index` are added and
-`custom/series` gives the order. [`sets/fixes.txt`](sets/fixes.txt), the
+`--only`, the series they need are added. [`sets/fixes.txt`](sets/fixes.txt), the
 bug-fix series only, is an example.
 
 ```bash
@@ -205,9 +341,9 @@ set exists.
   part of a version, a git tag and an image tag.
 - **Checks.** `check.sh` (and so CI on every pull request) fails when a set
   file names a series that does not exist, so dropping a series means
-  editing the sets that list it; CI also applies each set. `check.sh --set`
-  checks that set's build: its patches apply, the index has a section for
-  each of its series and none for the ones left out.
+  editing the sets that list it; CI also builds each set. `check.sh --set`
+  checks that set's build: its series combine (the index of a set lists its
+  series only).
 - **Tests.** `select-tests.py --set` selects from the set's patches only; a
   change to the set file selects all of them.
 - **Releases.** A set is released by a manual run of the workflow with the
@@ -227,7 +363,7 @@ set exists.
 | Event | Jobs |
 | --- | --- |
 | Pull request into `patches` | `apply` (the required check: tree rule, build with `build-custom.sh`, `check.sh --tree`, unit tests of `scripts/` and `release/`, test selection), `web` (`tsc -b` and the selected vitest files), `python` (the selected pytest files), `package` (the install set as an artifact, the server image built and smoke-tested but not pushed; the notes go to the job summary), `upstream-workflows` (below) |
-| Push to `patches` that changes `custom/BASE`, `custom/series`, `custom/patches/**`, `custom/release/**` (not its Markdown), `custom/scripts/build-custom.sh`, `check.sh`, `check-tree.sh` or `select-tests.py`, the workflow, or its action | The same, then `publish`: tags the build, pushes the image to GHCR, creates the pre-release and then moves `custom` to it. A merge that only changes docs, proposals or the tracker makes no release. |
+| Push to `patches` that changes `custom/BASE`, `custom/patches/**`, `custom/glue/**`, `custom/release/**` (not its Markdown), `custom/scripts/build-custom.sh`, `check.sh`, `check-tree.sh`, `select-tests.py`, `serieslib.py` or `series-files.sh`, the workflow, or its action | The same, then `publish`: tags the build, pushes the image to GHCR, creates the pre-release and then moves `custom` to it. A merge that only changes docs, proposals or the tracker makes no release. |
 | Manual run (`workflow_dispatch`) | Inputs: `dry_run` (default true: everything, with `publish` printing the pushes, tag, image push and release instead of doing them; a run on any ref other than `patches` is always dry), `prerelease` (default true; false marks a real run's release as the latest full release), `all_tests` (default false; true runs the tests of every patch), `set` (default empty: the whole series; a name builds, tests and releases that [build set](#named-build-sets) and leaves `custom` alone) |
 | Daily schedule | Only `upstream-workflows`. Schedules run from the default branch only, so this needs `patches` to be the default branch. |
 
@@ -379,7 +515,8 @@ Done on 2026-10-28, in this order:
   it with the built commit:
   `omnigent 0.20.0.dev0+oss65be0f24.p0123abc (37f5c6e0, built …)`.
 - **`custom`** points at the latest release's built commit: upstream at
-  `BASE` plus one commit per patch, without `custom/` or our workflow.
+  `BASE` plus one commit per patch (the series combined, in build order) and
+  the index commit, without `custom/` or our workflow.
 - **Release** on this fork, a pre-release by default; mark the one that goes
   to production as the full release later. Assets: the `omnigent`,
   `omnigent-client` and `omnigent-ui-sdk` wheels, `constraints.txt` (every
@@ -402,20 +539,21 @@ Every patch ships its own usage docs in the same commit, in upstream's places
 (`docs/`, the matching `feature-map/` recipe, or for API and telemetry details
 `omnigent/server/API.md` and `designs/`). A patch with nothing to document,
 such as an internal fix or a refactor, says why in a `Docs: none (<reason>)`
-trailer. The last commit, series `custom-docs-index`, is
-`docs/custom/README.md`: one `## <series>` section per series saying what it
-changes, how to turn it on and where its docs are; adding, changing or
-dropping a patch includes a fixup to it. `scripts/check.sh` enforces all
-three: docs or the trailer on every patch, a section for every series, and
-`custom-docs-index` last. The release notes carry that index, and
-`custom-docs.md` the docs themselves.
+trailer. The last commit of a build is the index, `docs/custom/README.md`:
+one `## <series>` section per series built, saying what it changes, how to
+turn it on and where its docs are. The build writes it from each series'
+[note](#notes), so adding, changing or dropping a series updates it with the
+series' own directory, and no patch may touch that file. `scripts/check.sh`
+enforces docs or the trailer on every patch and a complete note for every
+series. The release notes carry that index, and `custom-docs.md` the docs
+themselves.
 
 ## Tracker
 
 `tracker.yaml` records, per series and per upstream change we only watch, the
 upstream issue and PR links plus relationships (`carries`, `blocked_by`,
 `superseded_by`, `related`, `conflicts`). `scripts/tracker.py OUT.html` joins
-it with `series` and live GitHub state to produce a page with a drop list
+it with the series directories and live GitHub state to produce a page with a drop list
 (patches to remove on the next refresh), what waits on us, what waits on
 maintainers, and a dependency graph. The table below is the hand-written
 summary; the generated page is the live view.
@@ -441,20 +579,20 @@ request carries it, and the series holds a copy until it merges).
 | `chat-item-labels` | Bracketed labels like `[Q2]` in chat become chips that preview the item they refer to; `~~[Q2]~~` closes it, and an Open items panel lists what is still open. Adds the labelling rules to agents' instructions. Needs `codex-native-mode-instructions` and `session-labels-ui`. | proposed |
 | `web-reconnect-shell-inputs` | A queued `!command` no longer stays stuck at the bottom of the chat after the connection drops. | PR open ([#11395](https://github.com/omnigent-ai/omnigent/pull/11395)) |
 | `chat-item-comments` | Comment on labelled items and send the comments together as one structured message. Needs `chat-item-labels`. | proposed |
-| `session-labels-ui` | View and edit a session's labels in the web UI, delete labels through the API, and default labels per project. Needs `subscription-accounts`. | PR open ([#11398](https://github.com/omnigent-ai/omnigent/pull/11398) for the server, [#11399](https://github.com/omnigent-ai/omnigent/pull/11399) for the web UI (draft)) |
-| `gateway-request-tags` | Requests to a Databricks Unity Gateway carry the session id and labels as request tags. Needs `chat-item-labels`. | proposed (issue drafted) |
+| `session-labels-ui` | View and edit a session's labels in the web UI, delete labels through the API, and default labels per project. | PR open ([#11398](https://github.com/omnigent-ai/omnigent/pull/11398) for the server, [#11399](https://github.com/omnigent-ai/omnigent/pull/11399) for the web UI (draft)) |
+| `gateway-request-tags` | Requests to a Databricks Unity Gateway carry the session id and labels as request tags. | proposed (issue drafted) |
 | `claude-native-delegate-idle` | A Claude lead stops showing Working, and takes follow-ups without Steer, once its turn ends while agent-team teammates keep running: teammates count as background agents for upstream's background-agent hold ([#12561](https://github.com/omnigent-ai/omnigent/pull/12561)). Needs `claude-native-teammates`. | proposed (the status-file and OSC parts landed upstream as #12561) |
 | `delete-stops-runner` | Deleting a session stops its host-launched runner once no remaining session uses it, instead of leaving the process running until its idle timeout. | PR open ([#11391](https://github.com/omnigent-ai/omnigent/pull/11391)) |
 | `app-error-boundary` | Upstream's render error fallback also shows the error, component stack and path, with Copy details and Reload. | proposed |
 | `tolerate-retired-preferences` | A stored shared preference of a kind this build doesn't know (one a parked or newer series saved) is skipped on read instead of failing every preferences read with a 500; the row stays stored. | proposed |
 | `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. While any rule is on, the rules replace upstream's built-in pull request links ([#14191](https://github.com/omnigent-ai/omnigent/pull/14191)). Needs `chat-item-labels`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
 | `antigravity-cooldown` | The `antigravity` extra locks `google-antigravity` 0.1.23 instead of 0.1.2 (the fixed-date cooldown exemption in `uv.toml` is gone), and the antigravity harness reads a turn's token usage from the conversation, where the newer SDK reports it. On a refresh conflict in `uv.lock`, re-lock with `uv lock --upgrade-package google-antigravity` instead of merging the hunk. | PR open ([#14704](https://github.com/omnigent-ai/omnigent/pull/14704), draft) |
-| `custom-docs-index` | `docs/custom/README.md`, the index of the series: what each changes, how to turn it on, and where its docs are. | custom only |
 
 ### Parked series
 
-These series are out of the series for now. Their patch files and index
-sections are on the patches commit that release `custom/2026-11-09.1` was
+These series are out of the series for now. Their patch files (in the flat
+`<series>--<subject>.patch` layout of the time, listed by that commit's
+`custom/series`) and index sections are on the patches commit that release `custom/2026-11-09.1` was
 built from (the tag's `Patches-Commit:` line); their proposals stay under
 `proposals/`. "Optional" means kept out to keep the series small, not that
 anything is wrong with it.
@@ -479,17 +617,18 @@ anything is wrong with it.
 | `lean-history-items` | optional |
 | `history-prefetch` | optional |
 
-To restore one, apply it from that commit onto a working branch built from
-the current series, together with any other parked series its `# needs:`
-lines name (before it), then export and check it as in
-[Developing a change](#developing-a-change); a conflict is resolved as in a
-refresh.
+To restore one, apply it from that commit onto the foundation it will have
+now (`BASE`, or the series it needs: what its `# needs:` lines named, less
+the ones that were only there to make it apply), then export it as a new
+series and check it as in [Developing a change](#developing-a-change); a
+conflict is resolved as in a refresh.
 
 ```bash
 old=$(git tag -l --format='%(contents)' custom/2026-11-09.1 | sed -n 's/^Patches-Commit: //p')
 git worktree add --detach /tmp/parked "$old"
-custom/scripts/build-custom.sh work/restore   # then work on work/restore
+git switch -c work/<series> "$(cat custom/BASE)"   # or build-custom.sh --only <needs> --no-index work/<series>
 git am -3 $(/tmp/parked/custom/scripts/series-files.sh <series>)
+custom/scripts/export.sh --needs <needs or none> <series> work/<series>
 ```
 
 ## Deploying your own
@@ -515,7 +654,8 @@ in a fork of this branch rather than rebasing private commits onto the build.
   `omnigent-ai/omnigent` directly; it only needs to come here if it should be
   usable before it merges.
 - To add or change a patch, follow [Developing a change](#developing-a-change)
-  and send a pull request into `patches` with the regenerated files.
+  and send a pull request into `patches` with the series' regenerated
+  directory.
 - Screenshots and logs in `proposals/*/evidence/` must come from a throwaway
   server with dummy data. Never include credentials, real user data or
   private hostnames.

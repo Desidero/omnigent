@@ -63,23 +63,28 @@ fi
 
 base="$(tr -d '[:space:]' < "$here/BASE")"
 custom="$(git -C "$tree" rev-parse HEAD)"
-[[ "$(git -C "$tree" rev-list --count "$base..HEAD")" -gt 0 ]] \
-  || { echo "error: $tree is not a build of the series on BASE ${base:0:12}" >&2; exit 2; }
 set_series=""
+set_args=()
 if [[ -n "$set_name" ]]; then
-  # The set's series (series-files.sh also checks the name); the tree must be its build.
+  # The set's series (series-files.sh also checks the name).
   set_series="$("$here/scripts/series-files.sh" --set "$set_name" --names 2>/dev/null)" \
     || { "$here/scripts/series-files.sh" --set "$set_name" --names >/dev/null || true; exit 2; }
-  set_patches="$("$here/scripts/series-files.sh" --set "$set_name" 2>/dev/null | wc -l)"
-  [[ "$(git -C "$tree" rev-list --count "$base..HEAD")" -eq "$set_patches" ]] \
-    || { echo "error: $tree is not a build of set $set_name ($set_patches patches); build it with build-custom.sh --set $set_name" >&2; exit 2; }
+  set_args=(--set "$set_name")
+fi
+# The tree must be at the commit the series (or the set) build to: the build
+# is reproducible, so the engine names that commit without building a tree.
+expected="$(python3 -I "$here/scripts/serieslib.py" build --repo "$tree" "${set_args[@]}" 2>/dev/null)" \
+  || { python3 -I "$here/scripts/serieslib.py" build --repo "$tree" "${set_args[@]}" >/dev/null || true; exit 2; }
+if [[ "$custom" != "$expected" ]]; then
+  echo "error: $tree is at ${custom:0:12}, not the build of ${set_name:+set $set_name of }the series on BASE ${base:0:12} (${expected:0:12}); build it with build-custom.sh${set_name:+ --set $set_name}" >&2
+  exit 2
 fi
 [[ -z "$(git -C "$tree" status --porcelain --untracked-files=no)" ]] \
   || { echo "error: $tree has local changes; build from a clean tree" >&2; exit 2; }
 dirty=""
 if [[ -z "$patches_commit" ]]; then
   patches_commit="$(git -C "$here" rev-parse HEAD)"
-  [[ -z "$(git -C "$here" status --porcelain -- BASE series patches release ${set_name:+sets})" ]] || dirty=.dirty
+  [[ -z "$(git -C "$here" status --porcelain -- BASE patches glue release ${set_name:+sets})" ]] || dirty=.dirty
 fi
 
 upstream_version="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$tree/pyproject.toml")"

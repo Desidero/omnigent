@@ -24,6 +24,15 @@
 # tests of every patch because BASE moved.
 set -euo pipefail
 
+# Not converted yet: the steps below rebase one linear branch and export it
+# whole, and the series are now cut one by one from their own foundations.
+# Until this script does that per series, refresh by hand (custom/README.md,
+# "Refreshing the base").
+if [[ "${1:-}" != -h && "${1:-}" != --help ]]; then
+  echo "error: refresh.sh does not handle per-series patches yet; see 'Refreshing the base' in custom/README.md" >&2
+  exit 1
+fi
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 top="$(git -C "$here" rev-parse --show-toplevel)"
 remote=upstream

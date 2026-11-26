@@ -102,16 +102,24 @@ class ChangesSince(unittest.TestCase):
         self.assertIn("First release", notes.changes_since(self.manifest("a", []), None)[0])
 
 
+def make_series(custom: Path, name: str, files: tuple[str, ...] = ("01-one.patch",), needs: tuple[str, ...] = ()) -> None:
+    folder = custom / "patches" / name
+    folder.mkdir(parents=True)
+    (folder / "NOTE.md").write_text(f"# {name}\n\nNeeds: {', '.join(needs) or 'none'}\n\nAbout {name}.\n")
+    for file in files:
+        (folder / file).write_text("Subject: [PATCH] x\n\n---\n")
+
+
 class SeriesParsing(unittest.TestCase):
-    def test_continued_blocks_join_their_series(self):
+    def test_series_come_from_the_directories_in_build_order(self):
         with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "series").write_text(
-                "# header\n\n# series: a\n# needs: z\na--1.patch\n# series: b\nb--1.patch\n"
-                "# series: a (continued)\na--2.patch\n"
-            )
+            make_series(Path(tmp), "a", ("01-x.patch", "02-y.patch"), needs=("z",))
+            make_series(Path(tmp), "b")
+            make_series(Path(tmp), "z")
             parsed = notes.parse_series(Path(tmp))
         self.assertEqual([(s["name"], s["needs"], s["patches"]) for s in parsed],
-                         [("a", ["z"], ["a--1.patch", "a--2.patch"]), ("b", [], ["b--1.patch"])])
+                         [("b", [], ["b/01-one.patch"]), ("z", [], ["z/01-one.patch"]),
+                          ("a", ["z"], ["a/01-x.patch", "a/02-y.patch"])])
 
 
 class HostlibReleaseAssets(unittest.TestCase):
@@ -271,21 +279,39 @@ class PlanSetTags(unittest.TestCase):
 class SetSeriesAndNotes(unittest.TestCase):
     def test_series_json_keeps_only_the_named_series(self):
         with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "series").write_text("# series: a\na--1.patch\n# series: b\nb--1.patch\n# series: c\nc--1.patch\n")
-            with mock.patch.object(notes, "patch_subject", return_value="s"), \
-                    mock.patch.object(notes, "patch_id", return_value="i"):
+            for name in ("a", "b", "c"):
+                make_series(Path(tmp), name)
+            with mock.patch.object(notes.serieslib, "patch_id", return_value="i"):
                 every = notes.series_json(Path(tmp))
                 some = notes.series_json(Path(tmp), {"a", "c"})
+        self.assertEqual(every[0]["patches"], [{"file": "a/01-one.patch", "subject": "x", "patch_id": "i"}])
         self.assertEqual([entry["name"] for entry in every], ["a", "b", "c"])
         self.assertEqual([entry["name"] for entry in some], ["a", "c"])
+
+    def test_series_json_lists_the_glue_among_the_series(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a", "b", "c"):
+                make_series(Path(tmp), name)
+            for pair in ("a+b", "c+a"):
+                Path(tmp, "glue", pair).mkdir(parents=True)
+                Path(tmp, "glue", pair, "NOTE.md").write_text(f"# {pair}\n\nJoins: docs/x.md, y.py\n\nWhy.\n")
+            with mock.patch.object(notes.serieslib, "patch_id", return_value="i"):
+                every = notes.series_json(Path(tmp))
+                some = notes.series_json(Path(tmp), {"a", "b"})
+        self.assertEqual([entry["name"] for entry in every], ["c", "a", "b", "a+b", "c+a"])
+        self.assertEqual(every[-1], {"name": "c+a", "glue": True, "needs": ["c", "a"], "joins": ["docs/x.md", "y.py"],
+                                     "patches": []})
+        self.assertEqual([entry["name"] for entry in some], ["a", "b", "a+b"])
+        # Glue is not a series: the notes count and document series only.
+        manifest = {"tag": "t", "version": "v", "oss_commit": "x", "series": every}
+        changed = notes.changes_since({**manifest, "series": every[:3]}, manifest)
+        self.assertIn("- **Dropped** glue `a+b`.", changed)
 
     def render(self, extra: dict) -> tuple[str, str]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "custom" / "patches").mkdir(parents=True)
-            (root / "custom" / "series").write_text("# series: a\na--1.patch\n# series: b\nb--1.patch\n")
             for name in ("a", "b"):
-                (root / "custom" / "patches" / f"{name}--1.patch").write_text("Subject: [PATCH] x\n\n---\n")
+                make_series(root / "custom", name)
             (root / "tree").mkdir()
             manifest = {"tag": "custom/2026-10-27.1-core", "version": "1.0", "commit": "c" * 40,
                         "patches_commit": "p" * 40, "image": "i:t",
@@ -327,28 +353,41 @@ class BuildNames(unittest.TestCase):
         git(self.tree, "add", "-A")
         git(self.tree, "commit", "-q", "-m", "base")
         self.base = git(self.tree, "rev-parse", "HEAD")
-        for subject in ("one", "two", "index"):
-            git(self.tree, "commit", "-q", "--allow-empty", "-m", subject)
-        custom = root / "custom"
+        self.custom = root / "custom"
         for folder in ("release", "scripts", "sets"):
-            (custom / folder).mkdir(parents=True)
-        (custom / "release" / "build.sh").write_bytes((RELEASE / "build.sh").read_bytes())
-        script = RELEASE.parent / "scripts" / "series-files.sh"
-        (custom / "scripts" / "series-files.sh").write_bytes(script.read_bytes())
-        (custom / "scripts" / "series-files.sh").chmod(0o755)
-        (custom / "BASE").write_text(self.base + "\n")
-        (custom / "series").write_text(
-            "# series: a\na--one.patch\n# series: b\nb--two.patch\n# series: c\nc--x.patch\nc--y.patch\n"
-            "# series: custom-docs-index\ncustom-docs-index--index.patch\n"
-        )
-        (custom / "sets" / "core.txt").write_text("a\nb\n")
-        (custom / "sets" / "tiny.txt").write_text("a\n")
-        self.build_sh = custom / "release" / "build.sh"
+            (self.custom / folder).mkdir(parents=True)
+        (self.custom / "release" / "build.sh").write_bytes((RELEASE / "build.sh").read_bytes())
+        for name in ("series-files.sh", "serieslib.py"):
+            (self.custom / "scripts" / name).write_bytes((RELEASE.parent / "scripts" / name).read_bytes())
+            (self.custom / "scripts" / name).chmod(0o755)
+        (self.custom / "BASE").write_text(self.base + "\n")
+        # Real one-file series, each exported from its own branch on BASE.
+        for name, subjects in (("a", ("one",)), ("b", ("two",)), ("c", ("x", "y")), ("d", ("z",))):
+            git(self.tree, "switch", "-q", "-c", f"work/{name}", self.base)
+            for subject in subjects:
+                (self.tree / f"{name}-{subject}.md").write_text(subject + "\n")
+                git(self.tree, "add", "-A")
+                git(self.tree, "commit", "-q", "-m", f"{subject}\n\nDocs: none (test)")
+            self.lib("export", "--repo", str(self.tree), name, f"work/{name}")
+        (self.custom / "sets" / "core.txt").write_text("a\nb\n")
+        (self.custom / "sets" / "tiny.txt").write_text("a\n")
+        self.build_sh = self.custom / "release" / "build.sh"
+        self.checkout()
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def names(self, *args: str, check: bool = True) -> dict[str, str]:
+    def lib(self, *args: str) -> str:
+        command = [sys.executable, str(self.custom / "scripts" / "serieslib.py"), *args]
+        return subprocess.run(command, env=GIT_ENV, capture_output=True, text=True, check=True).stdout.strip()
+
+    def checkout(self, *selection: str) -> None:
+        """Put the tree at the commit the whole series, or a set, builds to."""
+        git(self.tree, "checkout", "-q", "--detach", self.lib("build", "--repo", str(self.tree), *selection))
+
+    def names(self, *args: str, check: bool = True, checkout: bool = True) -> dict[str, str]:
+        if checkout:
+            self.checkout(*(["--set", args[args.index("--set") + 1]] if "--set" in args else []))
         command = ["bash", str(self.build_sh), "--tree", str(self.tree), "--names-only", "--patches-commit", "0123abc" * 6,
                    "--image", "ghcr.io/o/r", *args]
         result = subprocess.run(command, env=GIT_ENV, capture_output=True, text=True)
@@ -393,10 +432,13 @@ class BuildNames(unittest.TestCase):
                 # A canonical version: the wheel's file name will carry it unchanged.
                 self.assertEqual(str(Version(names["VERSION"])), names["VERSION"])
 
-    def test_the_tree_must_be_a_build_of_the_set(self):
-        self.assertEqual(self.names("--set", "tiny", check=False), {})
-        self.assertIn("is not a build of set tiny (2 patches)", self.stderr)
-        self.assertEqual(self.names("--set", "absent", check=False), {})
+    def test_the_tree_must_be_at_the_commit_the_selection_builds(self):
+        self.checkout("--set", "core")
+        self.assertEqual(self.names("--set", "tiny", check=False, checkout=False), {})
+        self.assertIn("not the build of set tiny of the series", self.stderr)
+        self.assertEqual(self.names(check=False, checkout=False), {})
+        self.assertIn("not the build of the series", self.stderr)
+        self.assertEqual(self.names("--set", "absent", check=False, checkout=False), {})
         self.assertIn("no set named absent", self.stderr)
 
 

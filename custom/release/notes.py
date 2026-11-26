@@ -1,7 +1,8 @@
 """Release notes and per-series docs for a build of the patch series.
 
   notes.py series --custom DIR
-      Print the series as JSON: [{name, needs, patches: [{file, subject, patch_id}]}].
+      Print the series as JSON: [{name, needs, patches: [{file, subject, patch_id}]}],
+      file being <series>/<NN-slug>.patch under custom/patches/.
   notes.py render --manifest F --tree DIR --custom DIR --fork REPO --notes OUT --docs OUT
                   [--previous-manifest F] [--note TEXT]
       Write the release body (header, changes since the previous release, the
@@ -16,19 +17,19 @@ Stdlib only; runs with any python >= 3.11.
 from __future__ import annotations
 
 import argparse
-import email
-import email.policy
 import json
 import posixpath
 import re
-import subprocess
 import sys
 from pathlib import Path
 
+# The series' layout is read through custom/scripts/serieslib.py, next to this folder.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import serieslib  # noqa: E402
+
 UPSTREAM = "omnigent-ai/omnigent"
-DOC_PATHS_RE = re.compile(r"^(docs/|feature-map/|designs/|omnigent/server/API\.md$)")
-INDEX_PATH = "docs/custom/README.md"
-INDEX_SERIES = "custom-docs-index"
+DOC_PATHS_RE = serieslib.DOC_PATHS_RE
+INDEX_PATH = serieslib.INDEX_PATH
 # GitHub rejects release bodies over 125,000 characters.
 BODY_LIMIT = 120_000
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
@@ -44,69 +45,24 @@ SECTION_LIMIT = 3000
 
 
 def parse_series(custom_dir: Path) -> list[dict]:
-    """Series in apply order; a '(continued)' block joins its earlier series."""
-    order: list[str] = []
-    series: dict[str, dict] = {}
-    current = None
-    for raw in (custom_dir / "series").read_text().splitlines():
-        line = raw.strip()
-        match = re.match(r"^#\s*series:\s*(\S+)", line)
-        if match:
-            current = match.group(1)
-            if current not in series:
-                series[current] = {"name": current, "needs": [], "patches": []}
-                order.append(current)
-            continue
-        match = re.match(r"^#\s*needs:\s*(\S+)", line)
-        if match and current:
-            if match.group(1) not in series[current]["needs"]:
-                series[current]["needs"].append(match.group(1))
-            continue
-        if line and not line.startswith("#") and current:
-            series[current]["patches"].append(line)
-    return [series[name] for name in order]
-
-
-def patch_subject(path: Path) -> str:
-    with path.open("rb") as handle:
-        message = email.message_from_binary_file(handle, policy=email.policy.default)
-    subject = str(message.get("Subject", "")).replace("\n", " ")
-    return re.sub(r"^\[PATCH[^\]]*\]\s*", "", subject).strip()
-
-
-def patch_id(path: Path) -> str:
-    """git's stable patch id: the change, ignoring line numbers and blob ids."""
-    result = subprocess.run(
-        ["git", "patch-id", "--stable"],
-        input=path.read_bytes(),
-        capture_output=True,
-        check=True,
-    )
-    return result.stdout.decode().split(" ", 1)[0]
+    """Series in build order: [{name, needs, patches: [<series>/<file>, ...]}] (no glue)."""
+    catalog = serieslib.Catalog(custom_dir)
+    return [
+        {
+            "name": name,
+            "needs": catalog.series[name].needs,
+            "patches": [f"{name}/{patch.name}" for patch in catalog.series[name].patches],
+        }
+        for name in catalog.order
+    ]
 
 
 def series_json(custom_dir: Path, only: set[str] | None = None) -> list[dict]:
-    """The series with their patch ids; `only` keeps the named ones (a build set)."""
-    patches_dir = custom_dir / "patches"
-    out = []
-    for entry in parse_series(custom_dir):
-        if only is not None and entry["name"] not in only:
-            continue
-        out.append(
-            {
-                "name": entry["name"],
-                "needs": entry["needs"],
-                "patches": [
-                    {
-                        "file": name,
-                        "subject": patch_subject(patches_dir / name),
-                        "patch_id": patch_id(patches_dir / name),
-                    }
-                    for name in entry["patches"]
-                ],
-            }
-        )
-    return out
+    """The series with their patch ids, then the glue pairs among them ("glue": true).
+
+    `only` keeps the named series (a build set).
+    """
+    return serieslib.Catalog(custom_dir).as_json(only)
 
 
 # ---------------------------------------------------------------- diffs
@@ -330,23 +286,29 @@ def changes_since(current: dict, previous: dict | None) -> list[str]:
             continue
         old_ids = [p["patch_id"] for p in old[name]["patches"]]
         new_ids = [p["patch_id"] for p in new[name]["patches"]]
-        if old_ids == new_ids:
+        if old_ids == new_ids and old[name].get("joins") == new[name].get("joins"):
             unchanged += 1
         else:
             changed.append(name)
     for name in added:
         count = len(new[name]["patches"])
-        lines.append(f"- **Added** `{name}` ({count} patch{'es' if count != 1 else ''}).")
+        kind = "glue " if new[name].get("glue") else ""
+        lines.append(f"- **Added** {kind}`{name}` ({count} patch{'es' if count != 1 else ''}).")
     for name in changed:
         old_ids = {p["patch_id"] for p in old[name]["patches"]}
         new_ids = {p["patch_id"] for p in new[name]["patches"]}
         detail = []
         detail += [f"new or changed: {p['subject']}" for p in new[name]["patches"] if p["patch_id"] not in old_ids]
         detail += [f"removed: {p['subject']}" for p in old[name]["patches"] if p["patch_id"] not in new_ids]
+        if old[name].get("joins") != new[name].get("joins"):
+            detail.append("joined paths changed")
         if not detail:
             detail = ["patches reordered"]
         lines.append(f"- **Changed** `{name}`: " + "; ".join(detail) + ".")
     for name in dropped:
+        if old[name].get("glue"):
+            lines.append(f"- **Dropped** glue `{name}`.")
+            continue
         lines.append(f"- **Dropped** `{name}` (landed upstream or retired).")
     if not (added or changed or dropped):
         lines.append("- No series changed.")
@@ -370,12 +332,13 @@ def render(args: argparse.Namespace) -> None:
         f"- **Version:** `{manifest['version']}` (build `{manifest.get('build_id')}`)",
         f"- **OSS base:** [`{short(manifest.get('oss_commit'))}`](https://github.com/{UPSTREAM}/commit/{manifest.get('oss_commit')})",
         f"- **Patches commit:** [`{short(manifest.get('patches_commit'))}`](https://github.com/{patches_repo}/commit/{manifest.get('patches_commit')})"
-        " (the `patches` branch: `custom/BASE`, `custom/series`, the patch files)",
+        " (the `patches` branch: `custom/BASE`, `custom/patches/<series>/`)",
         f"- **Built custom commit:** [`{short(manifest['commit'])}`](https://github.com/{fork}/commit/{manifest['commit']})"
         + ("" if is_release else " (not pushed: not a release build)"),
         f"{IMAGE_LINE_PREFIX}`{manifest['image']}`" + ("" if is_release else " (not pushed)"),
-        f"- **Series:** {len(manifest.get('series', []))}, "
-        f"{sum(len(s['patches']) for s in manifest.get('series', []))} patches",
+        f"- **Series:** {sum(1 for s in manifest.get('series', []) if not s.get('glue'))}, "
+        f"{sum(len(s['patches']) for s in manifest.get('series', []))} patches"
+        + (f", {glued} glue pairs" if (glued := sum(1 for s in manifest.get("series", []) if s.get("glue"))) else ""),
     ]
     if manifest.get("set"):
         header.append(
@@ -421,10 +384,10 @@ def custom_docs(manifest: dict, tree: Path, custom_dir: Path, fork: str, ref: st
         f"(custom `{short(manifest['commit'])}`). Whole files are shown when the series adds "
         "them; otherwise the headed sections that hold its added lines. Links point at the fork.",
     ]
-    built = {entry["name"] for entry in manifest.get("series", [])} if manifest.get("set") else None
+    built = {entry["name"] for entry in manifest.get("series", []) if not entry.get("glue")} if manifest.get("set") else None
     for entry in parse_series(custom_dir):
         name = entry["name"]
-        if name == INDEX_SERIES or (built is not None and name not in built):
+        if built is not None and name not in built:
             continue
         per_file: dict[str, dict] = {}
         for patch in entry["patches"]:
@@ -478,7 +441,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("series")
-    p.add_argument("--custom", required=True, help="the custom/ folder: series and patches/")
+    p.add_argument("--custom", required=True, help="the custom/ folder: patches/<series>/ and scripts/serieslib.py's layout")
     p.add_argument("--names", help="only these series, comma-separated (a build set)")
     p = sub.add_parser("render")
     for name in ("--manifest", "--tree", "--custom", "--fork", "--notes", "--docs"):

@@ -4,8 +4,9 @@
   custom/scripts/select-tests.py --tree <built tree> --out <dir> [--since <ref> | --all] [--set <name>]
 
 --since REF   the patches that differ from REF (a patch-id change, an added or a
-              removed patch) on the patches branch; a moved custom/BASE (an
-              upstream refresh) selects the whole series
+              removed patch; a moved or renumbered file is not a change) on the
+              patches branch; a moved custom/BASE (an upstream refresh) selects
+              the whole series
 --all         every patch in the series
 --set NAME    only the patches of that build set (custom/sets/NAME.txt, with
               the series it needs); a change to the set file selects them all
@@ -27,6 +28,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # custom/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import serieslib  # noqa: E402
 TOP = ROOT.parent  # the Omnigent checkout of the patches branch
 SKIP_TEST_DIRS = ("e2e", "e2e_ui", "e2e_live", "browser_ui", "benchmarks", "loadtest", "harness_bench")
 PYTEST_LIMIT = 250
@@ -39,10 +42,7 @@ def git(*args: str) -> str:
 
 
 def touched_files(patch_text: str) -> set[str]:
-    files = set()
-    for match in re.finditer(r"^diff --git a/(\S+) b/(\S+)$", patch_text, re.M):
-        files.update(match.groups())
-    return files
+    return set(serieslib.touched_files(patch_text))
 
 
 def patch_id(text: str) -> str:
@@ -54,23 +54,27 @@ def set_series(name: str | None) -> set[str] | None:
     """The series a build set holds, with the ones they need; None means every series."""
     if not name:
         return None
-    result = subprocess.run(
-        [str(ROOT / "scripts" / "series-files.sh"), "--set", name, "--names"], capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        sys.exit(result.stderr.strip().splitlines()[-1])
-    return set(result.stdout.split())
+    catalog = serieslib.Catalog(ROOT)
+    try:
+        return set(catalog.select(catalog.set_members(name), needs=True)[0])
+    except serieslib.SeriesError as error:
+        sys.exit(f"error: {error}")
 
 
 def in_set(patch: str, only: set[str] | None) -> bool:
-    """Whether a patch file (<series>--<subject>.patch) belongs to one of the series."""
-    return only is None or Path(patch).name.split("--", 1)[0] in only
+    """Whether a patch file belongs to the series: custom/patches/<series>/NN-<slug>.patch, or a
+    glue patch, custom/glue/<first>+<second>/NN-<slug>.patch, of two of them."""
+    series = Path(patch).parent.name
+    if series == "patches":  # the flat layout an older commit has: <series>--<slug>.patch
+        series = Path(patch).name.split("--", 1)[0]
+    return only is None or all(name in only for name in series.split("+"))
 
 
-def series_patches(only: set[str] | None = None) -> list[str]:
-    lines = (ROOT / "series").read_text().splitlines()
-    names = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
-    return [name for name in names if in_set(name, only)]
+def series_patches(only: set[str] | None = None) -> list[Path]:
+    """The patches of the series, and of the glue between them."""
+    catalog = serieslib.Catalog(ROOT)
+    names = [name for name in catalog.order if only is None or name in only]
+    return catalog.files(names) + [patch for glue in catalog.active_glue(names) for patch in glue.patches]
 
 
 def changed_patch_texts(since: str | None, set_name: str | None = None) -> tuple[list[str], str]:
@@ -79,18 +83,19 @@ def changed_patch_texts(since: str | None, set_name: str | None = None) -> tuple
     current = series_patches(only)
     scope = f" of set {set_name}" if set_name else ""
     if since is None:
-        return [(ROOT / "patches" / name).read_text() for name in current], f"all patches{scope}"
+        return [path.read_text() for path in current], f"all patches{scope}"
     # git runs in custom/, where a bare pathspec would mean custom/custom/...; anchor at the top.
-    paths = [":/custom/BASE", ":/custom/series", ":/custom/patches/"]
+    paths = [":/custom/BASE", ":/custom/patches/", ":/custom/glue/"]
     set_path = f"custom/sets/{set_name}.txt"
     if set_name:
         paths.append(f":/{set_path}")
-    names = git("diff", "--name-only", f"{since}...HEAD", "--", *paths).split()
+    names = git("diff", "--name-only", "--no-renames", f"{since}...HEAD", "--", *paths).split()
     if "custom/BASE" in names:
-        return [(ROOT / "patches" / name).read_text() for name in current], f"BASE moved: all patches{scope}"
+        return [path.read_text() for path in current], f"BASE moved: all patches{scope}"
     if set_name and set_path in names:
-        return [(ROOT / "patches" / name).read_text() for name in current], f"set {set_name} changed: all its patches"
-    texts = []
+        return [path.read_text() for path in current], f"set {set_name} changed: all its patches"
+    old: dict[str, str] = {}
+    new: dict[str, str] = {}
     for path in names:
         if not path.endswith(".patch") or not in_set(path, only):
             continue
@@ -99,10 +104,14 @@ def changed_patch_texts(since: str | None, set_name: str | None = None) -> tuple
             old_text = git("show", f"{since}:{path}")
         except subprocess.CalledProcessError:
             old_text = ""
-        new_text = new_file.read_text() if new_file.is_file() else ""
-        if old_text and new_text and patch_id(old_text) == patch_id(new_text):
-            continue  # only blob ids or line numbers moved
-        texts += [text for text in (old_text, new_text) if text]
+        if old_text:
+            old[patch_id(old_text)] = old_text
+        if new_file.is_file():
+            new[patch_id(new_file.read_text())] = new_file.read_text()
+    # A patch id on both sides is a moved or renumbered file, or one where only
+    # blob ids or line numbers changed.
+    texts = [text for key, text in old.items() if key not in new]
+    texts += [text for key, text in new.items() if key not in old]
     return texts, f"{len(texts)} patch versions{scope} changed since {since}"
 
 

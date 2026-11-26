@@ -36,7 +36,7 @@ anything.
 Needs `uv`, Node 22 and pnpm (the web UI is built into the wheel), and Docker
 with buildx for the image. A local build gets the tag `build/<build-id>`,
 with the checkout's commit as the patches commit and a `.dirty` build id
-when `custom/BASE`, `custom/series`, `custom/patches/` or `custom/release/`
+when `custom/BASE`, `custom/patches/`, `custom/glue/` or `custom/release/`
 has uncommitted changes. `/tmp/install-set/release/` is the folder to
 install.
 
