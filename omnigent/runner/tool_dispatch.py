@@ -77,6 +77,7 @@ from omnigent.runner.journal_tools import (
     execute_journal_tool,
     server_workflows_enabled,
 )
+from omnigent.runner.open_items_tools import OPEN_ITEMS_TOOL_NAMES, execute_open_items_tool
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
@@ -488,6 +489,10 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
+# Priority 5l.1: Open items — the runner proxies the server's
+# /v1/sessions/{id}/open-items routes for the calling session.
+_OPEN_ITEMS_TOOLS = OPEN_ITEMS_TOOL_NAMES
+
 # Priority 5l.2: The session journal — the runner proxies the server's
 # /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
 _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
@@ -566,6 +571,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _OPEN_ITEMS_TOOLS
     | _JOURNAL_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
@@ -1089,6 +1095,7 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _OPEN_ITEMS_TOOLS
     | _JOURNAL_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
@@ -9109,6 +9116,14 @@ async def execute_tool(
                 arguments,
                 server_client=server_client,
                 conversation_id=conversation_id,
+            )
+        elif tool_name in _OPEN_ITEMS_TOOLS:
+            output = await execute_open_items_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                call_id=call_id,
             )
         elif tool_name in _JOURNAL_TOOLS:
             output = await execute_journal_tool(

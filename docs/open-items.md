@@ -30,6 +30,47 @@ A session holds at most 500 items. Items are deleted with their session. A fork
 or a side chat starts with none, and session export and import leave them out;
 the forked transcript's labels still render as chat labels.
 
+## Agent tools
+
+The `open_items` tool group gives every agent three tools, which reach only the
+calling session's items:
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `sys_open_items_raise` | `items` (1 to 10): `kind` (`question`, `risk`, `finding`, `follow_up`, `link`), `title`, `detail`, and optionally `topic`, `links`, `url` (a link item's URL), `raised_by`, `label` (a label already written in chat, to adopt it) | Per item its `label`, `status` and `title`, `duplicate: true` for a link already pinned, or an `error`; then `open_count` and the `topics` in use. |
+| `sys_open_items_update` | `updates` (1 to 20): `label` and any of `status` (`open` or `closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty clears it), `add_links`, `remove_links` | Per label its new state, or its own error. |
+| `sys_open_items_list` | Optionally `status` (`open`, `answered`, `closed` or `all`; default open and answered), `kind`, `topic`, `query`, `limit` (1 to 100, default 50), `after` (a label) | Compact rows in label order: a 300-character detail preview, the latest answer, how closed items ended; `truncated` and `next_after` when more remain, counts by status and the topics. |
+
+Errors start with a code: `invalid_input`, `too_large`, `session_full`,
+`label_taken`, `not_found`, or `unavailable` when the server does not store open
+items (the agent then labels items in chat only).
+
+A raise retried by the harness with the same tool call ID returns the labels
+its first attempt allocated. Two raises at once in one session never get the
+same label. Adopting a label from chat takes it only if no item has it, and
+moves counting past it.
+
+### Which sessions get the tools
+
+- **SDK harnesses** get them with the turn's tools; **claude-native**,
+  **codex-native**, **pi-native**, **antigravity-native** and **hermes** get
+  them through the Omnigent tool relay, like the Inbox tools. Native harnesses
+  without the relay never see them and keep text labels, as the instruction's
+  last sentence tells them.
+- The runner keeps the group only when the server says, on the agent bundle
+  download, that it stores open items (`X-Omnigent-Open-Items: 1`). A server
+  without this feature sends no such header, so its sessions keep the
+  text-only instruction and no tools.
+- An agent spec turns the group off with:
+
+  ```yaml
+  tool_groups:
+    open_items: false
+  ```
+
+  A host whose Omnigent predates the group rejects an agent spec that names
+  it, so set the key only once every host has it.
+
 ## HTTP API
 
 | Route (under `/v1`) | Caller | Purpose |

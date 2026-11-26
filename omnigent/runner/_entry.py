@@ -1632,6 +1632,7 @@ def _load_agent_spec_bundle(
         without_memory_search,
         without_memory_tools,
     )
+    from omnigent.open_items_availability import OPEN_ITEMS_HEADER, without_open_items_tools
     from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
@@ -1667,6 +1668,8 @@ def _load_agent_spec_bundle(
         # tools need the server to turn them on.
         if resp.headers.get(USER_INBOX_HEADER) != "1":
             spec = without_user_inbox_tools(spec)
+        if resp.headers.get(OPEN_ITEMS_HEADER) != "1":
+            spec = without_open_items_tools(spec)
         if resp.headers.get(MEMORY_HEADER) != "1":
             spec = without_memory_tools(spec)
         elif resp.headers.get(MEMORY_SEARCH_HEADER) != "1":

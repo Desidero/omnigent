@@ -290,11 +290,24 @@ async def test_invalid_input_and_per_item_errors(
 
 
 async def test_a_server_without_storage_hides_the_feature(
-    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    stores: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from omnigent.open_items_availability import OPEN_ITEMS_HEADER
+    from tests.server.helpers import build_agent_bundle
+
     session_id = _session(stores)
+    LocalArtifactStore(str(tmp_path / "artifacts")).put(
+        f"{_ITEMS_AGENT}/{_BUNDLE_HASH}", build_agent_bundle("items-agent")
+    )
+    bundle_url = f"/v1/sessions/{session_id}/agent/contents"
+    # The runner keeps the tools only when the bundle download says the server stores items.
+    assert (await client.get(bundle_url, headers=_user(ALICE))).headers[OPEN_ITEMS_HEADER] == "1"
     assert (await client.get("/v1/info", headers=_user(ALICE))).json()["open_items"] is True
     monkeypatch.setattr(open_items_api, "open_items_store_for", _unavailable)
+    assert (await client.get(bundle_url, headers=_user(ALICE))).headers[OPEN_ITEMS_HEADER] == "0"
     assert (await client.get("/v1/info", headers=_user(ALICE))).json()["open_items"] is False
     missing = await client.get(f"/v1/sessions/{session_id}/open-items", headers=_user(ALICE))
     assert missing.status_code == 404
@@ -303,3 +316,95 @@ async def test_a_server_without_storage_hides_the_feature(
 
 def _unavailable(storage_location: str) -> Any:
     raise RuntimeError(f"no open items store at {storage_location}")
+
+
+async def test_the_agents_tools_raise_update_and_list_through_the_runner(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    """The runner's handlers drive the real routes and return compact results."""
+    import json
+
+    from omnigent.runner.open_items_tools import execute_open_items_tool
+
+    session_id = _session(stores)
+    client.headers.update(_runner(session_id))
+
+    async def run(tool: str, args: dict[str, Any], call_id: str | None = None) -> Any:
+        output = await execute_open_items_tool(
+            tool,
+            json.dumps(args),
+            server_client=client,
+            conversation_id=session_id,
+            call_id=call_id,
+        )
+        return json.loads(output)
+
+    raise_args = {
+        "items": [
+            {**_QUESTION, "topic": "cache"},
+            {"kind": "link", "url": "https://github.com/acme/app/pull/7", "title": "The PR"},
+        ]
+    }
+    raised = await run("sys_open_items_raise", raise_args, call_id="toolu_1")
+    assert raised == {
+        "items": [
+            {"label": "Q1", "status": "open", "title": "Cache rows?", "topic": "cache"},
+            {"label": "L1", "status": "open", "title": "The PR"},
+        ],
+        "open_count": 2,
+        "topics": ["cache"],
+    }
+    # The harness retrying the same call gets the same labels.
+    assert await run("sys_open_items_raise", raise_args, call_id="toolu_1") == raised
+    pinned_again = await run(
+        "sys_open_items_raise",
+        {"items": [{"kind": "link", "url": "https://github.com/acme/app/pull/7/files"}]},
+    )
+    assert pinned_again["items"][0] == {
+        "label": "L1",
+        "status": "open",
+        "title": "The PR",
+        "duplicate": True,
+    }
+
+    updated = await run(
+        "sys_open_items_update",
+        {
+            "updates": [
+                {"label": "Q1", "status": "closed", "resolution": "Copied as is"},
+                {"label": "R9", "status": "open"},
+            ]
+        },
+        call_id="toolu_2",
+    )
+    assert updated == {
+        "items": [
+            {
+                "label": "Q1",
+                "status": "closed",
+                "title": "Cache rows?",
+                "topic": "cache",
+                "resolution": "Copied as is",
+            },
+            {"label": "R9", "error": "not_found: no item R9"},
+        ]
+    }
+    listed = await run("sys_open_items_list", {"status": "all", "query": "copy"})
+    assert listed["items"] == [
+        {
+            "label": "Q1",
+            "status": "closed",
+            "title": "Cache rows?",
+            "topic": "cache",
+            "resolution": "Copied as is",
+            "kind": "question",
+            "detail": "Copy or link?",
+            "closed_by": "agent",
+        }
+    ]
+    assert (listed["truncated"], listed["counts"]) == (
+        False,
+        {"open": 1, "answered": 0, "closed": 1},
+    )
+    refused = await run("sys_open_items_raise", {"items": [{"kind": "question"}]})
+    assert refused == {"error": "invalid_input: title is required"}

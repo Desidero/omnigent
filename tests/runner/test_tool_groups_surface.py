@@ -20,6 +20,7 @@ _ALL_OFF = ToolGroupsConfig(
     comments=False,
     policies=False,
     agent_discovery=False,
+    open_items=False,
     memory=False,
     files=False,
 )
@@ -38,9 +39,9 @@ def _registered(spec: AgentSpec) -> set[str]:
 
 
 def _gated() -> frozenset[str]:
-    """Tools the seven groups control, derived from registration itself."""
+    """Tools the eight groups control, derived from registration itself."""
     gated = frozenset(_registered(_spec(_ALL_ON)) - _registered(_spec(_ALL_OFF)))
-    assert len(gated) == 35, sorted(gated)
+    assert len(gated) == 38, sorted(gated)
     return gated
 
 
