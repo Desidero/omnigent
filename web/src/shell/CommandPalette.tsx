@@ -1,6 +1,7 @@
-// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions.
+// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions,
+// and New chat in project (a row per project, once the user types).
 // Sessions are searched server-side (one loaded page can't find older ones), so
-// cmdk filtering is off and the static actions are filtered here.
+// cmdk filtering is off and the static rows are filtered here.
 
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -21,7 +22,16 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
+import {
+  matchNewChatInProject,
+  NEW_CHAT_IN_PROJECT_HEADING,
+  newChatInProjectLabel,
+  newChatInProjectPath,
+  newChatInProjectRowId,
+  useNewChatInProjectChoices,
+} from "./newChatInProject";
 import { PaletteSessionContext } from "./PaletteSessionContext";
+import { ProjectRowIcon } from "./ProjectPicker";
 import { type FeaturePaletteRow, useFeaturePaletteCommands } from "./useFeaturePaletteCommands";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
@@ -131,6 +141,11 @@ export function CommandPalette({
     () => groupByHeading(filterAppCommands(featureCommands.rows, query)),
     [featureCommands.rows, query],
   );
+  const projectChoices = useNewChatInProjectChoices(open && !sessionsOnly, query);
+  const filteredProjects = useMemo(
+    () => matchNewChatInProject(projectChoices, query),
+    [projectChoices, query],
+  );
 
   // The two search groups resolve independently, so a title match can render
   // above an already-highlighted content match. Keep the top row selected
@@ -143,7 +158,8 @@ export function CommandPalette({
     visibleSessions[0]?.id ??
     contentSessions[0]?.id ??
     (filteredActions[0] ? `action:${filteredActions[0].id}` : undefined) ??
-    (firstRunnableFeature ? `feature:${firstRunnableFeature.id}` : "");
+    (firstRunnableFeature ? `feature:${firstRunnableFeature.id}` : undefined) ??
+    (filteredProjects[0] ? newChatInProjectRowId(filteredProjects[0].name) : "");
   const [selectedValue, setSelectedValue] = useState("");
   const userMovedSelection = useRef(false);
   useEffect(() => {
@@ -161,6 +177,11 @@ export function CommandPalette({
   const runAction = (action: ActionCommand): void => {
     close();
     action.run();
+  };
+
+  const newChatInProject = (projectName: string): void => {
+    close();
+    navigate(newChatInProjectPath(projectName));
   };
 
   const goToSession = (id: string): void => {
@@ -394,6 +415,22 @@ export function CommandPalette({
                 ))}
               </CommandGroup>
             ))}
+            {filteredProjects.length > 0 && (
+              <CommandGroup heading={NEW_CHAT_IN_PROJECT_HEADING}>
+                {filteredProjects.map((project) => (
+                  <CommandItem
+                    key={project.name}
+                    value={newChatInProjectRowId(project.name)}
+                    onSelect={() => newChatInProject(project.name)}
+                  >
+                    <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
+                    <span className="flex-1 truncate text-left">
+                      {newChatInProjectLabel(project.name)}
+                    </span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
           </CommandList>
         </Command>
       </DialogContent>
