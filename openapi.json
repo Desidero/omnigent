@@ -6157,6 +6157,107 @@
         "title": "OpenFileResponse",
         "type": "object"
       },
+      "OpenItemAnswer": {
+        "description": "A person's reply to one item.",
+        "properties": {
+          "label": {
+            "maxLength": 4,
+            "minLength": 2,
+            "title": "Label",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "text"
+        ],
+        "title": "OpenItemAnswer",
+        "type": "object"
+      },
+      "OpenItemsAnswerRequest": {
+        "description": "Replies to record, one per item.",
+        "properties": {
+          "answers": {
+            "items": {
+              "$ref": "#/components/schemas/OpenItemAnswer"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Answers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "answers"
+        ],
+        "title": "OpenItemsAnswerRequest",
+        "type": "object"
+      },
+      "OpenItemsRaiseRequest": {
+        "description": "Items the session's agent raises; see `sys_open_items_raise`.",
+        "properties": {
+          "idempotency_key": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 10,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "idempotency_key"
+        ],
+        "title": "OpenItemsRaiseRequest",
+        "type": "object"
+      },
+      "OpenItemsUpdateRequest": {
+        "description": "Changes to items; see `sys_open_items_update`.",
+        "properties": {
+          "ref": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "updates": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Updates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "updates"
+        ],
+        "title": "OpenItemsUpdateRequest",
+        "type": "object"
+      },
       "OutputFileDoneEvent": {
         "description": "A streamed file output completed materializing.\n\nEmitted by `_emit_file_annotation_events` in\n`omnigent/runtime/workflow.py` once per file annotation in\nthe assistant's output. `filename` and `content_type` are\nonly populated when the originating annotation carried them.",
         "properties": {
@@ -8581,6 +8682,11 @@
             "title": "Needs Setup",
             "type": "boolean"
           },
+          "open_items": {
+            "default": false,
+            "title": "Open Items",
+            "type": "boolean"
+          },
           "picker": {
             "$ref": "#/components/schemas/PickerInfo",
             "default": {
@@ -8982,6 +9088,7 @@
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
+            "session.open_items.changed": "#/components/schemas/SessionOpenItemsChangedEvent",
             "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
@@ -9078,6 +9185,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionJournalAppendedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionOpenItemsChangedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -12423,6 +12533,57 @@
           "type"
         ],
         "title": "SessionNativeToolItem",
+        "type": "object"
+      },
+      "SessionOpenItemsChangedEvent": {
+        "description": "Items in the session's open items list were raised or changed.\n\nTransient: the list is the source of truth; a client that sees it, or\nreconnects, reads `GET /v1/sessions/{id}/open-items` again.",
+        "properties": {
+          "conversation_id": {
+            "description": "The session whose items changed.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "labels": {
+            "description": "The labels written, e.g. `[\"Q7\", \"R2\"]`.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "array"
+          },
+          "open_count": {
+            "description": "The session's open and answered items after the write.",
+            "format": "int64",
+            "title": "Open Count",
+            "type": "integer"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.open_items.changed",
+            "description": "Always `\"session.open_items.changed\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "labels",
+          "open_count"
+        ],
+        "title": "SessionOpenItemsChangedEvent",
         "type": "object"
       },
       "SessionPageBoundary": {
@@ -25654,6 +25815,348 @@
         "summary": "Reset Session Model Override",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/open-items": {
+      "get": {
+        "description": "One page of the session's items in label order, with counts over all of them.",
+        "operationId": "list_open_items_v1_sessions__session_id__open_items_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "default": [
+                "open",
+                "answered"
+              ],
+              "items": {
+                "enum": [
+                  "open",
+                  "answered",
+                  "closed",
+                  "all"
+                ],
+                "type": "string"
+              },
+              "title": "Status",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": [],
+              "items": {
+                "enum": [
+                  "question",
+                  "risk",
+                  "finding",
+                  "follow_up",
+                  "link"
+                ],
+                "type": "string"
+              },
+              "title": "Kind",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "topic",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Topic"
+            }
+          },
+          {
+            "in": "query",
+            "name": "raised_by",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Raised By"
+            }
+          },
+          {
+            "in": "query",
+            "name": "has_links",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Has Links"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Open Items V1 Sessions  Session Id  Open Items Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Open Items",
+        "tags": [
+          "open_items"
+        ]
+      },
+      "patch": {
+        "description": "Change items, from the session's runner or a person with edit access.",
+        "operationId": "update_open_items_v1_sessions__session_id__open_items_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenItemsUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Open Items V1 Sessions  Session Id  Open Items Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Open Items",
+        "tags": [
+          "open_items"
+        ]
+      },
+      "post": {
+        "description": "Raise items for the session's agent; only its runner calls this.",
+        "operationId": "raise_open_items_v1_sessions__session_id__open_items_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenItemsRaiseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Raise Open Items V1 Sessions  Session Id  Open Items Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Raise Open Items",
+        "tags": [
+          "open_items"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/open-items/answers": {
+      "post": {
+        "description": "Record a person's replies; needs edit access.",
+        "operationId": "answer_open_items_v1_sessions__session_id__open_items_answers_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenItemsAnswerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Answer Open Items V1 Sessions  Session Id  Open Items Answers Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Answer Open Items",
+        "tags": [
+          "open_items"
         ]
       }
     },

@@ -1610,6 +1610,93 @@ when the remote confirms the branch is absent. Detached HEADs, an unavailable
 workspace, or a failed remote check produce `null` values so clients can retain
 the original selection. Non-managed sessions return an empty repository list.
 
+### Open items
+
+The questions, risks, findings, follow-ups and pinned links a session's agent
+raises, each named by a label the server allocates (`Q7`). Not the transcript,
+which is `GET /v1/sessions/{id}/items`. `GET /v1/info` reports
+`open_items: true` when the server stores them. Usage:
+[`docs/open-items.md`](../../docs/open-items.md).
+
+```
+GET /v1/sessions/{session_id}/open-items?status=open&kind=question&q=cache&limit=100&after=Q3
+
+200 OK — {"data": [{"label": "Q7", "kind": "question", "number": 7,
+  "status": "open", "title": "Cache rows?", "detail": "...", "topic": "cache",
+  "links": [{"url": "https://...", "label": "PR"}], "url": null,
+  "raised_by": null, "created_at": 1764100000, "updated_at": 1764100000,
+  "closed_at": null, "resolution": null, "closed_by": null,
+  "answers": [{"text": "Link them", "at": 1764100100, "by": "bob@example.com"}]}],
+  "has_more": false, "next_after": null,
+  "counts": {"status": {"open": 3, "answered": 1, "closed": 2},
+             "kind": {"question": 4, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}},
+  "topics": ["cache"]}
+```
+
+Read access. Items come in label order (by kind, then number). `status` and
+`kind` repeat; `status` defaults to `open` and `answered`, and `all` means
+every status. `topic`, `raised_by`, `has_links` and `q` (case-insensitive text
+in the label, title, detail, topic, links, resolution and answers) narrow the
+page; `limit` is 1 to 200 (default 100) and `after` takes a label, the previous
+page's `next_after`. `counts` and `topics` cover all of the session's items.
+
+```
+POST /v1/sessions/{session_id}/open-items
+X-Omnigent-Orchestration-Source: <session_id>
+
+{"items": [{"kind": "question", "title": "Cache rows?", "detail": "...",
+  "topic": "cache", "links": ["https://..."], "label": "Q7"}],
+ "idempotency_key": "tool:toolu_01"}
+
+200 OK — {"items": [{"item": {...}, "duplicate": false} | {"error": {"code", "message"}}],
+  "open_count": 4, "topics": ["cache"]}
+400 — invalid_input or too_large: nothing was written
+403 — not the session's own runner (source header and, on a shared server,
+  its bound runner's tunnel token), or its agent has `tool_groups.open_items: false`
+404 — no such session, or the server does not store open items
+```
+
+Only the session's runner raises items, for its agent. One to ten items; item
+`i` is written under `<idempotency_key>:<i>`, so a retry returns the items the
+first attempt wrote. `kind` is `question`, `risk`, `finding`, `follow_up` or
+`link` (which needs `url`; pinning a URL the session already pinned returns that
+item with `duplicate: true`). `label` adopts a label written in chat if it is
+free. An item that cannot be taken carries its own error: `session_full` (500
+items, or 999 of the kind) or `label_taken`.
+
+```
+PATCH /v1/sessions/{session_id}/open-items
+
+{"updates": [{"label": "Q7", "status": "closed", "resolution": "Linked them"},
+             {"label": "R2", "topic": "release", "add_links": ["https://..."],
+              "remove_links": ["https://..."]}],
+ "ref": "tool:toolu_02"}
+
+200 OK — {"items": [{"label": "Q7", "item": {...}} | {"label": "R2", "error": {"code": "not_found", ...}}]}
+```
+
+From the session's runner (with the source header, as above) or from a person
+with edit access. One to twenty updates; each sets any of `status` (`open` or
+`closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty
+clears it), `add_links` and `remove_links`. A close records `closed_by`
+(`agent` or `user`) and `ref`; a reopen clears the resolution and keeps the
+answers. A label the session lacks gets `not_found`, a change that would not
+fit gets `too_large`; the others still apply.
+
+```
+POST /v1/sessions/{session_id}/open-items/answers
+
+{"answers": [{"label": "Q7", "text": "Link them"}]}
+
+200 OK — {"items": [{"label": "Q7", "item": {...}}]}
+```
+
+Edit access. Records each reply (the latest five are kept); an open item
+becomes `answered`.
+
+Each write publishes `session.open_items.changed` on the session's stream.
+Deleting a session deletes its items; a fork starts with none.
+
 ### Stream Session
 
 ```
@@ -1682,6 +1769,7 @@ stream and surface queue/interrupt semantics.
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |
+| `session.open_items.changed` | `SessionOpenItemsChangedEvent` | `{type, conversation_id, labels: string[], open_count: int}` — items were raised or changed; read `GET …/open-items` again. |
 
 > **Note on `session.input.consumed`:** This event name and payload
 > may change in a future revision; clients should isolate the
