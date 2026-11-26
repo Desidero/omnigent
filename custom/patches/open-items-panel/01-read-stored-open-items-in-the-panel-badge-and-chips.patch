@@ -1,0 +1,1840 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 15:47:29 +0000
+Subject: [PATCH] feat(web): read stored open items in the panel, badge and
+ chips
+
+The Open items panel, its header badge and the label chips read item state
+from the chat text in the browser, so they depend on how much history is
+loaded, and an item an agent closed with sys_open_items_update stays open
+in the panel until the chat strikes it. Servers with the open items store
+keep the real state.
+
+Where /v1/info reports open_items, the web reads every stored item of the
+session (GET /v1/sessions/{id}/open-items, all statuses) and keeps the list
+current with session.open_items.changed and a re-read when the session
+stream reopens. One index merges the two: a stored label takes its state
+from the store everywhere (chips, popovers, panel, badge), and a label only
+the chat has keeps the chat's state, listed as "chat only". The panel lists
+stored items by status (latest reply first, open, answered, closed folded),
+expands a row to its detail, links, answers and resolution, and lets a
+person with edit access close (one tap, or with a resolution), reopen and
+retopic items through PATCH. Dismissing a stored item becomes a user close:
+the omnigent.items_dismissed label is no longer written for stored items,
+and is still read for chat-only ones. A stored item the chat struck while
+the store keeps it open is flagged with a one-tap Close.
+
+Without the capability, or when the list cannot be read, everything renders
+from the chat as before.
+
+Not proposed upstream yet: the store and the panel it extends are not
+upstream either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-item-labels.md                      |   3 +
+ docs/open-items.md                            |  40 +-
+ feature-map/open-items.md                     |  10 +-
+ web/src/components/chat/OpenItemsPanel.tsx    |   2 +-
+ .../components/chat/SessionItemsButton.tsx    |  12 +-
+ .../chat/StoredOpenItemsPanel.test.tsx        | 244 +++++++++
+ .../components/chat/StoredOpenItemsPanel.tsx  | 481 ++++++++++++++++++
+ web/src/components/chat/Transcript.tsx        |   7 +-
+ web/src/hooks/useStoredOpenItems.ts           | 140 +++++
+ web/src/lib/capabilities.ts                   |   7 +
+ web/src/lib/events.ts                         |  12 +
+ web/src/lib/openItems.test.ts                 | 174 +++++++
+ web/src/lib/openItems.ts                      | 316 ++++++++++++
+ web/src/lib/sessionEvents.test.ts             |  18 +
+ web/src/lib/sse.ts                            |  13 +
+ web/src/store/chatStore.openItems.test.ts     |  20 +
+ web/src/store/chatStore.ts                    |   5 +
+ web/src/test/openItemsFixtures.ts             |  26 +
+ 18 files changed, 1519 insertions(+), 11 deletions(-)
+ create mode 100644 web/src/components/chat/StoredOpenItemsPanel.test.tsx
+ create mode 100644 web/src/components/chat/StoredOpenItemsPanel.tsx
+ create mode 100644 web/src/hooks/useStoredOpenItems.ts
+ create mode 100644 web/src/lib/openItems.test.ts
+ create mode 100644 web/src/lib/openItems.ts
+ create mode 100644 web/src/store/chatStore.openItems.test.ts
+ create mode 100644 web/src/test/openItemsFixtures.ts
+
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+index 0a1112e12ec518537870da39d7bb475e6fabdc9a..76924ea5c532b0ed101d1c7738eb2bb70437709e 100644
+--- a/docs/chat-item-labels.md
++++ b/docs/chat-item-labels.md
+@@ -81,6 +81,9 @@ you or the agent write them.
+   there is missing until you scroll up far enough to load it, and a label
+   whose first message is not loaded is described by its earliest loaded
+   mention, so a pinned link shows only if that mention carries the link.
++  Where the server stores open items, the panel, its badge and the chips take
++  stored items from the server instead; see
++  [Open items in the web UI](open-items.md#in-the-web-ui).
+ - **Latest reply:** the Open items list puts the items the agent's newest reply
+   mentions first, tinted, and includes an item that reply just closed, struck
+   through. Expanded, they sit under **In the latest reply**, ahead of the other
+diff --git a/docs/open-items.md b/docs/open-items.md
+index f741cd92b60c03fa648a3406c2ee51da8b75e9c1..c4854d5660a3251864069d415ac0e6b8f7f5665f 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -77,6 +77,42 @@ only if the tools are missing.
+   A host whose Omnigent predates the group rejects an agent spec that names
+   it, so set the key only once every host has it.
+ 
++## In the web UI
++
++Where the server stores open items (`GET /v1/info` reports `open_items: true`),
++the **Open items** section of the session header's panel (see
++[item labels](chat-item-labels.md#what-the-chat-shows)) lists the session's
++stored items, whether or not their messages are loaded in your browser, and
++stays current as the agent raises and closes them.
++
++- **One list:** each stored item shows its stored status. A label written in
++  the chat that the server does not hold is listed too, marked **chat only**,
++  with its state read from the chat as before. Pinned links stay under
++  **Links**.
++- **Chips:** a label's chips in the chat follow the stored status: a stored
++  item is closed exactly when the server says so, whatever the chat wrote, and
++  its popover shows the stored resolution when the chat never struck it.
++- **Groups:** items the latest reply mentions come first, then the open ones,
++  then **Answered** (you replied and the agent has not closed it yet), with
++  **Closed (N)** folded at the end. The badge counts open items: answered and
++  closed ones, chat-only items you dismissed and pinned links are left out.
++- **Details:** select an item to expand it: its detail, links, your latest
++  answers, how it was closed, and **Show in conversation** when a loaded
++  message has it. Its chip previews it where the chat raised it.
++- **Changes (edit access):** the ✕ on an open stored item closes it, recorded
++  as closed by a person with the resolution "Closed from the Open items panel";
++  expanded, you can write the resolution yourself, **Reopen** a closed item, or
++  **Set topic**. When the chat struck a label that is still open in the store,
++  the item is marked **closed in chat** and its details offer **Close** with
++  the chat's sentence as the resolution. The agent sees every change in
++  `sys_open_items_list`.
++- **Chat-only items** keep their dismiss button; dismissals are still stored
++  as the `omnigent.items_dismissed` session label, which is read for chat-only
++  items and never written for stored ones.
++
++On a server without open items the panel reads the chat alone, exactly as
++[item labels](chat-item-labels.md) describe.
++
+ ## HTTP API
+ 
+ | Route (under `/v1`) | Caller | Purpose |
+@@ -95,8 +131,8 @@ when the server stores them. The request and response shapes are in
+ 
+ Nothing is backfilled: items a session labelled in chat before stay chat
+ labels until an agent adopts them with `label`. A server or host without this
+-feature keeps working with text labels, and the web chips read the chat text
+-as before. The items live in their own tables, apart from the main migration
++feature keeps working with text labels, and the web reads the chat text as
++before. The items live in their own tables, apart from the main migration
+ chain (see [side stores](extending/side_schemas.md)): a build without the
+ feature starts against a database that holds them and leaves them alone.
+ Search runs over the session's items in the server, not in SQL, because a
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index 2e5e10b9e470677aa50e496de84dfb8604a745eb..0b07926602e637a5041a56e83e94fe3ca8b82205 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -1,6 +1,6 @@
+ # Open items
+ 
+-A session's agent records the questions, risks, findings and follow-ups it raises, and the links it pins, as stored open items with labels the server allocates (`Q7`), and still writes each one once in the chat. Agents close, reopen and list items through their tools; people read them over the API and may close, reopen, retopic or answer them. There is no panel for them yet: the chat's label chips and Open items bar still read the chat text.
++A session's agent records the questions, risks, findings and follow-ups it raises, and the links it pins, as stored open items with labels the server allocates (`Q7`), and still writes each one once in the chat. Agents close, reopen and list items through their tools; people read them over the API and in the Open items panel of the session header, where they may close, reopen and retopic them.
+ 
+ ## Sub-features
+ 
+@@ -11,12 +11,15 @@ A session's agent records the questions, risks, findings and follow-ups it raise
+ - `items-event`: every write publishes `session.open_items.changed` on the session's stream.
+ - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
+ - `items-delete`: deleting a session deletes its items; a fork starts with none.
++- `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
++- `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
+ 
+ ## How to get to it (user POV)
+ 
+ - Chat: ask an agent with the default tool groups something that leaves it open questions; it calls `sys_open_items_raise`, which shows as a tool row, and writes the items with the returned labels.
+ - Chat: answer or settle an item; the agent closes it with `sys_open_items_update` and strikes its label.
+ - API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/answers` with edit access.
++- Web: the bookmark button in the session header (badge = open items) opens the panel; select a row to expand it; ✕ closes a stored item.
+ - Agent spec: `tool_groups.open_items: false` turns the tools off for that agent.
+ 
+ ## Driving it with the repro environment
+@@ -27,11 +30,14 @@ Preconditions: a local server and runner from this checkout; any harness.
+ - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
+ - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
+ - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
++- Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge and user changes: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; the live event: `web/src/store/chatStore.openItems.test.ts`.
++- Human check (panel): with items raised as above, open the header's bookmark button. Expect the badge to count the open items, each row its stored title, and an answered or closed one under its group. Tap ✕ on one: it moves to **Closed (N)**, the badge drops, its chips in the chat strike through, and `sys_open_items_list` shows it `closed_by: user`. On a server without the store the panel looks as before.
+ - Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row, a struck `~~[Q1]~~`, and the item `closed` with `closed_by: agent` in the API.
+ 
+ ## Gotchas
+ 
+-- The web UI does not read the store yet: chips and the Open items bar still follow the chat text, so an item closed only through the API still shows open in the bar.
++- A stored item closed only through the API shows struck chips; their popover's "Show" goes to the label's latest loaded mention, since no message closed it.
++- The pinned Open items bar (a transcript without the session header) reads the merged chip state but keeps its old layout and lists only labels in loaded messages.
+ - Hosts without the series do not know the `open_items` key in `tool_groups:`, and an agent spec naming it fails to load there.
+ - A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the instruction's last sentence covers that.
+ - Labels are unique per session, not across a session tree: a child session counts from Q1.
+diff --git a/web/src/components/chat/OpenItemsPanel.tsx b/web/src/components/chat/OpenItemsPanel.tsx
+index 47e91e4d9583cf0dfa33b8b16e3496fc6c82b8cb..41918532027728c9df6bd0761bcc7cb931bc54fc 100644
+--- a/web/src/components/chat/OpenItemsPanel.tsx
++++ b/web/src/components/chat/OpenItemsPanel.tsx
+@@ -99,7 +99,7 @@ export function useCollapseOnOutsidePress(enabled = true) {
+  * written to the session's labels so they stay dismissed on every device. A
+  * write in flight shows its own value so a dismiss takes effect at once.
+  */
+-function useDismissedItems(sessionId: string | null) {
++export function useDismissedItems(sessionId: string | null) {
+   const { session } = useSession(sessionId);
+   const update = useUpdateSessionLabels(sessionId);
+   const pending = update.isPending ? update.variables?.[DISMISSED_ITEMS_LABEL_KEY] : undefined;
+diff --git a/web/src/components/chat/SessionItemsButton.tsx b/web/src/components/chat/SessionItemsButton.tsx
+index 1ed34416e2909fd571af3aea4ead6a8ecd5b33bb..551552c3d5000c90c5b488bc37a23707becc0069 100644
+--- a/web/src/components/chat/SessionItemsButton.tsx
++++ b/web/src/components/chat/SessionItemsButton.tsx
+@@ -2,7 +2,9 @@ import { useContext, useEffect, useState } from "react";
+ import { createPortal } from "react-dom";
+ import { BookmarkIcon, ExternalLinkIcon, LinkIcon } from "lucide-react";
+ import { ItemLabelPopover, itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
+-import { OpenItemsPanel, trackedItems, useOpenItemCount } from "@/components/chat/OpenItemsPanel";
++import { trackedItems } from "@/components/chat/OpenItemsPanel";
++import { SessionOpenItemsSection } from "@/components/chat/StoredOpenItemsPanel";
++import { useSessionItemsIndex, useSessionOpenItemCount } from "@/hooks/useStoredOpenItems";
+ import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+@@ -53,12 +55,12 @@ function LinkRow({ link, sessionId }: { link: SessionLink; sessionId: string | n
+   );
+ }
+ 
+-/** The panel's two sections: the Open items tracker, then the session's links. */
++/** The panel's two sections: the open items (stored, or the chat's), then the session's links. */
+ function SessionItemsPanel({ links }: { links: readonly SessionLink[] }) {
+   const sessionId = useContext(ItemLabelSessionContext);
+   return (
+     <>
+-      <OpenItemsPanel layout="section" />
++      <SessionOpenItemsSection />
+       <section data-testid="session-links" aria-label="Links">
+         <div className="flex items-center gap-2 px-3 py-2 text-ui font-medium">
+           <LinkIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+@@ -95,9 +97,9 @@ export function SessionItemsButton({
+   host: HTMLElement;
+   links: readonly SessionLink[];
+ }) {
+-  const index = useContext(ItemLabelIndexContext);
++  const index = useSessionItemsIndex(useContext(ItemLabelIndexContext));
+   const isMobile = useIsMobileViewport();
+-  const openCount = useOpenItemCount();
++  const openCount = useSessionOpenItemCount();
+   const [open, setOpen] = useState(false);
+   // "Show in conversation" in an item's preview jumps to a message: get out of its way.
+   const [searchParams] = useSearchParams();
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.test.tsx b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..0bc211edfa5e6313c7b1da27dd7df652c7811d95
+--- /dev/null
++++ b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+@@ -0,0 +1,244 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const viewport = vi.hoisted(() => ({ mobile: false }));
++const access = vi.hoisted(() => ({ canEdit: true }));
++const fetchMock = vi.hoisted(() => vi.fn());
++vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => viewport.mobile }));
++vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => access.canEdit }));
++vi.mock(import("@/lib/identity"), async (importOriginal) => ({
++  ...(await importOriginal()),
++  authenticatedFetch: fetchMock,
++}));
++
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
++import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
++import type { ServerInfo } from "@/lib/capabilities";
++import {
++  DISMISSED_ITEMS_LABEL_KEY,
++  ItemLabelIndexContext,
++  ItemLabelSessionContext,
++  buildItemLabelIndex,
++  itemLabelsIn,
++  struckItemLabelsIn,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import { mergeStoredOpenItems, openItemsKey, type StoredOpenItem } from "@/lib/openItems";
++import { collectSessionLinks } from "@/lib/sessionLinks";
++import { SessionItemsHeaderSlot, useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
++import { storedItem } from "@/test/openItemsFixtures";
++import { SessionItemsButton } from "./SessionItemsButton";
++import { PANEL_CLOSE_RESOLUTION } from "./StoredOpenItemsPanel";
++
++beforeEach(() => {
++  viewport.mobile = false;
++  access.canEdit = true;
++});
++
++afterEach(() => {
++  cleanup();
++  fetchMock.mockReset();
++});
++
++/** The header button inside the label scope the transcript gives it, store merged in. */
++function TranscriptItems({ sources }: { sources: ItemLabelSource[] }) {
++  const host = useSessionItemsHeaderHost("conv_1");
++  const index = buildItemLabelIndex(
++    sources.map((source) => ({
++      source,
++      labels: itemLabelsIn(source.text),
++      struck: struckItemLabelsIn(source.text),
++    })),
++  );
++  const merged = mergeStoredOpenItems(index, useStoredOpenItems("conv_1"));
++  return (
++    <ItemLabelIndexContext.Provider value={merged}>
++      <ItemLabelSessionContext.Provider value="conv_1">
++        {host && <SessionItemsButton host={host} links={collectSessionLinks(sources, index)} />}
++      </ItemLabelSessionContext.Provider>
++    </ItemLabelIndexContext.Provider>
++  );
++}
++
++function renderPanel(
++  texts: string[],
++  stored: StoredOpenItem[] | null,
++  labels: Record<string, string> = {},
++) {
++  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  queryClient.setQueryData(["session", "conv_1"], { id: "conv_1", labels });
++  if (stored) queryClient.setQueryData(openItemsKey("conv_1"), stored);
++  const info = (stored ? { open_items: true } : { open_items: false }) as ServerInfo;
++  const sources = texts.map((text, position): ItemLabelSource => ({
++    messageId: `m${position}`,
++    role: "assistant",
++    text,
++  }));
++  render(
++    <QueryClientProvider client={queryClient}>
++      <CapabilitiesProvider info={info}>
++        <MemoryRouter>
++          <TooltipProvider>
++            <SessionItemsHeaderSlot sessionId="conv_1" />
++            <TranscriptItems sources={sources} />
++          </TooltipProvider>
++        </MemoryRouter>
++      </CapabilitiesProvider>
++    </QueryClientProvider>,
++  );
++  return queryClient;
++}
++
++const ITEMS = "- [Q1] **Backfill window.** Batch it?\n- [Q2] **Soft-deleted rows.** Copy or drop?";
++const badge = () => screen.queryByTestId("session-items-count")?.textContent ?? null;
++const openPanel = () => {
++  fireEvent.click(screen.getByTestId("session-items-trigger"));
++  return within(screen.getByTestId("session-items-panel")).getByTestId("open-items");
++};
++const rowLabels = (panel: HTMLElement) =>
++  within(panel)
++    .queryAllByTestId("open-item-row")
++    .map((row) => row.getAttribute("data-label"));
++
++function respondWith(items: StoredOpenItem[]) {
++  fetchMock.mockResolvedValueOnce(
++    new Response(JSON.stringify({ items: items.map((item) => ({ label: item.label, item })) })),
++  );
++}
++
++async function patchBody(call = 0) {
++  await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(call));
++  const [url, init] = fetchMock.mock.calls[call] as [string, RequestInit];
++  expect(url).toBe("/v1/sessions/conv_1/open-items");
++  expect(init.method).toBe("PATCH");
++  return JSON.parse(init.body as string);
++}
++
++describe("the Open items panel on a server that stores them", () => {
++  it("counts stored items by their stored status and lists chat-only labels as such", () => {
++    renderPanel(
++      [ITEMS, "- [R1] **Flaky test.**\n- [T1] **Rename later.**", "~~[Q1]~~ batching it."],
++      [
++        storedItem("Q1", { title: "Backfill window" }),
++        storedItem("Q2", { status: "answered" }),
++        storedItem("F3", { title: "Raised before the loaded history" }),
++      ],
++    );
++    // Q1 stays open (the store says so), F3 counts though no loaded message has it,
++    // R1 and T1 are chat-only and open; Q2 waits on the agent.
++    expect(badge()).toBe("4");
++    const panel = openPanel();
++    expect(rowLabels(panel)).toEqual(["Q1", "R1", "F3", "T1", "Q2"]);
++    expect(panel.textContent).toContain("Answered (1)");
++    const r1 = within(panel).getByRole("button", { name: "Item R1, chat only" });
++    expect(r1.textContent).toContain("chat only");
++    const q1 = within(panel).getByRole("button", { name: "Item Q1" });
++    expect(q1.textContent).toContain("closed in chat");
++    expect(within(panel).getByRole("button", { name: "Dismiss item R1" })).toBeTruthy();
++    expect(within(panel).getByRole("button", { name: "Close item Q1" })).toBeTruthy();
++  });
++
++  it("shows the button for stored items when no loaded message has a label", () => {
++    renderPanel(["Nothing labelled here."], [storedItem("Q7")]);
++    expect(badge()).toBe("1");
++    expect(rowLabels(openPanel())).toEqual(["Q7"]);
++  });
++
++  it("closes a stored item in one tap through the API instead of dismissing it", async () => {
++    const queryClient = renderPanel(
++      [ITEMS, "Still on [Q2]."],
++      [storedItem("Q1"), storedItem("Q2")],
++    );
++    expect(badge()).toBe("2");
++    const panel = openPanel();
++    respondWith([
++      storedItem("Q2", { status: "closed", resolution: PANEL_CLOSE_RESOLUTION, closed_by: "user" }),
++    ]);
++    fireEvent.click(within(panel).getByRole("button", { name: "Close item Q2" }));
++    expect(await patchBody()).toEqual({
++      updates: [{ label: "Q2", status: "closed", resolution: PANEL_CLOSE_RESOLUTION }],
++    });
++    await waitFor(() => expect(badge()).toBe("1"));
++    // The latest reply mentions Q2, so it stays first, struck through.
++    expect(within(panel).getByRole("button", { name: "Item Q2 (closed)" })).toBeTruthy();
++    // No dismissed-items label is written for a stored item.
++    const session = queryClient.getQueryData<{ labels: Record<string, string> }>([
++      "session",
++      "conv_1",
++    ]);
++    expect(session?.labels[DISMISSED_ITEMS_LABEL_KEY]).toBeUndefined();
++  });
++
++  it("expands a row to its detail, answers and outcome, and reopens or retopics it", async () => {
++    renderPanel(
++      [ITEMS, "~~[Q1]~~ done.", "Looking at the rest."],
++      [
++        storedItem("Q1", {
++          status: "closed",
++          detail: "Batch the **backfill** nightly?",
++          resolution: "Nightly batches",
++          closed_by: "agent",
++          closed_at: 1_764_100_500,
++          answers: [{ text: "Yes, nightly", at: 1_764_100_100, by: "bob@example.com" }],
++          links: [{ url: "https://example.com/pr/1", label: "PR 1" }],
++          topic: "cache",
++        }),
++      ],
++    );
++    // Q2 is a chat-only open item.
++    expect(badge()).toBe("1");
++    const panel = openPanel();
++    fireEvent.click(within(panel).getByRole("button", { name: "Closed (1)" }));
++    fireEvent.click(within(panel).getByRole("button", { name: "Item Q1 (closed)" }));
++    const details = within(panel).getByTestId("open-item-details");
++    expect(details.textContent).toContain("backfill");
++    expect(details.textContent).toContain("Yes, nightly");
++    expect(details.textContent).toContain("Closed by the agent");
++    expect(details.textContent).toContain("Nightly batches");
++    expect(within(details).getByRole("link", { name: "PR 1" })).toBeTruthy();
++
++    respondWith([storedItem("Q1", { topic: "cache" })]);
++    fireEvent.click(within(details).getByRole("button", { name: "Reopen" }));
++    expect(await patchBody()).toEqual({ updates: [{ label: "Q1", status: "open" }] });
++    await waitFor(() => expect(badge()).toBe("2"));
++
++    respondWith([storedItem("Q1", { topic: "release" })]);
++    const topic = within(panel).getByRole("combobox", { name: "Topic of Q1" });
++    fireEvent.change(topic, { target: { value: "release" } });
++    fireEvent.click(within(panel).getByRole("button", { name: "Set topic" }));
++    expect(await patchBody(1)).toEqual({ updates: [{ label: "Q1", topic: "release" }] });
++  });
++
++  it("closes an item the chat closed with the chat's sentence as its resolution", async () => {
++    renderPanel([ITEMS, "~~[Q1]~~ We batch it nightly."], [storedItem("Q1"), storedItem("Q2")]);
++    const panel = openPanel();
++    fireEvent.click(within(panel).getByRole("button", { name: "Item Q1" }));
++    respondWith([storedItem("Q1", { status: "closed" })]);
++    const notice = within(panel).getByText(/The chat closed this item/).parentElement!;
++    fireEvent.click(within(notice).getByRole("button", { name: "Close" }));
++    expect(await patchBody()).toEqual({
++      updates: [{ label: "Q1", status: "closed", resolution: "[Q1] We batch it nightly." }],
++    });
++  });
++
++  it("offers no changes to a viewer without edit access", () => {
++    access.canEdit = false;
++    renderPanel([ITEMS, "More on [Q2]."], [storedItem("Q1"), storedItem("Q2")]);
++    const panel = openPanel();
++    expect(within(panel).queryByRole("button", { name: /^Close item/ })).toBeNull();
++    fireEvent.click(within(panel).getByRole("button", { name: "Item Q2" }));
++    expect(within(panel).queryByRole("button", { name: "Close" })).toBeNull();
++    expect(within(panel).queryByRole("button", { name: "Set topic" })).toBeNull();
++  });
++
++  it("keeps the chat's tracker, unchanged, where the server stores no items", () => {
++    renderPanel([ITEMS, "More on [Q2]."], null);
++    const panel = openPanel();
++    expect(panel.tagName).toBe("DETAILS");
++    expect(within(panel).getByRole("button", { name: "Dismiss item Q1" })).toBeTruthy();
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.tsx b/web/src/components/chat/StoredOpenItemsPanel.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..5afef3dff0f112d39b4fe0a9c5eeb5ccd9b485c6
+--- /dev/null
++++ b/web/src/components/chat/StoredOpenItemsPanel.tsx
+@@ -0,0 +1,481 @@
++import { useContext, useMemo, useState, type ReactNode } from "react";
++import { ChevronRightIcon, MessageSquareDotIcon, XIcon } from "lucide-react";
++import {
++  FilePathAwareMessageResponse,
++  ItemLabelPopover,
++  itemLabelChipClass,
++} from "@/components/blocks/ChatMarkdown";
++import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
++import { Button } from "@/components/ui/button";
++import { useCanEdit } from "@/hooks/usePermissions";
++import { useStoredOpenItems, useUpdateStoredOpenItems } from "@/hooks/useStoredOpenItems";
++import {
++  ItemLabelIndexContext,
++  ItemLabelMessageContext,
++  ItemLabelSessionContext,
++} from "@/lib/itemLabels";
++import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
++import {
++  chatResolution,
++  countOpenRows,
++  openItemRows,
++  type OpenItemRow,
++  type OpenItemUpdate,
++  type StoredOpenItem,
++} from "@/lib/openItems";
++import { relativeTime } from "@/lib/relativeTime";
++import { useSearchParams } from "@/lib/routing";
++import { cn } from "@/lib/utils";
++
++/** What a close from the panel records when the person gives no reason. */
++export const PANEL_CLOSE_RESOLUTION = "Closed from the Open items panel";
++
++const GROUP_HEADING_CLASS = "px-3 pt-2 pb-1 text-xs text-muted-foreground";
++const TAG_CLASS =
++  "shrink-0 rounded-full border border-border px-1.5 text-[10px] leading-4 text-muted-foreground";
++
++function ago(epochSeconds: number): string {
++  const age = relativeTime(epochSeconds * 1000);
++  return age === "now" ? "just now" : `${age} ago`;
++}
++
++function rowName(row: OpenItemRow): string {
++  const state = row.status === "open" ? "" : ` (${row.status})`;
++  return `Item ${row.label}${state}${row.stored ? "" : ", chat only"}`;
++}
++
++/** Markdown of an item's detail; labels in it resolve against the message that raised it. */
++function ItemMarkdown({ row, text }: { row: OpenItemRow; text: string }) {
++  return (
++    <ItemLabelMessageContext.Provider value={row.entry?.source.messageId ?? null}>
++      <FilePathAwareMessageResponse>{text}</FilePathAwareMessageResponse>
++    </ItemLabelMessageContext.Provider>
++  );
++}
++
++function StoredItemFacts({ item }: { item: StoredOpenItem }) {
++  return (
++    <>
++      {item.links.length > 0 && (
++        <ul className="flex flex-col gap-0.5">
++          {item.links.map((link) => (
++            <li key={link.url} className="truncate">
++              <a
++                href={link.url}
++                target="_blank"
++                rel="noopener noreferrer"
++                className="text-link hover:underline"
++              >
++                {link.label ?? link.url}
++              </a>
++            </li>
++          ))}
++        </ul>
++      )}
++      {item.answers.length > 0 && (
++        <section aria-label="Answers" className="flex flex-col gap-1">
++          {item.answers.map((answer) => (
++            <div key={`${answer.at}:${answer.text}`} className="border-l-2 border-border pl-2">
++              <div className="text-xs text-muted-foreground">
++                {`Answered · ${answer.by ?? "You"} · ${ago(answer.at)}`}
++              </div>
++              <p className="whitespace-pre-wrap">{answer.text}</p>
++            </div>
++          ))}
++        </section>
++      )}
++      {item.status === "closed" && (
++        <div className="border-l-2 border-border pl-2">
++          <div className="text-xs text-muted-foreground">
++            {`Closed by ${item.closed_by === "user" ? "a person" : "the agent"}`}
++            {item.closed_at !== null && ` · ${ago(item.closed_at)}`}
++          </div>
++          {item.resolution && <p className="whitespace-pre-wrap">{item.resolution}</p>}
++        </div>
++      )}
++      <div className="text-xs text-muted-foreground">
++        {`Raised ${ago(item.created_at)}`}
++        {item.raised_by && ` for ${item.raised_by}`}
++      </div>
++    </>
++  );
++}
++
++/** Topic editor: a slug from the topics in use, or a new one; empty clears it. */
++function TopicForm({
++  item,
++  topics,
++  onSave,
++}: {
++  item: StoredOpenItem;
++  topics: readonly string[];
++  onSave: (topic: string) => void;
++}) {
++  const listId = `open-item-topics-${item.label}`;
++  return (
++    <form
++      className="flex min-w-0 items-center gap-1"
++      onSubmit={(event) => {
++        event.preventDefault();
++        const field = new FormData(event.currentTarget).get("topic");
++        onSave(typeof field === "string" ? field.trim() : "");
++      }}
++    >
++      <input
++        name="topic"
++        list={listId}
++        defaultValue={item.topic ?? ""}
++        placeholder="Topic"
++        aria-label={`Topic of ${item.label}`}
++        maxLength={48}
++        className="h-7 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-xs"
++      />
++      <datalist id={listId}>
++        {topics.map((topic) => (
++          <option key={topic} value={topic} />
++        ))}
++      </datalist>
++      <Button type="submit" size="sm" variant="ghost" className="h-7 px-2 text-xs">
++        Set topic
++      </Button>
++    </form>
++  );
++}
++
++function RowDetails({
++  row,
++  canEdit,
++  topics,
++  onUpdate,
++}: {
++  row: OpenItemRow;
++  canEdit: boolean;
++  topics: readonly string[];
++  onUpdate: (update: OpenItemUpdate) => void;
++}) {
++  const [, setSearchParams] = useSearchParams();
++  const [resolution, setResolution] = useState("");
++  const item = row.stored;
++  const messageId = row.entry?.source.messageId;
++  const closedInChat = item && row.entry?.closedInChat ? chatResolution(row) : null;
++  return (
++    <div className="flex flex-col gap-2 px-3 pt-1 pb-2 text-sm" data-testid="open-item-details">
++      {row.detail ? (
++        <ItemMarkdown row={row} text={row.detail} />
++      ) : (
++        <p className="text-muted-foreground">{row.title}</p>
++      )}
++      {item && <StoredItemFacts item={item} />}
++      {closedInChat !== null && (
++        <div className="flex items-center justify-between gap-2 rounded-md bg-muted px-2 py-1 text-xs">
++          <span>The chat closed this item; it is still open here.</span>
++          {canEdit && (
++            <Button
++              type="button"
++              size="sm"
++              variant="outline"
++              className="h-6 px-2 text-xs"
++              onClick={() =>
++                onUpdate({
++                  label: row.label,
++                  status: "closed",
++                  resolution: closedInChat || PANEL_CLOSE_RESOLUTION,
++                })
++              }
++            >
++              Close
++            </Button>
++          )}
++        </div>
++      )}
++      <div className="flex flex-wrap items-center gap-2">
++        {messageId && (
++          <button
++            type="button"
++            className="text-xs text-link hover:underline"
++            onClick={() =>
++              setSearchParams((previous) => {
++                const next = new URLSearchParams(previous);
++                next.set(MESSAGE_QUERY_PARAM, messageId);
++                return next;
++              })
++            }
++          >
++            Show in conversation
++          </button>
++        )}
++        {item && canEdit && item.status !== "closed" && (
++          <form
++            className="flex min-w-0 flex-1 items-center gap-1"
++            onSubmit={(event) => {
++              event.preventDefault();
++              onUpdate({
++                label: row.label,
++                status: "closed",
++                resolution: resolution.trim() || PANEL_CLOSE_RESOLUTION,
++              });
++            }}
++          >
++            <input
++              value={resolution}
++              onChange={(event) => setResolution(event.target.value)}
++              placeholder="How it ended (optional)"
++              aria-label={`Resolution for ${row.label}`}
++              maxLength={2000}
++              className="h-7 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-xs"
++            />
++            <Button type="submit" size="sm" variant="outline" className="h-7 px-2 text-xs">
++              Close
++            </Button>
++          </form>
++        )}
++        {item && canEdit && item.status === "closed" && (
++          <Button
++            type="button"
++            size="sm"
++            variant="outline"
++            className="h-7 px-2 text-xs"
++            onClick={() => onUpdate({ label: row.label, status: "open" })}
++          >
++            Reopen
++          </Button>
++        )}
++      </div>
++      {item && canEdit && (
++        <TopicForm
++          item={item}
++          topics={topics}
++          onSave={(topic) => {
++            if (topic !== (item.topic ?? "")) onUpdate({ label: row.label, topic });
++          }}
++        />
++      )}
++    </div>
++  );
++}
++
++function ItemRowView({
++  row,
++  expanded,
++  onToggle,
++  action,
++  children,
++}: {
++  row: OpenItemRow;
++  expanded: boolean;
++  onToggle: () => void;
++  action?: ReactNode;
++  children?: ReactNode;
++}) {
++  const closed = row.status === "closed";
++  const chip = (
++    <span className={cn(itemLabelChipClass(closed, row.recent), "shrink-0")}>{row.label}</span>
++  );
++  return (
++    <li data-testid="open-item-row" data-label={row.label} className="min-w-0">
++      <div className="flex min-w-0 items-center">
++        {/* The chip previews the item where the chat raised it, as chips in messages do. */}
++        {row.entry?.source.messageId ? (
++          <ItemLabelPopover item={row.entry}>
++            <button
++              type="button"
++              aria-label={`Preview ${row.label} in the conversation`}
++              className="ml-3 shrink-0"
++            >
++              {chip}
++            </button>
++          </ItemLabelPopover>
++        ) : (
++          <span className="ml-3">{chip}</span>
++        )}
++        <button
++          type="button"
++          aria-expanded={expanded}
++          aria-label={rowName(row)}
++          className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-ui hover:bg-muted"
++          onClick={onToggle}
++        >
++          <span className={cn("truncate", closed && "text-muted-foreground line-through")}>
++            {row.title || row.label}
++          </span>
++          {row.status === "answered" && <span className={TAG_CLASS}>answered</span>}
++          {row.entry?.closedInChat && row.status !== "closed" && (
++            <span className={TAG_CLASS}>closed in chat</span>
++          )}
++          {!row.stored && <span className={TAG_CLASS}>chat only</span>}
++          {row.topic && <span className={cn(TAG_CLASS, "ml-auto")}>{row.topic}</span>}
++        </button>
++        {action}
++      </div>
++      {expanded && children}
++    </li>
++  );
++}
++
++function QuickAction({
++  label,
++  title,
++  onClick,
++  children,
++}: {
++  label: string;
++  title?: string;
++  onClick: () => void;
++  children: ReactNode;
++}) {
++  return (
++    <button
++      type="button"
++      aria-label={label}
++      title={title}
++      className="mr-2 shrink-0 rounded p-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
++      onClick={onClick}
++    >
++      {children}
++    </button>
++  );
++}
++
++/** A fold such as "Closed (4)": a heading button that shows or hides its rows. */
++function Fold({ title, count, children }: { title: string; count: number; children: ReactNode }) {
++  const [open, setOpen] = useState(false);
++  if (count === 0) return null;
++  return (
++    <>
++      <li>
++        <button
++          type="button"
++          aria-expanded={open}
++          className={cn(
++            GROUP_HEADING_CLASS,
++            "flex w-full items-center gap-1 hover:text-foreground",
++          )}
++          onClick={() => setOpen((shown) => !shown)}
++        >
++          <ChevronRightIcon
++            className={cn("size-3 transition-transform", open && "rotate-90")}
++            aria-hidden="true"
++          />
++          {`${title} (${count})`}
++        </button>
++      </li>
++      {open && children}
++    </>
++  );
++}
++
++/**
++ * The Open items section on a server that stores them: stored items by their
++ * stored status, and labels only the chat has, marked "chat only". People
++ * with edit access close, reopen and retopic stored items here; chat-only
++ * items are dismissed as before.
++ */
++export function StoredOpenItemsPanel({
++  stored,
++  sessionId,
++}: {
++  stored: readonly StoredOpenItem[];
++  sessionId: string | null;
++}) {
++  const index = useContext(ItemLabelIndexContext);
++  const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
++  const canEdit = useCanEdit(sessionId ?? "");
++  const update = useUpdateStoredOpenItems(sessionId);
++  const [expanded, setExpanded] = useState<string | null>(null);
++  const rows = useMemo(() => openItemRows(index, stored, dismissed), [index, stored, dismissed]);
++  const topics = useMemo(
++    () => [...new Set(stored.flatMap((item) => (item.topic ? [item.topic] : [])))].sort(),
++    [stored],
++  );
++  if (rows.length === 0) return null;
++
++  const change = (patch: OpenItemUpdate) => update.mutate([patch]);
++  const renderRow = (row: OpenItemRow) => {
++    let action: ReactNode = null;
++    if (row.stored && canEdit && row.status !== "closed") {
++      action = (
++        <QuickAction
++          label={`Close item ${row.label}`}
++          title="Close"
++          onClick={() =>
++            change({ label: row.label, status: "closed", resolution: PANEL_CLOSE_RESOLUTION })
++          }
++        >
++          <XIcon className="size-3" aria-hidden="true" />
++        </QuickAction>
++      );
++    } else if (!row.stored && row.dismissed) {
++      action = (
++        <QuickAction label={`Restore item ${row.label}`} onClick={() => restore(row.label)}>
++          Restore
++        </QuickAction>
++      );
++    } else if (!row.stored && row.status === "open") {
++      action = (
++        <QuickAction
++          label={`Dismiss item ${row.label}`}
++          title="Dismiss from open items"
++          onClick={() => dismiss(row.label)}
++        >
++          <XIcon className="size-3" aria-hidden="true" />
++        </QuickAction>
++      );
++    }
++    return (
++      <ItemRowView
++        key={row.label}
++        row={row}
++        expanded={expanded === row.label}
++        onToggle={() => setExpanded((open) => (open === row.label ? null : row.label))}
++        action={action}
++      >
++        <RowDetails row={row} canEdit={canEdit} topics={topics} onUpdate={change} />
++      </ItemRowView>
++    );
++  };
++
++  const listed = rows.filter((row) => !row.dismissed);
++  const recent = listed.filter((row) => row.recent);
++  const open = listed.filter((row) => !row.recent && row.status === "open");
++  const answered = listed.filter((row) => !row.recent && row.status === "answered");
++  const closed = listed.filter((row) => !row.recent && row.status === "closed");
++  const dismissedRows = rows.filter((row) => row.dismissed);
++  return (
++    <section data-testid="open-items" aria-label="Open items">
++      <div className="flex items-center gap-2 px-3 py-2 text-ui font-medium">
++        <MessageSquareDotIcon className="size-4 shrink-0 text-muted-foreground" />
++        <span>Open items</span>
++        <span className="opacity-70">({countOpenRows(rows)})</span>
++      </div>
++      <ul className="max-h-[min(24rem,50vh)] overflow-y-auto border-t border-border py-1">
++        {recent.length > 0 && <li className={GROUP_HEADING_CLASS}>In the latest reply</li>}
++        {recent.map(renderRow)}
++        {recent.length > 0 && open.length > 0 && (
++          <li className={GROUP_HEADING_CLASS}>{`Other open (${open.length})`}</li>
++        )}
++        {open.map(renderRow)}
++        {answered.length > 0 && (
++          <li className={GROUP_HEADING_CLASS}>{`Answered (${answered.length})`}</li>
++        )}
++        {answered.map(renderRow)}
++        <Fold title="Closed" count={closed.length}>
++          {closed.map(renderRow)}
++        </Fold>
++        <Fold title="Dismissed" count={dismissedRows.length}>
++          {dismissedRows.map(renderRow)}
++        </Fold>
++      </ul>
++    </section>
++  );
++}
++
++/**
++ * The header panel's Open items section: read from the store where the
++ * server keeps open items, otherwise the chat's own tracker, unchanged.
++ */
++export function SessionOpenItemsSection() {
++  const sessionId = useContext(ItemLabelSessionContext);
++  const stored = useStoredOpenItems(sessionId);
++  if (!stored) return <OpenItemsPanel layout="section" />;
++  return <StoredOpenItemsPanel stored={stored} sessionId={sessionId} />;
++}
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index 067c5c1e384333faa7bd755b68816c551672029d..acb0adac62ebf9b66f6f19dd998ecf061a7fdc79 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -29,6 +29,8 @@ import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
+ import { TurnRail, type Turn } from "@/pages/TurnRail";
+ import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+ import { useSessionTasks } from "@/hooks/useSessionTasks";
++import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
++import { mergeStoredOpenItems } from "@/lib/openItems";
+ import { useSearchParams } from "@/lib/routing";
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+ import { onFindOpened } from "@/lib/nativeBridge";
+@@ -618,8 +620,11 @@ function ItemLabelScope({
+   sessionId: string | null;
+   children: React.ReactNode;
+ }) {
++  // Where the server stores open items, a stored label takes its state from the store.
++  const stored = useStoredOpenItems(sessionId);
++  const merged = useMemo(() => mergeStoredOpenItems(index, stored), [index, stored]);
+   return (
+-    <ItemLabelIndexContext.Provider value={index}>
++    <ItemLabelIndexContext.Provider value={merged}>
+       <ItemLabelSessionContext.Provider value={sessionId}>
+         {children}
+       </ItemLabelSessionContext.Provider>
+diff --git a/web/src/hooks/useStoredOpenItems.ts b/web/src/hooks/useStoredOpenItems.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..059481a76d915deffffe783af1f303c71683eb5f
+--- /dev/null
++++ b/web/src/hooks/useStoredOpenItems.ts
+@@ -0,0 +1,140 @@
++// A session's stored open items, on servers that store them (`/v1/info`
++// `open_items`). Kept live by `session.open_items.changed` (chatStore
++// invalidates the query) and read again whenever the session's stream reopens.
++
++import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
++import { useContext, useEffect, useMemo } from "react";
++import { useOpenItemCount, useDismissedItems } from "@/components/chat/OpenItemsPanel";
++import { showToast } from "@/components/ui/toast";
++import { useServerInfo } from "@/lib/CapabilitiesContext";
++import {
++  ItemLabelIndexContext,
++  ItemLabelSessionContext,
++  type ItemLabelEntry,
++  type ItemLabelIndex,
++} from "@/lib/itemLabels";
++import {
++  countOpenRows,
++  fetchStoredOpenItems,
++  openItemRows,
++  openItemsKey,
++  refreshStoredOpenItems,
++  updateStoredOpenItems,
++  withWrittenItems,
++  type OpenItemUpdate,
++  type StoredOpenItem,
++} from "@/lib/openItems";
++import { isSessionStreamOpen, subscribeSessionStreams } from "@/lib/sessionStreamSignals";
++import { isTempConvId } from "@/lib/tempConversationId";
++
++/** Whether the server stores open items; false while `/v1/info` loads and on older servers. */
++export function useOpenItemsAvailable(): boolean {
++  const info = useServerInfo();
++  return info !== "loading" && info.open_items === true;
++}
++
++/**
++ * The session's stored items in label order. Null on servers without the
++ * store, until the first read lands, and when it fails: callers then show
++ * the chat's labels alone, as before the store existed.
++ */
++export function useStoredOpenItems(
++  rawSessionId: string | null | undefined,
++): readonly StoredOpenItem[] | null {
++  const queryClient = useQueryClient();
++  const available = useOpenItemsAvailable();
++  const sessionId = rawSessionId && !isTempConvId(rawSessionId) ? rawSessionId : undefined;
++  const active = available && sessionId !== undefined;
++  const query = useQuery({
++    queryKey: openItemsKey(sessionId),
++    queryFn: () => fetchStoredOpenItems(sessionId!),
++    enabled: active,
++    // The session stream keeps it current.
++    staleTime: Number.POSITIVE_INFINITY,
++    refetchOnWindowFocus: false,
++    retry: 1,
++  });
++  useEffect(() => {
++    if (!active) return;
++    // Events missed while the stream was down: read the list again when it reopens.
++    return subscribeSessionStreams((id) => {
++      if (id === sessionId && isSessionStreamOpen(id)) {
++        refreshStoredOpenItems(queryClient, sessionId);
++      }
++    });
++  }, [active, sessionId, queryClient]);
++  return active && query.data ? query.data : null;
++}
++
++/**
++ * Close, reopen or retopic stored items. The written items replace their
++ * cached copies at once; a refused write says why in a toast.
++ */
++export function useUpdateStoredOpenItems(sessionId: string | null) {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (updates: OpenItemUpdate[]) => {
++      if (!sessionId) throw new Error("No session selected");
++      return updateStoredOpenItems(sessionId, updates);
++    },
++    onSuccess: (results) => {
++      if (!sessionId) return;
++      queryClient.setQueryData<StoredOpenItem[]>(openItemsKey(sessionId), (items) =>
++        withWrittenItems(items, results),
++      );
++      const refused = results.find((result) => "error" in result);
++      if (refused && "error" in refused) {
++        showToast(`Couldn't change ${refused.label}: ${refused.error.message}`);
++      }
++    },
++    onError: (error) => showToast(`Couldn't change the item: ${error.message}`),
++  });
++}
++
++/**
++ * The header button's badge: open items that wait on the user. With stored
++ * items, stored ones count by their stored status and the chat's own labels
++ * as before; otherwise the chat's count alone.
++ */
++export function useSessionOpenItemCount(): number {
++  const chatCount = useOpenItemCount();
++  const index = useContext(ItemLabelIndexContext);
++  const sessionId = useContext(ItemLabelSessionContext);
++  const stored = useStoredOpenItems(sessionId);
++  const { dismissed } = useDismissedItems(sessionId);
++  return useMemo(
++    () => (stored ? countOpenRows(openItemRows(index, stored, dismissed)) : chatCount),
++    [stored, index, dismissed, chatCount],
++  );
++}
++
++/**
++ * The index the header button decides whether to show from: `index`, plus
++ * stored items none of whose messages are loaded, so a long session's items
++ * stay one tap away. Their entries only count; nothing renders them.
++ */
++export function useSessionItemsIndex(index: ItemLabelIndex | null): ItemLabelIndex | null {
++  const stored = useStoredOpenItems(useContext(ItemLabelSessionContext));
++  return useMemo(() => {
++    const unloaded = (stored ?? []).filter(
++      (item) => item.kind !== "link" && !index?.items.has(item.label),
++    );
++    if (unloaded.length === 0) return index;
++    const items = new Map<string, ItemLabelEntry>(index?.items);
++    for (const item of unloaded) {
++      const source = {
++        messageId: "",
++        role: "assistant" as const,
++        text: `[${item.label}] ${item.title}`,
++      };
++      items.set(item.label, {
++        label: item.label,
++        source,
++        closedBy: item.status === "closed" ? source : null,
++        lastMention: source,
++        messageCount: 1,
++      } as ItemLabelEntry);
++    }
++    return { enabled: true, items, latestReply: index?.latestReply ?? null };
++  }, [index, stored]);
++}
+diff --git a/web/src/lib/capabilities.ts b/web/src/lib/capabilities.ts
+index 25547d3c7545c04f004c8d718f1d39973854c315..2df6e64464281bfde9244ebf6d00f1b50e9d39f1 100644
+--- a/web/src/lib/capabilities.ts
++++ b/web/src/lib/capabilities.ts
+@@ -372,6 +372,12 @@ export interface ServerInfo {
+    * ``session.journal.appended``), which the Tasks tab shows; absent on older servers (off).
+    */
+   session_journal?: boolean;
++  /**
++   * True when the server stores open items (``/v1/sessions/{id}/open-items`` and
++   * ``session.open_items.changed``), which the Open items panel reads; absent on
++   * older servers (off), where the panel reads the chat's item labels alone.
++   */
++  open_items?: boolean;
+   /**
+    * True when the server keeps each user's saved workflows (``/v1/workflows``), which
+    * Run a workflow offers; absent on older servers (off).
+@@ -798,6 +804,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
+           session_rewind: data.session_rewind === true,
+           session_pull_requests: data.session_pull_requests === true,
+           session_journal: data.session_journal === true,
++          open_items: data.open_items === true,
+           workflows: data.workflows === true,
+           workflow_sharing: data.workflow_sharing === true,
+           session_title_instructions: data.session_title_instructions === true,
+diff --git a/web/src/lib/events.ts b/web/src/lib/events.ts
+index c9e5fbde4b2ed545847634ba86e1ab32edbac8f3..954e4d5b7967aec7d1e21102bb5285b97e751aaf 100644
+--- a/web/src/lib/events.ts
++++ b/web/src/lib/events.ts
+@@ -927,6 +927,17 @@ export interface SessionJournalAppendedEvent {
+   entry: JournalEntry;
+ }
+ 
++/**
++ * `session.open_items.changed` — stored open items of the session were raised
++ * or changed. Transient: a client that reconnects reads the list again.
++ */
++export interface SessionOpenItemsChangedEvent {
++  type: "session_open_items_changed";
++  conversationId: string;
++  /** The labels written, e.g. `["Q7"]`. */
++  labels: string[];
++}
++
+ /**
+  * `session.changed_files.invalidated` — the session's changed-files list
+  * may have changed; the consumer should refetch it. Coarse signal (no
+@@ -1095,6 +1106,7 @@ export type StreamEvent =
+   | SessionResourceDeletedEvent
+   | SessionChildSessionUpdatedEvent
+   | SessionJournalAppendedEvent
++  | SessionOpenItemsChangedEvent
+   | SessionChangedFilesInvalidatedEvent
+   | SessionTerminalActivityEvent
+   | SessionModelOptionsEvent
+diff --git a/web/src/lib/openItems.test.ts b/web/src/lib/openItems.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dcae48e9800d84d2fa6bd9f4cf653c1071e155c
+--- /dev/null
++++ b/web/src/lib/openItems.test.ts
+@@ -0,0 +1,174 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++const fetchMock = vi.hoisted(() => vi.fn());
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
++
++import {
++  buildItemLabelIndex,
++  itemLabelsIn,
++  struckItemLabelsIn,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import {
++  chatResolution,
++  compareItemLabels,
++  countOpenRows,
++  fetchStoredOpenItems,
++  mergeStoredOpenItems,
++  openItemRows,
++  storedItemOf,
++  withWrittenItems,
++  type StoredOpenItem,
++} from "./openItems";
++import { storedItem } from "@/test/openItemsFixtures";
++
++afterEach(() => {
++  fetchMock.mockReset();
++});
++
++function index(texts: string[]) {
++  return buildItemLabelIndex(
++    texts.map((text, position) => {
++      const source: ItemLabelSource = { messageId: `m${position}`, role: "assistant", text };
++      return { source, labels: itemLabelsIn(text), struck: struckItemLabelsIn(text) };
++    }),
++  );
++}
++
++const ITEMS = "- [Q1] **Backfill window.** Batch it?\n- [Q2] **Soft-deleted rows.** Copy or drop?";
++
++describe("mergeStoredOpenItems", () => {
++  it("returns the chat's index itself while the store holds nothing", () => {
++    const chat = index([ITEMS]);
++    expect(mergeStoredOpenItems(chat, null)).toBe(chat);
++    expect(mergeStoredOpenItems(chat, [])).toBe(chat);
++  });
++
++  it("takes a stored label's state from the store, whatever the chat wrote", () => {
++    const chat = index([ITEMS, "~~[Q1]~~ batching it."]);
++    const merged = mergeStoredOpenItems(chat, [
++      storedItem("Q1"),
++      storedItem("Q2", { status: "closed", resolution: "Dropped them", closed_at: 1_764_100_500 }),
++    ]);
++    const q1 = merged.items.get("Q1")!;
++    const q2 = merged.items.get("Q2")!;
++    // The chat struck Q1 but the store keeps it open: open, with the chat's close offered.
++    expect(q1.closedBy).toBeNull();
++    expect(storedItemOf(q1)?.status).toBe("open");
++    expect((q1 as { closedInChat?: ItemLabelSource }).closedInChat?.messageId).toBe("m1");
++    // Closed only in the store: closed, described by its resolution at its latest mention.
++    expect(q2.closedBy).toMatchObject({
++      messageId: "m0",
++      text: "~~[Q2]~~ Dropped them",
++      createdAtS: 1_764_100_500,
++    });
++    // The parsed entry's own fields are kept.
++    expect(q2.source).toBe(chat.items.get("Q2")!.source);
++  });
++
++  it("turns chips on for a stored label the chat mentions only once", () => {
++    const chat = index(["[Q1] **Only once.**"]);
++    expect(chat.enabled).toBe(false);
++    expect(mergeStoredOpenItems(chat, [storedItem("Q1")]).enabled).toBe(true);
++    expect(mergeStoredOpenItems(chat, [storedItem("Q9")]).enabled).toBe(false);
++  });
++});
++
++describe("openItemRows", () => {
++  it("lists stored items, then chat-only labels, in label order, without pinned links", () => {
++    const chat = index([ITEMS, "- [R1] **Flaky.**\n- [A4] **Other letter.**", "[L1] pinned"]);
++    const merged = mergeStoredOpenItems(chat, [
++      storedItem("Q2", { status: "answered", topic: "cache" }),
++      storedItem("T3"),
++      storedItem("L1", { url: "https://example.com" }),
++    ]);
++    expect(openItemRows(chat, [], new Set()).map((row) => row.label)).toEqual([
++      "Q1",
++      "Q2",
++      "R1",
++      "A4",
++    ]);
++
++    const stored = [
++      storedItem("Q2", { status: "answered", topic: "cache" }),
++      storedItem("T3"),
++      storedItem("L1", { url: "https://example.com" }),
++    ];
++    const all = openItemRows(merged, stored, new Set(["Q1"]));
++    expect(all.map((row) => [row.label, row.status, row.stored !== null, row.dismissed])).toEqual([
++      ["Q1", "open", false, true],
++      ["Q2", "answered", true, false],
++      ["R1", "open", false, false],
++      ["T3", "open", true, false],
++      ["A4", "open", false, false],
++    ]);
++    expect(all.find((row) => row.label === "Q1")?.title).toBe("Backfill window.");
++    expect(all.find((row) => row.label === "A4")?.kind).toBeNull();
++    // Answered items wait on the agent, and dismissed ones are out of the count.
++    expect(countOpenRows(all)).toBe(3);
++  });
++
++  it("lists every stored item even when no loaded message mentions it", () => {
++    const rows = openItemRows(null, [storedItem("Q4"), storedItem("F1")], new Set());
++    expect(rows.map((row) => [row.label, row.entry])).toEqual([
++      ["Q4", null],
++      ["F1", null],
++    ]);
++  });
++
++  it("offers the chat's closing sentence as the resolution", () => {
++    const chat = index([ITEMS, "~~[Q1]~~ We batch it nightly. More later."]);
++    const merged = mergeStoredOpenItems(chat, [storedItem("Q1")]);
++    const [row] = openItemRows(merged, [storedItem("Q1")], new Set());
++    expect(chatResolution(row)).toBe("[Q1] We batch it nightly.");
++  });
++});
++
++describe("compareItemLabels", () => {
++  it("orders by kind, then number, with other letters last", () => {
++    const labels = ["A4", "T2", "Q10", "R1", "Q2", "AB1"];
++    expect(labels.sort(compareItemLabels)).toEqual(["Q2", "Q10", "R1", "T2", "A4", "AB1"]);
++  });
++});
++
++describe("withWrittenItems", () => {
++  it("puts written items in place and keeps label order", () => {
++    const cached = [storedItem("Q1"), storedItem("R1")];
++    const written = withWrittenItems(cached, [
++      { label: "R1", item: storedItem("R1", { status: "closed" }) },
++      { label: "Q2", item: storedItem("Q2") },
++      { label: "T9", error: { code: "not_found", message: "no item T9" } },
++    ]);
++    expect(written?.map((item) => [item.label, item.status])).toEqual([
++      ["Q1", "open"],
++      ["Q2", "open"],
++      ["R1", "closed"],
++    ]);
++    expect(withWrittenItems(undefined, [])).toBeUndefined();
++  });
++});
++
++describe("fetchStoredOpenItems", () => {
++  it("reads every page of every status", async () => {
++    const page = (data: StoredOpenItem[], nextAfter: string | null) =>
++      new Response(JSON.stringify({ data, has_more: nextAfter !== null, next_after: nextAfter }));
++    fetchMock
++      .mockResolvedValueOnce(page([storedItem("Q1")], "Q1"))
++      .mockResolvedValueOnce(page([storedItem("R1")], null));
++    const items = await fetchStoredOpenItems("conv 1");
++    expect(items.map((item) => item.label)).toEqual(["Q1", "R1"]);
++    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
++      "/v1/sessions/conv%201/open-items?status=all&limit=200",
++      "/v1/sessions/conv%201/open-items?status=all&limit=200&after=Q1",
++    ]);
++  });
++
++  it("fails with the server's reason", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response(JSON.stringify({ error: { message: "Open items are not available" } }), {
++        status: 404,
++      }),
++    );
++    await expect(fetchStoredOpenItems("conv_1")).rejects.toThrow("Open items are not available");
++  });
++});
+diff --git a/web/src/lib/openItems.ts b/web/src/lib/openItems.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..68eba8bc8d3b82bb8dd2e561d96bf787f51ca60f
+--- /dev/null
++++ b/web/src/lib/openItems.ts
+@@ -0,0 +1,316 @@
++// A session's stored open items (`/v1/sessions/{id}/open-items`), and the one
++// index the chat and the panel read: a label the store holds takes its state
++// from the store; a label only in the chat keeps the state the chat text gives
++// it, shown as "chat only".
++
++import type { QueryClient } from "@tanstack/react-query";
++import { authenticatedFetch } from "@/lib/identity";
++import {
++  extractItemBlock,
++  extractLabelSentence,
++  itemLabelTitle,
++  mentionedInLatestReply,
++  type ItemLabelEntry,
++  type ItemLabelIndex,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
++import { isLinkItemLabel } from "@/lib/sessionLinks";
++
++export type OpenItemKind = "question" | "risk" | "finding" | "follow_up" | "link";
++export type OpenItemStatus = "open" | "answered" | "closed";
++
++/** Kinds in label order, with the letter their labels start with. */
++export const OPEN_ITEM_KINDS: readonly { kind: OpenItemKind; letter: string; name: string }[] = [
++  { kind: "question", letter: "Q", name: "Questions" },
++  { kind: "risk", letter: "R", name: "Risks" },
++  { kind: "finding", letter: "F", name: "Findings" },
++  { kind: "follow_up", letter: "T", name: "Follow-ups" },
++  { kind: "link", letter: "L", name: "Links" },
++];
++
++export interface OpenItemLink {
++  url: string;
++  label?: string;
++}
++
++export interface OpenItemAnswer {
++  text: string;
++  /** Epoch seconds. */
++  at: number;
++  by: string | null;
++}
++
++/** One stored item, as `GET /v1/sessions/{id}/open-items` returns it. */
++export interface StoredOpenItem {
++  label: string;
++  kind: OpenItemKind;
++  number: number;
++  status: OpenItemStatus;
++  title: string;
++  detail: string;
++  topic: string | null;
++  links: OpenItemLink[];
++  url: string | null;
++  raised_by: string | null;
++  created_at: number;
++  updated_at: number;
++  closed_at: number | null;
++  resolution: string | null;
++  closed_by: "agent" | "user" | null;
++  answers: OpenItemAnswer[];
++}
++
++interface OpenItemsPage {
++  data: StoredOpenItem[];
++  has_more: boolean;
++  next_after: string | null;
++}
++
++/** A change a person makes to one item through `PATCH …/open-items`. */
++export interface OpenItemUpdate {
++  label: string;
++  status?: "open" | "closed";
++  /** Required to close. */
++  resolution?: string;
++  /** Empty clears it. */
++  topic?: string;
++}
++
++/** Per-label outcome of a write: the item as stored now, or why it was refused. */
++export type OpenItemWriteResult =
++  | { label: string; item: StoredOpenItem }
++  | { label: string; error: { code: string; message: string } };
++
++// The store caps a session at 500 items; pages of 200 read them all in three requests.
++const PAGE_LIMIT = "200";
++// The store's limit on a resolution.
++const RESOLUTION_MAX_CHARS = 2000;
++const MAX_PAGES = 5;
++
++export function openItemsKey(sessionId: string | undefined) {
++  return ["session-open-items", sessionId] as const;
++}
++
++/** Refetch a session's stored items, e.g. after `session.open_items.changed`. */
++export function refreshStoredOpenItems(queryClient: QueryClient, sessionId: string): void {
++  void queryClient.invalidateQueries({ queryKey: openItemsKey(sessionId), exact: true });
++}
++
++function openItemsUrl(sessionId: string, suffix = ""): string {
++  return `/v1/sessions/${encodeURIComponent(sessionId)}/open-items${suffix}`;
++}
++
++/** Every stored item of the session, in label order. */
++export async function fetchStoredOpenItems(sessionId: string): Promise<StoredOpenItem[]> {
++  const items: StoredOpenItem[] = [];
++  let after: string | null = null;
++  /* oxlint-disable no-await-in-loop -- each page starts after the previous page's last label */
++  for (let page = 0; page < MAX_PAGES; page += 1) {
++    const params = new URLSearchParams({ status: "all", limit: PAGE_LIMIT });
++    if (after) params.set("after", after);
++    const response = await authenticatedFetch(`${openItemsUrl(sessionId)}?${params}`);
++    if (!response.ok) throw await apiErrorFromResponse(response);
++    const body = (await response.json()) as OpenItemsPage;
++    items.push(...body.data);
++    if (!body.has_more || !body.next_after) break;
++    after = body.next_after;
++  }
++  /* oxlint-enable no-await-in-loop */
++  return items;
++}
++
++/** Close, reopen or retopic items as the signed-in person (edit access). */
++export async function updateStoredOpenItems(
++  sessionId: string,
++  updates: readonly OpenItemUpdate[],
++): Promise<OpenItemWriteResult[]> {
++  const response = await authenticatedFetch(openItemsUrl(sessionId), {
++    method: "PATCH",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ updates }),
++  });
++  if (!response.ok) throw await apiErrorFromResponse(response);
++  return ((await response.json()) as { items: OpenItemWriteResult[] }).items;
++}
++
++/** The cached list with the items a write returned put in place. */
++export function withWrittenItems(
++  items: readonly StoredOpenItem[] | undefined,
++  results: readonly OpenItemWriteResult[],
++): StoredOpenItem[] | undefined {
++  if (!items) return undefined;
++  const written = new Map(
++    results.flatMap((result) => ("item" in result ? [[result.item.label, result.item]] : [])),
++  );
++  if (written.size === 0) return [...items];
++  const kept = items.map((item) => written.get(item.label) ?? item);
++  const known = new Set(items.map((item) => item.label));
++  const added = [...written.values()].filter((item) => !known.has(item.label));
++  return added.length === 0 ? kept : sortByLabel([...kept, ...added]);
++}
++
++const KIND_ORDER = new Map(OPEN_ITEM_KINDS.map(({ letter }, position) => [letter, position]));
++const LABEL_PARTS_RE = /^([A-Z]{1,3})(\d{1,3})$/;
++
++/** Label order, as the store lists: by kind, then number; other letters last. */
++export function compareItemLabels(left: string, right: string): number {
++  const [, leftLetter = left, leftNumber = "0"] = left.match(LABEL_PARTS_RE) ?? [];
++  const [, rightLetter = right, rightNumber = "0"] = right.match(LABEL_PARTS_RE) ?? [];
++  const leftKind = KIND_ORDER.get(leftLetter) ?? KIND_ORDER.size;
++  const rightKind = KIND_ORDER.get(rightLetter) ?? KIND_ORDER.size;
++  if (leftKind !== rightKind) return leftKind - rightKind;
++  if (leftLetter !== rightLetter) return leftLetter < rightLetter ? -1 : 1;
++  return Number(leftNumber) - Number(rightNumber);
++}
++
++function sortByLabel(items: StoredOpenItem[]): StoredOpenItem[] {
++  return items.sort((left, right) => compareItemLabels(left.label, right.label));
++}
++
++/** The kind a chat label names, when it is a label the store could hold. */
++export function kindOfLabel(label: string): OpenItemKind | null {
++  const match = label.match(/^([QRFTL])[1-9]\d{0,2}$/);
++  return match ? (OPEN_ITEM_KINDS.find(({ letter }) => letter === match[1])?.kind ?? null) : null;
++}
++
++/** What the store adds to a chat item: its stored record, and a close only the chat made. */
++export interface StoredItemFields {
++  stored?: StoredOpenItem;
++  /** The chat struck the label while the store keeps the item open; offered as a one-tap close. */
++  closedInChat?: ItemLabelSource;
++}
++
++export type MergedItemLabelEntry = ItemLabelEntry & StoredItemFields;
++
++/** The stored record behind an index entry, if the store holds its label. */
++export function storedItemOf(entry: ItemLabelEntry): StoredOpenItem | undefined {
++  return (entry as MergedItemLabelEntry).stored;
++}
++
++/**
++ * The transcript's label index with stored state applied: a stored item is
++ * closed exactly when the store says so. A store close the chat never wrote
++ * is described by its resolution, at the label's latest mention.
++ *
++ * @returns `index` itself without stored items, so a session the store knows
++ *   nothing about renders as before.
++ */
++export function mergeStoredOpenItems(
++  index: ItemLabelIndex,
++  stored: readonly StoredOpenItem[] | null,
++): ItemLabelIndex {
++  if (!stored || stored.length === 0) return index;
++  const byLabel = new Map(stored.map((item) => [item.label, item]));
++  let storedInChat = false;
++  const items = new Map<string, ItemLabelEntry>();
++  for (const [label, entry] of index.items) {
++    const item = byLabel.get(label);
++    if (!item) {
++      items.set(label, entry);
++      continue;
++    }
++    storedInChat = true;
++    const merged: MergedItemLabelEntry = { ...entry, stored: item };
++    if (item.status === "closed") {
++      merged.closedBy = entry.closedBy ?? storeClosingSource(entry, item);
++    } else {
++      merged.closedBy = null;
++      if (entry.closedBy) merged.closedInChat = entry.closedBy;
++    }
++    items.set(label, merged);
++  }
++  return { ...index, enabled: index.enabled || storedInChat, items };
++}
++
++function storeClosingSource(entry: ItemLabelEntry, item: StoredOpenItem): ItemLabelSource {
++  const resolution = item.resolution?.trim();
++  return {
++    messageId: entry.lastMention.messageId,
++    role: item.closed_by === "user" ? "user" : "assistant",
++    text: resolution ? `~~[${item.label}]~~ ${resolution}` : `~~[${item.label}]~~`,
++    ...(item.closed_at !== null ? { createdAtS: item.closed_at } : {}),
++  };
++}
++
++/** One row of the Open items panel: a stored item, or a label only the chat has. */
++export interface OpenItemRow {
++  label: string;
++  /** Null for a chat label of a letter the store does not use, e.g. `[A4]`. */
++  kind: OpenItemKind | null;
++  status: OpenItemStatus;
++  title: string;
++  detail: string;
++  topic: string | null;
++  /** The stored record; null for a chat-only item. */
++  stored: StoredOpenItem | null;
++  /** Where the chat defines or mentions it; null when no loaded message does. */
++  entry: MergedItemLabelEntry | null;
++  /** The latest agent reply mentions it. */
++  recent: boolean;
++  /** Dismissed from the panel (chat-only items, stored on the session's labels). */
++  dismissed: boolean;
++}
++
++/**
++ * The panel's rows in label order: every stored item but pinned links, then
++ * the chat's own labels the store does not hold. Chat labels count only once
++ * the transcript uses labels, as the chips do.
++ */
++export function openItemRows(
++  index: ItemLabelIndex | null,
++  stored: readonly StoredOpenItem[],
++  dismissed: ReadonlySet<string>,
++): OpenItemRow[] {
++  const rows: OpenItemRow[] = [];
++  const storedLabels = new Set<string>();
++  for (const item of stored) {
++    storedLabels.add(item.label);
++    if (item.kind === "link") continue;
++    const entry = (index?.items.get(item.label) as MergedItemLabelEntry | undefined) ?? null;
++    rows.push({
++      label: item.label,
++      kind: item.kind,
++      status: item.status,
++      title: item.title,
++      detail: item.detail,
++      topic: item.topic,
++      stored: item,
++      entry,
++      recent: entry !== null && index !== null && mentionedInLatestReply(index, entry),
++      dismissed: false,
++    });
++  }
++  if (index?.enabled) {
++    for (const entry of index.items.values()) {
++      if (storedLabels.has(entry.label) || isLinkItemLabel(entry.label)) continue;
++      const closed = entry.closedBy !== null;
++      rows.push({
++        label: entry.label,
++        kind: kindOfLabel(entry.label),
++        status: closed ? "closed" : "open",
++        title: itemLabelTitle(entry.source.text, entry.label),
++        detail: extractItemBlock(entry.source.text, entry.label) ?? "",
++        topic: null,
++        stored: null,
++        entry,
++        recent: mentionedInLatestReply(index, entry),
++        dismissed: !closed && dismissed.has(entry.label),
++      });
++    }
++  }
++  return rows.sort((left, right) => compareItemLabels(left.label, right.label));
++}
++
++/** How many rows wait on the user: open, not dismissed. Answered items wait on the agent. */
++export function countOpenRows(rows: readonly OpenItemRow[]): number {
++  return rows.filter((row) => row.status === "open" && !row.dismissed).length;
++}
++
++/** The sentence that closed an item in chat, as a resolution for the store. */
++export function chatResolution(row: OpenItemRow): string | null {
++  const closing = row.entry?.closedInChat ?? (row.stored ? null : row.entry?.closedBy);
++  if (!closing) return null;
++  const sentence = extractLabelSentence(closing.text, row.label);
++  return sentence ? sentence.replace(/~~/g, "").trim().slice(0, RESOLUTION_MAX_CHARS) : null;
++}
+diff --git a/web/src/lib/sessionEvents.test.ts b/web/src/lib/sessionEvents.test.ts
+index 7bc1effdb1db4dc87b16a40f7ee96aab17cc0afb..63520f0f0239b2ce4eafab6e1b85621389ff8882 100644
+--- a/web/src/lib/sessionEvents.test.ts
++++ b/web/src/lib/sessionEvents.test.ts
+@@ -1864,6 +1864,24 @@ describe("session.journal.appended (FLAT envelope)", () => {
+   });
+ });
+ 
++describe("session.open_items.changed (FLAT envelope)", () => {
++  it("carries the session and the labels written", () => {
++    expect(
++      parse("session.open_items.changed", {
++        type: "session.open_items.changed",
++        conversation_id: "conv_abc",
++        labels: ["Q7", 3, "R1"],
++        open_count: 2,
++      }),
++    ).toEqual([
++      { type: "session_open_items_changed", conversationId: "conv_abc", labels: ["Q7", "R1"] },
++    ]);
++    expect(
++      parse("session.open_items.changed", { type: "session.open_items.changed", labels: [] }),
++    ).toEqual([]);
++  });
++});
++
+ describe("session.changed_files.invalidated (FLAT envelope)", () => {
+   it("lifts session id and defaults environment", () => {
+     const out = parse("session.changed_files.invalidated", {
+diff --git a/web/src/lib/sse.ts b/web/src/lib/sse.ts
+index 3a8ff81f094e5230b8f7fda0495aa9c24ac20a30..456c9b13eb92e10ecdb3321da5c3e4e0e034a0cd 100644
+--- a/web/src/lib/sse.ts
++++ b/web/src/lib/sse.ts
+@@ -42,6 +42,7 @@ import type {
+   SessionChangedFilesInvalidatedEvent,
+   SessionChildSessionUpdatedEvent,
+   SessionJournalAppendedEvent,
++  SessionOpenItemsChangedEvent,
+   SessionModelOptionsEvent,
+   SessionCreatedEvent,
+   SessionInputConsumedEvent,
+@@ -977,6 +978,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
+       entry: entry as JournalEntry,
+     } satisfies SessionJournalAppendedEvent;
+   }
++  if (eventType === "session.open_items.changed") {
++    const conversationId = data.conversation_id;
++    if (typeof conversationId !== "string" || !conversationId) return null;
++    const labels = Array.isArray(data.labels)
++      ? data.labels.filter((label): label is string => typeof label === "string")
++      : [];
++    return {
++      type: "session_open_items_changed",
++      conversationId,
++      labels,
++    } satisfies SessionOpenItemsChangedEvent;
++  }
+   if (eventType === "session.changed_files.invalidated") {
+     const sessionId = data.session_id;
+     if (typeof sessionId !== "string" || !sessionId) return null;
+diff --git a/web/src/store/chatStore.openItems.test.ts b/web/src/store/chatStore.openItems.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..56c8bd7eec40e08aae4108da91e969e75aeb3aa1
+--- /dev/null
++++ b/web/src/store/chatStore.openItems.test.ts
+@@ -0,0 +1,20 @@
++import { QueryClient } from "@tanstack/react-query";
++import { describe, expect, it } from "vitest";
++import { openItemsKey } from "@/lib/openItems";
++import { handleSessionEvent, initChatStore } from "@/store/chatStore";
++import { storedItem } from "@/test/openItemsFixtures";
++
++describe("a live open items change", () => {
++  it("marks that session's stored items stale, and only that session's", () => {
++    const queryClient = new QueryClient();
++    initChatStore(queryClient);
++    queryClient.setQueryData(openItemsKey("conv"), [storedItem("Q1")]);
++    queryClient.setQueryData(openItemsKey("other"), [storedItem("Q1")]);
++    handleSessionEvent(
++      { type: "session_open_items_changed", conversationId: "conv", labels: ["Q1"] },
++      "conv",
++    );
++    expect(queryClient.getQueryState(openItemsKey("conv"))?.isInvalidated).toBe(true);
++    expect(queryClient.getQueryState(openItemsKey("other"))?.isInvalidated).toBe(false);
++  });
++});
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 9577fffef657d0939285f8d6888907662dce0a3c..69ea2ca6518502a699c0ab8778318256104e2950 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -120,6 +120,7 @@ import {
+ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
+ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+ import { applyJournalEntry } from "@/hooks/useSessionJournal";
++import { refreshStoredOpenItems } from "@/lib/openItems";
+ import { isFirstPlan } from "@/lib/sessionJournal";
+ import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+ import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
+@@ -10307,6 +10308,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
+         showTasksTabBesideChat(event.conversationId, "first-plan");
+       }
+       return;
++    case "session_open_items_changed":
++      // The Open items panel, badge and chips read the stored list again.
++      if (queryClient) refreshStoredOpenItems(queryClient, event.conversationId);
++      return;
+     case "session_changed_files_invalidated":
+       // Coarse "something changed" signal. Coalesce bursts into one
+       // changed-files/root refresh, and mark expanded directory caches
+diff --git a/web/src/test/openItemsFixtures.ts b/web/src/test/openItemsFixtures.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..47122c9a4cce9deaa3c57bf65090aaee9574da38
+--- /dev/null
++++ b/web/src/test/openItemsFixtures.ts
+@@ -0,0 +1,26 @@
++import type { StoredOpenItem } from "@/lib/openItems";
++
++const KINDS = { Q: "question", R: "risk", F: "finding", T: "follow_up", L: "link" } as const;
++
++/** A stored item as `GET …/open-items` returns it, open unless `fields` say otherwise. */
++export function storedItem(label: string, fields: Partial<StoredOpenItem> = {}): StoredOpenItem {
++  return {
++    label,
++    kind: KINDS[label[0] as keyof typeof KINDS],
++    number: Number(label.slice(1)),
++    status: "open",
++    title: `Title of ${label}`,
++    detail: "",
++    topic: null,
++    links: [],
++    url: null,
++    raised_by: null,
++    created_at: 1_764_100_000,
++    updated_at: 1_764_100_000,
++    closed_at: null,
++    resolution: null,
++    closed_by: null,
++    answers: [],
++    ...fields,
++  };
++}
