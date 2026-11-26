@@ -115,17 +115,23 @@ def test_item_label_chip_previews_defining_item(
     expect(popover).to_contain_text("keeping our index naming")
     page.keyboard.press("Escape")
 
-    # The panel lists what is still open; closed items fold under "Closed".
+    # The header button counts what is still open; its panel lists every item,
+    # closed ones under "Closed".
+    items_button = page.get_by_test_id("session-items-trigger")
+    expect(items_button).to_contain_text("2")
+    items_button.click()
     panel = page.get_by_test_id("open-items")
     expect(panel).to_contain_text("Open items")
     expect(panel).to_contain_text("(2)")
-    panel.get_by_role("button", name="Show item R1").first.click()
-    expect(popover).to_contain_text("ON DELETE CASCADE")
-    page.keyboard.press("Escape")
-    panel.locator("summary").click()
     expect(panel.get_by_role("button", name="Show item Q2 (closed)")).to_contain_text(
         "Soft-deleted rows"
     )
+    # An item's preview opens over the panel; Escape closes the preview, then the panel.
+    panel.get_by_role("button", name="Show item R1").first.click()
+    expect(popover.last).to_contain_text("ON DELETE CASCADE")
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    expect(panel).to_have_count(0)
 
     status.get_by_role("button", name="Show item Q2 (closed)").click()
     popover.get_by_role("button", name="Show in conversation").click()

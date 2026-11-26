@@ -228,6 +228,24 @@ describe("ChatHeader — pending session presentation", () => {
   });
 });
 
+describe("ChatHeader — open items slot", () => {
+  it("gives a session's transcript a slot for its open-items button, on desktop and mobile", () => {
+    const session = { sidebarOpen: true, conversationId: "conv_1", conversationTitle: "Audit" };
+    renderHeader(session);
+    expect(screen.getByTestId("session-items-slot")).toBeEmptyDOMElement();
+    cleanup();
+
+    isMobileMock.mockReturnValue(true);
+    renderHeader(session);
+    expect(screen.getByTestId("session-items-slot")).toBeEmptyDOMElement();
+  });
+
+  it("has no slot while the session is pending", () => {
+    renderHeader({ sidebarOpen: true, conversationId: "temp:12345678", pending: true });
+    expect(screen.queryByTestId("session-items-slot")).toBeNull();
+  });
+});
+
 describe("ChatHeader — workspace pane alignment", () => {
   it("uses the desktop workspace offset without changing the mobile inset", () => {
     const { container } = renderHeader({ sidebarOpen: true });

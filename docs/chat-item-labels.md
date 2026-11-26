@@ -45,14 +45,23 @@ you or the agent write them.
 - **Closing:** a struck-through mention, `~~[Q2]~~`, closes the item. Its chips
   are struck through everywhere and the popover adds the sentence that closed
   it. The newest mention decides, so a later plain mention reopens it.
-- **Open items:** a bar above the thread lists the open labels as chips.
-  Expand it for every item with its title, closed ones under **Closed (N)**.
-- **Latest reply:** the Open items bar puts the items the agent's newest reply
+- **Open items:** a button in the session header, beside Agent info, carries
+  the number of open items as a badge. Click it for a panel (on a phone, tap
+  it for a sheet at the bottom of the screen) that lists the open labels as
+  chips and every item with its title, closed ones under **Closed (N)**. The
+  button appears once the transcript uses labels. A transcript shown without
+  the session header keeps the list as a bar pinned above the thread.
+- **Loaded history only:** items are read from the messages loaded in your
+  browser; the list is not stored on the server. In a long session whose early
+  history has not been loaded, an item mentioned only there is missing until
+  you scroll up far enough to load it, and a label whose first message is not
+  loaded is described by its earliest loaded mention.
+- **Latest reply:** the Open items list puts the items the agent's newest reply
   mentions first, tinted, and includes an item that reply just closed, struck
   through. Expanded, they sit under **In the latest reply**, ahead of the other
   open items.
-- **Dismiss:** each open item in the expanded bar has a dismiss button. A
-  dismissed item leaves the bar's chips and open count; **Show dismissed (N)**
+- **Dismiss:** each open item in the list has a dismiss button. A dismissed
+  item leaves the chips, the open count and the badge; **Show dismissed (N)**
   at the bottom lists it with **Restore**. An item the agent later closes shows
   as closed as usual. Dismissals are stored on the session, as the
   `omnigent.items_dismissed` label, so they follow you to other devices.
