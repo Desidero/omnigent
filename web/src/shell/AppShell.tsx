@@ -180,7 +180,7 @@ import { isMobileViewport, Sidebar } from "./Sidebar";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
-import { useSettingsRoute } from "./settingsNav";
+import { useBackToSettingsList, useSettingsRoute } from "./settingsNav";
 import { useOpenSidebarForSettingsSearch } from "./settingsSearch/settingsSearchFocus";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
@@ -491,10 +491,12 @@ function AppShellImpl() {
     if (canvasMode) setSidebarPeek(false);
   }, [canvasMode]);
 
-  // Desktop settings need the sidebar's Back row. Mobile section links keep
-  // the drawer state chosen by navigation; the header can reopen the menu.
+  // Desktop settings need the sidebar's Back row. On the phone layout bare
+  // /settings is the menu on its own, and a page opens with the menu closed;
+  // docked beside the page, the menu keeps the state navigation chose.
   // Restore the prior sidebar preference when leaving settings.
   const { inSettings } = useSettingsRoute();
+  const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
@@ -508,7 +510,7 @@ function AppShellImpl() {
         return (
           !isMobileViewport() ||
           location.pathname.replace(/\/$/, "") === rebasePath("/settings") ||
-          wasOpen
+          (wasOpen && sideBySideSidebar)
         );
       });
       setSidebarPeek(false);
@@ -520,7 +522,7 @@ function AppShellImpl() {
       setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
       sidebarOpenBeforeSettingsRef.current = null;
     }
-  }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
+  }, [inSettings, location.pathname, rebasePath, setSidebarOpen, sideBySideSidebar]);
 
   // ⌘K's "Search settings…" opens the sidebar so its field can be seen. From outside Settings the
   // sidebar's state is recorded first, so Back restores a collapsed sidebar, as after any other trip.
@@ -538,9 +540,14 @@ function AppShellImpl() {
   const mobileViewport = useIsMobileViewport();
   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
   const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
-  const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
+  // A phone Settings page goes Back to the page list rather than opening the menu over it.
+  const backToSettingsList = useBackToSettingsList();
+  const settingsPageBack =
+    inSettings && !atSettingsRoot && mobileViewport && !sideBySideSidebar
+      ? backToSettingsList
+      : undefined;
   const lastMobileViewportRef = useRef(mobileViewport);
   const lastSidebarOpenRef = useRef(sidebarOpen);
   const sidebarOpenBeforeNarrowRef = useRef(false);
@@ -3492,6 +3499,7 @@ function AppShellImpl() {
                     // the floating card (and in the title-bar strip on mac).
                     sidebarOpen={sidebarOpen}
                     settingsMode={inSettings}
+                    onBackToSettings={settingsPageBack}
                     onOpenSidebar={handleSidebarOpen}
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}

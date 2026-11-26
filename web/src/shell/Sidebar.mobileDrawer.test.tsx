@@ -4,7 +4,7 @@ import { conversation as conv, conversationPage } from "@/test/sidebarMockHelper
 // floats at the top, and Settings sits in the profile footer.
 
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -92,15 +92,33 @@ describe("mobile sidebar drawer", () => {
     );
   });
 
-  it("keeps the peek strip and the scrim on the settings page, so its content shows", () => {
+  it("keeps the peek strip and the scrim on a settings page, so its content shows", () => {
+    stubMobileLayout(true);
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
     const onClose = vi.fn();
-    renderSidebar({ route: "/settings", onClose });
+    renderSidebar({ route: "/settings/appearance", onClose });
 
     expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
       "max-md:right-14",
     );
     fireEvent.click(screen.getByTestId("sidebar-scrim"));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the bare /settings menu full width with no page behind it to tap back to", () => {
+    stubMobileLayout(true);
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    renderSidebar({ route: "/settings" });
+
+    expect(screen.getByRole("complementary", { name: "Conversations" })).not.toHaveClass(
+      "max-md:right-14",
+    );
+    expect(screen.queryByTestId("sidebar-scrim")).toBeNull();
+    expect(screen.getByTestId("settings-nav-general")).toBeInTheDocument();
   });
 
   it("keeps Settings in the profile footer and hides the desktop collapse toggle on mobile", async () => {
@@ -291,6 +309,19 @@ describe("mobile sidebar drawer swipe to close", () => {
 
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(drawer.style.transform).toBe("");
+  });
+
+  it("stays open under a swipe on the bare /settings menu, which has no page behind it", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer({ route: "/settings" });
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 60);
+    touch(drawer, "touchmove", 100, 120);
+    touch(drawer, "touchend", 0, 400);
+
+    expect(drawer.style.transform).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it("springs back open without closing after a short drag", () => {

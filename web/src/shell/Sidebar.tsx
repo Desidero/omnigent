@@ -266,6 +266,7 @@ import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
 } from "@/hooks/useIsSideBySideSidebarViewport";
+import { useAtSettingsRoot } from "@/hooks/useAtSettingsRoot";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
@@ -1012,6 +1013,7 @@ function SidebarImpl({
   // for the settings section nav (see settingsNav.tsx) — entering settings
   // shouldn't replace the whole sidebar.
   const { inSettings } = useSettingsRoute();
+  const atSettingsRoot = useAtSettingsRoot();
   // Fetched only in Settings, whose nav drops Harnesses when none is offered.
   const curatedOutHarnesses = useCuratedOutHarnesses(inSettings);
   // Remember the pre-settings location so the Back row returns to the
@@ -1125,8 +1127,11 @@ function SidebarImpl({
       if (shouldOpen) onOpen?.();
     },
   });
+  // On the phone layout bare /settings is the Settings menu on its own: full width, with no page
+  // behind it to swipe or tap back to.
+  const settingsPageList = atSettingsRoot && mobileLayout && !sideBySide;
   useSidebarSwipeToClose({
-    enabled: closeSwipeEnabled,
+    enabled: closeSwipeEnabled && !settingsPageList,
     drawerRef,
     scrimRef,
     holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
@@ -1256,7 +1261,7 @@ function SidebarImpl({
       pill) and renders after the sidebar, so a same-z peer that ever takes
       pointer events would win the tie inside the exposed strip and swallow the
       dismiss. Strictly between chat chrome and the drawer's z-50. */}
-      {!sideBySide && (
+      {!sideBySide && !settingsPageList && (
         <button
           type="button"
           ref={scrimRef}
@@ -1309,7 +1314,7 @@ function SidebarImpl({
           // most of the phone but stops short of the right edge so the chat stays
           // visible (and tappable through the scrim) behind it.
           "fixed inset-0 z-50",
-          !sideBySide && "max-md:right-14",
+          !sideBySide && !settingsPageList && "max-md:right-14",
           // Mobile only: animate the slide so the iOS edge-swipe settles
           // smoothly on release. Suppressed inline while a drag is live (the
           // overlay must track the finger 1:1). Scoped to transform so it can't

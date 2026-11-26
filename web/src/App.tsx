@@ -13,6 +13,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
 import { isElectronShell } from "@/lib/nativeBridge";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -152,6 +154,16 @@ function AppRedirect({ to }: { to: string }) {
     navigate({ pathname: to, search, hash }, { replace: true });
   }, [navigate, to, search, hash]);
   return null;
+}
+
+/**
+ * Bare /settings. Where the Settings menu would cover the page (the phone drawer), the menu is
+ * the page list on its own and no page opens; elsewhere it opens the canonical General section.
+ */
+function SettingsIndexRoute({ to }: { to: string }) {
+  const mobileLayout = useIsMobileViewport();
+  const docked = useIsSideBySideSidebarViewport();
+  return mobileLayout && !docked ? null : <AppRedirect to={to} />;
 }
 
 interface AppProps {
@@ -346,10 +358,11 @@ function AppRoutes({ basename }: AppProps) {
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
-              redirects to the canonical General section. */}
+              redirects to the canonical General section, except on the
+              phone layout, where it is the page list. */}
           <Route
             path={`${prefix}/settings`}
-            element={<AppRedirect to={`${prefix}/settings/general`} />}
+            element={<SettingsIndexRoute to={`${prefix}/settings/general`} />}
           />
           <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />

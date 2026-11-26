@@ -4,6 +4,7 @@ import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
   ArrowLeftIcon,
   BotIcon,
+  ChevronLeftIcon,
   EllipsisVerticalIcon,
   FileIcon,
   FolderPlusIcon,
@@ -155,6 +156,8 @@ interface ChatHeaderProps {
   onOpenSidebar: (peek?: boolean) => void;
   /** Render the mobile settings-menu toggle and fade. */
   settingsMode?: boolean;
+  /** On a phone Settings page: a Back to the page list replaces the menu toggle. */
+  onBackToSettings?: () => void;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
   /**
@@ -360,6 +363,7 @@ export function ChatHeader({
   sidebarOpen,
   onOpenSidebar,
   settingsMode = false,
+  onBackToSettings,
   isChildSession,
   subAgentName,
   conversationId,
@@ -631,7 +635,20 @@ export function ChatHeader({
           !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
-        {!sidebarOpen && (!canvas || canvas.compact || canvas.focused) && (
+        {!sidebarOpen && onBackToSettings && (
+          <MobileHeaderButton
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Back to Settings"
+            componentId="settings.header.back"
+            onClick={onBackToSettings}
+            className="mobile-touch-target pointer-events-auto border-none text-muted-foreground hover:text-foreground"
+          >
+            <ChevronLeftIcon className="size-5" />
+          </MobileHeaderButton>
+        )}
+        {!sidebarOpen && !onBackToSettings && (!canvas || canvas.compact || canvas.focused) && (
           <SidebarOpenButton
             onOpenSidebar={onOpenSidebar}
             settingsMode={settingsMode}

@@ -98,6 +98,7 @@ function renderHeader(props: {
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
   settingsMode?: boolean;
+  onBackToSettings?: () => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -108,6 +109,7 @@ function renderHeader(props: {
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
             settingsMode={props.settingsMode}
+            onBackToSettings={props.onBackToSettings}
             isChildSession={props.isChildSession ?? false}
             subAgentName={props.subAgentName ?? null}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
@@ -324,6 +326,19 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     const button = screen.getByRole("button", { name: "Open settings menu" });
     expect(button.querySelector("svg")).toHaveClass("lucide-menu");
     expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
+  });
+
+  it("goes Back to the Settings list instead of opening the menu on a phone Settings page", () => {
+    const onBackToSettings = vi.fn();
+    const onOpenSidebar = vi.fn();
+    renderHeader({ sidebarOpen: false, settingsMode: true, onBackToSettings, onOpenSidebar });
+
+    expect(screen.queryByRole("button", { name: "Open settings menu" })).toBeNull();
+    const back = screen.getByRole("button", { name: "Back to Settings" });
+    expect(back.querySelector("svg")).toHaveClass("lucide-chevron-left");
+    fireEvent.click(back);
+    expect(onBackToSettings).toHaveBeenCalledTimes(1);
+    expect(onOpenSidebar).not.toHaveBeenCalled();
   });
 
   it("drops the settings header fade while the sidebar is open", () => {

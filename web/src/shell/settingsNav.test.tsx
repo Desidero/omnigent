@@ -8,7 +8,14 @@
 import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { SettingsIcon } from "lucide-react";
 import type { ReactNode } from "react";
-import { MemoryRouter, useNavigate } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+} from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -46,9 +53,11 @@ vi.mock("@/hooks/useIsAdmin", () => ({
   useIsAdmin: () => mocks.isAdmin,
 }));
 
+import { useAtSettingsRoot } from "@/hooks/useAtSettingsRoot";
 import {
   SettingsSidebarBody,
   settingsNavGroups,
+  useBackToSettingsList,
   useSettingsRoute,
   useTrackSettingsReturn,
 } from "./settingsNav";
@@ -459,7 +468,12 @@ describe("SettingsSidebarBody on phones", () => {
     expect(general.parentElement).not.toHaveClass("gap-px");
   });
 
-  // Bare /settings redirects to /settings/general, so the open section is always set.
+  it("marks no page current on the bare /settings list", () => {
+    renderBody({ route: "/settings" });
+    expect(screen.getByTestId("settings-nav-general")).toBeInTheDocument();
+    expect(document.querySelector('[aria-current="page"]')).toBeNull();
+  });
+
   it.each(["/settings/general", "/settings/appearance"])(
     "shows no selected row at %s but keeps aria-current",
     (route) => {
@@ -513,6 +527,87 @@ it("loads beside a mock of the viewport hook that has only the hook", async () =
     vi.doUnmock("@/hooks/useIsMobileViewport");
     vi.resetModules();
   }
+});
+
+// The phone page list at bare /settings and the Settings page it opens.
+function SettingsListFlow() {
+  const location = useLocation();
+  const navigationType = useNavigationType();
+  return (
+    <>
+      <span data-testid="flow-location" data-navigation-type={navigationType}>
+        {location.pathname}
+      </span>
+      <Routes>
+        <Route path="/settings" element={<SettingsSidebarBody onNavClick={() => {}} />} />
+        <Route path="/settings/:section" element={<SettingsPageBack />} />
+        <Route path="*" element={null} />
+      </Routes>
+    </>
+  );
+}
+
+function SettingsPageBack() {
+  const back = useBackToSettingsList();
+  return (
+    <button type="button" onClick={back}>
+      Back to Settings
+    </button>
+  );
+}
+
+describe("Back from a phone Settings page", () => {
+  beforeEach(() => {
+    stubMobileLayout({ docked: false });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderFlow(entries: string[]) {
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={entries} initialIndex={entries.length - 1}>
+          <SettingsListFlow />
+        </MemoryRouter>
+      </TooltipProvider>,
+    );
+  }
+
+  it("pops back to the list a page was opened from", () => {
+    renderFlow(["/c/conv_a", "/settings"]);
+    fireEvent.click(screen.getByTestId("settings-nav-appearance"));
+    expect(screen.getByTestId("flow-location")).toHaveTextContent("/settings/appearance");
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to Settings" }));
+    const location = screen.getByTestId("flow-location");
+    expect(location).toHaveTextContent(/^\/settings$/);
+    expect(location).toHaveAttribute("data-navigation-type", "POP");
+  });
+
+  it("replaces a deep-linked page with the list", () => {
+    renderFlow(["/c/conv_a", "/settings/archived"]);
+    fireEvent.click(screen.getByRole("button", { name: "Back to Settings" }));
+    const location = screen.getByTestId("flow-location");
+    expect(location).toHaveTextContent(/^\/settings$/);
+    expect(location).toHaveAttribute("data-navigation-type", "REPLACE");
+  });
+});
+
+describe("useAtSettingsRoot", () => {
+  it.each([
+    ["/settings", true],
+    ["/settings/", true],
+    ["/ml/omnigent-embed/settings", true],
+    ["/settings/general", false],
+    ["/settings/harnesses/codex", false],
+    ["/inbox", false],
+  ])("reads %s as the root: %s", (path, root) => {
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
+    );
+    expect(renderHook(() => useAtSettingsRoot(), { wrapper }).result.current).toBe(root);
+  });
 });
 
 describe("useSettingsRoute", () => {

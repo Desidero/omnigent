@@ -6,7 +6,7 @@
 // selection is URL-driven (/settings/<section>) so the nav (in the sidebar)
 // and the content (in the outlet) stay in sync without shared state.
 
-import { type ReactNode, useEffect } from "react";
+import { type ReactNode, useCallback, useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
@@ -28,7 +28,7 @@ import {
   UsersIcon,
   VectorSquareIcon,
 } from "lucide-react";
-import { Link, useLocation } from "@/lib/routing";
+import { Link, useLocation, useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
@@ -36,6 +36,7 @@ import {
   customAgentsSettingsEnabled,
   isSingleUserMode,
 } from "@/lib/capabilities";
+import { useAtSettingsRoot } from "@/hooks/useAtSettingsRoot";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isElectronShell } from "@/lib/nativeBridge";
@@ -237,6 +238,20 @@ export function useSettingsRoute(): {
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
 }
 
+/** Location state of a page opened from the phone page list, so its Back can pop to the list. */
+const FROM_SETTINGS_LIST = { fromSettingsList: true };
+
+/** Back from a Settings page to the phone page list: pops to the list when the page came from it. */
+export function useBackToSettingsList(): () => void {
+  const navigate = useNavigate();
+  const state: unknown = useLocation().state;
+  const fromList = typeof state === "object" && state !== null && "fromSettingsList" in state;
+  return useCallback(() => {
+    if (fromList) navigate(-1);
+    else navigate("/settings", { replace: true });
+  }, [fromList, navigate]);
+}
+
 // Last location the user was on before entering /settings — path + search so
 // the conversation (and its ?file= etc.) is preserved. The Back row
 // returns here instead of the home page. Module-scoped: the sidebar stays
@@ -304,6 +319,7 @@ export function SettingsSidebarBody({
   searching?: boolean;
 }) {
   const { section } = useSettingsRoute();
+  const atRoot = useAtSettingsRoot();
   // The phone drawer covers the page, so it reads as a list of pages; docked beside
   // the page (the only time the sidebar passes onCollapse) it stays the sidebar nav.
   const phoneMenu = useIsMobileViewport() && onCollapse === undefined;
@@ -373,7 +389,8 @@ export function SettingsSidebarBody({
               >
                 {group.items.map((item) => {
                   const Icon = item.icon;
-                  const current = section === item.id;
+                  // The phone list at bare /settings opens no page, though the route reads General.
+                  const current = section === item.id && !(phoneMenu && atRoot);
                   // No page shows beside the phone menu, so no row looks selected.
                   const selected = current && !phoneMenu;
                   return (
@@ -395,6 +412,7 @@ export function SettingsSidebarBody({
                       <Link
                         to={settingsSectionPath(item.id)}
                         onClick={onNavClick}
+                        state={atRoot ? FROM_SETTINGS_LIST : undefined}
                         data-testid={`settings-nav-${item.id}`}
                         componentId={`settings.nav.${item.id}`}
                         aria-current={current ? "page" : undefined}
