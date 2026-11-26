@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 05:29:58 +0000
+Subject: [PATCH] fix(web): close the open-items panel when a comment is
+ started from it
+
+With item comments and the header's open-items button both present,
+choosing Comment in an item's preview opened from the button's panel
+switches the composer to comment mode while the panel is still up; on a
+phone the panel is a sheet over the composer. The panel now closes on a
+comment request, as it does for "Show in conversation".
+
+The docs and the browser test of item comments named the Open items bar;
+with the button they go through the header's panel.
+
+Local only: glue between the chat-item-comments and
+open-items-links-compact series, neither of which is upstream.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-item-labels.md                           |  5 +++--
+ tests/e2e_ui/chat/test_item_label_chips.py         |  9 ++++++---
+ .../components/chat/SessionItemsButton.test.tsx    | 14 +++++++++++++-
+ web/src/components/chat/SessionItemsButton.tsx     |  6 ++++++
+ 4 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+index d4115a5e4ab4800ba62f025a1fa929afae7e0396..c34c29c389d2f3a6cee42c6118a02dc3e77a01ae 100644
+--- a/docs/chat-item-labels.md
++++ b/docs/chat-item-labels.md
+@@ -91,8 +91,9 @@ you or the agent write them.
+ To answer several items at once, comment on each and send the comments
+ together, like reviewing a document:
+ 
+-1. Click an item's chip (in a message, in the Open items bar, or the label in
+-   its own defining message) and choose **Comment** in its popover.
++1. Click an item's chip (in a message, in the Open items panel, or the label
++   in its own defining message) and choose **Comment** in its popover. From
++   the Open items panel, this closes the panel.
+ 2. The composer switches to comment mode for that item: a card names it, and
+    whatever you had typed is set aside until you save. Attachments, paste,
+    @-mentions of files and sessions, and dictation work as usual; a draft keeps
+diff --git a/tests/e2e_ui/chat/test_item_label_chips.py b/tests/e2e_ui/chat/test_item_label_chips.py
+index ae31903a718feb9f48a2c85a5ac5fc361bcd6482..e0b090093462dc62aa9a3bb7a52f1e74a08ace86 100644
+--- a/tests/e2e_ui/chat/test_item_label_chips.py
++++ b/tests/e2e_ui/chat/test_item_label_chips.py
+@@ -5,7 +5,7 @@ them by label in a later status update. Clicking the later chip must preview
+ the defining item's own block, not the whole message, without scrolling the
+ transcript; "Show in conversation" then jumps to the defining message. Closing
+ an item (``~~[Q2]~~``) strikes its chips, the popover shows how it was closed,
+-and the pinned Open items panel lists only what is still open. Comments drafted
++and the header's Open items panel lists only what is still open. Comments drafted
+ on several items go out as one message and rebuild each item's thread.
+ """
+ 
+@@ -249,13 +249,16 @@ def test_item_comments_submit_together_and_thread_in_popover(
+     expect(popover).to_contain_text("I'll leave the cascade in place.")
+     page.keyboard.press("Escape")
+ 
+-    # Phone width: comment from the Open items panel; after a reload the tray
+-    # starts collapsed and its send button names the typed message.
++    # Phone width: comment from the Open items sheet, which the comment closes;
++    # after a reload the tray starts collapsed and its send button names the
++    # typed message.
+     page.set_viewport_size({"width": 390, "height": 844})
+     page.goto(f"{base_url}/c/{session_id}")
+     expect(page.locator(_ASSISTANT)).to_have_count(3, timeout=15_000)
++    page.get_by_test_id("session-items-trigger").click()
+     page.get_by_test_id("open-items").get_by_role("button", name="Show item Q3").first.click()
+     popover.get_by_role("button", name="Comment").click()
++    expect(page.get_by_test_id("session-items-panel")).to_have_count(0)
+     expect(comment_mode).to_be_in_viewport()
+     definition = comment_mode.get_by_role("region", name="Q3 text")
+     expect(definition).to_contain_text("Renaming touches 14 indexes")
+diff --git a/web/src/components/chat/SessionItemsButton.test.tsx b/web/src/components/chat/SessionItemsButton.test.tsx
+index 62ec0ceac4789abcb6f2f6e0b1f746a48b2f3452..1ca3f184ba95beefd365897422c6b165c3ac1192 100644
+--- a/web/src/components/chat/SessionItemsButton.test.tsx
++++ b/web/src/components/chat/SessionItemsButton.test.tsx
+@@ -1,5 +1,5 @@
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
++import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+ import { MemoryRouter } from "react-router-dom";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+@@ -16,6 +16,7 @@ import {
+   struckItemLabelsIn,
+   type ItemLabelSource,
+ } from "@/lib/itemLabels";
++import { requestItemComment } from "@/lib/itemCommentDrafts";
+ import { collectSessionLinks } from "@/lib/sessionLinks";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ import { SessionItemsHeaderSlot, useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
+@@ -170,6 +171,17 @@ describe("SessionItemsButton", () => {
+     expect(screen.queryByTestId("session-items-panel")).toBeNull();
+   });
+ 
++  it("closes when a comment on an item is started, on desktop and on a phone", () => {
++    for (const mobile of [false, true]) {
++      viewport.mobile = mobile;
++      renderButton([ITEMS, "Still need [Q2]."]);
++      openPanel();
++      act(() => requestItemComment("conv_1", { label: "Q2", title: "Soft-deleted rows." }));
++      expect(screen.queryByTestId("session-items-panel")).toBeNull();
++      cleanup();
++    }
++  });
++
+   it("opens as a dialog on a phone, with the same sections", () => {
+     viewport.mobile = true;
+     renderButton([ITEMS, "Looking.", PUBLISHED]);
+diff --git a/web/src/components/chat/SessionItemsButton.tsx b/web/src/components/chat/SessionItemsButton.tsx
+index 1ed34416e2909fd571af3aea4ead6a8ecd5b33bb..21c49824534977295b38c5e8b3908d4970ae6d55 100644
+--- a/web/src/components/chat/SessionItemsButton.tsx
++++ b/web/src/components/chat/SessionItemsButton.tsx
+@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import { useItemCommentRequest } from "@/lib/itemCommentDrafts";
+ import { ItemLabelIndexContext, ItemLabelSessionContext } from "@/lib/itemLabels";
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+ import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+@@ -105,6 +106,11 @@ export function SessionItemsButton({
+   useEffect(() => {
+     if (jumpTarget) setOpen(false);
+   }, [jumpTarget]);
++  // So does "Comment", which moves to the composer.
++  const commentRequest = useItemCommentRequest(useContext(ItemLabelSessionContext));
++  useEffect(() => {
++    if (commentRequest) setOpen(false);
++  }, [commentRequest]);
+   if (trackedItems(index).length === 0 && links.length === 0) return null;
+ 
+   const trigger = (
