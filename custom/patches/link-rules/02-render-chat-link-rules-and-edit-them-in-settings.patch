@@ -17,9 +17,15 @@ Settings group to edit them.
   re-parsed as http(s) before use.
 - Git references follow the session's repository, read from the git info
   the PR panel already fetches: the git rule for its host (or, unlisted, the
-  provider the server resolved) links #123, issue #123, PR #123 / MR #123 and
-  the provider's !123 with GitHub, GitLab or Azure DevOps URL shapes. Without
-  a repository a bare #123 stays text. The GitHub rule links owner/repo#123
+  provider the server resolved) links issue #123, PR #123 / MR #123 and the
+  provider's !123 with GitHub, GitLab or Azure DevOps URL shapes. A bare #123
+  is no rule's to link, since it could be any repository's: it stays with
+  the built-in pull request links, which link it only to a pull request the
+  session links. Those run first and park each reference on a link, so the
+  rules pass reads a parked reference as the text it was: PR #123 and
+  owner/repo#123 are the rules', a bare #123 a url rule matches is that
+  rule's, and a qualified reference no rule links is text, as it was while
+  the rules replaced the built-in links. The GitHub rule links owner/repo#123
   in every session; in a session on another host, a qualified reference under
   the session's top-level group, with more than two segments or with !, stays
   on that host. The runner's GitHub, GitLab and Azure DevOps resources report
@@ -46,8 +52,8 @@ feat/git-ref-notation; drop this copy once they merge.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/chat-link-rules.md                       |  82 ++
- feature-map/preferences.md                    |  20 +-
+ docs/chat-link-rules.md                       |  87 ++
+ feature-map/preferences.md                    |  22 +-
  omnigent/runner/git_providers/azure_devops.py |   9 +-
  omnigent/runner/git_providers/gitlab.py       |   9 +-
  omnigent/runner/github_resource.py            |   3 +
@@ -55,24 +61,24 @@ Signed-off-by: Desidero <desidero@gmail.com>
  tests/runner/test_github_resource.py          |  42 +-
  tests/runner/test_gitlab_provider.py          |   2 +
  tests/runner/test_pr_resource_azure_devops.py |  10 +-
- .../blocks/ChatMarkdown.linkRules.test.tsx    | 247 +++++
- web/src/components/blocks/ChatMarkdown.tsx    |  65 +-
+ .../blocks/ChatMarkdown.linkRules.test.tsx    | 346 +++++++
+ web/src/components/blocks/ChatMarkdown.tsx    |  76 +-
  .../components/chat/LinkRulesScope.test.ts    |  69 ++
  web/src/components/chat/LinkRulesScope.tsx    |  88 ++
  web/src/components/chat/Transcript.tsx        |   3 +-
  web/src/hooks/useLinkRules.ts                 |  14 +
  web/src/hooks/usePullRequests.ts              |   2 +
- web/src/lib/linkRules.test.ts                 | 418 +++++++++
- web/src/lib/linkRules.ts                      | 857 ++++++++++++++++++
+ web/src/lib/linkRules.test.ts                 | 489 +++++++++
+ web/src/lib/linkRules.ts                      | 934 ++++++++++++++++++
  web/src/lib/linkRulesApi.ts                   |  86 ++
  web/src/pages/SettingsPage.test.tsx           |   4 +
  web/src/pages/SettingsPage.tsx                |   2 +
  .../settings/LinkRulesSettingsGroup.test.tsx  | 180 ++++
- .../pages/settings/LinkRulesSettingsGroup.tsx | 436 +++++++++
- .../pages/settings/search/catalog/general.ts  |  52 ++
+ .../pages/settings/LinkRulesSettingsGroup.tsx | 437 ++++++++
+ .../pages/settings/search/catalog/general.ts  |  52 +
  .../search/settingsPageAudit.test.tsx         |  52 +-
  .../search/settingsUnownedBaseline.ts         |   8 +
- 26 files changed, 2756 insertions(+), 24 deletions(-)
+ 26 files changed, 3023 insertions(+), 23 deletions(-)
  create mode 100644 web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
  create mode 100644 web/src/components/chat/LinkRulesScope.test.ts
  create mode 100644 web/src/components/chat/LinkRulesScope.tsx
@@ -84,10 +90,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  create mode 100644 web/src/pages/settings/LinkRulesSettingsGroup.tsx
 
 diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
-index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..7cfd38670bd7669ed8c2d114dc5e1238711485ff 100644
+index 4a48f573ac8a3d1b9a8dc03c826347e490e76e7a..740c2e2c99b75f986d01e1c552b5fc9a2e2a4e53 100644
 --- a/docs/chat-link-rules.md
 +++ b/docs/chat-link-rules.md
-@@ -4,6 +4,88 @@ Link rules turn short references in chat messages, such as `BST-2135` or
+@@ -4,6 +4,93 @@ Link rules turn short references in chat messages, such as `BST-2135` or
  `PR #123`, into links. Each user has one list of rules, saved as a shared
  preference, so every session and device shows the same links.
  
@@ -113,10 +119,15 @@ index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..7cfd38670bd7669ed8c2d114dc5e1238
 +file links have been found, and never inside links, inline code, code blocks
 +or raw HTML. Where two rules match overlapping text, the match that starts
 +first wins, then the rule listed first. A link's tooltip names its rule.
-+While any rule is on, the rules also take the place of Omnigent's built-in
-+pull request links (`#1234` and `owner/repo#12` in github.com sessions), so
-+the `git` rules decide where those references go; with every rule off or
-+removed, the built-in links apply again.
++A bare `#1234` is not a rule's to link: it stays with Omnigent's built-in
++pull request links, which link it only to a pull request the session already
++links (one on its Pull Requests panel, when exactly one has that number) and
++never guess a repository for it. That is the same with the rules on or off. A
++`url` rule of your own that matches a bare `#1234` still links it. While any
++rule is on, the rules do take the place of the built-in `owner/repo#12` links
++(in github.com sessions), so the `git` rules decide where a qualified
++reference goes; with every rule off or removed, those built-in links apply
++again.
 +
 +- `url` and `git` links open in a new tab like any other web link.
 +- `git` references link as described in [Git references](#git-references).
@@ -139,17 +150,17 @@ index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..7cfd38670bd7669ed8c2d114dc5e1238
 +rule for that host, the first enabled rule for the provider the server
 +resolved does (so a GitHub Enterprise or self-managed GitLab host links with
 +nobody listing it, on its own host). A session with no repository, or one on
-+a host no rule or provider covers, leaves bare references as text: a bare
-+`#123` is never guessed onto a host. Projects carry no repository of their
-+own (only a default workspace path), so there is no project fallback.
++a host no rule or provider covers, leaves `issue #123`, `PR #123` and `!123`
++as text. Projects carry no repository of their own (only a default workspace
++path), so there is no project fallback.
 +
 +| In the session's rule | Links to |
 +| --- | --- |
-+| `#123` | GitHub: the pull request when the session knows one by that number, else `/issues/123` (GitHub redirects for pull requests). GitLab: `/-/issues/123`. Azure DevOps: work item 123 |
++| `#123` | Nothing from the rule, on any provider: a number alone could be any repository's. The built-in links take it to the pull request the session links with that number, if there is one |
 +| `issue #123`, `work item #123` | The issue (GitLab, GitHub) or work item (Azure DevOps) |
 +| `PR #123`, `pull #123`, `pull request #123`, `MR #123`, `merge request #123` | The pull or merge request |
 +| `!123` (GitLab, Azure DevOps only) | The merge or pull request |
-+| `owner/repo#123`, `group/sub/project!123` | That repository on the session's host (not on Azure DevOps, which has no notation for another repository) |
++| `owner/repo#123`, `group/sub/project!123` | That repository on the session's host (not on Azure DevOps, which has no notation for another repository). On GitHub, `owner/repo#123` is the pull request when it is the session's repository and the session knows one by that number, else `/issues/123`, which GitHub redirects for pull requests |
 +
 +**GitHub links qualified references everywhere.** GitHub is referenced often
 +even from private repositories elsewhere, so the first enabled GitHub rule
@@ -177,7 +188,7 @@ index 79e1f46c87dda0a1a96b02c0db4f4ecb88d268bd..7cfd38670bd7669ed8c2d114dc5e1238
  
  A rule has a `name` (unique, up to 64 characters), a `kind`, a `pattern`, a
 diff --git a/feature-map/preferences.md b/feature-map/preferences.md
-index b7b264b23736521bb04ff6ee44a6eac6c261deee..39266fe214310ac491b0698055d8d9a4fe9cb0f6 100644
+index b7b264b23736521bb04ff6ee44a6eac6c261deee..f70140c201d0c8c9f7fee0ad116b067b9ba723b3 100644
 --- a/feature-map/preferences.md
 +++ b/feature-map/preferences.md
 @@ -26,7 +26,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
@@ -190,7 +201,7 @@ index b7b264b23736521bb04ff6ee44a6eac6c261deee..39266fe214310ac491b0698055d8d9a4
  
  - `configuration-copy`: review, save, show and import model defaults, harness
    selection/arguments and launcher plugin opt-outs; preserve local-only values.
-@@ -78,6 +79,23 @@ git host checks, which `git` rule a session uses, reading and saving the old
+@@ -78,6 +79,25 @@ git host checks, which `git` rule a session uses, reading and saving the old
  stale versions, rejected rules, the old kind on input, a server without shared
  preferences).
  
@@ -198,8 +209,10 @@ index b7b264b23736521bb04ff6ee44a6eac6c261deee..39266fe214310ac491b0698055d8d9a4
 +edits, previews, saves and resets the rules, including **Add git host** for a
 +self-managed host; without shared preferences it shows the defaults
 +read-only. In a session, write `ABC-12` (after turning on and editing the Jira
-+example), `#12`, `PR #12`, `owner/repo#12` or `session:<id>` in a message and
-+check each renders as a link, while the same text in backticks stays code. In
++example), `issue #12`, `PR #12`, `owner/repo#12` or `session:<id>` in a message and
++check each renders as a link, while the same text in backticks stays code. A
++bare `#12` links only when the session's Pull Requests panel lists a pull
++request with that number, and then to that pull request. In
 +a session on a GitLab checkout, `!12` links to the merge request and
 +`facebook/react#1` to GitHub; in a session outside a repository only
 +`owner/repo#12` links. Component coverage:
@@ -444,10 +457,10 @@ index cfa3ecb3e0f76c280a633efffef4aa4b783aaf2b..8e442d6205425f672d42855a282f2f66
  
 diff --git a/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx b/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7dd6b35276
+index 0000000000000000000000000000000000000000..155e15ad43491873f59ef3f4534e6d17d524c429
 --- /dev/null
 +++ b/web/src/components/blocks/ChatMarkdown.linkRules.test.tsx
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,346 @@
 +// Link rules in chat markdown: references in plain text become links after
 +// item labels and file links have taken theirs, and text in links, code and
 +// code blocks is never rewritten.
@@ -456,6 +469,7 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 +import { MemoryRouter, useLocation } from "react-router-dom";
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import type { PullRequestInfo } from "@/hooks/usePullRequests";
 +import {
 +  ItemLabelIndexContext,
 +  ItemLabelMessageContext,
@@ -470,6 +484,7 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +  LinkRuleMatchersContext,
 +  type SessionGitRepository,
 +} from "@/lib/linkRules";
++import { FileViewerContext } from "@/shell/FileViewerContext";
 +import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 +
 +const JIRA: LinkRule = {
@@ -543,6 +558,7 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +  matchers: readonly LinkMatcher[],
 +  client: QueryClient,
 +  breaks = false,
++  linkPullRequestRefs = false,
 +) {
 +  return (
 +    <QueryClientProvider client={client}>
@@ -551,7 +567,10 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +          <ItemLabelIndexContext.Provider value={INDEX}>
 +            <ItemLabelMessageContext.Provider value="resp_2">
 +              <LinkRuleMatchersContext.Provider value={matchers}>
-+                <FilePathAwareMessageResponse breaks={breaks}>
++                <FilePathAwareMessageResponse
++                  breaks={breaks}
++                  linkPullRequestRefs={linkPullRequestRefs}
++                >
 +                  {markdown}
 +                </FilePathAwareMessageResponse>
 +              </LinkRuleMatchersContext.Provider>
@@ -626,8 +645,8 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +  });
 +
 +  it("links GitHub references on the session's repository host", async () => {
-+    renderMarkdown("Fixes #12.", [GITHUB_RULE]);
-+    expect((await screen.findByText("#12", { selector: "a" })).getAttribute("href")).toBe(
++    renderMarkdown("Fixes issue #12.", [GITHUB_RULE]);
++    expect((await screen.findByText("issue #12", { selector: "a" })).getAttribute("href")).toBe(
 +      "https://git.example.com/acme/app/issues/12",
 +    );
 +  });
@@ -635,7 +654,7 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +  it("links issue and pull request references except inside code", async () => {
 +    renderMarkdown(
 +      [
-+        "Reported in #12, fixed by PR #34 and backported in other/project#56.",
++        "Reported in issue #12, fixed by PR #34 and backported in other/project#56. Not #90.",
 +        "The span `#78` and the block below stay plain:",
 +        "",
 +        "```sh",
@@ -644,7 +663,11 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +      ].join("\n"),
 +      [GITHUB_RULE],
 +    );
-+    expect(linkFor("#12")?.getAttribute("href")).toBe("https://git.example.com/acme/app/issues/12");
++    expect((await screen.findByText("issue #12", { selector: "a" })).getAttribute("href")).toBe(
++      "https://git.example.com/acme/app/issues/12",
++    );
++    // A bare number is never guessed onto the session's repository.
++    expect(linkFor("#90")).toBe(null);
 +    expect((await screen.findByText("PR #34", { selector: "a" })).getAttribute("href")).toBe(
 +      "https://git.example.com/acme/app/pull/34",
 +    );
@@ -666,12 +689,12 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +
 +  it("re-renders a message when its rules arrive after it rendered", async () => {
 +    const client = new QueryClient();
-+    const view = render(markdownTree("Fixes #12.", [], client));
-+    await screen.findByText(/Fixes #12/);
-+    expect(linkFor("#12")).toBe(null);
-+    view.rerender(markdownTree("Fixes #12.", compileLinkRules([GITHUB_RULE], GITHUB), client));
-+    expect((await screen.findByText("#12", { selector: "a" })).getAttribute("href")).toBe(
-+      "https://git.example.com/acme/app/issues/12",
++    const view = render(markdownTree("Fixes PR #12.", [], client));
++    await screen.findByText(/Fixes PR #12/);
++    expect(linkFor("PR #12")).toBe(null);
++    view.rerender(markdownTree("Fixes PR #12.", compileLinkRules([GITHUB_RULE], GITHUB), client));
++    expect((await screen.findByText("PR #12", { selector: "a" })).getAttribute("href")).toBe(
++      "https://git.example.com/acme/app/pull/12",
 +    );
 +  });
 +
@@ -695,11 +718,100 @@ index 0000000000000000000000000000000000000000..7a622a0fe37435e05fb5b7150f158c7d
 +    expect(container.querySelector("a")).toBe(null);
 +  });
 +});
++
++// Where the built-in pull request links read the session's pull requests from.
++const FILE_VIEWER = {
++  openFile: () => {},
++  openGithubTab: () => {},
++  isChangedPath: () => false,
++  conversationId: "current",
++  workspaceRoot: "/home/u/ws",
++  workspaceHome: "/home/u",
++};
++
++describe("a bare #123 beside link rules", () => {
++  // The session links one pull request, acme/app#4242; its workspace is that repository.
++  const INFO: PullRequestInfo = {
++    object: "session.github.info",
++    available: true,
++    repo: { name_with_owner: "acme/app", host: "github.com" },
++    workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
++    prs: [
++      {
++        url: "https://github.com/acme/app/pull/4242",
++        host: "github.com",
++        repository: "acme/app",
++        number: 4242,
++        relationship: "attached",
++      },
++    ],
++  };
++  const ON_GITHUB: SessionGitRepository = {
++    provider: "github",
++    origin: "https://github.com",
++    repository: "acme/app",
++    pullNumbers: new Set([4242]),
++  };
++
++  function renderInSession(markdown: string, rules: LinkRule[]) {
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    client.setQueryData(["github-info", "current"], INFO);
++    render(
++      <FileViewerContext.Provider value={FILE_VIEWER}>
++        {markdownTree(markdown, compileLinkRules(rules, ON_GITHUB), client, false, true)}
++      </FileViewerContext.Provider>,
++    );
++  }
++  /** Each link's text and where it goes; pull request links wrap their text in a label. */
++  const links = () =>
++    Object.fromEntries(
++      screen
++        .getAllByRole("link")
++        .map((link) => [link.textContent?.trim() ?? "", link.getAttribute("href")]),
++    );
++
++  it("links only to a pull request the session links, and the rules keep their own forms", async () => {
++    renderInSession("Landed in #4242, unlike #9999; see PR #7, issue #8 and other/project#56.", [
++      GITHUB_RULE,
++    ]);
++    await screen.findByRole("link", { name: /PR #7/ });
++    // #9999 is not on the session repository's issue page: it could be any repository's.
++    expect(links()).toEqual({
++      "#4242": "https://github.com/acme/app/pull/4242",
++      "PR #7": "https://github.com/acme/app/pull/7",
++      "issue #8": "https://github.com/acme/app/issues/8",
++      "other/project#56": "https://github.com/other/project/issues/56",
++    });
++  });
++
++  it("goes to a rule of the user's that matches it", async () => {
++    const tickets: LinkRule = {
++      name: "Tickets",
++      kind: "url",
++      pattern: "#{num}",
++      url: "https://tickets.example.com/{num}",
++      enabled: true,
++    };
++    renderInSession("Landed in #4242.", [tickets, GITHUB_RULE]);
++    await screen.findByRole("link", { name: /#4242/ });
++    expect(links()).toEqual({ "#4242": "https://tickets.example.com/4242" });
++  });
++
++  it("leaves a qualified reference to the rules, which link it or not", async () => {
++    renderInSession("Landed in #4242, after other/project#56 and BST-1.", [JIRA]);
++    await screen.findByRole("link", { name: /BST-1/ });
++    expect(links()).toEqual({
++      "#4242": "https://github.com/acme/app/pull/4242",
++      "BST-1": "https://jira.example.com/browse/BST-1",
++    });
++    expect(screen.getByText(/after other\/project#56 and/)).toBeTruthy();
++  });
++});
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index 838cb13095ae2235008918db5103975275d06de4..fda9a124da0fb8555fbe6fd3095738f8b8a5b541 100644
+index 838cb13095ae2235008918db5103975275d06de4..749e9d37fd7db33d1bc32eae65a81ed557c97796 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
-@@ -71,6 +71,13 @@ import {
+@@ -71,6 +71,14 @@ import {
  } from "@/lib/itemLabels";
  import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
  import { relativeTime } from "@/lib/relativeTime";
@@ -709,15 +821,23 @@ index 838cb13095ae2235008918db5103975275d06de4..fda9a124da0fb8555fbe6fd3095738f8
 +  linkMatchersKey,
 +  parseSessionReference,
 +  remarkLinkRules,
++  type ParkedReference,
 +} from "@/lib/linkRules";
  import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
  import { cn } from "@/lib/utils";
  import { parseMentionPillTitle } from "@/lib/mentionPills";
-@@ -778,7 +785,34 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
+@@ -778,7 +786,41 @@ function ItemLabelChip({ label, children }: { label: string; children: React.Rea
    );
  }
  
 -/** Routes item-label links to {@link ItemLabelChip} and every other link to {@link WorkspaceFileLink}. */
++// A reference the built-in pull request links parked, as the link rules see it.
++const parkedPullRequestRef: ParkedReference = (url) => {
++  const reference = parsePullRequestRefHref(url);
++  if (reference === null) return null;
++  return reference.repo === null ? "bare" : "qualified";
++};
++
 +/**
 + * A `session:<id>` or `session:<id>/<message id>` reference: opens that session
 + * in the app, scrolled to the message. Only link-rule providers, which sit
@@ -749,7 +869,7 @@ index 838cb13095ae2235008918db5103975275d06de4..fda9a124da0fb8555fbe6fd3095738f8
  function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
    if (props.href?.startsWith(ITEM_LABEL_HREF_PREFIX)) {
      return (
-@@ -787,6 +821,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
+@@ -787,6 +829,9 @@ function ChatMarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a"
        </ItemLabelChip>
      );
    }
@@ -759,25 +879,24 @@ index 838cb13095ae2235008918db5103975275d06de4..fda9a124da0fb8555fbe6fd3095738f8
    return <MarkdownLink {...props} />;
  }
  
-@@ -1067,7 +1104,9 @@ function remarkHtmlAsText() {
+@@ -1067,7 +1112,11 @@ function remarkHtmlAsText() {
   * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
   * block rendering too, stripping `<pre>` and collapsing whitespace.
   *
 - * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`.
 + * Item labels (`[Q3]`) become {@link ItemLabelChip}s via `remarkItemLabels`;
 + * after them, the user's link rules (from {@link LinkRuleMatchersContext})
-+ * link the references left in plain text.
++ * link the references left in plain text. They also read what the built-in
++ * pull request links parked: `PR #12` and `owner/repo#12` are theirs, and a
++ * bare `#12` no rule matches stays with the built-in links.
   *
   * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
   * instead of collapsing to spaces per CommonMark. Used for user bubbles,
-@@ -1102,22 +1141,29 @@ export function FilePathAwareMessageResponse({
+@@ -1102,22 +1151,32 @@ export function FilePathAwareMessageResponse({
  }) {
    const components =
      leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
 +  const linkMatchers = useContext(LinkRuleMatchersContext);
-+  // The user's link rules own `#123` and `owner/repo#123` wherever they are active;
-+  // the built-in pull request links apply only without them.
-+  const builtInPullRequestRefs = linkPullRequestRefs && linkMatchers.length === 0;
  
    // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
    const remarkPlugins = useMemo(
@@ -785,14 +904,19 @@ index 838cb13095ae2235008918db5103975275d06de4..fda9a124da0fb8555fbe6fd3095738f8
        ...Object.values(defaultRemarkPlugins),
 -      // Before the leading command split: PR and label splitting rebuild text nodes,
 -      // which would drop its `kbd` tag, and their new nodes have no source position.
--      ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
 +      // Before the leading command split: PR, label and link-rule splitting rebuild text
 +      // nodes, which would drop its `kbd` tag, and their new nodes have no source position.
-+      ...(builtInPullRequestRefs ? [remarkPullRequestRefs] : []),
+       ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
        ...(literalHtml ? [remarkHtmlAsText] : []),
        remarkItemLabels,
 +      ...(linkMatchers.length > 0
-+        ? [[remarkLinkRules, linkMatchers] as [typeof remarkLinkRules, typeof linkMatchers]]
++        ? [
++            [remarkLinkRules, linkMatchers, parkedPullRequestRef] as [
++              typeof remarkLinkRules,
++              typeof linkMatchers,
++              ParkedReference,
++            ],
++          ]
 +        : []),
        ...(leadingCommand !== undefined
          ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
@@ -800,11 +924,11 @@ index 838cb13095ae2235008918db5103975275d06de4..fda9a124da0fb8555fbe6fd3095738f8
        ...(breaks ? [remarkBreaks] : []),
      ],
 -    [breaks, literalHtml, linkPullRequestRefs, leadingCommand],
-+    [breaks, literalHtml, builtInPullRequestRefs, linkMatchers, leadingCommand],
++    [breaks, literalHtml, linkPullRequestRefs, linkMatchers, leadingCommand],
    );
  
    // Throttle the markdown so the live (still-growing) bubble re-parses a few
-@@ -1148,9 +1194,10 @@ export function FilePathAwareMessageResponse({
+@@ -1148,9 +1207,10 @@ export function FilePathAwareMessageResponse({
  
    return (
      <MessageResponse
@@ -1043,10 +1167,10 @@ index a17d35bc6aa07c821611a6e7205539b52f31dfe2..26bf64a6e65b534c89baacb623bc7e76
  /** A `gh`-configured account — one option in the panel's account selector. */
 diff --git a/web/src/lib/linkRules.test.ts b/web/src/lib/linkRules.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3efd24fbd
+index 0000000000000000000000000000000000000000..0102e0dcc3efd32c0e4513147ce4a8aaeb06bdb6
 --- /dev/null
 +++ b/web/src/lib/linkRules.test.ts
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,489 @@
 +import { describe, expect, it } from "vitest";
 +import {
 +  checkGitHost,
@@ -1059,6 +1183,7 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +  type LinkRule,
 +  linkRuleError,
 +  linkRuleErrors,
++  type ParkedReference,
 +  parseSessionReference,
 +  remarkLinkRules,
 +  type SessionGitRepository,
@@ -1257,10 +1382,19 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +    ]);
 +  });
 +
-+  it("sends a bare GitHub number to a known pull request, else the issue page", () => {
-+    expect(links("Fixes #12, see #7 and other/lib#3. a#4", GIT_DEFAULTS, GITHUB_SESSION)).toEqual([
-+      { text: "#12", href: "https://github.com/acme/app/issues/12" },
-+      { text: "#7", href: "https://github.com/acme/app/pull/7" },
++  it("never links a bare number, on any provider", () => {
++    const azure = repo("azure_devops", "https://dev.azure.com", "org/project/repo");
++    for (const session of [GITHUB_SESSION, GITLAB_SESSION, azure, null]) {
++      expect(links("Fixes #12, see #7. a#4", GIT_DEFAULTS, session)).toEqual([]);
++    }
++  });
++
++  it("sends a qualified GitHub number to a known pull request, else the issue page", () => {
++    expect(
++      links("See acme/app#12, acme/app#7 and other/lib#3.", GIT_DEFAULTS, GITHUB_SESSION),
++    ).toEqual([
++      { text: "acme/app#12", href: "https://github.com/acme/app/issues/12" },
++      { text: "acme/app#7", href: "https://github.com/acme/app/pull/7" },
 +      { text: "other/lib#3", href: "https://github.com/other/lib/issues/3" },
 +    ]);
 +  });
@@ -1288,20 +1422,23 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +      { text: "MR #5", href: "https://gitlab.com/acme/backend/api/-/merge_requests/5" },
 +      { text: "acme/web!6", href: "https://gitlab.com/acme/web/-/merge_requests/6" },
 +      { text: "acme/frontend/web#7", href: "https://gitlab.com/acme/frontend/web/-/issues/7" },
-+      { text: "#8", href: "https://gitlab.com/acme/backend/api/-/issues/8" },
 +    ]);
 +  });
 +
 +  it("recognises `!` only where the session's provider writes requests that way", () => {
-+    expect(links("Merged !5 and #6.", GIT_DEFAULTS, GITHUB_SESSION).map((l) => l.text)).toEqual([
-+      "#6",
++    expect(links("Merged !5 and PR #6.", GIT_DEFAULTS, GITHUB_SESSION).map((l) => l.text)).toEqual([
++      "PR #6",
++    ]);
++    expect(links("Merged !5 and PR #6.", GIT_DEFAULTS, GITLAB_SESSION).map((l) => l.text)).toEqual([
++      "!5",
++      "PR #6",
 +    ]);
 +  });
 +
 +  it("maps an Azure DevOps session to work items and pull requests", () => {
 +    const azure = repo("azure_devops", "https://dev.azure.com", "org/project/repo");
-+    expect(links("#8, PR #9, !10 and org/other#2", GIT_DEFAULTS, azure)).toEqual([
-+      { text: "#8", href: "https://dev.azure.com/org/project/_workitems/edit/8" },
++    expect(links("work item #8, PR #9, !10 and org/other#2", GIT_DEFAULTS, azure)).toEqual([
++      { text: "work item #8", href: "https://dev.azure.com/org/project/_workitems/edit/8" },
 +      { text: "PR #9", href: "https://dev.azure.com/org/project/_git/repo/pullrequest/9" },
 +      { text: "!10", href: "https://dev.azure.com/org/project/_git/repo/pullrequest/10" },
 +    ]);
@@ -1310,20 +1447,20 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +  it("uses a listed self-hosted host, and its provider's URL shapes", () => {
 +    const ours = gitRule("Our GitLab", "gitlab", "git.example.com");
 +    const session = repo(null, "https://git.example.com", "team/app");
-+    expect(links("#3 and !4", [...GIT_DEFAULTS, ours], session)).toEqual([
-+      { text: "#3", href: "https://git.example.com/team/app/-/issues/3" },
++    expect(links("issue #3 and !4", [...GIT_DEFAULTS, ours], session)).toEqual([
++      { text: "issue #3", href: "https://git.example.com/team/app/-/issues/3" },
 +      { text: "!4", href: "https://git.example.com/team/app/-/merge_requests/4" },
 +    ]);
 +    // Unlisted, and no provider claims it: only GitHub's qualified form links.
-+    expect(links("#3 and acme/web#4", GIT_DEFAULTS, session)).toEqual([
++    expect(links("issue #3 and acme/web#4", GIT_DEFAULTS, session)).toEqual([
 +      { text: "acme/web#4", href: "https://github.com/acme/web/issues/4" },
 +    ]);
 +  });
 +
 +  it("links a GitHub Enterprise session through the GitHub rule on its own host", () => {
 +    const enterprise = repo("github", "https://ghe.example.com", "acme/app");
-+    expect(links("#3, acme/lib#4 and torvalds/linux#5", GIT_DEFAULTS, enterprise)).toEqual([
-+      { text: "#3", href: "https://ghe.example.com/acme/app/issues/3" },
++    expect(links("issue #3, acme/lib#4 and torvalds/linux#5", GIT_DEFAULTS, enterprise)).toEqual([
++      { text: "issue #3", href: "https://ghe.example.com/acme/app/issues/3" },
 +      { text: "acme/lib#4", href: "https://ghe.example.com/acme/lib/issues/4" },
 +      { text: "torvalds/linux#5", href: "https://github.com/torvalds/linux/issues/5" },
 +    ]);
@@ -1356,7 +1493,7 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +
 +  it("turns a session's host off with its disabled rule", () => {
 +    const rules = [GITHUB_RULE, { ...GITLAB_RULE, enabled: false }];
-+    expect(links("#3 and facebook/react#4", rules, GITLAB_SESSION)).toEqual([
++    expect(links("issue #3 and facebook/react#4", rules, GITLAB_SESSION)).toEqual([
 +      { text: "facebook/react#4", href: "https://github.com/facebook/react/issues/4" },
 +    ]);
 +  });
@@ -1423,14 +1560,7 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +    };
 +    remarkLinkRules(compileLinkRules(GIT_DEFAULTS, GITHUB_SESSION))(tree);
 +    expect(tree.children[0].children).toEqual([
-+      { type: "text", value: "Fixed " },
-+      {
-+        type: "link",
-+        url: "https://github.com/acme/app/issues/1",
-+        title: "GitHub",
-+        children: [{ type: "text", value: "#1" }],
-+      },
-+      { type: "text", value: " in " },
++      { type: "text", value: "Fixed #1 in " },
 +      { type: "inlineCode", value: "#2" },
 +      { type: "text", value: " (" },
 +      {
@@ -1443,6 +1573,71 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +      { type: "link", url: "https://x.test", children: [{ type: "text", value: "#4" }] },
 +    ]);
 +    expect(tree.children[1]).toEqual({ type: "code", value: "#5" });
++  });
++
++  // What the built-in pull request links leave behind: each reference parked on a link.
++  const parkedLink = (text: string) => ({
++    type: "link",
++    url: `parked:${text}`,
++    children: [{ type: "text", value: text }],
++  });
++  const parked: ParkedReference = (url) =>
++    url?.startsWith("parked:") ? (url.includes("/") ? "qualified" : "bare") : null;
++  const ruleLink = (text: string, url: string, title = "GitHub") => ({
++    type: "link",
++    url,
++    title,
++    children: [{ type: "text", value: text }],
++  });
++
++  type Node = Parameters<ReturnType<typeof remarkLinkRules>>[0];
++
++  function linked(children: Node[], rules: LinkRule[], session = GITHUB_SESSION) {
++    const tree = { type: "root", children: [{ type: "paragraph", children }] };
++    remarkLinkRules(compileLinkRules(rules, session), parked)(tree);
++    return tree.children[0].children;
++  }
++
++  it("takes the references its rules name from the built-in links and leaves it a bare number", () => {
++    expect(
++      linked(
++        [
++          { type: "text", value: "Landed in " },
++          parkedLink("#12"),
++          { type: "text", value: ", after PR " },
++          parkedLink("#34"),
++          { type: "text", value: " and " },
++          parkedLink("other/lib#56"),
++          { type: "text", value: "." },
++        ],
++        GIT_DEFAULTS,
++      ),
++    ).toEqual([
++      { type: "text", value: "Landed in " },
++      parkedLink("#12"),
++      { type: "text", value: ", after " },
++      ruleLink("PR #34", "https://github.com/acme/app/pull/34"),
++      { type: "text", value: " and " },
++      ruleLink("other/lib#56", "https://github.com/other/lib/issues/56"),
++      { type: "text", value: "." },
++    ]);
++  });
++
++  it("gives a bare number to a rule that matches it", () => {
++    const tickets = urlRule("#{num}", "https://tickets.example.com/{num}", "Tickets");
++    expect(linked([parkedLink("#12")], [tickets, ...GIT_DEFAULTS])).toEqual([
++      ruleLink("#12", "https://tickets.example.com/12", "Tickets"),
++    ]);
++  });
++
++  it("leaves a qualified reference no rule links as text", () => {
++    const jira = urlRule("BST-{num}", "https://jira.example.com/browse/BST-{num}", "Jira");
++    expect(
++      linked(
++        [{ type: "text", value: "See " }, parkedLink("other/lib#56"), parkedLink("#7")],
++        [jira],
++      ),
++    ).toEqual([{ type: "text", value: "See other/lib#56" }, parkedLink("#7")]);
 +  });
 +});
 +
@@ -1467,10 +1662,10 @@ index 0000000000000000000000000000000000000000..3da070614060ca147f50720c0243c9e3
 +});
 diff --git a/web/src/lib/linkRules.ts b/web/src/lib/linkRules.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c047839eff
+index 0000000000000000000000000000000000000000..cb56786a728cac0be6a957b8545309cc41363a11
 --- /dev/null
 +++ b/web/src/lib/linkRules.ts
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,934 @@
 +// Chat link rules: short references such as `BST-2135`, `PR #123` or
 +// `session:<id>` that chat messages render as links. The server validates a
 +// rule when it is saved (omnigent/link_rules.py); this module checks it again
@@ -1478,8 +1673,10 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +// the result on every message. See docs/chat-link-rules.md.
 +//
 +// `git` rules list git hosts. The session's repository picks the one that
-+// links bare `#123`, `issue #123`, `PR #123` and the provider's `!123`; the
-+// GitHub rule links `owner/repo#123` in every session.
++// links `issue #123`, `PR #123` and the provider's `!123`; the GitHub rule
++// links `owner/repo#123` in every session. A bare `#123` is not a rule's to
++// link: it stays with the built-in pull request links, which link it only to
++// a pull request the session links.
 +//
 +// Compiled regexes avoid lookbehind and named groups, which older Safari can't
 +// parse: a match's leading boundary is consumed as group 1 instead.
@@ -1893,7 +2090,7 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +  origin: string;
 +  /** The repository path, e.g. `owner/repo`, `group/sub/project` or `org/project/repo`. */
 +  repository: string;
-+  /** Pull request numbers known on `repository`; GitHub's bare `#N` links those to the PR. */
++  /** Pull request numbers known on `repository`; GitHub's `owner/repo#N` links those to the PR. */
 +  pullNumbers: ReadonlySet<number>;
 +}
 +
@@ -1902,7 +2099,8 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +}
 +
 +/**
-+ * The `git` rule that owns a session's bare references: the rule for the
++ * The `git` rule that owns a session's unqualified references (`issue #123`,
++ * `PR #123`, `!123`): the rule for the
 + * repository's host (a disabled one turns linking off), else the first
 + * enabled rule for the provider the server resolved. Mirrors
 + * `session_git_rule` in omnigent/link_rules.py.
@@ -1955,7 +2153,7 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +const REQUEST_WORDS = ["pull request", "merge request", "pull", "pr", "mr"];
 +const ISSUE_WORDS = ["work item", "issue"];
 +
-+/** What a git reference says it is: `issue #1`, `PR #1` / `!1`, or a bare `#1`. */
++/** What a git reference says it is: `issue #1`, `PR #1` / `!1`, or just `#1` (`owner/repo#1`). */
 +export type GitReferenceKind = "issue" | "request" | "unspecified";
 +
 +/** Where one compiled git rule links: a repository on a host, with its provider's URL shapes. */
@@ -1996,9 +2194,10 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +
 +/**
 + * The page a reference names on `target`'s provider, or null when the
-+ * provider has no page for it. A bare GitHub `#N` goes to the pull request when
-+ * the session knows one by that number, else to the issue page, which GitHub
-+ * redirects for pull requests.
++ * provider has no page for it. A GitHub `owner/repo#N` with no kind word goes
++ * to the pull request when it is the session's repository and the session
++ * knows one by that number, else to the issue page, which GitHub redirects for
++ * pull requests.
 + */
 +export function gitReferenceUrl(
 +  target: GitLinkTarget,
@@ -2067,11 +2266,10 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +    href: (match) => {
 +      const repository = match[3] ?? null;
 +      if (!accepts(repository, match[4])) return null;
-+      return gitReferenceUrl(target, {
-+        kind: gitReferenceKind(match[2], match[4]),
-+        number: Number(match[5]),
-+        repository,
-+      });
++      const kind = gitReferenceKind(match[2], match[4]);
++      // A bare `#123` could be any repository's, so no rule guesses where it goes.
++      if (kind === "unspecified" && repository === null) return null;
++      return gitReferenceUrl(target, { kind, number: Number(match[5]), repository });
 +    },
 +  };
 +}
@@ -2086,8 +2284,8 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +
 +/**
 + * Matchers for the `git` rules, at their rules' places in the list: the
-+ * session's rule links bare references and its own qualified ones, and the
-+ * GitHub rule links every other `owner/repo#123`.
++ * session's rule links `issue #123`, `PR #123`, `!123` and its own qualified
++ * references, and the GitHub rule links every other `owner/repo#123`.
 + */
 +function gitMatchers(
 +  rules: readonly LinkRule[],
@@ -2158,7 +2356,7 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 + *
 + * @param rules - The user's rules, in priority order.
 + * @param session - The session's repository, or `null` when it has none:
-+ *   then only GitHub's `owner/repo#123` links, and bare `#123` stays text.
++ *   then only GitHub's `owner/repo#123` links.
 + */
 +export function compileLinkRules(
 +  rules: readonly LinkRule[],
@@ -2296,22 +2494,96 @@ index 0000000000000000000000000000000000000000..813d6df593e4b237f0b1614fd9c1c3c0
 +  return parts;
 +}
 +
-+function linkify(node: MdastNode, matchers: readonly LinkMatcher[]): void {
++/**
++ * What a link node is to the built-in pull request links, which run before the
++ * rules and park each reference they find on a link: `bare` for a parked
++ * `#123`, `qualified` for a parked `owner/repo#123`, `null` for any other link.
++ */
++export type ParkedReference = (url: string | undefined) => "bare" | "qualified" | null;
++
++/**
++ * Split a run of text and parked references. The rules read the run as the text
++ * it was, so `PR #123` and `owner/repo#123` are theirs to link; a bare `#123`
++ * no rule matched stays parked for the built-in links, and a qualified
++ * reference no rule matched is text.
++ */
++function splitRun(
++  run: MdastNode[],
++  matchers: readonly LinkMatcher[],
++  parked: ParkedReference,
++): MdastNode[] {
++  if (run.length === 1 && run[0].type === "text") return splitText(run[0], matchers);
++  let text = "";
++  const references: { start: number; end: number; node: MdastNode }[] = [];
++  for (const node of run) {
++    const value = node.type === "text" ? (node.value ?? "") : (node.children?.[0]?.value ?? "");
++    if (node.type !== "text") {
++      references.push({ start: text.length, end: text.length + value.length, node });
++    }
++    text += value;
++  }
++  const parts: MdastNode[] = [];
++  let last = 0;
++  const pushText = (to: number) => {
++    if (to > last) parts.push({ type: "text", value: text.slice(last, to) });
++    last = to;
++  };
++  const pushUnmatched = (to: number) => {
++    for (const reference of references) {
++      if (reference.start < last || reference.end > to) continue;
++      if (parked(reference.node.url) !== "bare") continue;
++      pushText(reference.start);
++      parts.push(reference.node);
++      last = reference.end;
++    }
++    pushText(to);
++  };
++  for (const span of findLinks(text, matchers)) {
++    pushUnmatched(span.start);
++    parts.push({
++      type: "link",
++      url: span.href,
++      title: span.name,
++      children: [{ type: "text", value: text.slice(span.start, span.end) }],
++    });
++    last = span.end;
++  }
++  pushUnmatched(text.length);
++  return parts;
++}
++
++function linkify(node: MdastNode, matchers: readonly LinkMatcher[], parked: ParkedReference): void {
 +  if (!node.children || SKIPPED_PARENTS.has(node.type)) return;
-+  node.children = node.children.flatMap((child) => {
-+    if (child.type === "text") return splitText(child, matchers);
-+    linkify(child, matchers);
-+    return [child];
-+  });
++  const children: MdastNode[] = [];
++  let run: MdastNode[] = [];
++  const endRun = () => {
++    if (run.length > 0) children.push(...splitRun(run, matchers, parked));
++    run = [];
++  };
++  for (const child of node.children) {
++    if (child.type === "text" || (child.type === "link" && parked(child.url) !== null)) {
++      run.push(child);
++      continue;
++    }
++    endRun();
++    linkify(child, matchers, parked);
++    children.push(child);
++  }
++  endRun();
++  node.children = children;
 +}
 +
 +/**
 + * Remark plugin applying link rules to text. It runs after item labels have
-+ * become links, and never touches links, code or raw HTML.
++ * become links, and never touches links, code or raw HTML, except the
++ * references the built-in pull request links parked (`parked` says which).
 + */
-+export function remarkLinkRules(matchers: readonly LinkMatcher[]) {
++export function remarkLinkRules(
++  matchers: readonly LinkMatcher[],
++  parked: ParkedReference = () => null,
++) {
 +  return (tree: MdastNode) => {
-+    if (matchers.length > 0) linkify(tree, matchers);
++    if (matchers.length > 0) linkify(tree, matchers, parked);
 +  };
 +}
 +
@@ -2643,10 +2915,10 @@ index 0000000000000000000000000000000000000000..34ffaa7964822fa54fa2e21e12c725f0
 +});
 diff --git a/web/src/pages/settings/LinkRulesSettingsGroup.tsx b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..21fba8aaf59ed1ee1f7f77c96217b3aa7cbd631b
+index 0000000000000000000000000000000000000000..542680b26d85e9e10917a2a9645a571476a4a541
 --- /dev/null
 +++ b/web/src/pages/settings/LinkRulesSettingsGroup.tsx
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,437 @@
 +import { useQueryClient } from "@tanstack/react-query";
 +import { useMemo, useState } from "react";
 +import ReactMarkdown, { type Components } from "react-markdown";
@@ -2920,8 +3192,9 @@ index 0000000000000000000000000000000000000000..21fba8aaf59ed1ee1f7f77c96217b3aa
 +            </SettingsContent>
 +          </div>
 +          <p className="mt-1 text-xs text-muted-foreground">
-+            The preview has no session, so only GitHub&rsquo;s owner/repo#123 links here. Bare #123,
-+            PR #123 and !123 link in a session whose repository is on a listed git host.
++            The preview has no session, so only GitHub&rsquo;s owner/repo#123 links here. PR #123,
++            issue #123 and !123 link in a session whose repository is on a listed git host. A bare
++            #123 links only to a pull request the session links.
 +          </p>
 +        </div>
 +      </SettingsItem>

@@ -1,17 +1,18 @@
 # link-rules
 
 Needs: chat-item-labels
-Covers: 898e2eaa1d6f5aa9
+Covers: 42090a4e68f7522f
 
 Short references in chat messages (`BST-2135`, `PR #123`, `!123`,
 `owner/repo#123`, `session:<id>`) render as links, from rules each user sets in
 Settings and agents can change with approval. Git hosts are stored as `git`
 rules (GitHub, GitLab, Azure DevOps, plus self-hosted ones); the session's
-repository picks the one that links bare `#123`, and GitHub links
-`owner/repo#123` in every session. In a git checkout, agents are asked to say
-`issue #123` or `PR #123`. While any rule is on, the rules take the place of
-upstream's built-in pull request links (`#1234`, `owner/repo#12` in github.com
-sessions).
+repository picks the one that links `issue #123`, `PR #123` and `!123`, and
+GitHub links `owner/repo#123` in every session. In a git checkout, agents are
+asked to say `issue #123` or `PR #123`. A bare `#123` is left to upstream's
+built-in pull request links, which link it only to a pull request the session
+already links; while any rule is on, the rules take the place of the built-in
+`owner/repo#12` links.
 
 - **Turn on:** GitHub, GitLab, Azure DevOps and session references are on by
   default. Edit, add (**Add git host** for GitHub Enterprise or a self-managed
@@ -34,7 +35,8 @@ sessions).
 - Rules are one per-user shared preference (`link_rules`): the defaults apply until a list is saved, `GET /v1/link-rules` always answers, and on a server without shared preferences the defaults are read-only (`PUT` is 409). A stale `expected_version` is refused with 409 and stores no conflict, so a save from Settings or `sys_link_rules` never overwrites a newer list; `null` restores the defaults.
 - The server validates every rule on both write paths (`PUT /v1/link-rules` and the shared-preference operation) and answers 422 with the rule and field at fault: a raw regex stays in the subset Python and every supported browser parse alike, a `url` template has a fixed http(s) scheme and host before any placeholder, a `git` host is a bare host name. The web client runs the same checks again when it compiles a rule.
 - A saved rule of the old `github` kind reads as the GitHub `git` rule and is stored in the new form on the next write; `{"kind": "github"}` is accepted on input until 0.22.0.
-- In the chat, rules link agent and user messages after item labels and file links, never inside links, inline code, code blocks or raw HTML, with every capture percent-encoded. A bare `#123` links only through the `git` rule of the session's repository host and stays text in a session without a repository; `owner/repo#123` links to GitHub in every session while the GitHub rule is on.
+- In the chat, rules link agent and user messages after item labels and file links, never inside links, inline code, code blocks or raw HTML, with every capture percent-encoded. `issue #123`, `PR #123` and the provider's `!123` link only through the `git` rule of the session's repository host; `owner/repo#123` links to GitHub in every session while the GitHub rule is on.
+- No `git` rule links a bare `#123`, on any provider, and none guesses a repository for it: with rules on or off it follows upstream's built-in links, to the one pull request the session links with that number, else text. A `url` rule that matches a bare `#123` still links it, and a qualified reference no rule links stays text while any rule is on.
 - Every `sys_link_rules` `add`, `update` and `remove` waits for the user's approval even when no other policy applies (`__ask_on_link_rule_change`); `list` is not gated, and `tool_groups.link_rules: false` removes the tool.
 - Agents are told each enabled rule's syntax in one framework instruction, with the `issue #123` / `PR #123` sentence only when the workspace is a git checkout and no instruction when every rule is off. SDK harnesses get it per turn; native Claude and Codex get it at launch only.
 
