@@ -16,11 +16,13 @@ import {
 import {
   countOpenRows,
   fetchStoredOpenItems,
+  importChatItems,
   openItemRows,
   openItemsKey,
   refreshStoredOpenItems,
   updateStoredOpenItems,
   withWrittenItems,
+  type ChatItemImport,
   type OpenItemUpdate,
   type StoredOpenItem,
 } from "@/lib/openItems";
@@ -88,6 +90,30 @@ export function useUpdateStoredOpenItems(sessionId: string | null) {
       }
     },
     onError: (error) => showToast(`Couldn't change the item: ${error.message}`),
+  });
+}
+
+/** Store the chat's own labels under their labels; says how it went in a toast. */
+export function useImportChatItems(sessionId: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (items: ChatItemImport[]) => {
+      if (!sessionId) throw new Error("No session selected");
+      return importChatItems(sessionId, items);
+    },
+    onSuccess: (results) => {
+      if (!sessionId) return;
+      queryClient.setQueryData<StoredOpenItem[]>(openItemsKey(sessionId), (items) =>
+        withWrittenItems(items, results),
+      );
+      const imported = results.filter((result) => "item" in result).length;
+      const refused = results.length - imported;
+      showToast(
+        `Imported ${imported} item${imported === 1 ? "" : "s"} from the chat` +
+          (refused > 0 ? `; ${refused} already stored or refused` : ""),
+      );
+    },
+    onError: (error) => showToast(`Couldn't import the chat's items: ${error.message}`),
   });
 }
 

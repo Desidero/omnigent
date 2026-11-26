@@ -1700,6 +1700,23 @@ kept, fewer if they would not fit); an open item becomes `answered`. A reply
 whose `ref` the item already holds is not added again, so a retried request
 writes nothing new.
 
+```
+POST /v1/sessions/{session_id}/open-items/import
+
+{"items": [{"kind": "question", "title": "Cache rows?", "detail": "...", "label": "Q7"},
+           {"kind": "risk", "title": "Flaky", "label": "R2", "resolution": "Fixed the test"}],
+ "idempotency_key": "import:2b1c9f"}
+
+200 OK — {"items": [{"item": {...}, "duplicate": false} | {"error": {"code", "message"}}]}
+```
+
+Edit access. Stores items written in the chat under their own labels, such as
+the labels of a session older than the store, so the list holds them and the
+session's counters move past them. Items are shaped as for a raise, each with
+its `label`; `resolution` stores an item closed (by a person), for one the
+chat closed. A label already stored gets `label_taken`; a retry with the same
+`idempotency_key` returns the items its first attempt stored.
+
 Each write publishes `session.open_items.changed` on the session's stream.
 Deleting a session deletes its items; a fork starts with none.
 

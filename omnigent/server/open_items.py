@@ -18,6 +18,9 @@ Routes, under ``/v1``:
   runner as above, or from a person with edit access.
 * ``POST /sessions/{session_id}/open-items/replies`` records a person's replies,
   such as their comments on items (edit access); an open item becomes answered.
+* ``POST /sessions/{session_id}/open-items/import`` stores items written in the
+  chat under their own labels (edit access), so chat labels written before the
+  store, or by an agent without the tools, join the list and are never reused.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from omnigent.entities.open_items import (
     UPDATE_BATCH_MAX,
     OpenItemError,
     OpenItemFilter,
+    format_label,
     item_to_json,
     normalize_change,
     normalize_new_item,
@@ -121,6 +125,17 @@ class OpenItemsReplyRequest(BaseModel):
     replies: list[OpenItemReply] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
     # Names the write, e.g. "comment:<id>", so a retry records each reply once.
     ref: str | None = Field(default=None, max_length=IDEMPOTENCY_KEY_MAX_CHARS)
+
+
+class OpenItemsImportRequest(BaseModel):
+    """Chat items a person stores under their chat labels.
+
+    Each item is shaped as for a raise and must carry its ``label``; an
+    optional ``resolution`` stores it closed, for an item the chat closed.
+    """
+
+    items: list[dict[str, Any]] = Field(min_length=1, max_length=RAISE_BATCH_MAX)
+    idempotency_key: str = Field(min_length=1, max_length=BATCH_KEY_MAX_CHARS)
 
 
 def _require_store(conversation_store: ConversationStore) -> OpenItemsStore:
@@ -335,6 +350,67 @@ def create_open_items_router(
             "open_count": sum(item.status != "closed" for item in everything),
             "topics": sorted({t for item in everything if (t := item.content.get("topic"))}),
         }
+
+    @router.post("/sessions/{session_id}/open-items/import")
+    async def import_open_items(
+        request: Request, session_id: str, body: OpenItemsImportRequest
+    ) -> dict[str, Any]:
+        """Store chat items under their own labels; needs edit access."""
+        session = await _session(request, session_id, LEVEL_EDIT)
+        store = _require_store(conversation_store)
+        user_id = get_user_id(request, auth_provider)
+        with _item_errors():
+            items, closes = [], []
+            for raw in body.items:
+                fields = dict(raw)
+                resolution = fields.pop("resolution", None)
+                item = normalize_new_item(fields)
+                if item.number is None:
+                    raise OpenItemError("invalid_input", "an imported item needs its chat label")
+                label = format_label(item.kind, item.number)
+                items.append(item)
+                closes.append(
+                    None
+                    if resolution is None
+                    else normalize_change(
+                        {"label": label, "status": "closed", "resolution": resolution}
+                    )
+                )
+            owner = await asyncio.to_thread(_owner, session, user_id)
+            raised = await asyncio.to_thread(
+                lambda: store.raise_items(
+                    session.id,
+                    items,
+                    idempotency_key=body.idempotency_key,
+                    root_conversation_id=session.root_conversation_id or session.id,
+                    user_id=owner,
+                )
+            )
+            # Close what the chat closed, unless a retry finds it already settled.
+            to_close = [
+                change
+                for change, result in zip(closes, raised, strict=True)
+                if change is not None
+                and result.item is not None
+                and result.item.status != "closed"
+            ]
+            closed = (
+                await asyncio.to_thread(
+                    lambda: store.change_items(session.id, to_close, actor="user")
+                )
+                if to_close
+                else []
+            )
+        after_close = {result.label: result.item for result in closed if result.item is not None}
+        rows: list[dict[str, Any]] = []
+        for result in raised:
+            if result.item is None:
+                rows.append({"error": _error_json(result.error)})  # type: ignore[arg-type]
+                continue
+            item = after_close.get(result.item.label, result.item)
+            rows.append({"item": item_to_json(item), "duplicate": result.duplicate})
+        await _publish(store, session.id, [row["item"]["label"] for row in rows if "item" in row])
+        return {"items": rows}
 
     @router.patch("/sessions/{session_id}/open-items")
     async def update_open_items(
