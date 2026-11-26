@@ -5,15 +5,13 @@ Closes #TODO (issue to be opened)
 
 ## Summary
 
-Depends on: subscription-accounts (stacked; would be rebased or split for upstream).
-
 After an agent opens a pull request, someone still has to keep an eye on it and tell the agent when CI fails or a reviewer comments. This adds an opt-in watcher that does that: it checks the session's PRs in the background and wakes the agent when there is something to fix, until the PR is green. It is behind the default-off `pr_watch` feature flag and works with any harness.
 
 - **Composer control.** A "Watch PRs" chip in the composer bar, next to the PR link, opens a popover with "All PRs in this session" (every PR it tracks now and any it opens later) and one box per open PR with its title, CI state and wake-ups used. Unchecking one PR while All is on keeps the rest. The chip reads "Watching N PRs" while active. The Pull Requests panel gains a "Watch until green" switch bound to the same state.
-- **Poller.** `omnigent/server/pr_watch.py` runs one poller per server. It reads each watched PR through the same path as the Pull Requests panel (runner, else host, running the provider CLI with the host's account), so it adds no credentials. It reports failed checks on the head commit, comments and reviews from other accounts, and merge conflicts, each once, coalesced across PRs into one `[System: PR watch ...]` message sent through the normal message path (so input policies apply to it, as to a typed message), only while the session is idle. In All mode it enrols PRs as the session's tracked list grows, skipping merged and closed ones.
+- **Poller.** `omnigent/server/pr_watch.py` runs one poller per server. It takes the session's PRs from the server's stored list, asks the listed-session refresher for a read while All is on or the list is not imported yet, and reads each watched PR through the same path as the Pull Requests panel (runner, else host, running the provider CLI with the host's account, sharing a read with an open panel), so it adds no credentials. It reports failed checks on the head commit, comments and reviews from other accounts, and merge conflicts, each once, coalesced across PRs into one `[System: PR watch ...]` message sent as the session's owner through the normal message path (so input policies apply to it, as to a typed message), only while the session is idle: not during a turn and not while it waits on an approval or a question. In All mode it enrols PRs as the session's stored list grows, skipping merged and closed ones.
 - **Prompt-injection guard.** Only comments and reviews from the repository's owners, members and collaborators count; anyone else's text never reaches the agent.
 - **Stopping.** Each PR's watch ends with a transcript note that starts no turn when its checks pass with no changes requested, it is merged or closed, its wake-up budget (default 10) is spent, checks cannot be read, or five wake-ups in a row could not be delivered. The ended state is kept so All mode does not pick the PR up again.
-- **State without a migration.** Watch state lives in server-reserved session labels (`omnigent.pr_watch.mode` for All, plus a URL and a state label per PR keyed by a hash of its URL, values capped at 256 characters), so it survives restarts. Forks drop the whole family, and clients can only change it through `GET`/`PUT`/`PATCH`/`DELETE /v1/sessions/{id}/pr-watch`, which require edit access.
+- **State without a migration.** Watch state lives in server-reserved session labels (`omnigent.pr_watch.mode` for All, plus a URL and a state label per PR keyed by a hash of its URL, values capped at 256 characters), so it survives restarts. Forks drop the whole family, and clients can only change it through `GET`/`PUT`/`PATCH`/`DELETE /v1/sessions/{id}/pr-watch`. Reading needs read access; changes are for the session's owner only, like the other pull request changes on a shared session, since wake-ups are sent as the owner.
 - **Provider payload.** The GitHub payload gains `mergeable`, each reviewer's `submitted_at`, and comment and review `author_association`, so conflicts, repeat reviews and trusted authors can be detected.
 - Tuning: `OMNIGENT_PR_WATCH_INTERVAL_S` (default 90) and `OMNIGENT_PR_WATCH_MAX_WAKES` (default 10).
 - `feature-map/pr-watch.md` documents the sub-features, entry points and gotchas, including the `pr_watch` flag and both tuning variables with their defaults and bounds; `openapi.json` is regenerated.
@@ -47,7 +45,7 @@ Manual (use a scratch GitHub repository the host's `gh` account can read and pus
 4. Attach or open a third PR and confirm the next poll picks it up.
 5. From an account that is not a collaborator, comment on a watched PR: no wake-up. Comment as a collaborator: a wake-up quotes it.
 6. In another session select two red PRs, uncheck one, and confirm the wake-up lists only the other. Toggle "Watch until green" in the Pull Requests panel and confirm the chip updates.
-7. As a view-only collaborator, confirm the boxes are disabled with a reason.
+7. As someone the session is shared with (view or edit), confirm the boxes are disabled with the owner-only reason.
 8. Restart the server without the flag: the chip and panel switch are gone and the `/pr-watch` routes return 404.
 
 ## Demo
