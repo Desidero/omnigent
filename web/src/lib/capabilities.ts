@@ -176,6 +176,12 @@ export interface ServerInfo {
    */
   sandbox_provider_automation_notices?: Record<string, string>;
   /**
+   * The per-user connection a provider launches sandboxes as, e.g.
+   * ``{ databricks: "databricks" }``. Its picker row stays disabled until the
+   * signed-in user has that connection; a provider absent from the map needs none.
+   */
+  sandbox_provider_owner_connections?: Record<string, string>;
+  /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
    * Sandbox Integrations nav; the SPA renders one panel per provider via
@@ -551,6 +557,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
   sandbox_provider_automation_notices: {},
+  sandbox_provider_owner_connections: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -682,7 +689,7 @@ function parseSandboxProviderCapabilities(
   );
 }
 
-function parseProviderAutomationNotices(value: unknown): Record<string, string> {
+function parseProviderTextMap(value: unknown): Record<string, string> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value).filter(
@@ -734,8 +741,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           sandbox_provider_capabilities: parseSandboxProviderCapabilities(
             data.sandbox_provider_capabilities,
           ),
-          sandbox_provider_automation_notices: parseProviderAutomationNotices(
+          sandbox_provider_automation_notices: parseProviderTextMap(
             data.sandbox_provider_automation_notices,
+          ),
+          sandbox_provider_owner_connections: parseProviderTextMap(
+            data.sandbox_provider_owner_connections,
           ),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")

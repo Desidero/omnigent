@@ -151,6 +151,11 @@ async def test_launch_for_an_unconnected_owner_is_a_409_connect_prompt(db_uri: s
     assert "Connect Databricks" in str(info.value.detail)
 
 
+def test_the_databricks_provider_reports_the_connection_it_launches_as() -> None:
+    """The picker gate reads this; the 409 above still guards the launch itself."""
+    assert _owner_deployment().provider_owner_connections() == {"databricks": "databricks"}
+
+
 _DORMANT_HOST_ID = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
 
 

@@ -2460,6 +2460,46 @@ def test_provider_automation_notices_list_only_launchable_providers_that_set_one
     }
 
 
+class _OwnerIdentityLauncher(FakeSandboxLauncher):
+    """A provider that launches each sandbox as the session owner."""
+
+    owner_credential_provider = "databricks"
+
+
+def test_provider_owner_connections_name_the_connection_a_provider_launches_as() -> None:
+    """A provider whose launcher acts as its owner reports which connection that
+    is; one that needs none, or can't launch, is absent."""
+
+    def unlaunchable_factory() -> _OwnerIdentityLauncher:
+        raise AssertionError("a provider that can't launch must not be instantiated")
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            *(
+                ManagedSandboxConfig(
+                    server_url="https://s",
+                    provider=provider,
+                    token_ttl_s=3600,
+                    launcher_factory=factory,
+                )
+                for provider, factory in (
+                    ("owned", _OwnerIdentityLauncher),
+                    ("shared", FakeSandboxLauncher),
+                )
+            ),
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="unlaunchable",
+                token_ttl_s=3600,
+                launcher_factory=unlaunchable_factory,
+                managed_launch_supported=False,
+            ),
+        )
+    )
+
+    assert deployment.provider_owner_connections() == {"owned": "databricks"}
+
+
 def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
     """A provider that manages sandbox profiles is reported as no destination for
     a move, which the move route refuses, whether profile discovery is on or not."""
@@ -2715,6 +2755,38 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     # No provider set on the injected config → the UI keeps the generic
     # label rather than inventing a name.
     assert body["sandbox_provider"] is None
+
+
+async def test_info_reports_the_connection_a_provider_launches_as(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` names the connection an owner-identity provider needs, in
+    its own map, and nothing per-user: the route is unauthenticated."""
+    config = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                provider=provider,
+                launcher_factory=factory,
+                token_ttl_s=3600,
+            )
+            for provider, factory in (
+                ("owned", _OwnerIdentityLauncher),
+                ("shared", FakeSandboxLauncher),
+            )
+        )
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sandbox_provider_owner_connections"] == {"owned": "databricks"}
+    assert body["sandbox_providers"] == ["owned", "shared"]
+    TypeAdapter(dict[str, dict[str, bool]]).validate_python(
+        body["sandbox_provider_capabilities"], strict=True
+    )
 
 
 async def test_info_reports_a_providers_automation_notice_apart_from_its_flags(
