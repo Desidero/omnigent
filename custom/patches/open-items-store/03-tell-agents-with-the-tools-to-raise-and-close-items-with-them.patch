@@ -1,0 +1,611 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 07:32:21 +0000
+Subject: [PATCH] feat(open-items): tell agents with the tools to raise and
+ close items with them
+
+Agents follow the item-label instruction, which has them pick label
+numbers themselves and close an item only by striking it in chat. With
+the open items tools available, that would leave the store unused and
+the numbers made up.
+
+Agents whose spec keeps the open_items tool group now get a second part
+after the item-label instruction: raise items with sys_open_items_raise
+before presenting them and write each with the returned label, never
+pick a number, adopt a label already written in chat by raising it with
+that label, close with sys_open_items_update and a one-line resolution
+and then strike the label in chat, list instead of relying on memory,
+and still write every item and close in chat. It ends with the fallback:
+without the tools, label in chat only. SDK harnesses get it every turn,
+right after the item-label instruction; native harnesses get it at
+launch, after the stable guidance (build_native_startup_instructions is
+wrapped rather than edited, so guidance other changes add to its list
+composes with it). The
+runner drops the group when the server does not store open items, so
+those sessions, and launches without a spec, keep the text-only
+instruction. A CLI-launched claude-native or codex-native session
+composes its instruction from its local wrapper spec, so there the
+fallback sentence covers a server without the feature.
+
+Not proposed upstream yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/AGENT_YAML_SPEC.md                       |  3 +-
+ docs/chat-item-labels.md                      |  5 ++
+ docs/open-items.md                            |  6 +++
+ feature-map/open-items.md                     |  2 +
+ omnigent/runtime/prompt.py                    | 52 ++++++++++++++++++-
+ .../claude_native/test_claude_native.py       | 14 +++--
+ .../session/test_terminal_prepare.py          | 10 +++-
+ .../codex_native/test_codex_native.py         | 14 +++--
+ .../test_app_native_startup_instructions.py   | 14 +++--
+ ...pp_sessions_native_terminals_autocreate.py | 27 +++++++---
+ ...t_app_sessions_native_terminals_runtime.py | 10 ++--
+ tests/runner/test_runner_dispatch.py          |  2 +
+ tests/runner/test_runner_entry.py             |  5 ++
+ tests/runtime/test_prompt.py                  | 22 +++++++-
+ tests/spec/test_resolve_agent_bundle.py       | 10 +++-
+ 15 files changed, 165 insertions(+), 31 deletions(-)
+
+diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
+index 3edb6188b02e1a3723751c3dc2387c119cd176ac..53ddc5ac6b2812198019137083d219ddecc9b134 100644
+--- a/docs/AGENT_YAML_SPEC.md
++++ b/docs/AGENT_YAML_SPEC.md
+@@ -1377,7 +1377,8 @@ feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox
+ The `open_items` group keeps the session's questions, risks, findings,
+ follow-ups and pinned links with labels the server allocates (see
+ [Open items](open-items.md)); the runner drops it when the server does not
+-store open items.
++store open items, and turning it off also drops the instruction's part about
++these tools.
+ Disabling `browser` also
+ drops the embedded-browser guidance from the composed system prompt, and
+ disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..e105c2cf4da3c25c91b18c3550d3a84f4ddc4498 100644
+--- a/docs/chat-item-labels.md
++++ b/docs/chat-item-labels.md
+@@ -21,6 +21,11 @@ The instruction suggests `[Q1]`, `[Q2]` for questions, `[R1]` for risks,
+ a settled item by writing its label struck through (`~~[Q2]~~`) in the
+ sentence that says how it ended.
+ 
++An agent with the `open_items` tool group also records each item with its
++tools before writing it, uses the label they return, and closes items through
++them; see [Open items](open-items.md). It still writes items and closes in the
++chat as above, and labels in chat only when those tools are not available.
++
+ SDK harnesses get the instruction with every turn. Native harnesses take
+ instructions only at launch, so it joins the stable guidance appended to the
+ agent's own instructions there: through Claude Code's `--append-system-prompt`
+diff --git a/docs/open-items.md b/docs/open-items.md
+index 01aa67999a5e5730a6bc7cbb247d9c991bb176ed..f741cd92b60c03fa648a3406c2ee51da8b75e9c1 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -50,6 +50,12 @@ its first attempt allocated. Two raises at once in one session never get the
+ same label. Adopting a label from chat takes it only if no item has it, and
+ moves counting past it.
+ 
++The framework instruction for item labels gains a part for these tools: raise
++an item before presenting it and write it with the returned label, never pick a
++number, close with `sys_open_items_update` and a one-line resolution and then
++strike the label in chat, list instead of relying on memory, and label in chat
++only if the tools are missing.
++
+ ### Which sessions get the tools
+ 
+ - **SDK harnesses** get them with the turn's tools; **claude-native**,
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index c123168e0ffca740a9090beb92d20b02cd1326e0..2e5e10b9e470677aa50e496de84dfb8604a745eb 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -26,10 +26,12 @@ Preconditions: a local server and runner from this checkout; any harness.
+ - Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
+ - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
+ - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
++- Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
+ - Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row, a struck `~~[Q1]~~`, and the item `closed` with `closed_by: agent` in the API.
+ 
+ ## Gotchas
+ 
+ - The web UI does not read the store yet: chips and the Open items bar still follow the chat text, so an item closed only through the API still shows open in the bar.
+ - Hosts without the series do not know the `open_items` key in `tool_groups:`, and an agent spec naming it fails to load there.
++- A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the instruction's last sentence covers that.
+ - Labels are unique per session, not across a session tree: a child session counts from Q1.
+diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
+index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..76c7674d38e46e513062c79d80bb61e893e558c8 100644
+--- a/omnigent/runtime/prompt.py
++++ b/omnigent/runtime/prompt.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import collections.abc
++import functools
+ import json
+ import re
+ from collections.abc import Sequence
+@@ -91,6 +93,47 @@ ITEM_LABEL_INSTRUCTION = (
+     "closing settled ones keeps that list accurate."
+ )
+ 
++# Follows ITEM_LABEL_INSTRUCTION for agents with the ``open_items`` tool group;
++# the store, not the chat text, then decides an item's state.
++OPEN_ITEMS_INSTRUCTION = (
++    "Stored items: this session keeps its items with the sys_open_items_* tools. "
++    "Before you present new items in chat, record them with sys_open_items_raise "
++    "(several in one call) and write each with the label it returns; never pick a "
++    "number yourself. To keep an item you already labelled in chat without the "
++    "tool, raise it with that label. When an item is settled, call "
++    "sys_open_items_update with status closed and a one-line resolution, then "
++    "strike its label in chat as above; reopen it with status open. Call "
++    "sys_open_items_list to see what is open instead of relying on memory. Still "
++    "write each item and each close in chat as above: that is what the user reads. "
++    "If these tools are not available to you, label items in chat only."
++)
++
++
++def _item_label_instructions(spec: AgentSpec | None) -> tuple[str, ...]:
++    """The item-label guidance, with the stored-items part when the spec keeps the tools."""
++    if spec is not None and spec.tool_groups.open_items:
++        return ITEM_LABEL_INSTRUCTION, OPEN_ITEMS_INSTRUCTION
++    return (ITEM_LABEL_INSTRUCTION,)
++
++
++def _with_stored_items_guidance(
++    compose: collections.abc.Callable[..., str],
++) -> collections.abc.Callable[..., str]:
++    """Follow a native startup composer's text with the stored-items guidance.
++
++    Only for a spec that keeps the ``open_items`` tools; a launch without a
++    spec has none, so it keeps text labels.
++    """
++
++    @functools.wraps(compose)
++    def compose_with_stored_items(spec: AgentSpec | None, *args: Any, **kwargs: Any) -> str:
++        text = compose(spec, *args, **kwargs)
++        if spec is None or not spec.tool_groups.open_items:
++            return text
++        return f"{text}\n\n{OPEN_ITEMS_INSTRUCTION}"
++
++    return compose_with_stored_items
++
+ 
+ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+     """
+@@ -107,7 +150,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+     agent unless the spec sets ``tool_groups.browser: false``, in which
+     case the prompt must not steer the model toward tools it lacks. The
+     item-label guidance applies to every agent, since every transcript
+-    renders label chips.
++    renders label chips; an agent with the ``open_items`` tool group also
++    gets the guidance for its tools.
+ 
+     :param spec: The parsed AgentSpec.
+     :returns: The applicable spec-level framework instructions.
+@@ -119,7 +163,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+     if spec.tool_groups.browser:
+         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+     instructions.append(WORKSPACE_IMAGE_INSTRUCTION)
+-    instructions.append(ITEM_LABEL_INSTRUCTION)
++    instructions.extend(_item_label_instructions(spec))
+     return instructions
+ 
+ 
+@@ -271,6 +315,10 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
+     return append_framework_instructions(authored, framework) or "\n\n".join(framework)
+ 
+ 
++# Native launches get the stored-items guidance after the stable guidance the composer adds.
++build_native_startup_instructions = _with_stored_items_guidance(build_native_startup_instructions)
++
++
+ def _strip_output_annotations(
+     content: list[dict[str, Any]],
+ ) -> list[dict[str, Any]]:
+diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
+index 8be309c21a39b2051e8af3dcb5d6c912e3b53542..6ef4ca4e282b7e3c3398524019e3c7dd79ba99f9 100644
+--- a/tests/harnesses/claude_native/test_claude_native.py
++++ b/tests/harnesses/claude_native/test_claude_native.py
+@@ -46,7 +46,11 @@ from omnigent.native import native_terminal
+ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+ from omnigent.runtime import tool_result_replay as trc
+ from omnigent.runtime import workflow
+-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import (
++    ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
++    WORKSPACE_IMAGE_INSTRUCTION,
++)
+ from omnigent.spec import load_omnigent_yaml
+ from omnigent.telemetry.request_headers import client_user_agent
+ from omnigent.terminals.ws_common import (
+@@ -1993,7 +1997,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+     assert (
+         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+     )
+-    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{OPEN_ITEMS_INSTRUCTION}")
+ 
+ 
+ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
+@@ -2081,7 +2085,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
+     assert (
+         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+     )
+-    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert launch_kwargs["append_system_prompt"].endswith(f"\n\n{OPEN_ITEMS_INSTRUCTION}")
+ 
+ 
+ def test_local_resume_does_not_print_redundant_resume_hint(
+@@ -7122,7 +7126,9 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
+     result = claude_native._wrapper_spec_startup_instructions(spec_path)
+     assert result is not None
+     assert "Claude Code is running in the session terminal" in result
+-    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert result.endswith(
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
++    )
+ 
+ 
+ def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+diff --git a/tests/harnesses/codex_native/session/test_terminal_prepare.py b/tests/harnesses/codex_native/session/test_terminal_prepare.py
+index 672f1c01a0cbb321339873c4c82f43c54be3935c..c2c1d479657d6fcbe753f1c052ab82fe92c7f271 100644
+--- a/tests/harnesses/codex_native/session/test_terminal_prepare.py
++++ b/tests/harnesses/codex_native/session/test_terminal_prepare.py
+@@ -15,7 +15,11 @@ import pytest
+ 
+ from omnigent._runner_startup import RunnerStartupProgress
+ from omnigent.harnesses.codex_native import main as codex_native
+-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import (
++    ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
++    WORKSPACE_IMAGE_INSTRUCTION,
++)
+ from tests.harnesses.codex_native.session._support import (
+     _write_source_rollout,
+ )
+@@ -32,7 +36,9 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
+     result = codex_native._wrapper_spec_startup_instructions(spec_path)
+     assert result is not None
+     assert "Codex is running in the session terminal" in result
+-    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert result.endswith(
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
++    )
+ 
+ 
+ def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+diff --git a/tests/harnesses/codex_native/test_codex_native.py b/tests/harnesses/codex_native/test_codex_native.py
+index 2534bdf2b3ee7026c17173d5ffa470f4ff151baa..9302f4082193864a5f3d39a38ef3c4d254080d66 100644
+--- a/tests/harnesses/codex_native/test_codex_native.py
++++ b/tests/harnesses/codex_native/test_codex_native.py
+@@ -34,7 +34,11 @@ from omnigent.harnesses.codex_native.bridge import (
+ )
+ from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+ from omnigent.inner.native_attachments import attachment_cache_dir
+-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import (
++    ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
++    WORKSPACE_IMAGE_INSTRUCTION,
++)
+ from omnigent.spec import load
+ 
+ # The default-stance auto-review override normalize_codex_permission_launch_args
+@@ -9199,7 +9203,9 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
+     result = codex_native._wrapper_spec_startup_instructions(spec_path)
+     assert result is not None
+     assert "Codex is running in the session terminal" in result
+-    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert result.endswith(
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
++    )
+ 
+ 
+ @pytest.mark.asyncio
+@@ -9439,7 +9445,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
+ 
+     assert captured.get("developer_instructions") is not None
+     assert "Codex is running in the session terminal" in captured["developer_instructions"]
+-    assert captured["developer_instructions"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert captured["developer_instructions"].endswith(f"\n\n{OPEN_ITEMS_INSTRUCTION}")
+ 
+ 
+ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
+@@ -9522,7 +9528,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
+ 
+     assert captured.get("developer_instructions") is not None
+     assert "Codex is running in the session terminal" in captured["developer_instructions"]
+-    assert captured["developer_instructions"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
++    assert captured["developer_instructions"].endswith(f"\n\n{OPEN_ITEMS_INSTRUCTION}")
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/runner/test_app_native_startup_instructions.py b/tests/runner/test_app_native_startup_instructions.py
+index 122874e9df04cc361d94251c49625db039a37828..944954e9d97561b0eef9e9736769b4aef259a1ee 100644
+--- a/tests/runner/test_app_native_startup_instructions.py
++++ b/tests/runner/test_app_native_startup_instructions.py
+@@ -11,11 +11,17 @@ from omnigent.runner.app import (
+     _native_startup_instructions_from_spec,
+ )
+ from omnigent.runner.native.orchestration import _opencode_session_instructions_from_spec
+-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import (
++    ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
++    WORKSPACE_IMAGE_INSTRUCTION,
++)
+ from omnigent.spec.types import AgentSpec, ExecutorSpec
+ 
+-# The stable guidance every native startup carries after the author text.
+-_STARTUP_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++# The stable guidance every native startup carries after the author text; without
++# a spec there is no open_items tool group, so items stay text labels.
++_NO_SPEC_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++_STARTUP_GUIDANCE = f"{_NO_SPEC_GUIDANCE}\n\n{OPEN_ITEMS_INSTRUCTION}"
+ 
+ 
+ def _spec(instructions: str | None) -> AgentSpec:
+@@ -44,7 +50,7 @@ def test_native_startup_instructions_from_spec(instructions: str | None, expecte
+ 
+ def test_native_startup_instructions_from_spec_none_spec() -> None:
+     """A missing spec still receives stable image guidance."""
+-    assert _native_startup_instructions_from_spec(None) == _STARTUP_GUIDANCE
++    assert _native_startup_instructions_from_spec(None) == _NO_SPEC_GUIDANCE
+ 
+ 
+ @pytest.mark.parametrize("has_spec", [False, True])
+diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+index 3e83be027e18bf78a7d18bfa5c6484f5ac489787..6e0e19e23942708c5e5fd506a6f7cf98db2b5cef 100644
+--- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
++++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+@@ -81,7 +81,11 @@ from omnigent.runner.resource_registry import (
+     SessionResourceRegistry,
+ )
+ from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
+-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import (
++    ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
++    WORKSPACE_IMAGE_INSTRUCTION,
++)
+ from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
+ from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+ from omnigent.terminals import TerminalRegistry
+@@ -173,8 +177,10 @@ def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
+     return json.loads(settings_path.read_text(encoding="utf-8"))
+ 
+ 
+-# What a native launch with no author text appends to the system prompt.
+-_STARTUP_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++# What a native launch with no author text appends to the system prompt; a
++# launch without a spec has no open_items tool group, so items stay text labels.
++_NO_SPEC_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++_STARTUP_GUIDANCE = f"{_NO_SPEC_GUIDANCE}\n\n{OPEN_ITEMS_INSTRUCTION}"
+ 
+ 
+ def _appended_system_prompt(args: list[str]) -> str | None:
+@@ -433,6 +439,8 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
+         f"{instructions}\n\n{_STARTUP_GUIDANCE}"
+         if instruction_spec in {"raw", "resolved", "resolved-replace"}
+         else _STARTUP_GUIDANCE
++        if instruction_spec != "missing"
++        else _NO_SPEC_GUIDANCE
+     )
+     if memory_guidance is not None:
+         expected = f"{expected}\n\n{memory_guidance}"
+@@ -1573,6 +1581,9 @@ async def test_devin_image_guidance_leaves_the_rule_for_authored_sessions(
+         expected = (
+             f"{authored}\n\n{_STARTUP_GUIDANCE}"
+             if session_id == "fallback-session"
++            # A live workspace rule carries the author text; the preamble gets no spec.
++            else _NO_SPEC_GUIDANCE
++            if session_id == "authored-session"
+             else _STARTUP_GUIDANCE
+         )
+         assert preamble == expected
+@@ -2505,7 +2516,7 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
+ 
+     assert _appended_system_prompt(captured["spec"].args) == (
+         "Be a concise, careful coding assistant.\n\n"
+-        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
+     )
+ 
+ 
+@@ -3821,7 +3832,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+         assert synth_costs == [None] * int(fork_carry_history)
+ 
+     # Startup gets the stable guidance; session-title metadata stays out of it.
+-    assert _appended_system_prompt(launched_args) == _STARTUP_GUIDANCE
++    assert _appended_system_prompt(launched_args) == _NO_SPEC_GUIDANCE
+ 
+     permission_mode_index = launched_args.index("--permission-mode")
+     assert launched_args[permission_mode_index + 1] == "auto"
+@@ -6812,7 +6823,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
+     # early no longer cascades into "no server running" (#540).
+     assert spec.keep_alive_after_exit is True
+     args = spec.args
+-    assert _appended_system_prompt(args) == _STARTUP_GUIDANCE
++    assert _appended_system_prompt(args) == _NO_SPEC_GUIDANCE
+     settings = _load_claude_invocation_settings(args)
+     assert "PermissionRequest" in settings["hooks"]
+     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
+@@ -7038,7 +7049,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+     )
+     # A pinned session's spawns stay on the claude family, so it gets neither
+     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
+-    assert _appended_system_prompt(spec.args) == _STARTUP_GUIDANCE
++    assert _appended_system_prompt(spec.args) == _NO_SPEC_GUIDANCE
+ 
+ 
+ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
+@@ -7067,7 +7078,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
+     # The custom-slot pin tracks the launched 1M-capable Opus and carries [1m].
+     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
+     # And the auto-harness extras, which only make sense alongside the router.
+-    assert (_appended_system_prompt(spec.args) or "").startswith(f"{_STARTUP_GUIDANCE}\n\n")
++    assert (_appended_system_prompt(spec.args) or "").startswith(f"{_NO_SPEC_GUIDANCE}\n\n")
+     allowed = spec.args[spec.args.index("--allowedTools") + 1]
+     assert "mcp__omnigent__sys_session_create" in allowed
+ 
+diff --git a/tests/runner/test_app_sessions_native_terminals_runtime.py b/tests/runner/test_app_sessions_native_terminals_runtime.py
+index 8f6d61b6d1b14c8385a3e0f9db2c944deeb5bddb..3d9549ac05b000443367ecfaf1775532d96bf1f7 100644
+--- a/tests/runner/test_app_sessions_native_terminals_runtime.py
++++ b/tests/runner/test_app_sessions_native_terminals_runtime.py
+@@ -50,7 +50,11 @@ from omnigent.runner.session_init_protocol import (
+     RunnerSessionInitEnvelope,
+     RunnerSessionInitSnapshot,
+ )
+-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
++from omnigent.runtime.prompt import (
++    ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
++    WORKSPACE_IMAGE_INSTRUCTION,
++)
+ from omnigent.spec.types import AgentSpec, ExecutorSpec
+ from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
+ from omnigent.terminals import TerminalRegistry
+@@ -994,7 +998,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
+     assert build_calls[0]["reconcile_process_registry"] is False
+     assert build_calls[0]["developer_instructions"] == (
+         "Be a concise, careful coding assistant.\n\n"
+-        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
+     )
+     # Persisted pass-through args must reach launch resolution (--profile layering).
+     assert resolve_calls and all(
+@@ -1980,7 +1984,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
+     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
+     assert build_calls[0]["developer_instructions"] == (
+         "Be a concise, careful coding assistant.\n\n"
+-        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
++        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
+     )
+ 
+     # Sandbox-override regression: the launched Codex terminal must inherit
+diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
+index 360b357f1b53c29ca41b0c46140076c073c443a5..72849387f99557ad1640f22de90bc06153380181 100644
+--- a/tests/runner/test_runner_dispatch.py
++++ b/tests/runner/test_runner_dispatch.py
+@@ -103,6 +103,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+ from omnigent.runtime.prompt import (
+     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+     ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
+     WORKSPACE_IMAGE_INSTRUCTION,
+ )
+ from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
+@@ -14130,6 +14131,7 @@ def _contract_composed_instructions(*parts: str) -> str:
+             EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+             WORKSPACE_IMAGE_INSTRUCTION,
+             ITEM_LABEL_INSTRUCTION,
++            OPEN_ITEMS_INSTRUCTION,
+         )
+     )
+ 
+diff --git a/tests/runner/test_runner_entry.py b/tests/runner/test_runner_entry.py
+index 2518851b82978e769aa1d790ec741f27dcd5b234..e31b630e05f65e82ebbc9a637db2f0c8063465be 100644
+--- a/tests/runner/test_runner_entry.py
++++ b/tests/runner/test_runner_entry.py
+@@ -4455,6 +4455,7 @@ async def test_runner_keeps_user_inbox_tools_only_when_the_server_turns_them_on(
+ @pytest.mark.asyncio
+ async def test_runner_keeps_open_items_tools_only_when_the_server_stores_them(tmp_path):
+     from omnigent.open_items_availability import OPEN_ITEMS_HEADER
++    from omnigent.runtime.prompt import OPEN_ITEMS_INSTRUCTION, build_native_startup_instructions
+     from omnigent.tools.manager import ToolManager
+     from tests.server.helpers import build_agent_bundle
+ 
+@@ -4488,6 +4489,10 @@ async def test_runner_keeps_open_items_tools_only_when_the_server_stores_them(tm
+         return "sys_open_items_raise" in names
+ 
+     assert [advertised(result.spec) for result in results] == [False, True, False]
++    assert [
++        OPEN_ITEMS_INSTRUCTION in build_native_startup_instructions(result.spec)
++        for result in results
++    ] == [False, True, False]
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
+index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..315a3b21844e7ca964ac15dad3b60c1e6a0d50a5 100644
+--- a/tests/runtime/test_prompt.py
++++ b/tests/runtime/test_prompt.py
+@@ -15,6 +15,7 @@ from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+ from omnigent.runtime.prompt import (
+     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+     ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
+     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+     SUBAGENT_WAKE_NOTICE_SHAPE,
+     WORKSPACE_IMAGE_INSTRUCTION,
+@@ -41,6 +42,7 @@ def _spec(
+     spawn: bool = False,
+     builtins: tuple[str, ...] = (),
+     browser: bool = True,
++    open_items: bool = False,
+ ) -> AgentSpec:
+     """
+     Stub only the AgentSpec fields the instruction builders read.
+@@ -55,7 +57,7 @@ def _spec(
+                 builtins=[SimpleNamespace(name=name) for name in builtins],
+             ),
+             spawn=spawn,
+-            tool_groups=SimpleNamespace(browser=browser),
++            tool_groups=SimpleNamespace(browser=browser, open_items=open_items),
+         ),
+     )
+ 
+@@ -482,3 +484,21 @@ def test_item_label_examples_match_the_chat_label_shape() -> None:
+ def test_item_label_instruction_shows_a_bold_title_after_the_label() -> None:
+     """The example puts a bold title right after the label, which the chat UI lists items by."""
+     assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
++
++
++def test_stored_items_guidance_follows_the_open_items_tool_group() -> None:
++    """Agents with the open items tools are told to use them; others keep text labels."""
++    stored = f"{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
++    spec = _spec("Agent prompt", open_items=True)
++    assert build_instructions_nullable(spec, None, []).endswith(f"\n\n{stored}")
++    assert build_native_startup_instructions(spec) == (
++        f"Agent prompt\n\n{WORKSPACE_IMAGE_INSTRUCTION}\n\n{stored}"
++    )
++    for without_tools in (_spec("Agent prompt"), None):
++        startup = build_native_startup_instructions(without_tools)
++        assert startup.endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
++        assert OPEN_ITEMS_INSTRUCTION not in startup
++    # The tools' instruction names every tool and keeps the text fallback.
++    for name in ("sys_open_items_raise", "sys_open_items_update", "sys_open_items_list"):
++        assert name in OPEN_ITEMS_INSTRUCTION
++    assert "label items in chat only" in OPEN_ITEMS_INSTRUCTION
+diff --git a/tests/spec/test_resolve_agent_bundle.py b/tests/spec/test_resolve_agent_bundle.py
+index 3fda5ebbfefec3c6de001d6dc0dc9df62ae89528..bbe7cb2b818addf9f7894df14bc9deb9eae22f4f 100644
+--- a/tests/spec/test_resolve_agent_bundle.py
++++ b/tests/spec/test_resolve_agent_bundle.py
+@@ -7,7 +7,11 @@ import pytest
+ from omnigent.cli import _bundle
+ from omnigent.inner.bundle_skills import claude_native_skill_args
+ from omnigent.runner.tool_dispatch import _execute_skill_tool
+-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, build_instructions
++from omnigent.runtime.prompt import (
++    ITEM_LABEL_INSTRUCTION,
++    OPEN_ITEMS_INSTRUCTION,
++    build_instructions,
++)
+ from omnigent.server.bundles import validate_agent_bundle
+ from omnigent.spec import load, materialize_bundle
+ from omnigent.tools.builtins.load_skill import LoadSkillTool, list_skill_resources
+@@ -65,7 +69,9 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() ->
+     # Include the shared framework guidance alongside the agent's procedure index;
+     # the item-label rules are framework text appended to every agent.
+     assert ITEM_LABEL_INSTRUCTION in prompt
+-    assert len(prompt.split()) - len(ITEM_LABEL_INSTRUCTION.split()) < 1600
++    assert OPEN_ITEMS_INSTRUCTION in prompt
++    item_guidance = f"{ITEM_LABEL_INSTRUCTION} {OPEN_ITEMS_INSTRUCTION}"
++    assert len(prompt.split()) - len(item_guidance.split()) < 1600
+     assert spec.skills
+     for skill in spec.skills:
+         assert skill.name in prompt
