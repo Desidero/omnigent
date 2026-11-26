@@ -122,6 +122,13 @@ stays current as the agent raises and closes them.
 - **Chat-only items** keep their dismiss button; dismissals are still stored
   as the `omnigent.items_dismissed` session label, which is read for chat-only
   items and never written for stored ones.
+- **Import from chat (edit access):** when the chat has labels the server
+  does not hold, such as a session's items from before the store, the panel
+  offers **Import N from chat**. It stores each under its own label, with the
+  title and block the chat gives it, closed (by you) if the chat closed or you
+  dismissed it, so counting moves past them and an agent never reuses one.
+  Pinned links (`[L1]`) are imported with their URL, and labels of other
+  letters (such as `[A4]`) stay chat only.
 
 On a server without open items the panel reads the chat alone, exactly as
 [item labels](chat-item-labels.md) describe.
@@ -134,6 +141,7 @@ On a server without open items the panel reads the chat alone, exactly as
 | `POST /sessions/{id}/open-items` | the session's runner | Raise items for an agent with the `open_items` group. |
 | `PATCH /sessions/{id}/open-items` | the session's runner, or a person with edit access | Reply to, close, reopen, retitle, retopic or relink items. |
 | `POST /sessions/{id}/open-items/replies` | edit access | Record a person's replies (a `ref` makes a retry add nothing); an open item becomes answered. |
+| `POST /sessions/{id}/open-items/import` | edit access | Store items written in the chat under their own labels, closed if the chat closed them. |
 
 Each write publishes `session.open_items.changed` on the session's stream with
 the labels written and the open count. `GET /v1/info` reports `open_items: true`
@@ -143,7 +151,7 @@ when the server stores them. The request and response shapes are in
 ## Compatibility
 
 Nothing is backfilled: items a session labelled in chat before stay chat
-labels. A server or host without this
+labels until you import them from the panel. A server or host without this
 feature keeps working with text labels, and the web reads the chat text as
 before. The items live in their own tables, apart from the main migration
 chain (see [side stores](extending/side_schemas.md)): a build without the

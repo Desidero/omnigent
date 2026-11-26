@@ -8,7 +8,11 @@ import {
 import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
 import { Button } from "@/components/ui/button";
 import { useCanEdit } from "@/hooks/usePermissions";
-import { useStoredOpenItems, useUpdateStoredOpenItems } from "@/hooks/useStoredOpenItems";
+import {
+  useImportChatItems,
+  useStoredOpenItems,
+  useUpdateStoredOpenItems,
+} from "@/hooks/useStoredOpenItems";
 import {
   ItemLabelIndexContext,
   ItemLabelMessageContext,
@@ -16,6 +20,7 @@ import {
 } from "@/lib/itemLabels";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import {
+  chatItemsToImport,
   chatResolution,
   countOpenRows,
   openItemRows,
@@ -381,11 +386,16 @@ export function StoredOpenItemsPanel({
   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
   const canEdit = useCanEdit(sessionId ?? "");
   const update = useUpdateStoredOpenItems(sessionId);
+  const importItems = useImportChatItems(sessionId);
   const [expanded, setExpanded] = useState<string | null>(null);
   const rows = useMemo(() => openItemRows(index, stored, dismissed), [index, stored, dismissed]);
   const topics = useMemo(
     () => [...new Set(stored.flatMap((item) => (item.topic ? [item.topic] : [])))].sort(),
     [stored],
+  );
+  const imports = useMemo(
+    () => (canEdit ? chatItemsToImport(index, stored, dismissed) : []),
+    [canEdit, index, stored, dismissed],
   );
   if (rows.length === 0) return null;
 
@@ -446,6 +456,19 @@ export function StoredOpenItemsPanel({
         <MessageSquareDotIcon className="size-4 shrink-0 text-muted-foreground" />
         <span>Open items</span>
         <span className="opacity-70">({countOpenRows(rows)})</span>
+        {imports.length > 0 && (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="ml-auto h-6 px-2 text-xs font-normal"
+            title="Store the chat's own labels with the session's items"
+            disabled={importItems.isPending}
+            onClick={() => importItems.mutate(imports)}
+          >
+            {importItems.isPending ? "Importing…" : `Import ${imports.length} from chat`}
+          </Button>
+        )}
       </div>
       <ul className="max-h-[min(24rem,50vh)] overflow-y-auto border-t border-border py-1">
         {recent.length > 0 && <li className={GROUP_HEADING_CLASS}>In the latest reply</li>}
