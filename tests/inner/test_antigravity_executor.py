@@ -5,9 +5,11 @@ The fakes here mirror the real ``google.antigravity`` streaming surface the
 executor depends on: ``agent.conversation`` yields :class:`Step` objects from
 ``receive_steps()`` (text / reasoning deltas, tool calls, status, usage) as the
 turn runs, a registered ``PostToolCallHook`` fires per tool completion with a
-``ToolResult``, and ``conversation.cancel()`` aborts a running turn. They let
-the streaming / tool-pairing / cancellation logic be tested without the SDK
-package or network.
+``ToolResult``, a ``PreToolCallDecideHook`` decides each tool call before it
+runs (a refusal comes back as an ``ERROR`` step quoting the hook's message, as
+SDK 0.1.23 reports it), and ``conversation.cancel()`` aborts a running turn.
+They let the streaming / tool-pairing / shell-gate / cancellation logic be
+tested without the SDK package or network.
 """
 
 from __future__ import annotations
@@ -150,6 +152,20 @@ class _FireToolResult:
 
 
 @dataclass
+class _DecideToolCall:
+    """Turn-script action: the SDK runs its pre-tool decide hooks for this call.
+
+    ``allowed`` records what the hooks decided once the action has run. With
+    ``refusal_on_call``, a refusal is reported the way SDK 0.1.2 does: as the
+    call's own ``TOOL_CALL`` step in ``ERROR``, after the call was streamed.
+    """
+
+    tool_call: _FakeToolCall
+    allowed: bool | None = None
+    refusal_on_call: bool = False
+
+
+@dataclass
 class _RaiseCancelled:
     """Turn-script action: ``receive_steps`` raises the SDK's cancellation error."""
 
@@ -162,7 +178,7 @@ class _RaiseGeneric:
 
 
 # A turn script is the ordered list of actions one ``receive_steps()`` replays.
-_TurnAction = _YieldStep | _FireToolResult | _RaiseCancelled | _RaiseGeneric
+_TurnAction = _YieldStep | _FireToolResult | _DecideToolCall | _RaiseCancelled | _RaiseGeneric
 
 
 class _FakeConversation:
@@ -190,7 +206,25 @@ class _FakeConversation:
                 yield action.step
             elif isinstance(action, _FireToolResult):
                 for hook in self._hooks:
-                    await hook.run(SimpleNamespace(), action.tool_result)
+                    if isinstance(hook, _FakePostToolCallHook):
+                        await hook.run(SimpleNamespace(), action.tool_result)
+            elif isinstance(action, _DecideToolCall):
+                result = _FakeHookResult(allow=True)
+                for hook in self._hooks:
+                    if isinstance(hook, _FakePreToolCallDecideHook):
+                        result = await hook.run(SimpleNamespace(), action.tool_call)
+                        if not result.allow:
+                            break
+                action.allowed = result.allow
+                if not result.allow and action.refusal_on_call:
+                    yield _FakeStep(
+                        step_type=_StepType.TOOL_CALL,
+                        status=_StepStatus.ERROR,
+                        tool_calls=[action.tool_call],
+                        error="User denied permission for tool call.",
+                    )
+                elif not result.allow:
+                    yield _sdk_denial_step(result.message)
             elif isinstance(action, _RaiseCancelled):
                 raise _AntigravityCancelledError("cancelled")
             elif isinstance(action, _RaiseGeneric):
@@ -241,6 +275,7 @@ class _FakeLocalAgentConfig:
         location: str | None = None,
         tools: Any = None,
         hooks: Any = None,
+        policies: Any = None,
     ) -> None:
         self.system_instructions = system_instructions
         self.model = model if isinstance(model, str) else None
@@ -251,6 +286,7 @@ class _FakeLocalAgentConfig:
         self.location = location
         self.tools = tools
         self.hooks = hooks
+        self.policies = policies
 
 
 class _FakePostToolCallHook:
@@ -258,6 +294,61 @@ class _FakePostToolCallHook:
 
     async def run(self, context: Any, data: Any) -> None:
         return None
+
+
+@dataclass
+class _FakeHookResult:
+    """Mirror of ``google.antigravity.types.HookResult``."""
+
+    allow: bool = True
+    message: str = ""
+
+
+class _FakePreToolCallDecideHook:
+    """Sub-classable stand-in for ``google.antigravity.hooks.PreToolCallDecideHook``."""
+
+    async def run(self, context: Any, data: Any) -> _FakeHookResult:
+        return _FakeHookResult()
+
+
+@dataclass(frozen=True)
+class _FakePolicy:
+    """Mirror of ``google.antigravity.hooks.policy.Policy`` (the fields tests read)."""
+
+    tool: str
+    decision: str
+    name: str = ""
+
+
+class _FakePolicyModule:
+    """Mirror of ``google.antigravity.hooks.policy`` — just ``allow``."""
+
+    @staticmethod
+    def allow(tool: str, *, name: str = "") -> _FakePolicy:
+        return _FakePolicy(tool, "APPROVE", name)
+
+
+class _FakeHooks:
+    """Mirror of ``google.antigravity.hooks`` (the members the executor uses)."""
+
+    PostToolCallHook = _FakePostToolCallHook
+    PreToolCallDecideHook = _FakePreToolCallDecideHook
+    policy = _FakePolicyModule
+
+
+class _FakeTypes:
+    """Mirror of ``google.antigravity.types`` (the members the executor uses)."""
+
+    AntigravityCancelledError = _AntigravityCancelledError
+    HookResult = _FakeHookResult
+
+
+def _sdk_denial_step(message: str) -> _FakeStep:
+    """The step SDK 0.1.23 yields when a pre-tool hook refuses a call."""
+    text = f'{message} ("denied by pre-tool hook: {message}")'
+    return _FakeStep(
+        step_type=_StepType.TEXT_RESPONSE, status=_StepStatus.ERROR, content_delta=text, error=text
+    )
 
 
 def _install_fake_sdk(
@@ -278,12 +369,6 @@ def _install_fake_sdk(
     """
     queue: collections.deque[list[_TurnAction]] = collections.deque(scripts)
     captured: dict[str, Any] = {"agents": [], "configs": []}
-
-    class _FakeHooks:
-        PostToolCallHook = _FakePostToolCallHook
-
-    class _FakeTypes:
-        AntigravityCancelledError = _AntigravityCancelledError
 
     class _FakeModule:
         LocalAgentConfig = _FakeLocalAgentConfig
@@ -1221,12 +1306,6 @@ def _install_blocking_sdk(
         async def __aexit__(self, *_a: object) -> None:
             return None
 
-    class _FakeHooks:
-        PostToolCallHook = _FakePostToolCallHook
-
-    class _FakeTypes:
-        AntigravityCancelledError = _AntigravityCancelledError
-
     class _FakeModule:
         LocalAgentConfig = _FakeLocalAgentConfig
         hooks = _FakeHooks
@@ -1363,12 +1442,6 @@ def _install_rebuild_sdk(monkeypatch: pytest.MonkeyPatch, gate: asyncio.Event) -
         async def __aexit__(self, *_a: object) -> None:
             self.closed = True
 
-    class _FakeHooks:
-        PostToolCallHook = _FakePostToolCallHook
-
-    class _FakeTypes:
-        AntigravityCancelledError = _AntigravityCancelledError
-
     class _FakeModule:
         LocalAgentConfig = _FakeLocalAgentConfig
         hooks = _FakeHooks
@@ -1433,3 +1506,279 @@ async def test_next_turn_rebuilds_after_interrupt(monkeypatch: pytest.MonkeyPatc
     completes = [e for e in events if isinstance(e, TurnComplete)]
     assert len(completes) == 1
     assert completes[0].response == "second-reply"
+
+
+# ── Shell commands: Omnigent policy + permission mode ───────────────────
+
+_LS = _FakeToolCall("run_command", {"CommandLine": "ls", "Cwd": "/work"}, call_id="call_1")
+
+
+def _verdict(action: str, reason: str | None = None) -> SimpleNamespace:
+    """A policy verdict as the adapter's evaluator bridge returns it."""
+    return SimpleNamespace(action=action, reason=reason)
+
+
+def _wire_bridges(
+    executor: AntigravityExecutor,
+    *,
+    verdict: SimpleNamespace | None = None,
+    approve: bool | None = None,
+) -> dict[str, list[Any]]:
+    """Install fake policy / approval bridges, as the ExecutorAdapter does.
+
+    :param verdict: What the policy evaluator answers, or ``None`` to leave it unwired.
+    :param approve: The user's answer on the card, or ``None`` to leave it unwired.
+    :returns: The calls each bridge received, keyed ``"policy"`` / ``"asked"``.
+    """
+    calls: dict[str, list[Any]] = {"policy": [], "asked": []}
+
+    async def _evaluate(phase: str, data: dict[str, Any]) -> SimpleNamespace:
+        calls["policy"].append((phase, data))
+        assert verdict is not None
+        return verdict
+
+    async def _ask(tool_name: str, tool_input: dict[str, Any]) -> bool:
+        calls["asked"].append((tool_name, tool_input))
+        assert approve is not None
+        return approve
+
+    if verdict is not None:
+        executor._policy_evaluator = _evaluate
+    if approve is not None:
+        executor._elicitation_handler = _ask
+    return calls
+
+
+def _ran_ls_script(decide: _DecideToolCall) -> list[_TurnAction]:
+    """A turn whose shell call is allowed: the SDK runs it, then the model replies."""
+    ran = _FakeToolCall("run_command", {"command_line": "ls"}, call_id="traj:4")
+    return [
+        decide,
+        _tool_call_step(ran),
+        _tool_call_step(ran, status=_StepStatus.DONE),
+        _text_step("listed"),
+    ]
+
+
+def _refused_ls_script(decide: _DecideToolCall) -> list[_TurnAction]:
+    """A turn whose shell call is refused: the SDK reports it, then the model goes on."""
+    return [decide, _text_step("could not run it")]
+
+
+@pytest.mark.asyncio
+async def test_shell_policy_replaces_sdk_default_deny(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The agent gets an allow-all policy plus the shell gate, not the SDK's run_command deny."""
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
+    executor = AntigravityExecutor()
+
+    await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+
+    config = captured["configs"][0]
+    assert config.policies == [_FakePolicy("*", "APPROVE", "omnigent_shell_gate")]
+    assert any(isinstance(hook, _FakePreToolCallDecideHook) for hook in config.hooks)
+
+
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions"])
+@pytest.mark.asyncio
+async def test_shell_command_runs_without_asking_when_policy_allows(
+    monkeypatch: pytest.MonkeyPatch, permission_mode: str
+) -> None:
+    """In a mode that does not ask, a command Omnigent policy allows just runs."""
+    decide = _DecideToolCall(_LS)
+    _install_fake_sdk(monkeypatch, scripts=[_ran_ls_script(decide)])
+    executor = AntigravityExecutor(permission_mode=permission_mode)
+    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=False)
+
+    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    assert decide.allowed is True
+    assert calls["policy"] == [
+        ("PHASE_TOOL_CALL", {"name": "run_command", "arguments": _LS.args}),
+    ]
+    assert calls["asked"] == []
+    assert [e.name for e in events if isinstance(e, ToolCallRequest)] == ["run_command"]
+    assert any(isinstance(e, TurnComplete) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_shell_command_asks_and_runs_when_approved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In a mode that asks, the command runs only after the user approves the card."""
+    decide = _DecideToolCall(_LS)
+    _install_fake_sdk(monkeypatch, scripts=[_ran_ls_script(decide)])
+    executor = AntigravityExecutor(permission_mode="default")
+    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=True)
+
+    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    assert calls["asked"] == [("run_command", _LS.args)]
+    assert decide.allowed is True
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_refused_shell_command_fails_the_call_and_the_turn_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user refusal fails that tool call; the SDK's report of it is not a turn error."""
+    decide = _DecideToolCall(_LS)
+    _install_fake_sdk(monkeypatch, scripts=[_refused_ls_script(decide)])
+    executor = AntigravityExecutor(permission_mode="default")
+    _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=False)
+
+    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    assert decide.allowed is False
+    requests = [e for e in events if isinstance(e, ToolCallRequest)]
+    completes = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert [(r.name, r.args, r.metadata) for r in requests] == [
+        ("run_command", _LS.args, {"call_id": "call_1"})
+    ]
+    assert len(completes) == 1
+    assert completes[0].status == ToolCallStatus.ERROR
+    assert completes[0].error == "The user declined to run this command."
+    assert completes[0].metadata == requests[0].metadata
+    # The SDK's denial report is neither assistant text nor a turn failure.
+    assert [e.text for e in events if isinstance(e, TextChunk)] == ["could not run it"]
+    assert not any(isinstance(e, ExecutorError) for e in events)
+    turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_completes) == 1 and turn_completes[0].response == "could not run it"
+
+
+@pytest.mark.parametrize("permission_mode", ["auto", "default"])
+@pytest.mark.asyncio
+async def test_shell_command_denied_by_omnigent_policy(
+    monkeypatch: pytest.MonkeyPatch, permission_mode: str
+) -> None:
+    """A policy DENY refuses the command in every mode, without asking the user."""
+    decide = _DecideToolCall(_LS)
+    _install_fake_sdk(monkeypatch, scripts=[_refused_ls_script(decide)])
+    executor = AntigravityExecutor(permission_mode=permission_mode)
+    calls = _wire_bridges(
+        executor, verdict=_verdict("POLICY_ACTION_DENY", "no shell here"), approve=True
+    )
+
+    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    assert decide.allowed is False
+    assert calls["asked"] == []
+    completes = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert len(completes) == 1 and completes[0].status == ToolCallStatus.ERROR
+    assert completes[0].error == "Denied by Omnigent policy: no shell here"
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_policy_ask_prompts_even_in_a_mode_that_does_not_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ASK verdict reaches the approval card even under ``bypassPermissions``."""
+    decide = _DecideToolCall(_LS)
+    _install_fake_sdk(monkeypatch, scripts=[_ran_ls_script(decide)])
+    executor = AntigravityExecutor(permission_mode="bypassPermissions")
+    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ASK"), approve=True)
+
+    await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    assert calls["asked"] == [("run_command", _LS.args)]
+    assert decide.allowed is True
+
+
+async def _raising_evaluator(phase: str, data: dict[str, Any]) -> SimpleNamespace:
+    raise RuntimeError("policy service down")
+
+
+@pytest.mark.parametrize(
+    ("permission_mode", "evaluator", "expected_error"),
+    [
+        ("default", None, "Approval is required to run this command"),
+        ("auto", _raising_evaluator, "Omnigent could not evaluate its policies"),
+        ("auto", "POLICY_ACTION_SOMETHING_NEW", "Unexpected Omnigent policy verdict"),
+    ],
+    ids=["no-approval-handler", "evaluator-raises", "unknown-verdict"],
+)
+@pytest.mark.asyncio
+async def test_shell_gate_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, permission_mode: str, evaluator: Any, expected_error: str
+) -> None:
+    """When the gate cannot decide, the command is refused and the turn still ends cleanly."""
+    decide = _DecideToolCall(_LS)
+    _install_fake_sdk(monkeypatch, scripts=[_refused_ls_script(decide)])
+    executor = AntigravityExecutor(permission_mode=permission_mode)
+    if isinstance(evaluator, str):
+        _wire_bridges(executor, verdict=_verdict(evaluator))
+    else:
+        executor._policy_evaluator = evaluator
+
+    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    assert decide.allowed is False
+    completes = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert len(completes) == 1 and completes[0].error.startswith(expected_error)
+    assert any(isinstance(e, TurnComplete) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_shell_gate_leaves_other_tools_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only run_command is gated; other tools pass without a policy round trip or card."""
+    view = _FakeToolCall("view_file", {"AbsolutePath": "/work/a.txt"}, call_id="call_2")
+    decide = _DecideToolCall(view)
+    _install_fake_sdk(monkeypatch, scripts=[[decide, _text_step("ok")]])
+    executor = AntigravityExecutor(permission_mode="default")
+    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_DENY"), approve=False)
+
+    await _drain(executor, [{"role": "user", "content": "read", "session_id": "s1"}])
+
+    assert decide.allowed is True
+    assert calls == {"policy": [], "asked": []}
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_after_refused_shell_command_still_fails_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the SDK's report of the refusal is absorbed; any other ERROR step fails the turn."""
+    script: list[_TurnAction] = [
+        _DecideToolCall(_LS),
+        _YieldStep(
+            _FakeStep(step_type=_StepType.FINISH, status=_StepStatus.ERROR, error="model exploded")
+        ),
+    ]
+    _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor(permission_mode="default")
+    _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=False)
+
+    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert [e.message for e in errors] == ["model exploded"]
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_refusal_on_an_sdk_that_streams_the_call_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK 0.1.2 streams the call, then asks the hook: the refusal closes that same call once."""
+    call = _FakeToolCall("run_command", {"command_line": "ls"}, call_id="traj:2")
+    decide = _DecideToolCall(call, refusal_on_call=True)
+    script: list[_TurnAction] = [
+        _tool_call_step(call),
+        decide,
+        _text_step("could not run it"),
+    ]
+    _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_DENY", "no shell here"))
+
+    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
+
+    assert decide.allowed is False
+    requests = [e for e in events if isinstance(e, ToolCallRequest)]
+    completes = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert [r.metadata for r in requests] == [{"call_id": "traj:2"}]
+    assert [(c.metadata, c.error) for c in completes] == [
+        ({"call_id": "traj:2"}, "Denied by Omnigent policy: no shell here")
+    ]
+    assert any(isinstance(e, TurnComplete) for e in events)

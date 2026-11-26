@@ -2721,6 +2721,10 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
         location = config.get("location")
         if location:
             env["HARNESS_ANTIGRAVITY_LOCATION"] = str(location)
+    # Permission stance for the SDK's shell tool; unset, the wrap uses ``auto``.
+    permission_mode = config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ANTIGRAVITY_PERMISSION_MODE"] = str(permission_mode)
 
     return env
 

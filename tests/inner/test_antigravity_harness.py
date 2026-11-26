@@ -43,6 +43,22 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
     assert "/v1/sessions/{conversation_id}/events" in paths
 
 
+def test_approval_cards_name_antigravity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shell-command approval cards read "Antigravity wants to use ...", not "Claude"."""
+    captured: dict[str, Any] = {}
+
+    class _RecordingAdapter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def build(self) -> None:
+            return None
+
+    monkeypatch.setattr(antigravity_harness, "ExecutorAdapter", _RecordingAdapter)
+    antigravity_harness.create_app()
+    assert captured["harness_label"] == "Antigravity"
+
+
 _ALL_ANTIGRAVITY_ENV = (
     "HARNESS_ANTIGRAVITY_MODEL",
     "HARNESS_ANTIGRAVITY_API_KEY",
@@ -50,6 +66,7 @@ _ALL_ANTIGRAVITY_ENV = (
     "HARNESS_ANTIGRAVITY_PROJECT",
     "HARNESS_ANTIGRAVITY_LOCATION",
     "HARNESS_ANTIGRAVITY_OS_ENV",
+    "HARNESS_ANTIGRAVITY_PERMISSION_MODE",
 )
 
 
@@ -83,6 +100,7 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("HARNESS_ANTIGRAVITY_VERTEX", "true")
     monkeypatch.setenv("HARNESS_ANTIGRAVITY_PROJECT", "my-proj")
     monkeypatch.setenv("HARNESS_ANTIGRAVITY_LOCATION", "us-central1")
+    monkeypatch.setenv("HARNESS_ANTIGRAVITY_PERMISSION_MODE", "default")
 
     captured = _capture_factory_kwargs(monkeypatch)
 
@@ -91,6 +109,7 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["vertex"] is True
     assert captured["project"] == "my-proj"
     assert captured["location"] == "us-central1"
+    assert captured["permission_mode"] == "default"
 
 
 @pytest.mark.parametrize("os_env_payload", [None, '{"sandbox": {"type": "none"}}'])
@@ -111,6 +130,7 @@ def test_executor_factory_defaults_when_unset(
     assert captured["vertex"] is False
     assert captured["project"] is None
     assert captured["location"] is None
+    assert captured["permission_mode"] == "auto"
 
 
 @pytest.mark.parametrize(

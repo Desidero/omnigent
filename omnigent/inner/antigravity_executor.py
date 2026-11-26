@@ -27,6 +27,11 @@ Streaming model:
 - Tool *requests* derive from ``Step.tool_calls`` (deduped by call id); tool
   *completions* (with payload, error, duration) arrive via a registered
   ``PostToolCallHook`` and pair back by call id.
+- Shell commands: the SDK's default policy denies its ``run_command`` tool.
+  The executor allows it at the policy layer and gates each call in a
+  ``PreToolCallDecideHook`` by Omnigent's TOOL_CALL policies and the
+  permission mode (see :meth:`_shell_command_denial`). A refused call fails as
+  a tool call and the SDK turn goes on.
 - Cancellation: :meth:`interrupt_session` -> ``conversation.cancel()``, which
   surfaces ``TurnCancelled``.
 
@@ -35,8 +40,9 @@ Authentication is Gemini-native: a direct API key (``api_key``) or Vertex AI
 ``base_url``, so there is deliberately no gateway / Databricks routing path.
 
 SDK touchpoints are isolated in :meth:`_open_agent`, :meth:`_build_sdk_tools`,
-:meth:`_build_post_tool_hook`, and :meth:`_drive_turn`, and duck-typed to
-tolerate drift across the v0.1.x surface. Unit tests stub the SDK module.
+:meth:`_build_post_tool_hook`, :meth:`_build_shell_gate_hook`, and
+:meth:`_drive_turn`, and duck-typed to tolerate drift across the v0.1.x
+surface. Unit tests stub the SDK module.
 """
 
 from __future__ import annotations
@@ -114,6 +120,16 @@ _ToolCallable: TypeAlias = Callable[..., Awaitable[ToolResult]]  # type: ignore[
 ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
     [str, dict[str, Any]], Awaitable[dict[str, Any]]
 ]
+# Bridges the ExecutorAdapter installs: ``(phase, data)`` -> Omnigent policy
+# verdict, and ``(tool_name, tool_input)`` -> the user's answer on an approval card.
+PolicyEvaluator: TypeAlias = Callable[[str, _StrAnyDict], Awaitable[object]]
+ElicitationHandler: TypeAlias = Callable[[str, _StrAnyDict], Awaitable[bool]]
+
+# The SDK's shell tool (``BuiltinTools.RUN_COMMAND``).
+_SHELL_TOOL = "run_command"
+# Permission modes that run a shell command no policy objects to without asking,
+# as the cursor and claude-sdk harnesses do. Any other mode asks first.
+_NO_PROMPT_PERMISSION_MODES = frozenset({"auto", "bypassPermissions"})
 
 
 def _ensure_antigravity_sdk() -> ModuleType:
@@ -308,6 +324,8 @@ class _AntigravitySessionState:
         the terminal :class:`TurnComplete`.
     :param interrupt_requested: Set by :meth:`interrupt_session` so the
         consumer suppresses a trailing :class:`TurnComplete` after cancel.
+    :param shell_denials: Messages of shell commands the gate refused this
+        turn, each awaiting the ``ERROR`` step the SDK reports it with.
     """
 
     agent: SDKAgent = None
@@ -317,6 +335,7 @@ class _AntigravitySessionState:
     active_queue: _EventQueue | None = field(default=None)
     last_usage: SDKUsage = None
     interrupt_requested: bool = False
+    shell_denials: list[str] = field(default_factory=list)
 
 
 class AntigravityExecutor(Executor):
@@ -331,6 +350,7 @@ class AntigravityExecutor(Executor):
         project: str | None = None,
         location: str | None = None,
         retry_policy: RetryPolicy | None = None,
+        permission_mode: str = "auto",
     ) -> None:
         """Create an AntigravityExecutor.
 
@@ -348,6 +368,10 @@ class AntigravityExecutor(Executor):
             ``"us-central1"``. ``None`` unless *vertex* is set.
         :param retry_policy: Optional retry policy, reserved for parity with
             the other SDK executors. ``None`` uses defaults.
+        :param permission_mode: Omnigent permission stance for shell commands.
+            ``"auto"`` (default) and ``"bypassPermissions"`` run a command no
+            policy objects to; any other value, e.g. ``"default"``, asks on an
+            approval card first. A policy DENY blocks in every mode.
         """
         self._model_override = model
         self._api_key = api_key
@@ -359,6 +383,10 @@ class AntigravityExecutor(Executor):
         # Set by the harness ExecutorAdapter when unset; the SDK tools route
         # invocations through this to reach Omnigent's tools under policy.
         self._tool_executor: ToolExecutor | None = None
+        self._permission_mode = permission_mode or "auto"
+        # Also set by the adapter; they gate the SDK's own shell tool.
+        self._policy_evaluator: PolicyEvaluator | None = None
+        self._elicitation_handler: ElicitationHandler | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -522,6 +550,7 @@ class AntigravityExecutor(Executor):
         event_queue: _EventQueue = asyncio.Queue()
         state.active_queue = event_queue
         state.pending_tools.clear()
+        state.shell_denials.clear()
         state.last_usage = None
         state.interrupt_requested = False
 
@@ -596,6 +625,10 @@ class AntigravityExecutor(Executor):
         try:
             await conversation.send(prompt)
             async for step in conversation.receive_steps():
+                if self._is_shell_denial_report(step, state):
+                    # Already surfaced as a failed tool call by the gate; the
+                    # SDK turn goes on, so this is not a turn failure.
+                    continue
                 # Only surface MODEL->USER steps. The SDK echoes the user's
                 # input and environment-directed steps in the same stream (its
                 # ``receive_chunks`` filters identically); without this the
@@ -702,6 +735,29 @@ class AntigravityExecutor(Executor):
             args: ToolArgs = raw_args if isinstance(raw_args, dict) else {}
             state.pending_tools[call_id] = _PendingTool(name=name, started=time.monotonic())
             queue.put_nowait(ToolCallRequest(name=name, args=args, metadata={"call_id": call_id}))
+
+    @staticmethod
+    def _is_shell_denial_report(step: SDKStep, state: _AntigravitySessionState) -> bool:
+        """Whether *step* is the SDK reporting a shell command the gate refused.
+
+        The SDK reports a pre-tool hook's refusal as an ``ERROR`` step (not a
+        ``TOOL_CALL`` one) whose error quotes the hook's message, then lets the
+        model continue. Each refusal is matched once.
+
+        :param step: The current SDK :class:`Step`.
+        :param state: The session state holding this turn's refusal messages.
+        :returns: ``True`` when *step* reports one of them (it is consumed).
+        """
+        if not state.shell_denials or _enum_name(getattr(step, "status", None)) != "ERROR":
+            return False
+        if _enum_name(getattr(step, "type", None)) == "TOOL_CALL":
+            return False
+        reported = str(getattr(step, "error", "") or "")
+        for message in state.shell_denials:
+            if message in reported:
+                state.shell_denials.remove(message)
+                return True
+        return False
 
     def _complete_pending_from_step(
         self, step: SDKStep, state: _AntigravitySessionState, status: str
@@ -869,7 +925,16 @@ class AntigravityExecutor(Executor):
         sdk_tools = self._build_sdk_tools(tools)
         if sdk_tools:
             config_kwargs["tools"] = sdk_tools
-        config_kwargs["hooks"] = [self._build_post_tool_hook(antigravity, state)]
+        config_kwargs["hooks"] = [
+            self._build_post_tool_hook(antigravity, state),
+            self._build_shell_gate_hook(antigravity, state),
+        ]
+        # The SDK's default policy denies run_command outright. Allow every tool
+        # at the policy layer, as the default does for the others, and let the
+        # shell gate hook decide run_command.
+        config_kwargs["policies"] = [
+            antigravity.hooks.policy.allow("*", name="omnigent_shell_gate")
+        ]
         config = self._build_local_agent_config(antigravity, model=model, kwargs=config_kwargs)
         agent = antigravity.Agent(config)
         # Agent is documented as an async context manager; enter it if so.
@@ -932,6 +997,118 @@ class AntigravityExecutor(Executor):
                 )
 
         return _OmnigentToolCompleteHook()
+
+    def _build_shell_gate_hook(
+        self, antigravity: ModuleType, state: _AntigravitySessionState
+    ) -> SDKHook:
+        """Build a ``PreToolCallDecideHook`` that gates the SDK's shell tool.
+
+        Other tools pass. A refused command is surfaced right away as a
+        :class:`ToolCallRequest` and failed :class:`ToolCallComplete`, and its
+        message is recorded so :meth:`_drive_turn` skips the SDK's report of it.
+
+        :param antigravity: The imported ``google.antigravity`` module.
+        :param state: The session state (queue + refusal messages).
+        :returns: A ``PreToolCallDecideHook`` for ``LocalAgentConfig.hooks``.
+        """
+        executor = self
+        hook_result = antigravity.types.HookResult
+
+        class _OmnigentShellGateHook(antigravity.hooks.PreToolCallDecideHook):  # type: ignore[misc, name-defined]
+            """Allows or refuses each ``run_command`` call before it runs."""
+
+            async def run(self, context: SDKHookContext, data: SDKToolCall) -> Any:  # type: ignore[explicit-any]  # noqa: ARG002 — context unused; required by hook signature
+                """Return the SDK ``HookResult`` for one tool call.
+
+                :param context: The SDK ``HookContext`` (unused here).
+                :param data: The SDK ``ToolCall`` about to run.
+                :returns: ``HookResult(allow=True)`` or a refusal with its reason.
+                """
+                name = _tool_name(getattr(data, "name", None))
+                if name != _SHELL_TOOL:
+                    return hook_result(allow=True)
+                raw_args = getattr(data, "args", None)
+                args: ToolArgs = dict(raw_args) if isinstance(raw_args, dict) else {}
+                denial = await executor._shell_command_denial(args)
+                if denial is None:
+                    return hook_result(allow=True)
+                state.shell_denials.append(denial)
+                queue = state.active_queue
+                if queue is not None:
+                    raw_id = getattr(data, "id", None)
+                    call_id = raw_id if isinstance(raw_id, str) and raw_id else uuid.uuid4().hex
+                    metadata = {"call_id": call_id}
+                    # Older SDKs stream the call before asking the hook, so its
+                    # request is already out; close it here instead.
+                    pending = state.pending_tools.pop(call_id, None)
+                    if pending is None:
+                        queue.put_nowait(ToolCallRequest(name=name, args=args, metadata=metadata))
+                    queue.put_nowait(
+                        ToolCallComplete(
+                            name=name,
+                            status=ToolCallStatus.ERROR,
+                            result=None,
+                            error=denial,
+                            duration_ms=(time.monotonic() - pending.started) * 1000
+                            if pending
+                            else 0.0,
+                            metadata=metadata,
+                        )
+                    )
+                return hook_result(allow=False, message=denial)
+
+        return _OmnigentShellGateHook()
+
+    async def _shell_command_denial(self, args: ToolArgs) -> str | None:
+        """Decide a shell command like the other SDK harnesses decide native tools.
+
+        1. Omnigent's TOOL_CALL policies: DENY refuses, ASK asks the user.
+        2. The permission mode: ``auto`` / ``bypassPermissions`` run the
+           command; any other mode asks the user on an approval card.
+
+        Fails closed: an evaluator error, an unknown verdict, or a needed
+        approval with no approval handler refuses the command.
+
+        :param args: The command's SDK arguments, e.g.
+            ``{"CommandLine": "ls", "Cwd": "/repo"}``.
+        :returns: ``None`` to run it, or the refusal message the model sees.
+        """
+        evaluator = self._policy_evaluator
+        if evaluator is not None:
+            try:
+                verdict = await evaluator(
+                    "PHASE_TOOL_CALL", {"name": _SHELL_TOOL, "arguments": args}
+                )
+            except Exception:
+                logger.exception("Antigravity shell-command policy evaluation failed")
+                return "Omnigent could not evaluate its policies for this command."
+            action = getattr(verdict, "action", None)
+            reason = getattr(verdict, "reason", None) or ""
+            if action == "POLICY_ACTION_DENY":
+                return f"Denied by Omnigent policy: {reason or 'no reason given'}"
+            if action == "POLICY_ACTION_ASK":
+                return await self._ask_to_run_shell_command(args)
+            if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
+                return f"Unexpected Omnigent policy verdict {action!r}; command not run."
+        if self._permission_mode in _NO_PROMPT_PERMISSION_MODES:
+            return None
+        return await self._ask_to_run_shell_command(args)
+
+    async def _ask_to_run_shell_command(self, args: ToolArgs) -> str | None:
+        """Ask the user on Omnigent's approval card; refuse when nobody can answer.
+
+        :param args: The command's SDK arguments, shown on the card.
+        :returns: ``None`` when approved, else the refusal message.
+        """
+        handler = self._elicitation_handler
+        if handler is None:
+            return "Approval is required to run this command, but none can be requested."
+        try:
+            approved = await handler(_SHELL_TOOL, args)
+        except Exception:
+            logger.exception("Antigravity shell-command approval request failed")
+            return "The approval request for this command failed; command not run."
+        return None if approved else "The user declined to run this command."
 
     def _build_sdk_tools(self, tools: list[ToolSpec]) -> list[SDKTool]:
         """Build SDK tools (plain callables) from Omnigent tool specs.

@@ -136,6 +136,25 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+The SDK's shell tool, `run_command`, follows the agent's Omnigent policies and
+`executor.config.permission_mode`, like native tools on the other SDK
+harnesses. Each call is first evaluated as a `tool_call` policy event named
+`run_command` with the SDK's own arguments (`CommandLine` and `Cwd` on recent
+SDKs, `command_line` on older ones): a DENY refuses it and an ASK asks on an
+approval card. Then the permission mode decides: `auto` (the default) and
+`bypassPermissions` run the command; any other value, e.g. `default`, asks on
+an approval card first. A refused command fails as a tool call with the reason,
+and the model carries on; rejecting the approval card ends the turn, as on the
+other SDK harnesses. The SDK's other built-in tools are not gated this way.
+
+```yaml
+executor:
+  type: omnigent
+  config:
+    harness: antigravity
+    permission_mode: default   # ask before every shell command
+```
+
 ### Codex tool switches
 
 With `harness: codex`, `web_search: false` turns off Codex's built-in web

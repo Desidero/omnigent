@@ -195,6 +195,14 @@ def test_vertex_config_threads_project_and_location() -> None:
     assert env["HARNESS_ANTIGRAVITY_LOCATION"] == "us-central1"
 
 
+@pytest.mark.parametrize("mode", [None, "default"])
+def test_permission_mode_threads_into_env_var(mode: str | None) -> None:
+    """``executor.config.permission_mode`` reaches the wrap; unset, the wrap default applies."""
+    config_extra = {} if mode is None else {"permission_mode": mode}
+    env = _build_antigravity_spawn_env(_make_spec(config_extra=config_extra))
+    assert env.get("HARNESS_ANTIGRAVITY_PERMISSION_MODE") == mode
+
+
 def test_databricks_auth_ignored_with_warning(caplog: pytest.LogCaptureFixture) -> None:
     """``DatabricksAuth`` is unsupported: no env var emitted, and a warning logged."""
     with caplog.at_level(logging.WARNING, logger=wf.__name__):

@@ -174,10 +174,11 @@ processes after teardown.
 Several were merged as-is and have **fix PRs in flight (#276–#281)** — verify
 against your checkout:
 
-- **Native/built-in tools bypass the TOOL_CALL policy.** Only a
-  `PostToolCallHook` (post-execution, can't block) was installed at merge, so a
-  DENY/ASK guardrail doesn't gate the SDK's native shell/file tools before they
-  run. Bridged `sys_*` tools route through the server. *(Fix: policy-enforcement PR.)*
+- **Native file tools bypass the TOOL_CALL policy.** The shell tool
+  (`run_command`) is gated before it runs by Omnigent policies and
+  `executor.config.permission_mode` (`auto` default; `default` asks on a card),
+  but the SDK's file tools (`create_file`, `edit_file`, …) still run ungated.
+  Bridged `sys_*` tools route through the server.
 - **LLM_REQUEST / LLM_RESPONSE policies aren't evaluated** in `run_turn` (prompt-
   deny / output-block silently ignored). *(Fix: policy-enforcement PR.)*
 - **History on a fresh/rebuilt session.** The SDK has no history-injection API,

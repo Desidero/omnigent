@@ -29,6 +29,10 @@ Env vars read at startup:
   e.g. ``"us-central1"``.
 - ``HARNESS_ANTIGRAVITY_OS_ENV``: JSON-encoded OS environment policy.
   Requested sandbox restrictions are rejected because the SDK cannot enforce them.
+- ``HARNESS_ANTIGRAVITY_PERMISSION_MODE``: Omnigent permission stance for the
+  SDK's shell tool, from ``executor.config.permission_mode``. ``auto``
+  (default) and ``bypassPermissions`` run a command no policy objects to; any
+  other value (e.g. ``default``) asks on an approval card first.
 """
 
 from __future__ import annotations
@@ -54,6 +58,7 @@ _ENV_VERTEX = "HARNESS_ANTIGRAVITY_VERTEX"
 _ENV_PROJECT = "HARNESS_ANTIGRAVITY_PROJECT"
 _ENV_LOCATION = "HARNESS_ANTIGRAVITY_LOCATION"
 _ENV_OS_ENV = "HARNESS_ANTIGRAVITY_OS_ENV"
+_ENV_PERMISSION_MODE = "HARNESS_ANTIGRAVITY_PERMISSION_MODE"
 
 # Truthy spellings accepted for the boolean Vertex flag.
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -75,6 +80,7 @@ def _build_antigravity_executor() -> Executor:
         vertex=os.environ.get(_ENV_VERTEX, "").strip().lower() in _TRUTHY,
         project=os.environ.get(_ENV_PROJECT) or None,
         location=os.environ.get(_ENV_LOCATION) or None,
+        permission_mode=os.environ.get(_ENV_PERMISSION_MODE, "").strip() or "auto",
     )
 
 
@@ -88,5 +94,7 @@ def create_app() -> FastAPI:
     :returns: The FastAPI app from :class:`ExecutorAdapter`'s
         :meth:`build` method.
     """
-    adapter = ExecutorAdapter(executor_factory=_build_antigravity_executor)
+    adapter = ExecutorAdapter(
+        executor_factory=_build_antigravity_executor, harness_label="Antigravity"
+    )
     return adapter.build()
