@@ -928,6 +928,17 @@ export interface SessionJournalAppendedEvent {
 }
 
 /**
+ * `session.open_items.changed` — stored open items of the session were raised
+ * or changed. Transient: a client that reconnects reads the list again.
+ */
+export interface SessionOpenItemsChangedEvent {
+  type: "session_open_items_changed";
+  conversationId: string;
+  /** The labels written, e.g. `["Q7"]`. */
+  labels: string[];
+}
+
+/**
  * `session.changed_files.invalidated` — the session's changed-files list
  * may have changed; the consumer should refetch it. Coarse signal (no
  * per-file payload).
@@ -1095,6 +1106,7 @@ export type StreamEvent =
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent
   | SessionJournalAppendedEvent
+  | SessionOpenItemsChangedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionModelOptionsEvent
