@@ -40,37 +40,76 @@ inbox is runner-local); the tool result and docs say to check it with
 sys_session_get_info. Its runner acknowledges the completion instead of
 making the forwarder retry for minutes.
 
+Smart Routing decides which router may answer from the gateway backing a
+host reports, and a host reports it for its default provider only. A
+session created with provider_override runs on another account, yet it was
+still counted as gateway-backed whenever the host's default was (or the
+host had reported nothing). The workspace router then picked a gateway
+catalog id for a session on, say, a Claude subscription, and the pick was
+pinned as its model. A child on its own account was also offered its
+parent's catalog, which lists the parent's provider's models, so the
+built-in judge could hand it the same kind of id.
+
+A session that chose a provider is now never counted as gateway-backed: the
+server cannot tell whether that account reaches the gateway's catalog, so
+the workspace router and the static databricks-* table are out of play and
+the built-in judge answers from a catalog the session's own runner
+resolved. That covers message turns, native panes, the first-prompt and
+sub-agent spawn hooks, and child sessions.
+
+- A child whose account differs from its parent's is offered its own
+  runner's catalog. When that lists nothing for its harness the child is
+  not routed and keeps the model its orchestrator asked for.
+- An auto-harness child has no family to inherit an account by but shares
+  its parent's runner, so the parent's account counts for it too.
+- A native create on a chosen account is not routed at create: the host's
+  pre-launch catalog describes its default provider. An auto-harness create
+  keeps the wrapper the client named. The first prompt routes instead, off
+  the pane's own vocabulary.
+
+Sessions without a provider_override are routed as before.
+
 Signed-off-by: Desidero <desidero@gmail.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 (cherry picked from commit f72a7ba03eae839f9dff878bfa34669902c32daf)
 ---
- docs/providers.md                             |  29 +++
+ docs/providers.md                             |  36 +++
  feature-map/native-harnesses.md               |   9 +
  omnigent/onboarding/subscription_accounts.py  |  35 +++
  omnigent/runner/app.py                        |   7 +-
- omnigent/runner/child_account.py              | 130 ++++++++++
- omnigent/runner/tool_dispatch.py              | 205 ++++++++++++++--
- .../server/routes/_sessions/orchestration.py  |   8 +-
+ omnigent/runner/child_account.py              | 130 +++++++++
+ omnigent/runner/tool_dispatch.py              | 205 +++++++++++++--
+ .../server/routes/_sessions/orchestration.py  | 140 +++++++++-
  omnigent/server/schemas.py                    |   3 +-
- omnigent/tools/builtins/list_models.py        |  41 +++-
+ omnigent/tools/builtins/list_models.py        |  41 ++-
  omnigent/tools/builtins/spawn.py              |  20 ++
  .../onboarding/test_subscription_accounts.py  |  61 +++++
  .../test_native_subagent_inbox_delivery.py    |  22 ++
- tests/runner/test_runner_dispatch.py          | 224 +++++++++++++++++-
- .../integration/test_session_host_launch.py   |  42 ++++
+ tests/runner/test_runner_dispatch.py          | 224 +++++++++++++++-
+ .../integration/test_routing_integration.py   | 246 +++++++++++++++++-
+ .../integration/test_session_host_launch.py   |  42 +++
+ .../test_native_smart_routing_create.py       |  84 ++++++
  .../test_subagent_status_forward_recovery.py  |  33 +++
- tests/tools/builtins/test_list_models.py      |  42 ++++
- 16 files changed, 882 insertions(+), 29 deletions(-)
+ tests/tools/builtins/test_list_models.py      |  42 +++
+ 18 files changed, 1339 insertions(+), 41 deletions(-)
  create mode 100644 omnigent/runner/child_account.py
 
 diff --git a/docs/providers.md b/docs/providers.md
-index aab5b61f7e379140766ee392e6d102f962c91914..168804089f68bb1b8dd344f3c49c58385ee92bcc 100644
+index aab5b61f7e379140766ee392e6d102f962c91914..5629dce3e48029147ab0713debbb4963e28b1838 100644
 --- a/docs/providers.md
 +++ b/docs/providers.md
-@@ -131,6 +131,35 @@ How the choice applies:
+@@ -130,6 +130,42 @@ How the choice applies:
+   choice for it.
  - Only sessions on a connected host can choose. Managed sandboxes use their
    deployment's inference settings.
- 
++- Smart Routing never asks the workspace router for a session on a chosen
++  provider, because a host reports gateway backing for its default provider
++  only. The built-in routing model picks from the models the session's own
++  runner lists; a server without one leaves the session unrouted. A native
++  session is routed on its first prompt instead of at create, and a sub-agent
++  on another account than its parent is offered its own runner's models, not
++  the parent's.
++
 +## Child sessions an agent starts
 +
 +An agent with `spawn: true` can start a child session on one of its host's
@@ -99,10 +138,9 @@ index aab5b61f7e379140766ee392e6d102f962c91914..168804089f68bb1b8dd344f3c49c5838
 +runner on the same host and workspace. It does not wake the parent when it
 +finishes, so the parent checks it with `sys_session_get_info` or
 +`sys_session_get_history`.
-+
+ 
  ## Switching a running session
  
- A Claude session (claude-native or claude-sdk) can move to another provider
 diff --git a/feature-map/native-harnesses.md b/feature-map/native-harnesses.md
 index 2c48f230fd1fb8ce84009f39cbc8fbbc06f107d8..3c7f56a4312b03c2625fa20aa3630458a8b33a5b 100644
 --- a/feature-map/native-harnesses.md
@@ -584,7 +622,7 @@ index ff418c0ed295e0a5cb1dbbbc8bf0ecccdb801fd5..ad6f86fe225d031133719662326e7587
      server_client: httpx.AsyncClient,
      *,
 diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
-index b8949d624308eeafedfdb87f448a1568d6928e97..de07d51c26c810954e04d61260fcf99d42a5bb98 100644
+index b8949d624308eeafedfdb87f448a1568d6928e97..3c4f774b7aaba592c5f6c89b6a08bcb8da1f90cc 100644
 --- a/omnigent/server/routes/_sessions/orchestration.py
 +++ b/omnigent/server/routes/_sessions/orchestration.py
 @@ -4578,6 +4578,10 @@ async def _heal_subagent_runner_binding_via_parent(
@@ -598,7 +636,221 @@ index b8949d624308eeafedfdb87f448a1568d6928e97..de07d51c26c810954e04d61260fcf99d
      candidate_ids: list[str] = []
      if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
          candidate_ids.append(child_conv.parent_conversation_id)
-@@ -13403,7 +13407,9 @@ async def _create_session_from_existing_agent(
+@@ -8514,14 +8518,20 @@ async def _forward_event_to_runner(
+             # every one of them must be gateway-backed for the workspace router
+             # to serve the pick; otherwise the built-in judge does.
+             _auto_backed = _gateway_backed(
+-                await _session_routing_host(conv, host_store), _AUTO_ROUTING_HARNESSES
++                await _session_routing_host(conv, host_store),
++                _AUTO_ROUTING_HARNESSES,
++                provider_override=await _runner_account(conv, conversation_store),
+             )
+             # For a forced-auto child, route against the parent's catalog (full
+             # spawnable-worker map) rather than the child's leaf "self" catalog.
++            # A child that chose a provider has its own runner, and is offered
++            # that runner's catalog instead.
+             _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
+                 _auto_text,
+                 session_id=session_id,
+-                catalog_session_id=conv.parent_conversation_id,
++                catalog_session_id=(
++                    None if conv.provider_override is not None else conv.parent_conversation_id
++                ),
+                 runner_client=runner_client,
+                 gateway_backed=_auto_backed,
+                 allow_static_fallback=_auto_backed,
+@@ -8660,18 +8670,30 @@ async def _forward_event_to_runner(
+                 _child_host = await _session_routing_host(conv, host_store)
+                 if _child_host is None and _parent_conv is not None:
+                     _child_host = await _session_routing_host(_parent_conv, host_store)
+-                _child_backed = _gateway_backed(_child_host, _child_gateway_harnesses)
++                _child_backed = _gateway_backed(
++                    _child_host,
++                    _child_gateway_harnesses,
++                    provider_override=conv.provider_override,
++                )
+                 # Route against the PARENT's catalog: it enumerates the
+                 # spawnable workers (claude_code/codex/pi) with full model
+                 # lists, whereas this child's own leaf catalog is "self"-only
+                 # and would force the static fallback (a smaller/different set).
++                # A child on another account is offered its own runner's
++                # catalog instead: the parent's lists another provider's models.
++                _own_account = _on_own_account(conv, _parent_conv)
+                 _routed_harness, _routed_model, _verdict, _route_err = await route_session_harness(
+                     _user_text,
+                     session_id=session_id,
+-                    catalog_session_id=conv.parent_conversation_id,
++                    catalog_session_id=None if _own_account else conv.parent_conversation_id,
+                     runner_client=runner_client,
+                     allowed_family=_child_family,
+                     harness_candidates=_child_candidates,
++                    catalog=(
++                        await _own_runner_catalog(session_id, _child_harness, runner_client)
++                        if _own_account and _child_harness is not None and _child_pinned
++                        else None
++                    ),
+                     gateway_backed=_child_backed,
+                     allow_static_fallback=_child_backed,
+                 )
+@@ -8718,7 +8740,9 @@ async def _forward_event_to_runner(
+                 # A turn cannot change harness, so only this session's own
+                 # family has to be gateway-backed for the workspace router.
+                 _turn_backed = _gateway_backed(
+-                    await _session_routing_host(conv, host_store), (_harness or "",)
++                    await _session_routing_host(conv, host_store),
++                    (_harness or "",),
++                    provider_override=conv.provider_override,
+                 )
+                 # ``_or_decline``: a routing outage returns an error string
+                 # rather than raising. Raised here it became a 500 on the
+@@ -9524,7 +9548,9 @@ async def _dispatch_session_event_to_runner_impl(
+                 # the gateway the built-in judge routes off the pane's picker
+                 # vocabulary, which is the only reachable candidate set anyway.
+                 _native_backed = _gateway_backed(
+-                    await _session_routing_host(conv, host_store), (_harness or "",)
++                    await _session_routing_host(conv, host_store),
++                    (_harness or "",),
++                    provider_override=conv.provider_override,
+                 )
+                 # ``_or_decline``: a routing outage must not 500 the message
+                 # POST. The pane keeps its own model and the card says why.
+@@ -12155,16 +12181,87 @@ def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -
+     return not_gateway_backed(reported_gateway_inference(host), harnesses)
+ 
+ 
+-def _gateway_backed(host: Host | None, harnesses: Sequence[str]) -> bool:
++def _gateway_backed(
++    host: Host | None,
++    harnesses: Sequence[str],
++    *,
++    provider_override: str | None = None,
++) -> bool:
+     """Whether the external router can serve a call over *harnesses* on *host*.
+ 
++    A host reports gateway backing for its default provider only, so a session
++    that chose a provider is never counted as backed: the server cannot tell
++    whether that account reaches the gateway's catalog.
++
+     :param host: The session's target host, or ``None``.
+     :param harnesses: Every harness family the call may land on.
+-    :returns: ``True`` unless the host explicitly reports one as not backed.
++    :param provider_override: The session's chosen provider, e.g.
++        ``"claude-max2"``, or ``None`` for the host default.
++    :returns: ``True`` unless the session chose a provider or the host
++        explicitly reports a harness as not backed.
+     """
++    if provider_override is not None:
++        return False
+     return not _ungatewayed_native_harnesses(host, harnesses)
+ 
+ 
++def _on_own_account(conv: Conversation, parent: Conversation | None) -> bool:
++    """Whether *conv* runs on a provider account its parent does not share.
++
++    :param conv: The child session row.
++    :param parent: Its parent's row, or ``None`` when it cannot be read.
++    :returns: ``True`` when the parent's model catalog, resolved under the
++        parent's provider, does not describe what *conv* can run.
++    """
++    return conv.provider_override is not None and (
++        parent is None or parent.provider_override != conv.provider_override
++    )
++
++
++async def _runner_account(
++    conv: Conversation,
++    conversation_store: ConversationStore,
++) -> str | None:
++    """The provider account an auto-harness session's runner was launched on.
++
++    An auto child has no harness family to inherit its parent's account by,
++    yet it shares the parent's runner, where that account serves its families.
++
++    :param conv: The session row, top-level or child.
++    :param conversation_store: Store used to read the parent row.
++    :returns: The session's own provider, else its parent's, else ``None``.
++    """
++    if conv.provider_override is not None or conv.parent_conversation_id is None:
++        return conv.provider_override
++    parent = await asyncio.to_thread(
++        conversation_store.get_conversation, conv.parent_conversation_id
++    )
++    return parent.provider_override if parent is not None else None
++
++
++async def _own_runner_catalog(
++    session_id: str,
++    harness: str,
++    runner_client: httpx.AsyncClient,
++) -> dict[str, list[str]] | None:
++    """The models *harness* can run on this session's own runner.
++
++    A runner resolves its catalog under the provider it was launched on, so
++    this is the account-accurate candidate list for a session that chose one.
++
++    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
++    :param harness: The session's own harness, e.g. ``"claude-sdk"``.
++    :param runner_client: HTTP client pointed at the session's runner.
++    :returns: ``{harness: model ids}``, or ``None`` when the runner lists none.
++    """
++    from omnigent.server.smart_routing import catalog_models_for_harness, fetch_runner_models
++
++    models = catalog_models_for_harness(
++        await fetch_runner_models(session_id, runner_client), harness, allow_self=True
++    )
++    return {harness: models} if models else None
++
++
+ def _oss_routing_available(caps: Any = None) -> bool:  # type: ignore[explicit-any]
+     """Whether the built-in judge can answer for a harness off the gateway.
+ 
+@@ -12260,10 +12357,15 @@ async def _spawn_gateway_backed(
+     :param request: Used to reach the app's host store.
+     :param conv: The parent session row.
+     :param harnesses: Every harness family the spawn may land on.
+-    :returns: ``True`` unless the host explicitly reports one as not backed.
++    :returns: ``True`` unless the session chose a provider or the host
++        explicitly reports a harness as not backed.
+     """
+     host_store = getattr(request.app.state, "host_store", None)
+-    return _gateway_backed(await _session_routing_host(conv, host_store), harnesses)
++    return _gateway_backed(
++        await _session_routing_host(conv, host_store),
++        harnesses,
++        provider_override=conv.provider_override,
++    )
+ 
+ 
+ def _harness_labels(harnesses: Sequence[str]) -> str:
+@@ -12556,6 +12658,10 @@ def _fixed_native_routing_harness(
+     # A client-pinned model wins over the router, exactly as it does per turn.
+     if body.model_override is not None:
+         return None
++    # The host's pre-launch catalog lists its default provider's models, so a
++    # session on a chosen account routes on its first prompt, off its own pane.
++    if body.provider_override is not None:
++        return None
+     harness = _create_resolved_harness(agent, body.harness_override, agent_cache)
+     return harness if harness in AUTO_NATIVE_ROUTING_HARNESSES else None
+ 
+@@ -13068,7 +13174,15 @@ async def _create_session_from_existing_agent(
+     _native_routed_model: str | None = None
+     _native_routing_verdict: dict[str, Any] | None = None
+     _native_routing_error: str | None = None
+-    if _native_smart_routing:
++    if _native_smart_routing and body.provider_override is not None:
++        # An account serves one CLI family, and the host's pre-launch catalog
++        # lists its default provider's models: keep the wrapper the client
++        # named and leave the model to the pane's first prompt.
++        _native_routing_error = (
++            f"Not routed at create: this session runs on the {body.provider_override!r} "
++            "account, so it keeps the harness it was created with."
++        )
++    elif _native_smart_routing:
+         (
+             _routed_agent_name,
+             _native_routed_model,
+@@ -13403,7 +13517,9 @@ async def _create_session_from_existing_agent(
      # Inherit runner affinity from the parent session so the child
      # is assigned to the same runner (sub-agent co-location).
      inherited_runner_id: str | None = None
@@ -1094,6 +1346,281 @@ index da1a5d41a7b15d0eb446e6ed871ceacb52a852e0..cf2a4202a6a6e414be7c27795b295f85
  @pytest.mark.asyncio
  async def test_sys_session_get_info_defaults_to_caller_session() -> None:
      """
+diff --git a/tests/server/integration/test_routing_integration.py b/tests/server/integration/test_routing_integration.py
+index 8600cadcf2f23ae1d6be55ec481ece6ca7e6343f..efa5e5bd06b4e446a4e83e050f4acd2f6c99ac7d 100644
+--- a/tests/server/integration/test_routing_integration.py
++++ b/tests/server/integration/test_routing_integration.py
+@@ -1450,6 +1450,7 @@ async def _dispatch_native_turn(
+     *,
+     model: str,
+     routing_client: Any = None,  # type: ignore[explicit-any]
++    caps: FakeCaps | None = None,
+ ) -> tuple[Any, list[dict[str, Any]]]:
+     """Send one web message into a native pane with the router returning *model*.
+ 
+@@ -1458,6 +1459,8 @@ async def _dispatch_native_turn(
+     :param model: Model the fake router picks for this turn.
+     :param routing_client: Routing-client double to use, so a caller can read
+         back what was offered. ``None`` builds one returning *model*.
++    :param caps: Whole caps double, for a deployment with more than one router;
++        *model* and *routing_client* are then unused.
+     :returns: The last routing-decision item's data and the forwarded bodies.
+     """
+     forwarded: list[dict[str, Any]] = []
+@@ -1467,7 +1470,7 @@ async def _dispatch_native_turn(
+             forwarded.append(json.loads(request.content))
+         return httpx.Response(202, json={"queued": True})
+ 
+-    caps = FakeCaps(
++    caps = caps or FakeCaps(
+         routing_client=routing_client
+         if routing_client is not None
+         else FakeRoutingClient(
+@@ -2232,3 +2235,244 @@ async def test_an_auto_harness_outage_leaves_the_route_once_label_unclaimed(
+     assert routed is not None
+     assert routed.model_override == GPT_MODEL
+     assert routed.labels.get(ROUTING_DECISION_LABEL_KEY)
++
++
++# ── 11. A session on a chosen provider account ─────────────────────
++#
++# A host reports gateway backing for its DEFAULT provider. A session created
++# with ``provider_override`` runs on another account, so the workspace router's
++# picks and any catalog resolved under another provider are not its models.
++
++_ACCOUNT = "claude-max2"
++_ACCOUNT_MODELS = ["claude-sonnet-4-6", "claude-opus-4-8"]
++_ACCOUNT_PICK = "claude-opus-4-8"
++
++
++def _workspace_router_and_judge() -> tuple[FakeRoutingClient, FakeRoutingClient, FakeCaps]:
++    """A deployment with both routers, each answering in its own vocabulary.
++
++    :returns: ``(external, local, caps)``: the workspace router picks a gateway
++        catalog id, the built-in judge an id the account serves.
++    """
++    from omnigent.server.routing_backend import RoutingBackends
++
++    external = FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="workspace pick"))
++    local = FakeRoutingClient(
++        RoutingResult(model=_ACCOUNT_PICK, rationale="judge pick", harness="claude-sdk")
++    )
++    caps = FakeCaps(
++        routing_client=external,
++        routing_backends=RoutingBackends(external=external, local=local),
++    )
++    return external, local, caps
++
++
++def _catalog_runner_client(catalogs: dict[str, dict[str, list[str]]]) -> httpx.AsyncClient:
++    """A runner that serves each session's model catalog and acks every turn.
++
++    :param catalogs: Session id → worker name → model ids, e.g.
++        ``{"conv_1": {"self": ["claude-opus-4-8"]}}``. Other sessions get none.
++    :returns: The runner client.
++    """
++
++    def _handler(request: httpx.Request) -> httpx.Response:
++        parts = request.url.path.split("/")
++        if request.method == "GET" and parts[-1] == "models":
++            workers = {
++                worker: {"models": [{"id": model} for model in models]}
++                for worker, models in catalogs.get(parts[-2], {}).items()
++            }
++            return httpx.Response(200, json={"workers": workers})
++        return httpx.Response(202, json={"queued": True})
++
++    return httpx.AsyncClient(
++        base_url="http://runner.test", transport=httpx.MockTransport(_handler)
++    )
++
++
++@pytest.mark.parametrize(
++    ("case", "parent_account", "parent_models", "own_models", "offered", "pinned"),
++    [
++        # The child chose its own account: its runner's catalog is the only one
++        # that lists what that account serves.
++        (
++            "own-account",
++            None,
++            [ROUTED_MODEL, LLM_PICKED_MODEL],
++            _ACCOUNT_MODELS,
++            [{"claude-sdk": _ACCOUNT_MODELS}],
++            _ACCOUNT_PICK,
++        ),
++        # Nothing account-accurate to offer: the child keeps the model its
++        # orchestrator asked for rather than one from the parent's provider.
++        ("own-account-no-catalog", None, [ROUTED_MODEL, LLM_PICKED_MODEL], None, [], None),
++        # A child on its parent's account shares the parent's catalog.
++        (
++            "parents-account",
++            _ACCOUNT,
++            _ACCOUNT_MODELS,
++            None,
++            [{"claude-sdk": _ACCOUNT_MODELS}],
++            _ACCOUNT_PICK,
++        ),
++    ],
++)
++async def test_a_child_on_a_chosen_account_is_routed_within_that_account(
++    client: httpx.AsyncClient,
++    db_uri: str,
++    case: str,
++    parent_account: str | None,
++    parent_models: list[str],
++    own_models: list[str] | None,
++    offered: list[dict[str, list[str]]],
++    pinned: str | None,
++) -> None:
++    """The workspace router never picks for a child that runs on an account."""
++    parent_id, child, conv_store = await _pinned_parent_and_child(
++        client, db_uri, agent_name=f"routing-account-{case}", harness="claude-sdk"
++    )
++    if parent_account is not None:
++        conv_store.set_provider_override(parent_id, parent_account)
++    conv_store.set_provider_override(child.id, _ACCOUNT)
++    child = conv_store.update_conversation(child.id, model_override=LLM_PICKED_MODEL)
++    assert child is not None and child.provider_override == _ACCOUNT
++
++    catalogs = {parent_id: {"claude_code": parent_models}}
++    if own_models is not None:
++        catalogs[child.id] = {"self": own_models}
++    external, local, caps = _workspace_router_and_judge()
++    body = SessionEventInput(
++        type="message",
++        data={"role": "user", "content": [{"type": "input_text", "text": "audit routing"}]},
++    )
++    with patch("omnigent.runtime._globals._caps", new=caps):
++        async with _catalog_runner_client(catalogs) as runner_client:
++            await orchestration_module._forward_event_to_runner(
++                child.id, child, body, conv_store, runner_client
++            )
++
++    assert external.calls == []
++    assert local.offered == offered
++    refreshed = conv_store.get_conversation(child.id)
++    assert refreshed is not None
++    assert refreshed.model_override == (pinned or LLM_PICKED_MODEL)
++    decisions = _routing_decisions(conv_store, child.id)
++    assert len(decisions) == 1
++    assert decisions[0].data.applied is (pinned is not None)
++    if pinned is not None:
++        assert decisions[0].data.router_source == "oss-llm"
++
++
++@pytest.mark.parametrize(
++    ("case", "account_holder", "catalog_holder"),
++    [
++        # The child chose the account, so it has a runner and a catalog of its own.
++        ("own-account", "child", "child"),
++        # No family to inherit by, but it shares the runner of a parent on one.
++        ("parents-runner", "parent", "parent"),
++    ],
++)
++async def test_an_auto_child_on_a_chosen_account_is_routed_within_that_account(
++    client: httpx.AsyncClient,
++    db_uri: str,
++    case: str,
++    account_holder: str,
++    catalog_holder: str,
++) -> None:
++    """Whichever row names the account, an auto child's runner is on it."""
++    parent_id, child, conv_store = await _auto_parent_and_child(
++        client,
++        db_uri,
++        agent_name=f"routing-account-auto-{case}",
++        cost_control="on",
++        subagent_routing="on",
++    )
++    assert child.harness_override == "auto"
++    ids = {"parent": parent_id, "child": child.id}
++    conv_store.set_provider_override(ids[account_holder], _ACCOUNT)
++    child = conv_store.get_conversation(child.id)
++    assert child is not None
++    # Whoever does not hold the account-accurate catalog lists gateway ids.
++    catalogs = {session_id: {"claude_code": [ROUTED_MODEL]} for session_id in ids.values()}
++    catalogs[ids[catalog_holder]] = {"claude_code": _ACCOUNT_MODELS}
++    external, local, caps = _workspace_router_and_judge()
++    body = SessionEventInput(
++        type="message",
++        data={"role": "user", "content": [{"type": "input_text", "text": "audit routing"}]},
++    )
++    with patch("omnigent.runtime._globals._caps", new=caps):
++        async with _catalog_runner_client(catalogs) as runner_client:
++            await orchestration_module._forward_event_to_runner(
++                child.id, child, body, conv_store, runner_client
++            )
++
++    assert external.calls == []
++    assert local.offered == [{"claude-sdk": _ACCOUNT_MODELS}]
++    refreshed = conv_store.get_conversation(child.id)
++    assert refreshed is not None
++    assert (refreshed.harness_override, refreshed.model_override) == ("claude-sdk", _ACCOUNT_PICK)
++
++
++async def test_a_native_child_pane_on_a_chosen_account_is_routed_by_the_judge(
++    client: httpx.AsyncClient,
++    db_uri: str,
++) -> None:
++    """A pane on an account is offered its own vocabulary, by the judge."""
++    child, conv_store = await _native_child(client, db_uri, agent_name="routing-account-pane")
++    conv_store.set_provider_override(child.id, _ACCOUNT)
++    child = conv_store.get_conversation(child.id)
++    assert child is not None
++    external, local, caps = _workspace_router_and_judge()
++    orchestration_module._model_options_cache[child.id] = [
++        {"id": "opus", "model": _ACCOUNT_PICK},
++    ]
++    try:
++        decision, forwards = await _dispatch_native_turn(
++            child, conv_store, model=_ACCOUNT_PICK, caps=caps
++        )
++    finally:
++        orchestration_module._model_options_cache.pop(child.id, None)
++
++    assert external.calls == []
++    assert [list(offer.values()) for offer in local.offered] == [[[_ACCOUNT_PICK]]]
++    assert decision.router_source == "oss-llm"
++    assert [f.get("model_override") for f in forwards] == [_ACCOUNT_PICK]
++
++
++async def test_the_subagent_relay_uses_the_judge_for_a_parent_on_a_chosen_account(
++    client: httpx.AsyncClient,
++    db_uri: str,
++) -> None:
++    """A pane's own spawns run on its account, whatever the host's default is."""
++    parent, _child, conv_store = await _parent_and_child(
++        client, db_uri, agent_name="routing-account-relay"
++    )
++    conv_store.set_provider_override(parent["id"], _ACCOUNT)
++    external, _local, caps = _workspace_router_and_judge()
++    # The host's default provider is the gateway; the session's account is not.
++    gatewayed = _host_reporting_gateway({"claude-native": True})
++    with (
++        patch("omnigent.runtime._globals._caps", new=caps),
++        patch.object(
++            orchestration_module, "_session_routing_host", AsyncMock(return_value=gatewayed)
++        ),
++        patch.object(
++            subagent_routing,
++            "candidate_models",
++            lambda harness, **kwargs: {harness: list(_ACCOUNT_MODELS)},
++        ),
++    ):
++        resp = await client.post(
++            f"/v1/sessions/{parent['id']}/hooks/route-subagent",
++            json={
++                "harness": "claude-native",
++                "task_name": "code-reviewer",
++                "prompt": "review the auth module",
++                "parent_model": _ACCOUNT_MODELS[0],
++            },
++        )
++
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["router_source"] == "oss-llm"
++    assert resp.json()["model"] == _ACCOUNT_PICK
++    assert external.calls == []
 diff --git a/tests/server/integration/test_session_host_launch.py b/tests/server/integration/test_session_host_launch.py
 index b446460a7a407f6ace52658e95483400bc16ed27..7a95a58f0bb6f908d31cc829ab07af338744583c 100644
 --- a/tests/server/integration/test_session_host_launch.py
@@ -1147,6 +1674,108 @@ index b446460a7a407f6ace52658e95483400bc16ed27..7a95a58f0bb6f908d31cc829ab07af33
  @pytest.mark.parametrize(
      "payload,capabilities,detail",
      [
+diff --git a/tests/server/routes/test_native_smart_routing_create.py b/tests/server/routes/test_native_smart_routing_create.py
+index 350262e856bf9ad46f59ec41fd557922fb14da89..981d0920f0ecebedd70a195f2efd3e29d0002ba3 100644
+--- a/tests/server/routes/test_native_smart_routing_create.py
++++ b/tests/server/routes/test_native_smart_routing_create.py
+@@ -607,6 +607,79 @@ async def test_an_outage_at_create_leaves_the_first_prompt_free_to_route(
+     assert conv.model_override == CLAUDE_MODEL
+ 
+ 
++@pytest.mark.parametrize(
++    "create_body",
++    [{}, {"harness_override": "auto"}],
++    ids=["fixed-harness", "auto-harness"],
++)
++async def test_a_create_on_a_chosen_account_routes_on_its_first_prompt_instead(
++    client: httpx.AsyncClient,
++    db_uri: str,
++    create_body: dict[str, str],
++) -> None:
++    """Before launch nothing describes the account: not the host's catalog, not its gateway report.
++
++    The pane's own vocabulary does, so the built-in judge routes the first
++    prompt off it and the workspace router is never asked.
++    """
++    from omnigent.server.routes._sessions import orchestration
++    from omnigent.server.routing_backend import RoutingBackends
++
++    wrappers = await _native_wrappers(client, db_uri)
++    external = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="workspace pick"))
++    judge = FakeRoutingClient(RoutingResult(model="claude-opus-4-8", rationale="judge pick"))
++    caps = FakeCaps(
++        routing_client=external,
++        routing_backends=RoutingBackends(external=external, local=judge),
++    )
++    with (
++        patch("omnigent.runtime._globals._caps", new=caps),
++        # Choosing a provider needs a connected host, which is not under test.
++        patch.object(
++            orchestration, "_validated_provider_override", lambda value, *_a, **_k: value
++        ),
++    ):
++        created = await client.post(
++            "/v1/sessions",
++            json={
++                "agent_id": wrappers["claude-native"],
++                "cost_control_mode_override": "on",
++                "smart_routing_message": ROUTING_MESSAGE,
++                "provider_override": "claude-max2",
++                **create_body,
++            },
++        )
++        assert created.status_code == 201, created.text
++        session_id = created.json()["id"]
++        assert (external.offered, judge.offered) == ([], [])
++        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
++        assert conv is not None
++        assert conv.provider_override == "claude-max2"
++        # The pane the client named, on the account's own default model.
++        assert conv.agent_id == wrappers["claude-native"]
++        assert conv.model_override is None
++        assert ROUTING_DECISION_LABEL_KEY not in conv.labels
++
++        orchestration._model_options_cache[session_id] = [
++            {"id": "opus", "model": "claude-opus-4-8"}
++        ]
++        try:
++            route = await client.post(
++                f"/v1/sessions/{session_id}/hooks/route-turn",
++                json={"harness": "claude-native", "prompt": ROUTING_MESSAGE},
++            )
++        finally:
++            orchestration._model_options_cache.pop(session_id, None)
++
++    assert route.status_code == 200, route.text
++    assert route.json()["action"] == "route"
++    assert external.offered == []
++    assert judge.offered == [{"claude-native": ["claude-opus-4-8"]}]
++    routed = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
++    assert routed is not None
++    assert routed.model_override == "claude-opus-4-8"
++
++
+ async def test_bundle_agent_auto_path_is_unchanged(
+     client: httpx.AsyncClient,
+     db_uri: str,
+@@ -1157,6 +1230,17 @@ def test_ungatewayed_native_harnesses_without_a_host(
+     assert _ungatewayed_native_harnesses(None, AUTO_NATIVE_ROUTING_HARNESSES) == []
+ 
+ 
++def test_a_chosen_provider_is_never_counted_as_gateway_backed(
++    gateway_host_registry: HostRegistry,
++) -> None:
++    """The host's report describes its default provider, not the session's."""
++    from omnigent.server.routes._sessions.orchestration import _gateway_backed
++
++    host = _host_reporting({"claude-native": True})
++    assert _gateway_backed(host, ("claude-native",)) is True
++    assert _gateway_backed(host, ("claude-native",), provider_override="claude-max2") is False
++
++
+ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
+     """A request whose host store serves *host* and whose registry is empty."""
+     return SimpleNamespace(
 diff --git a/tests/server/routes/test_subagent_status_forward_recovery.py b/tests/server/routes/test_subagent_status_forward_recovery.py
 index c348e80e00604c816afd41b6cf523672c2aba2a3..500bcf4bf1af00d39abdf06b909b362e0422ec39 100644
 --- a/tests/server/routes/test_subagent_status_forward_recovery.py
