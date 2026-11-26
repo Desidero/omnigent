@@ -135,8 +135,9 @@ describe("the Open items panel on a server that stores them", () => {
     expect(panel.textContent).toContain("Answered (1)");
     const r1 = within(panel).getByRole("button", { name: "Item R1, chat only" });
     expect(r1.textContent).toContain("chat only");
+    // The chat struck Q1, but chat text never changes a stored item.
     const q1 = within(panel).getByRole("button", { name: "Item Q1" });
-    expect(q1.textContent).toContain("closed in chat");
+    expect(q1.textContent).not.toContain("closed in chat");
     expect(within(panel).getByRole("button", { name: "Dismiss item R1" })).toBeTruthy();
     expect(within(panel).getByRole("button", { name: "Close item Q1" })).toBeTruthy();
   });
@@ -172,7 +173,7 @@ describe("the Open items panel on a server that stores them", () => {
     expect(session?.labels[DISMISSED_ITEMS_LABEL_KEY]).toBeUndefined();
   });
 
-  it("expands a row to its detail, answers and outcome, and reopens or retopics it", async () => {
+  it("expands a row to its detail, thread and outcome, and reopens or retopics it", async () => {
     renderPanel(
       [ITEMS, "~~[Q1]~~ done.", "Looking at the rest."],
       [
@@ -182,7 +183,10 @@ describe("the Open items panel on a server that stores them", () => {
           resolution: "Nightly batches",
           closed_by: "agent",
           closed_at: 1_764_100_500,
-          answers: [{ text: "Yes, nightly", at: 1_764_100_100, by: "bob@example.com" }],
+          replies: [
+            { author: "user", text: "Nightly?", at: 1_764_100_100, by: "bob@example.com" },
+            { author: "agent", text: "Yes, nightly", at: 1_764_100_200 },
+          ],
           links: [{ url: "https://example.com/pr/1", label: "PR 1" }],
           topic: "cache",
         }),
@@ -195,7 +199,15 @@ describe("the Open items panel on a server that stores them", () => {
     fireEvent.click(within(panel).getByRole("button", { name: "Item Q1 (closed)" }));
     const details = within(panel).getByTestId("open-item-details");
     expect(details.textContent).toContain("backfill");
-    expect(details.textContent).toContain("Yes, nightly");
+    expect(
+      within(details)
+        .getAllByTestId("open-item-reply")
+        .map((reply) => [reply.dataset.author, reply.textContent]),
+    ).toEqual([
+      ["user", expect.stringContaining("Nightly?")],
+      ["agent", expect.stringContaining("Yes, nightly")],
+    ]);
+    expect(details.textContent).toContain("bob@example.com");
     expect(details.textContent).toContain("Closed by the agent");
     expect(details.textContent).toContain("Nightly batches");
     expect(within(details).getByRole("link", { name: "PR 1" })).toBeTruthy();
@@ -212,16 +224,27 @@ describe("the Open items panel on a server that stores them", () => {
     expect(await patchBody(1)).toEqual({ updates: [{ label: "Q1", topic: "release" }] });
   });
 
-  it("closes an item the chat closed with the chat's sentence as its resolution", async () => {
-    renderPanel([ITEMS, "~~[Q1]~~ We batch it nightly."], [storedItem("Q1"), storedItem("Q2")]);
+  it("shows each reply once and leaves out a resolution that repeats the last one", () => {
+    renderPanel(
+      [ITEMS, "Looking at the rest."],
+      [
+        storedItem("Q1", {
+          status: "closed",
+          closed_by: "user",
+          resolution: "Copy them as they are.",
+          closed_at: 1_764_100_500,
+          replies: [{ author: "user", text: "Copy them as they are.", at: 1_764_100_400 }],
+        }),
+      ],
+    );
     const panel = openPanel();
-    fireEvent.click(within(panel).getByRole("button", { name: "Item Q1" }));
-    respondWith([storedItem("Q1", { status: "closed" })]);
-    const notice = within(panel).getByText(/The chat closed this item/).parentElement!;
-    fireEvent.click(within(notice).getByRole("button", { name: "Close" }));
-    expect(await patchBody()).toEqual({
-      updates: [{ label: "Q1", status: "closed", resolution: "[Q1] We batch it nightly." }],
-    });
+    fireEvent.click(within(panel).getByRole("button", { name: "Closed (1)" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Item Q1 (closed)" }));
+    const details = within(panel).getByTestId("open-item-details");
+    expect(details.textContent?.split("Copy them as they are.").length).toBe(2);
+    expect(within(details).getByTestId("open-item-resolution").textContent).toContain(
+      "Closed by a person",
+    );
   });
 
   it("imports the chat's own labels into the store", async () => {
