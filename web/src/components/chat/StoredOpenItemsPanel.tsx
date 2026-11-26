@@ -1,10 +1,11 @@
-import { useContext, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useContext, useMemo, useState, type ReactNode } from "react";
 import { ChevronRightIcon, MessageSquareDotIcon, XIcon } from "lucide-react";
 import {
   FilePathAwareMessageResponse,
   ItemLabelPopover,
   itemLabelChipClass,
 } from "@/components/blocks/ChatMarkdown";
+import { OpenItemsFilterBar } from "@/components/chat/OpenItemsFilterBar";
 import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
 import { StoredItemThread } from "@/components/chat/StoredItemThread";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,16 @@ import {
 } from "@/lib/itemLabels";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import {
+  NO_OPEN_ITEM_FILTERS,
+  filterOpenItemRows,
+  groupOpenItemRows,
+  hasOpenItemFilters,
+  openItemFacetCounts,
+  useOpenItemGrouping,
+  useOpenItemsView,
+  writeOpenItemGrouping,
+} from "@/lib/openItemFilters";
+import {
   chatItemsToImport,
   countOpenRows,
   openItemRows,
@@ -37,6 +48,8 @@ import { cn } from "@/lib/utils";
 /** What a close from the panel records when the person gives no reason. */
 export const PANEL_CLOSE_RESOLUTION = "Closed from the Open items panel";
 
+// Below this many items the list is short enough to read without search or chips.
+const FILTER_BAR_MIN_ROWS = 5;
 const GROUP_HEADING_CLASS = "px-3 pt-2 pb-1 text-xs text-muted-foreground";
 const TAG_CLASS =
   "shrink-0 rounded-full border border-border px-1.5 text-[10px] leading-4 text-muted-foreground";
@@ -333,39 +346,42 @@ function QuickAction({
   );
 }
 
-/** A fold such as "Closed (4)": a heading button that shows or hides its rows. */
-function Fold({ title, count, children }: { title: string; count: number; children: ReactNode }) {
-  const [open, setOpen] = useState(false);
-  if (count === 0) return null;
+/** A group's heading, e.g. "Closed (4)": shows or folds the rows under it. */
+function GroupHeading({
+  title,
+  count,
+  folded,
+  onToggle,
+}: {
+  title: string;
+  count: number;
+  folded: boolean;
+  onToggle: () => void;
+}) {
   return (
-    <>
-      <li>
-        <button
-          type="button"
-          aria-expanded={open}
-          className={cn(
-            GROUP_HEADING_CLASS,
-            "flex w-full items-center gap-1 hover:text-foreground",
-          )}
-          onClick={() => setOpen((shown) => !shown)}
-        >
-          <ChevronRightIcon
-            className={cn("size-3 transition-transform", open && "rotate-90")}
-            aria-hidden="true"
-          />
-          {`${title} (${count})`}
-        </button>
-      </li>
-      {open && children}
-    </>
+    <li>
+      <button
+        type="button"
+        aria-expanded={!folded}
+        className={cn(GROUP_HEADING_CLASS, "flex w-full items-center gap-1 hover:text-foreground")}
+        onClick={onToggle}
+      >
+        <ChevronRightIcon
+          className={cn("size-3 transition-transform", !folded && "rotate-90")}
+          aria-hidden="true"
+        />
+        {`${title} (${count})`}
+      </button>
+    </li>
   );
 }
 
 /**
- * The Open items section on a server that stores them: stored items by their
- * stored status, and labels only the chat has, marked "chat only". People
- * with edit access close, reopen and retopic stored items here; chat-only
- * items are dismissed as before.
+ * The Open items section on a server that stores them: stored items, and
+ * labels only the chat has, marked "chat only", grouped by status, topic or
+ * kind, with search and filter chips once the list is long. People with edit
+ * access close, reopen and retopic stored items here; chat-only items are
+ * dismissed as before.
  */
 export function StoredOpenItemsPanel({
   stored,
@@ -381,6 +397,8 @@ export function StoredOpenItemsPanel({
   const update = useUpdateStoredOpenItems(sessionId);
   const importItems = useImportChatItems(sessionId);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [view, setView] = useOpenItemsView(sessionId);
+  const grouping = useOpenItemGrouping();
   const rows = useMemo(() => openItemRows(index, stored, dismissed), [index, stored, dismissed]);
   const topics = useMemo(
     () => [...new Set(stored.flatMap((item) => (item.topic ? [item.topic] : [])))].sort(),
@@ -439,11 +457,34 @@ export function StoredOpenItemsPanel({
   };
 
   const listed = rows.filter((row) => !row.dismissed);
-  const recent = listed.filter((row) => row.recent);
-  const open = listed.filter((row) => !row.recent && row.status === "open");
-  const answered = listed.filter((row) => !row.recent && row.status === "answered");
-  const closed = listed.filter((row) => !row.recent && row.status === "closed");
-  const dismissedRows = rows.filter((row) => row.dismissed);
+  const filters = view.filters;
+  const groups = groupOpenItemRows(filterOpenItemRows(listed, filters), grouping);
+  const dismissedRows = filterOpenItemRows(
+    rows.filter((row) => row.dismissed),
+    filters,
+  );
+  if (dismissedRows.length > 0) {
+    groups.push({
+      key: "dismissed",
+      title: "Dismissed",
+      rows: dismissedRows,
+      foldedByDefault: true,
+    });
+  }
+  // A search shows every match; with a chip selected, the closed group opens too.
+  const searching = filters.query.trim() !== "";
+  const filtered = hasOpenItemFilters(filters);
+  const isFolded = (group: (typeof groups)[number]) =>
+    !searching && view.toggledGroups.includes(group.key) !== (group.foldedByDefault && !filtered);
+  const toggleGroup = (key: string) =>
+    setView((current) => ({
+      ...current,
+      toggledGroups: current.toggledGroups.includes(key)
+        ? current.toggledGroups.filter((other) => other !== key)
+        : [...current.toggledGroups, key],
+    }));
+  const setFilters = (next: typeof filters) =>
+    setView((current) => ({ ...current, filters: next }));
   return (
     <section data-testid="open-items" aria-label="Open items">
       <div className="flex items-center gap-2 px-3 py-2 text-ui font-medium">
@@ -464,23 +505,42 @@ export function StoredOpenItemsPanel({
           </Button>
         )}
       </div>
+      {(rows.length >= FILTER_BAR_MIN_ROWS || hasOpenItemFilters(filters)) && (
+        <OpenItemsFilterBar
+          filters={filters}
+          counts={openItemFacetCounts(listed, filters)}
+          grouping={grouping}
+          onFiltersChange={setFilters}
+          onGroupingChange={writeOpenItemGrouping}
+        />
+      )}
       <ul className="max-h-[min(24rem,50vh)] overflow-y-auto border-t border-border py-1">
-        {recent.length > 0 && <li className={GROUP_HEADING_CLASS}>In the latest reply</li>}
-        {recent.map(renderRow)}
-        {recent.length > 0 && open.length > 0 && (
-          <li className={GROUP_HEADING_CLASS}>{`Other open (${open.length})`}</li>
+        {groups.length === 0 && (
+          <li className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
+            No items match.
+            <button
+              type="button"
+              className="text-link hover:underline"
+              onClick={() => setFilters(NO_OPEN_ITEM_FILTERS)}
+            >
+              Clear filters
+            </button>
+          </li>
         )}
-        {open.map(renderRow)}
-        {answered.length > 0 && (
-          <li className={GROUP_HEADING_CLASS}>{`Answered (${answered.length})`}</li>
-        )}
-        {answered.map(renderRow)}
-        <Fold title="Closed" count={closed.length}>
-          {closed.map(renderRow)}
-        </Fold>
-        <Fold title="Dismissed" count={dismissedRows.length}>
-          {dismissedRows.map(renderRow)}
-        </Fold>
+        {groups.map((group) => {
+          const folded = isFolded(group);
+          return (
+            <Fragment key={group.key}>
+              <GroupHeading
+                title={group.title}
+                count={group.rows.length}
+                folded={folded}
+                onToggle={() => toggleGroup(group.key)}
+              />
+              {!folded && group.rows.map(renderRow)}
+            </Fragment>
+          );
+        })}
       </ul>
     </section>
   );
