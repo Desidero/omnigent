@@ -1,3 +1,4 @@
+import { EditorView } from "@codemirror/view";
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
 import {
   codeMirrorComposerLoad,
@@ -44,6 +45,7 @@ import { useSkills } from "@/hooks/useSkills";
 vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
 import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseSkillsModule from "@/hooks/useSkills";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
@@ -295,17 +297,24 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   getDesktopFeatures: vi.fn(async () => null),
   connectArcaHost: vi.fn(async () => ({ ok: false })),
 }));
-vi.mock("@/hooks/useHosts", () => ({
-  useHosts: vi.fn(),
-  useHostModelOptions: vi.fn(),
-  fetchHosts: vi.fn(async () => []),
-  // The setup dialog mounts these; default to inert so tests that don't
-  // exercise install / credential-write don't need to wire them up.
-  useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
-  useInstallingHarnesses: vi.fn(() => new Set<string>()),
-  useStoreCredential: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
-  useDetectedCredentials: vi.fn(() => ({ data: [] })),
-}));
+vi.mock("@/hooks/useHosts", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseHostsModule>();
+  const fetchHostsMock = vi.fn(async (_includeSandbox?: boolean): Promise<Host[]> => []);
+  return {
+    useHosts: vi.fn(),
+    useHostModelOptions: vi.fn(),
+    fetchHosts: fetchHostsMock,
+    // The on-demand refresh reads through the mocked fetch; filtering stays real.
+    fetchHostsNow: vi.fn(() => fetchHostsMock(true)),
+    withoutSandboxHosts: actual.withoutSandboxHosts,
+    // The setup dialog mounts these; default to inert so tests that don't
+    // exercise install / credential-write don't need to wire them up.
+    useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+    useInstallingHarnesses: vi.fn(() => new Set<string>()),
+    useStoreCredential: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+    useDetectedCredentials: vi.fn(() => ({ data: [] })),
+  };
+});
 // The setup dialog's copyable command rows call copyText; stub it so a click
 // can be asserted without touching the real clipboard.
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
@@ -10268,6 +10277,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    resetCodeMirrorComposerLoadForTests();
   });
 
   function input() {
@@ -10386,6 +10396,36 @@ describe("NewChatLandingScreen @-file-mention", () => {
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
     expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py] explain this");
+  });
+
+  it("keeps a tag when text is typed right after its token", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    act(() => insertComposerText(composerTargetOf(input())!, "@RE"));
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect(composerTargetOf(input())!.value).toBe("@README.md ");
+
+    act(() => {
+      EditorView.findFromDOM(input())!.dispatch({
+        changes: { from: 10, insert: "x" },
+        selection: { anchor: 11 },
+        userEvent: "input.type",
+      });
+    });
+    expect(composerTargetOf(input())!.value).toBe("@README.md x ");
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");
   });
 
   it("suppresses stale parent rows while a drilled directory is still loading", async () => {

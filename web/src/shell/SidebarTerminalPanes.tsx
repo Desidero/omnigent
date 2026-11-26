@@ -38,9 +38,11 @@ import {
 import { readTerminalGroups, updateTerminalGroups, useTerminalGroups } from "./terminalGroupsStore";
 import { currentTerminalListGeneration, useTerminalListGeneration } from "./terminalListGeneration";
 import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
+import { usePaneShellExit } from "./paneShellExit";
 import { useTerminalPaneActions } from "./terminalPaneActions";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
 import { NO_MAIN_SPLIT_MEMBERS, useMainOwnedTerminalKeys } from "./terminalPlacement";
+import { useFloatingPanesShown } from "./useFloatingPanes";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 
 export interface SidebarTerminalPanesProps {
@@ -96,6 +98,7 @@ export function SidebarTerminalPanes({
 }: SidebarTerminalPanesProps) {
   const { terminals, listCompleteAt, isFetching } = useTerminals(conversationId);
   const listGeneration = useTerminalListGeneration(conversationId, terminals.length);
+  const floatingPanes = useFloatingPanesShown();
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   // Splits are managed only by desktop owners; everyone else sees one shell per tab.
   const splitAllowed = usePanesSplitsAllowed(readOnly);
@@ -210,6 +213,8 @@ export function SidebarTerminalPanes({
       focusSplitPane(target, shownKey);
     }
   }, [target, shownKey, savedFocus, selectionMoved, requestedMember]);
+  // The sidebar removes no ended pane, so the keyboard never needs handing on.
+  const observePaneShell = usePaneShellExit(target, false, () => null);
   const actions = useTerminalPaneActions(target, terminals, {
     measureSizing: () => domCellSizing(panesRef.current),
   });
@@ -234,6 +239,15 @@ export function SidebarTerminalPanes({
     shownPaneKeys: shownPanesOf(split, shownKey),
     panesRef,
   });
+  // A shell opened by hand takes the keyboard as it connects while focus stays where the open
+  // left it, such as in the chat composer; moving focus meanwhile cancels that.
+  const launchFocus = useRef<{ key: string; element: Element | null } | null>(null);
+  useLayoutEffect(() => {
+    launchFocus.current =
+      autoFocusKey === null ? null : { key: autoFocusKey, element: document.activeElement };
+  }, [autoFocusKey]);
+  const focusUnmovedSinceOpen = (paneKey: string) =>
+    launchFocus.current?.key === paneKey && launchFocus.current.element === document.activeElement;
 
   // The pane a request goes to: the one it names, or the focused one for the view's own.
   const focusRecipient =
@@ -302,6 +316,8 @@ export function SidebarTerminalPanes({
           )
         }
         panesRef={panesRef}
+        // With floating panes a tab dragged over the panes opens in the main view's split only.
+        tabDropTarget={!floatingPanes}
         zoomedKey={zoomedKey}
         onUnzoom={(key) => {
           unzoomPane(target);
@@ -358,14 +374,19 @@ export function SidebarTerminalPanes({
               active={takesFocus}
               focusOnConnect={() =>
                 takesFocus &&
-                (paneKey === autoFocusKey || (split !== undefined && takeConnectFocus(paneKey))) &&
-                focusStillHere()
+                (paneKey === autoFocusKey
+                  ? focusUnmovedSinceOpen(paneKey) || focusStillHere()
+                  : split !== undefined && takeConnectFocus(paneKey) && focusStillHere())
               }
               focusRequest={
                 pendingFocus && focusRecipient === paneKey ? pendingFocus.id : undefined
               }
               onFocusRequestTaken={(id) => settleTerminalFocus(conversationId, "rail", id)}
-              onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
+              onStateChange={(state) => {
+                setTerminalConnectionState(terminal.id, state);
+                // A reconnect here clears a mark another surface left; only the main view removes.
+                observePaneShell(paneKey, state);
+              }}
               onActivity={() => markTerminalActive(terminal.id)}
             />
           );

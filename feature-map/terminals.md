@@ -51,7 +51,9 @@ Native subagents that share a parent's terminal show their work in chat and have
 no Chat/Terminal switcher. Open the parent session to use its terminal. Children
 with their own terminal retain the switcher.
 
-- Use the Chat/Terminal switcher in the session header.
+- Use the Chat/Terminal switcher in the session header. With `floating_panes` on, a
+  terminal-first session's chat card shows it in the card's top row instead. While a
+  split floats beside the chat as separate cards, it sits in the agent pane's row.
 - Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
   off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
@@ -73,6 +75,13 @@ with their own terminal retain the switcher.
   pane's title strip has a menu with Close Pane. While a split shows, Chat keeps
   the panes on screen with the web chat as the agent's pane, and ⌘D from its
   composer splits again. With the flag off, the classic Terminal view above stays.
+- With `floating_panes` on as well (off by default), a split's panes float as cards. Drag a
+  pane by the band around its title strip's handle; a double-click elsewhere on the strip
+  maximizes it, and a strip too narrow for both zones moves and maximizes from anywhere. A
+  pane whose shell exits closes at once, and the pane beside it takes the keyboard. Close Pane
+  closes a shell its runner reads as idle without asking; a busy one asks and names its job,
+  such as "vim is running in zsh". When the runner can't answer within half a second, or the
+  shell was typed into meanwhile, it asks as before.
 
 **User shells:**
 
@@ -110,6 +119,16 @@ with their own terminal retain the switcher.
   who may resume it. The strip's All tabs list shows shells under **Shells**; a row's × or
   Cmd/Ctrl+Backspace closes that one shell with the same terminal confirmation as its tab.
   Group closes there leave shells open.
+- Sidebar splits: for a session owner, ⌘D in a sidebar shell tab splits it with a new shell.
+  The split shows as one strip entry named for its focused shell, such as "zsh +1", and
+  focusing a pane selects its shell's tab. Closing the entry, from its ×, its menu's **Close
+  split** or Close tab's chord (⌥⌘W), asks once ("Close 2 shells?") and ends every shell in it;
+  a pane's own **Close Pane** ends just that pane's shell. Move Tab Left and Right move the
+  entry whole. Its panes take the panes view's keys and ⌘K commands: ⌘⌥ plus an arrow key
+  moves between them, and ⌘K lists Maximize Pane (Restore Panes while one fills the split),
+  Equalize Panes, Move Pane…, the Swap and Focus commands, and Close Pane. A close that
+  can't end its shells keeps their tabs and says so once, naming each, such as "Couldn't
+  close zsh and bash. They're still running."
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the
@@ -172,6 +191,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`split-panes` with `workspace_sidebar_v2`:**
   `tests/e2e_ui/shells/test_panes_view.py` splits, moves between, lists and
   closes panes in the Terminal view, and splits from Chat's composer beside a split.
+  It also splits a sidebar shell with ⌘D, keeps both shells connected across a reload,
+  and closes the split's strip entry whole; it checks the entry leaves the strip, not
+  that the runner deleted both shells.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,

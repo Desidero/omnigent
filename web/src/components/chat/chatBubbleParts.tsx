@@ -27,6 +27,7 @@ import {
   Loader2Icon,
   PencilIcon,
   SplitIcon,
+  SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -73,6 +74,7 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import { cn } from "@/lib/utils";
 import {
   splitKnownSlashCommand,
@@ -714,7 +716,7 @@ export function WorkingIndicator() {
     );
   }
   // Background shells outliving a finished turn keep the session in progress,
-  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // but the agent isn't thinking: show the static terminal glyph, not a spinner.
   // The main composer's pill announces the count; side chats have no pill.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
     const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
@@ -728,7 +730,7 @@ export function WorkingIndicator() {
         <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
           <MessageContent>
             <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
-              <RunningDot className="size-3.5" />
+              <SquareTerminalIcon aria-hidden strokeWidth={1.5} className="size-3.5 shrink-0" />
               <span className="text-sm font-mono">{label}</span>
             </div>
           </MessageContent>
@@ -750,7 +752,7 @@ export function WorkingIndicator() {
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5">
+          <div ref={throttleAnimations} className="flex items-center gap-1.5 py-0.5">
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm" duration={1.5}>
               {label}

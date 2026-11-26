@@ -1,9 +1,10 @@
 import type * as CapabilitiesModule from "@/lib/capabilities";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseFloatingPanesModule from "./useFloatingPanes";
 
 import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { useEffect } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { TERMINAL_SURFACE_ATTRIBUTE } from "@/lib/paneSurfaces";
 import type { TerminalGroup } from "@/lib/terminalGroups";
@@ -36,6 +37,8 @@ import {
 
 const lifecycle = vi.hoisted(() => ({ mounted: [] as string[], unmounted: [] as string[] }));
 const listing = vi.hoisted(() => ({ ids: ["a", "b", "c"] }));
+// Each mounted pane's answer to "take the keyboard now?" as its terminal connects.
+const connectFocus = vi.hoisted(() => new Map<string, () => boolean>());
 
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
@@ -52,6 +55,11 @@ vi.mock("./useTerminalStatuses", () => ({
   useTerminalStatuses: () => ({ setTerminalConnectionState: vi.fn(), markTerminalActive: vi.fn() }),
 }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => false }));
+const floatingPanes = vi.hoisted(() => ({ shown: false }));
+vi.mock("./useFloatingPanes", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseFloatingPanesModule>()),
+  useFloatingPanesShown: () => floatingPanes.shown,
+}));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
 vi.mock("@/lib/capabilities", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
@@ -59,7 +67,13 @@ vi.mock("@/lib/capabilities", async (importOriginal) => ({
 }));
 // Each pane's terminal, reporting what the sidebar asks of it.
 vi.mock("./TerminalPaneSurface", () => ({
-  TerminalPaneSurface: ({ terminal, active, focusRequest }: TerminalPaneSurfaceProps) => {
+  TerminalPaneSurface: ({
+    terminal,
+    active,
+    focusOnConnect,
+    focusRequest,
+  }: TerminalPaneSurfaceProps) => {
+    connectFocus.set(terminal.id, focusOnConnect);
     useEffect(() => {
       lifecycle.mounted.push(terminal.id);
       return () => {
@@ -101,12 +115,14 @@ function Sidebar({
   mountedKeys = NO_SHELLS,
   mainSplitsShown = true,
   readOnly = false,
+  autoFocusKey = null,
 }: {
   conversationId: string;
   shownKey: string | null;
   mountedKeys?: string[];
   mainSplitsShown?: boolean;
   readOnly?: boolean;
+  autoFocusKey?: string | null;
 }) {
   const mainSplitMembers = useMainSplitMembers(conversationId, mainSplitsShown);
   return (
@@ -116,7 +132,7 @@ function Sidebar({
       mountedKeys={mountedKeys}
       readOnly={readOnly}
       visible
-      autoFocusKey={null}
+      autoFocusKey={autoFocusKey}
       mainSplitMembers={mainSplitMembers}
     />
   );
@@ -127,6 +143,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  floatingPanes.shown = false;
   cleanup();
   vi.restoreAllMocks();
   window.localStorage.clear();
@@ -136,10 +153,27 @@ afterEach(() => {
   lifecycle.mounted.length = 0;
   lifecycle.unmounted.length = 0;
   listing.ids = ["a", "b", "c"];
+  connectFocus.clear();
   resetTerminalOpenRequestsForTests();
 });
 
 describe("SidebarTerminalPanes", () => {
+  it.each([
+    { floating: false, target: true },
+    { floating: true, target: false },
+  ])(
+    "takes a tab dragged over its split only without floating panes ($floating)",
+    async ({ floating, target }) => {
+      floatingPanes.shown = floating;
+      const id = nextSession();
+      updateTerminalGroups(id, () => [PAIR]);
+      const { container } = render(<Sidebar conversationId={id} shownKey="terminal:a" />);
+      await screen.findByTestId("terminal-a");
+      // With floating panes the main view's split takes the tab, so the sidebar's never claims it.
+      expect(container.querySelector(`[data-split-panes="${id}"]`) !== null).toBe(target);
+    },
+  );
+
   it("keeps a member whose shell didn't start in its group, saying why, though the list never has it", async () => {
     const id = nextSession();
     recordPaneStartFailure(id, "terminal:x", { terminal: "zsh", reason: "runner offline" });
@@ -396,6 +430,32 @@ describe("SidebarTerminalPanes", () => {
     rerender(<Sidebar conversationId={id} shownKey="terminal:a" mountedKeys={mountedKeys} />);
     expect(lifecycle.unmounted).toEqual([]);
     expect(lifecycle.mounted).toHaveLength(3);
+  });
+
+  it("gives a shell opened by hand the keyboard as it connects, though focus was in the chat", () => {
+    const composer = document.body.appendChild(document.createElement("textarea"));
+    onTestFinished(() => composer.remove());
+    composer.focus();
+    render(
+      <Sidebar conversationId={nextSession()} shownKey="terminal:a" autoFocusKey="terminal:a" />,
+    );
+    expect(document.activeElement).toBe(composer);
+    expect(connectFocus.get("a")?.()).toBe(true);
+  });
+
+  it("leaves the keyboard where the person moved it before a shell opened by hand connects", () => {
+    const composer = document.body.appendChild(document.createElement("textarea"));
+    const elsewhere = document.body.appendChild(document.createElement("input"));
+    onTestFinished(() => {
+      composer.remove();
+      elsewhere.remove();
+    });
+    composer.focus();
+    render(
+      <Sidebar conversationId={nextSession()} shownKey="terminal:a" autoFocusKey="terminal:a" />,
+    );
+    elsewhere.focus();
+    expect(connectFocus.get("a")?.()).toBe(false);
   });
 
   it("hands an explicit focus request to the requested member's pane only", async () => {
