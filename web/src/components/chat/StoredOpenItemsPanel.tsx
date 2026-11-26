@@ -6,6 +6,7 @@ import {
   itemLabelChipClass,
 } from "@/components/blocks/ChatMarkdown";
 import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
+import { StoredItemThread } from "@/components/chat/StoredItemThread";
 import { Button } from "@/components/ui/button";
 import { useCanEdit } from "@/hooks/usePermissions";
 import {
@@ -21,7 +22,6 @@ import {
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import {
   chatItemsToImport,
-  chatResolution,
   countOpenRows,
   openItemRows,
   type OpenItemRow,
@@ -58,7 +58,11 @@ function ItemMarkdown({ row, text }: { row: OpenItemRow; text: string }) {
   );
 }
 
-function StoredItemFacts({ item }: { item: StoredOpenItem }) {
+const threadMarkdown = (text: string) => (
+  <FilePathAwareMessageResponse>{text}</FilePathAwareMessageResponse>
+);
+
+function StoredItemFacts({ item, messageId }: { item: StoredOpenItem; messageId: string | null }) {
   return (
     <>
       {item.links.length > 0 && (
@@ -77,27 +81,7 @@ function StoredItemFacts({ item }: { item: StoredOpenItem }) {
           ))}
         </ul>
       )}
-      {item.answers.length > 0 && (
-        <section aria-label="Answers" className="flex flex-col gap-1">
-          {item.answers.map((answer) => (
-            <div key={`${answer.at}:${answer.text}`} className="border-l-2 border-border pl-2">
-              <div className="text-xs text-muted-foreground">
-                {`Answered · ${answer.by ?? "You"} · ${ago(answer.at)}`}
-              </div>
-              <p className="whitespace-pre-wrap">{answer.text}</p>
-            </div>
-          ))}
-        </section>
-      )}
-      {item.status === "closed" && (
-        <div className="border-l-2 border-border pl-2">
-          <div className="text-xs text-muted-foreground">
-            {`Closed by ${item.closed_by === "user" ? "a person" : "the agent"}`}
-            {item.closed_at !== null && ` · ${ago(item.closed_at)}`}
-          </div>
-          {item.resolution && <p className="whitespace-pre-wrap">{item.resolution}</p>}
-        </div>
-      )}
+      <StoredItemThread item={item} messageId={messageId} markdown={threadMarkdown} />
       <div className="text-xs text-muted-foreground">
         {`Raised ${ago(item.created_at)}`}
         {item.raised_by && ` for ${item.raised_by}`}
@@ -162,7 +146,6 @@ function RowDetails({
   const [resolution, setResolution] = useState("");
   const item = row.stored;
   const messageId = row.entry?.source.messageId;
-  const closedInChat = item && row.entry?.closedInChat ? chatResolution(row) : null;
   return (
     <div className="flex flex-col gap-2 px-3 pt-1 pb-2 text-sm" data-testid="open-item-details">
       {row.detail ? (
@@ -170,29 +153,7 @@ function RowDetails({
       ) : (
         <p className="text-muted-foreground">{row.title}</p>
       )}
-      {item && <StoredItemFacts item={item} />}
-      {closedInChat !== null && (
-        <div className="flex items-center justify-between gap-2 rounded-md bg-muted px-2 py-1 text-xs">
-          <span>The chat closed this item; it is still open here.</span>
-          {canEdit && (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="h-6 px-2 text-xs"
-              onClick={() =>
-                onUpdate({
-                  label: row.label,
-                  status: "closed",
-                  resolution: closedInChat || PANEL_CLOSE_RESOLUTION,
-                })
-              }
-            >
-              Close
-            </Button>
-          )}
-        </div>
-      )}
+      {item && <StoredItemFacts item={item} messageId={messageId ?? null} />}
       <div className="flex flex-wrap items-center gap-2">
         {messageId && (
           <button
@@ -304,9 +265,6 @@ function ItemRowView({
             {row.title || row.label}
           </span>
           {row.status === "answered" && <span className={TAG_CLASS}>answered</span>}
-          {row.entry?.closedInChat && row.status !== "closed" && (
-            <span className={TAG_CLASS}>closed in chat</span>
-          )}
           {!row.stored && <span className={TAG_CLASS}>chat only</span>}
           {row.topic && <span className={cn(TAG_CLASS, "ml-auto")}>{row.topic}</span>}
         </button>
