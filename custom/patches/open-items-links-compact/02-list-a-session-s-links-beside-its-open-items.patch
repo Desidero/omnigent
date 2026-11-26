@@ -14,7 +14,11 @@ loaded transcript like the items, with nothing stored:
   matchers (SESSION_LINK_MATCHERS) says which links count; the first one
   takes claude.ai/artifact/<id> and claude.ai/code/artifact/<id> links in
   agent messages. A page is listed once, newest mention first, titled by
-  the newest link text written for it. Links in fenced code are skipped.
+  the newest link text written for it, else by the words around a bare
+  URL (a heading or bold title on its line or just above it, or the end
+  of the sentence leading up to it), else by a short name such as
+  "Artifact 1f3a9c20", never the whole URL. Nothing is fetched for a
+  title: artifact pages are private. Links in fenced code are skipped.
 - A link label pins any other link on purpose: [L1] followed by a bold
   title and the link. It is an ordinary item label, so it numbers,
   previews and closes the same way: ~~[L1]~~ takes the link off the list,
@@ -24,7 +28,8 @@ loaded transcript like the items, with nothing stored:
 Each link opens the way a link in chat does. The button now also shows
 for a transcript that has links but no items.
 
-The item-label instruction every agent gets says how to pin a link. A page
+The item-label instruction every agent gets says how to pin a link, and
+asks for other links as [Descriptive name](url) so the list can name them. A page
 or pin mentioned only in history that has not been loaded is missing until
 the reader scrolls up to it, as for items.
 
@@ -32,25 +37,26 @@ Local only: this extends the chat-item-labels series, which is not
 upstream, and is not proposed upstream yet.
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/chat-item-labels.md                      |  34 ++-
- omnigent/runtime/prompt.py                    |   8 +
- tests/runtime/test_prompt.py                  |   5 +
+ docs/chat-item-labels.md                      |  39 ++-
+ omnigent/runtime/prompt.py                    |  10 +
+ tests/runtime/test_prompt.py                  |  10 +-
  web/src/components/chat/OpenItemsPanel.tsx    |   6 +-
- .../chat/SessionItemsButton.test.tsx          |  64 ++++--
- .../components/chat/SessionItemsButton.tsx    |  99 +++++++--
+ .../chat/SessionItemsButton.test.tsx          |  64 +++-
+ .../components/chat/SessionItemsButton.tsx    |  99 +++++-
  web/src/components/chat/Transcript.tsx        |  21 +-
  web/src/components/chat/chatBubbleParts.tsx   |  10 +
  web/src/lib/itemLabels.ts                     |   5 +
- web/src/lib/sessionLinks.test.ts              | 169 +++++++++++++++
- web/src/lib/sessionLinks.ts                   | 195 ++++++++++++++++++
- 11 files changed, 580 insertions(+), 36 deletions(-)
+ web/src/lib/sessionLinks.test.ts              | 210 ++++++++++++
+ web/src/lib/sessionLinks.ts                   | 304 ++++++++++++++++++
+ 11 files changed, 741 insertions(+), 37 deletions(-)
  create mode 100644 web/src/lib/sessionLinks.test.ts
  create mode 100644 web/src/lib/sessionLinks.ts
 
 diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
-index 53e52e9d8bdcf683242ee7c6b0e62102b12cd913..56eb6929b1aa14ef49a66852cf80f95aa3cecfb4 100644
+index 53e52e9d8bdcf683242ee7c6b0e62102b12cd913..52d19437b31a94b419db80bb4ae0cd3778a142db 100644
 --- a/docs/chat-item-labels.md
 +++ b/docs/chat-item-labels.md
 @@ -21,6 +21,14 @@ The instruction suggests `[Q1]`, `[Q2]` for questions, `[R1]` for risks,
@@ -68,7 +74,7 @@ index 53e52e9d8bdcf683242ee7c6b0e62102b12cd913..56eb6929b1aa14ef49a66852cf80f95a
  SDK harnesses get the instruction with every turn. Native harnesses take
  instructions only at launch, so it joins the stable guidance appended to the
  agent's own instructions there: through Claude Code's `--append-system-prompt`
-@@ -49,13 +57,25 @@ you or the agent write them.
+@@ -49,13 +57,30 @@ you or the agent write them.
    the number of open items as a badge. Click it for a panel (on a phone, tap
    it for a sheet at the bottom of the screen) that lists the open labels as
    chips and every item with its title, closed ones under **Closed (N)**. The
@@ -88,7 +94,12 @@ index 53e52e9d8bdcf683242ee7c6b0e62102b12cd913..56eb6929b1aa14ef49a66852cf80f95a
 +  previews that block like any item. Then come the pages the agent's messages
 +  link to at `https://claude.ai/artifact/…` or `https://claude.ai/code/artifact/…`,
 +  collected without the agent doing anything: one row per page, newest mention
-+  first, titled by the newest link text written for it. Links inside fenced
++  first, titled by the newest link text written for it. A link written as a
++  bare URL is named from the words around it: a heading or bold title on its
++  line (or on the line just above, when the link starts its line), else the
++  last few words of the sentence before it; with none of these a page shows
++  as a short name such as `Artifact 1f3a9c20` or `example.com/reports`, never
++  the whole address. Pages are never fetched for a title. Links inside fenced
 +  code are skipped. `~~[L1]~~` takes a pinned link off the list, together with
 +  the collected row for the same page, and a later plain `[L1]` puts it back.
 +  A link label is not an open item: it is left out of the badge and the items.
@@ -102,10 +113,10 @@ index 53e52e9d8bdcf683242ee7c6b0e62102b12cd913..56eb6929b1aa14ef49a66852cf80f95a
    mentions first, tinted, and includes an item that reply just closed, struck
    through. Expanded, they sit under **In the latest reply**, ahead of the other
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..2a14a4aca049bcb793b341befae65e403f5a3474 100644
+index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..44cd8355a866e68c1971711e7ebfa9b9685e1e8b 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
-@@ -82,6 +82,14 @@ ITEM_LABEL_INSTRUCTION = (
+@@ -82,6 +82,16 @@ ITEM_LABEL_INSTRUCTION = (
      "a label for a different item. When the user writes a label, it means that "
      "item. Don't wrap labels in backticks or code, and use labels only for items "
      "like these.\n\n"
@@ -116,15 +127,27 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..2a14a4aca049bcb793b341befae65e40
 +    "pinned links in the session's Links list, next to its open items. Count "
 +    "link labels up like the others, refer to the page by its label afterwards, "
 +    "and close the label as described below when the page is gone or replaced, "
-+    "which takes it off the list.\n\n"
++    "which takes it off the list. Write any other link as "
++    "[Descriptive name](https://example.com/page) rather than a bare URL, so the "
++    "list can name it.\n\n"
      "Closing items: when an item is resolved, decided, rejected, done, or no "
      "longer relevant, close it by writing its label struck through, as in "
      '~~[Q2]~~, inside the sentence that says how it ended ("~~[Q2]~~ copied the '
 diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
-index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..faabd51f5ae1df4936b7a5db2dae8c35f400637a 100644
+index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..93cdef7c74c8be7febbdc419a2e5865658a04719 100644
 --- a/tests/runtime/test_prompt.py
 +++ b/tests/runtime/test_prompt.py
-@@ -482,3 +482,8 @@ def test_item_label_examples_match_the_chat_label_shape() -> None:
+@@ -473,7 +473,8 @@ def test_native_startup_instructions_keep_only_stable_guidance() -> None:
+ 
+ def test_item_label_examples_match_the_chat_label_shape() -> None:
+     """Every example label must match the shape web/src/lib/itemLabels.ts renders as a chip."""
+-    examples = re.findall(r"\[[^\]]*\]", ITEM_LABEL_INSTRUCTION)
++    # Bracketed text followed by "(" is a markdown link's text, which the chat skips too.
++    examples = re.findall(r"\[[^\]]*\](?!\()", ITEM_LABEL_INSTRUCTION)
+     assert examples
+     for example in examples:
+         assert re.fullmatch(r"\[[A-Z]{1,3}\d{1,3}\]", example)
+@@ -482,3 +483,10 @@ def test_item_label_examples_match_the_chat_label_shape() -> None:
  def test_item_label_instruction_shows_a_bold_title_after_the_label() -> None:
      """The example puts a bold title right after the label, which the chat UI lists items by."""
      assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
@@ -133,6 +156,8 @@ index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..faabd51f5ae1df4936b7a5db2dae8c35
 +def test_item_label_instruction_shows_how_to_pin_a_link() -> None:
 +    """A link label takes a bold title and a bare URL, which the chat's Links list reads."""
 +    assert re.search(r"\[L\d{1,3}\] \*\*[^*]+\*\* https://\S+", ITEM_LABEL_INSTRUCTION)
++    # Other links are named by their markdown text, which the Links list shows.
++    assert re.search(r"\[Descriptive name\]\(https://\S+\)", ITEM_LABEL_INSTRUCTION)
 diff --git a/web/src/components/chat/OpenItemsPanel.tsx b/web/src/components/chat/OpenItemsPanel.tsx
 index 7e52db24a01257c0a08a589b42e38a7f707b21c2..47e91e4d9583cf0dfa33b8b16e3496fc6c82b8cb 100644
 --- a/web/src/components/chat/OpenItemsPanel.tsx
@@ -523,16 +548,16 @@ index 2d22dceb782d6550fe2421f48fa8ea5ff2bbda44..d493c8a9db59df4cdad0c461bb95cbc7
  const itemLabelScans = new WeakMap<Bubble, ItemLabelScan>();
  
 diff --git a/web/src/lib/itemLabels.ts b/web/src/lib/itemLabels.ts
-index 8b6814ea6f55290f1797750ed673b22cc966bf58..483885297c2e7fed9f38e6dd6da90b98277160db 100644
+index 8b6814ea6f55290f1797750ed673b22cc966bf58..e32e9529f56afb5e28ba79fafc1cb49f4517c9d7 100644
 --- a/web/src/lib/itemLabels.ts
 +++ b/web/src/lib/itemLabels.ts
 @@ -163,6 +163,11 @@ function scanLines(markdown: string): ScannedLine[] {
    return lines;
  }
  
-+/** The lines of `markdown` outside fenced code blocks. */
-+export function linesOutsideFences(markdown: string): string[] {
-+  return scanLines(markdown).flatMap((line) => (line.inFence ? [] : [line.text]));
++/** The lines of `markdown`, each line of a fenced code block as null. */
++export function proseLines(markdown: string): (string | null)[] {
++  return scanLines(markdown).map((line) => (line.inFence ? null : line.text));
 +}
 +
  /** Blanks out inline code spans so a label inside backticks is never matched. */
@@ -540,10 +565,10 @@ index 8b6814ea6f55290f1797750ed673b22cc966bf58..483885297c2e7fed9f38e6dd6da90b98
    return line.replace(/(`+)[^`]*?\1/g, (span) => " ".repeat(span.length));
 diff --git a/web/src/lib/sessionLinks.test.ts b/web/src/lib/sessionLinks.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac9eab71d8c84d5201d62eb22f1468c0beadfb67
+index 0000000000000000000000000000000000000000..3eb6e1eecb52a7371399bb54e803fa96fa57e53f
 --- /dev/null
 +++ b/web/src/lib/sessionLinks.test.ts
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,210 @@
 +import { describe, expect, it } from "vitest";
 +import {
 +  buildItemLabelIndex,
@@ -557,6 +582,7 @@ index 0000000000000000000000000000000000000000..ac9eab71d8c84d5201d62eb22f1468c0
 +  collectSessionLinks,
 +  isLinkItemLabel,
 +  linksInMarkdown,
++  shortLinkName,
 +} from "./sessionLinks";
 +
 +type Message = string | { user: string };
@@ -628,7 +654,7 @@ index 0000000000000000000000000000000000000000..ac9eab71d8c84d5201d62eb22f1468c0
 +    );
 +    expect(links.map(({ title, href, kind, item }) => ({ title, href, kind, item }))).toEqual([
 +      {
-+        title: "Artifact 77aa88bb",
++        title: "The review page",
 +        href: "https://claude.ai/code/artifact/77aa88bb-cccc",
 +        kind: "artifact",
 +        item: null,
@@ -652,6 +678,39 @@ index 0000000000000000000000000000000000000000..ac9eab71d8c84d5201d62eb22f1468c0
 +      ["Patch catalog", "https://claude.ai/artifact/aaa", "m2"],
 +      ["board", "https://claude.ai/artifact/bbb", "m0"],
 +    ]);
++  });
++
++  it("names a link from a heading or bold title on its line or just above, else the words before it", () => {
++    expect(
++      titles(
++        "## Release report https://claude.ai/artifact/aaa",
++        "**Patch catalog**\nhttps://claude.ai/artifact/bbb",
++        "- **Board:** https://claude.ai/artifact/ccc",
++        "Done. The dashboard for the cache rollout numbers is at https://claude.ai/artifact/ddd.",
++        "Published https://claude.ai/artifact/eee",
++      ),
++    ).toEqual([
++      "Artifact eee",
++      "dashboard for the cache rollout numbers",
++      "Board",
++      "Patch catalog",
++      "Release report",
++    ]);
++  });
++
++  it("keeps link text over a name from the words around a later mention", () => {
++    expect(
++      titles(
++        "Made the [catalog](https://claude.ai/artifact/aaa).",
++        "The patch list is https://claude.ai/artifact/aaa",
++      ),
++    ).toEqual(["catalog"]);
++    expect(
++      titles(
++        "The patch list is https://claude.ai/artifact/aaa",
++        "Updated https://claude.ai/artifact/aaa again.",
++      ),
++    ).toEqual(["The patch list"]);
 +  });
 +
 +  it("ignores look-alike hosts, other claude.ai pages and plain http", () => {
@@ -682,12 +741,19 @@ index 0000000000000000000000000000000000000000..ac9eab71d8c84d5201d62eb22f1468c0
 +    expect(links[0].item?.label).toBe("L1");
 +  });
 +
-+  it("falls back to the first sentence, the link text, then the host for a title", () => {
++  it("falls back to the first sentence, the link text, then a short form of the URL for a title", () => {
 +    expect(
 +      titles(
 +        "[L1] Staging dashboard: https://example.com/a\n\n[L2] [Design notes](https://example.com/b)\n\n[L3] https://docs.example.com/c",
 +      ),
-+    ).toEqual(["Staging dashboard", "Design notes", "docs.example.com"]);
++    ).toEqual(["Staging dashboard", "Design notes", "docs.example.com/c"]);
++  });
++
++  it("shortens a URL to its host and the start of its path", () => {
++    expect(shortLinkName(new URL("https://www.example.com/"))).toBe("example.com");
++    expect(
++      shortLinkName(new URL("https://docs.example.com/d/1AbCdEfGhIjKlMnOpQrStUv/edit?usp=sharing")),
++    ).toBe("docs.example.com/d/1AbCdEfGhIjK…/…");
 +  });
 +
 +  it("pins from a single message and from the user, but not a label without a link", () => {
@@ -715,20 +781,21 @@ index 0000000000000000000000000000000000000000..ac9eab71d8c84d5201d62eb22f1468c0
 +});
 diff --git a/web/src/lib/sessionLinks.ts b/web/src/lib/sessionLinks.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..6dada6192cd1a5dd1664a6ea0561cdf559740697
+index 0000000000000000000000000000000000000000..0a41b253f44f8ef19b075e38aa42ba528f13e15f
 --- /dev/null
 +++ b/web/src/lib/sessionLinks.ts
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,304 @@
 +// Session links: the pages a session keeps coming back to, listed beside its
 +// open items. Both sources are read from the loaded transcript: links of a
 +// known kind that agent messages mention (SESSION_LINK_MATCHERS), and links
 +// pinned on purpose with a link label, `[L1] **Title** https://…`. A link label
 +// is an item label (itemLabels.ts), so it numbers, previews and closes like one.
++// Links are named from the text written around them; nothing is fetched.
 +
 +import {
 +  extractItemBlock,
 +  itemLabelTitle,
-+  linesOutsideFences,
++  proseLines,
 +  type ItemLabelEntry,
 +  type ItemLabelIndex,
 +  type ItemLabelSource,
@@ -789,6 +856,8 @@ index 0000000000000000000000000000000000000000..6dada6192cd1a5dd1664a6ea0561cdf5
 +  url: URL;
 +  /** The text of a markdown link; null for a bare URL or one used as its own text. */
 +  text: string | null;
++  /** A name the words around the link give it (see `nameAroundLink`); null when they don't. */
++  context: string | null;
 +}
 +
 +// A markdown link, an autolink, or a bare URL.
@@ -808,16 +877,104 @@ index 0000000000000000000000000000000000000000..6dada6192cd1a5dd1664a6ea0561cdf5
 +  }
 +}
 +
++const HEADING_TEXT_RE = /^ {0,3}#{1,6}\s+(.*?)\s*#*\s*$/;
++const LIST_MARKER_RE = /^\s*(?:[-*+]\s+|\d{1,9}[.)]\s+|>\s*)*/;
++const BOLD_SPAN_RE = /(\*\*|__)(?!\s)(.+?)\1/g;
++const ONLY_BOLD_RE = /^(\*\*|__)(?!\s)(.+?)\1\s*:?$/;
++// Words that lead up to a link without naming it: "The dashboard is at <url>".
++const FILLER_WORDS_RE = /\s+(?:at|is|are|was|here|see|in|on|to|via|from|the|a|an)$/i;
++const FRAGMENT_WORDS = 6;
++
++/** Text with labels, link markup and emphasis removed, for a name. */
++function nameText(text: string): string {
++  return withoutMarkup(
++    text
++      .replace(new RegExp(LINK_SOURCE, "g"), (_match, linkText?: string) => linkText ?? "")
++      .replace(/\[[A-Z]{1,3}\d{1,3}\]/g, ""),
++  )
++    .replace(/^[\s:.\-–—]+|[\s:.,;!?\-–—(]+$/g, "")
++    .trim();
++}
++
++/** The heading text, or the whole bold span, a line holds; null when it holds neither. */
++function headingOrBoldLine(line: string): string | null {
++  const heading = line.match(HEADING_TEXT_RE);
++  if (heading) return nameText(heading[1]) || null;
++  const bold = line.replace(LIST_MARKER_RE, "").trim().match(ONLY_BOLD_RE);
++  return bold ? nameText(bold[2]) || null : null;
++}
++
++/** The last few words of the sentence before a link, without filler or punctuation. */
++function fragmentBefore(text: string): string | null {
++  const sentence = nameText(
++    text
++      .replace(LIST_MARKER_RE, "")
++      .split(/[.!?]\s+/)
++      .pop() ?? "",
++  );
++  let fragment = sentence;
++  for (let next = fragment.replace(FILLER_WORDS_RE, ""); next !== fragment;) {
++    fragment = next;
++    next = fragment.replace(FILLER_WORDS_RE, "");
++  }
++  const words = fragment
++    .replace(/[\s:,;\-–—(]+$/, "")
++    .split(/\s+/)
++    .filter(Boolean);
++  // One word ("Published <url>") says what happened, not what the page is.
++  return words.length >= 2 ? words.slice(-FRAGMENT_WORDS).join(" ") : null;
++}
++
++/**
++ * A name for a link from the words around it: a heading or bold title on its
++ * line, else one on the line just before when the link starts its line, else
++ * the end of the sentence leading up to it.
++ */
++function nameAroundLink(line: string, start: number, previous: string | null): string | null {
++  const own = headingOrBoldLine(line);
++  if (own) return own;
++  const before = line.slice(0, start);
++  const bold = [...before.matchAll(BOLD_SPAN_RE)].pop();
++  if (bold) return nameText(bold[2]) || null;
++  const titledAbove = previous === null ? null : headingOrBoldLine(previous);
++  if (titledAbove && nameText(before.replace(LIST_MARKER_RE, "")) === "") return titledAbove;
++  return fragmentBefore(before) ?? titledAbove;
++}
++
++/**
++ * A short readable form of a URL for a link nothing names: the host and the
++ * start of its path, never the whole address.
++ */
++export function shortLinkName(url: URL): string {
++  const host = url.hostname.replace(/^www\./, "");
++  const segments = url.pathname.split("/").filter(Boolean);
++  const shown = segments
++    .slice(0, 2)
++    .map((segment) => (segment.length > 16 ? `${segment.slice(0, 12)}…` : segment));
++  if (segments.length > 2) shown.push("…");
++  return [host, ...shown].join("/");
++}
++
 +/** The http(s) links `markdown` writes outside fenced code, in order. */
 +export function linksInMarkdown(markdown: string): WrittenLink[] {
 +  const links: WrittenLink[] = [];
-+  for (const line of linesOutsideFences(markdown)) {
++  let previous: string | null = null;
++  for (const line of proseLines(markdown)) {
++    if (line === null) {
++      previous = null;
++      continue;
++    }
 +    for (const match of line.matchAll(new RegExp(LINK_SOURCE, "g"))) {
 +      const url = parseHttpUrl(match[2] ?? match[3] ?? trimBareUrl(match[4]));
 +      if (!url) continue;
 +      const text = withoutMarkup(match[1] ?? "");
-+      links.push({ url, text: text && !/^https?:\/\//i.test(text) ? text : null });
++      links.push({
++        url,
++        text: text && !/^https?:\/\//i.test(text) ? text : null,
++        context: nameAroundLink(line, match.index ?? 0, previous),
++      });
 +    }
++    previous = line.trim() === "" ? null : line;
 +  }
 +  return links;
 +}
@@ -826,7 +983,10 @@ index 0000000000000000000000000000000000000000..6dada6192cd1a5dd1664a6ea0561cdf5
 +  key: string;
 +  kind: string;
 +  href: string;
++  /** The link's own text. */
 +  title: string | null;
++  /** A name from the words around it, used when no mention gives link text. */
++  context: string | null;
 +  untitled: string;
 +}
 +
@@ -836,12 +996,19 @@ index 0000000000000000000000000000000000000000..6dada6192cd1a5dd1664a6ea0561cdf5
 +function linkMentions(source: ItemLabelSource): readonly LinkMention[] {
 +  const cached = mentionsBySource.get(source);
 +  if (cached) return cached;
-+  const mentions = linksInMarkdown(source.text).flatMap(({ url, text }): LinkMention[] => {
++  const mentions = linksInMarkdown(source.text).flatMap(({ url, text, context }): LinkMention[] => {
 +    const matcher = matcherFor(url);
 +    const key = matcher?.pageKey(url);
 +    if (!matcher || !key) return [];
 +    return [
-+      { key, kind: matcher.kind, href: url.href, title: text, untitled: matcher.untitled(url) },
++      {
++        key,
++        kind: matcher.kind,
++        href: url.href,
++        title: text,
++        context,
++        untitled: matcher.untitled(url),
++      },
 +    ];
 +  });
 +  mentionsBySource.set(source, mentions);
@@ -869,7 +1036,7 @@ index 0000000000000000000000000000000000000000..6dada6192cd1a5dd1664a6ea0561cdf5
 +    pin = {
 +      key: matcher?.pageKey(link.url) ?? link.url.href,
 +      href: link.url.href,
-+      title: title || link.text || matcher?.untitled(link.url) || link.url.hostname,
++      title: title || link.text || matcher?.untitled(link.url) || shortLinkName(link.url),
 +    };
 +  }
 +  pins.set(item.label, pin);
@@ -879,24 +1046,32 @@ index 0000000000000000000000000000000000000000..6dada6192cd1a5dd1664a6ea0561cdf5
 +/**
 + * The Links list for a transcript's messages, in order. Pinned links come
 + * first, as defined; then the pages agent messages mention, newest mention
-+ * first, each once and titled by the newest link text given for it. A pin
-+ * stands for its page, so closing the pin takes the page off the list.
++ * first, each once. A page is titled by the newest link text given for it,
++ * else the newest name the words around a mention give it, else its kind's
++ * short name. A pin stands for its page, so closing the pin takes the page
++ * off the list.
 + */
 +export function collectSessionLinks(
 +  sources: Iterable<ItemLabelSource>,
 +  index: ItemLabelIndex | null,
 +): SessionLink[] {
 +  const mentioned = new Map<string, SessionLink>();
++  const names = new Map<string, { text: string | null; context: string | null }>();
 +  for (const source of sources) {
 +    if (source.role !== "assistant") continue;
 +    for (const mention of linkMentions(source)) {
-+      const title = mention.title ?? mentioned.get(mention.key)?.title ?? mention.untitled;
++      const earlier = names.get(mention.key);
++      const name = {
++        text: mention.title ?? earlier?.text ?? null,
++        context: mention.context ?? earlier?.context ?? null,
++      };
++      names.set(mention.key, name);
 +      // Re-inserting keeps the map in order of latest mention.
 +      mentioned.delete(mention.key);
 +      mentioned.set(mention.key, {
 +        key: mention.key,
 +        href: mention.href,
-+        title,
++        title: name.text ?? name.context ?? mention.untitled,
 +        kind: mention.kind,
 +        item: null,
 +        lastMention: source,

@@ -1,7 +1,7 @@
 # open-items-links-compact
 
 Needs: chat-item-labels
-Covers: 6eca4afecbca8526
+Covers: 22d709436d1fc570
 
 The Open items bar of `chat-item-labels` becomes a compact button in the
 session header, beside Agent info, with the number of open items as a badge;
@@ -23,11 +23,11 @@ meant to be tried and revised.
 - In a session with the header, the open items open from one header button whose badge counts the items that are open: not closed, not dismissed, not a link label. The pinned bar is not shown there. A transcript shown without the session header keeps the bar.
 - The panel holds the same tracker as the bar (`OpenItemsPanel` in its `section` layout, not a copy): chips, titles, latest-reply grouping, Closed fold, dismiss and restore, each item's preview. It starts expanded, and "Show in conversation" closes the panel.
 - On a phone the panel is a sheet at the bottom of the screen and is not modal, so an item's preview can hand focus to the page behind it (which closes the sheet).
-- Links lists pinned links first, in the order pinned, then collected pages, newest mention first, one row per page, titled by the newest link text given. Only agent messages are collected from; fenced code is skipped; each link opens the way a link in chat does.
+- Links lists pinned links first, in the order pinned, then collected pages, newest mention first, one row per page, titled by the newest link text given, else by the words around a bare URL (a heading or bold title on its line or just above, or the last few words of the sentence before it), else by a short name; a row never shows the whole URL as its title, and nothing is fetched to name a link. Only agent messages are collected from; fenced code is skipped; each link opens the way a link in chat does.
 - Which links are collected is the list `SESSION_LINK_MATCHERS`; adding a kind is adding a matcher.
 - A link label is `L` and one to three digits. It is an ordinary item label (same parsing, numbering, chip and preview) that pins the first link in its own block, from the agent or the user, even while the transcript uses no other label. `~~[L1]~~` removes the pin and the collected row for the same page; a later plain `[L1]` restores it.
 - Nothing is stored: items and links come from the loaded transcript. What is mentioned only in history not yet loaded is missing until it loads, and a label whose first message is not loaded is described by its earliest loaded mention (the bar's existing limit).
-- Every agent gets the pinned-links paragraph as part of the item-label instruction, on the same channels and with the same label shape.
+- Every agent gets the pinned-links paragraph as part of the item-label instruction, on the same channels and with the same label shape; it asks for other links as `[Descriptive name](url)`.
 - The series stays clear of the lines `chat-item-comments` changes in the files they share, so the two build together, and the panel calls nothing whose signature that series changes. With both, their glue closes the panel when a comment is started from it.
 
 ## Key code
@@ -37,8 +37,8 @@ meant to be tried and revised.
 - `web/src/shell/ChatHeader.tsx`: `SessionItemsHeaderSlot`
 - `web/src/components/chat/OpenItemsPanel.tsx`: `trackedItems`, `useOpenItemCount`
 - `web/src/components/chat/Transcript.tsx`: `TranscriptSessionItems`
-- `web/src/lib/sessionLinks.ts`: `collectSessionLinks`, `SESSION_LINK_MATCHERS`, `isLinkItemLabel`, `linksInMarkdown`
-- `web/src/lib/itemLabels.ts`: `linesOutsideFences`
+- `web/src/lib/sessionLinks.ts`: `collectSessionLinks`, `SESSION_LINK_MATCHERS`, `isLinkItemLabel`, `linksInMarkdown`, `shortLinkName`
+- `web/src/lib/itemLabels.ts`: `proseLines`
 - `omnigent/runtime/prompt.py`: `ITEM_LABEL_INSTRUCTION`
 
 ## Tests
