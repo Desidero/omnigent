@@ -1,0 +1,973 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 15:57:34 +0000
+Subject: [PATCH] fix(antigravity): gate shell commands by Omnigent policy and
+ permission mode
+
+The Antigravity SDK's default policy, confirm_run_command(), denies its
+run_command tool outright, and the harness reported that denial as a turn
+error, so every turn in which Gemini ran a shell command failed with
+`Denied by policy "confirm_run_command"`.
+
+Allow every tool at the SDK policy layer and gate run_command in a
+PreToolCallDecideHook, the way the cursor and claude-sdk harnesses gate
+their native tools: Omnigent TOOL_CALL policies first (DENY refuses, ASK
+asks), then executor.config.permission_mode (auto, the default, and
+bypassPermissions run the command; any other mode asks on an approval
+card). A refusal fails that tool call with its reason; the SDK reports it
+as an ERROR step and lets the model continue, so that step is no longer
+treated as a turn failure. Approval cards now say "Antigravity" instead
+of "Claude".
+
+Upstream issue omnigent-ai/omnigent#8484 tracks the bug; the open
+omnigent-ai/omnigent#8497 routes the SDK's ask_user handler to the
+approval card instead and does not evaluate Omnigent policies. Not
+proposed upstream yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ .../skills/antigravity-sdk-e2e-dev/SKILL.md   |   9 +-
+ docs/AGENT_YAML_SPEC.md                       |  19 +
+ omnigent/inner/antigravity_executor.py        | 183 +++++++-
+ omnigent/inner/antigravity_harness.py         |  10 +-
+ omnigent/runtime/workflow.py                  |   4 +
+ tests/inner/test_antigravity_executor.py      | 395 +++++++++++++++++-
+ tests/inner/test_antigravity_harness.py       |  20 +
+ tests/runtime/test_antigravity_spawn_env.py   |   8 +
+ 8 files changed, 617 insertions(+), 31 deletions(-)
+
+diff --git a/.claude/skills/antigravity-sdk-e2e-dev/SKILL.md b/.claude/skills/antigravity-sdk-e2e-dev/SKILL.md
+index a461a5641116fff7d8e030f2feee06346ffaabfe..7ac6f27fb05b90ac2027b4c68cef4849afd40385 100644
+--- a/.claude/skills/antigravity-sdk-e2e-dev/SKILL.md
++++ b/.claude/skills/antigravity-sdk-e2e-dev/SKILL.md
+@@ -174,10 +174,11 @@ processes after teardown.
+ Several were merged as-is and have **fix PRs in flight (#276–#281)** — verify
+ against your checkout:
+ 
+-- **Native/built-in tools bypass the TOOL_CALL policy.** Only a
+-  `PostToolCallHook` (post-execution, can't block) was installed at merge, so a
+-  DENY/ASK guardrail doesn't gate the SDK's native shell/file tools before they
+-  run. Bridged `sys_*` tools route through the server. *(Fix: policy-enforcement PR.)*
++- **Native file tools bypass the TOOL_CALL policy.** The shell tool
++  (`run_command`) is gated before it runs by Omnigent policies and
++  `executor.config.permission_mode` (`auto` default; `default` asks on a card),
++  but the SDK's file tools (`create_file`, `edit_file`, …) still run ungated.
++  Bridged `sys_*` tools route through the server.
+ - **LLM_REQUEST / LLM_RESPONSE policies aren't evaluated** in `run_turn` (prompt-
+   deny / output-block silently ignored). *(Fix: policy-enforcement PR.)*
+ - **History on a fresh/rebuilt session.** The SDK has no history-injection API,
+diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
+index 755f4648b90a1315553c72174cc664918f600ba7..24f242d75f4e0d6097f937492f132e16ea29f164 100644
+--- a/docs/AGENT_YAML_SPEC.md
++++ b/docs/AGENT_YAML_SPEC.md
+@@ -136,6 +136,25 @@ executor:
+     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
+ ```
+ 
++The SDK's shell tool, `run_command`, follows the agent's Omnigent policies and
++`executor.config.permission_mode`, like native tools on the other SDK
++harnesses. Each call is first evaluated as a `tool_call` policy event named
++`run_command` with the SDK's own arguments (`CommandLine` and `Cwd` on recent
++SDKs, `command_line` on older ones): a DENY refuses it and an ASK asks on an
++approval card. Then the permission mode decides: `auto` (the default) and
++`bypassPermissions` run the command; any other value, e.g. `default`, asks on
++an approval card first. A refused command fails as a tool call with the reason,
++and the model carries on; rejecting the approval card ends the turn, as on the
++other SDK harnesses. The SDK's other built-in tools are not gated this way.
++
++```yaml
++executor:
++  type: omnigent
++  config:
++    harness: antigravity
++    permission_mode: default   # ask before every shell command
++```
++
+ ### Codex tool switches
+ 
+ With `harness: codex`, `web_search: false` turns off Codex's built-in web
+diff --git a/omnigent/inner/antigravity_executor.py b/omnigent/inner/antigravity_executor.py
+index 5b76d3f47fd92aa7a1e7abf1896399c93166c40c..550e9dc8645172409962f79cc7377b4b7c4e58ab 100644
+--- a/omnigent/inner/antigravity_executor.py
++++ b/omnigent/inner/antigravity_executor.py
+@@ -25,6 +25,11 @@ Streaming model:
+ - Tool *requests* derive from ``Step.tool_calls`` (deduped by call id); tool
+   *completions* (with payload, error, duration) arrive via a registered
+   ``PostToolCallHook`` and pair back by call id.
++- Shell commands: the SDK's default policy denies its ``run_command`` tool.
++  The executor allows it at the policy layer and gates each call in a
++  ``PreToolCallDecideHook`` by Omnigent's TOOL_CALL policies and the
++  permission mode (see :meth:`_shell_command_denial`). A refused call fails as
++  a tool call and the SDK turn goes on.
+ - Cancellation: :meth:`interrupt_session` -> ``conversation.cancel()``, which
+   surfaces ``TurnCancelled``.
+ 
+@@ -33,8 +38,9 @@ Authentication is Gemini-native: a direct API key (``api_key``) or Vertex AI
+ ``base_url``, so there is deliberately no gateway / Databricks routing path.
+ 
+ SDK touchpoints are isolated in :meth:`_open_agent`, :meth:`_build_sdk_tools`,
+-:meth:`_build_post_tool_hook`, and :meth:`_drive_turn`, and duck-typed to
+-tolerate drift across the v0.1.x surface. Unit tests stub the SDK module.
++:meth:`_build_post_tool_hook`, :meth:`_build_shell_gate_hook`, and
++:meth:`_drive_turn`, and duck-typed to tolerate drift across the v0.1.x
++surface. Unit tests stub the SDK module.
+ """
+ 
+ from __future__ import annotations
+@@ -112,6 +118,16 @@ _ToolCallable: TypeAlias = Callable[..., Awaitable[ToolResult]]  # type: ignore[
+ ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
+     [str, dict[str, Any]], Awaitable[dict[str, Any]]
+ ]
++# Bridges the ExecutorAdapter installs: ``(phase, data)`` -> Omnigent policy
++# verdict, and ``(tool_name, tool_input)`` -> the user's answer on an approval card.
++PolicyEvaluator: TypeAlias = Callable[[str, _StrAnyDict], Awaitable[object]]
++ElicitationHandler: TypeAlias = Callable[[str, _StrAnyDict], Awaitable[bool]]
++
++# The SDK's shell tool (``BuiltinTools.RUN_COMMAND``).
++_SHELL_TOOL = "run_command"
++# Permission modes that run a shell command no policy objects to without asking,
++# as the cursor and claude-sdk harnesses do. Any other mode asks first.
++_NO_PROMPT_PERMISSION_MODES = frozenset({"auto", "bypassPermissions"})
+ 
+ 
+ def _ensure_antigravity_sdk() -> ModuleType:
+@@ -306,6 +322,8 @@ class _AntigravitySessionState:
+         the terminal :class:`TurnComplete`.
+     :param interrupt_requested: Set by :meth:`interrupt_session` so the
+         consumer suppresses a trailing :class:`TurnComplete` after cancel.
++    :param shell_denials: Messages of shell commands the gate refused this
++        turn, each awaiting the ``ERROR`` step the SDK reports it with.
+     """
+ 
+     agent: SDKAgent = None
+@@ -315,6 +333,7 @@ class _AntigravitySessionState:
+     active_queue: _EventQueue | None = field(default=None)
+     last_usage: SDKUsage = None
+     interrupt_requested: bool = False
++    shell_denials: list[str] = field(default_factory=list)
+ 
+ 
+ class AntigravityExecutor(Executor):
+@@ -329,6 +348,7 @@ class AntigravityExecutor(Executor):
+         project: str | None = None,
+         location: str | None = None,
+         retry_policy: RetryPolicy | None = None,
++        permission_mode: str = "auto",
+     ) -> None:
+         """Create an AntigravityExecutor.
+ 
+@@ -346,6 +366,10 @@ class AntigravityExecutor(Executor):
+             ``"us-central1"``. ``None`` unless *vertex* is set.
+         :param retry_policy: Optional retry policy, reserved for parity with
+             the other SDK executors. ``None`` uses defaults.
++        :param permission_mode: Omnigent permission stance for shell commands.
++            ``"auto"`` (default) and ``"bypassPermissions"`` run a command no
++            policy objects to; any other value, e.g. ``"default"``, asks on an
++            approval card first. A policy DENY blocks in every mode.
+         """
+         self._model_override = model
+         self._api_key = api_key
+@@ -357,6 +381,10 @@ class AntigravityExecutor(Executor):
+         # Set by the harness ExecutorAdapter when unset; the SDK tools route
+         # invocations through this to reach Omnigent's tools under policy.
+         self._tool_executor: ToolExecutor | None = None
++        self._permission_mode = permission_mode or "auto"
++        # Also set by the adapter; they gate the SDK's own shell tool.
++        self._policy_evaluator: PolicyEvaluator | None = None
++        self._elicitation_handler: ElicitationHandler | None = None
+ 
+     def supports_streaming(self) -> bool:
+         return True
+@@ -520,6 +548,7 @@ class AntigravityExecutor(Executor):
+         event_queue: _EventQueue = asyncio.Queue()
+         state.active_queue = event_queue
+         state.pending_tools.clear()
++        state.shell_denials.clear()
+         state.last_usage = None
+         state.interrupt_requested = False
+ 
+@@ -594,6 +623,10 @@ class AntigravityExecutor(Executor):
+         try:
+             await conversation.send(prompt)
+             async for step in conversation.receive_steps():
++                if self._is_shell_denial_report(step, state):
++                    # Already surfaced as a failed tool call by the gate; the
++                    # SDK turn goes on, so this is not a turn failure.
++                    continue
+                 # Only surface MODEL->USER steps. The SDK echoes the user's
+                 # input and environment-directed steps in the same stream (its
+                 # ``receive_chunks`` filters identically); without this the
+@@ -696,6 +729,29 @@ class AntigravityExecutor(Executor):
+             state.pending_tools[call_id] = _PendingTool(name=name, started=time.monotonic())
+             queue.put_nowait(ToolCallRequest(name=name, args=args, metadata={"call_id": call_id}))
+ 
++    @staticmethod
++    def _is_shell_denial_report(step: SDKStep, state: _AntigravitySessionState) -> bool:
++        """Whether *step* is the SDK reporting a shell command the gate refused.
++
++        The SDK reports a pre-tool hook's refusal as an ``ERROR`` step (not a
++        ``TOOL_CALL`` one) whose error quotes the hook's message, then lets the
++        model continue. Each refusal is matched once.
++
++        :param step: The current SDK :class:`Step`.
++        :param state: The session state holding this turn's refusal messages.
++        :returns: ``True`` when *step* reports one of them (it is consumed).
++        """
++        if not state.shell_denials or _enum_name(getattr(step, "status", None)) != "ERROR":
++            return False
++        if _enum_name(getattr(step, "type", None)) == "TOOL_CALL":
++            return False
++        reported = str(getattr(step, "error", "") or "")
++        for message in state.shell_denials:
++            if message in reported:
++                state.shell_denials.remove(message)
++                return True
++        return False
++
+     def _complete_pending_from_step(
+         self, step: SDKStep, state: _AntigravitySessionState, status: str
+     ) -> None:
+@@ -862,7 +918,16 @@ class AntigravityExecutor(Executor):
+         sdk_tools = self._build_sdk_tools(tools)
+         if sdk_tools:
+             config_kwargs["tools"] = sdk_tools
+-        config_kwargs["hooks"] = [self._build_post_tool_hook(antigravity, state)]
++        config_kwargs["hooks"] = [
++            self._build_post_tool_hook(antigravity, state),
++            self._build_shell_gate_hook(antigravity, state),
++        ]
++        # The SDK's default policy denies run_command outright. Allow every tool
++        # at the policy layer, as the default does for the others, and let the
++        # shell gate hook decide run_command.
++        config_kwargs["policies"] = [
++            antigravity.hooks.policy.allow("*", name="omnigent_shell_gate")
++        ]
+         config = self._build_local_agent_config(antigravity, model=model, kwargs=config_kwargs)
+         agent = antigravity.Agent(config)
+         # Agent is documented as an async context manager; enter it if so.
+@@ -926,6 +991,118 @@ class AntigravityExecutor(Executor):
+ 
+         return _OmnigentToolCompleteHook()
+ 
++    def _build_shell_gate_hook(
++        self, antigravity: ModuleType, state: _AntigravitySessionState
++    ) -> SDKHook:
++        """Build a ``PreToolCallDecideHook`` that gates the SDK's shell tool.
++
++        Other tools pass. A refused command is surfaced right away as a
++        :class:`ToolCallRequest` and failed :class:`ToolCallComplete`, and its
++        message is recorded so :meth:`_drive_turn` skips the SDK's report of it.
++
++        :param antigravity: The imported ``google.antigravity`` module.
++        :param state: The session state (queue + refusal messages).
++        :returns: A ``PreToolCallDecideHook`` for ``LocalAgentConfig.hooks``.
++        """
++        executor = self
++        hook_result = antigravity.types.HookResult
++
++        class _OmnigentShellGateHook(antigravity.hooks.PreToolCallDecideHook):  # type: ignore[misc, name-defined]
++            """Allows or refuses each ``run_command`` call before it runs."""
++
++            async def run(self, context: SDKHookContext, data: SDKToolCall) -> Any:  # type: ignore[explicit-any]  # noqa: ARG002 — context unused; required by hook signature
++                """Return the SDK ``HookResult`` for one tool call.
++
++                :param context: The SDK ``HookContext`` (unused here).
++                :param data: The SDK ``ToolCall`` about to run.
++                :returns: ``HookResult(allow=True)`` or a refusal with its reason.
++                """
++                name = _tool_name(getattr(data, "name", None))
++                if name != _SHELL_TOOL:
++                    return hook_result(allow=True)
++                raw_args = getattr(data, "args", None)
++                args: ToolArgs = dict(raw_args) if isinstance(raw_args, dict) else {}
++                denial = await executor._shell_command_denial(args)
++                if denial is None:
++                    return hook_result(allow=True)
++                state.shell_denials.append(denial)
++                queue = state.active_queue
++                if queue is not None:
++                    raw_id = getattr(data, "id", None)
++                    call_id = raw_id if isinstance(raw_id, str) and raw_id else uuid.uuid4().hex
++                    metadata = {"call_id": call_id}
++                    # Older SDKs stream the call before asking the hook, so its
++                    # request is already out; close it here instead.
++                    pending = state.pending_tools.pop(call_id, None)
++                    if pending is None:
++                        queue.put_nowait(ToolCallRequest(name=name, args=args, metadata=metadata))
++                    queue.put_nowait(
++                        ToolCallComplete(
++                            name=name,
++                            status=ToolCallStatus.ERROR,
++                            result=None,
++                            error=denial,
++                            duration_ms=(time.monotonic() - pending.started) * 1000
++                            if pending
++                            else 0.0,
++                            metadata=metadata,
++                        )
++                    )
++                return hook_result(allow=False, message=denial)
++
++        return _OmnigentShellGateHook()
++
++    async def _shell_command_denial(self, args: ToolArgs) -> str | None:
++        """Decide a shell command like the other SDK harnesses decide native tools.
++
++        1. Omnigent's TOOL_CALL policies: DENY refuses, ASK asks the user.
++        2. The permission mode: ``auto`` / ``bypassPermissions`` run the
++           command; any other mode asks the user on an approval card.
++
++        Fails closed: an evaluator error, an unknown verdict, or a needed
++        approval with no approval handler refuses the command.
++
++        :param args: The command's SDK arguments, e.g.
++            ``{"CommandLine": "ls", "Cwd": "/repo"}``.
++        :returns: ``None`` to run it, or the refusal message the model sees.
++        """
++        evaluator = self._policy_evaluator
++        if evaluator is not None:
++            try:
++                verdict = await evaluator(
++                    "PHASE_TOOL_CALL", {"name": _SHELL_TOOL, "arguments": args}
++                )
++            except Exception:
++                logger.exception("Antigravity shell-command policy evaluation failed")
++                return "Omnigent could not evaluate its policies for this command."
++            action = getattr(verdict, "action", None)
++            reason = getattr(verdict, "reason", None) or ""
++            if action == "POLICY_ACTION_DENY":
++                return f"Denied by Omnigent policy: {reason or 'no reason given'}"
++            if action == "POLICY_ACTION_ASK":
++                return await self._ask_to_run_shell_command(args)
++            if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
++                return f"Unexpected Omnigent policy verdict {action!r}; command not run."
++        if self._permission_mode in _NO_PROMPT_PERMISSION_MODES:
++            return None
++        return await self._ask_to_run_shell_command(args)
++
++    async def _ask_to_run_shell_command(self, args: ToolArgs) -> str | None:
++        """Ask the user on Omnigent's approval card; refuse when nobody can answer.
++
++        :param args: The command's SDK arguments, shown on the card.
++        :returns: ``None`` when approved, else the refusal message.
++        """
++        handler = self._elicitation_handler
++        if handler is None:
++            return "Approval is required to run this command, but none can be requested."
++        try:
++            approved = await handler(_SHELL_TOOL, args)
++        except Exception:
++            logger.exception("Antigravity shell-command approval request failed")
++            return "The approval request for this command failed; command not run."
++        return None if approved else "The user declined to run this command."
++
+     def _build_sdk_tools(self, tools: list[ToolSpec]) -> list[SDKTool]:
+         """Build SDK tools (plain callables) from Omnigent tool specs.
+ 
+diff --git a/omnigent/inner/antigravity_harness.py b/omnigent/inner/antigravity_harness.py
+index 583e7c00f4d9fa3fa9088b47f7a343fb44891e4c..adfef9a15b2e326c187f982a4178055eaf22d6df 100644
+--- a/omnigent/inner/antigravity_harness.py
++++ b/omnigent/inner/antigravity_harness.py
+@@ -29,6 +29,10 @@ Env vars read at startup:
+   e.g. ``"us-central1"``.
+ - ``HARNESS_ANTIGRAVITY_OS_ENV``: JSON-encoded OS environment policy.
+   Requested sandbox restrictions are rejected because the SDK cannot enforce them.
++- ``HARNESS_ANTIGRAVITY_PERMISSION_MODE``: Omnigent permission stance for the
++  SDK's shell tool, from ``executor.config.permission_mode``. ``auto``
++  (default) and ``bypassPermissions`` run a command no policy objects to; any
++  other value (e.g. ``default``) asks on an approval card first.
+ """
+ 
+ from __future__ import annotations
+@@ -54,6 +58,7 @@ _ENV_VERTEX = "HARNESS_ANTIGRAVITY_VERTEX"
+ _ENV_PROJECT = "HARNESS_ANTIGRAVITY_PROJECT"
+ _ENV_LOCATION = "HARNESS_ANTIGRAVITY_LOCATION"
+ _ENV_OS_ENV = "HARNESS_ANTIGRAVITY_OS_ENV"
++_ENV_PERMISSION_MODE = "HARNESS_ANTIGRAVITY_PERMISSION_MODE"
+ 
+ # Truthy spellings accepted for the boolean Vertex flag.
+ _TRUTHY = frozenset({"1", "true", "yes", "on"})
+@@ -75,6 +80,7 @@ def _build_antigravity_executor() -> Executor:
+         vertex=os.environ.get(_ENV_VERTEX, "").strip().lower() in _TRUTHY,
+         project=os.environ.get(_ENV_PROJECT) or None,
+         location=os.environ.get(_ENV_LOCATION) or None,
++        permission_mode=os.environ.get(_ENV_PERMISSION_MODE, "").strip() or "auto",
+     )
+ 
+ 
+@@ -88,5 +94,7 @@ def create_app() -> FastAPI:
+     :returns: The FastAPI app from :class:`ExecutorAdapter`'s
+         :meth:`build` method.
+     """
+-    adapter = ExecutorAdapter(executor_factory=_build_antigravity_executor)
++    adapter = ExecutorAdapter(
++        executor_factory=_build_antigravity_executor, harness_label="Antigravity"
++    )
+     return adapter.build()
+diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
+index a1f9baee20e5c635e6644ea93b5fbe26e0cb6d42..eb9f8f8917a84757a472ec602755b676fe169dcf 100644
+--- a/omnigent/runtime/workflow.py
++++ b/omnigent/runtime/workflow.py
+@@ -2721,6 +2721,10 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
+         location = config.get("location")
+         if location:
+             env["HARNESS_ANTIGRAVITY_LOCATION"] = str(location)
++    # Permission stance for the SDK's shell tool; unset, the wrap uses ``auto``.
++    permission_mode = config.get("permission_mode")
++    if permission_mode is not None:
++        env["HARNESS_ANTIGRAVITY_PERMISSION_MODE"] = str(permission_mode)
+ 
+     return env
+ 
+diff --git a/tests/inner/test_antigravity_executor.py b/tests/inner/test_antigravity_executor.py
+index 33e9780795bd890cf12b27a36d0916e719d9492b..f4a300c3069f4f9ce88c2f6b3192747af0b45586 100644
+--- a/tests/inner/test_antigravity_executor.py
++++ b/tests/inner/test_antigravity_executor.py
+@@ -5,9 +5,11 @@ The fakes here mirror the real ``google.antigravity`` streaming surface the
+ executor depends on: ``agent.conversation`` yields :class:`Step` objects from
+ ``receive_steps()`` (text / reasoning deltas, tool calls, status, usage) as the
+ turn runs, a registered ``PostToolCallHook`` fires per tool completion with a
+-``ToolResult``, and ``conversation.cancel()`` aborts a running turn. They let
+-the streaming / tool-pairing / cancellation logic be tested without the SDK
+-package or network.
++``ToolResult``, a ``PreToolCallDecideHook`` decides each tool call before it
++runs (a refusal comes back as an ``ERROR`` step quoting the hook's message, as
++SDK 0.1.23 reports it), and ``conversation.cancel()`` aborts a running turn.
++They let the streaming / tool-pairing / shell-gate / cancellation logic be
++tested without the SDK package or network.
+ """
+ 
+ from __future__ import annotations
+@@ -149,6 +151,20 @@ class _FireToolResult:
+     tool_result: _FakeToolResult
+ 
+ 
++@dataclass
++class _DecideToolCall:
++    """Turn-script action: the SDK runs its pre-tool decide hooks for this call.
++
++    ``allowed`` records what the hooks decided once the action has run. With
++    ``refusal_on_call``, a refusal is reported the way SDK 0.1.2 does: as the
++    call's own ``TOOL_CALL`` step in ``ERROR``, after the call was streamed.
++    """
++
++    tool_call: _FakeToolCall
++    allowed: bool | None = None
++    refusal_on_call: bool = False
++
++
+ @dataclass
+ class _RaiseCancelled:
+     """Turn-script action: ``receive_steps`` raises the SDK's cancellation error."""
+@@ -162,7 +178,7 @@ class _RaiseGeneric:
+ 
+ 
+ # A turn script is the ordered list of actions one ``receive_steps()`` replays.
+-_TurnAction = _YieldStep | _FireToolResult | _RaiseCancelled | _RaiseGeneric
++_TurnAction = _YieldStep | _FireToolResult | _DecideToolCall | _RaiseCancelled | _RaiseGeneric
+ 
+ 
+ class _FakeConversation:
+@@ -184,7 +200,25 @@ class _FakeConversation:
+                 yield action.step
+             elif isinstance(action, _FireToolResult):
+                 for hook in self._hooks:
+-                    await hook.run(SimpleNamespace(), action.tool_result)
++                    if isinstance(hook, _FakePostToolCallHook):
++                        await hook.run(SimpleNamespace(), action.tool_result)
++            elif isinstance(action, _DecideToolCall):
++                result = _FakeHookResult(allow=True)
++                for hook in self._hooks:
++                    if isinstance(hook, _FakePreToolCallDecideHook):
++                        result = await hook.run(SimpleNamespace(), action.tool_call)
++                        if not result.allow:
++                            break
++                action.allowed = result.allow
++                if not result.allow and action.refusal_on_call:
++                    yield _FakeStep(
++                        step_type=_StepType.TOOL_CALL,
++                        status=_StepStatus.ERROR,
++                        tool_calls=[action.tool_call],
++                        error="User denied permission for tool call.",
++                    )
++                elif not result.allow:
++                    yield _sdk_denial_step(result.message)
+             elif isinstance(action, _RaiseCancelled):
+                 raise _AntigravityCancelledError("cancelled")
+             elif isinstance(action, _RaiseGeneric):
+@@ -228,6 +262,7 @@ class _FakeLocalAgentConfig:
+         location: str | None = None,
+         tools: Any = None,
+         hooks: Any = None,
++        policies: Any = None,
+     ) -> None:
+         self.system_instructions = system_instructions
+         self.model = model if isinstance(model, str) else None
+@@ -238,6 +273,7 @@ class _FakeLocalAgentConfig:
+         self.location = location
+         self.tools = tools
+         self.hooks = hooks
++        self.policies = policies
+ 
+ 
+ class _FakePostToolCallHook:
+@@ -247,6 +283,61 @@ class _FakePostToolCallHook:
+         return None
+ 
+ 
++@dataclass
++class _FakeHookResult:
++    """Mirror of ``google.antigravity.types.HookResult``."""
++
++    allow: bool = True
++    message: str = ""
++
++
++class _FakePreToolCallDecideHook:
++    """Sub-classable stand-in for ``google.antigravity.hooks.PreToolCallDecideHook``."""
++
++    async def run(self, context: Any, data: Any) -> _FakeHookResult:
++        return _FakeHookResult()
++
++
++@dataclass(frozen=True)
++class _FakePolicy:
++    """Mirror of ``google.antigravity.hooks.policy.Policy`` (the fields tests read)."""
++
++    tool: str
++    decision: str
++    name: str = ""
++
++
++class _FakePolicyModule:
++    """Mirror of ``google.antigravity.hooks.policy`` — just ``allow``."""
++
++    @staticmethod
++    def allow(tool: str, *, name: str = "") -> _FakePolicy:
++        return _FakePolicy(tool, "APPROVE", name)
++
++
++class _FakeHooks:
++    """Mirror of ``google.antigravity.hooks`` (the members the executor uses)."""
++
++    PostToolCallHook = _FakePostToolCallHook
++    PreToolCallDecideHook = _FakePreToolCallDecideHook
++    policy = _FakePolicyModule
++
++
++class _FakeTypes:
++    """Mirror of ``google.antigravity.types`` (the members the executor uses)."""
++
++    AntigravityCancelledError = _AntigravityCancelledError
++    HookResult = _FakeHookResult
++
++
++def _sdk_denial_step(message: str) -> _FakeStep:
++    """The step SDK 0.1.23 yields when a pre-tool hook refuses a call."""
++    text = f'{message} ("denied by pre-tool hook: {message}")'
++    return _FakeStep(
++        step_type=_StepType.TEXT_RESPONSE, status=_StepStatus.ERROR, content_delta=text, error=text
++    )
++
++
+ def _install_fake_sdk(
+     monkeypatch: pytest.MonkeyPatch,
+     *,
+@@ -263,12 +354,6 @@ def _install_fake_sdk(
+     queue: collections.deque[list[_TurnAction]] = collections.deque(scripts)
+     captured: dict[str, Any] = {"agents": [], "configs": []}
+ 
+-    class _FakeHooks:
+-        PostToolCallHook = _FakePostToolCallHook
+-
+-    class _FakeTypes:
+-        AntigravityCancelledError = _AntigravityCancelledError
+-
+     class _FakeModule:
+         LocalAgentConfig = _FakeLocalAgentConfig
+         hooks = _FakeHooks
+@@ -1180,12 +1265,6 @@ def _install_blocking_sdk(
+         async def __aexit__(self, *_a: object) -> None:
+             return None
+ 
+-    class _FakeHooks:
+-        PostToolCallHook = _FakePostToolCallHook
+-
+-    class _FakeTypes:
+-        AntigravityCancelledError = _AntigravityCancelledError
+-
+     class _FakeModule:
+         LocalAgentConfig = _FakeLocalAgentConfig
+         hooks = _FakeHooks
+@@ -1322,12 +1401,6 @@ def _install_rebuild_sdk(monkeypatch: pytest.MonkeyPatch, gate: asyncio.Event) -
+         async def __aexit__(self, *_a: object) -> None:
+             self.closed = True
+ 
+-    class _FakeHooks:
+-        PostToolCallHook = _FakePostToolCallHook
+-
+-    class _FakeTypes:
+-        AntigravityCancelledError = _AntigravityCancelledError
+-
+     class _FakeModule:
+         LocalAgentConfig = _FakeLocalAgentConfig
+         hooks = _FakeHooks
+@@ -1392,3 +1465,279 @@ async def test_next_turn_rebuilds_after_interrupt(monkeypatch: pytest.MonkeyPatc
+     completes = [e for e in events if isinstance(e, TurnComplete)]
+     assert len(completes) == 1
+     assert completes[0].response == "second-reply"
++
++
++# ── Shell commands: Omnigent policy + permission mode ───────────────────
++
++_LS = _FakeToolCall("run_command", {"CommandLine": "ls", "Cwd": "/work"}, call_id="call_1")
++
++
++def _verdict(action: str, reason: str | None = None) -> SimpleNamespace:
++    """A policy verdict as the adapter's evaluator bridge returns it."""
++    return SimpleNamespace(action=action, reason=reason)
++
++
++def _wire_bridges(
++    executor: AntigravityExecutor,
++    *,
++    verdict: SimpleNamespace | None = None,
++    approve: bool | None = None,
++) -> dict[str, list[Any]]:
++    """Install fake policy / approval bridges, as the ExecutorAdapter does.
++
++    :param verdict: What the policy evaluator answers, or ``None`` to leave it unwired.
++    :param approve: The user's answer on the card, or ``None`` to leave it unwired.
++    :returns: The calls each bridge received, keyed ``"policy"`` / ``"asked"``.
++    """
++    calls: dict[str, list[Any]] = {"policy": [], "asked": []}
++
++    async def _evaluate(phase: str, data: dict[str, Any]) -> SimpleNamespace:
++        calls["policy"].append((phase, data))
++        assert verdict is not None
++        return verdict
++
++    async def _ask(tool_name: str, tool_input: dict[str, Any]) -> bool:
++        calls["asked"].append((tool_name, tool_input))
++        assert approve is not None
++        return approve
++
++    if verdict is not None:
++        executor._policy_evaluator = _evaluate
++    if approve is not None:
++        executor._elicitation_handler = _ask
++    return calls
++
++
++def _ran_ls_script(decide: _DecideToolCall) -> list[_TurnAction]:
++    """A turn whose shell call is allowed: the SDK runs it, then the model replies."""
++    ran = _FakeToolCall("run_command", {"command_line": "ls"}, call_id="traj:4")
++    return [
++        decide,
++        _tool_call_step(ran),
++        _tool_call_step(ran, status=_StepStatus.DONE),
++        _text_step("listed"),
++    ]
++
++
++def _refused_ls_script(decide: _DecideToolCall) -> list[_TurnAction]:
++    """A turn whose shell call is refused: the SDK reports it, then the model goes on."""
++    return [decide, _text_step("could not run it")]
++
++
++@pytest.mark.asyncio
++async def test_shell_policy_replaces_sdk_default_deny(monkeypatch: pytest.MonkeyPatch) -> None:
++    """The agent gets an allow-all policy plus the shell gate, not the SDK's run_command deny."""
++    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
++    executor = AntigravityExecutor()
++
++    await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
++
++    config = captured["configs"][0]
++    assert config.policies == [_FakePolicy("*", "APPROVE", "omnigent_shell_gate")]
++    assert any(isinstance(hook, _FakePreToolCallDecideHook) for hook in config.hooks)
++
++
++@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions"])
++@pytest.mark.asyncio
++async def test_shell_command_runs_without_asking_when_policy_allows(
++    monkeypatch: pytest.MonkeyPatch, permission_mode: str
++) -> None:
++    """In a mode that does not ask, a command Omnigent policy allows just runs."""
++    decide = _DecideToolCall(_LS)
++    _install_fake_sdk(monkeypatch, scripts=[_ran_ls_script(decide)])
++    executor = AntigravityExecutor(permission_mode=permission_mode)
++    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=False)
++
++    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    assert decide.allowed is True
++    assert calls["policy"] == [
++        ("PHASE_TOOL_CALL", {"name": "run_command", "arguments": _LS.args}),
++    ]
++    assert calls["asked"] == []
++    assert [e.name for e in events if isinstance(e, ToolCallRequest)] == ["run_command"]
++    assert any(isinstance(e, TurnComplete) for e in events)
++
++
++@pytest.mark.asyncio
++async def test_shell_command_asks_and_runs_when_approved(monkeypatch: pytest.MonkeyPatch) -> None:
++    """In a mode that asks, the command runs only after the user approves the card."""
++    decide = _DecideToolCall(_LS)
++    _install_fake_sdk(monkeypatch, scripts=[_ran_ls_script(decide)])
++    executor = AntigravityExecutor(permission_mode="default")
++    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=True)
++
++    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    assert calls["asked"] == [("run_command", _LS.args)]
++    assert decide.allowed is True
++    assert any(isinstance(e, TurnComplete) for e in events)
++    assert not any(isinstance(e, ExecutorError) for e in events)
++
++
++@pytest.mark.asyncio
++async def test_refused_shell_command_fails_the_call_and_the_turn_continues(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A user refusal fails that tool call; the SDK's report of it is not a turn error."""
++    decide = _DecideToolCall(_LS)
++    _install_fake_sdk(monkeypatch, scripts=[_refused_ls_script(decide)])
++    executor = AntigravityExecutor(permission_mode="default")
++    _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=False)
++
++    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    assert decide.allowed is False
++    requests = [e for e in events if isinstance(e, ToolCallRequest)]
++    completes = [e for e in events if isinstance(e, ToolCallComplete)]
++    assert [(r.name, r.args, r.metadata) for r in requests] == [
++        ("run_command", _LS.args, {"call_id": "call_1"})
++    ]
++    assert len(completes) == 1
++    assert completes[0].status == ToolCallStatus.ERROR
++    assert completes[0].error == "The user declined to run this command."
++    assert completes[0].metadata == requests[0].metadata
++    # The SDK's denial report is neither assistant text nor a turn failure.
++    assert [e.text for e in events if isinstance(e, TextChunk)] == ["could not run it"]
++    assert not any(isinstance(e, ExecutorError) for e in events)
++    turn_completes = [e for e in events if isinstance(e, TurnComplete)]
++    assert len(turn_completes) == 1 and turn_completes[0].response == "could not run it"
++
++
++@pytest.mark.parametrize("permission_mode", ["auto", "default"])
++@pytest.mark.asyncio
++async def test_shell_command_denied_by_omnigent_policy(
++    monkeypatch: pytest.MonkeyPatch, permission_mode: str
++) -> None:
++    """A policy DENY refuses the command in every mode, without asking the user."""
++    decide = _DecideToolCall(_LS)
++    _install_fake_sdk(monkeypatch, scripts=[_refused_ls_script(decide)])
++    executor = AntigravityExecutor(permission_mode=permission_mode)
++    calls = _wire_bridges(
++        executor, verdict=_verdict("POLICY_ACTION_DENY", "no shell here"), approve=True
++    )
++
++    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    assert decide.allowed is False
++    assert calls["asked"] == []
++    completes = [e for e in events if isinstance(e, ToolCallComplete)]
++    assert len(completes) == 1 and completes[0].status == ToolCallStatus.ERROR
++    assert completes[0].error == "Denied by Omnigent policy: no shell here"
++    assert any(isinstance(e, TurnComplete) for e in events)
++    assert not any(isinstance(e, ExecutorError) for e in events)
++
++
++@pytest.mark.asyncio
++async def test_policy_ask_prompts_even_in_a_mode_that_does_not_ask(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """An ASK verdict reaches the approval card even under ``bypassPermissions``."""
++    decide = _DecideToolCall(_LS)
++    _install_fake_sdk(monkeypatch, scripts=[_ran_ls_script(decide)])
++    executor = AntigravityExecutor(permission_mode="bypassPermissions")
++    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ASK"), approve=True)
++
++    await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    assert calls["asked"] == [("run_command", _LS.args)]
++    assert decide.allowed is True
++
++
++async def _raising_evaluator(phase: str, data: dict[str, Any]) -> SimpleNamespace:
++    raise RuntimeError("policy service down")
++
++
++@pytest.mark.parametrize(
++    ("permission_mode", "evaluator", "expected_error"),
++    [
++        ("default", None, "Approval is required to run this command"),
++        ("auto", _raising_evaluator, "Omnigent could not evaluate its policies"),
++        ("auto", "POLICY_ACTION_SOMETHING_NEW", "Unexpected Omnigent policy verdict"),
++    ],
++    ids=["no-approval-handler", "evaluator-raises", "unknown-verdict"],
++)
++@pytest.mark.asyncio
++async def test_shell_gate_fails_closed(
++    monkeypatch: pytest.MonkeyPatch, permission_mode: str, evaluator: Any, expected_error: str
++) -> None:
++    """When the gate cannot decide, the command is refused and the turn still ends cleanly."""
++    decide = _DecideToolCall(_LS)
++    _install_fake_sdk(monkeypatch, scripts=[_refused_ls_script(decide)])
++    executor = AntigravityExecutor(permission_mode=permission_mode)
++    if isinstance(evaluator, str):
++        _wire_bridges(executor, verdict=_verdict(evaluator))
++    else:
++        executor._policy_evaluator = evaluator
++
++    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    assert decide.allowed is False
++    completes = [e for e in events if isinstance(e, ToolCallComplete)]
++    assert len(completes) == 1 and completes[0].error.startswith(expected_error)
++    assert any(isinstance(e, TurnComplete) for e in events)
++
++
++@pytest.mark.asyncio
++async def test_shell_gate_leaves_other_tools_alone(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Only run_command is gated; other tools pass without a policy round trip or card."""
++    view = _FakeToolCall("view_file", {"AbsolutePath": "/work/a.txt"}, call_id="call_2")
++    decide = _DecideToolCall(view)
++    _install_fake_sdk(monkeypatch, scripts=[[decide, _text_step("ok")]])
++    executor = AntigravityExecutor(permission_mode="default")
++    calls = _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_DENY"), approve=False)
++
++    await _drain(executor, [{"role": "user", "content": "read", "session_id": "s1"}])
++
++    assert decide.allowed is True
++    assert calls == {"policy": [], "asked": []}
++
++
++@pytest.mark.asyncio
++async def test_unrelated_error_after_refused_shell_command_still_fails_turn(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Only the SDK's report of the refusal is absorbed; any other ERROR step fails the turn."""
++    script: list[_TurnAction] = [
++        _DecideToolCall(_LS),
++        _YieldStep(
++            _FakeStep(step_type=_StepType.FINISH, status=_StepStatus.ERROR, error="model exploded")
++        ),
++    ]
++    _install_fake_sdk(monkeypatch, scripts=[script])
++    executor = AntigravityExecutor(permission_mode="default")
++    _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_ALLOW"), approve=False)
++
++    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    errors = [e for e in events if isinstance(e, ExecutorError)]
++    assert [e.message for e in errors] == ["model exploded"]
++    assert not any(isinstance(e, TurnComplete) for e in events)
++
++
++@pytest.mark.asyncio
++async def test_refusal_on_an_sdk_that_streams_the_call_first(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """SDK 0.1.2 streams the call, then asks the hook: the refusal closes that same call once."""
++    call = _FakeToolCall("run_command", {"command_line": "ls"}, call_id="traj:2")
++    decide = _DecideToolCall(call, refusal_on_call=True)
++    script: list[_TurnAction] = [
++        _tool_call_step(call),
++        decide,
++        _text_step("could not run it"),
++    ]
++    _install_fake_sdk(monkeypatch, scripts=[script])
++    executor = AntigravityExecutor()
++    _wire_bridges(executor, verdict=_verdict("POLICY_ACTION_DENY", "no shell here"))
++
++    events = await _drain(executor, [{"role": "user", "content": "ls", "session_id": "s1"}])
++
++    assert decide.allowed is False
++    requests = [e for e in events if isinstance(e, ToolCallRequest)]
++    completes = [e for e in events if isinstance(e, ToolCallComplete)]
++    assert [r.metadata for r in requests] == [{"call_id": "traj:2"}]
++    assert [(c.metadata, c.error) for c in completes] == [
++        ({"call_id": "traj:2"}, "Denied by Omnigent policy: no shell here")
++    ]
++    assert any(isinstance(e, TurnComplete) for e in events)
+diff --git a/tests/inner/test_antigravity_harness.py b/tests/inner/test_antigravity_harness.py
+index c0c2ad8e2453a5a694d024901f088eb6b1b0058b..f569c45e4b38eb85979b17f9be94ed768120df61 100644
+--- a/tests/inner/test_antigravity_harness.py
++++ b/tests/inner/test_antigravity_harness.py
+@@ -43,6 +43,22 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
+     assert "/v1/sessions/{conversation_id}/events" in paths
+ 
+ 
++def test_approval_cards_name_antigravity(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Shell-command approval cards read "Antigravity wants to use ...", not "Claude"."""
++    captured: dict[str, Any] = {}
++
++    class _RecordingAdapter:
++        def __init__(self, **kwargs: Any) -> None:
++            captured.update(kwargs)
++
++        def build(self) -> None:
++            return None
++
++    monkeypatch.setattr(antigravity_harness, "ExecutorAdapter", _RecordingAdapter)
++    antigravity_harness.create_app()
++    assert captured["harness_label"] == "Antigravity"
++
++
+ _ALL_ANTIGRAVITY_ENV = (
+     "HARNESS_ANTIGRAVITY_MODEL",
+     "HARNESS_ANTIGRAVITY_API_KEY",
+@@ -50,6 +66,7 @@ _ALL_ANTIGRAVITY_ENV = (
+     "HARNESS_ANTIGRAVITY_PROJECT",
+     "HARNESS_ANTIGRAVITY_LOCATION",
+     "HARNESS_ANTIGRAVITY_OS_ENV",
++    "HARNESS_ANTIGRAVITY_PERMISSION_MODE",
+ )
+ 
+ 
+@@ -83,6 +100,7 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
+     monkeypatch.setenv("HARNESS_ANTIGRAVITY_VERTEX", "true")
+     monkeypatch.setenv("HARNESS_ANTIGRAVITY_PROJECT", "my-proj")
+     monkeypatch.setenv("HARNESS_ANTIGRAVITY_LOCATION", "us-central1")
++    monkeypatch.setenv("HARNESS_ANTIGRAVITY_PERMISSION_MODE", "default")
+ 
+     captured = _capture_factory_kwargs(monkeypatch)
+ 
+@@ -91,6 +109,7 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
+     assert captured["vertex"] is True
+     assert captured["project"] == "my-proj"
+     assert captured["location"] == "us-central1"
++    assert captured["permission_mode"] == "default"
+ 
+ 
+ @pytest.mark.parametrize("os_env_payload", [None, '{"sandbox": {"type": "none"}}'])
+@@ -111,6 +130,7 @@ def test_executor_factory_defaults_when_unset(
+     assert captured["vertex"] is False
+     assert captured["project"] is None
+     assert captured["location"] is None
++    assert captured["permission_mode"] == "auto"
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/runtime/test_antigravity_spawn_env.py b/tests/runtime/test_antigravity_spawn_env.py
+index ef8b89d08a95c990a82ff2b23b2f4556bd705b19..e86e09193a54e5129235e4a0680a2865da3d56b7 100644
+--- a/tests/runtime/test_antigravity_spawn_env.py
++++ b/tests/runtime/test_antigravity_spawn_env.py
+@@ -195,6 +195,14 @@ def test_vertex_config_threads_project_and_location() -> None:
+     assert env["HARNESS_ANTIGRAVITY_LOCATION"] == "us-central1"
+ 
+ 
++@pytest.mark.parametrize("mode", [None, "default"])
++def test_permission_mode_threads_into_env_var(mode: str | None) -> None:
++    """``executor.config.permission_mode`` reaches the wrap; unset, the wrap default applies."""
++    config_extra = {} if mode is None else {"permission_mode": mode}
++    env = _build_antigravity_spawn_env(_make_spec(config_extra=config_extra))
++    assert env.get("HARNESS_ANTIGRAVITY_PERMISSION_MODE") == mode
++
++
+ def test_databricks_auth_ignored_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+     """``DatabricksAuth`` is unsupported: no env var emitted, and a warning logged."""
+     with caplog.at_level(logging.WARNING, logger=wf.__name__):
