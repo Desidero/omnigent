@@ -453,7 +453,8 @@ class BuildSets(unittest.TestCase):
         self.base = self.commit("upstream base")
         run("git", "switch", "-q", "-c", "patches", cwd=self.repo)
         custom = self.repo / "custom"
-        copy_scripts(custom, "build-custom.sh", "check.sh", "export.sh", "select-tests.py", *SERIES_SCRIPTS)
+        copy_scripts(custom, "build-custom.sh", "check.sh", "check-tree.sh", "export.sh", "refresh.sh",
+                     "select-tests.py", *SERIES_SCRIPTS)
         self.write("custom/BASE", self.base + "\n")
         self.write("custom/sets/small.txt", "# b, and a because b needs it\nb\n")
         self.write("custom/index-intro.md", "# The series\n\nWhat this build holds.\n")
@@ -798,6 +799,136 @@ class BuildSets(unittest.TestCase):
         verify = self.script("serieslib.py", "verify")
         self.assertEqual((verify.returncode, verify.stdout), (0, ""), verify.stderr)
         self.assertEqual((self.build() / "docs" / "table.md").read_text(), "| title |\n| --- |\n| first |\n| final |\n")
+
+    def upstream_moves(self) -> str:
+        """Upstream renames the table's column, takes c's change as it is, and changes the line b changes."""
+        self.series("work/d", self.base, "rename the last row", {"docs/table.md": "| name |\n| --- |\n| first |\n| final |\n"})
+        self.export("d", "work/d")
+        on_b = self.script("build-custom.sh", "--series", "b", "work/g-base").stdout.strip()
+        self.series("work/g", on_b, "more about beta", {"docs/beta.md": "# Beta\n"})
+        self.export("g", "work/g", "--needs", "b")
+        self.fill_notes()
+        self.write("custom/sets/small.txt", "a\nb\nc\n")
+        self.commit("add d and g")
+        self.series("upstream-next", self.base, "upstream moves", {
+            "docs/table.md": "| title |\n| --- |\n| first |\n| last |\n",
+            "omnigent/gamma.py": "gamma = 2\n", "docs/gamma.md": "# Gamma\n", "omnigent/beta.py": "beta = 9\n",
+        })
+        return run("git", "rev-parse", "upstream-next", cwd=self.repo).stdout.strip()
+
+    def test_refresh_moves_each_series_alone_parks_and_drops(self):
+        new_base = self.upstream_moves()
+        run("git", "switch", "-q", "-c", "refresh/test", cwd=self.repo)
+        result = self.script("refresh.sh", "--no-fetch", "--upstream", "upstream-next", "--no-upstream-check")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for line in ("a: unchanged", "b: conflict (omnigent/beta.py)", "c: landed (every patch is empty on the new BASE; "
+                     "commented out of set small)", "d: refreshed", "g: waits (needs b)",
+                     "refresh: 1 conflict, 1 landed, 1 refreshed, 1 unchanged, 1 waits"):
+            self.assertIn(line + "\n", result.stdout)
+        self.assertIn("custom/scripts/export.sh b work/b", result.stdout)
+        self.assertIn("Some series are stale", result.stderr)
+        custom = self.repo / "custom"
+        self.assertFalse((custom / "patches" / "c").exists())
+        self.assertIn("# c  (landed upstream)", (custom / "sets" / "small.txt").read_text())
+        # The stale series is as it was; nothing is committed yet.
+        self.assertIn("-beta = 1", (custom / "patches" / "b" / "01-beta-change.patch").read_text())
+        self.assertEqual(run("git", "log", "-1", "--format=%s", cwd=self.repo).stdout.strip(),
+                         f"Merge upstream {new_base[:12]} into patches")
+        # b cannot be parked from under g.
+        refused = self.script("refresh.sh", "--continue", "--park", "b", "--no-upstream-check")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("b is needed by g: park them too", refused.stderr)
+        done = self.script("refresh.sh", "--continue", "--park", "b", "--park", "g", "--no-upstream-check")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"parked b (cut from {self.base[:12]}); commented out of set small", done.stdout)
+        self.assertIn("refresh: 2 unchanged", done.stdout)  # a and d, which the first run moved
+        self.assertIn(f"Refreshed onto {new_base[:12]}", done.stdout)
+        self.assertIn(f"Needs: a\nBase: {self.base}\n", (custom / "parked" / "b" / "NOTE.md").read_text())
+        self.assertTrue((custom / "parked" / "g" / "01-more-about-beta.patch").is_file())
+        self.assertEqual(run("git", "log", "-1", "--format=%s", cwd=self.repo).stdout.strip(),
+                         f"Refresh the series onto upstream {new_base[:12]}")
+        self.assertEqual(run("git", "status", "--porcelain", cwd=self.repo).stdout, "")
+        tree = self.build()
+        self.assertEqual(self.subjects(tree), ["upstream moves", "alpha change", "rename the last row", INDEX])
+        self.assertEqual((tree / "docs" / "table.md").read_text(), "| title |\n| --- |\n| first |\n| final |\n")
+        # A parked directory needs its Base line.
+        note = custom / "parked" / "g" / "NOTE.md"
+        note.write_text(re.sub(r"^Base:.*\n", "", note.read_text(), flags=re.M))
+        self.assertIn("custom/parked/g/NOTE.md needs a 'Base: <commit>' line", self.script("serieslib.py", "lint").stdout)
+
+    def test_refresh_rehearsal_writes_nothing(self):
+        new_base = self.upstream_moves()
+        result = self.script("refresh.sh", "--rehearse", "--no-fetch", "--upstream", "upstream-next", "--no-upstream-check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"rehearsal: {self.base[:12]} -> {new_base[:12]}; nothing is written", result.stdout)
+        self.assertIn("b: conflict (omnigent/beta.py)", result.stdout)
+        self.assertIn("c: landed", result.stdout)
+        self.assertEqual(run("git", "status", "--porcelain", cwd=self.repo).stdout, "")
+        self.assertEqual((self.repo / "custom" / "BASE").read_text().strip(), self.base)
+
+    def test_refresh_keeps_glue_in_step_with_its_series(self):
+        self.add_row_series("d", "delta")
+        self.add_row_series("e", "epsilon")
+        make_glue(self.repo / "custom", "d+e", joins=("docs/table.md", "docs/alpha.md"))
+        make_glue(self.repo / "custom", "a+c", joins=("docs/alpha.md",))
+        self.commit("add d, e and glue")
+        self.series("upstream-next", self.base, "upstream moves", {"docs/new.md": "# New\n"})
+        self.write("custom/BASE", run("git", "rev-parse", "upstream-next", cwd=self.repo).stdout)
+        result = self.script("serieslib.py", "refresh", "--no-upstream-check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("glue d+e: refreshed (no longer joined: docs/alpha.md)", result.stdout)
+        self.assertIn("glue a+c: removed (the two series combine without it now)", result.stdout)
+        self.assertIn("Joins: docs/table.md\n", (self.repo / "custom" / "glue" / "d+e" / "NOTE.md").read_text())
+        self.assertFalse((self.repo / "custom" / "glue" / "a+c").exists())
+        self.assertEqual(self.verify(), "")
+
+    def refresh_with_gh(self, gh: str, *args: str) -> str:
+        """serieslib.py refresh with a `gh` that runs this shell line; returns what it printed."""
+        fake = Path(self.tmp.name, "bin")
+        fake.mkdir(exist_ok=True)
+        (fake / "gh").write_text(f"#!/bin/sh\n{gh}\n")
+        (fake / "gh").chmod(0o755)
+        command = [str(self.repo / "custom/scripts/serieslib.py"), "refresh", *args]
+        env = {**GIT_ENV, "PATH": f"{fake}:{GIT_ENV['PATH']}"}
+        return subprocess.run(command, cwd=self.repo, env=env, capture_output=True, text=True).stdout
+
+    def test_refresh_runs_the_series_own_copy_of_a_test_it_changes(self):
+        # d extends a test upstream already has, under the same name.
+        self.series("work/d", self.base, "delta change\n\nDocs: none (test)",
+                    {"omnigent/delta.py": "delta = 1\n", "tests/test_alpha.py": "def test_it():\n    assert delta_only\n"})
+        self.export("d", "work/d")
+        self.fill_notes()
+        note = self.repo / "custom" / "patches" / "d" / "NOTE.md"
+        note.write_text(note.read_text()
+                        .replace("kept here only.", "pull request [#7](https://github.com/o/r/pull/7).")
+                        .replace("## Tests\n\n- none (a stub)", "## Tests\n\n- `tests/test_alpha.py::test_it`"))
+        self.commit("add d")
+        merged = """echo '{"state": "MERGED"}'"""
+        tip = self.script("build-custom.sh", "--series", "d", "--no-index", "work/d-built").stdout.strip()
+        self.assertIn(f"run them there (the series' own copy: git checkout {tip[:12]} -- tests/test_alpha.py) "
+                      "to see whether the series can go: tests/test_alpha.py::test_it\n", self.refresh_with_gh(merged))
+        # BASE's copy of the test would pass this command; the series' copy does not.
+        base_copy_only = "sh -c '! grep -q delta_only tests/test_alpha.py' --"
+        self.assertIn("on bare BASE, in the series' own copy of tests/test_alpha.py, they fail (exit 1)",
+                      self.refresh_with_gh(merged, "--landed-test-cmd", base_copy_only))
+
+    def test_refresh_hints_at_a_series_whose_upstream_pull_request_merged(self):
+        note = self.repo / "custom" / "patches" / "c" / "NOTE.md"
+        note.write_text(note.read_text()
+                        .replace("kept here only.", "pull request [#7](https://github.com/o/r/pull/7).")
+                        .replace("- none (a stub)\n", "- `omnigent/gamma.py`: `gamma`\n", 1)
+                        .replace("## Tests\n\n- none (a stub)", "## Tests\n\n- `tests/test_gamma.py::test_it`\n- `tests/test_new.py`"))
+        self.commit("c is proposed upstream")
+        refresh = self.refresh_with_gh
+        merged = """echo '{"state": "MERGED"}'"""
+        out = refresh(merged)
+        self.assertIn("c: unchanged\n  hint: upstream #7 merged and 1 of the note's tests are on BASE; run them there "
+                      "to see whether the series can go: tests/test_gamma.py::test_it\n", out)
+        self.assertIn("on bare BASE they pass: the series looks landed, drop it", refresh(merged, "--landed-test-cmd", "true"))
+        self.assertIn("on bare BASE they fail (exit 1)", refresh(merged, "--landed-test-cmd", "false"))
+        self.assertNotIn("hint", refresh("""echo '{"state": "OPEN"}'"""))
+        self.assertIn("(upstream check): skipped (gh could not be asked)", refresh("exit 1"))
+        self.assertNotIn("upstream check", refresh("exit 1", "--no-upstream-check"))
 
     def test_recut_stops_on_a_conflict_and_says_how_to_finish(self):
         self.series("work/a", None, "alpha moves beta\n\nDocs: none (test)", {"omnigent/beta.py": "beta = 5\n"})

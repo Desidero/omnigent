@@ -7,6 +7,7 @@
   custom/patches/<series>/NN-<slug>.patch  its patches, applied in file-name order
   custom/glue/<first>+<second>/NOTE.md     how two series fit together: "Joins: <paths>"
   custom/glue/<first>+<second>/NN-*.patch  optional patches on top of the two combined
+  custom/parked/<series>/                  a series out of the build; its note says "Base: <commit>"
   custom/sets/<name>.txt                   named build sets, one series per line
   custom/index-intro.md                    the text above the sections of the built index
 
@@ -44,6 +45,10 @@ release notes, tracker) imports this module or runs it:
                                                   rewrite one series from its branch
   serieslib.py export [--repo R] --glue <first>+<second> <branch>
                                                   rewrite a glue pair's patches
+  serieslib.py refresh [--repo R] [--from C]      move every series onto the BASE custom/BASE
+                                                  names now; one line each: unchanged, refreshed,
+                                                  landed, conflict, waits (exit 1 on the last two)
+  serieslib.py park [--from C] <series>...        move series to custom/parked/, out of the build
   serieslib.py covers [--write] [<series>...]     the hash a note's "Covers:" line holds
   serieslib.py json [--names a,b]                 [{name, needs, patches: [{file, subject, patch_id}]}]
 
@@ -430,6 +435,7 @@ class Catalog:
                 problems += self._docs_rule(f"{name}/{patch.name}", patch)
             problems += self.note_problems(name)
         problems += self._glue_problems()
+        problems += self._parked_problems()
         problems += self._order_problems()
         for set_name in self.set_names():
             try:
@@ -487,6 +493,24 @@ class Catalog:
                 problems.append(f"{where}/NOTE.md does not say why the two series meet")
             for patch in glue.patches:
                 problems += self._docs_rule(f"glue {name}/{patch.name}", patch)
+        return problems
+
+    def _parked_problems(self) -> list[str]:
+        """custom/parked/<series>/: a series out of the build, with the BASE its patches are cut from."""
+        problems = []
+        parked = self.custom / "parked"
+        for path in sorted(parked.iterdir()) if parked.is_dir() else []:
+            where = f"custom/parked/{path.name}"
+            if not path.is_dir():
+                problems.append(f"{where} is not in a series directory")
+                continue
+            if path.name in self.series:
+                problems.append(f"{where}: {path.name} is also under custom/patches/; keep one")
+            note = parse_note((path / "NOTE.md").read_text()) if (path / "NOTE.md").is_file() else None
+            if note is None or not re.fullmatch(r"[0-9a-f]{40}", note.fields.get("Base", "")):
+                problems.append(f"{where}/NOTE.md needs a 'Base: <commit>' line: the BASE its patches are cut from")
+            if not list(path.glob("*.patch")):
+                problems.append(f"{where} has no patches")
         return problems
 
     def _order_problems(self) -> list[str]:
@@ -629,6 +653,16 @@ class Built:
     tip: str
     order: list[str]
     commits: int
+
+
+@dataclass
+class Transplant:
+    """Commits moved onto another foundation: what arrived, what was empty there, what stopped it."""
+
+    picked: list[str] = field(default_factory=list)
+    landed: list[str] = field(default_factory=list)
+    conflict: str = ""
+    paths: list[str] = field(default_factory=list)
 
 
 class Engine:
@@ -833,6 +867,28 @@ class Engine:
         if side is not None:
             return None
         return self.git("hash-object", "-w", "--stdin", data=b"".join(out))
+
+    def transplant(self, label: str, start: str, commits: list[str]) -> Transplant:
+        """Cherry-pick commits made elsewhere onto `start`, stopping at the first conflict.
+
+        A commit that changes nothing there (upstream has it) is left out and
+        its subject kept in `landed`.
+        """
+        moved = Transplant()
+        tip = start
+        for commit in commits:
+            try:
+                new = self._pick(tip, commit, label, [], {})
+            except BuildError as error:
+                moved.conflict = str(error)
+                moved.paths = [line.strip().split(" (")[0] for line in str(error).splitlines()[1:-1]]
+                return moved
+            if self.tree(new) == self.tree(tip):
+                moved.landed.append(self.git("log", "-1", "--format=%s", commit))
+                continue
+            moved.picked.append(new)
+            tip = new
+        return moved
 
     def _commit_like(self, commit: str, tree: str, parent: str) -> str:
         """A commit with another commit's author, date and message."""
@@ -1114,6 +1170,24 @@ def export_series(custom: Path, repo: Path, name: str, branch: str, needs: list[
     return notes
 
 
+def source_engine(custom: Path, repo: Path, source: str, into: str) -> Engine:
+    """An engine for the series as committed at `source`, read from the clone `repo`."""
+    inside = subprocess.run(["git", "-C", str(custom), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    prefix = "custom"
+    if inside.returncode == 0 and Path(custom).resolve().is_relative_to(inside.stdout.strip()):
+        prefix = Path(custom).resolve().relative_to(inside.stdout.strip()).as_posix()
+    wanted = [f"{prefix}/{part}" for part in ("BASE", "patches", "glue")]
+    present = [
+        path for path in wanted
+        if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{source}:{path}"], capture_output=True).returncode == 0
+    ]  # fmt: skip
+    if f"{prefix}/BASE" not in present:
+        raise SeriesError(f"{source} has no {prefix}/BASE in {repo}")
+    archive = subprocess.run(["git", "-C", str(repo), "archive", source, *present], capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", into], input=archive, check=True)
+    return Engine(Catalog(Path(into) / prefix), repo)
+
+
 def recut(custom: Path, repo: Path, names: list[str], source: str) -> list[str]:
     """Move series whose foundation changed onto their new foundation.
 
@@ -1122,16 +1196,8 @@ def recut(custom: Path, repo: Path, names: list[str], source: str) -> list[str]:
     the working tree now give, and the series' patch files are rewritten. A
     conflict leaves the series alone and says how to finish by hand.
     """
-    top = subprocess.run(
-        ["git", "-C", str(custom), "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
-    ).stdout.strip()
-    prefix = Path(custom).resolve().relative_to(top).as_posix()
     with tempfile.TemporaryDirectory(prefix="serieslib-old-") as old_dir:
-        archive = subprocess.run(
-            ["git", "-C", top, "archive", source, f"{prefix}/BASE", f"{prefix}/patches"], capture_output=True, check=True
-        ).stdout
-        subprocess.run(["tar", "-x", "-C", old_dir], input=archive, check=True)
-        old = Engine(Catalog(Path(old_dir) / prefix), repo)
+        old = source_engine(custom, repo, source, old_dir)
         notes = []
         catalog = Catalog(custom)
         for name in [name for name in catalog.order if name in names]:
@@ -1144,23 +1210,293 @@ def recut(custom: Path, repo: Path, names: list[str], source: str) -> list[str]:
                 pass
             if name not in old.catalog.series:
                 raise SeriesError(f"{name} is not a series at {source}")
-            tip = engine.foundation(name)
-            try:
-                picked = []
-                for commit in old.series_commits(name):
-                    tip = engine._pick(tip, commit, name, [], {})
-                    picked.append(tip)
-            except BuildError as error:
-                old_tip = old.series_commits(name)[-1]
-                notes.append(
-                    f"{name}: conflicts on its new foundation {engine.foundation(name)[:12]}; finish by hand:\n"
-                    f"  git switch -c work/{name} {engine.foundation(name)[:12]} && "
-                    f"git cherry-pick {old.foundation(name)[:12]}..{old_tip[:12]}\n"
-                    f"  custom/scripts/export.sh {name} work/{name}\n  ({str(error).splitlines()[0]})"
-                )
+            moved = engine.transplant(name, engine.foundation(name), old.series_commits(name))
+            if moved.conflict:
+                notes.append(f"{name}: conflicts on its new foundation {engine.foundation(name)[:12]}; finish by hand:")
+                notes.append(by_hand(engine, old, name) + f"\n  ({moved.conflict.splitlines()[0]})")
                 break
-            notes += write_series(engine, name, picked, engine.catalog.series[name].needs)
+            notes += write_series(engine, name, moved.picked, engine.catalog.series[name].needs)
             notes.append(f"{name}: re-cut onto {engine.foundation(name)[:12]}")
+    return notes
+
+
+def by_hand(engine: Engine, old: Engine, name: str) -> str:
+    """The commands that move one series onto its new foundation by hand."""
+    return (
+        f"  git switch -c work/{name} {engine.foundation(name)[:12]} && "
+        f"git cherry-pick {old.foundation(name)[:12]}..{old.series_commits(name)[-1][:12]}\n"
+        f"  custom/scripts/export.sh {name} work/{name}"
+    )
+
+
+# ---------------------------------------------------------------- refresh
+
+STALE = ("conflict", "waits")
+
+
+def remove_from_sets(custom: Path, name: str, why: str) -> list[str]:
+    """Comment a series out of every set file that lists it."""
+    changed = []
+    for path in sorted((custom / "sets").glob("*.txt")):
+        lines = path.read_text().splitlines()
+        new = [f"# {line.strip()}  ({why})" if line.split("#", 1)[0].split() == [name] else line for line in lines]
+        if new != lines:
+            path.write_text("\n".join(new) + "\n")
+            changed.append(path.stem)
+    return changed
+
+
+def set_needs(note_path: Path, needs: list[str]) -> None:
+    text = note_path.read_text()
+    note_path.write_text(re.sub(r"^Needs:.*$", f"Needs: {', '.join(needs) if needs else 'none'}", text, count=1, flags=re.M))
+
+
+def drop_landed(custom: Path, name: str) -> list[str]:
+    """Remove a series upstream now has: its directory, its glue, and the needs and sets that name it."""
+    import shutil
+
+    catalog = Catalog(custom)
+    notes = []
+    shutil.rmtree(catalog.series[name].path)
+    for glue in catalog.glue.values():
+        if name in (glue.first, glue.second):
+            shutil.rmtree(glue.path)
+            notes.append(f"glue {glue.name} removed with it")
+    for other, entry in catalog.series.items():
+        if other != name and name in entry.needs:
+            set_needs(entry.path / "NOTE.md", [need for need in entry.needs if need != name])
+            notes.append(f"{other} no longer lists it under Needs")
+    sets = remove_from_sets(custom, name, "landed upstream")
+    if sets:
+        notes.append(f"commented out of set {', '.join(sets)}")
+    return notes
+
+
+def upstream_pulls(note: Note | None) -> list[tuple[str, int]]:
+    """(owner/name, number) of each pull request link in a note's Upstream line."""
+    body = note.body if note else ""
+    match = re.search(r"^- \*\*Upstream:\*\*.*?(?=^- \*\*|\Z)", body, re.S | re.M)
+    found = re.findall(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", match.group(0) if match else "")
+    return [(repo, int(number)) for repo, number in dict.fromkeys(found)]
+
+
+def merged_upstream(pulls: list[tuple[str, int]]) -> list[int] | None:
+    """The pull requests among these that GitHub says are merged; None when gh cannot say."""
+    merged = []
+    for repo, number in pulls:
+        try:
+            shown = subprocess.run(
+                ["gh", "pr", "view", str(number), "-R", repo, "--json", "state"],
+                capture_output=True, text=True, timeout=30,
+            )  # fmt: skip
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if shown.returncode != 0:
+            return None
+        if json.loads(shown.stdout).get("state") == "MERGED":
+            merged.append(number)
+    return merged
+
+
+def landed_hint(engine: Engine, old: Engine | None, name: str, merged: list[int], test_cmd: str | None) -> str:
+    """What the note's tests say on bare BASE, for a series whose upstream pull request merged.
+
+    The tests are the series' own. A test file the series changes is read from
+    the series' build (from `old`, the series as cut from the previous BASE,
+    when it no longer applies): BASE's copy of a test the series only extends
+    passes without the series.
+    """
+    ours = None
+    for source in (engine, old):
+        if ours is None and source is not None and name in source.catalog.series:
+            try:
+                ours = source.series_commits(name)[-1]
+            except BuildError:
+                pass
+    present, changed = [], []
+    for path, tests in engine.catalog.note_claims(name, "Tests"):
+        shown = engine.run("cat-file", "blob", f"{engine.base}:{path}", check=False)
+        text = shown.stdout.decode(errors="replace")
+        if shown.returncode == 0 and all(re.search(rf"(?<![\w$]){re.escape(test)}(?![\w$])", text) for test in tests):
+            present.append(path + "".join(f"::{test}" for test in tests))
+            mine = engine.run("rev-parse", "--verify", "--quiet", f"{ours}:{path}", check=False) if ours else None
+            if mine and mine.returncode == 0 and mine.stdout.decode().strip() != engine.git("rev-parse", f"{engine.base}:{path}"):
+                changed.append(path)
+    changed = list(dict.fromkeys(changed))
+    numbers = ", ".join(f"#{number}" for number in merged)
+    if not present:
+        return f"upstream {numbers} merged, but none of the note's tests is on BASE: not landed as written"
+    hint = f"upstream {numbers} merged and {len(present)} of the note's tests are on BASE"
+    python = [test for test in present if test.split("::")[0].endswith(".py")]
+    if not test_cmd or not python:
+        copy = f" (the series' own copy: git checkout {ours[:12]} -- {' '.join(changed)})" if changed else ""
+        return hint + f"; run them there{copy} to see whether the series can go: " + " ".join(present)
+    with tempfile.TemporaryDirectory(prefix="serieslib-base-") as holder:
+        tree = Path(holder) / "base"
+        engine.run("worktree", "add", "--detach", str(tree), engine.base)
+        try:
+            if changed:
+                subprocess.run(["git", "-C", str(tree), "checkout", "--quiet", ours, "--", *changed], check=True, capture_output=True)
+            ran = subprocess.run(f"{test_cmd} {' '.join(python)}", shell=True, cwd=tree, capture_output=True, text=True)
+        finally:
+            engine.run("worktree", "remove", "--force", str(tree), check=False)
+    verdict = "pass: the series looks landed, drop it" if ran.returncode == 0 else f"fail (exit {ran.returncode})"
+    copy = f", in the series' own copy of {', '.join(changed)}," if changed else ""
+    return f"{hint}; on bare BASE{copy} they {verdict}"
+
+
+def refresh(custom: Path, repo: Path, source: str, *, upstream_check: bool = True, test_cmd: str | None = None) -> list[dict]:
+    """Move every series, one by one, onto the BASE custom/BASE now names.
+
+    `source` is the commit that holds the series as they were, cut from the
+    old BASE. In build order, each series is cherry-picked onto its new
+    foundation and its files are rewritten. A conflict marks that series
+    stale and leaves its files alone; the series that need it wait; the rest
+    go on. A patch that comes out empty landed upstream and is dropped, and a
+    series with no patch left is removed with its note. Glue follows its two
+    series: its patches are moved, a join the pair no longer needs is taken
+    off, and glue with nothing left is deleted. Returns one row per series
+    and glue pair: {name, status, detail}.
+    """
+    import shutil
+
+    rows: dict[str, dict] = {}
+
+    def row(name: str, status: str, detail: str = "") -> None:
+        rows[name] = {"name": name, "status": status, "detail": detail}
+
+    with tempfile.TemporaryDirectory(prefix="serieslib-old-") as old_dir:
+        old = source_engine(custom, repo, source, old_dir)
+        for name in Catalog(custom).order:
+            catalog = Catalog(custom)
+            if name not in catalog.series:
+                continue
+            blocked = sorted(need for need in catalog.closure([name]) - {name} if rows.get(need, {}).get("status") in STALE)
+            if blocked:
+                row(name, "waits", f"needs {', '.join(blocked)}")
+                continue
+            engine = Engine(catalog, repo)
+            try:
+                engine.series_commits(name)
+                row(name, "unchanged")
+                continue
+            except BuildError:
+                pass
+            if name not in old.catalog.series:
+                row(name, "conflict", f"not a series at {source}: re-export it by hand")
+                continue
+            moved = engine.transplant(name, engine.foundation(name), old.series_commits(name))
+            if moved.conflict:
+                row(name, "conflict", "; ".join(moved.paths) + "\n" + by_hand(engine, old, name))
+            elif not moved.picked:
+                row(name, "landed", "every patch is empty on the new BASE; " + "; ".join(drop_landed(custom, name)))
+            else:
+                write_series(engine, name, moved.picked, catalog.series[name].needs)
+                detail = f"landed upstream and dropped: {'; '.join(moved.landed)}" if moved.landed else ""
+                row(name, "refreshed", detail)
+
+        for glue_name in sorted(Catalog(custom).glue):
+            catalog = Catalog(custom)
+            glue = catalog.glue.get(glue_name)
+            if glue is None or glue.first not in catalog.series or glue.second not in catalog.series:
+                continue
+            label = f"glue {glue_name}"
+            if any(rows.get(side, {}).get("status") in STALE for side in catalog.closure([glue.first, glue.second])):
+                row(label, "waits", "one of its series is stale")
+                continue
+            engine = Engine(catalog, repo)
+            try:
+                foundation = engine.glue_foundation(glue)
+            except BuildError as error:
+                row(label, "conflict", str(error).splitlines()[0] + ": the pair no longer combines")
+                continue
+            notes = []
+            unused = [path for path in glue.joins if (glue.name, path) not in engine.joins_used]
+            if unused:
+                kept = [path for path in glue.joins if path not in unused]
+                text = (glue.path / "NOTE.md").read_text()
+                line = f"Joins: {', '.join(kept)}\n" if kept else ""
+                (glue.path / "NOTE.md").write_text(re.sub(r"^Joins:.*\n", line, text, count=1, flags=re.M))
+                notes.append(f"no longer joined: {', '.join(unused)}")
+            patches = len(glue.patches)
+            if glue.patches:
+                try:
+                    engine.glue_commits(glue)
+                except BuildError:
+                    old_glue = old.catalog.glue.get(glue_name)
+                    moved = engine.transplant(label, foundation, old.glue_commits(old_glue) if old_glue else [])
+                    if moved.conflict or old_glue is None:
+                        row(label, "conflict", "; ".join(moved.paths) or f"not glue at {source}")
+                        continue
+                    write_patches(engine, glue.path, label, moved.picked)
+                    patches = len(moved.picked)
+                    notes.append("patches moved" + (f", landed: {'; '.join(moved.landed)}" if moved.landed else ""))
+            if patches == 0 and len(unused) == len(glue.joins):
+                shutil.rmtree(glue.path)
+                row(label, "removed", "the two series combine without it now")
+            else:
+                row(label, "refreshed" if notes else "unchanged", "; ".join(notes))
+
+        if upstream_check:
+            catalog = Catalog(custom)
+            engine = Engine(catalog, repo)
+            for name, entry in catalog.series.items():
+                pulls = upstream_pulls(entry.note)
+                if not pulls:
+                    continue
+                merged = merged_upstream(pulls)
+                if merged is None:
+                    rows["(upstream check)"] = {"name": "(upstream check)", "status": "skipped", "detail": "gh could not be asked"}
+                    break
+                if merged:
+                    rows[name]["hint"] = landed_hint(engine, old, name, merged, test_cmd)
+    return list(rows.values())
+
+
+def park(custom: Path, repo: Path, names: list[str], source: str) -> list[str]:
+    """Move series out of the build, to custom/parked/<series>/, as they are.
+
+    Each keeps its patches and note, which gains "Base: <commit>": the BASE
+    its patches are cut from. Glue with a parked series goes into its
+    directory, and set files stop listing it. A series that needs a parked
+    one has to be parked with it.
+    """
+    import shutil
+
+    catalog = Catalog(custom)
+    for name in names:
+        catalog.get(name)
+        dependents = sorted(other for other in catalog.series if other not in names and name in catalog.closure([other]))
+        if dependents:
+            raise SeriesError(f"{name} is needed by {', '.join(dependents)}: park them too, or drop their need")
+    old_base = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{source}:custom/BASE"], capture_output=True, text=True
+    ).stdout.strip()
+    engine = Engine(catalog, repo)
+    notes = []
+    for name in [name for name in reversed(catalog.order) if name in names]:
+        try:
+            engine.series_commits(name)
+            base = engine.base
+        except BuildError:
+            base = old_base or engine.base
+        target = custom / "parked" / name
+        if target.exists():
+            raise SeriesError(f"custom/parked/{name} exists already")
+        target.parent.mkdir(exist_ok=True)
+        shutil.move(str(catalog.series[name].path), str(target))
+        text = (target / "NOTE.md").read_text()
+        text = re.sub(r"^Base:.*\n", "", text, flags=re.M)
+        (target / "NOTE.md").write_text(re.sub(r"^(Needs:.*\n)", rf"\g<1>Base: {base}\n", text, count=1, flags=re.M))
+        for glue in catalog.glue.values():
+            if name in (glue.first, glue.second) and glue.path.exists():
+                (target / "glue").mkdir(exist_ok=True)
+                shutil.move(str(glue.path), str(target / "glue" / glue.name))
+                notes.append(f"glue {glue.name} parked with {name}")
+        sets = remove_from_sets(custom, name, "parked")
+        notes.append(
+            f"parked {name} (cut from {base[:12]})" + (f"; commented out of set {', '.join(sets)}" if sets else "")
+        )
     return notes
 
 
@@ -1245,6 +1581,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", default=str(CUSTOM.parent))
     p.add_argument("--from", dest="source", default="HEAD", help="the commit that holds the series as they were")
     p.add_argument("series", nargs="+")
+    p = sub.add_parser("refresh")
+    p.add_argument("--repo", default=str(CUSTOM.parent))
+    p.add_argument("--from", dest="source", default="HEAD", help="the commit that holds the series cut from the old BASE")
+    p.add_argument("--no-upstream-check", action="store_true", help="do not ask GitHub whether a note's pull request merged")
+    p.add_argument("--landed-test-cmd", help="run the note's tests that exist on bare BASE with this command, for a merged pull request")
+    p.add_argument("--json", dest="json_out", help="also write the rows to this file")
+    p = sub.add_parser("park")
+    p.add_argument("--repo", default=str(CUSTOM.parent))
+    p.add_argument("--from", dest="source", default="HEAD")
+    p.add_argument("series", nargs="+")
     p = sub.add_parser("covers")
     p.add_argument("--write", action="store_true", help="update the Covers: line of each NOTE.md")
     p.add_argument("series", nargs="*")
@@ -1284,6 +1630,27 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(export_series(Path(args.custom), Path(args.repo), args.series, args.branch, needs)))
         elif args.command == "recut":
             print("\n".join(recut(Path(args.custom), Path(args.repo), args.series, args.source)))
+        elif args.command == "refresh":
+            rows = refresh(
+                Path(args.custom), Path(args.repo), args.source,
+                upstream_check=not args.no_upstream_check, test_cmd=args.landed_test_cmd,
+            )  # fmt: skip
+            if args.json_out:
+                Path(args.json_out).write_text(json.dumps(rows, indent=2) + "\n")
+            for entry in rows:
+                first, *rest = (entry["detail"] or "").split("\n")
+                print(f"{entry['name']}: {entry['status']}" + (f" ({first})" if first else ""))
+                for line in rest:
+                    print(line)
+                if entry.get("hint"):
+                    print(f"  hint: {entry['hint']}")
+            counts: dict[str, int] = {}
+            for entry in rows:
+                counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+            print("refresh: " + ", ".join(f"{count} {status}" for status, count in sorted(counts.items())))
+            return 1 if any(entry["status"] in STALE for entry in rows) else 0
+        elif args.command == "park":
+            print("\n".join(park(Path(args.custom), Path(args.repo), args.series, args.source)))
         elif args.command == "covers":
             for name in args.series or catalog.order:
                 entry = catalog.get(name)

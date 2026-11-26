@@ -26,6 +26,7 @@ are dropped from the series.
 | `custom/patches/<series>/NOTE.md` | The series' [note](#notes): its name, a `Needs:` line (the series it is cut on top of, or `none`), a `Covers:` line, the text of its section in the index, and what must hold, the key code and the tests. |
 | `custom/index-intro.md` | The text above the sections of the built index, `docs/custom/README.md`. |
 | `custom/glue/<first>+<second>/` | [Glue](#glue) between two series that do not need each other: a `NOTE.md` with a `Joins:` line (the files where both insert at the same spot) and the reason, and optional patches that go on top of the two combined. Used only when both series are in a build. |
+| `custom/parked/<series>/` | A series taken out of the build during a [refresh](#refreshing-the-base): its patches and note as they were, the note with a `Base:` line. Not built. |
 | `custom/sets/<name>.txt` | Named [build sets](#named-build-sets): the series one kind of build holds, one per line. Without a set, a build is the whole series. |
 | `custom/proposals/<series>/` | The draft upstream PR description (`PR.md`), a draft issue where useful (`issue.md`), and `evidence/` (screenshots and logs to attach). `_reviews/` and `_watch/` hold review notes and drafts for upstream threads we only follow. |
 | `custom/scripts/` | Build, export, check, refresh and the upstream-workflow switch (below). `serieslib.py` is the one reader of the layout above and holds the build engine; the other scripts go through it. |
@@ -249,31 +250,59 @@ see [`release/README.md`](release/README.md)).
 
 ### Refreshing the base
 
-`custom/scripts/refresh.sh` rebased one linear branch and is not converted to
-per-series patches yet; it refuses to run. Until it is, a refresh is the same
-steps by hand, on a branch cut from `patches`:
+`custom/scripts/refresh.sh` does the refresh on a branch cut from `patches`,
+one series at a time:
 
 ```bash
 git fetch origin upstream
 git switch -c refresh/$(date -u +%F) origin/patches
-old=$(git rev-parse HEAD)
-git merge --no-ff upstream/main            # only upstream paths change
-git rev-parse upstream/main > custom/BASE
-custom/scripts/serieslib.py recut --from "$old" $(custom/scripts/series-files.sh --all --names)
-custom/scripts/check.sh && git add -A custom && git commit --no-verify
-custom/scripts/check-tree.sh --upstream upstream/main
+custom/scripts/refresh.sh --rehearse      # optional: what would happen, nothing written
+custom/scripts/refresh.sh                 # merges upstream/main, moves BASE, moves each series
+# if it stops on stale series: fix each by hand, or park it, then
+custom/scripts/refresh.sh --continue [--park <series>]...
+git push origin refresh/$(date -u +%F)    # and open the pull request into patches
 ```
 
-`recut` takes each series as it was at `$old` (built on the old `BASE`) and
-cherry-picks it onto its new foundation, in build order, so a series is moved
-after the ones it needs. A series whose files upstream did not touch is
-already exact and is left alone. On a conflict it stops and prints the
-commands to finish that series by hand (a branch on the new foundation, `git
-cherry-pick` of the old commits, `export.sh`); run `recut` again for the
-rest. A patch that landed upstream comes out empty: drop its file, or the
-directory when the whole series landed (its index section goes with its
-note). The pull
-request moves `BASE`, so CI runs the tests of every patch.
+It merges `upstream/main` into the branch (only upstream paths change, so the
+merge does not conflict), writes the new commit to `custom/BASE`, and moves
+every series onto its new foundation separately, in build order
+(`serieslib.py refresh`). Each series ends as one of:
+
+| Result | Meaning |
+| --- | --- |
+| `unchanged` | Its patches still apply exactly: upstream did not touch its files. |
+| `refreshed` | Cherry-picked onto the new foundation and rewritten. A patch that came out empty landed upstream and is dropped. |
+| `landed` | No patch is left. The series is removed with its note (and so its index section), its glue, and the `Needs:` and set lines that name it. |
+| `conflict` | Stale. Its files are left as they were, and the commands to move it by hand are printed: a branch on the new foundation, `git cherry-pick` of the old commits, `export.sh`. |
+| `waits` | It needs a stale series. |
+
+A stale series does not hold up the others. Glue follows its two series: its
+patches are moved, a join the pair no longer needs is taken off, and glue
+with nothing left is removed. When nothing is stale the script runs
+`check.sh`, commits `custom/`, and runs `check-tree.sh`; review the notes of
+the series that changed (a dropped patch moves `Covers:`). The pull request
+moves `BASE`, so CI runs the tests of every patch.
+
+**Parking.** `refresh.sh --continue --park <series>` moves a stale series to
+`custom/parked/<series>/` as it is, so the refresh can land without it. Its
+note gains `Base: <commit>`, the `BASE` its patches are cut from; its glue
+goes into the same directory; set files stop listing it; a series that needs
+it has to be parked with it. Nothing under `custom/parked/` is built. To
+bring one back, move its directory to `custom/patches/`, take the `Base:`
+line out, and run `serieslib.py recut --from <the commit before it was
+parked> <series>`, which moves it from where it was cut onto today's
+foundation (or prints the commands to do it by hand).
+
+**Landed in another shape.** A series can land upstream rewritten, so that
+its patches conflict instead of coming out empty. For every series whose
+note links an upstream pull request that GitHub says is merged, the refresh
+names the note's tests that exist on bare `BASE`; with `--landed-test-cmd
+"uv run pytest -q"` it runs them in a worktree of `BASE`. A test file the
+series changes is run in the series' own copy, since `BASE`'s copy of a test
+the series only extends passes without the series. If they pass there,
+upstream has the behaviour and the series can be deleted. The question goes
+to GitHub through `gh`, read only; `--no-upstream-check` skips it, and
+without `gh` or a network it is skipped with a line saying so.
 
 The merge brings upstream's workflow changes onto the branch, so pushing it
 needs a credential that may write workflow files (`gh auth login` asks for
@@ -599,7 +628,9 @@ request carries it, and the series holds a copy until it merges).
 
 ### Parked series
 
-These series are out of the series for now. Their patch files (in the flat
+A series parked by a refresh sits in `custom/parked/<series>/`
+([Refreshing the base](#refreshing-the-base)). The ones below were taken out
+before that directory existed. Their patch files (in the flat
 `<series>--<subject>.patch` layout of the time, listed by that commit's
 `custom/series`) and index sections are on the patches commit that release `custom/2026-11-09.1` was
 built from (the tag's `Patches-Commit:` line); their proposals stay under
