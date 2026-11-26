@@ -1493,6 +1493,16 @@ function markInputReady(config) {
   }
 }
 
+// Framework notices that came with web messages, for the model as hidden
+// context when Pi next starts the agent (before_agent_start), never as the
+// user's text. Omnigent names this message's customType.
+const FRAMEWORK_CONTEXT_TYPE = "omnigent-framework-context";
+const pendingFrameworkContext = [];
+
+function takeFrameworkContext() {
+  return pendingFrameworkContext.splice(0).join("\n\n");
+}
+
 function startInboxPoller(
   pi,
   config,
@@ -1568,9 +1578,17 @@ function startInboxPoller(
           typeof isTurnActive === "function" && isTurnActive()
             ? "steer"
             : "followUp";
+        const frameworkContext =
+          typeof payload.framework_context === "string" ? payload.framework_context : "";
+        if (frameworkContext) pendingFrameworkContext.push(frameworkContext);
         try {
           pi.sendUserMessage(payload.content, { deliverAs });
         } catch (_err) {
+          // A retry pushes it again.
+          if (frameworkContext) {
+            const at = pendingFrameworkContext.lastIndexOf(frameworkContext);
+            if (at !== -1) pendingFrameworkContext.splice(at, 1);
+          }
           // Leave the file to retry next tick, capped by attempt count.
           const key = id ?? fullPath;
           const attempts = (deliverAttempts.get(key) ?? 0) + 1;
@@ -2487,6 +2505,14 @@ module.exports = function (pi) {
       type: "external_model_change",
       data: { model: selectedModel },
     });
+  });
+
+  pi.on("before_agent_start", async () => {
+    const context = takeFrameworkContext();
+    if (!context) return undefined;
+    return {
+      message: { customType: FRAMEWORK_CONTEXT_TYPE, content: context, display: false },
+    };
   });
 
   pi.on("agent_start", async (_event, ctx) => {

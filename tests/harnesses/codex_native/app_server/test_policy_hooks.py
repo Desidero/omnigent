@@ -206,7 +206,8 @@ def test_user_prompt_submit_carries_the_route_turn_hook(tmp_path: Path) -> None:
     # Trust is filtered by module, so route-turn must ride the policy one.
     assert _POLICY_HOOK_MODULE in routing[0]["command"]
     listed = {"result": {"data": [{"cwd": "/repo", "hooks": commands}]}}
-    assert len(_our_policy_hooks_from_list(listed, "/repo")) == 2
+    # The policy gate, the framework-context hook and route-turn.
+    assert len(_our_policy_hooks_from_list(listed, "/repo")) == 3
     # The user's own prompt hook survives the merge.
     assert any(h["command"] == "echo mine" for h in commands)
 

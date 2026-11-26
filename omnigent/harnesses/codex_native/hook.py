@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.harnesses.codex_native.bridge import (
+    CODEX_FRAMEWORK_CONTEXT_FILE,
     read_bridge_state,
     read_codex_config_model,
     read_policy_hook_config,
@@ -66,10 +67,38 @@ def main(argv: list[str] | None = None) -> int:
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
         return _main_route_turn(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "framework-context":
+        return _main_framework_context(raw_argv[1:])
     print(
         f"omnigent codex hook: unknown subcommand {raw_argv[:1]!r}",
         file=sys.stderr,
     )
+    return 0
+
+
+def _main_framework_context(argv: list[str]) -> int:
+    """
+    Hand Codex the framework notices waiting for this prompt, once.
+
+    Registered on ``UserPromptSubmit``; the executor writes the notices to
+    :data:`CODEX_FRAMEWORK_CONTEXT_FILE` before it delivers the prompt.
+
+    :param argv: CLI argv after the subcommand, e.g. ``["--bridge-dir", "/tmp/x"]``.
+    :returns: Process exit code. Always ``0``.
+    """
+    args = _parse_evaluate_policy_args(argv)
+    sys.stdin.read()
+    path = Path(args.bridge_dir) / CODEX_FRAMEWORK_CONTEXT_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+        path.unlink(missing_ok=True)
+    except OSError:
+        return 0
+    if text:
+        output = {
+            "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}
+        }
+        sys.stdout.write(json.dumps(output))
     return 0
 
 

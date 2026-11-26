@@ -49,6 +49,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
 from omnigent.harnesses.codex_native.bridge import (
+    CODEX_FRAMEWORK_CONTEXT_FILE,
     clear_certificate_failure,
     mirror_applied_codex_settings,
     read_codex_config_model,
@@ -3460,7 +3461,8 @@ def _codex_policy_hooks_settings(
     the server-level ``_evaluate_input_policy`` skips native message
     events). ``mcp__*`` tools are filtered out inside the hook itself,
     not by a matcher, so the relay path remains the single MCP
-    enforcement point.
+    enforcement point. ``UserPromptSubmit`` also hands Codex the
+    framework notices waiting for the prompt.
 
     :param bridge_dir: Native Codex bridge directory.
     :param python_executable: Python executable for the hook command.
@@ -3478,7 +3480,10 @@ def _codex_policy_hooks_settings(
     from omnigent.native.tool_observer_hook import hook_settings
 
     observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
-    prompt_submit: list[_JsonObject] = [hook]
+    prompt_submit: list[_JsonObject] = [
+        hook,
+        _codex_framework_context_hook(bridge_dir, python_executable),
+    ]
     if turn_routing:
         prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
     return {
@@ -3487,6 +3492,37 @@ def _codex_policy_hooks_settings(
             "PostToolUse": [{"hooks": [hook, observer]}],
             "UserPromptSubmit": [{"hooks": prompt_submit}],
         }
+    }
+
+
+def _codex_framework_context_hook(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
+    """
+    Build the ``UserPromptSubmit`` entry that hands Codex this prompt's framework notices.
+
+    The shell answers alone while no notice is waiting, so a prompt pays no
+    interpreter start for it; as for the routing hook, the subcommand lives in
+    :data:`_POLICY_HOOK_MODULE` so the trust handshake covers it.
+
+    :param bridge_dir: Native Codex bridge directory holding the notices file.
+    :param python_executable: Python executable for the hook command.
+    :returns: One ``hooks.json`` command-hook entry.
+    """
+    context_file = shlex.quote(str(bridge_dir / CODEX_FRAMEWORK_CONTEXT_FILE))
+    command = shlex.join(
+        [
+            python_executable or sys.executable,
+            "-I",
+            "-m",
+            _POLICY_HOOK_MODULE,
+            "framework-context",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
+    )
+    return {
+        "type": "command",
+        "command": f"if [ ! -e {context_file} ]; then cat >/dev/null; exit 0; fi; {command}",
+        "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
 
 

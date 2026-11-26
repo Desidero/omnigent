@@ -61,6 +61,9 @@ _CODEX_DISABLED_COMPOSER_TEXT = frozenset(
 
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
+# Framework notices for the next prompt; the ``framework-context`` hook hands them
+# to Codex as UserPromptSubmit context and removes the file.
+CODEX_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
 _EGRESS_CERTIFICATE_FILE = "egress_certificate_failure.json"
