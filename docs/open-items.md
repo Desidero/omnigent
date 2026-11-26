@@ -58,6 +58,47 @@ strike the label in chat, list instead of relying on memory, leave an item the
 user closed closed (one whose comment heading ends `(closed by me)` included)
 unless the user asks again, and label in chat only if the tools are missing.
 
+### Items labelled only in chat
+
+Agents with the tools are asked to record every item with
+`sys_open_items_raise`, and that instruction does not mention what follows. When
+an agent writes an item in chat anyway, as `[Q3] **Title** detail`, the server
+records it so that it is not lost:
+
+- **When:** after each turn ends, off the turn's path, the server reads the
+  agent messages written since it last looked (the first time, only the latest
+  turn: older history is not backfilled), with the same label rules as the
+  chat (labels in code, link text and passing mentions are skipped; a label
+  counts where it starts its line or list item).
+- **Recorded:** a label the session's store does not have is stored under that
+  label, with its title, its block as the detail and the links in it, and
+  `raised_by: "auto"`; a link label stores its first link. A label the store
+  already has, from a tool or an earlier read, is left alone, so a repeated
+  read, a retry or an edited message adds nothing. Raising that label with the
+  tool later takes the item over (its title, detail, topic and links), keeping
+  the number. The session's cap of 500 items applies, and a read records or
+  closes at most 20 labels.
+- **Closed:** a struck label (`~~[Q3]~~`) closes its item if it is still open,
+  with the sentence that struck it as the resolution and `closed_by: "auto"`.
+  Nothing is reopened from chat.
+- **The note:** when a read changed something, the agent's next message
+  carries one framework note, given to the model as context for that turn and
+  never shown as your text:
+
+  ```text
+  [Open items] Q3 "Region?" and R1 "No snapshot" were labelled in chat without being recorded, so they were added for you. Next time record items with sys_open_items_raise; set a topic or close them with sys_open_items_update if needed. Closed from chat: Q1. Open now: 4.
+  ```
+
+  A read that changes nothing leaves no note. A session's agent gets at most
+  three notes; after that, recording goes on without them.
+- **Harnesses:** SDK harnesses get the note as context through the same
+  framework-notice channel as upload notices (Claude SDK as prompt-hook context,
+  the others as a system message), claude-native and codex-native through
+  their `UserPromptSubmit` hook, and pi-native as a hidden message when the
+  agent starts. Other native harnesses get the items recorded but no note.
+- **Turn off:** with the tools, `tool_groups.open_items: false`; nothing is
+  read for an agent without them.
+
 ### Which sessions get the tools
 
 - **SDK harnesses** get them with the turn's tools; **claude-native**,

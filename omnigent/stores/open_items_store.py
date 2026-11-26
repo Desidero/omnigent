@@ -7,6 +7,9 @@ session and kind with the next number to allocate, plus a session row (kind
 kind's row, so two raises in one session never get the same label while
 other sessions don't wait. A raise carries an idempotency key per item, so a
 retried raise returns the labels its first attempt allocated.
+``open_items_chat_notes`` holds, per session, what the server recorded from
+labels the agent wrote only in chat and has not told it about yet
+(:mod:`omnigent.server.open_items_auto`).
 
 The tables live apart from the main migration chain
 (``docs/extending/side_schemas.md``); deleting a session deletes its rows,
@@ -55,6 +58,7 @@ from omnigent.entities.open_items import (
     KIND_BY_CODE,
     KINDS,
     NUMBER_MAX,
+    RAISED_FROM_CHAT,
     SESSION_HEAD_KIND,
     STATUS_BY_CODE,
     STATUSES,
@@ -146,6 +150,24 @@ class SqlOpenItemHead(OpenItemsBase):
     next_number: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class SqlOpenItemChatNote(OpenItemsBase):
+    """Per session: how far its chat was read for labels, and what to tell the agent."""
+
+    __tablename__ = "open_items_chat_notes"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # The newest conversation item read; None until the first read.
+    scanned_through: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # How many notes the agent was given.
+    notes_sent: Mapped[int] = mapped_column(Integer, nullable=False)
+    # {"added": [{"label", "title"}], "closed": [label]} not yet told; None when nothing is.
+    pending: Mapped[dict[str, Any] | None] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=True
+    )
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 def delete_open_items_batch(session: Session, conversation_ids: Sequence[str]) -> bool:
     """Delete deleted sessions' heads and up to :data:`DELETE_BATCH` of their items.
 
@@ -160,6 +182,12 @@ def delete_open_items_batch(session: Session, conversation_ids: Sequence[str]) -
         delete(SqlOpenItemHead).where(
             SqlOpenItemHead.workspace_id == workspace_id,
             SqlOpenItemHead.conversation_id.in_(conversation_ids),
+        )
+    )
+    session.execute(
+        delete(SqlOpenItemChatNote).where(
+            SqlOpenItemChatNote.workspace_id == workspace_id,
+            SqlOpenItemChatNote.conversation_id.in_(conversation_ids),
         )
     )
     keys: list[Any] = []
@@ -208,6 +236,13 @@ class RaisedItem:
     item: OpenItem | None = None
     duplicate: bool = False
     error: OpenItemError | None = None
+    #: The raise took over an item the server had recorded from the chat.
+    took_over: bool = False
+
+    @property
+    def added(self) -> bool:
+        """Whether the raise added an item to the session."""
+        return self.item is not None and not self.duplicate and not self.took_over
 
 
 @dataclass(frozen=True)
@@ -217,6 +252,23 @@ class ChangedItem:
     label: str
     item: OpenItem | None = None
     error: OpenItemError | None = None
+
+
+@dataclass(frozen=True)
+class ChatRecord:
+    """What one read of a session's chat changed: the items it added and closed."""
+
+    added: list[OpenItem]
+    closed: list[OpenItem]
+
+
+@dataclass(frozen=True)
+class ChatNote:
+    """What the agent has not been told yet, taken for its next turn."""
+
+    added: list[dict[str, str]]
+    closed: list[str]
+    open_count: int
 
 
 class OpenItemsSessionNotFoundError(Exception):
@@ -235,6 +287,11 @@ def _to_item(row: SqlOpenItem) -> OpenItem:
         content=dict(row.content),
         outcome=dict(row.outcome or {}),
     )
+
+
+def _recorded_from_chat(row: SqlOpenItem) -> bool:
+    """Whether the server recorded the item from a label the agent wrote only in chat."""
+    return (row.content or {}).get("raised_by") == RAISED_FROM_CHAT
 
 
 def _check_size(content: dict[str, Any], label: str) -> None:
@@ -346,7 +403,8 @@ class OpenItemsStore:
         Item ``i`` is written under ``<idempotency_key>:<i>``; a retry with the
         same key returns the items the first attempt wrote. A link whose URL
         the session already pinned returns that item as a duplicate. An item
-        with its own number adopts that label if it is free.
+        with its own number adopts that label if it is free, or takes over the
+        item the server recorded under it from the chat.
 
         :param items: Checked items, see
             :func:`~omnigent.entities.open_items.normalize_new_item`.
@@ -369,7 +427,7 @@ class OpenItemsStore:
                 result = self._raise_one(
                     session, conversation_id, item, key, count, root_conversation_id, user_id
                 )
-                if result.item is not None and not result.duplicate:
+                if result.added:
                     count += 1
                 results.append(result)
             self._set_head(session, conversation_id, SESSION_HEAD_KIND, count)
@@ -410,6 +468,14 @@ class OpenItemsStore:
             ).scalar()
             if pinned is not None:
                 return RaisedItem(item=_to_item(pinned), duplicate=True)
+        if item.number is not None and item.content.get("raised_by") != RAISED_FROM_CHAT:
+            existing = self._row(session, conversation_id, kind, item.number, lock=True)
+            if existing is not None and _recorded_from_chat(existing):
+                # The agent raising a label the server recorded from its chat takes it over.
+                existing.content = item.content
+                existing.idempotency_key = key
+                existing.updated_at = now_epoch()
+                return RaisedItem(item=_to_item(existing), took_over=True)
         if count >= ITEMS_PER_SESSION:
             return RaisedItem(
                 error=OpenItemError(
@@ -455,6 +521,151 @@ class OpenItemsStore:
         session.flush()
         self._set_head(session, conversation_id, kind, max(next_number, number + 1))
         return RaisedItem(item=_to_item(row))
+
+    def record_from_chat(
+        self,
+        conversation_id: str,
+        raises: Sequence[tuple[str, NewOpenItem]],
+        closes: Sequence[tuple[str, OpenItemChange]],
+        *,
+        scanned_through: str | None,
+        root_conversation_id: str,
+        user_id: str,
+        note_limit: int,
+    ) -> ChatRecord:
+        """Record items the agent labelled only in chat, and close the ones it struck.
+
+        A label any item already has is left alone, so nothing a tool raised
+        changes and a read repeated over the same messages adds nothing. A
+        struck label closes its item if it is still open. What changes is kept
+        to tell the agent, unless it was told ``note_limit`` times already.
+
+        :param raises: ``(idempotency key, item)`` pairs; each item carries its
+            chat label as ``number``.
+        :param closes: ``(closed_ref, close)`` pairs.
+        :param scanned_through: The newest conversation item read.
+        :raises OpenItemsSessionNotFoundError: If the session doesn't exist.
+        """
+        for _, item in raises:
+            _check_size(item.content, f"the {item.kind} {item.content.get('title')!r}")
+
+        def write(session: Session) -> ChatRecord:
+            count = self._lock_head(session, conversation_id, SESSION_HEAD_KIND)
+            self._require_session(session, conversation_id)
+            note = self._lock_chat_note(session, conversation_id)
+            added: list[OpenItem] = []
+            for key, item in raises:
+                assert item.number is not None
+                if self._row(session, conversation_id, KINDS[item.kind][0], item.number):
+                    continue
+                result = self._raise_one(
+                    session, conversation_id, item, key, count, root_conversation_id, user_id
+                )
+                if result.added:
+                    count += 1
+                    added.append(result.item)  # type: ignore[arg-type]
+            closed: list[OpenItem] = []
+            for ref, change in closes:
+                row = self._row(session, conversation_id, KINDS[change.kind][0], change.number)
+                if row is None or row.status == STATUSES["closed"]:
+                    continue
+                changed = self._change_one(session, conversation_id, change, RAISED_FROM_CHAT, ref)
+                if changed.item is not None:
+                    closed.append(changed.item)
+            self._set_head(session, conversation_id, SESSION_HEAD_KIND, count)
+            if scanned_through is not None:
+                note.scanned_through = scanned_through
+            if (added or closed) and note.notes_sent < note_limit:
+                pending = dict(note.pending or {})
+                pending["added"] = [
+                    *(pending.get("added") or []),
+                    *({"label": item.label, "title": item.content["title"]} for item in added),
+                ]
+                pending["closed"] = [*(pending.get("closed") or []), *(i.label for i in closed)]
+                _check_size(pending, "the note for the agent")
+                note.pending = pending
+            note.updated_at = now_epoch()
+            return ChatRecord(added=added, closed=closed)
+
+        return run_write_transaction(self._writes, "record_open_items_from_chat", write)
+
+    def _lock_chat_note(self, session: Session, conversation_id: str) -> SqlOpenItemChatNote:
+        """Lock a session's chat note row, creating it on first use."""
+        values = {
+            "workspace_id": current_workspace_id(),
+            "conversation_id": conversation_id,
+            "scanned_through": None,
+            "notes_sent": 0,
+            "pending": None,
+            "updated_at": now_epoch(),
+        }
+        if self._dialect == "mysql":
+            statement: Any = (
+                mysql_insert(SqlOpenItemChatNote)
+                .values(**values)
+                .on_duplicate_key_update(notes_sent=SqlOpenItemChatNote.notes_sent)
+            )
+        elif self._dialect == "sqlite":
+            statement = sqlite_insert(SqlOpenItemChatNote).values(**values)
+            statement = statement.on_conflict_do_nothing()
+        else:
+            statement = pg_insert(SqlOpenItemChatNote).values(**values).on_conflict_do_nothing()
+        session.execute(statement)
+        return session.execute(
+            select(SqlOpenItemChatNote)
+            .where(
+                SqlOpenItemChatNote.workspace_id == current_workspace_id(),
+                SqlOpenItemChatNote.conversation_id == conversation_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+
+    def chat_scanned_through(self, conversation_id: str) -> tuple[bool, str | None]:
+        """Whether the session's chat was read before, and the newest item read."""
+        with self._reads("read_open_items_chat_cursor") as session:
+            row = session.execute(
+                select(SqlOpenItemChatNote.scanned_through).where(
+                    SqlOpenItemChatNote.workspace_id == current_workspace_id(),
+                    SqlOpenItemChatNote.conversation_id == conversation_id,
+                )
+            ).first()
+            return (row is not None, row[0] if row is not None else None)
+
+    def take_chat_note(self, conversation_id: str) -> ChatNote | None:
+        """Take what the agent has not been told yet, counting it as told; ``None`` if nothing."""
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> ChatNote | None:
+            note = session.execute(
+                select(SqlOpenItemChatNote)
+                .where(
+                    SqlOpenItemChatNote.workspace_id == workspace_id,
+                    SqlOpenItemChatNote.conversation_id == conversation_id,
+                )
+                .with_for_update()
+            ).scalar()
+            if note is None or not note.pending:
+                return None
+            pending = dict(note.pending)
+            note.pending = None
+            note.notes_sent += 1
+            note.updated_at = now_epoch()
+            open_count = session.execute(
+                select(func.count())
+                .select_from(SqlOpenItem)
+                .where(
+                    SqlOpenItem.workspace_id == workspace_id,
+                    SqlOpenItem.conversation_id == conversation_id,
+                    SqlOpenItem.status.in_([STATUSES["open"], STATUSES["answered"]]),
+                )
+            ).scalar_one()
+            return ChatNote(
+                added=list(pending.get("added") or []),
+                closed=list(pending.get("closed") or []),
+                open_count=open_count,
+            )
+
+        return run_write_transaction(self._writes, "take_open_items_chat_note", write)
 
     def change_items(
         self,

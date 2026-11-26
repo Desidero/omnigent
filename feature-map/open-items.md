@@ -7,6 +7,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
 - `items-raise`: `sys_open_items_raise` allocates labels per session and kind; a retried call gets the same labels; a pinned URL pinned again returns the same item; `label` adopts a chat label if it is free.
 - `items-update`: `sys_open_items_update` closes with a resolution, reopens, and edits title, detail, topic and links, each label with its own result.
 - `items-list`: `sys_open_items_list` and `GET /v1/sessions/{id}/open-items` list in label order with status, kind, topic and text filters, counts and topics.
+- `items-from-chat`: after a turn, labels the agent wrote only in chat are recorded (`raised_by: auto`) and struck ones closed (`closed_by: auto`); its next message carries one `[Open items]` framework note, at most three per session.
 - `items-answers`: a person's replies, recorded with `POST …/open-items/answers`, mark an open item answered.
 - `items-event`: every write publishes `session.open_items.changed` on the session's stream.
 - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
@@ -24,6 +25,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
 Preconditions: a local server and runner from this checkout; any harness.
 
 - Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
+- Chat-only labels and the note: `tests/server/test_open_items_auto.py` (recording, idempotency, caps, takeover, strikes, the note's text and limit, a session without the group); delivery per harness: `tests/inner/test_framework_text_notices.py`, `tests/inner/test_sdk_resize_notices.py`, `omnigent/resources/pi_native/omnigent_pi_native_extension.test.js`; the label rules shared with the web: `tests/entities/test_item_labels.py` and `web/src/lib/itemLabelCases.test.ts`.
 - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
 - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
 - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.

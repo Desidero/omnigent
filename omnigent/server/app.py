@@ -86,6 +86,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
     managed_host_keepalive,
     open_items,
+    open_items_auto,
     session_journal,
     session_live_state,
     session_pull_requests,
@@ -2304,6 +2305,12 @@ def create_app(
         ),
     )
     pull_request_refresher = session_pull_requests.PullRequestRefresher()
+    open_items_recorder = open_items_auto.ChatItemRecorder(
+        conversation_store,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+        permission_store=permission_store,
+    )
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).
@@ -2617,10 +2624,13 @@ def create_app(
 
         session_pull_requests.install_refresher(pull_request_refresher)
         install_background_title_coordinator(background_title_coordinator)
+        open_items_auto.install_recorder(open_items_recorder)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            open_items_auto.install_recorder(None)
+            await open_items_recorder.aclose()
             install_background_title_coordinator(None)
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()

@@ -7846,6 +7846,11 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    if isinstance(event.get("content"), list):
+        from omnigent.server import open_items_auto
+
+        # What the server recorded from the agent's chat labels rides along as context.
+        event["content"] = await open_items_auto.with_pending_note(session_id, event["content"])
     forward_options: dict[str, Any] = {}
     if native_shell_authorized:
         from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
@@ -8512,6 +8517,13 @@ async def _forward_event_to_runner(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+    if isinstance(forwarded_data.get("content"), list):
+        from omnigent.server import open_items_auto
+
+        # What the server recorded from the agent's chat labels rides along as context.
+        forwarded_data["content"] = await open_items_auto.with_pending_note(
+            session_id, forwarded_data["content"]
+        )
 
     from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
 
