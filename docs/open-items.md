@@ -153,6 +153,24 @@ stays current as the agent raises and closes them.
   the item is marked **closed in chat** and its details offer **Close** with
   the chat's sentence as the resolution. The agent sees every change in
   `sys_open_items_list`.
+- **Answers from comments:** with [comments on items](chat-item-labels.md#comment-on-items),
+  an expanded item also offers **Comment**. When a "Comments on N items"
+  message posts, the browser that sent it records each item's comments as
+  that item's answer (`POST …/open-items/answers`): an open stored item
+  becomes **Answered** and lists the answer, and the agent sees it in
+  `sys_open_items_list`. The message itself goes through the normal send path
+  first, so if recording fails the item just stays open. Labels the server
+  does not hold are skipped.
+- **Comment and close:** on a stored item that is not closed, the comment's
+  header card offers **Comment and close** (on a phone, **Close**), the
+  tray's ✓ switches it per item, and an expanded panel row offers it next to
+  **Comment**. The item is marked **closes when sent** in the panel and
+  **closes** in the tray until the message posts. The message tells the agent
+  with a heading ending `(closed by me)`; after it posts, the item's answer is
+  recorded and the item is closed by you (`PATCH …/open-items`, `closed_by`
+  `user`) with the comment as its resolution, cut to 2,000 characters. If the
+  close fails, the item stays open with its answer and a toast says so. A
+  close is never read from what a comment says.
 - **Chat-only items** keep their dismiss button; dismissals are still stored
   as the `omnigent.items_dismissed` session label, which is read for chat-only
   items and never written for stored ones.

@@ -15,6 +15,8 @@ A session's agent records the questions, risks, findings and follow-ups it raise
 - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
 - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
 - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
+- `items-comment-answers`: a posted "Comments on N items" message records each stored item's comments as its answer, so it shows answered; a failed record leaves it open and never touches the message.
+- `items-comment-close`: **Comment and close**, chosen per item in comment mode (header card, tray ✓, panel row), marks the item's heading `(closed by me)` and, after the post, closes it as the user with the comment as its resolution; only on stored items that are not closed.
 
 ## How to get to it (user POV)
 
@@ -32,6 +34,7 @@ Preconditions: a local server and runner from this checkout; any harness.
 - Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
 - Chat-only labels and the note: `tests/server/test_open_items_auto.py` (recording, idempotency, caps, takeover, strikes, the note's text and limit, a session without the group); delivery per harness: `tests/inner/test_framework_text_notices.py`, `tests/inner/test_sdk_resize_notices.py`, `omnigent/resources/pi_native/omnigent_pi_native_extension.test.js`; the label rules shared with the web: `tests/entities/test_item_labels.py` and `web/src/lib/itemLabelCases.test.ts`.
 - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
+- Answers from comments (web): `web/src/lib/openItemAnswers.test.ts`, `web/src/hooks/useItemCommentMode.test.tsx`. Human check: with an open stored item, choose **Comment** on its chip or in its expanded panel row, send the comment; the item moves to **Answered** with your text under it, and the badge drops by one. With **Comment and close** on, the row says **closes when sent** before sending and the item moves to **Closed** with your comment as its resolution after.
 - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
 - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
 - Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge and user changes: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; the live event: `web/src/store/chatStore.openItems.test.ts`.

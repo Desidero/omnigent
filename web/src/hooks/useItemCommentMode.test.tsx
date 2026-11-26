@@ -21,8 +21,16 @@ import {
   type ItemCommentState,
 } from "@/lib/itemCommentDrafts";
 import { buildItemLabelIndex } from "@/lib/itemLabels";
+import { publishStoredOpenItems, resetClosableItemLabelsForTests } from "@/lib/openItemAnswers";
+import { storedItem } from "@/test/openItemsFixtures";
 import { useChatStore } from "@/store/chatStore";
 import { useItemCommentMode, type ComposerContent } from "./useItemCommentMode";
+
+const recordAnswers = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+vi.mock(import("@/lib/openItemAnswers"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  recordItemCommentAnswers: recordAnswers,
+}));
 
 const SESSION_ID = "conv_comments";
 const DEFINING_TEXT = [
@@ -99,6 +107,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   resetItemCommentDraftsForTests();
+  resetClosableItemLabelsForTests();
   localStorage.clear();
 });
 
@@ -112,6 +121,7 @@ describe("useItemCommentMode", () => {
       label: "Q2",
       title: "Report cutoff timezone",
       draftId: null,
+      closes: false,
     });
     expect(composer.text).toBe("");
     expect(result.current.excerpt).toBe("UTC or the account's zone?");
@@ -347,6 +357,126 @@ describe("useItemCommentMode", () => {
       vi.advanceTimersByTime(10);
     });
     expect(getItemCommentState(SESSION_ID)).toEqual({ drafts: [], submissions: [] });
+  });
+
+  it("records the comments as the items' answers once, when the message posts", async () => {
+    recordAnswers.mockClear();
+    const { result } = renderCommentMode();
+    comment(result, "R1", "Batch it.");
+    await act(() => result.current.submitComments());
+    const [text] = send.mock.calls[0];
+    act(() => {
+      useChatStore.setState({
+        queuedMessages: [{ queueId: "q_1", text, conversationId: SESSION_ID }],
+      });
+      vi.advanceTimersByTime(10);
+    });
+    expect(recordAnswers).not.toHaveBeenCalled();
+    act(() => {
+      useChatStore.setState({
+        queuedMessages: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text }], posted: true },
+        ],
+      });
+      vi.advanceTimersByTime(10);
+    });
+    act(() => {
+      useChatStore.setState({ pendingUserMessages: [] });
+      vi.advanceTimersByTime(10);
+    });
+    expect(recordAnswers.mock.calls).toEqual([[SESSION_ID, text, undefined]]);
+  });
+
+  it("sends Comment and close marked in the heading and closes the item once it posts", async () => {
+    recordAnswers.mockClear();
+    publishStoredOpenItems(SESSION_ID, [storedItem("Q2"), storedItem("R1")]);
+    const { result } = renderCommentMode();
+    act(() => result.current.startComment({ label: "Q2", title: "Q2 title" }));
+    expect(result.current.target?.closes).toBe(false);
+    act(() => result.current.setTargetCloses(true));
+    composer = { text: "Use the account's zone.", files: [], mentions: [], sessions: [] };
+    act(() => result.current.saveComment());
+    comment(result, "R1", "Batch it.");
+    expect(result.current.unsentDrafts.map((draft) => [draft.label, draft.closes])).toEqual([
+      ["R1", undefined],
+      ["Q2", true],
+    ]);
+
+    await act(() => result.current.submitComments());
+    const [text] = send.mock.calls[0];
+    expect(text).toBe(
+      [
+        "Comments on 2 items:",
+        "#### [R1] Backfill locking",
+        "Batch it.",
+        "#### [Q2] Report cutoff timezone (closed by me)",
+        "Use the account's zone.",
+      ].join("\n\n"),
+    );
+    act(() => {
+      useChatStore.setState({
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text }], posted: true },
+        ],
+      });
+      vi.advanceTimersByTime(10);
+    });
+    expect(recordAnswers.mock.calls).toEqual([[SESSION_ID, text, ["Q2"]]]);
+  });
+
+  it("keeps Comment and close per item, and back in the drafts if the send is undone", async () => {
+    publishStoredOpenItems(SESSION_ID, [storedItem("Q2")]);
+    const { result } = renderCommentMode();
+    comment(result, "Q2", "First.");
+    comment(result, "Q2", "Second.");
+    act(() => result.current.toggleItemClose("Q2"));
+    expect(unsent(getItemCommentState(SESSION_ID)).map((draft) => draft.closes)).toEqual([
+      true,
+      true,
+    ]);
+    // A further comment on the item starts as closing it too.
+    act(() => result.current.startComment({ label: "Q2", title: "Q2 title" }));
+    expect(result.current.target?.closes).toBe(true);
+    act(() => result.current.leaveCommentMode());
+
+    await act(() => result.current.submitComments());
+    const [text] = send.mock.calls[0];
+    act(() => {
+      useChatStore.setState({
+        queuedMessages: [{ queueId: "q_1", text, conversationId: SESSION_ID }],
+      });
+    });
+    act(() => {
+      useChatStore.setState({ queuedMessages: [] });
+      expect(result.current.restoreQueuedMessage(text)).toBe(true);
+    });
+    expect(result.current.unsentDrafts.map((draft) => draft.closes)).toEqual([true, true]);
+
+    act(() => result.current.toggleItemClose("Q2"));
+    expect(result.current.unsentDrafts.map((draft) => draft.closes)).toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it("offers no Comment and close without a stored item that is still open", async () => {
+    recordAnswers.mockClear();
+    publishStoredOpenItems(SESSION_ID, [storedItem("R1", { status: "closed" })]);
+    const { result } = renderCommentMode();
+    act(() => result.current.startComment({ label: "Q2", title: "Q2 title", closes: true }));
+    expect(result.current.target?.closes).toBe(false);
+    composer = { text: "Use the account's zone.", files: [], mentions: [], sessions: [] };
+    act(() => result.current.saveComment());
+    act(() => result.current.toggleItemClose("R1"));
+    comment(result, "R1", "Batch it.");
+    expect(result.current.closableLabels.size).toBe(0);
+    expect(result.current.unsentDrafts.some((draft) => draft.closes)).toBe(false);
+
+    await act(() => result.current.submitComments());
+    const [text] = send.mock.calls[0];
+    expect(text).not.toContain("(closed by me)");
+    expect(getItemCommentState(SESSION_ID).submissions[0]).not.toHaveProperty("closes");
   });
 
   it("gives the comments and the typed message back when the queued message is cancelled", async () => {

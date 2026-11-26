@@ -164,4 +164,10 @@ next reply. A comment on a closed item leaves it closed.
 
 Sent comments are read back from the transcript, so they show on every device.
 Drafts stay in this browser only (attachments included) and survive a reload;
-a failed or cancelled send puts them back as drafts.
+a failed or cancelled send puts them back as drafts. Where the server stores
+open items, each comment on a stored item is also recorded as its answer once
+the message posts, so the item shows as answered (see
+[Open items in the web UI](open-items.md#in-the-web-ui)). On a stored item
+that is not closed, **Comment and close** in the comment's header card (or a
+draft's ✓ in the tray) closes the item with the comment once it posts; its
+heading in the message then ends `(closed by me)`.

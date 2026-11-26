@@ -26,6 +26,7 @@ import {
   type OpenItemUpdate,
   type StoredOpenItem,
 } from "@/lib/openItems";
+import { publishStoredOpenItems } from "@/lib/openItemAnswers";
 import { isSessionStreamOpen, subscribeSessionStreams } from "@/lib/sessionStreamSignals";
 import { isTempConvId } from "@/lib/tempConversationId";
 
@@ -65,7 +66,12 @@ export function useStoredOpenItems(
       }
     });
   }, [active, sessionId, queryClient]);
-  return active && query.data ? query.data : null;
+  const items = active && query.data ? query.data : null;
+  // The composer offers "Comment and close" on the stored items still open.
+  useEffect(() => {
+    if (sessionId !== undefined) publishStoredOpenItems(sessionId, items);
+  }, [sessionId, items]);
+  return items;
 }
 
 /**

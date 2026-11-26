@@ -4655,6 +4655,9 @@ function ComposerImpl(
           drafts={commentMode.unsentDrafts}
           editingDraftId={commentTarget?.draftId ?? null}
           composingLabel={composingCommentLabel}
+          composingCloses={commentTarget?.closes ?? false}
+          closableLabels={commentMode.closableLabels}
+          onToggleClose={commentMode.toggleItemClose}
           withMessage={hasGeneralMessage}
           sendDisabledReason={commentSendDisabledReason}
           onSend={() => void sendCommentDrafts()}
@@ -4886,6 +4889,10 @@ function ComposerImpl(
                   item={commentMode.item}
                   excerpt={commentMode.excerpt}
                   editing={commentTarget.draftId !== null}
+                  closes={commentTarget.closes}
+                  {...(commentMode.closableLabels.has(commentTarget.label)
+                    ? { onClosesChange: commentMode.setTargetCloses }
+                    : {})}
                   onLeave={commentMode.leaveCommentMode}
                 />
               )}

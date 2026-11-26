@@ -14,6 +14,12 @@ vi.mock(import("@/lib/identity"), async (importOriginal) => ({
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  registerItemCommentComposer,
+  resetItemCommentDraftsForTests,
+  saveItemCommentDraft,
+  useItemCommentRequest,
+} from "@/lib/itemCommentDrafts";
 import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -271,6 +277,64 @@ describe("the Open items panel on a server that stores them", () => {
       expect(within(panel).queryByRole("button", { name: /from chat$/ })).toBeNull(),
     );
     expect(within(panel).queryByText("chat only")).toBeNull();
+  });
+
+  it("starts a comment on a stored item from its details, closing the panel", () => {
+    const unregister = registerItemCommentComposer("conv_1");
+    let request: ReturnType<typeof useItemCommentRequest> = null;
+    function RequestProbe() {
+      request = useItemCommentRequest("conv_1");
+      return null;
+    }
+    render(<RequestProbe />);
+    renderPanel(["Nothing labelled."], [storedItem("Q7", { title: "Cache rows?" })]);
+    const panel = openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Item Q7" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Comment" }));
+    expect(request).toMatchObject({ label: "Q7", title: "Cache rows?" });
+    expect(request).not.toHaveProperty("closes");
+    expect(screen.queryByTestId("session-items-panel")).toBeNull();
+    unregister();
+    resetItemCommentDraftsForTests();
+  });
+
+  it("offers Comment and close on a stored item that is not closed, and marks closing rows", () => {
+    const unregister = registerItemCommentComposer("conv_1");
+    let request: ReturnType<typeof useItemCommentRequest> = null;
+    function RequestProbe() {
+      request = useItemCommentRequest("conv_1");
+      return null;
+    }
+    render(<RequestProbe />);
+    saveItemCommentDraft("conv_1", {
+      id: "d1",
+      label: "Q8",
+      title: "",
+      text: "Done.",
+      files: [],
+      createdAt: 1,
+      closes: true,
+    });
+    renderPanel(
+      ["Nothing labelled."],
+      [
+        storedItem("Q7", { title: "Cache rows?" }),
+        storedItem("Q8"),
+        storedItem("Q9", { status: "closed", resolution: "Done" }),
+      ],
+    );
+    const panel = openPanel();
+    const row = (label: string) =>
+      within(panel)
+        .getAllByTestId("open-item-row")
+        .find((element) => element.dataset.label === label)!;
+    expect(within(row("Q8")).getByText("closes when sent")).toBeTruthy();
+    expect(within(row("Q7")).queryByText("closes when sent")).toBeNull();
+    fireEvent.click(within(panel).getByRole("button", { name: "Item Q7" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Comment and close" }));
+    expect(request).toMatchObject({ label: "Q7", title: "Cache rows?", closes: true });
+    unregister();
+    resetItemCommentDraftsForTests();
   });
 
   it("offers no changes to a viewer without edit access", () => {
