@@ -15,8 +15,9 @@ session to another account, keep Claude token accounts that share one
 - **Docs:** [Model providers](../providers.md); the menu in
   [Composer](../../feature-map/composer.md) (`account`) and child accounts in
   [Native harnesses](../../feature-map/native-harnesses.md) (`child-account`).
-- **Upstream:** proposed from `feat/subscription-accounts` (design on upstream
-  issue [#503](https://github.com/omnigent-ai/omnigent/issues/503)).
+- **Upstream:** not proposed yet: carried here while the design is discussed on
+  upstream issue [#503](https://github.com/omnigent-ai/omnigent/issues/503) (open). The contribution branch is
+  `feat/subscription-accounts`; no pull request is open from it.
 
 ## Must hold
 

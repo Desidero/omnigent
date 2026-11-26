@@ -12,7 +12,8 @@ whole history, forward from the start or from a saved cursor.
   alias of upstream's `visibility` until 0.24.0.
 - **Docs:** [Agent YAML spec](../AGENT_YAML_SPEC.md) (session read tools) and
   `omnigent/server/API.md` (List Sessions).
-- **Upstream:** proposed from `feat/session-history-paging`.
+- **Upstream:** not proposed yet: the feature request is not opened and there
+  is no pull request. It is prepared on `feat/session-history-paging`.
 
 ## Must hold
 

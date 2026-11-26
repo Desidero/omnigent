@@ -10,7 +10,8 @@ items. Agents get an instruction to label and close items.
 
 - **Turn on:** on by default; labels render once a transcript uses them.
 - **Docs:** [Item labels in chat](../chat-item-labels.md).
-- **Upstream:** proposed from `feat/chat-item-citations`; the latest-reply
+- **Upstream:** not proposed yet: there is no upstream issue or pull request.
+  The first patch is prepared on `feat/chat-item-citations`; the latest-reply
   emphasis and dismissing items are kept here only.
 
 ## Must hold

@@ -24,9 +24,10 @@ sessions).
   [Shared preference operations](../shared-preferences-api.md),
   [Agent YAML](../AGENT_YAML_SPEC.md) (`tool_groups.link_rules`) and
   [Preferences](../../feature-map/preferences.md) (`chat-link-rules`).
-- **Upstream:** proposed from `feat/chat-link-rules`; the git-reference
-  part (issue and pull request notation, its instruction) is planned from
-  `feat/git-ref-notation`.
+- **Upstream:** not proposed yet: no pull request is open. It is to go up from
+  `feat/chat-link-rules`, the git-reference part (issue and pull request
+  notation, its instruction) from `feat/git-ref-notation`; the related upstream
+  issue is [#11176](https://github.com/omnigent-ai/omnigent/issues/11176) (open).
 
 ## Must hold
 

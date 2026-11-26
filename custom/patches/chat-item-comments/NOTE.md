@@ -10,7 +10,9 @@ alone, and the tray's menu sends only the comments or only the message.
 
 - **Turn on:** on by default; choose **Comment** in an item's popover.
 - **Docs:** [Item labels in chat](../chat-item-labels.md) (Comment on items).
-- **Upstream:** proposed from `feat/chat-item-comments`.
+- **Upstream:** not proposed yet: there is no upstream issue or pull request.
+  It is prepared on `feat/chat-item-comments`, to go up together with the
+  labelled-items renderer of `chat-item-labels`.
 
 ## Must hold
 

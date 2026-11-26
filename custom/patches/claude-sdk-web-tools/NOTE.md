@@ -9,7 +9,8 @@ claude-sdk agents can use Claude Code's own WebSearch and WebFetch.
   `executor` (`executor.config.native_tools` in a directory bundle).
 - **Docs:** [Agent YAML spec](../AGENT_YAML_SPEC.md) (Claude SDK built-in web
   tools).
-- **Upstream:** proposed from `feat/claude-sdk-native-tools`.
+- **Upstream:** not proposed yet: there is no upstream issue or pull request.
+  It is prepared on `feat/claude-sdk-native-tools`.
 
 ## Must hold
 

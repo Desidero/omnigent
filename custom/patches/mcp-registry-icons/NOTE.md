@@ -15,7 +15,12 @@ payloads that are not an image of the named type fail registry validation.
 - **Docs:** "Administrator configuration" in the
   [registry README](../../examples/mcp-registry/README.md#administrator-configuration);
   the picker in the [composer feature map](../../feature-map/composer.md).
-- **Upstream:** not proposed upstream yet.
+- **Upstream:** not proposed from here. Upstream has its own issue for the same
+  field, [#13294](https://github.com/omnigent-ai/omnigent/issues/13294) (open), and a draft pull request,
+  [#13295](https://github.com/omnigent-ai/omnigent/pull/13295), that takes a wider set of values (https URLs,
+  same-origin paths, and SVG, PNG or WebP data URIs, base64 or URL-encoded, up
+  to 32 KB). Every value accepted here is accepted there, so this series can be
+  dropped if that merges.
 
 ## Must hold
 

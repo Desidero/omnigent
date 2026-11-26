@@ -1,6 +1,6 @@
 # claude-native-delegate-idle
 
-Needs: claude-native-teammates
+Needs: none
 Covers: 1aa49b5907039389
 
 A Claude lead session stops showing Working, and takes follow-ups without
