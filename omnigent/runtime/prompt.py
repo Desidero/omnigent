@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import collections.abc
+import functools
 import json
 import re
 from collections.abc import Sequence
@@ -120,6 +122,51 @@ ITEM_LABEL_INSTRUCTION = (
     "reopen it."
 )
 
+# Replaces ITEM_LABEL_INSTRUCTION for agents with the ``open_items`` tool group:
+# the store keeps each item and its replies, and a label in chat only points at it.
+OPEN_ITEMS_INSTRUCTION = (
+    "Open items: every question you ask the user, and every risk, finding or "
+    "follow-up they should come back to, is an open item, as is a page worth pinning. "
+    "Before writing a reply that has any, call sys_open_items_raise for them (several "
+    "per call, each with a topic); it is the only way to create an item, and it "
+    "returns labels such as Q7. Then write each item once, starting with its label "
+    "and a bold title: [Q7] **Docker socket access?** detail. Don't ask them as an "
+    "unlabelled list or a question form instead. Afterwards refer to items by label, "
+    "and never write a label the tool did not return. When the user comments on items "
+    '("Comments on N items:", one "#### [Q7] title" section each), call '
+    "sys_open_items_update for each with your reply, adding status closed and a "
+    "one-line resolution only if that settles it, then answer in chat as usual. Close "
+    'other items the same way once settled. Items the user closed ("(closed by me)") '
+    "stay closed unless they ask again. Use sys_open_items_list, not memory, for what "
+    "is open. In chat, talk about the items, not about recording them."
+)
+
+
+def _item_label_instructions(spec: AgentSpec | None) -> tuple[str, ...]:
+    """The item guidance: the stored-items block when the spec keeps the tools, else labels."""
+    if spec is not None and spec.tool_groups.open_items:
+        return (OPEN_ITEMS_INSTRUCTION,)
+    return (ITEM_LABEL_INSTRUCTION,)
+
+
+def _with_stored_items_guidance(
+    compose: collections.abc.Callable[..., str],
+) -> collections.abc.Callable[..., str]:
+    """Swap the text-label guidance of a native startup composer for the stored-items block.
+
+    Only for a spec that keeps the ``open_items`` tools; a launch without a
+    spec has none, so it keeps text labels.
+    """
+
+    @functools.wraps(compose)
+    def compose_with_stored_items(spec: AgentSpec | None, *args: Any, **kwargs: Any) -> str:
+        text = compose(spec, *args, **kwargs)
+        if spec is None or not spec.tool_groups.open_items:
+            return text
+        return text.replace(ITEM_LABEL_INSTRUCTION, OPEN_ITEMS_INSTRUCTION, 1)
+
+    return compose_with_stored_items
+
 
 def is_git_checkout(path: Path) -> bool:
     """
@@ -190,7 +237,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     agent unless the spec sets ``tool_groups.browser: false``, in which
     case the prompt must not steer the model toward tools it lacks. The
     item-label guidance applies to every agent, since every transcript
-    renders label chips.
+    renders label chips; an agent with the ``open_items`` tool group gets
+    the guidance for its tools instead.
 
     :param spec: The parsed AgentSpec.
     :returns: The applicable spec-level framework instructions.
@@ -202,7 +250,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     if spec.tool_groups.browser:
         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
     instructions.append(WORKSPACE_IMAGE_INSTRUCTION)
-    instructions.append(ITEM_LABEL_INSTRUCTION)
+    instructions.extend(_item_label_instructions(spec))
     return instructions
 
 
@@ -364,6 +412,10 @@ def build_native_startup_instructions(
         *link_rule_instructions(link_rules, git_workspace),
     )
     return append_framework_instructions(authored, framework) or "\n\n".join(framework)
+
+
+# Native launches with the tools get the stored-items block in place of the text labels.
+build_native_startup_instructions = _with_stored_items_guidance(build_native_startup_instructions)
 
 
 def _strip_output_annotations(

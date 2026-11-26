@@ -4455,6 +4455,7 @@ async def test_runner_keeps_user_inbox_tools_only_when_the_server_turns_them_on(
 @pytest.mark.asyncio
 async def test_runner_keeps_open_items_tools_only_when_the_server_stores_them(tmp_path):
     from omnigent.open_items_availability import OPEN_ITEMS_HEADER
+    from omnigent.runtime.prompt import OPEN_ITEMS_INSTRUCTION, build_native_startup_instructions
     from omnigent.tools.manager import ToolManager
     from tests.server.helpers import build_agent_bundle
 
@@ -4488,6 +4489,10 @@ async def test_runner_keeps_open_items_tools_only_when_the_server_stores_them(tm
         return "sys_open_items_raise" in names
 
     assert [advertised(result.spec) for result in results] == [False, True, False]
+    assert [
+        OPEN_ITEMS_INSTRUCTION in build_native_startup_instructions(result.spec)
+        for result in results
+    ] == [False, True, False]
 
 
 @pytest.mark.asyncio
