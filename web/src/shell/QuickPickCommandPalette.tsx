@@ -1,6 +1,6 @@
-// ⌘K on QuickPick: the same Sessions, In messages and Actions rows as CommandPalette,
-// with fuzzy-ranked actions and keyboard navigation from the QuickPick list, and the
-// commands features on screen offer through `usePaletteCommands`, under their headings.
+// ⌘K on QuickPick: the same Sessions, In messages, Actions and New chat in project rows as
+// CommandPalette, with fuzzy-ranked actions and keyboard navigation from the QuickPick list,
+// and the commands features on screen offer through `usePaletteCommands`, under their headings.
 
 import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "zustand";
@@ -35,9 +35,17 @@ import {
   paletteChildPageStore,
   resetPaletteToRoot,
 } from "./commandPaletteChildPage";
+import {
+  NEW_CHAT_IN_PROJECT_HEADING,
+  newChatInProjectLabel,
+  newChatInProjectPath,
+  newChatInProjectRowId,
+  useNewChatInProjectChoices,
+} from "./newChatInProject";
 import { currentPaletteCommand, paletteCommandItems } from "./paletteCommandRows";
 import { PaletteSessionContext } from "./PaletteSessionContext";
 import type { PaletteTarget as PaletteRow } from "./paletteTarget";
+import { ProjectRowIcon } from "./ProjectPicker";
 import { useSettingChoicesPage } from "./settingChoicesPage";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
@@ -216,6 +224,7 @@ export function QuickPickCommandPalette({
       : [];
 
   const { visibleSessions, contentSessions, searching } = search;
+  const projectChoices = useNewChatInProjectChoices(open && !sessionsOnly, query);
   // Picked by kind, so a page kind nothing builds yet lists no rows instead of another page's.
   const activePage = (() => {
     switch (childPage?.kind) {
@@ -285,6 +294,24 @@ export function QuickPickCommandPalette({
             .filter((item) => item.group !== undefined)
             .map((item) => ({ ...item, matchHighlight: "underline" })),
     },
+    {
+      sourceId: "new-chat-in-project",
+      ranking: "client",
+      fuzzyMatching: "words",
+      items: projectChoices.map((project): QuickPickItem<PaletteRow> => ({
+        id: newChatInProjectRowId(project.name),
+        label: newChatInProjectLabel(project.name),
+        keywords: ["project"],
+        group: NEW_CHAT_IN_PROJECT_HEADING,
+        matchHighlight: "underline",
+        icon: <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />,
+        // The label names the user's project, so sessions matching the same word stay first.
+        leadsSources: false,
+        // These rows are hidden without a query, so Recent couldn't list them.
+        rememberInHistory: false,
+        value: { kind: "new-chat-in-project", projectName: project.name },
+      })),
+    },
   ];
   // A page kind nothing builds yet lists nothing, rather than the root's rows.
   const unbuiltPage = childPage !== null && activePage === null;
@@ -302,6 +329,10 @@ export function QuickPickCommandPalette({
     }
     if (row.kind === "action") {
       row.action.run();
+      return undefined;
+    }
+    if (row.kind === "new-chat-in-project") {
+      navigate(newChatInProjectPath(row.projectName));
       return undefined;
     }
     if (row.kind === "setting-choice") return settingPage.acceptChoice(row.value);

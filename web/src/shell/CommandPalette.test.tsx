@@ -689,6 +689,87 @@ describe("CommandPalette — match preview", () => {
   });
 });
 
+describe("CommandPalette — new chat in project", () => {
+  beforeEach(() => {
+    useProjects.mockReturnValue({
+      data: [
+        { id: "p1", name: "omnigent", icon: "🔥" },
+        { id: null, name: "docs site", icon: null },
+      ],
+    });
+  });
+
+  const type = (value: string) =>
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value } });
+  const projectRow = (name: string) =>
+    screen.queryByRole("option", { name: `New chat in ${name}` });
+
+  it("hides project rows until the user types", () => {
+    renderPalette();
+
+    expect(screen.queryByText("New chat in project")).toBeNull();
+    expect(projectRow("omnigent")).toBeNull();
+  });
+
+  it("matches every typed word against the row label", () => {
+    renderPalette();
+    type("new omni");
+
+    expect(projectRow("omnigent")).toBeTruthy();
+    expect(projectRow("docs site")).toBeNull();
+    expect(screen.getByTestId("project-icon").textContent).toBe("🔥");
+  });
+
+  it("lists every project when the query is the group heading's word", () => {
+    renderPalette();
+    type("project");
+
+    expect(projectRow("omnigent")).toBeTruthy();
+    expect(projectRow("docs site")).toBeTruthy();
+  });
+
+  it("opens the highlighted project row with Enter", async () => {
+    const { onOpenChange } = renderPalette();
+    type("omni");
+    await vi.waitFor(() => expect(projectRow("omnigent")).toHaveAttribute("aria-selected", "true"));
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+
+    expect(navigate).toHaveBeenCalledWith("/?project=omnigent");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("opens the composer with the project's defaults and closes", () => {
+    const { onOpenChange } = renderPalette();
+    type("docs");
+    fireEvent.click(projectRow("docs site")!);
+
+    expect(navigate).toHaveBeenCalledWith("/?project=docs%20site");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("omits project rows in the sessions-only switcher", () => {
+    renderPalette({ sessionsOnly: true });
+    type("omni");
+
+    expect(projectRow("omnigent")).toBeNull();
+  });
+
+  it("keeps sessions that match the same word above the project rows", () => {
+    vi.useFakeTimers();
+    onTestFinished(() => void vi.useRealTimers());
+    setSearchGroups({ title: searchPages([conv("fix", "omnigent fix")]) });
+    renderPalette();
+    type("omnigent");
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
+    expect(options[0]).toContain("omnigent fix");
+    expect(options[1]).toContain("New chat in omnigent");
+  });
+});
+
 describe("CommandPalette — input", () => {
   it("uses the sessions-first placeholder", () => {
     renderPalette();
