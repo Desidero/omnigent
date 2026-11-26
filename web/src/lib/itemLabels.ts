@@ -262,6 +262,11 @@ export function scanLines(markdown: string): ScannedLine[] {
   return lines;
 }
 
+/** The lines of `markdown`, each line of a fenced code block as null. */
+export function proseLines(markdown: string): (string | null)[] {
+  return scanLines(markdown).map((line) => (line.inFence ? null : line.text));
+}
+
 /** Blanks out inline code spans so a label inside backticks is never matched. */
 function withoutInlineCode(line: string): string {
   return line.replace(/(`+)[^`]*?\1/g, (span) => " ".repeat(span.length));

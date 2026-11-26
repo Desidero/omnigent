@@ -6,6 +6,7 @@ import {
   itemLabelChipClass,
   itemLabelChipName,
 } from "@/components/blocks/ChatMarkdown";
+import { isLinkItemLabel } from "@/lib/sessionLinks";
 import { useSession } from "@/hooks/useSession";
 import { useUpdateSessionLabels } from "@/hooks/useSessionLabels";
 import {
@@ -118,9 +119,10 @@ function useDismissedItems(sessionId: string | null) {
   };
 }
 
-/** The items the tracker lists: every labelled item, once the transcript uses labels. */
+/** The items the tracker lists: every labelled item but pinned links, once labels are in use. */
 export function trackedItems(index: ItemLabelIndex | null): ItemLabelEntry[] {
-  return index?.enabled ? [...index.items.values()] : [];
+  if (!index?.enabled) return [];
+  return [...index.items.values()].filter((item) => !isLinkItemLabel(item.label));
 }
 
 /** How many of the transcript's tracked items are open: neither closed nor dismissed. */
