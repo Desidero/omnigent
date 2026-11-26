@@ -5,7 +5,7 @@ them by label in a later status update. Clicking the later chip must preview
 the defining item's own block, not the whole message, without scrolling the
 transcript; "Show in conversation" then jumps to the defining message. Closing
 an item (``~~[Q2]~~``) strikes its chips, the popover shows how it was closed,
-and the pinned Open items panel lists only what is still open. Comments drafted
+and the header's Open items panel lists only what is still open. Comments drafted
 on several items go out as one message and rebuild each item's thread.
 """
 
@@ -249,13 +249,16 @@ def test_item_comments_submit_together_and_thread_in_popover(
     expect(popover).to_contain_text("I'll leave the cascade in place.")
     page.keyboard.press("Escape")
 
-    # Phone width: comment from the Open items panel; after a reload the tray
-    # starts collapsed and its send button names the typed message.
+    # Phone width: comment from the Open items sheet, which the comment closes;
+    # after a reload the tray starts collapsed and its send button names the
+    # typed message.
     page.set_viewport_size({"width": 390, "height": 844})
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.locator(_ASSISTANT)).to_have_count(3, timeout=15_000)
+    page.get_by_test_id("session-items-trigger").click()
     page.get_by_test_id("open-items").get_by_role("button", name="Show item Q3").first.click()
     popover.get_by_role("button", name="Comment").click()
+    expect(page.get_by_test_id("session-items-panel")).to_have_count(0)
     expect(comment_mode).to_be_in_viewport()
     definition = comment_mode.get_by_role("region", name="Q3 text")
     expect(definition).to_contain_text("Renaming touches 14 indexes")
