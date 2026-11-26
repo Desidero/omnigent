@@ -137,6 +137,7 @@ import {
 import { scanItemLabelSource } from "@/lib/itemComments";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
+import { collectSessionLinks, type SessionLink } from "@/lib/sessionLinks";
 import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -267,6 +268,15 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
     .map((item) => item.text)
     .join("\n\n")
     .trim();
+}
+
+/** The transcript's Links list: pages agent messages mention, then links pinned by label. */
+export function collectBubbleSessionLinks(
+  bubbles: readonly Bubble[],
+  index: ItemLabelIndex,
+): SessionLink[] {
+  const sources = bubbles.flatMap((bubble) => scanBubbleItemLabels(bubble)?.source ?? []);
+  return collectSessionLinks(sources, index);
 }
 
 // Finalized bubbles are reused by reference across rebuilds, so each is scanned once.

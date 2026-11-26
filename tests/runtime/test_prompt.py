@@ -569,7 +569,8 @@ def test_git_wording_without_a_session_repository_keeps_github_references() -> N
 
 def test_item_label_examples_match_the_chat_label_shape() -> None:
     """Every example label must match the shape web/src/lib/itemLabels.ts renders as a chip."""
-    examples = re.findall(r"\[[^\]]*\]", ITEM_LABEL_INSTRUCTION)
+    # Bracketed text followed by "(" is a markdown link's text, which the chat skips too.
+    examples = re.findall(r"\[[^\]]*\](?!\()", ITEM_LABEL_INSTRUCTION)
     assert examples
     for example in examples:
         assert re.fullmatch(r"\[[A-Z]{1,3}\d{1,3}\]", example)
@@ -578,3 +579,10 @@ def test_item_label_examples_match_the_chat_label_shape() -> None:
 def test_item_label_instruction_shows_a_bold_title_after_the_label() -> None:
     """The example puts a bold title right after the label, which the chat UI lists items by."""
     assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
+
+
+def test_item_label_instruction_shows_how_to_pin_a_link() -> None:
+    """A link label takes a bold title and a bare URL, which the chat's Links list reads."""
+    assert re.search(r"\[L\d{1,3}\] \*\*[^*]+\*\* https://\S+", ITEM_LABEL_INSTRUCTION)
+    # Other links are named by their markdown text, which the Links list shows.
+    assert re.search(r"\[Descriptive name\]\(https://\S+\)", ITEM_LABEL_INSTRUCTION)
