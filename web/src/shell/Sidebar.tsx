@@ -303,6 +303,7 @@ import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/c
 import { NewProjectButton } from "./NewProjectButton";
 import { SessionImportStatus } from "./SessionImportStatus";
 import { useSessionImportStore } from "@/store/sessionImport";
+import { askForProjectOnNewSessionClick } from "@/store/newSessionProjectPrompt";
 import { useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import { SettingsSidebar } from "./settingsSearch/SettingsSidebar";
 import {
@@ -1495,6 +1496,7 @@ function SidebarImpl({
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
+                    askForProjectOnNewSessionClick(e);
                   }}
                 >
                   <MessageCirclePlusIcon
@@ -3589,6 +3591,7 @@ function ConversationList({
                 event.stopPropagation();
                 onActiveTabChange("mine");
                 onRowClick(event);
+                askForProjectOnNewSessionClick(event);
               }}
             >
               <MessageCirclePlusIcon className="size-3.5" />

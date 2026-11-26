@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setEmbedRoot } from "@/lib/host";
 
+import { useNewSessionProjectPromptStore } from "@/store/newSessionProjectPrompt";
+
 import { isNewSessionHotkey, useNewSessionHotkey } from "./useNewSessionHotkey";
 
 const navigate = vi.fn();
@@ -13,6 +15,7 @@ afterEach(() => {
   cleanup();
   setEmbedRoot(null);
   navigate.mockReset();
+  useNewSessionProjectPromptStore.setState({ open: false, hosted: false });
   document.body.innerHTML = "";
 });
 
@@ -117,6 +120,17 @@ describe("useNewSessionHotkey", () => {
     const e = press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
 
     expect(navigate).toHaveBeenCalledWith("/");
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("asks for a project instead of navigating where the shell mounts the prompt", () => {
+    useNewSessionProjectPromptStore.setState({ hosted: true });
+    renderHook(() => useNewSessionHotkey(true, false));
+
+    const e = press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
+
+    expect(useNewSessionProjectPromptStore.getState().open).toBe(true);
+    expect(navigate).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(true);
   });
 

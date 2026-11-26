@@ -20,6 +20,12 @@ const QuickPickCommandPalette = lazy(() =>
 const ThemePicker = lazy(() =>
   import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
 );
+// Mounts closed, to load before the first new session asks for its project.
+const NewSessionProjectPrompt = lazy(() =>
+  import("./NewSessionProjectPrompt").then((module) => ({
+    default: module.NewSessionProjectPrompt,
+  })),
+);
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
 const ImportContextPreview = import.meta.env.DEV
@@ -91,6 +97,13 @@ export function AppShellOverlays({
           onToggleRightSidebar={toggleRightPanel}
           rightSidebarShortcutEnabled={!gridRoute}
           onGoToSession={goToSession}
+        />
+      </Suspense>
+      {/* "Start a new session in…", from the shortcut, the sidebar's links and ⌘K's New chat. */}
+      <Suspense fallback={null}>
+        <NewSessionProjectPrompt
+          paletteOpen={commandPaletteOpen}
+          closePalette={() => setCommandPaletteOpen(false)}
         />
       </Suspense>
       {/* "Select theme…" from ⌘K; previews each theme as the user moves through them. */}
