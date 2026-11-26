@@ -26,10 +26,12 @@ Preconditions: a local server and runner from this checkout; any harness.
 - Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
 - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
 - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
+- Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
 - Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row, a struck `~~[Q1]~~`, and the item `closed` with `closed_by: agent` in the API.
 
 ## Gotchas
 
 - The web UI does not read the store yet: chips and the Open items bar still follow the chat text, so an item closed only through the API still shows open in the bar.
 - Hosts without the series do not know the `open_items` key in `tool_groups:`, and an agent spec naming it fails to load there.
+- A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the instruction's last sentence covers that.
 - Labels are unique per session, not across a session tree: a child session counts from Q1.

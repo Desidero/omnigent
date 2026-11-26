@@ -7,7 +7,11 @@ import pytest
 from omnigent.cli import _bundle
 from omnigent.inner.bundle_skills import claude_native_skill_args
 from omnigent.runner.tool_dispatch import _execute_skill_tool
-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, build_instructions
+from omnigent.runtime.prompt import (
+    ITEM_LABEL_INSTRUCTION,
+    OPEN_ITEMS_INSTRUCTION,
+    build_instructions,
+)
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.spec import load, materialize_bundle
 from omnigent.tools.builtins.load_skill import LoadSkillTool, list_skill_resources
@@ -63,9 +67,10 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() -> 
     prompt = build_instructions(spec, None, [tool.get_schema()])
 
     # Include the shared framework guidance alongside the agent's procedure index;
-    # the item-label rules are framework text appended to every agent.
-    assert ITEM_LABEL_INSTRUCTION in prompt
-    assert len(prompt.split()) - len(ITEM_LABEL_INSTRUCTION.split()) < 1600
+    # an agent with the open items tools gets their guidance in place of text labels.
+    assert ITEM_LABEL_INSTRUCTION not in prompt
+    assert OPEN_ITEMS_INSTRUCTION in prompt
+    assert len(prompt.split()) - len(OPEN_ITEMS_INSTRUCTION.split()) < 1600
     assert spec.skills
     for skill in spec.skills:
         assert skill.name in prompt
