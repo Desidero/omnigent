@@ -641,19 +641,19 @@ anything is wrong with it.
 |---|---|
 | `backport-sidebar-filter-submenus` | landed upstream (#13481) |
 | `toast-safe-area` | superseded by upstream #13607 |
-| `skip-gzip-binary-files` | landed upstream (#12362); dropped at the 2026-11-24 refresh |
 | `terminal-touch` | mobile |
+| `new-chat-project-prompt` | optional |
+| `palette-new-chat-in-project` | optional |
+| `skip-gzip-binary-files` | landed upstream (#12362); dropped at the 2026-11-24 refresh |
 | `composer-send-tap` | mobile |
 | `mobile-settings-nav` | mobile |
 | `mobile-landing-project-chip` | mobile |
 | `mobile-sidebar-nav-strip` | mobile |
-| `pr-watch` | optional |
-| `queue-combine` | optional |
 | `sidebar-updated-filter` | optional |
 | `sidebar-sticky-toolbar` | optional |
-| `new-chat-project-prompt` | optional |
-| `palette-new-chat-in-project` | optional |
 | `chat-features` | optional |
+| `pr-watch` | optional |
+| `queue-combine` | optional |
 
 To restore one, apply it from that commit onto the foundation it will have
 now (`BASE`, or the series it needs: what its `# needs:` lines named, less
