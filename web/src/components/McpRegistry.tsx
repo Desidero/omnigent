@@ -94,7 +94,12 @@ function ServiceConnection({
           {service.connected ? "Connected" : "Not connected"}
         </span>
       </div>
-      <p className="text-xs text-muted-foreground">Available tools: {service.tools.join(", ")}</p>
+      <p className="text-xs text-muted-foreground">
+        Available tools:{" "}
+        {service.tools.length === 1 && service.tools[0] === "*"
+          ? "every tool the service offers"
+          : service.tools.join(", ")}
+      </p>
       <div className="flex flex-wrap gap-2">
         {/* One button per row action, so each names its action as the Settings catalog does. */}
         {service.auth === "bearer" &&

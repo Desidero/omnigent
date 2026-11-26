@@ -289,7 +289,7 @@ admin database/UI. Settings shows users only the entries they can access.
 | `public_url` | External Omnigent base URL used for OAuth callbacks; HTTPS except localhost. |
 | `services[].id` | Stable service key, also used in agent bundles and `service__tool` names. |
 | `url` | Administrator-approved Streamable HTTP MCP destination. |
-| `tools` | Required, nonempty list of allowed upstream tool names. |
+| `tools` | Required, nonempty list of allowed upstream tool names or `*` patterns; see [Tool allowlist patterns](#tool-allowlist-patterns). |
 | `allowed_users` | Optional list of authenticated user IDs; omitted permits all users. |
 | `auth` | `none`, personal `bearer`, configured `oauth`, or existing `github`/`databricks`. |
 | `oauth` | Authorization/token URLs, client ID, scopes, optional `resource` and `client_secret_env`. |
@@ -383,6 +383,51 @@ sequenceDiagram
   G->>P: Existing tool-result policy
   G-->>H: Policy-checked result
 ```
+
+### Tool allowlist patterns
+
+An entry in `tools` is an exact upstream tool name or a pattern, in which `*`
+stands for any run of characters, including none:
+
+```yaml
+tools: [whoami, read_*, "*_search"] # an exact name, a prefix, a suffix
+```
+
+```yaml
+tools: ["*"] # every tool the upstream offers
+```
+
+Quote an entry that starts with `*`; YAML reads a bare leading `*` as an alias.
+
+- **Matching.** An entry is compared with the whole tool name, case-sensitively,
+  as literal text. `*` is the only wildcard: `?`, `[...]` and regular-expression
+  syntax mean nothing, and no regular expression is built from the file. An
+  entry with `**`, or with both `*` and one of `?`, `[`, `]`, fails startup like
+  any other invalid field. Exact names work as before.
+- **Checked per call, not expanded.** The server does not turn a pattern into a
+  list of names. It checks the name against the entries when it lists a
+  service's tools and again on every call, before the credential is resolved.
+  A tool the upstream adds later is therefore offered and callable as soon as
+  its name matches, with no restart and no review by the administrator. Use the
+  narrowest pattern that does the job, and keep exact names for a service that
+  mixes read and write tools under one prefix.
+- **`"*"` is an explicit choice.** It allows every tool the upstream offers,
+  now and later, with the user's credential. There is no default (`tools`
+  stays required and nonempty), `"*"` must be the only entry, and the server
+  logs a warning naming the service at startup.
+- **No deny list.** The registry has allowlists only, so a pattern cannot
+  exclude a name. To leave out a tool that a pattern would admit, list the
+  names you want or use narrower patterns. Everything that narrows access
+  still applies on top and can only narrow: `allowed_users`, an agent's own
+  `tools` list for the service (exact names), and tool-call policies. A
+  policy that denies a call wins over any pattern.
+- **Rolling back.** A server from before patterns reads `read_*` as an exact
+  tool name, which matches nothing: the file still loads and the service's
+  tools disappear from sessions without an error. Replace patterns with names
+  before rolling back.
+
+`GET /v1/mcp-registry/services` returns the entries as written. **Settings →
+MCP** shows them the same way, and `["*"]` as "every tool the service offers".
 
 ## Embedding and downstream compatibility
 

@@ -33,6 +33,15 @@ describe("MCP account connections", () => {
     expect(document.querySelector('[data-settings-row-action="saveToken"]')).not.toBeNull();
   });
 
+  it.each([
+    [["read_ticket", "search_*"], "Available tools: read_ticket, search_*"],
+    [["*"], "Available tools: every tool the service offers"],
+  ])("describes the allowlist %j", async (tools, text) => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, tools }] });
+    render(<McpRegistryConnections />);
+    expect(await screen.findByText(text)).toBeInTheDocument();
+  });
+
   it.each(["github", "databricks"])(
     "links shared %s accounts to their provider controls",
     async (auth) => {

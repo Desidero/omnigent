@@ -73,6 +73,30 @@ def _upstream_error(exc: Exception) -> McpUpstreamError:
     )
 
 
+_TOOL_WILDCARD = "*"
+
+
+def _tool_pattern_matches(pattern: str, tool: str) -> bool:
+    """Whether *tool* is *pattern*, reading each ``*`` as any run of characters.
+
+    Literal, anchored at both ends: no regular expression is built from the file.
+    """
+    first, *middle = pattern.split(_TOOL_WILDCARD)
+    if not middle:
+        return tool == pattern
+    last = middle.pop()
+    end = len(tool) - len(last)
+    position = len(first)
+    if position > end or not tool.startswith(first) or not tool.endswith(last):
+        return False
+    for part in middle:
+        found = tool.find(part, position, end)
+        if found < 0:
+            return False
+        position = found + len(part)
+    return True
+
+
 class OAuthConfig(BaseModel):
     """Explicit OAuth configuration for an approved MCP resource."""
 
@@ -121,10 +145,25 @@ class McpService(BaseModel):
                 raise ValueError(
                     "MCP/OAuth URLs require HTTPS (allow_http is for local development)"
                 )
+        for entry in self.tools:
+            if _TOOL_WILDCARD not in entry:
+                continue
+            if entry == _TOOL_WILDCARD and len(self.tools) > 1:
+                raise ValueError("tools: '*' allows every tool and must be the only entry")
+            if _TOOL_WILDCARD * 2 in entry or any(c in entry for c in "?[]"):
+                raise ValueError("tools patterns take single '*' wildcards only")
         return self
 
     def permits(self, user_id: str) -> bool:
         return self.allowed_users is None or user_id in self.allowed_users
+
+    @property
+    def allows_every_tool(self) -> bool:
+        return self.tools == [_TOOL_WILDCARD]
+
+    def allows_tool(self, tool: str) -> bool:
+        """Whether the administrator's allowlist admits the upstream tool named *tool*."""
+        return any(_tool_pattern_matches(pattern, tool) for pattern in self.tools)
 
 
 class McpRegistryConfig(BaseModel):
@@ -189,6 +228,9 @@ class McpRegistry:
             raise ValueError(
                 "Set OMNIGENT_MCP_OAUTH_STATE_SECRET to at least 32 random characters"
             )
+        for s in config.services:
+            if s.allows_every_tool:
+                _logger.warning("MCP registry service %s allows every upstream tool", s.id)
 
     def service(self, service_id: str, user_id: str) -> McpService:
         service = self.services.get(service_id)
@@ -327,7 +369,7 @@ class McpRegistry:
         arguments: dict[str, Any] | None = None,
     ) -> Any:
         service = self.service(service_id, user_id)
-        if tool is not None and tool not in service.tools:
+        if tool is not None and not service.allows_tool(tool):
             raise ConnectionError("Tool is not allowed by the MCP registry")
         token = await self.token(service, user_id, app_state)
         headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -351,7 +393,7 @@ class McpRegistry:
                     cursor = None
                     for _ in range(100):
                         result = await session.list_tools(cursor=cursor)
-                        tools.extend(t for t in result.tools if t.name in service.tools)
+                        tools.extend(t for t in result.tools if service.allows_tool(t.name))
                         cursor = result.nextCursor
                         if not cursor:
                             return tools
