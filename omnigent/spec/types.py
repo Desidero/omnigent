@@ -904,6 +904,10 @@ class ToolGroupsConfig:
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
     :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
         statuses and notes.
+    :param open_items: ``sys_open_items_raise``, ``sys_open_items_update`` and
+        ``sys_open_items_list``: the session's stored questions, risks,
+        findings, follow-ups and links. The runner also drops them unless the
+        server stores open items.
     :param projects: ``sys_project_list``, ``sys_project_update`` and
         ``sys_session_update``.
     :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
@@ -922,6 +926,7 @@ class ToolGroupsConfig:
     policies: bool = True
     agent_discovery: bool = True
     journal: bool = True
+    open_items: bool = True
     projects: bool = True
     user_inbox: bool = True
     memory: bool = True

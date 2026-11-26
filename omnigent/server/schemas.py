@@ -6081,6 +6081,25 @@ class SessionJournalAppendedEvent(_SSEEventBase):
     entry: SessionJournalEntry
 
 
+class SessionOpenItemsChangedEvent(_SSEEventBase):
+    """
+    Items in the session's open items list were raised or changed.
+
+    Transient: the list is the source of truth; a client that sees it, or
+    reconnects, reads ``GET /v1/sessions/{id}/open-items`` again.
+
+    :param type: Always ``"session.open_items.changed"``.
+    :param conversation_id: The session whose items changed.
+    :param labels: The labels written, e.g. ``["Q7", "R2"]``.
+    :param open_count: The session's open and answered items after the write.
+    """
+
+    type: Literal["session.open_items.changed"]
+    conversation_id: str
+    labels: list[str]
+    open_count: int
+
+
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
     """
     The session's changed-files list may have changed — refetch it.
@@ -6226,6 +6245,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
     | SessionJournalAppendedEvent
+    | SessionOpenItemsChangedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────
