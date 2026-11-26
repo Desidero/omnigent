@@ -374,6 +374,12 @@ export interface ServerInfo {
    */
   session_journal?: boolean;
   /**
+   * True when the server stores open items (``/v1/sessions/{id}/open-items`` and
+   * ``session.open_items.changed``), which the Open items panel reads; absent on
+   * older servers (off), where the panel reads the chat's item labels alone.
+   */
+  open_items?: boolean;
+  /**
    * True when the server keeps each user's saved workflows (``/v1/workflows``), which
    * Run a workflow offers; absent on older servers (off).
    */
@@ -799,6 +805,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_rewind: data.session_rewind === true,
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
+          open_items: data.open_items === true,
           workflows: data.workflows === true,
           workflow_sharing: data.workflow_sharing === true,
           session_title_instructions: data.session_title_instructions === true,

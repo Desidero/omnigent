@@ -86,6 +86,9 @@ you or the agent write them.
   there is missing until you scroll up far enough to load it, and a label
   whose first message is not loaded is described by its earliest loaded
   mention, so a pinned link shows only if that mention carries the link.
+  Where the server stores open items, the panel, its badge and the chips take
+  stored items from the server instead; see
+  [Open items in the web UI](open-items.md#in-the-web-ui).
 - **Latest reply:** the Open items list puts the items the agent's newest reply
   mentions first, tinted, and includes an item that reply just closed, struck
   through. Expanded, they sit under **In the latest reply**, ahead of the other
