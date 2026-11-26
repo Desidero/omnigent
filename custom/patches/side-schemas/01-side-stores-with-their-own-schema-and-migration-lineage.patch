@@ -1,0 +1,1359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 06:45:17 +0000
+Subject: [PATCH] feat(db): side stores with their own schema and migration
+ lineage
+
+A feature that is not in the main Alembic chain, such as one carried as
+a patch on top of Omnigent, had nowhere to keep tables: a revision of its
+own in that chain gives every later main revision a second head, and a
+database upgraded with it can no longer be upgraded by a build without it.
+
+omnigent/db/side_schemas.py lets such a feature register a side store: a
+name, its own metadata and a directory of revisions only it owns. Its
+tables are named <name>_<table> and, on PostgreSQL and CockroachDB, live
+in the schema omx_<name>; its revision is recorded in its own
+<name>_alembic_version. The first use after the main bootstrap creates
+the schema and upgrades the store to its head, serialised across servers
+by an advisory lock on PostgreSQL and the write lock on SQLite, retried
+on CockroachDB and MySQL. The store refuses tables that break the
+database guide (foreign keys, auto-increment, JSON, enums, unbounded
+columns) or could collide with main names.
+
+Deleting a conversation now tells each registered store which
+conversations went, in batches, after the main delete has committed; a
+store whose cleanup fails is logged and skipped. The main bootstrap,
+CockroachDB's table check and `omnigent debug db-upgrade` see nothing of
+a side store, so a build without one starts against a database that has
+one. Usage: docs/extending/side_schemas.md.
+
+Not proposed upstream yet: upstream adds tables through its own chain.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/extending/side_schemas.md                | 140 +++++
+ omnigent/db/side_migrations/env.py            |  26 +
+ omnigent/db/side_schemas.py                   | 424 +++++++++++++++
+ .../conversation_store/sqlalchemy_store.py    |   3 +
+ tests/db/side_store_toy/__init__.py           |  81 +++
+ tests/db/side_store_toy/__main__.py           |  10 +
+ .../revisions/toy0001_create_notes.py         |  39 ++
+ .../revisions/toy0002_add_pinned.py           |  27 +
+ tests/db/test_migration_side_schemas.py       | 490 ++++++++++++++++++
+ 9 files changed, 1240 insertions(+)
+ create mode 100644 docs/extending/side_schemas.md
+ create mode 100644 omnigent/db/side_migrations/env.py
+ create mode 100644 omnigent/db/side_schemas.py
+ create mode 100644 tests/db/side_store_toy/__init__.py
+ create mode 100644 tests/db/side_store_toy/__main__.py
+ create mode 100644 tests/db/side_store_toy/revisions/toy0001_create_notes.py
+ create mode 100644 tests/db/side_store_toy/revisions/toy0002_add_pinned.py
+ create mode 100644 tests/db/test_migration_side_schemas.py
+
+diff --git a/docs/extending/side_schemas.md b/docs/extending/side_schemas.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8880faf6bd22eb2303703219ff2ac10cb5b416f2
+--- /dev/null
++++ b/docs/extending/side_schemas.md
+@@ -0,0 +1,140 @@
++# Side stores
++
++A side store gives a feature its own database tables and its own Alembic
++lineage, apart from the main chain in `omnigent/db/migrations`. Use it for a
++feature that lives outside that chain, such as one carried as a patch on top
++of Omnigent: its revisions never become heads of the main lineage, so the main
++chain keeps upgrading as before, and a build without the feature still starts
++against a database that holds its tables.
++
++The helper is `omnigent/db/side_schemas.py`. A feature headed for the main
++schema should move its tables into the main chain instead.
++
++## Names
++
++| What | Name |
++| --- | --- |
++| Store | `<name>`: lowercase letters, digits and single underscores, starting with a letter, at most 24 characters, e.g. `notes` |
++| Schema (PostgreSQL, CockroachDB) | `omx_<name>` |
++| Tables | `<name>_<table>`, e.g. `notes_entries`, at most 63 characters |
++| Indexes | `ix_<name>_<...>` |
++| Version table | `<name>_alembic_version`, in the store's schema |
++
++SQLite and MySQL have no usable schemas, so there the tables sit beside the
++main ones and the name prefix keeps them apart. A store refuses to start if a
++main table already uses its prefix.
++
++## Writing one
++
++Tables follow [`DATABASE_BEST_PRACTICES.md`](../DATABASE_BEST_PRACTICES.md).
++The store checks the parts it can see before its first migration: tables on
++`side_metadata(<name>)` with the prefix, an explicit primary key, no foreign
++keys, no auto-increment, no native JSON or enum columns, and string and binary
++columns declared with a length of at most 16,383. Reference main rows by
++value, owner first (`workspace_id`, then the conversation id).
++
++```python
++class NotesBase(DeclarativeBase):
++    metadata = side_metadata("notes")
++
++class Note(NotesBase):
++    __tablename__ = "notes_entries"
++    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=current_workspace_id)
++    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
++    note_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
++    body: Mapped[str] = mapped_column(String(2000))
++
++NOTES = register_side_store(SideStore("notes", NotesBase.metadata, Path(__file__).parent / "revisions", delete_notes))
++sessions = NOTES.session_maker(db_uri, query_name_prefix="omnigent.note_store")
++```
++
++`session_maker` returns the same named managed sessions as
++`make_named_managed_session_maker`, so name every operation:
++`with sessions("add_note") as session: ...`, or
++`run_write_transaction(sessions, "add_note", ...)`.
++
++Revisions go in the store's own directory and pass `migration_schema()` as
++the schema of every `op.*` call, which is `omx_<name>` on PostgreSQL and
++CockroachDB and `None` elsewhere:
++
++```python
++revision = "notes0001"
++down_revision = None
++
++def upgrade() -> None:
++    op.create_table("notes_entries", ..., schema=migration_schema())
++```
++
++Use `op.batch_alter_table` for column changes, so they also run on SQLite.
++Start revision ids with the store's name; they only have to be unique within
++the store.
++
++## Migration
++
++The first `session_maker` call for a database, after the main bootstrap has
++run, creates the schema if it is missing and upgrades the store to its head;
++later calls in the process skip the check. Concurrent first uses from several
++servers are serialised: on PostgreSQL by a transaction-scoped advisory lock
++keyed on the schema name, with the whole upgrade in that transaction; on
++SQLite by its write lock. CockroachDB and MySQL have neither, so a start that
++loses the race checks again and retries, up to five times.
++
++`omnigent debug db-upgrade` upgrades only the main lineage.
++
++On PostgreSQL, creating the schema needs the `CREATE` privilege on the
++database. A role without it works once an operator has created `omx_<name>`
++and granted it `USAGE` and `CREATE` on that schema.
++
++## Deleted conversations
++
++`SideStore.on_conversations_deleted(session, conversation_ids)` is called after
++a conversation and its sub-sessions are deleted, with at most 100 ids per
++transaction. Delete a bounded number of rows and return a true value when rows
++remain; it is called again with the same ids. Register the store with
++`register_side_store` at import time of a module the server imports at
++startup, or it is not called.
++
++## What holds
++
++- The main lineage never sees a side store: the main `alembic_version`, the
++  main bootstrap, the CockroachDB bootstrap's table check (it reads only
++  `public`) and `omnigent debug db-upgrade` are unchanged by it.
++- A build without the store, or with an older copy of it, starts and upgrades
++  the main schema normally against a database that holds the store's tables.
++  The rows stay as they are, unread.
++- A store whose recorded revision this build doesn't know stops with an error
++  on first use; the rest of the server runs.
++- A cleanup that fails is logged and skipped: the conversation delete still
++  succeeds, and that store keeps its rows. If the main delete fails, no
++  cleanup runs and the side rows stay.
++
++## What does not
++
++- Rows can outlive their conversation: there are no foreign keys, a cleanup
++  can fail, and a build without the store deletes conversations without
++  telling it. Readers must ignore rows whose conversation is gone.
++- Session export (`omnigent session export`) and import carry transcript items
++  only, and forking a session copies only main rows; side rows go with none of
++  them. Nothing in Omnigent copies a database table by table.
++- On SQLite and MySQL, autogenerating a main revision against a database that
++  holds side tables proposes dropping them. Delete those operations from the
++  generated revision.
++- Downgrades never run on their own.
++- On CockroachDB every DDL statement commits by itself, so a revision that
++  fails half way is not rolled back. Write revisions that can run again, or
++  repair the schema by hand.
++- During a rolling upgrade, a server still on the older build keeps using the
++  store as it found it, so revisions must stay readable by the previous
++  build (add, don't rename or drop). If such a server restarts after the
++  upgrade, its copy of the store stops as above until it is upgraded.
++
++## Removing a side store
++
++Deploy a build without it first, then drop its tables. Nothing in the main
++schema refers to them.
++
++- PostgreSQL and CockroachDB: `DROP SCHEMA omx_<name> CASCADE;`
++- SQLite and MySQL: `DROP TABLE <name>_<table>;` for each of the store's
++  tables, then `DROP TABLE <name>_alembic_version;`
++
++A build that has the store again recreates it, empty, on first use.
+diff --git a/omnigent/db/side_migrations/env.py b/omnigent/db/side_migrations/env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc59984096a8e0d1b9918703bd80651abd471bea
+--- /dev/null
++++ b/omnigent/db/side_migrations/env.py
+@@ -0,0 +1,26 @@
++"""Alembic environment shared by every side store (``omnigent.db.side_schemas``).
++
++It holds no revisions. Each run is pointed at one side store's own revision
++directory and version table, on a connection whose transaction the caller owns.
++"""
++
++from __future__ import annotations
++
++from alembic import context
++
++from omnigent.db.side_schemas import SideStore
++
++store: SideStore = context.config.attributes["side_store"]
++connection = context.config.attributes["connection"]
++schema = store.schema_on(connection.dialect.name)
++
++context.configure(
++    connection=connection,
++    target_metadata=store.metadata,
++    version_table=store.version_table,
++    version_table_schema=schema,
++    render_as_batch=True,  # required for SQLite ALTER TABLE support
++    side_schema=schema,
++)
++with context.begin_transaction():
++    context.run_migrations()
+diff --git a/omnigent/db/side_schemas.py b/omnigent/db/side_schemas.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dae3a1733e1c39698e7409234b22f5eb57844016
+--- /dev/null
++++ b/omnigent/db/side_schemas.py
+@@ -0,0 +1,424 @@
++"""Side stores: feature tables with a migration lineage of their own.
++
++A side store keeps a feature's tables apart from the main Alembic lineage in
++``omnigent/db/migrations``. Its tables are named ``<name>_<table>``, its
++revisions live in a directory only it owns, and its version table is
++``<name>_alembic_version``. On PostgreSQL and CockroachDB all of that sits in
++the schema ``omx_<name>``; other backends have no usable schemas, so the name
++prefix alone keeps it apart. The main lineage never sees a side store, and a
++build without the feature starts against a database that holds one.
++
++Side tables carry no foreign keys. They reference main rows by value, and
++:func:`delete_conversation_rows` tells each store which conversations were
++deleted. Usage: ``docs/extending/side_schemas.md``.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import logging
++import re
++import time
++import weakref
++from collections.abc import Callable, Sequence
++from dataclasses import dataclass
++from itertools import batched
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++from sqlalchemy import JSON, Engine, Enum, LargeBinary, MetaData, String, inspect, text
++from sqlalchemy.engine import Connection
++from sqlalchemy.orm import Session
++from sqlalchemy.types import TypeEngine
++
++from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
++from omnigent.db.query_context import query_name_scope
++from omnigent.db.utils import (
++    NamedManagedSessionMaker,
++    _engine_lock,
++    get_or_create_engine,
++    is_cockroachdb,
++    is_postgresql_family,
++    make_named_managed_session_maker,
++    run_write_transaction,
++)
++
++if TYPE_CHECKING:
++    from alembic.config import Config
++
++_logger = logging.getLogger(__name__)
++
++SIDE_SCHEMA_PREFIX = "omx_"
++_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
++_MAX_NAME_LENGTH = 24
++# PostgreSQL truncates longer identifiers silently.
++_MAX_TABLE_NAME_LENGTH = 63
++# Column values stay below 16 KiB (docs/DATABASE_BEST_PRACTICES.md).
++_MAX_DECLARED_LENGTH = 16_383
++_ENV_DIRECTORY = Path(__file__).parent / "side_migrations"
++# Backends where a database lock serializes a store's migration.
++_LOCKING_DIALECTS = frozenset({"postgresql", "sqlite"})
++_UNLOCKED_MIGRATE_ATTEMPTS = 5
++_CLEANUP_BATCH_SIZE = 100
++# Stops a cleanup callable that keeps asking for another round.
++_MAX_CLEANUP_ROUNDS = 1000
++
++# Deletes one bounded batch of a store's rows for the given conversation ids.
++# A true return value asks for another transaction over the same ids.
++ConversationCleanup = Callable[[Session, Sequence[str]], object]
++
++
++def side_schema_name(name: str) -> str:
++    """Return the schema that holds side store *name* on PostgreSQL-family backends."""
++    return f"{SIDE_SCHEMA_PREFIX}{name}"
++
++
++def side_metadata(name: str) -> MetaData:
++    """Return the ``MetaData`` a side store's declarative base must use.
++
++    Its tables are declared in the side schema; on backends without schemas
++    the store's sessions and migrations map that schema to none.
++
++    :param name: The side store's name, e.g. ``"notes"``.
++    """
++    _validate_name(name)
++    return MetaData(schema=side_schema_name(name))
++
++
++@dataclass(frozen=True)
++class SideStore:
++    """One feature's tables, revisions and cleanup.
++
++    :ivar name: Lowercase identifier, e.g. ``"notes"``; prefixes every table.
++    :ivar metadata: The feature's own metadata, from :func:`side_metadata`.
++    :ivar migrations: Directory holding only this store's Alembic revisions.
++    :ivar on_conversations_deleted: Called with the ids of deleted
++        conversations, at most 100 per transaction; ``None`` for a store that
++        keeps nothing per conversation.
++    """
++
++    name: str
++    metadata: MetaData
++    migrations: Path
++    on_conversations_deleted: ConversationCleanup | None = None
++
++    def __post_init__(self) -> None:
++        _validate_name(self.name)
++
++    @property
++    def schema(self) -> str:
++        """The store's schema on PostgreSQL-family backends."""
++        return side_schema_name(self.name)
++
++    @property
++    def version_table(self) -> str:
++        """The table that records this store's Alembic revision."""
++        return f"{self.name}_alembic_version"
++
++    def schema_on(self, dialect_name: str) -> str | None:
++        """Return the schema the store's tables really live in, or ``None``."""
++        return self.schema if is_postgresql_family(dialect_name) else None
++
++    def session_maker(
++        self, db_uri: str, *, query_name_prefix: str, immediate: bool = False
++    ) -> NamedManagedSessionMaker:
++        """Return named managed sessions for this store, migrating it first.
++
++        The first call per database creates the schema if it is missing and
++        upgrades the store's lineage to head; later calls only build the maker.
++
++        :param db_uri: The main database URI, as given to the other stores.
++        :param query_name_prefix: Namespace of the feature's operation names,
++            e.g. ``"omnigent.note_store"``.
++        :param immediate: Forwarded to :func:`make_named_managed_session_maker`.
++        :raises RuntimeError: If the store's tables break the naming rules or
++            its migration fails.
++        """
++        return _session_maker(
++            self, get_or_create_engine(db_uri), query_name_prefix, immediate=immediate
++        )
++
++
++def _validate_name(name: str) -> None:
++    if len(name) > _MAX_NAME_LENGTH or _NAME_PATTERN.fullmatch(name) is None:
++        raise ValueError(
++            f"side store name {name!r} must be lowercase letters, digits and single "
++            f"underscores, start with a letter, and be at most {_MAX_NAME_LENGTH} characters"
++        )
++
++
++def _main_table_names() -> set[str]:
++    from omnigent.db.db_models import ConversationBase, OmnigentBase
++
++    return {
++        table.name
++        for metadata in (OmnigentBase.metadata, ConversationBase.metadata)
++        for table in metadata.tables.values()
++    } | {"alembic_version"}
++
++
++def _validate_tables(store: SideStore) -> None:
++    """Reject tables that could collide with, or bind to, the main schema."""
++    problems: list[str] = []
++    prefix = f"{store.name}_"
++    taken = sorted(name for name in _main_table_names() if name.startswith(prefix))
++    if taken:
++        problems.append(f"the main schema already uses the prefix {prefix!r} ({taken[0]})")
++    for table in store.metadata.tables.values():
++        if table.schema != store.schema:
++            problems.append(f"{table.name}: declare it on side_metadata({store.name!r})")
++        if not table.name.startswith(prefix) or table.name == store.version_table:
++            problems.append(f"{table.name}: name it {prefix}<table>")
++        if len(table.name) > _MAX_TABLE_NAME_LENGTH:
++            problems.append(f"{table.name}: longer than {_MAX_TABLE_NAME_LENGTH} characters")
++        if table.foreign_key_constraints:
++            problems.append(f"{table.name}: foreign keys are not allowed; reference ids by value")
++        if not table.primary_key.columns:
++            problems.append(f"{table.name}: needs an explicit primary key")
++        if table.autoincrement_column is not None:
++            problems.append(f"{table.name}: auto-increment keys are not allowed")
++        # SQLite index names share one namespace with the main schema's.
++        problems.extend(
++            f"{table.name}: name index {index.name!r} ix_{prefix}<...>"
++            for index in table.indexes
++            if not (index.name or "").startswith(f"ix_{prefix}")
++        )
++        problems.extend(
++            f"{table.name}.{column.name}: {problem}"
++            for column in table.columns
++            if (problem := _column_type_problem(column.type)) is not None
++        )
++    if problems:
++        raise RuntimeError(f"Side store {store.name!r} is not valid: " + "; ".join(problems))
++
++
++def _column_type_problem(column_type: TypeEngine[object]) -> str | None:
++    """Name a column type ``docs/DATABASE_BEST_PRACTICES.md`` rules out, if any."""
++    if isinstance(column_type, JSON):
++        return "native JSON columns are not allowed"
++    if isinstance(column_type, Enum):
++        return "native enums are not allowed; store integer codes"
++    if isinstance(column_type, (String, LargeBinary)) and (
++        column_type.length is None or column_type.length > _MAX_DECLARED_LENGTH
++    ):
++        return f"declare a length of at most {_MAX_DECLARED_LENGTH}"
++    return None
++
++
++# ── Registry ───────────────────────────────────────────
++
++_registry: dict[str, SideStore] = {}
++
++
++def register_side_store(store: SideStore) -> SideStore:
++    """Register *store* so conversation deletes reach its cleanup.
++
++    Call it once, at import time of the feature's store module.
++
++    :raises ValueError: If another store already uses the name.
++    """
++    existing = _registry.setdefault(store.name, store)
++    if existing is not store:
++        raise ValueError(f"side store {store.name!r} is already registered")
++    return store
++
++
++# ── Migration ──────────────────────────────────────────
++
++# The stores already at head, per engine.
++_migrated: weakref.WeakKeyDictionary[Engine, set[str]] = weakref.WeakKeyDictionary()
++
++
++def migration_schema() -> str | None:
++    """Return the schema to pass to ``op.*`` calls in a side store's revision.
++
++    ``omx_<name>`` on PostgreSQL-family backends and ``None`` elsewhere.
++    """
++    from alembic import op
++
++    return op.get_context().opts["side_schema"]
++
++
++def _alembic_config(store: SideStore) -> Config:
++    from alembic.config import Config
++
++    config = Config()
++    config.set_main_option("script_location", str(_ENV_DIRECTORY))
++    # One location per line, so a path may hold spaces, commas or colons.
++    config.set_main_option("path_separator", "newline")
++    config.set_main_option("version_locations", str(store.migrations))
++    return config
++
++
++def _current_revision(connection: Connection, store: SideStore) -> str | None:
++    from alembic.runtime.migration import MigrationContext
++
++    schema = store.schema_on(connection.dialect.name)
++    if not inspect(connection).has_table(store.version_table, schema=schema):
++        return None
++    context = MigrationContext.configure(
++        connection, opts={"version_table": store.version_table, "version_table_schema": schema}
++    )
++    return context.get_current_revision()
++
++
++def _lock_and_create_schema(connection: Connection, store: SideStore) -> None:
++    """Serialize concurrent migrations of *store* and make sure its schema exists."""
++    dialect = connection.dialect.name
++    if dialect == "sqlite":
++        # Take the write lock before reading the revision; other processes wait.
++        connection.exec_driver_sql("BEGIN IMMEDIATE")
++    elif is_cockroachdb(dialect):
++        # No advisory locks: a losing concurrent start fails and is retried.
++        version = _crdb_server_version(connection.engine)
++        _prepare_crdb_schema_transaction(connection, version)
++        connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{store.schema}"'))
++        connection.commit()
++        _prepare_crdb_schema_transaction(connection, version)
++    elif dialect == "postgresql":
++        digest = hashlib.sha256(store.schema.encode()).digest()
++        key = int.from_bytes(digest[:8], "big", signed=True)
++        connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
++        # CREATE SCHEMA needs CREATE on the database even with IF NOT EXISTS,
++        # so a schema an operator created beforehand is left alone.
++        if not inspect(connection).has_schema(store.schema):
++            connection.execute(text(f'CREATE SCHEMA "{store.schema}"'))
++
++
++def _upgrade_to_head(store: SideStore, engine: Engine) -> None:
++    from alembic import command
++    from alembic.script import ScriptDirectory
++    from alembic.util import CommandError
++
++    config = _alembic_config(store)
++    script = ScriptDirectory.from_config(config)
++    head = script.get_current_head()
++    if head is None:
++        raise RuntimeError(f"Side store {store.name!r} has no revisions in {store.migrations}.")
++
++    with engine.connect() as connection:
++        if _current_revision(connection, store) == head:
++            return
++    with engine.connect() as connection:
++        _lock_and_create_schema(connection, store)
++        current = _current_revision(connection, store)
++        if current is not None and current != head:
++            try:
++                script.get_revision(current)
++            except CommandError as exc:
++                raise RuntimeError(
++                    f"Side store {store.name!r} is at revision {current!r}, which this "
++                    f"build does not know (its latest is {head!r}). Upgrade Omnigent, "
++                    "or remove the side store as docs/extending/side_schemas.md describes."
++                ) from exc
++        if current != head:
++            _logger.info("Migrating side store %r from %r to %r", store.name, current, head)
++            config.attributes["connection"] = connection
++            config.attributes["side_store"] = store
++            command.upgrade(config, "head")
++        if connection.in_transaction():
++            connection.commit()
++
++
++def ensure_side_store(store: SideStore, engine: Engine) -> None:
++    """Bring *store* to head on *engine*'s database, once per engine.
++
++    Safe to call from several threads, and from several servers starting at
++    once: PostgreSQL serializes them on an advisory lock and SQLite on its
++    write lock, with the whole upgrade in one transaction. Other backends
++    have neither, so there a failed attempt is retried after checking whether
++    another server finished the work.
++
++    :raises RuntimeError: If the store is invalid, newer than this build, or
++        its migration fails.
++    """
++    if store.name in _migrated.get(engine, ()):
++        return
++    attempts = 1 if engine.dialect.name in _LOCKING_DIALECTS else _UNLOCKED_MIGRATE_ATTEMPTS
++    # Alembic's context is process-global, so side migrations take the lock
++    # the main migrations run under.
++    with _engine_lock:
++        if store.name in _migrated.get(engine, ()):
++            return
++        _validate_tables(store)
++        with query_name_scope(f"omnigent.side_store.{store.name}.migrate"):
++            for attempt in range(1, attempts + 1):
++                try:
++                    _upgrade_to_head(store, engine)
++                    break
++                except RuntimeError:
++                    raise
++                except Exception as exc:
++                    if attempt == attempts:
++                        raise RuntimeError(
++                            f"Side store {store.name!r} could not be migrated."
++                        ) from exc
++                    _logger.warning(
++                        "Side store %r migration attempt %d failed; retrying",
++                        store.name,
++                        attempt,
++                        exc_info=True,
++                    )
++                    time.sleep(0.5 * attempt)
++        _migrated.setdefault(engine, set()).add(store.name)
++
++
++def _session_maker(
++    store: SideStore, engine: Engine, query_name_prefix: str, *, immediate: bool
++) -> NamedManagedSessionMaker:
++    ensure_side_store(store, engine)
++    if store.schema_on(engine.dialect.name) is None:
++        # No schemas here: the declared side schema maps to the default one.
++        engine = engine.execution_options(schema_translate_map={store.schema: None})
++    return make_named_managed_session_maker(
++        engine, query_name_prefix=query_name_prefix, immediate=immediate
++    )
++
++
++# ── Conversation cleanup ───────────────────────────────
++
++
++def delete_conversation_rows(engine: Engine, conversation_ids: Sequence[str]) -> None:
++    """Tell every registered side store that these conversations are gone.
++
++    Runs after the main delete has committed and never raises: a store whose
++    cleanup fails is logged and skipped, and keeps its rows.
++
++    :param engine: The main database engine.
++    :param conversation_ids: Ids of the deleted conversation and its descendants.
++    """
++    for store in list(_registry.values()):
++        if store.on_conversations_deleted is None:
++            continue
++        try:
++            _run_cleanup(store, store.on_conversations_deleted, engine, conversation_ids)
++        except Exception:
++            _logger.exception(
++                "Side store %r cleanup failed; its rows for %d deleted conversation(s) remain",
++                store.name,
++                len(conversation_ids),
++            )
++
++
++def _run_cleanup(
++    store: SideStore,
++    cleanup: ConversationCleanup,
++    engine: Engine,
++    conversation_ids: Sequence[str],
++) -> None:
++    sessions = _session_maker(store, engine, f"omnigent.side_store.{store.name}", immediate=True)
++    for batch in batched(conversation_ids, _CLEANUP_BATCH_SIZE):
++        for _ in range(_MAX_CLEANUP_ROUNDS):
++            more = run_write_transaction(
++                sessions,
++                "delete_conversation_rows",
++                lambda session, ids=batch: cleanup(session, ids),
++            )
++            if not more:
++                break
++        else:
++            _logger.warning(
++                "Side store %r cleanup did not finish in %d rounds",
++                store.name,
++                _MAX_CLEANUP_ROUNDS,
++            )
+diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
+index 68564df61d24015629ba904433d4082ce1beb4ae..c07821e44f7de04fd2b4ecad2e102b9bcb97bc80 100644
+--- a/omnigent/stores/conversation_store/sqlalchemy_store.py
++++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
+@@ -69,6 +69,7 @@ from omnigent.db.enum_codecs import (
+     encode_session_live_status,
+ )
+ from omnigent.db.query_context import query_name_scope
++from omnigent.db.side_schemas import delete_conversation_rows as delete_side_store_rows
+ from omnigent.db.utils import (
+     _supports_fts5,
+     build_search_snippet,
+@@ -7844,6 +7845,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+                 lambda session, batch=batch_ids: delete_metadata(session, batch),
+             )
+         self._delete_session_journals(subtree_ids)
++        # Side stores hold rows by conversation id; their failures stay theirs.
++        delete_side_store_rows(self._engine, subtree_ids)
+ 
+         return True
+ 
+diff --git a/tests/db/side_store_toy/__init__.py b/tests/db/side_store_toy/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b25741d874f82e36a901b4ee2a782a801904bd3f
+--- /dev/null
++++ b/tests/db/side_store_toy/__init__.py
+@@ -0,0 +1,81 @@
++"""A toy side store for the side-schema tests: notes kept per conversation."""
++
++from __future__ import annotations
++
++import uuid
++from collections.abc import Sequence
++from pathlib import Path
++
++from sqlalchemy import BigInteger, SmallInteger, String, delete, select
++from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
++
++from omnigent.db.db_models import Uuid16, current_workspace_id
++from omnigent.db.side_schemas import ConversationCleanup, SideStore, side_metadata
++
++REVISIONS = Path(__file__).parent / "revisions"
++QUERY_NAME_PREFIX = "omnigent.toy_note_store"
++# Set in a process that should hold its migration open, so a second one overlaps it.
++MIGRATION_DELAY_ENV = "OMNIGENT_TEST_TOY_MIGRATION_DELAY"
++
++
++class ToyBase(DeclarativeBase):
++    metadata = side_metadata("toy")
++
++
++class ToyNote(ToyBase):
++    """A note on a conversation; ``pinned`` arrives with the second revision."""
++
++    __tablename__ = "toy_notes"
++
++    workspace_id: Mapped[int] = mapped_column(
++        BigInteger, primary_key=True, default=current_workspace_id
++    )
++    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
++    note_id: Mapped[str] = mapped_column(
++        Uuid16(), primary_key=True, default=lambda: uuid.uuid4().hex
++    )
++    body: Mapped[str] = mapped_column(String(256))
++    pinned: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
++
++
++def delete_notes(session: Session, conversation_ids: Sequence[str]) -> None:
++    session.execute(
++        delete(ToyNote).where(
++            ToyNote.workspace_id == current_workspace_id(),
++            ToyNote.conversation_id.in_(conversation_ids),
++        )
++    )
++
++
++def make_toy_store(
++    migrations: Path = REVISIONS, cleanup: ConversationCleanup | None = delete_notes
++) -> SideStore:
++    return SideStore(
++        name="toy",
++        metadata=ToyBase.metadata,
++        migrations=migrations,
++        on_conversations_deleted=cleanup,
++    )
++
++
++def add_note(db_uri: str, conversation_id: str, body: str) -> None:
++    sessions = make_toy_store().session_maker(db_uri, query_name_prefix=QUERY_NAME_PREFIX)
++    with sessions("add_note") as session:
++        session.add(ToyNote(conversation_id=conversation_id, body=body))
++
++
++def note_bodies(db_uri: str) -> list[str]:
++    sessions = make_toy_store().session_maker(db_uri, query_name_prefix=QUERY_NAME_PREFIX)
++    with sessions("list_notes") as session:
++        return sorted(session.scalars(select(ToyNote.body)))
++
++
++def first_use_in_new_process(db_uri: str, gate: Path, conversation_id: str, body: str) -> None:
++    """Stand in for a starting server: open the database, wait at the gate, use the store."""
++    from omnigent.db.utils import get_or_create_engine
++    from tests._helpers.polling import poll_until
++
++    get_or_create_engine(db_uri)
++    (gate / f"ready-{body}").touch()
++    poll_until(lambda: (gate / "go").exists(), timeout_s=60, interval_s=0.01)
++    add_note(db_uri, conversation_id, body)
+diff --git a/tests/db/side_store_toy/__main__.py b/tests/db/side_store_toy/__main__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e008b4940c551bf24cb845ab722725e772d8a59c
+--- /dev/null
++++ b/tests/db/side_store_toy/__main__.py
+@@ -0,0 +1,10 @@
++"""Run one stand-in server: ``python -m tests.db.side_store_toy <uri> <gate> <id> <body>``."""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++from tests.db.side_store_toy import first_use_in_new_process
++
++first_use_in_new_process(sys.argv[1], Path(sys.argv[2]), sys.argv[3], sys.argv[4])
+diff --git a/tests/db/side_store_toy/revisions/toy0001_create_notes.py b/tests/db/side_store_toy/revisions/toy0001_create_notes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9ae622a3657325455c81e931d119e09a7497e6d
+--- /dev/null
++++ b/tests/db/side_store_toy/revisions/toy0001_create_notes.py
+@@ -0,0 +1,39 @@
++"""create toy notes
++
++Revision ID: toy0001
++Revises:
++"""
++
++from __future__ import annotations
++
++import os
++import time
++
++import sqlalchemy as sa
++from alembic import op
++
++from omnigent.db.db_models import Uuid16
++from omnigent.db.side_schemas import migration_schema
++
++revision: str = "toy0001"
++down_revision: str | None = None
++branch_labels: str | None = None
++depends_on: str | None = None
++
++
++def upgrade() -> None:
++    op.create_table(
++        "toy_notes",
++        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
++        sa.Column("conversation_id", Uuid16(), nullable=False),
++        sa.Column("note_id", Uuid16(), nullable=False),
++        sa.Column("body", sa.String(length=256), nullable=False),
++        sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "note_id", name="pk_toy_notes"),
++        schema=migration_schema(),
++    )
++    # Lets the concurrency test hold the migration open (see MIGRATION_DELAY_ENV).
++    time.sleep(float(os.environ.get("OMNIGENT_TEST_TOY_MIGRATION_DELAY", "0")))
++
++
++def downgrade() -> None:
++    op.drop_table("toy_notes", schema=migration_schema())
+diff --git a/tests/db/side_store_toy/revisions/toy0002_add_pinned.py b/tests/db/side_store_toy/revisions/toy0002_add_pinned.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c37fef59ed5583ce3817c75443cb1c975d9b9c23
+--- /dev/null
++++ b/tests/db/side_store_toy/revisions/toy0002_add_pinned.py
+@@ -0,0 +1,27 @@
++"""add pinned to toy notes
++
++Revision ID: toy0002
++Revises: toy0001
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++from alembic import op
++
++from omnigent.db.side_schemas import migration_schema
++
++revision: str = "toy0002"
++down_revision: str | None = "toy0001"
++branch_labels: str | None = None
++depends_on: str | None = None
++
++
++def upgrade() -> None:
++    with op.batch_alter_table("toy_notes", schema=migration_schema()) as batch:
++        batch.add_column(sa.Column("pinned", sa.SmallInteger(), nullable=True))
++
++
++def downgrade() -> None:
++    with op.batch_alter_table("toy_notes", schema=migration_schema()) as batch:
++        batch.drop_column("pinned")
+diff --git a/tests/db/test_migration_side_schemas.py b/tests/db/test_migration_side_schemas.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..33dbe182931b0c146c035ed06b27125158491bf2
+--- /dev/null
++++ b/tests/db/test_migration_side_schemas.py
+@@ -0,0 +1,490 @@
++"""Side stores keep their tables and migration lineage apart from the main schema."""
++
++from __future__ import annotations
++
++import shutil
++import subprocess
++import sys
++import uuid
++from collections.abc import Callable, Iterator, Sequence
++from pathlib import Path
++
++import pytest
++import sqlalchemy as sa
++from sqlalchemy import Engine, inspect, text
++from sqlalchemy.orm import Session
++
++from omnigent.db import side_schemas
++from omnigent.db.db_models import ConversationBase, OmnigentBase, Uuid16
++from omnigent.db.side_schemas import SideStore, side_metadata
++from omnigent.db.utils import (
++    _create_engine,
++    _get_current_db_revision,
++    _get_head_db_revision,
++    _initialize_or_verify_schema,
++    _run_migrations,
++    get_or_create_engine,
++)
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from tests._helpers.live_server import terminate_process
++from tests._helpers.polling import poll_until
++from tests.db.side_store_toy import (
++    MIGRATION_DELAY_ENV,
++    REVISIONS,
++    add_note,
++    delete_notes,
++    make_toy_store,
++    note_bodies,
++)
++
++_SIDE_TABLES = {"toy_notes", "toy_alembic_version"}
++
++
++def _restart() -> None:
++    """Forget which stores this process migrated, as a restarted server has."""
++    side_schemas._migrated.clear()
++
++
++def _qualified(engine: Engine, store: SideStore, table: str) -> str:
++    schema = store.schema_on(engine.dialect.name)
++    return f'"{schema}".{table}' if schema else table
++
++
++def _remove(engine: Engine, store: SideStore) -> None:
++    """Remove a side store with the statements docs/extending/side_schemas.md gives."""
++    schema = store.schema_on(engine.dialect.name)
++    statements = (
++        [f'DROP SCHEMA IF EXISTS "{schema}" CASCADE']
++        if schema
++        else [f"DROP TABLE IF EXISTS {table}" for table in sorted(_SIDE_TABLES)]
++    )
++    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
++        for statement in statements:
++            connection.execute(text(statement))
++
++
++def _side_revision(engine: Engine, store: SideStore) -> str | None:
++    with engine.connect() as connection:
++        return side_schemas._current_revision(connection, store)
++
++
++def _start_build_without_side_stores(db_uri: str) -> None:
++    """Run the main bootstrap and upgrade exactly as a build without side stores does."""
++    engine = _create_engine(db_uri)
++    try:
++        _initialize_or_verify_schema(engine, db_uri)  # server start
++        _run_migrations(engine, db_uri)  # `omnigent debug db-upgrade`
++        assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
++    finally:
++        engine.dispose()
++
++
++@pytest.fixture()
++def toy(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[SideStore]:
++    """The toy store, registered for this test and removed from the database after it."""
++    store = make_toy_store()
++    monkeypatch.setattr(side_schemas, "_registry", {store.name: store})
++    yield store
++    _restart()
++    _remove(get_or_create_engine(db_uri), store)
++
++
++@pytest.fixture()
++def conversations(db_uri: str) -> SqlAlchemyConversationStore:
++    return SqlAlchemyConversationStore(db_uri)
++
++
++# ── Naming and lineage ─────────────────────────────────
++
++
++def test_first_use_creates_the_store_apart_from_the_main_schema(
++    db_uri: str, toy: SideStore
++) -> None:
++    add_note(db_uri, uuid.uuid4().hex, "first")
++    assert note_bodies(db_uri) == ["first"]
++
++    engine = get_or_create_engine(db_uri)
++    inspector = inspect(engine)
++    schema = toy.schema_on(engine.dialect.name)
++    if schema is None:
++        assert set(inspector.get_table_names()) >= _SIDE_TABLES
++    else:
++        assert schema == "omx_toy"
++        assert set(inspector.get_table_names(schema=schema)) == _SIDE_TABLES
++        assert not _SIDE_TABLES & set(inspector.get_table_names())
++    assert _side_revision(engine, toy) == "toy0002"
++    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
++
++
++def test_a_newer_build_upgrades_from_the_first_revision(
++    db_uri: str, toy: SideStore, tmp_path: Path
++) -> None:
++    first_only = tmp_path / "revisions"
++    first_only.mkdir()
++    shutil.copy(REVISIONS / "toy0001_create_notes.py", first_only)
++    engine = get_or_create_engine(db_uri)
++    side_schemas.ensure_side_store(make_toy_store(migrations=first_only), engine)
++    assert _side_revision(engine, toy) == "toy0001"
++    with engine.begin() as connection:
++        connection.execute(
++            text(
++                f"INSERT INTO {_qualified(engine, toy, 'toy_notes')} "
++                "(workspace_id, conversation_id, note_id, body) "
++                "VALUES (0, :conversation, :note, :body)"
++            ),
++            {"conversation": uuid.uuid4().bytes, "note": uuid.uuid4().bytes, "body": "kept"},
++        )
++
++    _restart()
++
++    assert note_bodies(db_uri) == ["kept"]
++    assert _side_revision(engine, toy) == "toy0002"
++
++
++def test_repeated_and_restarted_use_does_not_migrate_again(
++    db_uri: str, toy: SideStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    add_note(db_uri, uuid.uuid4().hex, "one")
++    upgrades: list[object] = []
++    monkeypatch.setattr("alembic.command.upgrade", lambda *args, **kwargs: upgrades.append(args))
++
++    add_note(db_uri, uuid.uuid4().hex, "two")
++    _restart()
++    add_note(db_uri, uuid.uuid4().hex, "three")
++
++    assert upgrades == []
++    assert note_bodies(db_uri) == ["one", "three", "two"]
++
++
++def test_two_servers_starting_together_migrate_once(
++    db_uri: str, toy: SideStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    # The first server holds its migration open, so the second starts inside it:
++    # it waits on the lock, or on CockroachDB fails, checks again and retries.
++    monkeypatch.setenv(MIGRATION_DELAY_ENV, "1")
++    bodies = ["server-0", "server-1"]
++    servers = [
++        subprocess.Popen(
++            [
++                sys.executable,
++                "-m",
++                "tests.db.side_store_toy",
++                db_uri,
++                tmp_path,
++                uuid.uuid4().hex,
++                body,
++            ],
++            cwd=Path(__file__).parents[2],
++        )
++        for body in bodies
++    ]
++    try:
++        poll_until(
++            lambda: (
++                all((tmp_path / f"ready-{body}").exists() for body in bodies)
++                or any(server.poll() is not None for server in servers)
++            ),
++            timeout_s=60,
++            interval_s=0.05,
++        )
++        (tmp_path / "go").touch()
++        assert [server.wait(timeout=120) for server in servers] == [0, 0]
++    finally:
++        for server in servers:
++            terminate_process(server)
++
++    assert note_bodies(db_uri) == bodies
++    assert _side_revision(get_or_create_engine(db_uri), toy) == "toy0002"
++
++
++def test_a_failed_upgrade_leaves_nothing_behind_and_can_be_retried(
++    db_uri: str, toy: SideStore, tmp_path: Path
++) -> None:
++    engine = get_or_create_engine(db_uri)
++    if engine.dialect.name not in ("postgresql", "sqlite"):
++        pytest.skip("this backend commits each DDL statement on its own")
++    broken = tmp_path / "revisions"
++    shutil.copytree(REVISIONS, broken)
++    (broken / "toy0003_fails.py").write_text(
++        "revision = 'toy0003'\ndown_revision = 'toy0002'\n\n\n"
++        "def upgrade() -> None:\n    raise OSError('revision failed')\n"
++    )
++
++    with pytest.raises(RuntimeError, match="could not be migrated"):
++        side_schemas.ensure_side_store(make_toy_store(migrations=broken), engine)
++
++    assert _side_revision(engine, toy) is None
++    assert "toy_notes" not in inspect(engine).get_table_names(
++        schema=toy.schema_on(engine.dialect.name)
++    )
++    add_note(db_uri, uuid.uuid4().hex, "after the fix")
++    assert note_bodies(db_uri) == ["after the fix"]
++
++
++# ── The main lineage never sees a side store ───────────
++
++
++def test_a_build_without_side_stores_starts_and_upgrades(
++    db_uri: str, toy: SideStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    add_note(db_uri, uuid.uuid4().hex, "kept")
++    monkeypatch.setattr(side_schemas, "_registry", {})
++
++    _start_build_without_side_stores(db_uri)
++
++    assert note_bodies(db_uri) == ["kept"]
++
++
++def test_a_side_revision_from_a_newer_build_stops_only_that_store(
++    db_uri: str, toy: SideStore
++) -> None:
++    add_note(db_uri, uuid.uuid4().hex, "kept")
++    engine = get_or_create_engine(db_uri)
++    with engine.begin() as connection:
++        connection.execute(
++            text(
++                f"UPDATE {_qualified(engine, toy, 'toy_alembic_version')} "
++                "SET version_num = 'toy9999'"
++            )
++        )
++    _restart()
++
++    _start_build_without_side_stores(db_uri)
++    with pytest.raises(RuntimeError, match="'toy9999', which this build does not know"):
++        note_bodies(db_uri)
++
++
++def test_a_removed_side_store_leaves_the_main_schema_and_can_return(
++    db_uri: str, toy: SideStore
++) -> None:
++    add_note(db_uri, uuid.uuid4().hex, "gone")
++    _remove(get_or_create_engine(db_uri), toy)
++    _restart()
++
++    _start_build_without_side_stores(db_uri)
++    assert note_bodies(db_uri) == []
++
++
++def _proposed_table_changes(engine: Engine) -> set[tuple[str, str]]:
++    """The tables autogenerate would add to or drop from the main lineage."""
++    from alembic.autogenerate import compare_metadata
++    from alembic.runtime.migration import MigrationContext
++
++    with engine.connect() as connection:
++        differences = compare_metadata(
++            MigrationContext.configure(connection),
++            [OmnigentBase.metadata, ConversationBase.metadata],
++        )
++    return {
++        (difference[0], difference[1].name)
++        for difference in differences
++        if isinstance(difference, tuple) and difference[0] in ("add_table", "remove_table")
++    }
++
++
++def test_main_autogenerate_sees_side_tables_only_where_schemas_are_missing(
++    db_uri: str, toy: SideStore
++) -> None:
++    engine = get_or_create_engine(db_uri)
++    before = _proposed_table_changes(engine)
++    add_note(db_uri, uuid.uuid4().hex, "first")
++
++    proposed = _proposed_table_changes(engine) - before
++
++    if toy.schema_on(engine.dialect.name) is None:
++        # Nothing hides the tables here: leave these out of an autogenerated revision.
++        assert proposed == {("remove_table", table) for table in _SIDE_TABLES}
++    else:
++        assert proposed == set()
++
++
++# ── Rules a store must follow ──────────────────────────
++
++
++@pytest.mark.parametrize("name", ["Toy", "toy-notes", "toy__notes", "_toy", "9toy", "t" * 25])
++def test_names_that_cannot_prefix_tables_are_refused(name: str) -> None:
++    with pytest.raises(ValueError, match="side store name"):
++        side_metadata(name)
++
++
++@pytest.mark.parametrize(
++    ("define", "problem"),
++    [
++        (
++            lambda m: sa.Table("notes", m, sa.Column("id", Uuid16(), primary_key=True)),
++            "bad_<table>",
++        ),
++        (
++            lambda m: sa.Table(
++                "bad_notes", m, sa.Column("id", Uuid16(), primary_key=True), schema=sa.BLANK_SCHEMA
++            ),
++            r"side_metadata\('bad'\)",
++        ),
++        (
++            lambda m: sa.Table(
++                "bad_notes",
++                m,
++                sa.Column("id", Uuid16(), primary_key=True),
++                sa.Column("conversation_id", Uuid16(), sa.ForeignKey("conversations.id")),
++            ),
++            "foreign keys are not allowed",
++        ),
++        (
++            lambda m: sa.Table("bad_notes", m, sa.Column("body", sa.String(8))),
++            "explicit primary key",
++        ),
++        (
++            lambda m: sa.Table("bad_notes", m, sa.Column("id", sa.Integer, primary_key=True)),
++            "auto-increment keys are not allowed",
++        ),
++        (
++            lambda m: sa.Table(
++                "bad_notes",
++                m,
++                sa.Column("id", Uuid16(), primary_key=True),
++                sa.Column("data", sa.JSON),
++            ),
++            "native JSON columns are not allowed",
++        ),
++        (
++            lambda m: sa.Table(
++                "bad_notes",
++                m,
++                sa.Column("id", Uuid16(), primary_key=True),
++                sa.Column("kind", sa.Enum("a", "b", name="bad_kind")),
++            ),
++            "native enums are not allowed",
++        ),
++        (
++            lambda m: sa.Table(
++                "bad_notes",
++                m,
++                sa.Column("id", Uuid16(), primary_key=True),
++                sa.Column("body", sa.Text),
++            ),
++            "declare a length of at most 16383",
++        ),
++        (
++            lambda m: sa.Table(
++                "bad_notes",
++                m,
++                sa.Column("id", Uuid16(), primary_key=True),
++                sa.Column("body", sa.String(64)),
++                sa.Index("ix_notes_body", "body"),
++            ),
++            "name index 'ix_notes_body' ix_bad_",
++        ),
++    ],
++)
++def test_tables_that_break_the_rules_are_refused(
++    define: Callable[[sa.MetaData], object], problem: str
++) -> None:
++    metadata = side_metadata("bad")
++    define(metadata)
++    with pytest.raises(RuntimeError, match=problem):
++        side_schemas._validate_tables(SideStore("bad", metadata, REVISIONS))
++
++
++def test_a_name_the_main_schema_already_prefixes_is_refused() -> None:
++    store = SideStore("conversation", side_metadata("conversation"), REVISIONS)
++    with pytest.raises(RuntimeError, match="already uses the prefix 'conversation_'"):
++        side_schemas._validate_tables(store)
++
++
++def test_a_name_is_registered_once(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(side_schemas, "_registry", {})
++    store = make_toy_store()
++    assert side_schemas.register_side_store(store) is store
++    assert side_schemas.register_side_store(store) is store
++    with pytest.raises(ValueError, match="already registered"):
++        side_schemas.register_side_store(make_toy_store(cleanup=None))
++
++
++# ── Cleanup when a conversation is deleted ─────────────
++
++
++@pytest.mark.asyncio
++async def test_deleting_a_conversation_cleans_its_subtree_in_batches(
++    db_uri: str,
++    toy: SideStore,
++    conversations: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    parent = conversations.create_conversation()
++    child = conversations.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
++    other = conversations.create_conversation()
++    for conversation, body in ((parent, "parent"), (child, "child"), (other, "other")):
++        add_note(db_uri, conversation.id, body)
++    batches: list[tuple[str, ...]] = []
++    more_rows = iter([True, False, False])
++
++    def cleanup(session: Session, conversation_ids: Sequence[str]) -> bool:
++        batches.append(tuple(conversation_ids))
++        delete_notes(session, conversation_ids)
++        return next(more_rows)
++
++    monkeypatch.setattr(side_schemas, "_registry", {"toy": make_toy_store(cleanup=cleanup)})
++    monkeypatch.setattr(side_schemas, "_CLEANUP_BATCH_SIZE", 1)
++
++    assert await conversations.delete_conversation(parent.id) is True
++
++    assert note_bodies(db_uri) == ["other"]
++    # One id per transaction, and the first batch again because it reported more rows.
++    assert len(batches) == 3
++    assert batches[0] == batches[1]
++    assert {batch[0] for batch in batches} == {parent.id, child.id}
++
++
++@pytest.mark.asyncio
++async def test_a_failing_side_store_does_not_fail_the_delete(
++    db_uri: str,
++    toy: SideStore,
++    conversations: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    first = conversations.create_conversation()
++    second = conversations.create_conversation()
++    add_note(db_uri, first.id, "first")
++    add_note(db_uri, second.id, "second")
++
++    def refuse(session: Session, conversation_ids: Sequence[str]) -> None:
++        raise OSError("side store is broken")
++
++    # A store whose migration fails is skipped and the next store still runs.
++    without_revisions = SideStore("empty", side_metadata("empty"), tmp_path, refuse)
++    monkeypatch.setattr(side_schemas, "_registry", {"empty": without_revisions, "toy": toy})
++    assert await conversations.delete_conversation(first.id) is True
++    assert note_bodies(db_uri) == ["second"]
++    assert "Side store 'empty' cleanup failed" in caplog.text
++
++    # A store whose cleanup raises keeps its rows; the conversation is gone all the same.
++    monkeypatch.setattr(side_schemas, "_registry", {"toy": make_toy_store(cleanup=refuse)})
++    assert await conversations.delete_conversation(second.id) is True
++    assert conversations.get_conversation(second.id) is None
++    assert note_bodies(db_uri) == ["second"]
++    assert "Side store 'toy' cleanup failed" in caplog.text
++
++
++@pytest.mark.asyncio
++async def test_a_failed_delete_keeps_side_rows(
++    db_uri: str,
++    toy: SideStore,
++    conversations: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    conversation = conversations.create_conversation()
++    add_note(db_uri, conversation.id, "kept")
++
++    def fail(*args: object) -> None:
++        raise OSError("main delete failed")
++
++    monkeypatch.setattr(
++        "omnigent.stores.conversation_store.sqlalchemy_store.delete_fts_by_conversation_ids", fail
++    )
++    with pytest.raises(OSError, match="main delete failed"):
++        await conversations.delete_conversation(conversation.id)
++
++    assert conversations.get_conversation(conversation.id) is not None
++    assert note_bodies(db_uri) == ["kept"]
