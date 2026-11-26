@@ -1,0 +1,706 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 21:48:23 +0000
+Subject: [PATCH] feat(harness): hand framework text notices to codex-native
+ and pi-native
+
+Framework notice blocks are how the server and runner give the model
+context with a message that must never become the user's text; today they
+only carry the downscaled-image notice. A feature that wants to tell the
+agent something at the start of its next turn (without starting one) has
+no channel for plain text, and codex-native and pi-native read only the
+image form.
+
+- A notice block may now carry framework-owned "text"
+  (framework_text_notice_block); framework_notices returns it beside the
+  upload notices, so Claude SDK (UserPromptSubmit hook context), the
+  OpenAI Agents SDK and other harnesses that expand notices (system
+  messages), and claude-native (its framework-context prompt hook) get it
+  unchanged.
+- codex-native stages a message's text notices in the bridge directory,
+  and a new framework-context UserPromptSubmit hook hands them to Codex
+  as additionalContext, once. The shell answers alone while no notice
+  waits, so a prompt pays no interpreter start; the subcommand lives in
+  the policy-hook module, so the existing trust handshake covers it.
+- pi-native passes them on the inbox payload; the extension adds them as
+  a hidden custom message from before_agent_start, once.
+
+Not proposed upstream yet.
+
+Docs: none (internal channel; the open items docs describe the note that uses it)
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ omnigent/harnesses/codex_native/app_server.py |  40 ++++++-
+ omnigent/harnesses/codex_native/bridge.py     |   3 +
+ omnigent/harnesses/codex_native/hook.py       |  29 +++++
+ omnigent/harnesses/pi_native/bridge.py        |   9 +-
+ omnigent/inner/codex_native_executor.py       |  13 +++
+ omnigent/inner/native_attachments.py          |  23 +++-
+ omnigent/inner/pi_native_executor.py          |  18 ++-
+ .../pi_native/omnigent_pi_native_extension.js |  26 +++++
+ .../omnigent_pi_native_extension.test.js      |  39 +++++++
+ .../app_server/test_policy_hooks.py           |   3 +-
+ tests/inner/test_framework_text_notices.py    | 108 ++++++++++++++++++
+ tests/inner/test_pi_native_executor.py        |  14 ++-
+ tests/inner/test_sdk_resize_notices.py        |   9 +-
+ 13 files changed, 319 insertions(+), 15 deletions(-)
+ create mode 100644 tests/inner/test_framework_text_notices.py
+
+diff --git a/omnigent/harnesses/codex_native/app_server.py b/omnigent/harnesses/codex_native/app_server.py
+index 4da094951358adf63f6be6f98d08da619f08bfee..c4ea7ba701a02960fb969444bb1a05c378dd279a 100644
+--- a/omnigent/harnesses/codex_native/app_server.py
++++ b/omnigent/harnesses/codex_native/app_server.py
+@@ -49,6 +49,7 @@ from omnigent.debug_logging import debug_event
+ from omnigent.errors import ErrorCode, OmnigentError
+ from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
+ from omnigent.harnesses.codex_native.bridge import (
++    CODEX_FRAMEWORK_CONTEXT_FILE,
+     clear_certificate_failure,
+     mirror_applied_codex_settings,
+     read_codex_config_model,
+@@ -3460,7 +3461,8 @@ def _codex_policy_hooks_settings(
+     the server-level ``_evaluate_input_policy`` skips native message
+     events). ``mcp__*`` tools are filtered out inside the hook itself,
+     not by a matcher, so the relay path remains the single MCP
+-    enforcement point.
++    enforcement point. ``UserPromptSubmit`` also hands Codex the
++    framework notices waiting for the prompt.
+ 
+     :param bridge_dir: Native Codex bridge directory.
+     :param python_executable: Python executable for the hook command.
+@@ -3478,7 +3480,10 @@ def _codex_policy_hooks_settings(
+     from omnigent.native.tool_observer_hook import hook_settings
+ 
+     observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
+-    prompt_submit: list[_JsonObject] = [hook]
++    prompt_submit: list[_JsonObject] = [
++        hook,
++        _codex_framework_context_hook(bridge_dir, python_executable),
++    ]
+     if turn_routing:
+         prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
+     return {
+@@ -3490,6 +3495,37 @@ def _codex_policy_hooks_settings(
+     }
+ 
+ 
++def _codex_framework_context_hook(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
++    """
++    Build the ``UserPromptSubmit`` entry that hands Codex this prompt's framework notices.
++
++    The shell answers alone while no notice is waiting, so a prompt pays no
++    interpreter start for it; as for the routing hook, the subcommand lives in
++    :data:`_POLICY_HOOK_MODULE` so the trust handshake covers it.
++
++    :param bridge_dir: Native Codex bridge directory holding the notices file.
++    :param python_executable: Python executable for the hook command.
++    :returns: One ``hooks.json`` command-hook entry.
++    """
++    context_file = shlex.quote(str(bridge_dir / CODEX_FRAMEWORK_CONTEXT_FILE))
++    command = shlex.join(
++        [
++            python_executable or sys.executable,
++            "-I",
++            "-m",
++            _POLICY_HOOK_MODULE,
++            "framework-context",
++            "--bridge-dir",
++            str(bridge_dir),
++        ]
++    )
++    return {
++        "type": "command",
++        "command": f"if [ ! -e {context_file} ]; then cat >/dev/null; exit 0; fi; {command}",
++        "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
++    }
++
++
+ def _codex_route_turn_hook(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
+     """
+     Build the ``UserPromptSubmit`` entry for first-message model routing.
+diff --git a/omnigent/harnesses/codex_native/bridge.py b/omnigent/harnesses/codex_native/bridge.py
+index ddbeab4678e4cc6c28cbf325d814676871f214f3..f7dc2a5ed3d8eb4dad1a75a87b88fc3b2b6e5657 100644
+--- a/omnigent/harnesses/codex_native/bridge.py
++++ b/omnigent/harnesses/codex_native/bridge.py
+@@ -61,6 +61,9 @@ _CODEX_DISABLED_COMPOSER_TEXT = frozenset(
+ 
+ _STATE_FILE = "state.json"
+ _STATE_LOCK_FILE = "state.lock"
++# Framework notices for the next prompt; the ``framework-context`` hook hands them
++# to Codex as UserPromptSubmit context and removes the file.
++CODEX_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+ _STARTUP_ERROR_FILE = "startup_error.json"
+ _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
+ _EGRESS_CERTIFICATE_FILE = "egress_certificate_failure.json"
+diff --git a/omnigent/harnesses/codex_native/hook.py b/omnigent/harnesses/codex_native/hook.py
+index 8274fbf76baedd274edc1a6c2dd8433b882c9752..1368b8e2d20d327af8b8286d5ad90676b4952cd3 100644
+--- a/omnigent/harnesses/codex_native/hook.py
++++ b/omnigent/harnesses/codex_native/hook.py
+@@ -20,6 +20,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ from omnigent.harnesses.codex_native.bridge import (
++    CODEX_FRAMEWORK_CONTEXT_FILE,
+     read_bridge_state,
+     read_codex_config_model,
+     read_policy_hook_config,
+@@ -66,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
+         return _main_evaluate_policy(raw_argv[1:])
+     if raw_argv and raw_argv[0] == "route-turn":
+         return _main_route_turn(raw_argv[1:])
++    if raw_argv and raw_argv[0] == "framework-context":
++        return _main_framework_context(raw_argv[1:])
+     print(
+         f"omnigent codex hook: unknown subcommand {raw_argv[:1]!r}",
+         file=sys.stderr,
+@@ -73,6 +76,32 @@ def main(argv: list[str] | None = None) -> int:
+     return 0
+ 
+ 
++def _main_framework_context(argv: list[str]) -> int:
++    """
++    Hand Codex the framework notices waiting for this prompt, once.
++
++    Registered on ``UserPromptSubmit``; the executor writes the notices to
++    :data:`CODEX_FRAMEWORK_CONTEXT_FILE` before it delivers the prompt.
++
++    :param argv: CLI argv after the subcommand, e.g. ``["--bridge-dir", "/tmp/x"]``.
++    :returns: Process exit code. Always ``0``.
++    """
++    args = _parse_evaluate_policy_args(argv)
++    sys.stdin.read()
++    path = Path(args.bridge_dir) / CODEX_FRAMEWORK_CONTEXT_FILE
++    try:
++        text = path.read_text(encoding="utf-8")
++        path.unlink(missing_ok=True)
++    except OSError:
++        return 0
++    if text:
++        output = {
++            "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}
++        }
++        sys.stdout.write(json.dumps(output))
++    return 0
++
++
+ def _main_evaluate_policy(argv: list[str]) -> int:
+     """
+     Evaluate a Codex ``PreToolUse`` / ``PostToolUse`` /
+diff --git a/omnigent/harnesses/pi_native/bridge.py b/omnigent/harnesses/pi_native/bridge.py
+index 5cb9fb240e3140721abc5f17faa0928e65ee7941..3dce6eaf40e035f1eae196c24c4ef85c90c202c1 100644
+--- a/omnigent/harnesses/pi_native/bridge.py
++++ b/omnigent/harnesses/pi_native/bridge.py
+@@ -215,7 +215,9 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+     return bool(config) and (Path(config).parent / _INPUT_READY_FILE).is_file()
+ 
+ 
+-def enqueue_user_message(bridge_dir: Path, content: str) -> str:
++def enqueue_user_message(
++    bridge_dir: Path, content: str, *, framework_context: str | None = None
++) -> str:
+     """
+     Queue a web-originated user message for the resident Pi extension.
+ 
+@@ -225,6 +227,9 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
+ 
+     :param bridge_dir: Native Pi bridge directory.
+     :param content: Plain text user message.
++    :param framework_context: Framework notices for the model with this
++        message; the extension adds them as hidden context when the agent
++        starts, never as the user's text.
+     :returns: Opaque message id.
+     """
+     message_id = f"msg_{uuid.uuid4().hex}"
+@@ -234,6 +239,8 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
+         "content": content,
+         "created_at": time.time(),
+     }
++    if framework_context:
++        payload["framework_context"] = framework_context
+     _enqueue_payload(bridge_dir, message_id, payload)
+     return message_id
+ 
+diff --git a/omnigent/inner/codex_native_executor.py b/omnigent/inner/codex_native_executor.py
+index f65c760a5b6fce854af66f2ec5122067f8ff836d..b14667136e5a272d3de2f46e59887d4939d2ab3f 100644
+--- a/omnigent/inner/codex_native_executor.py
++++ b/omnigent/inner/codex_native_executor.py
+@@ -37,6 +37,7 @@ from omnigent.harnesses.codex_native.app_server import (
+ )
+ from omnigent.harnesses.codex_native.bridge import (
+     CODEX_APP_SERVER_STOPPED,
++    CODEX_FRAMEWORK_CONTEXT_FILE,
+     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
+     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
+@@ -89,6 +90,7 @@ from omnigent.inner.native_attachments import (
+     FRAMEWORK_NOTICE_BLOCK_TYPE,
+     attachment_reference_line,
+     codex_resize_metadata_path,
++    framework_text_notices,
+     materialize_attachment,
+     parse_data_uri,
+     unresolved_attachment_marker,
+@@ -1110,6 +1112,7 @@ class CodexNativeExecutor(Executor):
+         input_items = _content_to_input_items(content, self._bridge_dir)
+         if not input_items:
+             return False
++        _stage_framework_context(self._bridge_dir, content)
+         # Serialized against run_turn so the read-decide-RPC-write below
+         # is atomic with respect to the initiating-message injection.
+         async with self._inject_lock:
+@@ -1309,6 +1312,7 @@ class CodexNativeExecutor(Executor):
+         if not input_items:
+             yield ExecutorError(message="Codex native turn had no user input to send")
+             return
++        _stage_framework_context(self._bridge_dir, latest_user_content)
+         # Wait for the bridge to boot OUTSIDE the injection lock. Poll quickly
+         # during the expected startup window, then back off. Once state exists,
+         # the decision/RPC/write below runs under the lock — re-reading state
+@@ -1680,6 +1684,15 @@ def _latest_user_content(messages: list[Message]) -> object:
+     return None
+ 
+ 
++def _stage_framework_context(bridge_dir: Path, content: object) -> None:
++    """Leave a prompt's framework notices for Codex's ``framework-context`` prompt hook."""
++    notices = framework_text_notices(content)
++    if notices:
++        (bridge_dir / CODEX_FRAMEWORK_CONTEXT_FILE).write_text(
++            "\n\n".join(notices), encoding="utf-8"
++        )
++
++
+ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
+     """
+     Normalize executor content into Codex app-server input items.
+diff --git a/omnigent/inner/native_attachments.py b/omnigent/inner/native_attachments.py
+index b7484b66eb29cbe0f05fded1c4ff0e2aeebbdaba..937691d82307a681a7eb8d0bf40cb596db15532f 100644
+--- a/omnigent/inner/native_attachments.py
++++ b/omnigent/inner/native_attachments.py
+@@ -601,6 +601,11 @@ def framework_notice_block(source_metadata: Mapping[str, object]) -> dict[str, o
+     return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "source_metadata": dict(source_metadata)}
+ 
+ 
++def framework_text_notice_block(text: str) -> dict[str, object]:
++    """Build transient model context holding framework-owned text, e.g. a note for this turn."""
++    return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "text": text}
++
++
+ def framework_notices(content: object) -> list[str]:
+     """Extract transient framework notices from structured content."""
+     if not isinstance(content, list):
+@@ -609,12 +614,28 @@ def framework_notices(content: object) -> list[str]:
+     for block in content:
+         if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE:
+             continue
+-        text = resize_notice(block.get("source_metadata"))
++        text = block.get("text")
++        if not isinstance(text, str):
++            text = resize_notice(block.get("source_metadata"))
+         if text:
+             notices.append(text)
+     return notices
+ 
+ 
++def framework_text_notices(content: object) -> list[str]:
++    """The framework-owned text notices in structured content, without upload notices."""
++    if not isinstance(content, list):
++        return []
++    return [
++        block["text"]
++        for block in content
++        if isinstance(block, dict)
++        and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
++        and isinstance(block.get("text"), str)
++        and block["text"]
++    ]
++
++
+ def expand_framework_notices(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     """Render structured notices as system context at a provider boundary."""
+     result: list[dict[str, Any]] = []
+diff --git a/omnigent/inner/pi_native_executor.py b/omnigent/inner/pi_native_executor.py
+index f3cc42241b023202a0047ed551559f0ae4250f63..3ee698355f8ce17fe8064bc007b300e9d9bfce77 100644
+--- a/omnigent/inner/pi_native_executor.py
++++ b/omnigent/inner/pi_native_executor.py
+@@ -24,7 +24,7 @@ from omnigent.inner.executor import (
+     ToolSpec,
+     TurnComplete,
+ )
+-from omnigent.inner.native_attachments import attachment_reference_line
++from omnigent.inner.native_attachments import attachment_reference_line, framework_text_notices
+ 
+ 
+ class PiNativeExecutor(Executor):
+@@ -74,9 +74,10 @@ class PiNativeExecutor(Executor):
+         text = _content_to_text(content, self._bridge_dir)
+         if not text:
+             return False
++        notices = "\n\n".join(framework_text_notices(content)) or None
+         async with self._enqueue_lock:
+             await asyncio.to_thread(self._refresh_auth_headers)
+-            enqueue_user_message(self._bridge_dir, text)
++            enqueue_user_message(self._bridge_dir, text, framework_context=notices)
+         return True
+ 
+     async def run_turn(
+@@ -108,12 +109,15 @@ class PiNativeExecutor(Executor):
+         if not text:
+             yield ExecutorError(message="Pi native turn had no user text to send")
+             return
++        notices = framework_text_notices(_latest_user_content(messages))
+         model = config.model if config is not None else None
+         async with self._enqueue_lock:
+             await asyncio.to_thread(self._refresh_auth_headers)
+             if model:
+                 enqueue_model_change(self._bridge_dir, model)
+-            enqueue_user_message(self._bridge_dir, text)
++            enqueue_user_message(
++                self._bridge_dir, text, framework_context="\n\n".join(notices) or None
++            )
+         yield TurnComplete(response=None)
+ 
+     def _refresh_auth_headers(self) -> None:
+@@ -180,6 +184,14 @@ def _request_session_id_from_env() -> str | None:
+     return raw or None
+ 
+ 
++def _latest_user_content(messages: list[Message]) -> object:
++    """The latest user message's content, or ``None``."""
++    for message in reversed(messages):
++        if message.get("role") == "user":
++            return message.get("content")
++    return None
++
++
+ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
+     """
+     Return the latest user text from executor messages.
+diff --git a/omnigent/resources/pi_native/omnigent_pi_native_extension.js b/omnigent/resources/pi_native/omnigent_pi_native_extension.js
+index de36547c396b9166394223cd288485b39450585e..c491e6e95297e3ad6096baa9994b75ed08ac5ebd 100644
+--- a/omnigent/resources/pi_native/omnigent_pi_native_extension.js
++++ b/omnigent/resources/pi_native/omnigent_pi_native_extension.js
+@@ -1493,6 +1493,16 @@ function markInputReady(config) {
+   }
+ }
+ 
++// Framework notices that came with web messages, for the model as hidden
++// context when Pi next starts the agent (before_agent_start), never as the
++// user's text. Omnigent names this message's customType.
++const FRAMEWORK_CONTEXT_TYPE = "omnigent-framework-context";
++const pendingFrameworkContext = [];
++
++function takeFrameworkContext() {
++  return pendingFrameworkContext.splice(0).join("\n\n");
++}
++
+ function startInboxPoller(
+   pi,
+   config,
+@@ -1568,9 +1578,17 @@ function startInboxPoller(
+           typeof isTurnActive === "function" && isTurnActive()
+             ? "steer"
+             : "followUp";
++        const frameworkContext =
++          typeof payload.framework_context === "string" ? payload.framework_context : "";
++        if (frameworkContext) pendingFrameworkContext.push(frameworkContext);
+         try {
+           pi.sendUserMessage(payload.content, { deliverAs });
+         } catch (_err) {
++          // A retry pushes it again.
++          if (frameworkContext) {
++            const at = pendingFrameworkContext.lastIndexOf(frameworkContext);
++            if (at !== -1) pendingFrameworkContext.splice(at, 1);
++          }
+           // Leave the file to retry next tick, capped by attempt count.
+           const key = id ?? fullPath;
+           const attempts = (deliverAttempts.get(key) ?? 0) + 1;
+@@ -2489,6 +2507,14 @@ module.exports = function (pi) {
+     });
+   });
+ 
++  pi.on("before_agent_start", async () => {
++    const context = takeFrameworkContext();
++    if (!context) return undefined;
++    return {
++      message: { customType: FRAMEWORK_CONTEXT_TYPE, content: context, display: false },
++    };
++  });
++
+   pi.on("agent_start", async (_event, ctx) => {
+     rememberContext(ctx);
+     // A brand-new agent loop must never inherit a replay window armed before it
+diff --git a/omnigent/resources/pi_native/omnigent_pi_native_extension.test.js b/omnigent/resources/pi_native/omnigent_pi_native_extension.test.js
+index 8578dbf787e76ffa0afa258d9956e79c28929782..a330119a29e582ac3b3bc35b1ee2dc035b89455b 100644
+--- a/omnigent/resources/pi_native/omnigent_pi_native_extension.test.js
++++ b/omnigent/resources/pi_native/omnigent_pi_native_extension.test.js
+@@ -727,8 +727,47 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
+   }
+ }
+ 
++// A web message's framework notice reaches the model as hidden context when
++// the agent starts, once, and never as the user's text.
++async function testFrameworkContextRidesWithTheMessage() {
++  const h = makeHarness();
++  const ctx = makeCtx({ idle: true });
++  const sent = [];
++  h.pi.sendUserMessage = (text) => sent.push(text);
++  await h.handlers.session_start({}, ctx);
++  const payloadPath = path.join(h.inboxDir, "with-context.json");
++  fs.writeFileSync(
++    payloadPath,
++    JSON.stringify({
++      id: "with-context",
++      type: "user_message",
++      content: "Next step",
++      framework_context: "[Open items] Q3 \"Title\" was labelled in chat without being recorded.",
++    }),
++  );
++  const deadline = Date.now() + 3000;
++  while (fs.existsSync(payloadPath)) {
++    if (Date.now() > deadline) throw new Error("message was not consumed by poller");
++    await sleep(20);
++  }
++  const first = await h.handlers.before_agent_start({ prompt: "Next step" }, ctx);
++  const again = await h.handlers.before_agent_start({ prompt: "Later" }, ctx);
++  assert(
++    "the framework notice is sent as hidden context, not as user text",
++    sent.length === 1 &&
++      sent[0] === "Next step" &&
++      first &&
++      first.message.customType === "omnigent-framework-context" &&
++      first.message.display === false &&
++      first.message.content.startsWith("[Open items] Q3"),
++    JSON.stringify({ sent, first }),
++  );
++  assert("the framework notice is given once", again === undefined, JSON.stringify(again));
++}
++
+ (async () => {
+   try {
++    await testFrameworkContextRidesWithTheMessage();
+     await testSessionStartupDoesNotCompleteATurn();
+     await testSessionStartMarksInputReady();
+     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
+diff --git a/tests/harnesses/codex_native/app_server/test_policy_hooks.py b/tests/harnesses/codex_native/app_server/test_policy_hooks.py
+index 0e6a15f607f9afa2d69822f247a5beefc1144235..5c5a93d0acefb8873e44eba0ea3084338b74134d 100644
+--- a/tests/harnesses/codex_native/app_server/test_policy_hooks.py
++++ b/tests/harnesses/codex_native/app_server/test_policy_hooks.py
+@@ -206,7 +206,8 @@ def test_user_prompt_submit_carries_the_route_turn_hook(tmp_path: Path) -> None:
+     # Trust is filtered by module, so route-turn must ride the policy one.
+     assert _POLICY_HOOK_MODULE in routing[0]["command"]
+     listed = {"result": {"data": [{"cwd": "/repo", "hooks": commands}]}}
+-    assert len(_our_policy_hooks_from_list(listed, "/repo")) == 2
++    # The policy gate, the framework-context hook and route-turn.
++    assert len(_our_policy_hooks_from_list(listed, "/repo")) == 3
+     # The user's own prompt hook survives the merge.
+     assert any(h["command"] == "echo mine" for h in commands)
+ 
+diff --git a/tests/inner/test_framework_text_notices.py b/tests/inner/test_framework_text_notices.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..66260500b7dc34e777d23a269b3126476feac5b4
+--- /dev/null
++++ b/tests/inner/test_framework_text_notices.py
+@@ -0,0 +1,108 @@
++"""A framework text notice reaches the model on every harness family, never as user text.
++
++The server may add framework-owned text to a message as a notice block (the
++open items note, for one); these tests follow it to each harness's own
++context channel.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from omnigent.harnesses.codex_native import hook as codex_hook
++from omnigent.harnesses.codex_native.app_server import _codex_policy_hooks_settings
++from omnigent.harnesses.codex_native.bridge import CODEX_FRAMEWORK_CONTEXT_FILE
++from omnigent.inner import claude_native_executor, codex_native_executor
++from omnigent.inner import pi_native_executor as pne
++from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
++from omnigent.inner.native_attachments import (
++    expand_framework_notices,
++    framework_notice_block,
++    framework_notices,
++    framework_text_notice_block,
++    framework_text_notices,
++    resize_notice,
++)
++
++_NOTE = '[Open items] Q3 "Region?" was labelled in chat without being recorded.'
++
++
++def _content() -> list[dict[str, Any]]:
++    return [{"type": "input_text", "text": "Next step"}, framework_text_notice_block(_NOTE)]
++
++
++def test_text_notices_sit_beside_upload_notices() -> None:
++    dimensions = {"width": 6000, "height": 4000}
++    content = [*_content(), framework_notice_block(dimensions)]
++    assert framework_notices(content) == [_NOTE, resize_notice(dimensions)]
++    assert framework_text_notices(content) == [_NOTE]
++
++
++def test_sdk_harnesses_read_the_note_as_system_context() -> None:
++    """The provider boundary SDK harnesses share turns notices into system messages."""
++    expanded = expand_framework_notices([{"role": "user", "content": _content()}])
++    assert expanded == [
++        {"role": "system", "content": [{"type": "input_text", "text": _NOTE}]},
++        {"role": "user", "content": [{"type": "input_text", "text": "Next step"}]},
++    ]
++
++
++@pytest.mark.asyncio
++async def test_claude_native_hands_the_note_to_its_prompt_hook(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    sent: list[str] = []
++
++    def inject(bridge_dir: Path, *, content: str, **_: Any) -> None:
++        sent.append(content)
++
++    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
++    executor = ClaudeNativeExecutor(tmp_path)
++    async for _ in executor.run_turn([{"role": "user", "content": _content()}], [], ""):
++        pass
++    assert sent == ["Next step"]
++    assert (tmp_path / "pending_framework_context.txt").read_text() == _NOTE
++
++
++def test_codex_native_hands_the_note_to_its_prompt_hook(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
++) -> None:
++    codex_native_executor._stage_framework_context(tmp_path, _content())
++    assert (tmp_path / CODEX_FRAMEWORK_CONTEXT_FILE).read_text() == _NOTE
++    # A message without a text notice leaves nothing for the hook.
++    codex_native_executor._stage_framework_context(tmp_path / "none", ["plain"])
++    assert not (tmp_path / "none").exists()
++
++    monkeypatch.setattr("sys.stdin", type("Stdin", (), {"read": lambda self: "{}"})())
++    assert codex_hook.main(["framework-context", "--bridge-dir", str(tmp_path)]) == 0
++    assert json.loads(capsys.readouterr().out) == {
++        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": _NOTE}
++    }
++    assert not (tmp_path / CODEX_FRAMEWORK_CONTEXT_FILE).exists()
++    assert codex_hook.main(["framework-context", "--bridge-dir", str(tmp_path)]) == 0
++    assert capsys.readouterr().out == ""
++
++    # Registered on every prompt, answering in the shell while no notice waits.
++    settings = _codex_policy_hooks_settings(tmp_path, "/usr/bin/python3")
++    [prompt_hooks] = settings["hooks"]["UserPromptSubmit"]
++    [context_hook] = [
++        hook for hook in prompt_hooks["hooks"] if "framework-context" in hook["command"]
++    ]
++    assert context_hook["command"].startswith("if [ ! -e ")
++    assert "omnigent.harnesses.codex_native.hook" in context_hook["command"]
++
++
++@pytest.mark.asyncio
++async def test_pi_native_queues_the_note_beside_the_message(tmp_path: Path) -> None:
++    executor = pne.PiNativeExecutor(bridge_dir=tmp_path)
++    async for _ in executor.run_turn([{"role": "user", "content": _content()}], [], ""):
++        pass
++    [queued] = [json.loads(path.read_text()) for path in (tmp_path / "inbox").glob("*.json")]
++    assert queued["content"] == "Next step"
++    # The extension adds it as hidden context when the agent starts
++    # (omnigent_pi_native_extension.test.js).
++    assert queued["framework_context"] == _NOTE
+diff --git a/tests/inner/test_pi_native_executor.py b/tests/inner/test_pi_native_executor.py
+index c947b5de23386e54a1d619c2c29065e717e0950f..eb988fcf39f1cad95fc6d2339032fcc7401501fd 100644
+--- a/tests/inner/test_pi_native_executor.py
++++ b/tests/inner/test_pi_native_executor.py
+@@ -61,7 +61,7 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
+     # the bridge sink is the only boundary that needs mocking.
+     enqueued: list[tuple[Path, str]] = []
+ 
+-    def _fake_enqueue(bridge_dir: Path, content: str) -> str:
++    def _fake_enqueue(bridge_dir: Path, content: str, **_: object) -> str:
+         enqueued.append((bridge_dir, content))
+         return "msg_test"
+ 
+@@ -85,7 +85,7 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
+ async def test_run_turn_errors_with_no_user_text(tmp_path: Path, monkeypatch) -> None:
+     enqueued: list[str] = []
+     monkeypatch.setattr(
+-        pne, "enqueue_user_message", lambda bridge_dir, content: enqueued.append(content)
++        pne, "enqueue_user_message", lambda bridge_dir, content, **_: enqueued.append(content)
+     )
+     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+     events = [e async for e in ex.run_turn([{"role": "assistant", "content": "x"}], [], "")]
+@@ -98,7 +98,7 @@ async def test_run_turn_errors_with_no_user_text(tmp_path: Path, monkeypatch) ->
+ async def test_enqueue_session_message_queues_steering(tmp_path: Path, monkeypatch) -> None:
+     seen: list[str] = []
+     monkeypatch.setattr(
+-        pne, "enqueue_user_message", lambda bridge_dir, content: seen.append(content)
++        pne, "enqueue_user_message", lambda bridge_dir, content, **_: seen.append(content)
+     )
+     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+ 
+@@ -127,7 +127,7 @@ async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
+         return "tok"
+ 
+     monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
+-    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
++    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a, **_: "msg")
+     refreshed: list[dict[str, str]] = []
+     monkeypatch.setattr(
+         pne,
+@@ -164,7 +164,9 @@ async def test_slow_mint_keeps_overlapping_messages_in_arrival_order(
+     monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
+     monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: True)
+     queued: list[str] = []
+-    monkeypatch.setattr(pne, "enqueue_user_message", lambda bridge_dir, text: queued.append(text))
++    monkeypatch.setattr(
++        pne, "enqueue_user_message", lambda bridge_dir, text, **_: queued.append(text)
++    )
+     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+ 
+     async def _run_turn() -> None:
+@@ -189,7 +191,7 @@ async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
+         raise RuntimeError("sdk down")
+ 
+     monkeypatch.setattr(entry, "_make_auth_token_factory", _boom)
+-    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
++    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a, **_: "msg")
+     called: list[object] = []
+     monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: called.append(a))
+     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+diff --git a/tests/inner/test_sdk_resize_notices.py b/tests/inner/test_sdk_resize_notices.py
+index 154f3295c3bc64f6a56874c781fcfd3a66863c29..e77470241d4edec893824db9ec6f42835d880621 100644
+--- a/tests/inner/test_sdk_resize_notices.py
++++ b/tests/inner/test_sdk_resize_notices.py
+@@ -9,7 +9,10 @@ import httpx
+ import pytest
+ 
+ from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+-from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
++from omnigent.inner.native_attachments import (
++    FRAMEWORK_NOTICE_BLOCK_TYPE,
++    framework_text_notice_block,
++)
+ from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+ from omnigent.runner.app_support import _resolve_forwarded_message_content
+ from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+@@ -111,6 +114,9 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
+                 content = await _resolve_forwarded_message_content(
+                     authored, session_id="session", server_client=client
+                 )
++                if index == 1:
++                    # A server-added text notice rides the same channel.
++                    content = [*content, framework_text_notice_block("[Open items] note")]
+                 history.append({"type": "message", "role": "user", "content": content})
+                 request = CreateResponseRequest(model="test-agent", input=copy.deepcopy(history))
+                 queue = asyncio.Queue()
+@@ -137,6 +143,7 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
+                     assert FRAMEWORK_NOTICE_BLOCK_TYPE not in json.dumps(prompts_seen[-1])
+                     assert len(clients) == 1
+                     assert executor._pending_framework_context == {}
++                assert ("[Open items] note" in context) == (index == 1)
+                 if width:
+                     assert f"{width}×4000" in context.replace("\\u00d7", "×")
+                     assert f"{14000 - width}×4000" not in context.replace("\\u00d7", "×")
