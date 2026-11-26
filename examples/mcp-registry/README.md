@@ -311,6 +311,13 @@ before opening the existing Databricks OAuth flow.
 Personal bearer/OAuth connections require the existing KMS or Vault cipher;
 there is no plaintext fallback. Connections are scoped to workspace and user.
 
+A trial server without KMS or Vault can opt into a key file instead:
+`OMNIGENT_CREDENTIAL_CIPHER=local` with `OMNIGENT_CREDENTIAL_LOCAL_KEY_FILE`
+pointing at a `chmod 600` file made with `openssl rand -base64 32`. Anyone who
+can read that file and the database can read the stored tokens, and changing
+the key means every user reconnects; see
+[Local key file](../../designs/CREDENTIAL_STORE.md#local-key-file-explicit-opt-in).
+
 KMS-backed connections must fit within 4096 bytes after JSON serialization and
 UTF-8 encoding, including both access and refresh tokens. Oversized credentials
 are rejected before encryption with an operator-facing message; use the existing
