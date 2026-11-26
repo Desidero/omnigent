@@ -6,6 +6,8 @@ import type { SessionCommandId } from "./sessionCommands/commandIds";
 export type PaletteTarget =
   | { kind: "session"; id: string }
   | { kind: "action"; action: ActionCommand }
+  /** A "New chat in <project>" row. */
+  | { kind: "new-chat-in-project"; projectName: string }
   | PaletteCommandRow
   /** A session group's paging row; the selection parks on `lastRowId` while more load. */
   | { kind: "more"; load: () => void; lastRowId: string | undefined }
