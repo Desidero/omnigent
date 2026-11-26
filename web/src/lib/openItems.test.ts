@@ -10,10 +10,13 @@ import {
   type ItemLabelSource,
 } from "@/lib/itemLabels";
 import {
+  DISMISSED_RESOLUTION,
+  chatItemsToImport,
   chatResolution,
   compareItemLabels,
   countOpenRows,
   fetchStoredOpenItems,
+  importChatItems,
   mergeStoredOpenItems,
   openItemRows,
   storedItemOf,
@@ -170,5 +173,92 @@ describe("fetchStoredOpenItems", () => {
       }),
     );
     await expect(fetchStoredOpenItems("conv_1")).rejects.toThrow("Open items are not available");
+  });
+});
+
+describe("chatItemsToImport", () => {
+  it("takes the chat's labels the store lacks, closed as the chat left them", () => {
+    const chat = index([
+      ITEMS,
+      "- [R1] **Flaky test.**\n- [A4] **Other letter.**\n- [Q9] **Third.**",
+      "[L1] **Checklist** https://example.com/checklist\n\n[L2] **No link here.**",
+      "~~[R1]~~ Fixed the test. Done.",
+    ]);
+    const imports = chatItemsToImport(chat, [storedItem("Q2")], new Set(["Q9"]));
+    expect(imports).toEqual([
+      {
+        kind: "question",
+        label: "Q1",
+        title: "Backfill window.",
+        detail: "[Q1] **Backfill window.** Batch it?",
+      },
+      {
+        kind: "risk",
+        label: "R1",
+        title: "Flaky test.",
+        detail: "[R1] **Flaky test.**",
+        resolution: "[R1] Fixed the test.",
+      },
+      {
+        kind: "question",
+        label: "Q9",
+        title: "Third.",
+        detail: "[Q9] **Third.**",
+        resolution: DISMISSED_RESOLUTION,
+      },
+      {
+        kind: "link",
+        label: "L1",
+        title: "Checklist",
+        detail: expect.stringContaining("https://example.com/checklist"),
+        url: "https://example.com/checklist",
+      },
+    ]);
+    expect(chatItemsToImport(index(["[Q1] once"]), [], new Set())).toEqual([]);
+  });
+});
+
+describe("importChatItems", () => {
+  it("posts ten items per request and reports each label", async () => {
+    const items = Array.from({ length: 12 }, (_, position) => ({
+      kind: "question" as const,
+      label: `Q${position + 1}`,
+      title: `Item ${position + 1}`,
+      detail: "",
+    }));
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: items
+              .slice(0, 10)
+              .map((item, position) =>
+                position === 0
+                  ? { error: { code: "label_taken", message: "Q1 is already an item" } }
+                  : { item: storedItem(item.label) },
+              ),
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: items.slice(10).map((item) => ({ item: storedItem(item.label) })),
+          }),
+        ),
+      );
+    const results = await importChatItems("conv_1", items);
+    expect(results).toHaveLength(12);
+    expect(results[0]).toEqual({
+      label: "Q1",
+      error: { code: "label_taken", message: "Q1 is already an item" },
+    });
+    const bodies = fetchMock.mock.calls.map(([url, init]) => {
+      expect(url).toBe("/v1/sessions/conv_1/open-items/import");
+      return JSON.parse((init as RequestInit).body as string);
+    });
+    expect(bodies.map((body) => body.items.length)).toEqual([10, 2]);
+    expect(bodies[0].idempotency_key).toMatch(/^import:.+:0$/);
+    expect(bodies[1].idempotency_key).toMatch(/^import:.+:10$/);
   });
 });

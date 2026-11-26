@@ -416,3 +416,48 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
     )
     refused = await run("sys_open_items_raise", {"items": [{"kind": "question"}]})
     assert refused == {"error": "invalid_input: title is required"}
+
+
+async def test_editors_import_chat_labels_and_counting_moves_past_them(
+    client: httpx.AsyncClient, stores: SimpleNamespace, events: list[Any]
+) -> None:
+    session_id = _session(stores)
+    stores.permissions.grant(BOB, session_id, LEVEL_READ)
+    stores.permissions.grant(CAROL, session_id, LEVEL_EDIT)
+    url = f"/v1/sessions/{session_id}/open-items"
+    body = _raise_body(
+        {**_QUESTION, "label": "Q7"},
+        {"kind": "risk", "title": "Flaky", "label": "R2", "resolution": "Fixed the test"},
+        {"kind": "link", "url": "https://example.com/checklist", "label": "L1"},
+        key="import:1",
+    )
+    assert (await client.post(f"{url}/import", json=body, headers=_user(BOB))).status_code == 403
+    imported = await client.post(f"{url}/import", json=body, headers=_user(CAROL))
+    assert imported.status_code == 200, imported.text
+    rows = [row["item"] for row in imported.json()["items"]]
+    assert [(row["label"], row["status"], row["closed_by"]) for row in rows] == [
+        ("Q7", "open", None),
+        ("R2", "closed", "user"),
+        ("L1", "open", None),
+    ]
+    assert rows[1]["resolution"] == "Fixed the test"
+    assert events[-1][1]["labels"] == ["Q7", "R2", "L1"]
+    # A retry stores nothing new; the agent's next question counts on from the import.
+    again = await client.post(f"{url}/import", json=body, headers=_user(CAROL))
+    assert [row["item"]["label"] for row in again.json()["items"]] == ["Q7", "R2", "L1"]
+    raised = await client.post(url, json=_raise_body(_QUESTION), headers=_runner(session_id))
+    assert raised.json()["items"][0]["item"]["label"] == "Q8"
+
+    # A label in use is refused for that item alone; an item without a label is invalid.
+    taken = await client.post(
+        f"{url}/import",
+        json=_raise_body({**_QUESTION, "label": "Q8"}, {**_QUESTION, "label": "Q3"}, key="i:2"),
+        headers=_user(CAROL),
+    )
+    assert taken.json()["items"][0]["error"]["code"] == "label_taken"
+    assert taken.json()["items"][1]["item"]["label"] == "Q3"
+    for items in ([_QUESTION], [{**_QUESTION, "label": "Q4", "resolution": ""}]):
+        bad = await client.post(
+            f"{url}/import", json=_raise_body(*items, key="i:3"), headers=_user(CAROL)
+        )
+        assert bad.status_code == 400 and "invalid_input" in bad.text, bad.text

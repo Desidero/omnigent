@@ -12,6 +12,7 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
 - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent gets the text-label instruction.
 - `items-delete`: deleting a session deletes its items; a fork starts with none.
 - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
+- `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
 - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
 
 ## How to get to it (user POV)
@@ -19,6 +20,7 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
 - Chat: ask an agent with the default tool groups something that leaves it open questions; it calls `sys_open_items_raise`, which shows as a tool row, and writes the items with the returned labels.
 - Chat: answer or settle an item; the agent replies and closes it with `sys_open_items_update`.
 - API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/replies` with edit access.
+- API: `POST …/open-items/import` with edit access, items with their `label`.
 - Web: the bookmark button in the session header (badge = open items) opens the panel; select a row to expand it; ✕ closes a stored item.
 - Agent spec: `tool_groups.open_items: false` turns the tools off for that agent.
 
