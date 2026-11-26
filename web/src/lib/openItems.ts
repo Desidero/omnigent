@@ -15,7 +15,7 @@ import {
   type ItemLabelSource,
 } from "@/lib/itemLabels";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
-import { isLinkItemLabel } from "@/lib/sessionLinks";
+import { isLinkItemLabel, linksInMarkdown } from "@/lib/sessionLinks";
 
 export type OpenItemKind = "question" | "risk" | "finding" | "follow_up" | "link";
 export type OpenItemStatus = "open" | "answered" | "closed";
@@ -84,8 +84,12 @@ export type OpenItemWriteResult =
 
 // The store caps a session at 500 items; pages of 200 read them all in three requests.
 const PAGE_LIMIT = "200";
-// The store's limit on a resolution.
+// The store's limits on what an item carries.
+const TITLE_MAX_CHARS = 160;
+const DETAIL_MAX_CHARS = 6000;
 const RESOLUTION_MAX_CHARS = 2000;
+// Items per import request, as per raise.
+const IMPORT_BATCH = 10;
 const MAX_PAGES = 5;
 
 export function openItemsKey(sessionId: string | undefined) {
@@ -132,6 +136,48 @@ export async function updateStoredOpenItems(
   });
   if (!response.ok) throw await apiErrorFromResponse(response);
   return ((await response.json()) as { items: OpenItemWriteResult[] }).items;
+}
+
+/** A chat item to store under its chat label; see `POST …/open-items/import`. */
+export interface ChatItemImport {
+  kind: OpenItemKind;
+  label: string;
+  title: string;
+  detail: string;
+  url?: string;
+  /** Stores it closed, for an item the chat closed or the user dismissed. */
+  resolution?: string;
+}
+
+/**
+ * Store chat items under their own labels (edit access), ten per request.
+ * Labels already stored come back with `label_taken` and are left as they are.
+ */
+export async function importChatItems(
+  sessionId: string,
+  items: readonly ChatItemImport[],
+): Promise<OpenItemWriteResult[]> {
+  const batchKey = `import:${crypto.randomUUID()}`;
+  const results: OpenItemWriteResult[] = [];
+  /* oxlint-disable no-await-in-loop -- later batches move the counters past earlier ones */
+  for (let start = 0; start < items.length; start += IMPORT_BATCH) {
+    const batch = items.slice(start, start + IMPORT_BATCH);
+    const response = await authenticatedFetch(openItemsUrl(sessionId, "/import"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: batch, idempotency_key: `${batchKey}:${start}` }),
+    });
+    if (!response.ok) throw await apiErrorFromResponse(response);
+    const body = (await response.json()) as {
+      items: ({ item: StoredOpenItem } | { error: { code: string; message: string } })[];
+    };
+    body.items.forEach((row, position) => {
+      const label = batch[position].label;
+      results.push("item" in row ? { label, item: row.item } : { label, error: row.error });
+    });
+  }
+  /* oxlint-enable no-await-in-loop */
+  return results;
 }
 
 /** The cached list with the items a write returned put in place. */
@@ -305,6 +351,52 @@ export function openItemRows(
 /** How many rows wait on the user: open, not dismissed. Answered items wait on the agent. */
 export function countOpenRows(rows: readonly OpenItemRow[]): number {
   return rows.filter((row) => row.status === "open" && !row.dismissed).length;
+}
+
+/** What an import records for a chat item the user dismissed. */
+export const DISMISSED_RESOLUTION = "Dismissed from the Open items panel";
+
+/**
+ * The chat's labels the store does not hold, as an import would store them:
+ * items of the store's letters, and pinned links whose block has a URL.
+ * Closed items keep the sentence that closed them; dismissed ones are closed.
+ */
+export function chatItemsToImport(
+  index: ItemLabelIndex | null,
+  stored: readonly StoredOpenItem[],
+  dismissed: ReadonlySet<string>,
+): ChatItemImport[] {
+  if (!index?.enabled) return [];
+  const storedLabels = new Set(stored.map((item) => item.label));
+  const imports: ChatItemImport[] = [];
+  for (const entry of index.items.values()) {
+    const kind = kindOfLabel(entry.label);
+    if (!kind || storedLabels.has(entry.label)) continue;
+    const block = extractItemBlock(entry.source.text, entry.label) ?? "";
+    const item: ChatItemImport = {
+      kind,
+      label: entry.label,
+      title: (itemLabelTitle(entry.source.text, entry.label) || entry.label).slice(
+        0,
+        TITLE_MAX_CHARS,
+      ),
+      detail: block.slice(0, DETAIL_MAX_CHARS),
+    };
+    if (kind === "link") {
+      const url = linksInMarkdown(block)[0]?.url.href;
+      if (!url) continue;
+      item.url = url;
+    }
+    if (entry.closedBy) {
+      const sentence = extractLabelSentence(entry.closedBy.text, entry.label);
+      item.resolution =
+        sentence?.replace(/~~/g, "").trim().slice(0, RESOLUTION_MAX_CHARS) || "Closed in the chat";
+    } else if (dismissed.has(entry.label)) {
+      item.resolution = DISMISSED_RESOLUTION;
+    }
+    imports.push(item);
+  }
+  return imports;
 }
 
 /** The sentence that closed an item in chat, as a resolution for the store. */
