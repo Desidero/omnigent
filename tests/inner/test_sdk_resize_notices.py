@@ -9,7 +9,10 @@ import httpx
 import pytest
 
 from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
+from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    framework_text_notice_block,
+)
 from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
 from omnigent.runner.app_support import _resolve_forwarded_message_content
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -111,6 +114,9 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
                 content = await _resolve_forwarded_message_content(
                     authored, session_id="session", server_client=client
                 )
+                if index == 1:
+                    # A server-added text notice rides the same channel.
+                    content = [*content, framework_text_notice_block("[Open items] note")]
                 history.append({"type": "message", "role": "user", "content": content})
                 request = CreateResponseRequest(model="test-agent", input=copy.deepcopy(history))
                 queue = asyncio.Queue()
@@ -137,6 +143,7 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
                     assert FRAMEWORK_NOTICE_BLOCK_TYPE not in json.dumps(prompts_seen[-1])
                     assert len(clients) == 1
                     assert executor._pending_framework_context == {}
+                assert ("[Open items] note" in context) == (index == 1)
                 if width:
                     assert f"{width}×4000" in context.replace("\\u00d7", "×")
                     assert f"{14000 - width}×4000" not in context.replace("\\u00d7", "×")

@@ -24,7 +24,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.inner.native_attachments import attachment_reference_line, framework_text_notices
 
 
 class PiNativeExecutor(Executor):
@@ -74,9 +74,10 @@ class PiNativeExecutor(Executor):
         text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
+        notices = "\n\n".join(framework_text_notices(content)) or None
         async with self._enqueue_lock:
             await asyncio.to_thread(self._refresh_auth_headers)
-            enqueue_user_message(self._bridge_dir, text)
+            enqueue_user_message(self._bridge_dir, text, framework_context=notices)
         return True
 
     async def run_turn(
@@ -108,12 +109,15 @@ class PiNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Pi native turn had no user text to send")
             return
+        notices = framework_text_notices(_latest_user_content(messages))
         model = config.model if config is not None else None
         async with self._enqueue_lock:
             await asyncio.to_thread(self._refresh_auth_headers)
             if model:
                 enqueue_model_change(self._bridge_dir, model)
-            enqueue_user_message(self._bridge_dir, text)
+            enqueue_user_message(
+                self._bridge_dir, text, framework_context="\n\n".join(notices) or None
+            )
         yield TurnComplete(response=None)
 
     def _refresh_auth_headers(self) -> None:
@@ -178,6 +182,14 @@ def _request_session_id_from_env() -> str | None:
     """
     raw = os.environ.get(PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "").strip()
     return raw or None
+
+
+def _latest_user_content(messages: list[Message]) -> object:
+    """The latest user message's content, or ``None``."""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return message.get("content")
+    return None
 
 
 def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:

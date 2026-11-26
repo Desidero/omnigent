@@ -61,7 +61,7 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
     # the bridge sink is the only boundary that needs mocking.
     enqueued: list[tuple[Path, str]] = []
 
-    def _fake_enqueue(bridge_dir: Path, content: str) -> str:
+    def _fake_enqueue(bridge_dir: Path, content: str, **_: object) -> str:
         enqueued.append((bridge_dir, content))
         return "msg_test"
 
@@ -85,7 +85,7 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
 async def test_run_turn_errors_with_no_user_text(tmp_path: Path, monkeypatch) -> None:
     enqueued: list[str] = []
     monkeypatch.setattr(
-        pne, "enqueue_user_message", lambda bridge_dir, content: enqueued.append(content)
+        pne, "enqueue_user_message", lambda bridge_dir, content, **_: enqueued.append(content)
     )
     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
     events = [e async for e in ex.run_turn([{"role": "assistant", "content": "x"}], [], "")]
@@ -98,7 +98,7 @@ async def test_run_turn_errors_with_no_user_text(tmp_path: Path, monkeypatch) ->
 async def test_enqueue_session_message_queues_steering(tmp_path: Path, monkeypatch) -> None:
     seen: list[str] = []
     monkeypatch.setattr(
-        pne, "enqueue_user_message", lambda bridge_dir, content: seen.append(content)
+        pne, "enqueue_user_message", lambda bridge_dir, content, **_: seen.append(content)
     )
     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
 
@@ -127,7 +127,7 @@ async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
         return "tok"
 
     monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
-    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a, **_: "msg")
     refreshed: list[dict[str, str]] = []
     monkeypatch.setattr(
         pne,
@@ -164,7 +164,9 @@ async def test_slow_mint_keeps_overlapping_messages_in_arrival_order(
     monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
     monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: True)
     queued: list[str] = []
-    monkeypatch.setattr(pne, "enqueue_user_message", lambda bridge_dir, text: queued.append(text))
+    monkeypatch.setattr(
+        pne, "enqueue_user_message", lambda bridge_dir, text, **_: queued.append(text)
+    )
     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
 
     async def _run_turn() -> None:
@@ -189,7 +191,7 @@ async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
         raise RuntimeError("sdk down")
 
     monkeypatch.setattr(entry, "_make_auth_token_factory", _boom)
-    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a, **_: "msg")
     called: list[object] = []
     monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: called.append(a))
     ex = pne.PiNativeExecutor(bridge_dir=tmp_path)

@@ -727,8 +727,47 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   }
 }
 
+// A web message's framework notice reaches the model as hidden context when
+// the agent starts, once, and never as the user's text.
+async function testFrameworkContextRidesWithTheMessage() {
+  const h = makeHarness();
+  const ctx = makeCtx({ idle: true });
+  const sent = [];
+  h.pi.sendUserMessage = (text) => sent.push(text);
+  await h.handlers.session_start({}, ctx);
+  const payloadPath = path.join(h.inboxDir, "with-context.json");
+  fs.writeFileSync(
+    payloadPath,
+    JSON.stringify({
+      id: "with-context",
+      type: "user_message",
+      content: "Next step",
+      framework_context: "[Open items] Q3 \"Title\" was labelled in chat without being recorded.",
+    }),
+  );
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(payloadPath)) {
+    if (Date.now() > deadline) throw new Error("message was not consumed by poller");
+    await sleep(20);
+  }
+  const first = await h.handlers.before_agent_start({ prompt: "Next step" }, ctx);
+  const again = await h.handlers.before_agent_start({ prompt: "Later" }, ctx);
+  assert(
+    "the framework notice is sent as hidden context, not as user text",
+    sent.length === 1 &&
+      sent[0] === "Next step" &&
+      first &&
+      first.message.customType === "omnigent-framework-context" &&
+      first.message.display === false &&
+      first.message.content.startsWith("[Open items] Q3"),
+    JSON.stringify({ sent, first }),
+  );
+  assert("the framework notice is given once", again === undefined, JSON.stringify(again));
+}
+
 (async () => {
   try {
+    await testFrameworkContextRidesWithTheMessage();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();

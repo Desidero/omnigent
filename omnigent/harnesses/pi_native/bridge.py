@@ -215,7 +215,9 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return bool(config) and (Path(config).parent / _INPUT_READY_FILE).is_file()
 
 
-def enqueue_user_message(bridge_dir: Path, content: str) -> str:
+def enqueue_user_message(
+    bridge_dir: Path, content: str, *, framework_context: str | None = None
+) -> str:
     """
     Queue a web-originated user message for the resident Pi extension.
 
@@ -225,6 +227,9 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
 
     :param bridge_dir: Native Pi bridge directory.
     :param content: Plain text user message.
+    :param framework_context: Framework notices for the model with this
+        message; the extension adds them as hidden context when the agent
+        starts, never as the user's text.
     :returns: Opaque message id.
     """
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -234,6 +239,8 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
         "content": content,
         "created_at": time.time(),
     }
+    if framework_context:
+        payload["framework_context"] = framework_context
     _enqueue_payload(bridge_dir, message_id, payload)
     return message_id
 

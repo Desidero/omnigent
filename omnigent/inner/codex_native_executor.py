@@ -37,6 +37,7 @@ from omnigent.harnesses.codex_native.app_server import (
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
+    CODEX_FRAMEWORK_CONTEXT_FILE,
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
@@ -89,6 +90,7 @@ from omnigent.inner.native_attachments import (
     FRAMEWORK_NOTICE_BLOCK_TYPE,
     attachment_reference_line,
     codex_resize_metadata_path,
+    framework_text_notices,
     materialize_attachment,
     parse_data_uri,
     unresolved_attachment_marker,
@@ -1110,6 +1112,7 @@ class CodexNativeExecutor(Executor):
         input_items = _content_to_input_items(content, self._bridge_dir)
         if not input_items:
             return False
+        _stage_framework_context(self._bridge_dir, content)
         # Serialized against run_turn so the read-decide-RPC-write below
         # is atomic with respect to the initiating-message injection.
         async with self._inject_lock:
@@ -1309,6 +1312,7 @@ class CodexNativeExecutor(Executor):
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
             return
+        _stage_framework_context(self._bridge_dir, latest_user_content)
         # Wait for the bridge to boot OUTSIDE the injection lock. Poll quickly
         # during the expected startup window, then back off. Once state exists,
         # the decision/RPC/write below runs under the lock — re-reading state
@@ -1678,6 +1682,15 @@ def _latest_user_content(messages: list[Message]) -> object:
         if message.get("role") == "user":
             return message.get("content")
     return None
+
+
+def _stage_framework_context(bridge_dir: Path, content: object) -> None:
+    """Leave a prompt's framework notices for Codex's ``framework-context`` prompt hook."""
+    notices = framework_text_notices(content)
+    if notices:
+        (bridge_dir / CODEX_FRAMEWORK_CONTEXT_FILE).write_text(
+            "\n\n".join(notices), encoding="utf-8"
+        )
 
 
 def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
