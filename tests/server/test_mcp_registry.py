@@ -117,6 +117,127 @@ async def test_tool_and_service_rules_are_checked_before_credential_resolution(
     resolve.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("pattern", "tool", "allowed"),
+    [
+        ("read_ticket", "read_ticket", True),
+        ("read_ticket", "read_tickets", False),
+        ("read_ticket", "xread_ticket", False),
+        ("search_*", "search_issues", True),
+        ("search_*", "search_", True),
+        ("search_*", "research_issues", False),
+        ("search_*", "SEARCH_issues", False),
+        ("*_ticket", "read_ticket", True),
+        ("*_ticket", "read_ticket_history", False),
+        ("get_*_by_id", "get_issue_by_id", True),
+        ("get_*_by_id", "get__by_id", True),
+        ("get_*_by_id", "get_by_id", False),
+        ("get_*_by_id", "get_issue_by_id_and_delete", False),
+        ("a*b*c", "a-b-b-c", True),
+        ("a*b*c", "a-c-b", False),
+        ("ab*ba", "aba", False),
+        # Regular-expression syntax in an entry is literal text.
+        ("read.*", "read_ticket", False),
+        ("read.*", "read.ticket", True),
+        ("(read|delete)_*", "delete_ticket", False),
+        ("*", "delete_ticket", True),
+        ("*", "", True),
+    ],
+)
+def test_allowlist_patterns_are_literal_and_anchored(pattern, tool, allowed):
+    assert service(tools=[pattern]).allows_tool(tool) is allowed
+
+
+def test_any_allowlist_entry_may_admit_a_tool():
+    entry = service(tools=["read_ticket", "search_*"])
+    assert [entry.allows_tool(t) for t in ("read_ticket", "search_all", "delete_ticket")] == [
+        True,
+        True,
+        False,
+    ]
+    assert not entry.allows_every_tool
+    assert service(tools=["*"]).allows_every_tool
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [["*", "read_ticket"], ["read_ticket", "*"], ["search_**"], ["get_?*"], ["get_[a-z]*"]],
+)
+def test_ambiguous_allowlist_patterns_fail_validation(tools):
+    with pytest.raises(ValidationError, match="tools"):
+        service(tools=tools)
+
+
+@pytest.mark.asyncio
+async def test_patterns_are_checked_on_every_call_and_filter_discovery(registry, monkeypatch):
+    registry.services["tracker"] = service(auth="none", tools=["read_*"])
+    resolve = AsyncMock()
+    monkeypatch.setattr(registry, "token", resolve)
+    with pytest.raises(ConnectionError, match="not allowed"):
+        await registry.execute("tracker", "alice", SimpleNamespace(), tool="delete_ticket")
+    resolve.assert_not_awaited()
+
+    called = []
+
+    def upstream(request):
+        if request.method == "GET":
+            return httpx.Response(405)
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        message = json.loads(request.content)
+        if "id" not in message:
+            return httpx.Response(202)
+        if message["method"] == "tools/call":
+            called.append(message["params"]["name"])
+            result = {"content": [{"type": "text", "text": "ok"}]}
+        elif message["method"] == "initialize":
+            result = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "pattern-test", "version": "1"},
+            }
+        else:
+            names = ["read_ticket", "read_comment", "delete_ticket"]
+            result = {"tools": [{"name": n, "inputSchema": {"type": "object"}} for n in names]}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(upstream), **kwargs),
+    )
+    resolve.return_value = None
+    tools = await registry.execute("tracker", "alice", SimpleNamespace())
+    assert [tool.name for tool in tools] == ["read_ticket", "read_comment"]
+    # A tool that never appeared in a listing is still admitted or refused by name.
+    await registry.execute("tracker", "alice", SimpleNamespace(), tool="read_history")
+    with pytest.raises(ConnectionError, match="not allowed"):
+        await registry.execute("tracker", "alice", SimpleNamespace(), tool="delete_ticket")
+    assert called == ["read_history"]
+
+
+def test_a_registry_file_with_patterns_loads_and_allowing_everything_is_logged(
+    db_uri, tmp_path, monkeypatch, caplog
+):
+    from omnigent.server import mcp_registry
+
+    entries = [
+        service(auth="none", tools=["search_*", "read_ticket"]).model_dump(),
+        service(id="open", auth="none", tools=["*"]).model_dump(),
+    ]
+    catalog = tmp_path / "mcp-registry.yaml"
+    catalog.write_text(json.dumps({"services": entries}))
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
+    with caplog.at_level("WARNING", logger=mcp_registry.__name__):
+        registry = mcp_registry.build_mcp_registry_from_env(db_uri)
+    assert registry.services["tracker"].tools == ["search_*", "read_ticket"]
+    assert [r.getMessage() for r in caplog.records] == [
+        "MCP registry service open allows every upstream tool"
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "refresh_response", [{}, {"refresh_token": None}, {"refresh_token": "rotated"}]

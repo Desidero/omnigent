@@ -69,8 +69,10 @@ flowchart LR
 ```
 
 - **Administrator:** configures approved destinations, auth and nonempty tool
-  allowlists in `OMNIGENT_MCP_REGISTRY`. Optional user allowlists limit visibility
-  and use. Config changes require a server restart.
+  allowlists in `OMNIGENT_MCP_REGISTRY`. An allowlist entry is an exact tool name
+  or a `*` pattern, checked on every listing and call rather than expanded once;
+  `"*"` alone allows every upstream tool and is logged at startup. Optional user
+  allowlists limit visibility and use. Config changes require a server restart.
 - **User:** connects an account through **Settings → MCP** or the launch picker, then
   selects services per session. Selection and account connection are independent.
 - **Runner:** receives service references and tool schemas. A registry entry
