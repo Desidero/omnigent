@@ -1,7 +1,7 @@
 # subscription-accounts
 
 Needs: claude-config-dir
-Covers: 526bf480b599a52f
+Covers: f5ac39d6e7a10b1c
 
 Several Claude or Codex subscription accounts on one host: pick the account a
 new session runs on, give a project a default account, switch a running Claude
