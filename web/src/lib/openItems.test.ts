@@ -20,9 +20,11 @@ import {
   mergeStoredOpenItems,
   openItemRows,
   storedItemOf,
+  withStoredLinks,
   withWrittenItems,
   type StoredOpenItem,
 } from "./openItems";
+import { collectSessionLinks } from "@/lib/sessionLinks";
 import { storedItem } from "@/test/openItemsFixtures";
 
 afterEach(() => {
@@ -260,5 +262,54 @@ describe("importChatItems", () => {
     expect(bodies.map((body) => body.items.length)).toEqual([10, 2]);
     expect(bodies[0].idempotency_key).toMatch(/^import:.+:0$/);
     expect(bodies[1].idempotency_key).toMatch(/^import:.+:10$/);
+  });
+});
+
+describe("withStoredLinks", () => {
+  function chatLinks(texts: string[]) {
+    const sources = texts.map((text, position): ItemLabelSource => ({
+      messageId: `m${position}`,
+      role: "assistant",
+      text,
+    }));
+    return collectSessionLinks(sources, index(texts));
+  }
+
+  it("pins stored links under the agent's title, else a short form of the URL", () => {
+    const links = withStoredLinks(
+      chatLinks([
+        "[L1] **Old name** https://example.com/board",
+        "Made https://claude.ai/artifact/aaa",
+      ]),
+      [
+        storedItem("L1", { title: "Release board", url: "https://example.com/board" }),
+        storedItem("L2", {
+          title: "https://docs.example.com/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
+          url: "https://docs.example.com/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
+        }),
+      ],
+    );
+    expect(links.map((link) => [link.title, link.kind, link.item?.label ?? null])).toEqual([
+      ["Release board", "pinned", "L1"],
+      ["docs.example.com/d/1AbCdEfGhIjK…/…", "pinned", null],
+      ["Artifact aaa", "artifact", null],
+    ]);
+  });
+
+  it("takes a stored link closed in the store off the list, with its page", () => {
+    const links = withStoredLinks(
+      chatLinks([
+        "[L1] **Catalog** https://claude.ai/artifact/aaa",
+        "See https://claude.ai/artifact/aaa",
+      ]),
+      [storedItem("L1", { status: "closed", url: "https://claude.ai/artifact/aaa" })],
+    );
+    expect(links).toEqual([]);
+  });
+
+  it("leaves the chat's list alone without stored links", () => {
+    const links = chatLinks(["[L1] **Catalog** https://example.com/c"]);
+    expect(withStoredLinks(links, [storedItem("Q1")])).toBe(links);
+    expect(withStoredLinks(links, null)).toBe(links);
   });
 });

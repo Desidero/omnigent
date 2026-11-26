@@ -24,6 +24,7 @@ import {
   chatResolution,
   countOpenRows,
   openItemRows,
+  RAISED_FROM_CHAT,
   type OpenItemRow,
   type OpenItemUpdate,
   type StoredOpenItem,
@@ -92,7 +93,9 @@ function StoredItemFacts({ item }: { item: StoredOpenItem }) {
       {item.status === "closed" && (
         <div className="border-l-2 border-border pl-2">
           <div className="text-xs text-muted-foreground">
-            {`Closed by ${item.closed_by === "user" ? "a person" : "the agent"}`}
+            {item.closed_by === "auto"
+              ? "Closed in chat"
+              : `Closed by ${item.closed_by === "user" ? "a person" : "the agent"}`}
             {item.closed_at !== null && ` · ${ago(item.closed_at)}`}
           </div>
           {item.resolution && <p className="whitespace-pre-wrap">{item.resolution}</p>}
@@ -100,7 +103,9 @@ function StoredItemFacts({ item }: { item: StoredOpenItem }) {
       )}
       <div className="text-xs text-muted-foreground">
         {`Raised ${ago(item.created_at)}`}
-        {item.raised_by && ` for ${item.raised_by}`}
+        {item.raised_by === RAISED_FROM_CHAT
+          ? " · recorded from chat"
+          : item.raised_by && ` for ${item.raised_by}`}
       </div>
     </>
   );
