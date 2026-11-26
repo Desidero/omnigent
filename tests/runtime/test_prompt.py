@@ -18,6 +18,7 @@ from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     ITEM_LABEL_INSTRUCTION,
+    OPEN_ITEMS_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
     WORKSPACE_IMAGE_INSTRUCTION,
@@ -46,6 +47,7 @@ def _spec(
     spawn: bool = False,
     builtins: tuple[str, ...] = (),
     browser: bool = True,
+    open_items: bool = False,
 ) -> AgentSpec:
     """
     Stub only the AgentSpec fields the instruction builders read.
@@ -60,7 +62,7 @@ def _spec(
                 builtins=[SimpleNamespace(name=name) for name in builtins],
             ),
             spawn=spawn,
-            tool_groups=SimpleNamespace(browser=browser),
+            tool_groups=SimpleNamespace(browser=browser, open_items=open_items),
         ),
     )
 
@@ -586,3 +588,24 @@ def test_item_label_instruction_shows_how_to_pin_a_link() -> None:
     assert re.search(r"\[L\d{1,3}\] \*\*[^*]+\*\* https://\S+", ITEM_LABEL_INSTRUCTION)
     # Other links are named by their markdown text, which the Links list shows.
     assert re.search(r"\[Descriptive name\]\(https://\S+\)", ITEM_LABEL_INSTRUCTION)
+
+
+def test_stored_items_guidance_follows_the_open_items_tool_group() -> None:
+    """Agents with the open items tools are told to use them; others keep text labels."""
+    stored = f"{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
+    spec = _spec("Agent prompt", open_items=True)
+    assert build_instructions_nullable(spec, None, []).endswith(f"\n\n{stored}")
+    assert build_native_startup_instructions(spec) == (
+        f"Agent prompt\n\n{WORKSPACE_IMAGE_INSTRUCTION}\n\n{stored}"
+    )
+    for without_tools in (_spec("Agent prompt"), None):
+        startup = build_native_startup_instructions(without_tools)
+        assert startup.endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
+        assert OPEN_ITEMS_INSTRUCTION not in startup
+    # The tools' instruction names every tool and keeps the text fallback.
+    for name in ("sys_open_items_raise", "sys_open_items_update", "sys_open_items_list"):
+        assert name in OPEN_ITEMS_INSTRUCTION
+    assert "label items in chat only" in OPEN_ITEMS_INSTRUCTION
+    # An item the user closed, as "Comment and close" marks it, is not reopened.
+    assert '"(closed by me)"' in OPEN_ITEMS_INSTRUCTION
+    assert "unless the user asks again" in OPEN_ITEMS_INSTRUCTION

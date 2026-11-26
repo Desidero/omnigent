@@ -11,11 +11,17 @@ from omnigent.runner.app import (
     _native_startup_instructions_from_spec,
 )
 from omnigent.runner.native.orchestration import _opencode_session_instructions_from_spec
-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import (
+    ITEM_LABEL_INSTRUCTION,
+    OPEN_ITEMS_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
-# The stable guidance every native startup carries after the author text.
-_STARTUP_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+# The stable guidance every native startup carries after the author text; without
+# a spec there is no open_items tool group, so items stay text labels.
+_NO_SPEC_GUIDANCE = f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}"
+_STARTUP_GUIDANCE = f"{_NO_SPEC_GUIDANCE}\n\n{OPEN_ITEMS_INSTRUCTION}"
 
 
 def _spec(instructions: str | None) -> AgentSpec:
@@ -44,7 +50,7 @@ def test_native_startup_instructions_from_spec(instructions: str | None, expecte
 
 def test_native_startup_instructions_from_spec_none_spec() -> None:
     """A missing spec still receives stable image guidance."""
-    assert _native_startup_instructions_from_spec(None) == _STARTUP_GUIDANCE
+    assert _native_startup_instructions_from_spec(None) == _NO_SPEC_GUIDANCE
 
 
 @pytest.mark.parametrize("has_spec", [False, True])

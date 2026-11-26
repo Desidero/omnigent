@@ -29,6 +29,11 @@ title and the URL. Pinned links show under **Links** (below).
 [L1] **Release checklist** https://example.com/checklist
 ```
 
+An agent with the `open_items` tool group also records each item with its
+tools before writing it, uses the label they return, and closes items through
+them; see [Open items](open-items.md). It still writes items and closes in the
+chat as above, and labels in chat only when those tools are not available.
+
 SDK harnesses get the instruction with every turn. Native harnesses take
 instructions only at launch, so it joins the stable guidance appended to the
 agent's own instructions there: through Claude Code's `--append-system-prompt`

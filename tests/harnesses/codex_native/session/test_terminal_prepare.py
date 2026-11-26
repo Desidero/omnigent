@@ -15,7 +15,11 @@ import pytest
 
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.harnesses.codex_native import main as codex_native
-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import (
+    ITEM_LABEL_INSTRUCTION,
+    OPEN_ITEMS_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from tests.harnesses.codex_native.session._support import (
     _write_source_rollout,
 )
@@ -32,7 +36,9 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
     result = codex_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Codex is running in the session terminal" in result
-    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
+    assert result.endswith(
+        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
+    )
 
 
 def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
