@@ -6,6 +6,7 @@ import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { useNewSessionProjectPromptStore } from "@/store/newSessionProjectPrompt";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
@@ -1232,6 +1233,19 @@ describe("CommandPalette — actions", () => {
     fireEvent.click(screen.getByText("Go to Settings"));
 
     expect(navigate).toHaveBeenCalledWith("/settings");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("starts New chat on the project prompt where the shell mounts it", () => {
+    useNewSessionProjectPromptStore.setState({ hosted: true });
+    onTestFinished(() => useNewSessionProjectPromptStore.setState({ open: false, hosted: false }));
+    const onOpenChange = vi.fn();
+    renderPalette({ onOpenChange });
+
+    fireEvent.click(screen.getByText("New chat"));
+
+    expect(useNewSessionProjectPromptStore.getState().open).toBe(true);
+    expect(navigate).not.toHaveBeenCalled();
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 

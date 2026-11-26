@@ -6,6 +6,7 @@ import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { startNewSession } from "@/store/newSessionProjectPrompt";
 
 /** Browser Cmd/Ctrl+Shift+O; native shells Cmd/Ctrl+N. */
 export function isNewSessionHotkey(
@@ -16,7 +17,7 @@ export function isNewSessionHotkey(
   return matchesShortcut(e, "session.new", { mac: isMac, native });
 }
 
-/** Navigate to the same new-session route used by the command palette. */
+/** Start a new session as the command palette does: its project prompt, or the plain composer. */
 export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): void {
   const navigate = useNavigate();
   const isEmbedded = useIsEmbedded();
@@ -29,7 +30,7 @@ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): vo
       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
       e.preventDefault();
       e.stopPropagation();
-      navigate("/");
+      startNewSession(navigate);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);

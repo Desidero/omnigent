@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -8,6 +8,7 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 import { SHORTCUT_BINDINGS, type ShortcutId, shortcutKeys } from "@/lib/shortcuts/registry";
+import { useNewSessionProjectPromptStore } from "@/store/newSessionProjectPrompt";
 
 import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
 import { type OpenSessionCommandId, openSessionCommands } from "./openSessionCommands";
@@ -42,6 +43,18 @@ describe("useAppCommands", () => {
     byId.get("go-inbox")!.run();
     byId.get("go-settings")!.run();
     expect(navigate.mock.calls).toEqual([["/inbox"], ["/settings"]]);
+  });
+
+  it("starts New chat on the plain composer, or on the project prompt where it's mounted", () => {
+    const newChat = () => commands().find((command) => command.id === "new-chat")!;
+    newChat().run();
+    expect(navigate.mock.calls).toEqual([["/"]]);
+
+    useNewSessionProjectPromptStore.setState({ hosted: true });
+    onTestFinished(() => useNewSessionProjectPromptStore.setState({ open: false, hosted: false }));
+    newChat().run();
+    expect(useNewSessionProjectPromptStore.getState().open).toBe(true);
+    expect(navigate.mock.calls).toEqual([["/"]]);
   });
 
   it("drops the workspace sidebar's chord where the route owns it", () => {

@@ -329,6 +329,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (numbers increment) and ends it after an empty item.
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
+- `new-session-project-prompt`: when projects exist, the new-session hotkey,
+  the sidebar's New session links and the palette's New chat (either palette)
+  first ask for a project: a "Start a new session in…" picker with No project
+  first, then every project, filtered as you type. Picking one opens the
+  composer with its defaults (`/?project=<name>`). On a project's home page
+  they don't ask: the session starts in that project, in the home's composer
+  over the board (on phones, `/?project=<name>`). The composer already filed
+  under a project starts highlighted. Settings › General › Sessions turns the
+  prompt off. Modified clicks on the links still open a new tab. Below the `md`
+  breakpoint the prompt is a bottom sheet with no search field.
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
   opens and focuses the new-session composer in browsers. Native shells use
   ⌘/Ctrl+N. Embedded apps require focus inside the app.
@@ -539,6 +549,20 @@ and opens the composer with its prompt`).
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
+- With at least one project, press the new-session hotkey or click New session
+  on a desktop-width window: a "Start a new session in…" picker opens over the
+  page you were on. Type part of a project name and press Enter to land on
+  `/?project=<name>` with its defaults; choose No project for a plain composer;
+  Escape leaves you where you were. On a project's home page the hotkey, the
+  sidebar's New session and ⌘K's New chat each open the home's own composer
+  with no picker. Turn off **Ask for a project when starting a session** in
+  Settings and the same actions open the plain composer directly.
+- On a phone with at least one project, tap New session in the drawer: a
+  "Start a new session in" sheet slides up with No project and each project,
+  and the keyboard stays down. Tap a project to land on `/?project=<name>`, or
+  tap outside it, press Escape or drag its handle down to stay where you were.
+  From a project's home page, New session opens that project's composer with
+  no sheet.
 - With the browser app focused, press ⌘+Shift+O (macOS) or
   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
   composer.
@@ -1195,6 +1219,13 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   `tests/server/integration/test_host_session_binding.py::test_managed_launch_action_required_reaches_snapshot_and_stream`
   covers the server. Nothing in this repo emits the stage, so a live check needs
   a deployment that does.
+- **`new-session-project-prompt`:** no browser-level coverage; component
+  coverage in `web/src/shell/NewSessionProjectPrompt.test.tsx` (picker, sheet,
+  each entry point on a project home), `web/src/store/newSessionProjectPrompt.test.ts` (which clicks
+  and shortcuts ask) and `web/src/shell/Sidebar.newSessionPrompt.test.tsx`.
+  Browser tests that expect New session to open the composer on a server that
+  holds projects install `DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT`
+  (`tests/e2e_ui/conftest.py`) first.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the

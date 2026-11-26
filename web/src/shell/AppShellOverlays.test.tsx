@@ -14,6 +14,11 @@ vi.mock("./CommandPalette", () => ({
 vi.mock("@/components/KeyboardShortcutsDialog", () => ({ KeyboardShortcutsDialog: () => null }));
 vi.mock("@/components/onboarding/HostImportReview", () => ({ ImportReviewGate: () => null }));
 vi.mock("./RecentSessionsSwitcher", () => ({ RecentSessionsSwitcher: () => null }));
+vi.mock("./NewSessionProjectPrompt", () => ({
+  NewSessionProjectPrompt: ({ paletteOpen }: { paletteOpen: boolean }) => (
+    <div data-testid="new-session-project-prompt" data-palette-open={String(paletteOpen)} />
+  ),
+}));
 
 afterEach(cleanup);
 // Which flagged modules this case imported. Each case loads the shell and these mocks afresh,
@@ -63,6 +68,18 @@ async function renderOverlays(
     </QueryClientProvider>,
   );
 }
+
+describe("AppShellOverlays new-session project prompt", () => {
+  it.each([false, true])(
+    "mounts the prompt beside the palette (quick_pick_palette: %s)",
+    async (quickPick) => {
+      const { findByTestId } = await renderOverlays({ quick_pick_palette: quickPick });
+      const prompt = await findByTestId("new-session-project-prompt");
+      // The prompt and the palette replace each other, so it follows the palette's state.
+      expect(prompt.dataset.paletteOpen).toBe("true");
+    },
+  );
+});
 
 describe("AppShellOverlays palette flag", () => {
   const notOn = [
