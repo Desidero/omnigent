@@ -69,6 +69,7 @@ from omnigent.db.enum_codecs import (
     encode_session_live_status,
 )
 from omnigent.db.query_context import query_name_scope
+from omnigent.db.side_schemas import delete_conversation_rows as delete_side_store_rows
 from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
@@ -7873,6 +7874,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 lambda session, batch=batch_ids: delete_metadata(session, batch),
             )
         self._delete_session_journals(subtree_ids)
+        # Side stores hold rows by conversation id; their failures stay theirs.
+        delete_side_store_rows(self._engine, subtree_ids)
 
         return True
 
