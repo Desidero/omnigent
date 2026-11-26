@@ -160,6 +160,55 @@ def _changed_json(results: Sequence[ChangedItem]) -> list[dict[str, Any]]:
     ]
 
 
+def agent_keeps_open_items(
+    session: Conversation, agent_store: AgentStore, agent_cache: Any
+) -> bool:
+    """Whether the session's agent (or its named sub-agent) has the ``open_items`` tool group."""
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    agent = agent_store.get(session.agent_id) if session.agent_id else None
+    if agent is None:
+        return False
+    spec = agent_cache.load(
+        agent.id, agent.bundle_location, expand_env=agent.operator_authored
+    ).spec
+    if session.sub_agent_name:
+        spec = _find_spec_by_name(spec, session.sub_agent_name)
+    return spec is not None and spec.tool_groups.open_items
+
+
+def item_owner(
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    session: Conversation,
+    user_id: str | None,
+) -> str:
+    """The user an item is raised for: the root session's owner."""
+    if permission_store is None:
+        return RESERVED_USER_LOCAL
+    root = session.root_conversation_id or session.id
+    owner = conversation_store.get_session_owner(root, owner_only=True)
+    return owner or user_id or RESERVED_USER_LOCAL
+
+
+async def publish_open_items_changed(
+    store: OpenItemsStore, session_id: str, labels: list[str]
+) -> None:
+    """Tell the session's stream which items changed, with its open count."""
+    if not labels:
+        return
+    open_count = await asyncio.to_thread(store.open_count, session_id)
+    session_stream.publish(
+        session_id,
+        {
+            "type": OPEN_ITEMS_CHANGED_EVENT,
+            "conversation_id": session_id,
+            "labels": labels,
+            "open_count": open_count,
+        },
+    )
+
+
 def create_open_items_router(
     conversation_store: ConversationStore,
     *,
@@ -178,8 +227,6 @@ def create_open_items_router(
     :param auth_provider: Identifies the caller; ``None`` in single-user mode.
     :param permission_store: Session grants; ``None`` disables enforcement.
     """
-    from omnigent.runtime.workflow import _find_spec_by_name
-
     router = APIRouter()
 
     async def _session(request: Request, session_id: str, level: int) -> Conversation:
@@ -193,18 +240,6 @@ def create_open_items_router(
         if conversation is None:
             raise session_not_found()
         return conversation
-
-    def _agent_keeps_open_items(session: Conversation) -> bool:
-        """Whether the session's agent (or its named sub-agent) has the tool group."""
-        agent = agent_store.get(session.agent_id) if session.agent_id else None
-        if agent is None:
-            return False
-        spec = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.operator_authored
-        ).spec
-        if session.sub_agent_name:
-            spec = _find_spec_by_name(spec, session.sub_agent_name)
-        return spec is not None and spec.tool_groups.open_items
 
     async def _agent_session(request: Request, session_id: str) -> Conversation:
         """The session, when the call comes from its own runner for an agent with the group."""
@@ -226,7 +261,7 @@ def create_open_items_router(
                     "Only the session's bound runner writes its open items",
                     code=ErrorCode.FORBIDDEN,
                 )
-        if not await asyncio.to_thread(_agent_keeps_open_items, session):
+        if not await asyncio.to_thread(agent_keeps_open_items, session, agent_store, agent_cache):
             raise OmnigentError(
                 "Open items need an agent with the open_items tool group",
                 code=ErrorCode.FORBIDDEN,
@@ -234,25 +269,9 @@ def create_open_items_router(
         return session
 
     def _owner(session: Conversation, user_id: str | None) -> str:
-        if permission_store is None:
-            return RESERVED_USER_LOCAL
-        root = session.root_conversation_id or session.id
-        owner = conversation_store.get_session_owner(root, owner_only=True)
-        return owner or user_id or RESERVED_USER_LOCAL
+        return item_owner(conversation_store, permission_store, session, user_id)
 
-    async def _publish(store: OpenItemsStore, session_id: str, labels: list[str]) -> None:
-        if not labels:
-            return
-        open_count = await asyncio.to_thread(store.open_count, session_id)
-        session_stream.publish(
-            session_id,
-            {
-                "type": OPEN_ITEMS_CHANGED_EVENT,
-                "conversation_id": session_id,
-                "labels": labels,
-                "open_count": open_count,
-            },
-        )
+    _publish = publish_open_items_changed
 
     @router.get("/sessions/{session_id}/open-items")
     async def list_open_items(

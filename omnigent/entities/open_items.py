@@ -52,6 +52,8 @@ ITEMS_PER_SESSION = 500
 RAISE_BATCH_MAX = 10
 UPDATE_BATCH_MAX = 20
 LIST_PAGE_MAX = 200
+# raised_by (and closed_by) of what the server records from labels written only in chat.
+RAISED_FROM_CHAT = "auto"
 # Names the write that raised an item, e.g. "tool:<call id>:<index>".
 IDEMPOTENCY_KEY_MAX_CHARS = 128
 BATCH_KEY_MAX_CHARS = 120

@@ -121,6 +121,7 @@ from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import (
     background_session_titles,
+    open_items_auto,
     presence,
     session_live_state,
     session_pull_requests,
@@ -5577,6 +5578,7 @@ def _publish_status(
         # archives publish idle without persisting it, and skip both.
         session_pull_requests.notify_turn_end(session_id)
         background_session_titles.notify_turn_end(session_id)
+        open_items_auto.notify_turn_end(session_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
