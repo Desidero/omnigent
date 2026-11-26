@@ -22,6 +22,7 @@ from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
 from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
+from omnigent.open_items_availability import OPEN_ITEMS_HEADER
 from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER, POLICY_MODULES_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
@@ -45,6 +46,7 @@ from omnigent.server.auth import (
 from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.open_items import open_store as open_items_store
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
@@ -323,6 +325,10 @@ def register_agent_routes(
         memory_search_available = getattr(request.app.state, "memory_search_available", None)
         selection_headers[MEMORY_SEARCH_HEADER] = (
             "1" if memory_search_available is not None and memory_search_available() else "0"
+        )
+        # The runner keeps the open items tools only when this server stores them.
+        selection_headers[OPEN_ITEMS_HEADER] = (
+            "1" if open_items_store(conversation_store) is not None else "0"
         )
         return Response(
             content=bundle_bytes,

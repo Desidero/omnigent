@@ -4453,6 +4453,44 @@ async def test_runner_keeps_user_inbox_tools_only_when_the_server_turns_them_on(
 
 
 @pytest.mark.asyncio
+async def test_runner_keeps_open_items_tools_only_when_the_server_stores_them(tmp_path):
+    from omnigent.open_items_availability import OPEN_ITEMS_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("items-agent")
+    # No header is a server without the open items routes: the agent keeps text labels.
+    gate_headers = [{OPEN_ITEMS_HEADER: "0"}, {OPEN_ITEMS_HEADER: "1"}, {}]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_items", session_id="session"
+            )
+            for _ in range(3)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return "sys_open_items_raise" in names
+
+    assert [advertised(result.spec) for result in results] == [False, True, False]
+
+
+@pytest.mark.asyncio
 async def test_runner_offers_memory_tools_only_when_the_server_says_memory_is_available(tmp_path):
     from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
     from omnigent.tools.manager import ToolManager
