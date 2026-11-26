@@ -608,6 +608,9 @@ request carries it, and the series holds a copy until it merges).
 | `chat-item-labels` | Bracketed labels like `[Q2]` in chat become chips that preview the item they refer to; `~~[Q2]~~` closes it, and an Open items panel lists what is still open. Adds the labelling rules to agents' instructions. Needs `codex-native-mode-instructions` and `session-labels-ui`. | proposed |
 | `web-reconnect-shell-inputs` | A queued `!command` no longer stays stuck at the bottom of the chat after the connection drops. | PR open ([#11395](https://github.com/omnigent-ai/omnigent/pull/11395)) |
 | `chat-item-comments` | Comment on labelled items and send the comments together as one structured message. Needs `chat-item-labels`. | proposed |
+| `queue-combine` | The queue strip offers **Combine** for adjacent queued messages, and **Send all** where rows can be steered. Needs `chat-item-comments`. | proposed |
+| `pr-watch` | A session watches its pull requests: while it is idle the server wakes it about failed checks, owners' comments and reviews, and conflicts, until each is green, merged or closed. Off by default (`OMNIGENT_FEATURES=pr_watch`). | proposed |
+| `pr-refresh-main-checkout` | A session in a repository's main checkout keeps looking for pull requests at every turn end, so one opened later shows up. | carried from [#14515](https://github.com/omnigent-ai/omnigent/pull/14515) (not ours, open); drop when it merges |
 | `session-labels-ui` | View and edit a session's labels in the web UI, delete labels through the API, and default labels per project. | PR open ([#11398](https://github.com/omnigent-ai/omnigent/pull/11398) for the server, [#11399](https://github.com/omnigent-ai/omnigent/pull/11399) for the web UI (draft)) |
 | `gateway-request-tags` | Requests to a Databricks Unity Gateway carry the session id and labels as request tags. | proposed (issue drafted) |
 | `claude-native-delegate-idle` | A Claude lead stops showing Working, and takes follow-ups without Steer, once its turn ends while agent-team teammates keep running: teammates count as background agents for upstream's background-agent hold ([#12561](https://github.com/omnigent-ai/omnigent/pull/12561)). | proposed (the status-file and OSC parts landed upstream as #12561) |
@@ -652,8 +655,6 @@ anything is wrong with it.
 | `sidebar-updated-filter` | optional |
 | `sidebar-sticky-toolbar` | optional |
 | `chat-features` | optional |
-| `pr-watch` | optional |
-| `queue-combine` | optional |
 
 To restore one, apply it from that commit onto the foundation it will have
 now (`BASE`, or the series it needs: what its `# needs:` lines named, less
