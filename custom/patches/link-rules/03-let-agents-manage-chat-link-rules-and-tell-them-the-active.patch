@@ -24,10 +24,14 @@ references in the form the chat links instead of wrapping them in code.
   for issue #123 or PR #123 rather than a bare #123, and owner/repo#123 for
   another repository, naming the provider's !123 only when the workspace
   remote's git rule uses it; outside a checkout it is left out. SDK harnesses
-  get it per turn from rules and a workspace remote the runner rereads after
-  a minute; native Claude and Codex get it at launch, from the runner or from
-  omnigent claude/codex, so a rule changed mid-session reaches their prompt
-  on the next launch. A failed read just leaves it out.
+  get it per turn from rules the runner rereads after a minute; native Claude
+  and Codex get it at launch, from the runner or from omnigent claude/codex,
+  so a rule changed mid-session reaches their prompt on the next launch. A
+  failed read just leaves it out.
+- The workspace remote stays off the turn path: the runner looks it up in a
+  worker thread (WorkspaceGitCache), serves the last lookup while a lookup
+  older than a minute is redone, and holds only a workspace's first turn, for
+  at most a second. Outside a checkout it looks nothing up.
 - The instruction follows the item-label one: the native startup composer
   (build_native_startup_instructions) takes the rules and the git workspace
   for runner launches of Claude and Codex, and omnigent claude/codex append
@@ -41,15 +45,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/AGENT_YAML_SPEC.md                       |   1 +
- docs/chat-link-rules.md                       |  48 +++++
+ docs/chat-link-rules.md                       |  50 ++++++
  feature-map/preferences.md                    |  19 +-
  omnigent/harnesses/claude_native/main.py      |  16 +-
  omnigent/harnesses/codex_native/main.py       |  18 +-
  omnigent/native/native_terminal.py            |  36 ++++
  omnigent/policies/builtins/safety.py          |  37 ++++
- omnigent/runner/app.py                        |  50 +++++-
+ omnigent/runner/app.py                        |  56 +++++-
  omnigent/runner/native/orchestration.py       |  29 ++-
- omnigent/runner/pr_resource.py                |  25 +++
+ omnigent/runner/pr_resource.py                |  90 ++++++++++
  omnigent/runner/tool_dispatch.py              | 120 +++++++++++++
  omnigent/runtime/policies/builder.py          |  24 ++-
  omnigent/runtime/prompt.py                    |  81 ++++++++-
@@ -58,14 +62,14 @@ Signed-off-by: Desidero <desidero@gmail.com>
  omnigent/tools/builtins/web_fetch.py          |   1 +
  omnigent/tools/manager.py                     |  15 ++
  tests/runner/test_link_rules_tool_dispatch.py | 170 ++++++++++++++++++
- tests/runner/test_pr_resource.py              |  23 +++
+ tests/runner/test_pr_resource.py              |  86 +++++++++
  tests/runtime/policies/test_builder.py        |  16 +-
  .../policies/test_builder_session_policies.py |   6 +-
  .../policies/test_yaml_full_roundtrip.py      |   1 +
  tests/runtime/test_prompt.py                  |  96 ++++++++++
  tests/test_native_terminal.py                 |  26 +++
  tests/tools/test_manager.py                   |   8 +-
- 25 files changed, 942 insertions(+), 24 deletions(-)
+ 25 files changed, 1078 insertions(+), 24 deletions(-)
  create mode 100644 omnigent/tools/builtins/link_rules.py
  create mode 100644 tests/runner/test_link_rules_tool_dispatch.py
 
@@ -82,10 +86,10 @@ index 755f4648b90a1315553c72174cc664918f600ba7..37bdc38b59caa3c95b0cd6f542a6c050
  
  Every group except `files` defaults to `true`, so omitting the block changes
 diff --git a/docs/chat-link-rules.md b/docs/chat-link-rules.md
-index 740c2e2c99b75f986d01e1c552b5fc9a2e2a4e53..04222953d03d769997798ed5ae0b46a7566cb63e 100644
+index 740c2e2c99b75f986d01e1c552b5fc9a2e2a4e53..3807cdde392c0dc4511dcb6985d73f45eccb429b 100644
 --- a/docs/chat-link-rules.md
 +++ b/docs/chat-link-rules.md
-@@ -193,3 +193,51 @@ config); without them the defaults apply and can't be changed.
+@@ -193,3 +193,53 @@ config); without them the defaults apply and can't be changed.
    a version check.
  - The [shared preferences API](shared-preferences-api.md) reads and writes the
    same value, with its conflict handling.
@@ -133,8 +137,10 @@ index 740c2e2c99b75f986d01e1c552b5fc9a2e2a4e53..04222953d03d769997798ed5ae0b46a7
 +checkout, or with every `git` rule off, there is no such sentence.
 +
 +A rule saved mid-session renders in the chat right away. SDK harnesses read
-+the rules again for a later turn (the runner keeps them, and each workspace's
-+remote, for up to a minute).
++the rules again for a later turn (the runner keeps them for up to a minute).
++The runner looks up each workspace's remote in the background: a turn waits
++at most a second for the first lookup, and a lookup older than a minute is
++used once more while a fresh one runs.
 +Native Claude and Codex sessions get their instructions once, at launch, so
 +they see a changed rule in their prompt only after their next launch.
 diff --git a/feature-map/preferences.md b/feature-map/preferences.md
@@ -382,10 +388,18 @@ index 00efa6ead9d76f3a1f0b7d27fd43aa8939e1b6bb..cf8dd02500657bf13600fbdb57f9a0e4
  
  
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96dd69d9286 100644
+index 99e4daec68353299180cc96b65ab0cbfd449b239..580b317ca91d53cd00f7cf3ea750a6952649128b 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
-@@ -76,12 +76,14 @@ from omnigent.harness_plugins import (
+@@ -34,6 +34,7 @@ if TYPE_CHECKING:
+     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+     from omnigent.inner.claude_model_access import ClaudeModelAccess
+     from omnigent.runner.mcp_manager import RunnerMcpManager
++    from omnigent.runner.pr_resource import WorkspaceGitCache
+     from omnigent.runner.tool_dispatch import UnknownSessionWorkspace
+     from omnigent.terminals.registry import TerminalRegistry
+ 
+@@ -76,12 +77,14 @@ from omnigent.harness_plugins import (
      spawn_env_builders,
  )
  from omnigent.inner.executor import NativeTurnAcceptance
@@ -400,7 +414,7 @@ index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96d
  from omnigent.runner import native as _native
  from omnigent.runner import pending_approvals, pr_reports
  from omnigent.runner import subagent_work as _subagent_work
-@@ -227,6 +229,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
+@@ -227,6 +230,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
  from omnigent.runtime.prompt import (
      build_instructions,
      build_instructions_nullable,
@@ -408,27 +422,29 @@ index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96d
      raw_author_instructions,
  )
  from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
-@@ -245,6 +248,8 @@ _BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="run
+@@ -245,6 +249,10 @@ _BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="run
  
  # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
  _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 +# How long a turn's chat-links instruction reuses the last read of the rules.
 +_LINK_RULES_CACHE_TTL_S = 60.0
++# How long a turn waits for the first lookup of its workspace's git remote.
++_GIT_WORKSPACE_FIRST_WAIT_S = 1.0
  
  
  # Pending questions outlive prompt delivery; poll outside the turn watchdog.
-@@ -1559,6 +1564,10 @@ def create_runner_app(
+@@ -1559,6 +1567,10 @@ def create_runner_app(
      # snapshot and updated by ``effort_change``. In-process harnesses learn the
      # effort only from the forwarded turn body, which is built field by field.
      _session_reasoning_effort: dict[str, str] = {}
 +    # (fetched at, rules): the user's chat link rules, re-read after a TTL.
 +    _link_rules_cache: list[tuple[float, tuple[LinkRule, ...]]] = []
-+    # workspace path → (resolved at, its git remote or None outside a checkout).
-+    _git_workspace_cache: dict[str, tuple[float, GitWorkspace | None]] = {}
++    # Each workspace's git remote, made on the first turn that needs one.
++    _git_workspace_cache: list[WorkspaceGitCache] = []
      _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool]] = {}
      _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
      _session_cursor_model_names: dict[str, dict[str, str]] = {}
-@@ -6354,6 +6363,29 @@ def create_runner_app(
+@@ -6354,6 +6366,32 @@ def create_runner_app(
                  if _turn_message_bodies.get(conv) is msg_body:
                      _turn_message_bodies.pop(conv, None)
  
@@ -438,7 +454,8 @@ index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96d
 +        Rules are per user and a runner serves one user, so one cache entry
 +        covers every session; a saved change reaches the next turn after
 +        :data:`_LINK_RULES_CACHE_TTL_S`. The session's workspace decides the
-+        issue and pull request wording, re-resolved after the same interval.
++        issue and pull request wording; its remote is looked up in the
++        background and refreshed after the same interval.
 +        """
 +        now = time.monotonic()
 +        if not _link_rules_cache or now - _link_rules_cache[0][0] > _LINK_RULES_CACHE_TTL_S:
@@ -446,19 +463,21 @@ index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96d
 +        git_workspace: GitWorkspace | None = None
 +        workspace = await _session_runtime_cwd(conv)
 +        if workspace is not None:
-+            cached = _git_workspace_cache.get(str(workspace))
-+            if cached is None or now - cached[0] > _LINK_RULES_CACHE_TTL_S:
-+                from omnigent.runner.pr_resource import workspace_git
++            if not _git_workspace_cache:
++                from omnigent.runner.pr_resource import WorkspaceGitCache
 +
-+                cached = (now, await asyncio.to_thread(workspace_git, workspace))
-+                _git_workspace_cache[str(workspace)] = cached
-+            git_workspace = cached[1]
++                _git_workspace_cache.append(
++                    WorkspaceGitCache(
++                        ttl_s=_LINK_RULES_CACHE_TTL_S, first_wait_s=_GIT_WORKSPACE_FIRST_WAIT_S
++                    )
++                )
++            git_workspace = await _git_workspace_cache[0].get(workspace)
 +        return link_rule_instructions(_link_rules_cache[0][1], git_workspace)
 +
      def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
          """Reasoning block to forward on a turn, or ``None`` when unset.
  
-@@ -6484,15 +6516,20 @@ def create_runner_app(
+@@ -6484,15 +6522,20 @@ def create_runner_app(
              )
              # Gated harnesses use nullable to avoid the fallback literal.
              _authored_bg = raw_author_instructions(cached_spec) is not None
@@ -480,7 +499,7 @@ index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96d
                  )
              # Warn once per (conversation, harness, delivery) if the agent has
              # authored instructions but the harness can't deliver them.
-@@ -7276,10 +7313,14 @@ def create_runner_app(
+@@ -7276,10 +7319,14 @@ def create_runner_app(
                      if _instr_spec_ds is not None:
                          _per_req_instr = cast(str | None, body.get("instructions"))
                          _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
@@ -496,7 +515,7 @@ index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96d
                              ),
                          )
                          # Gated harnesses get nullable — skip the fallback literal.
-@@ -7291,7 +7332,10 @@ def create_runner_app(
+@@ -7291,7 +7338,10 @@ def create_runner_app(
                              _instr_body = {
                                  **body,
                                  "instructions": build_instructions(
@@ -608,10 +627,18 @@ index 708f89d80db0153e200a61213770d3a85898b12f..6de62fb7257542885f0747e96686c3c2
          allowed_tools=routed_spawn_tools,
          # The route-turn hook is registered only when this session can
 diff --git a/omnigent/runner/pr_resource.py b/omnigent/runner/pr_resource.py
-index 39a93eac859f72ed129cd1e2431674e8c895433d..9896fab252fd6e3654d022c6ceeada2f3b295cae 100644
+index 39a93eac859f72ed129cd1e2431674e8c895433d..bec1e60d5f17911b7d87b71c500ba5cabd80c92f 100644
 --- a/omnigent/runner/pr_resource.py
 +++ b/omnigent/runner/pr_resource.py
-@@ -26,6 +26,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
+@@ -12,6 +12,7 @@ Servers that track a session's PRs vouch for the PR a request targets
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import contextvars
+ import dataclasses
+ import functools
+@@ -26,6 +27,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
  from contextlib import contextmanager, suppress
  from contextvars import ContextVar
  from dataclasses import dataclass
@@ -619,7 +646,7 @@ index 39a93eac859f72ed129cd1e2431674e8c895433d..9896fab252fd6e3654d022c6ceeada2f
  from threading import Lock
  from typing import Any, ParamSpec, TypeVar
  
-@@ -40,6 +41,7 @@ from omnigent.git_providers import (
+@@ -40,6 +42,7 @@ from omnigent.git_providers import (
      providers,
      resolve_remote,
  )
@@ -627,7 +654,7 @@ index 39a93eac859f72ed129cd1e2431674e8c895433d..9896fab252fd6e3654d022c6ceeada2f
  from omnigent.runner import pr_reports
  from omnigent.runner.git_providers import (
      PR_DIFF_OBJECT,
-@@ -316,6 +318,29 @@ def resolve_provider(
+@@ -316,6 +319,93 @@ def resolve_provider(
      return _resolve(root, _default_pr(session_id, pr_url))
  
  
@@ -652,6 +679,70 @@ index 39a93eac859f72ed129cd1e2431674e8c895433d..9896fab252fd6e3654d022c6ceeada2f
 +        return GitWorkspace()
 +    provider = None if resolution.unclaimed else resolution.provider
 +    return GitWorkspace(provider=provider, host=resolution.remote_host)
++
++
++class WorkspaceGitCache:
++    """Each workspace's :func:`workspace_git`, resolved off the turn path.
++
++    Outside a checkout (a stat walk) there is nothing to resolve. In one, a
++    turn gets the cached remote; an entry older than ``ttl_s`` is still served
++    while a background lookup replaces it. Only a workspace seen for the first
++    time waits, for at most ``first_wait_s``, then reads as a checkout of
++    unknown remote until its lookup lands.
++
++    :param ttl_s: How long a resolved remote counts as current.
++    :param first_wait_s: How long a first lookup may hold up a turn.
++    :param resolve: The blocking lookup, run in a worker thread.
++    """
++
++    def __init__(
++        self,
++        *,
++        ttl_s: float,
++        first_wait_s: float,
++        resolve: Callable[[str], GitWorkspace | None] = workspace_git,
++    ) -> None:
++        self._ttl_s = ttl_s
++        self._first_wait_s = first_wait_s
++        self._resolve = resolve
++        self._entries: dict[str, tuple[float, GitWorkspace | None]] = {}
++        self._lookups: dict[str, asyncio.Task[GitWorkspace | None]] = {}
++
++    async def get(self, workspace: Path) -> GitWorkspace | None:
++        """The workspace's git remote, or ``None`` outside a git checkout.
++
++        :param workspace: The session's workspace directory.
++        :returns: The cached or freshly resolved remote; ``GitWorkspace()``
++            while a first lookup is still running.
++        """
++        from omnigent.runtime.prompt import is_git_checkout
++
++        if not is_git_checkout(workspace):
++            return None
++        key = str(workspace)
++        entry = self._entries.get(key)
++        if entry is not None and time.monotonic() - entry[0] <= self._ttl_s:
++            return entry[1]
++        lookup = self._lookups.get(key)
++        if lookup is None:
++            lookup = asyncio.get_running_loop().create_task(self._lookup(key))
++            self._lookups[key] = lookup
++        if entry is not None:
++            return entry[1]
++        try:
++            return await asyncio.wait_for(asyncio.shield(lookup), self._first_wait_s)
++        except TimeoutError:
++            return GitWorkspace()
++
++    async def _lookup(self, key: str) -> GitWorkspace | None:
++        try:
++            resolved = await asyncio.to_thread(self._resolve, key)
++        except Exception:  # the prompt hint is optional; never fail a turn
++            _logger.debug("Could not resolve the git remote of %s", key, exc_info=True)
++            resolved = GitWorkspace()
++        self._entries[key] = (time.monotonic(), resolved)
++        self._lookups.pop(key, None)
++        return resolved
 +
 +
  def _facet(provider_id: str | None) -> PullRequestFacet | None:
@@ -1344,10 +1435,23 @@ index 0000000000000000000000000000000000000000..c84dbf4c1eb3e673d6ae148ab73cb030
 +    }
 +    assert "provider=gitlab, host=g.example" in ask_on_link_rule_change(_event(git))["reason"]
 diff --git a/tests/runner/test_pr_resource.py b/tests/runner/test_pr_resource.py
-index caefa75107da8533619048b75785126d24c5e7e1..68438e0520d6155fda577d929740b4294e810c6b 100644
+index caefa75107da8533619048b75785126d24c5e7e1..db92968a215dfbcfb8beb62063fc1459e7e57b07 100644
 --- a/tests/runner/test_pr_resource.py
 +++ b/tests/runner/test_pr_resource.py
-@@ -23,6 +23,7 @@ from omnigent.git_providers import (
+@@ -2,10 +2,12 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import json
+ import os
+ import subprocess
+ import sys
++import threading
+ import types
+ from collections.abc import Iterator, Sequence
+ from pathlib import Path
+@@ -23,6 +25,7 @@ from omnigent.git_providers import (
      load_facet,
      reset_for_tests,
  )
@@ -1355,7 +1459,7 @@ index caefa75107da8533619048b75785126d24c5e7e1..68438e0520d6155fda577d929740b429
  from omnigent.runner import github_resource, pr_resource
  from omnigent.runner.git_providers import (
      ProviderCapabilities,
-@@ -712,3 +713,25 @@ def test_the_github_facet_loads_without_the_panel_module() -> None:
+@@ -712,3 +715,86 @@ def test_the_github_facet_loads_without_the_panel_module() -> None:
      )
  
      assert result.returncode == 0, result.stderr
@@ -1381,6 +1485,67 @@ index caefa75107da8533619048b75785126d24c5e7e1..68438e0520d6155fda577d929740b429
 +
 +def test_workspace_git_is_none_outside_a_checkout(tmp_path: Path) -> None:
 +    assert pr_resource.workspace_git(tmp_path) is None
++
++
++_GITHUB = GitWorkspace("github", "github.com")
++_GITLAB = GitWorkspace("gitlab", "gitlab.com")
++
++
++class _HeldRemote:
++    """A ``workspace_git`` stand-in whose lookups block until released."""
++
++    def __init__(self, remote: GitWorkspace) -> None:
++        self.remote = remote
++        self.calls = 0
++        self.released = threading.Event()
++
++    def __call__(self, root: str) -> GitWorkspace:
++        self.calls += 1
++        assert self.released.wait(budget(5)), "lookup never released"
++        return self.remote
++
++
++async def _await_remote(
++    cache: pr_resource.WorkspaceGitCache, workspace: Path, expected: GitWorkspace
++) -> None:
++    deadline = asyncio.get_running_loop().time() + budget(5)
++    while await cache.get(workspace) != expected:
++        assert asyncio.get_running_loop().time() < deadline, f"never resolved to {expected}"
++        await asyncio.sleep(0.01)
++
++
++async def test_workspace_git_cache_looks_nothing_up_outside_a_checkout(tmp_path: Path) -> None:
++    lookup = _HeldRemote(_GITHUB)
++    cache = pr_resource.WorkspaceGitCache(ttl_s=60, first_wait_s=budget(5), resolve=lookup)
++
++    assert await cache.get(tmp_path) is None
++    assert lookup.calls == 0
++
++
++async def test_workspace_git_cache_bounds_the_first_lookup(repo: Path) -> None:
++    lookup = _HeldRemote(_GITLAB)
++    cache = pr_resource.WorkspaceGitCache(ttl_s=60, first_wait_s=0.05, resolve=lookup)
++
++    # A slow first lookup leaves the turn with a checkout of unknown remote.
++    assert await cache.get(repo) == GitWorkspace()
++    assert await cache.get(repo) == GitWorkspace()
++    lookup.released.set()
++    await _await_remote(cache, repo, _GITLAB)
++    assert lookup.calls == 1
++
++
++async def test_workspace_git_cache_serves_the_last_remote_while_it_refreshes(repo: Path) -> None:
++    lookup = _HeldRemote(_GITHUB)
++    lookup.released.set()
++    # A negative TTL makes every entry stale, so each read starts a refresh.
++    cache = pr_resource.WorkspaceGitCache(ttl_s=-1, first_wait_s=budget(5), resolve=lookup)
++    assert await cache.get(repo) == _GITHUB
++
++    lookup.released.clear()
++    lookup.remote = _GITLAB
++    assert await cache.get(repo) == _GITHUB
++    lookup.released.set()
++    await _await_remote(cache, repo, _GITLAB)
 diff --git a/tests/runtime/policies/test_builder.py b/tests/runtime/policies/test_builder.py
 index 18c45c26d0a4d58783a3ff2d34d35ab8511a2301..0c8abfc2ac8ad174622879da4f5f2d9453ffcc2d 100644
 --- a/tests/runtime/policies/test_builder.py
