@@ -16,7 +16,9 @@ and write each with the returned label, never pick a number or write a
 new label without recording it, adopt a label already written in chat by raising it with
 that label, close with sys_open_items_update and a one-line resolution
 and then strike the label in chat, list instead of relying on memory,
-and still write every item and close in chat. It ends with the fallback:
+and still write every item and close in chat. Items the user closed
+(as a comment heading ending "(closed by me)" says) stay closed unless
+the user asks again. It ends with the fallback:
 without the tools, label in chat only. SDK harnesses get it every turn,
 right after the item-label instruction; native harnesses get it at
 launch, after the stable guidance (build_native_startup_instructions is
@@ -35,20 +37,20 @@ Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/AGENT_YAML_SPEC.md                       |  3 +-
  docs/chat-item-labels.md                      |  5 ++
- docs/open-items.md                            |  7 +++
+ docs/open-items.md                            |  8 +++
  feature-map/open-items.md                     |  2 +
- omnigent/runtime/prompt.py                    | 54 ++++++++++++++++++-
+ omnigent/runtime/prompt.py                    | 57 ++++++++++++++++++-
  .../claude_native/test_claude_native.py       | 14 +++--
  .../session/test_terminal_prepare.py          | 10 +++-
  .../codex_native/test_codex_native.py         | 14 +++--
  .../test_app_native_startup_instructions.py   | 14 +++--
- ...pp_sessions_native_terminals_autocreate.py | 27 +++++++---
- ...t_app_sessions_native_terminals_runtime.py | 10 ++--
+ ...pp_sessions_native_terminals_autocreate.py | 27 ++++++---
+ ...t_app_sessions_native_terminals_runtime.py | 10 +++-
  tests/runner/test_runner_dispatch.py          |  2 +
  tests/runner/test_runner_entry.py             |  5 ++
- tests/runtime/test_prompt.py                  | 22 +++++++-
+ tests/runtime/test_prompt.py                  | 25 +++++++-
  tests/spec/test_resolve_agent_bundle.py       | 10 +++-
- 15 files changed, 168 insertions(+), 31 deletions(-)
+ 15 files changed, 175 insertions(+), 31 deletions(-)
 
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
 index 3edb6188b02e1a3723751c3dc2387c119cd176ac..53ddc5ac6b2812198019137083d219ddecc9b134 100644
@@ -81,10 +83,10 @@ index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..e105c2cf4da3c25c91b18c3550d3a84f
  instructions only at launch, so it joins the stable guidance appended to the
  agent's own instructions there: through Claude Code's `--append-system-prompt`
 diff --git a/docs/open-items.md b/docs/open-items.md
-index fee612b2eea945e0b345eaefd88c826c35294591..edcf7fc66dc08c37925141727f98c0dd4fb6a136 100644
+index fee612b2eea945e0b345eaefd88c826c35294591..be8ef7323d7070209e1c15aacb0d6b0323406285 100644
 --- a/docs/open-items.md
 +++ b/docs/open-items.md
-@@ -50,6 +50,13 @@ its first attempt allocated. Two raises at once in one session never get the
+@@ -50,6 +50,14 @@ its first attempt allocated. Two raises at once in one session never get the
  same label. Adopting a label from chat takes it only if no item has it, and
  moves counting past it.
  
@@ -92,8 +94,9 @@ index fee612b2eea945e0b345eaefd88c826c35294591..edcf7fc66dc08c37925141727f98c0dd
 +every item, pinned links included, with `sys_open_items_raise` before presenting
 +it, with a topic, and write it with the returned label, never pick a number or
 +write a new label without recording it, close with `sys_open_items_update` and a one-line resolution and then
-+strike the label in chat, list instead of relying on memory, and label in chat
-+only if the tools are missing.
++strike the label in chat, list instead of relying on memory, leave an item the
++user closed closed (one whose comment heading ends `(closed by me)` included)
++unless the user asks again, and label in chat only if the tools are missing.
 +
  ### Which sessions get the tools
  
@@ -116,7 +119,7 @@ index c123168e0ffca740a9090beb92d20b02cd1326e0..2e5e10b9e470677aa50e496de84dfb86
 +- A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the instruction's last sentence covers that.
  - Labels are unique per session, not across a session tree: a child session counts from Q1.
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..da19205196d23b4f9ec7415137cd1e640b0345c0 100644
+index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..70c3ae67926c25a5e4846ffd21cb1a0a0c9efc33 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
 @@ -2,6 +2,8 @@
@@ -128,7 +131,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..da19205196d23b4f9ec7415137cd1e64
  import json
  import re
  from collections.abc import Sequence
-@@ -91,6 +93,49 @@ ITEM_LABEL_INSTRUCTION = (
+@@ -91,6 +93,52 @@ ITEM_LABEL_INSTRUCTION = (
      "closing settled ones keeps that list accurate."
  )
  
@@ -146,6 +149,9 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..da19205196d23b4f9ec7415137cd1e64
 +    "strike its label in chat as above; reopen it with status open. Call "
 +    "sys_open_items_list to see what is open instead of relying on memory. Still "
 +    "write each item and each close in chat as above: that is what the user reads. "
++    "Items the user closed stay closed, including one whose comment heading ends "
++    '"(closed by me)": take the comment as its resolution, strike its label when you '
++    "mention it, and don't reopen it or keep working on it unless the user asks again. "
 +    "If these tools are not available to you, label items in chat only."
 +)
 +
@@ -178,7 +184,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..da19205196d23b4f9ec7415137cd1e64
  
  def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      """
-@@ -107,7 +152,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -107,7 +155,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      agent unless the spec sets ``tool_groups.browser: false``, in which
      case the prompt must not steer the model toward tools it lacks. The
      item-label guidance applies to every agent, since every transcript
@@ -188,7 +194,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..da19205196d23b4f9ec7415137cd1e64
  
      :param spec: The parsed AgentSpec.
      :returns: The applicable spec-level framework instructions.
-@@ -119,7 +165,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -119,7 +168,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      if spec.tool_groups.browser:
          instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
      instructions.append(WORKSPACE_IMAGE_INSTRUCTION)
@@ -197,7 +203,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..da19205196d23b4f9ec7415137cd1e64
      return instructions
  
  
-@@ -271,6 +317,10 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
+@@ -271,6 +320,10 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
      return append_framework_instructions(authored, framework) or "\n\n".join(framework)
  
  
@@ -535,7 +541,7 @@ index 2518851b82978e769aa1d790ec741f27dcd5b234..e31b630e05f65e82ebbc9a637db2f0c8
  
  @pytest.mark.asyncio
 diff --git a/tests/runtime/test_prompt.py b/tests/runtime/test_prompt.py
-index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..315a3b21844e7ca964ac15dad3b60c1e6a0d50a5 100644
+index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..e7caf688ef905b21a71505c5210cd71a3f2e0c42 100644
 --- a/tests/runtime/test_prompt.py
 +++ b/tests/runtime/test_prompt.py
 @@ -15,6 +15,7 @@ from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
@@ -563,7 +569,7 @@ index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..315a3b21844e7ca964ac15dad3b60c1e
          ),
      )
  
-@@ -482,3 +484,21 @@ def test_item_label_examples_match_the_chat_label_shape() -> None:
+@@ -482,3 +484,24 @@ def test_item_label_examples_match_the_chat_label_shape() -> None:
  def test_item_label_instruction_shows_a_bold_title_after_the_label() -> None:
      """The example puts a bold title right after the label, which the chat UI lists items by."""
      assert re.search(r"\[[A-Z]{1,3}\d{1,3}\] \*\*[^*]+\*\* \S", ITEM_LABEL_INSTRUCTION)
@@ -585,6 +591,9 @@ index 61d849f621bcbf80a84c477df2434c73d0a8d5d8..315a3b21844e7ca964ac15dad3b60c1e
 +    for name in ("sys_open_items_raise", "sys_open_items_update", "sys_open_items_list"):
 +        assert name in OPEN_ITEMS_INSTRUCTION
 +    assert "label items in chat only" in OPEN_ITEMS_INSTRUCTION
++    # An item the user closed, as "Comment and close" marks it, is not reopened.
++    assert '"(closed by me)"' in OPEN_ITEMS_INSTRUCTION
++    assert "unless the user asks again" in OPEN_ITEMS_INSTRUCTION
 diff --git a/tests/spec/test_resolve_agent_bundle.py b/tests/spec/test_resolve_agent_bundle.py
 index 3fda5ebbfefec3c6de001d6dc0dc9df62ae89528..bbe7cb2b818addf9f7894df14bc9deb9eae22f4f 100644
 --- a/tests/spec/test_resolve_agent_bundle.py
