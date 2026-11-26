@@ -1,0 +1,945 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 16:01:40 +0000
+Subject: [PATCH] feat(web): search, filter and group the Open items panel
+
+A coordinator session raises tens of items across several pieces of work,
+and the Open items panel lists them in one column by status, so finding
+the open risks of one topic means reading the whole list.
+
+Once the panel holds five items or more it gets a search box and one row
+of chips: Open, Answered and Closed with counts, the kinds present and the
+topics in use. The search matches every typed word in an item's label,
+title, detail or topic; a chip keeps one status, kind or topic, and each
+count is what selecting it would list. Items group by status (as before),
+topic or kind, each group folding from its heading; the grouping is kept
+in this browser, and the search, chips and folds survive the panel closing
+until the page reloads. On a phone the search stays first in the sheet and
+the chips scroll sideways in one row. Filtering runs over the loaded list,
+which the store caps at 500 items, so it needs nothing from the server.
+
+Not proposed upstream yet: the panel it extends is not upstream either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/open-items.md                            |  22 +-
+ feature-map/open-items.md                     |   5 +-
+ .../components/chat/OpenItemsFilterBar.tsx    | 143 +++++++++++
+ .../chat/StoredOpenItemsPanel.test.tsx        |  89 +++++++
+ .../components/chat/StoredOpenItemsPanel.tsx  | 158 ++++++++----
+ web/src/lib/openItemFilters.test.ts           | 130 ++++++++++
+ web/src/lib/openItemFilters.ts                | 229 ++++++++++++++++++
+ 7 files changed, 721 insertions(+), 55 deletions(-)
+ create mode 100644 web/src/components/chat/OpenItemsFilterBar.tsx
+ create mode 100644 web/src/lib/openItemFilters.test.ts
+ create mode 100644 web/src/lib/openItemFilters.ts
+
+diff --git a/docs/open-items.md b/docs/open-items.md
+index 5ff2bb4bede5c9872f06f38ada9662fe485de350..2fba7e1e423a43d8fb4d2c9f03249e9cd7d546c9 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -92,10 +92,24 @@ stays current as the agent raises and closes them.
+ - **Chips:** a label's chips in the chat follow the stored status: a stored
+   item is closed exactly when the server says so, whatever the chat wrote, and
+   its popover shows the stored resolution when the chat never struck it.
+-- **Groups:** items the latest reply mentions come first, then the open ones,
+-  then **Answered** (you replied and the agent has not closed it yet), with
+-  **Closed (N)** folded at the end. The badge counts open items: answered and
+-  closed ones, chat-only items you dismissed and pinned links are left out.
++- **Groups:** by default, items the latest reply mentions come first, then
++  **Open**, **Answered** (you replied and the agent has not closed it yet) and
++  **Closed**, folded. **By topic** groups items under their topic (items
++  without one under **No topic**, last) and **By kind** under Questions,
++  Risks, Findings, Follow-ups and Other, open items first in each group. Each
++  group's heading folds it. The grouping is remembered in this browser. The
++  badge counts open items: answered and closed ones, chat-only items you
++  dismissed and pinned links are left out.
++- **Search and filters:** once the list holds five items or more, a search box
++  and one row of chips sit above it: **Open**, **Answered** and **Closed** with
++  their counts, the kinds present, and the topics in use (`#cache-rollout`).
++  The search matches every word you type in an item's label, title, detail or
++  topic; a chip keeps only its status, kind or topic, and selecting it again
++  clears it. Each count is what selecting that chip would list. Filtering runs
++  in the browser over the loaded list. A search shows every match, folded
++  groups included. On a phone the search stays at the top of the sheet and
++  the chips scroll sideways in one row. The search, chips and folds stay as
++  you left them when the panel closes, until the page reloads.
+ - **Details:** select an item to expand it: its detail, links, your latest
+   answers, how it was closed, and **Show in conversation** when a loaded
+   message has it. Its chip previews it where the chat raised it.
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index 9cf108cfa3849f83c132fedefe0e737b42bccbdb..5d0deed1932c296560c0d843a9069e7a2d1e78bc 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -12,6 +12,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
+ - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
+ - `items-delete`: deleting a session deletes its items; a fork starts with none.
+ - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
++- `items-filters`: in the panel, from five items, a search (label, title, detail, topic), status chips with counts, kind and topic chips, and grouping by status, topic or kind (remembered per browser); the view survives closing the panel.
+ - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
+ - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
+ 
+@@ -32,8 +33,8 @@ Preconditions: a local server and runner from this checkout; any harness.
+ - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
+ - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
+ - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
+-- Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge and user changes: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; the live event: `web/src/store/chatStore.openItems.test.ts`.
+-- Human check (panel): with items raised as above, open the header's bookmark button. Expect the badge to count the open items, each row its stored title, and an answered or closed one under its group. Tap ✕ on one: it moves to **Closed (N)**, the badge drops, its chips in the chat strike through, and `sys_open_items_list` shows it `closed_by: user`. On a server without the store the panel looks as before.
++- Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge, user changes, search, chips and grouping: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; filter rules: `web/src/lib/openItemFilters.test.ts`; the live event: `web/src/store/chatStore.openItems.test.ts`.
++- Human check (panel): with items raised as above, open the header's bookmark button. Expect the badge to count the open items, each row its stored title, and an answered or closed one under its group. Tap ✕ on one: it moves to **Closed (N)**, the badge drops, its chips in the chat strike through, and `sys_open_items_list` shows it `closed_by: user`. On a server without the store the panel looks as before. With five or more items, type a word from one item's detail: only it remains; pick **By topic**, close and reopen the panel: the grouping and search are kept. On a phone, the chip row scrolls sideways without moving the sheet.
+ - Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row, a struck `~~[Q1]~~`, and the item `closed` with `closed_by: agent` in the API.
+ 
+ ## Gotchas
+diff --git a/web/src/components/chat/OpenItemsFilterBar.tsx b/web/src/components/chat/OpenItemsFilterBar.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..24bf810f60dbebc8347ac396aa49c9a349298ff8
+--- /dev/null
++++ b/web/src/components/chat/OpenItemsFilterBar.tsx
+@@ -0,0 +1,143 @@
++import type { ReactNode } from "react";
++import { SearchIcon, XIcon } from "lucide-react";
++import {
++  OPEN_ITEM_STATUS_NAMES,
++  hasOpenItemFilters,
++  kindName,
++  NO_OPEN_ITEM_FILTERS,
++  type OpenItemFacetCounts,
++  type OpenItemFilters,
++  type OpenItemGrouping,
++} from "@/lib/openItemFilters";
++import type { OpenItemStatus } from "@/lib/openItems";
++import { cn } from "@/lib/utils";
++
++const GROUPINGS: { value: OpenItemGrouping; name: string }[] = [
++  { value: "status", name: "Status" },
++  { value: "topic", name: "Topic" },
++  { value: "kind", name: "Kind" },
++];
++
++function FilterChip({
++  pressed,
++  onClick,
++  children,
++}: {
++  pressed: boolean;
++  onClick: () => void;
++  children: ReactNode;
++}) {
++  return (
++    <button
++      type="button"
++      aria-pressed={pressed}
++      className={cn(
++        "shrink-0 rounded-full border px-2 py-0.5 text-xs tabular-nums transition-colors",
++        pressed
++          ? "border-primary bg-primary text-primary-foreground"
++          : "border-border text-muted-foreground hover:bg-muted hover:text-foreground",
++      )}
++      onClick={onClick}
++    >
++      {children}
++    </button>
++  );
++}
++
++/**
++ * Search, one sideways-scrolling row of chips (status with counts, kind,
++ * topic) and the grouping for the Open items panel. A chip selects its value
++ * in its facet; selecting it again clears the facet.
++ */
++export function OpenItemsFilterBar({
++  filters,
++  counts,
++  grouping,
++  onFiltersChange,
++  onGroupingChange,
++}: {
++  filters: OpenItemFilters;
++  counts: OpenItemFacetCounts;
++  grouping: OpenItemGrouping;
++  onFiltersChange: (filters: OpenItemFilters) => void;
++  onGroupingChange: (grouping: OpenItemGrouping) => void;
++}) {
++  const toggle = <Facet extends "status" | "kind" | "topic">(
++    facet: Facet,
++    value: OpenItemFilters[Facet],
++  ) => onFiltersChange({ ...filters, [facet]: filters[facet] === value ? null : value });
++  return (
++    <div className="flex flex-col gap-1.5 px-3 pb-2" data-testid="open-items-filters">
++      <div className="flex items-center gap-2">
++        <label className="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded-md border border-border bg-background px-2">
++          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
++          <input
++            type="search"
++            value={filters.query}
++            placeholder="Search items"
++            aria-label="Search open items"
++            className="min-w-0 flex-1 bg-transparent text-xs outline-none"
++            onChange={(event) => onFiltersChange({ ...filters, query: event.target.value })}
++          />
++        </label>
++        <select
++          value={grouping}
++          aria-label="Group items by"
++          className="h-7 shrink-0 rounded-md border border-border bg-background px-1 text-xs"
++          onChange={(event) => onGroupingChange(event.target.value as OpenItemGrouping)}
++        >
++          {GROUPINGS.map(({ value, name }) => (
++            <option key={value} value={value}>
++              {`By ${name.toLowerCase()}`}
++            </option>
++          ))}
++        </select>
++      </div>
++      <div
++        role="group"
++        aria-label="Filter open items"
++        className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
++      >
++        {hasOpenItemFilters(filters) && (
++          <button
++            type="button"
++            aria-label="Clear filters"
++            className="flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-xs text-link hover:underline"
++            onClick={() => onFiltersChange(NO_OPEN_ITEM_FILTERS)}
++          >
++            <XIcon className="size-3" aria-hidden="true" />
++            Clear
++          </button>
++        )}
++        {(["open", "answered", "closed"] as OpenItemStatus[]).map((status) => (
++          <FilterChip
++            key={status}
++            pressed={filters.status === status}
++            onClick={() => toggle("status", status)}
++          >
++            {`${OPEN_ITEM_STATUS_NAMES[status]} ${counts.status[status]}`}
++          </FilterChip>
++        ))}
++        {counts.kinds.length > 1 &&
++          counts.kinds.map(({ kind, count }) => (
++            <FilterChip
++              key={kind}
++              pressed={filters.kind === kind}
++              onClick={() => toggle("kind", kind)}
++            >
++              {`${kindName(kind)} ${count}`}
++            </FilterChip>
++          ))}
++        {counts.topics.map(({ topic, count }) => (
++          <FilterChip
++            key={topic}
++            pressed={filters.topic === topic}
++            onClick={() => toggle("topic", topic)}
++          >
++            {`#${topic} ${count}`}
++          </FilterChip>
++        ))}
++      </div>
++    </div>
++  );
++}
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.test.tsx b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+index 4e122253fda8dccc1b99f17a635038392db686c6..8cf914d36048bc7823759ff2310289512ed1a7bd 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.test.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+@@ -27,6 +27,7 @@ import {
+   type ItemLabelSource,
+ } from "@/lib/itemLabels";
+ import { mergeStoredOpenItems, openItemsKey, type StoredOpenItem } from "@/lib/openItems";
++import { NO_OPEN_ITEM_FILTERS, writeOpenItemsView } from "@/lib/openItemFilters";
+ import { collectSessionLinks } from "@/lib/sessionLinks";
+ import { SessionItemsHeaderSlot, useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
+ import { storedItem } from "@/test/openItemsFixtures";
+@@ -41,6 +42,8 @@ beforeEach(() => {
+ afterEach(() => {
+   cleanup();
+   fetchMock.mockReset();
++  writeOpenItemsView("conv_1", { filters: NO_OPEN_ITEM_FILTERS, toggledGroups: [] });
++  window.localStorage.clear();
+ });
+ 
+ /** The header button inside the label scope the transcript gives it, store merged in. */
+@@ -269,3 +272,89 @@ describe("the Open items panel on a server that stores them", () => {
+     expect(fetchMock).not.toHaveBeenCalled();
+   });
+ });
++
++describe("search, filters and grouping", () => {
++  const MANY = [
++    storedItem("Q1", { title: "Backfill window", topic: "cache" }),
++    storedItem("Q2", { title: "Soft-deleted rows", detail: "Copy or drop?", topic: "cache" }),
++    storedItem("Q3", { title: "Retention", status: "answered" }),
++    storedItem("R1", { title: "Flaky CI", status: "closed", topic: "release" }),
++    storedItem("T1", { title: "Rename the flag", topic: "release" }),
++  ];
++  const search = () => screen.getByRole("searchbox", { name: "Search open items" });
++  const chip = (name: string) => screen.getByRole("button", { name });
++
++  it("hides search and chips while the list is short", () => {
++    renderPanel(["Nothing labelled."], MANY.slice(0, 3));
++    openPanel();
++    expect(screen.queryByTestId("open-items-filters")).toBeNull();
++  });
++
++  it("searches title, detail and topic, and filters with chips that count", () => {
++    renderPanel(["Nothing labelled."], MANY);
++    const panel = openPanel();
++    expect(rowLabels(panel)).toEqual(["Q1", "Q2", "T1", "Q3"]);
++    fireEvent.change(search(), { target: { value: "drop" } });
++    expect(rowLabels(panel)).toEqual(["Q2"]);
++    fireEvent.change(search(), { target: { value: "release" } });
++    // A search opens the folded Closed group too.
++    expect(rowLabels(panel)).toEqual(["T1", "R1"]);
++
++    fireEvent.click(chip("Clear filters"));
++    expect(chip("Closed 1").getAttribute("aria-pressed")).toBe("false");
++    fireEvent.click(chip("Closed 1"));
++    expect(rowLabels(panel)).toEqual(["R1"]);
++    fireEvent.click(chip("Closed 1"));
++    fireEvent.click(chip("#cache 2"));
++    expect(rowLabels(panel)).toEqual(["Q1", "Q2"]);
++    expect(chip("Answered 0")).toBeTruthy();
++    fireEvent.click(chip("#cache 2"));
++    fireEvent.click(chip("Risks 1"));
++    expect(rowLabels(panel)).toEqual(["R1"]);
++    fireEvent.change(search(), { target: { value: "no such words" } });
++    expect(panel.textContent).toContain("No items match.");
++    fireEvent.click(within(panel).getByText("Clear filters"));
++    expect(rowLabels(panel)).toEqual(["Q1", "Q2", "T1", "Q3"]);
++  });
++
++  it("groups by topic or kind, remembered in this browser", () => {
++    renderPanel(["Nothing labelled."], MANY);
++    let panel = openPanel();
++    fireEvent.change(screen.getByRole("combobox", { name: "Group items by" }), {
++      target: { value: "topic" },
++    });
++    expect(
++      within(panel)
++        .getAllByRole("button", { expanded: true })
++        .map((heading) => heading.textContent),
++    ).toEqual(["cache (2)", "release (2)", "No topic (1)"]);
++    expect(rowLabels(panel)).toEqual(["Q1", "Q2", "T1", "R1", "Q3"]);
++    cleanup();
++
++    renderPanel(["Nothing labelled."], MANY);
++    panel = openPanel();
++    expect(
++      (screen.getByRole("combobox", { name: "Group items by" }) as HTMLSelectElement).value,
++    ).toBe("topic");
++    // A group folds from its heading.
++    fireEvent.click(within(panel).getByRole("button", { name: "cache (2)" }));
++    expect(rowLabels(panel)).toEqual(["T1", "R1", "Q3"]);
++  });
++
++  it("keeps the search and folds when the phone sheet closes and reopens", () => {
++    viewport.mobile = true;
++    renderPanel(["Nothing labelled."], MANY);
++    const panel = openPanel();
++    const filterBar = within(panel).getByTestId("open-items-filters");
++    // Search first, then one row of chips that scrolls sideways.
++    expect(filterBar.firstElementChild?.contains(search())).toBe(true);
++    expect(within(filterBar).getByRole("group").className).toContain("overflow-x-auto");
++    fireEvent.change(search(), { target: { value: "cache" } });
++    fireEvent.click(screen.getByTestId("session-items-trigger"));
++    expect(screen.queryByTestId("session-items-panel")).toBeNull();
++
++    const reopened = openPanel();
++    expect((search() as HTMLInputElement).value).toBe("cache");
++    expect(rowLabels(reopened)).toEqual(["Q1", "Q2"]);
++  });
++});
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.tsx b/web/src/components/chat/StoredOpenItemsPanel.tsx
+index 50e865e7ee96203890c3a284f336e2e0ef42bdaf..db56d14bf652fac4202b4c7861e02cfd6a8f5fe6 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.tsx
+@@ -1,10 +1,11 @@
+-import { useContext, useMemo, useState, type ReactNode } from "react";
++import { Fragment, useContext, useMemo, useState, type ReactNode } from "react";
+ import { ChevronRightIcon, MessageSquareDotIcon, XIcon } from "lucide-react";
+ import {
+   FilePathAwareMessageResponse,
+   ItemLabelPopover,
+   itemLabelChipClass,
+ } from "@/components/blocks/ChatMarkdown";
++import { OpenItemsFilterBar } from "@/components/chat/OpenItemsFilterBar";
+ import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
+ import { Button } from "@/components/ui/button";
+ import { useCanEdit } from "@/hooks/usePermissions";
+@@ -19,6 +20,16 @@ import {
+   ItemLabelSessionContext,
+ } from "@/lib/itemLabels";
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
++import {
++  NO_OPEN_ITEM_FILTERS,
++  filterOpenItemRows,
++  groupOpenItemRows,
++  hasOpenItemFilters,
++  openItemFacetCounts,
++  useOpenItemGrouping,
++  useOpenItemsView,
++  writeOpenItemGrouping,
++} from "@/lib/openItemFilters";
+ import {
+   chatItemsToImport,
+   chatResolution,
+@@ -35,6 +46,8 @@ import { cn } from "@/lib/utils";
+ /** What a close from the panel records when the person gives no reason. */
+ export const PANEL_CLOSE_RESOLUTION = "Closed from the Open items panel";
+ 
++// Below this many items the list is short enough to read without search or chips.
++const FILTER_BAR_MIN_ROWS = 5;
+ const GROUP_HEADING_CLASS = "px-3 pt-2 pb-1 text-xs text-muted-foreground";
+ const TAG_CLASS =
+   "shrink-0 rounded-full border border-border px-1.5 text-[10px] leading-4 text-muted-foreground";
+@@ -341,39 +354,42 @@ function QuickAction({
+   );
+ }
+ 
+-/** A fold such as "Closed (4)": a heading button that shows or hides its rows. */
+-function Fold({ title, count, children }: { title: string; count: number; children: ReactNode }) {
+-  const [open, setOpen] = useState(false);
+-  if (count === 0) return null;
++/** A group's heading, e.g. "Closed (4)": shows or folds the rows under it. */
++function GroupHeading({
++  title,
++  count,
++  folded,
++  onToggle,
++}: {
++  title: string;
++  count: number;
++  folded: boolean;
++  onToggle: () => void;
++}) {
+   return (
+-    <>
+-      <li>
+-        <button
+-          type="button"
+-          aria-expanded={open}
+-          className={cn(
+-            GROUP_HEADING_CLASS,
+-            "flex w-full items-center gap-1 hover:text-foreground",
+-          )}
+-          onClick={() => setOpen((shown) => !shown)}
+-        >
+-          <ChevronRightIcon
+-            className={cn("size-3 transition-transform", open && "rotate-90")}
+-            aria-hidden="true"
+-          />
+-          {`${title} (${count})`}
+-        </button>
+-      </li>
+-      {open && children}
+-    </>
++    <li>
++      <button
++        type="button"
++        aria-expanded={!folded}
++        className={cn(GROUP_HEADING_CLASS, "flex w-full items-center gap-1 hover:text-foreground")}
++        onClick={onToggle}
++      >
++        <ChevronRightIcon
++          className={cn("size-3 transition-transform", !folded && "rotate-90")}
++          aria-hidden="true"
++        />
++        {`${title} (${count})`}
++      </button>
++    </li>
+   );
+ }
+ 
+ /**
+- * The Open items section on a server that stores them: stored items by their
+- * stored status, and labels only the chat has, marked "chat only". People
+- * with edit access close, reopen and retopic stored items here; chat-only
+- * items are dismissed as before.
++ * The Open items section on a server that stores them: stored items, and
++ * labels only the chat has, marked "chat only", grouped by status, topic or
++ * kind, with search and filter chips once the list is long. People with edit
++ * access close, reopen and retopic stored items here; chat-only items are
++ * dismissed as before.
+  */
+ export function StoredOpenItemsPanel({
+   stored,
+@@ -388,6 +404,8 @@ export function StoredOpenItemsPanel({
+   const update = useUpdateStoredOpenItems(sessionId);
+   const importItems = useImportChatItems(sessionId);
+   const [expanded, setExpanded] = useState<string | null>(null);
++  const [view, setView] = useOpenItemsView(sessionId);
++  const grouping = useOpenItemGrouping();
+   const rows = useMemo(() => openItemRows(index, stored, dismissed), [index, stored, dismissed]);
+   const topics = useMemo(
+     () => [...new Set(stored.flatMap((item) => (item.topic ? [item.topic] : [])))].sort(),
+@@ -445,11 +463,34 @@ export function StoredOpenItemsPanel({
+   };
+ 
+   const listed = rows.filter((row) => !row.dismissed);
+-  const recent = listed.filter((row) => row.recent);
+-  const open = listed.filter((row) => !row.recent && row.status === "open");
+-  const answered = listed.filter((row) => !row.recent && row.status === "answered");
+-  const closed = listed.filter((row) => !row.recent && row.status === "closed");
+-  const dismissedRows = rows.filter((row) => row.dismissed);
++  const filters = view.filters;
++  const groups = groupOpenItemRows(filterOpenItemRows(listed, filters), grouping);
++  const dismissedRows = filterOpenItemRows(
++    rows.filter((row) => row.dismissed),
++    filters,
++  );
++  if (dismissedRows.length > 0) {
++    groups.push({
++      key: "dismissed",
++      title: "Dismissed",
++      rows: dismissedRows,
++      foldedByDefault: true,
++    });
++  }
++  // A search shows every match; with a chip selected, the closed group opens too.
++  const searching = filters.query.trim() !== "";
++  const filtered = hasOpenItemFilters(filters);
++  const isFolded = (group: (typeof groups)[number]) =>
++    !searching && view.toggledGroups.includes(group.key) !== (group.foldedByDefault && !filtered);
++  const toggleGroup = (key: string) =>
++    setView((current) => ({
++      ...current,
++      toggledGroups: current.toggledGroups.includes(key)
++        ? current.toggledGroups.filter((other) => other !== key)
++        : [...current.toggledGroups, key],
++    }));
++  const setFilters = (next: typeof filters) =>
++    setView((current) => ({ ...current, filters: next }));
+   return (
+     <section data-testid="open-items" aria-label="Open items">
+       <div className="flex items-center gap-2 px-3 py-2 text-ui font-medium">
+@@ -470,23 +511,42 @@ export function StoredOpenItemsPanel({
+           </Button>
+         )}
+       </div>
++      {(rows.length >= FILTER_BAR_MIN_ROWS || hasOpenItemFilters(filters)) && (
++        <OpenItemsFilterBar
++          filters={filters}
++          counts={openItemFacetCounts(listed, filters)}
++          grouping={grouping}
++          onFiltersChange={setFilters}
++          onGroupingChange={writeOpenItemGrouping}
++        />
++      )}
+       <ul className="max-h-[min(24rem,50vh)] overflow-y-auto border-t border-border py-1">
+-        {recent.length > 0 && <li className={GROUP_HEADING_CLASS}>In the latest reply</li>}
+-        {recent.map(renderRow)}
+-        {recent.length > 0 && open.length > 0 && (
+-          <li className={GROUP_HEADING_CLASS}>{`Other open (${open.length})`}</li>
+-        )}
+-        {open.map(renderRow)}
+-        {answered.length > 0 && (
+-          <li className={GROUP_HEADING_CLASS}>{`Answered (${answered.length})`}</li>
++        {groups.length === 0 && (
++          <li className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
++            No items match.
++            <button
++              type="button"
++              className="text-link hover:underline"
++              onClick={() => setFilters(NO_OPEN_ITEM_FILTERS)}
++            >
++              Clear filters
++            </button>
++          </li>
+         )}
+-        {answered.map(renderRow)}
+-        <Fold title="Closed" count={closed.length}>
+-          {closed.map(renderRow)}
+-        </Fold>
+-        <Fold title="Dismissed" count={dismissedRows.length}>
+-          {dismissedRows.map(renderRow)}
+-        </Fold>
++        {groups.map((group) => {
++          const folded = isFolded(group);
++          return (
++            <Fragment key={group.key}>
++              <GroupHeading
++                title={group.title}
++                count={group.rows.length}
++                folded={folded}
++                onToggle={() => toggleGroup(group.key)}
++              />
++              {!folded && group.rows.map(renderRow)}
++            </Fragment>
++          );
++        })}
+       </ul>
+     </section>
+   );
+diff --git a/web/src/lib/openItemFilters.test.ts b/web/src/lib/openItemFilters.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d1ca24673d64f0a71dc5f6c7e1b5fdc97acb101
+--- /dev/null
++++ b/web/src/lib/openItemFilters.test.ts
+@@ -0,0 +1,130 @@
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  NO_OPEN_ITEM_FILTERS,
++  filterOpenItemRows,
++  groupOpenItemRows,
++  openItemFacetCounts,
++  readOpenItemsView,
++  writeOpenItemsView,
++} from "./openItemFilters";
++import type { OpenItemRow } from "./openItems";
++
++function row(label: string, fields: Partial<OpenItemRow> = {}): OpenItemRow {
++  const kinds = { Q: "question", R: "risk", F: "finding", T: "follow_up" } as const;
++  return {
++    label,
++    kind: kinds[label[0] as keyof typeof kinds] ?? null,
++    status: "open",
++    title: `Title ${label}`,
++    detail: "",
++    topic: null,
++    stored: null,
++    entry: null,
++    recent: false,
++    dismissed: false,
++    ...fields,
++  };
++}
++
++const ROWS = [
++  row("Q1", { title: "Backfill window", topic: "cache" }),
++  row("Q2", { status: "answered", detail: "Copy or drop soft-deleted rows?", topic: "cache" }),
++  row("R1", { status: "closed", title: "Flaky CI" }),
++  row("T1", { topic: "release", recent: true }),
++  row("A4", { title: "Other letter" }),
++];
++const labels = (rows: readonly OpenItemRow[]) => rows.map((each) => each.label);
++
++afterEach(() => {
++  writeOpenItemsView("conv", { filters: NO_OPEN_ITEM_FILTERS, toggledGroups: [] });
++});
++
++describe("filterOpenItemRows", () => {
++  it("searches label, title, detail and topic, every word", () => {
++    const search = (query: string) =>
++      labels(filterOpenItemRows(ROWS, { ...NO_OPEN_ITEM_FILTERS, query }));
++    expect(search("backfill")).toEqual(["Q1"]);
++    expect(search("SOFT-deleted")).toEqual(["Q2"]);
++    expect(search("cache")).toEqual(["Q1", "Q2"]);
++    expect(search("r1")).toEqual(["R1"]);
++    expect(search("cache copy")).toEqual(["Q2"]);
++    expect(search("  ")).toEqual(labels(ROWS));
++  });
++
++  it("keeps the rows of the selected status, kind and topic", () => {
++    const only = (filters: Partial<typeof NO_OPEN_ITEM_FILTERS>) =>
++      labels(filterOpenItemRows(ROWS, { ...NO_OPEN_ITEM_FILTERS, ...filters }));
++    expect(only({ status: "answered" })).toEqual(["Q2"]);
++    expect(only({ kind: "question" })).toEqual(["Q1", "Q2"]);
++    expect(only({ kind: "other" })).toEqual(["A4"]);
++    expect(only({ topic: "cache", status: "open" })).toEqual(["Q1"]);
++  });
++});
++
++describe("openItemFacetCounts", () => {
++  it("counts what each chip would list, under the search and the other chips", () => {
++    expect(openItemFacetCounts(ROWS, NO_OPEN_ITEM_FILTERS)).toEqual({
++      status: { open: 3, answered: 1, closed: 1 },
++      kinds: [
++        { kind: "question", count: 2 },
++        { kind: "risk", count: 1 },
++        { kind: "follow_up", count: 1 },
++        { kind: "other", count: 1 },
++      ],
++      topics: [
++        { topic: "cache", count: 2 },
++        { topic: "release", count: 1 },
++      ],
++    });
++    const cacheOnly = openItemFacetCounts(ROWS, { ...NO_OPEN_ITEM_FILTERS, topic: "cache" });
++    expect(cacheOnly.status).toEqual({ open: 1, answered: 1, closed: 0 });
++    // The topic facet itself still offers every topic.
++    expect(cacheOnly.topics.map(({ topic }) => topic)).toEqual(["cache", "release"]);
++  });
++});
++
++describe("groupOpenItemRows", () => {
++  it("groups by status: the latest reply's items, then open, answered and closed (folded)", () => {
++    expect(
++      groupOpenItemRows(ROWS, "status").map((group) => [
++        group.title,
++        labels(group.rows),
++        group.foldedByDefault,
++      ]),
++    ).toEqual([
++      ["In the latest reply", ["T1"], false],
++      ["Open", ["Q1", "A4"], false],
++      ["Answered", ["Q2"], false],
++      ["Closed", ["R1"], true],
++    ]);
++  });
++
++  it("groups by topic, items without one last, open first within a group", () => {
++    expect(
++      groupOpenItemRows(ROWS, "topic").map((group) => [group.title, labels(group.rows)]),
++    ).toEqual([
++      ["cache", ["Q1", "Q2"]],
++      ["release", ["T1"]],
++      ["No topic", ["A4", "R1"]],
++    ]);
++  });
++
++  it("groups by kind in label order, other letters last", () => {
++    expect(groupOpenItemRows(ROWS, "kind").map((group) => group.title)).toEqual([
++      "Questions",
++      "Risks",
++      "Follow-ups",
++      "Other",
++    ]);
++  });
++});
++
++describe("the panel's view", () => {
++  it("is kept per session until the page reloads", () => {
++    const filters = { ...NO_OPEN_ITEM_FILTERS, query: "cache" };
++    writeOpenItemsView("conv", { filters, toggledGroups: ["closed"] });
++    expect(readOpenItemsView("conv")).toEqual({ filters, toggledGroups: ["closed"] });
++    expect(readOpenItemsView("other").filters).toEqual(NO_OPEN_ITEM_FILTERS);
++    expect(readOpenItemsView(null).filters).toEqual(NO_OPEN_ITEM_FILTERS);
++  });
++});
+diff --git a/web/src/lib/openItemFilters.ts b/web/src/lib/openItemFilters.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..01a658e333846209a247e9e71925d2047ab72329
+--- /dev/null
++++ b/web/src/lib/openItemFilters.ts
+@@ -0,0 +1,229 @@
++// Search, filters and grouping for the Open items panel. They run in the
++// browser over the session's loaded list (the store caps a session at 500
++// items), so they need nothing from the server.
++
++import { useSyncExternalStore } from "react";
++import {
++  OPEN_ITEM_KINDS,
++  type OpenItemKind,
++  type OpenItemRow,
++  type OpenItemStatus,
++} from "@/lib/openItems";
++import { createStoredChoicePreference } from "@/lib/storedChoicePreference";
++
++export type OpenItemGrouping = "status" | "topic" | "kind";
++/** A kind chip: one of the store's kinds, or chat labels of other letters. */
++export type OpenItemKindFilter = OpenItemKind | "other";
++
++export interface OpenItemFilters {
++  query: string;
++  status: OpenItemStatus | null;
++  kind: OpenItemKindFilter | null;
++  topic: string | null;
++}
++
++export const NO_OPEN_ITEM_FILTERS: OpenItemFilters = {
++  query: "",
++  status: null,
++  kind: null,
++  topic: null,
++};
++
++export const OPEN_ITEM_STATUS_NAMES: Record<OpenItemStatus, string> = {
++  open: "Open",
++  answered: "Answered",
++  closed: "Closed",
++};
++
++export function kindName(kind: OpenItemKindFilter): string {
++  return OPEN_ITEM_KINDS.find((entry) => entry.kind === kind)?.name ?? "Other";
++}
++
++export function hasOpenItemFilters(filters: OpenItemFilters): boolean {
++  return (
++    filters.query.trim() !== "" ||
++    filters.status !== null ||
++    filters.kind !== null ||
++    filters.topic !== null
++  );
++}
++
++function rowKind(row: OpenItemRow): OpenItemKindFilter {
++  return row.kind ?? "other";
++}
++
++/** Whether every word of `query` is in the row's label, title, detail or topic. */
++export function rowMatchesQuery(row: OpenItemRow, query: string): boolean {
++  const words = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
++  if (words.length === 0) return true;
++  const text = [row.label, row.title, row.detail, row.topic ?? ""].join("\n").toLocaleLowerCase();
++  return words.every((word) => text.includes(word));
++}
++
++/** The rows the search and the selected chips keep. */
++export function filterOpenItemRows(
++  rows: readonly OpenItemRow[],
++  filters: OpenItemFilters,
++): OpenItemRow[] {
++  return rows.filter(
++    (row) =>
++      rowMatchesQuery(row, filters.query) &&
++      (filters.status === null || row.status === filters.status) &&
++      (filters.kind === null || rowKind(row) === filters.kind) &&
++      (filters.topic === null || row.topic === filters.topic),
++  );
++}
++
++export interface OpenItemFacetCounts {
++  status: Record<OpenItemStatus, number>;
++  /** Kinds present, in label order. */
++  kinds: { kind: OpenItemKindFilter; count: number }[];
++  /** Topics present, by name. */
++  topics: { topic: string; count: number }[];
++}
++
++/**
++ * What each chip would show: per facet, the rows the search and the other
++ * facets' chips keep, so a count is what selecting the chip lists.
++ */
++export function openItemFacetCounts(
++  rows: readonly OpenItemRow[],
++  filters: OpenItemFilters,
++): OpenItemFacetCounts {
++  const without = (facet: "status" | "kind" | "topic") =>
++    filterOpenItemRows(rows, { ...filters, [facet]: null });
++  const status: Record<OpenItemStatus, number> = { open: 0, answered: 0, closed: 0 };
++  for (const row of without("status")) status[row.status] += 1;
++  const kindCounts = new Map<OpenItemKindFilter, number>();
++  for (const row of without("kind")) {
++    kindCounts.set(rowKind(row), (kindCounts.get(rowKind(row)) ?? 0) + 1);
++  }
++  const topicCounts = new Map<string, number>();
++  for (const row of without("topic")) {
++    if (row.topic) topicCounts.set(row.topic, (topicCounts.get(row.topic) ?? 0) + 1);
++  }
++  const kindOrder: OpenItemKindFilter[] = [...OPEN_ITEM_KINDS.map(({ kind }) => kind), "other"];
++  return {
++    status,
++    kinds: kindOrder.flatMap((kind) => {
++      const count = kindCounts.get(kind);
++      return count ? [{ kind, count }] : [];
++    }),
++    topics: [...topicCounts]
++      .sort(([left], [right]) => left.localeCompare(right))
++      .map(([topic, count]) => ({ topic, count })),
++  };
++}
++
++export interface OpenItemGroup {
++  key: string;
++  title: string;
++  rows: OpenItemRow[];
++  /** Folded unless the user opens it: closed items, by default. */
++  foldedByDefault: boolean;
++}
++
++const STATUS_ORDER: Record<OpenItemStatus, number> = { open: 0, answered: 1, closed: 2 };
++
++function byStatus(rows: OpenItemRow[]): OpenItemRow[] {
++  // Stable: rows keep label order within a status.
++  return [...rows].sort((left, right) => STATUS_ORDER[left.status] - STATUS_ORDER[right.status]);
++}
++
++/**
++ * Rows in groups. By status: what the latest reply mentions first, then
++ * open, answered and closed (folded). By topic or kind: one group each, in
++ * name or label order, open items first within a group.
++ */
++export function groupOpenItemRows(
++  rows: readonly OpenItemRow[],
++  grouping: OpenItemGrouping,
++): OpenItemGroup[] {
++  if (grouping === "status") {
++    const recent = rows.filter((row) => row.recent);
++    const rest = rows.filter((row) => !row.recent);
++    const groups: OpenItemGroup[] = [
++      { key: "recent", title: "In the latest reply", rows: recent, foldedByDefault: false },
++    ];
++    for (const status of ["open", "answered", "closed"] as const) {
++      groups.push({
++        key: status,
++        title: OPEN_ITEM_STATUS_NAMES[status],
++        rows: rest.filter((row) => row.status === status),
++        foldedByDefault: status === "closed",
++      });
++    }
++    return groups.filter((group) => group.rows.length > 0);
++  }
++  const keyOf = (row: OpenItemRow) => (grouping === "topic" ? (row.topic ?? "") : rowKind(row));
++  const buckets = new Map<string, OpenItemRow[]>();
++  for (const row of rows) {
++    const key = keyOf(row);
++    buckets.set(key, [...(buckets.get(key) ?? []), row]);
++  }
++  const keys =
++    grouping === "topic"
++      ? [...buckets.keys()].sort((left, right) =>
++          // Items without a topic come last.
++          left === "" ? 1 : right === "" ? -1 : left.localeCompare(right),
++        )
++      : [...OPEN_ITEM_KINDS.map(({ kind }) => kind as string), "other"].filter((key) =>
++          buckets.has(key),
++        );
++  return keys.map((key) => ({
++    key: `${grouping}:${key}`,
++    title: grouping === "topic" ? key || "No topic" : kindName(key as OpenItemKindFilter),
++    rows: byStatus(buckets.get(key) ?? []),
++    foldedByDefault: false,
++  }));
++}
++
++const groupingPreference = createStoredChoicePreference(
++  "omnigent:open-items-grouping",
++  ["status", "topic", "kind"],
++  "status",
++);
++
++/** How this browser groups the Open items panel. */
++export function useOpenItemGrouping(): OpenItemGrouping {
++  return groupingPreference.use() as OpenItemGrouping;
++}
++
++export function writeOpenItemGrouping(grouping: OpenItemGrouping): void {
++  groupingPreference.write(grouping);
++}
++
++/** The panel's search, chips and folds for one session. */
++export interface OpenItemsView {
++  filters: OpenItemFilters;
++  /** Groups the user opened or folded, against their default. */
++  toggledGroups: readonly string[];
++}
++
++const EMPTY_VIEW: OpenItemsView = { filters: NO_OPEN_ITEM_FILTERS, toggledGroups: [] };
++// Kept for the page's lifetime, so the panel reopens as it was left.
++const views = new Map<string, OpenItemsView>();
++const viewListeners = new Set<() => void>();
++
++function subscribeViews(listener: () => void): () => void {
++  viewListeners.add(listener);
++  return () => viewListeners.delete(listener);
++}
++
++export function readOpenItemsView(sessionId: string | null): OpenItemsView {
++  return (sessionId && views.get(sessionId)) || EMPTY_VIEW;
++}
++
++export function writeOpenItemsView(sessionId: string | null, view: OpenItemsView): void {
++  if (!sessionId) return;
++  views.set(sessionId, view);
++  for (const listener of viewListeners) listener();
++}
++
++/** The session's panel view, which outlives the panel closing until the page reloads. */
++export function useOpenItemsView(
++  sessionId: string | null,
++): [OpenItemsView, (update: (view: OpenItemsView) => OpenItemsView) => void] {
++  const view = useSyncExternalStore(subscribeViews, () => readOpenItemsView(sessionId));
++  return [view, (update) => writeOpenItemsView(sessionId, update(readOpenItemsView(sessionId)))];
++}
