@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { flushSync } from "react-dom";
 import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
@@ -30,7 +39,7 @@ import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
-import { mergeStoredOpenItems } from "@/lib/openItems";
+import { mergeStoredOpenItems, withStoredLinks } from "@/lib/openItems";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
@@ -649,7 +658,11 @@ function TranscriptSessionItems({
   bubbles: readonly Bubble[];
   index: ItemLabelIndex;
 }) {
-  const links = useMemo(() => collectBubbleSessionLinks(bubbles, index), [bubbles, index]);
+  const stored = useStoredOpenItems(useContext(ItemLabelSessionContext));
+  const links = useMemo(
+    () => withStoredLinks(collectBubbleSessionLinks(bubbles, index), stored),
+    [bubbles, index, stored],
+  );
   return <SessionItemsButton host={host} links={links} />;
 }
 

@@ -131,7 +131,9 @@ stays current as the agent raises and closes them.
 - **One list:** each stored item shows its stored status. A label written in
   the chat that the server does not hold is listed too, marked **chat only**,
   with its state read from the chat as before. Pinned links stay under
-  **Links**.
+  **Links**, which lists every open stored link first, under the title the
+  agent gave it (a short form of its URL when it gave none), whether or not a
+  loaded message pins it; a closed stored link leaves the list with its page.
 - **Chips:** a label's chips in the chat follow the stored status: a stored
   item is closed exactly when the server says so, whatever the chat wrote, and
   its popover shows the stored resolution when the chat never struck it.
@@ -141,7 +143,9 @@ stays current as the agent raises and closes them.
   closed ones, chat-only items you dismissed and pinned links are left out.
 - **Details:** select an item to expand it: its detail, links, your latest
   answers, how it was closed, and **Show in conversation** when a loaded
-  message has it. Its chip previews it where the chat raised it.
+  message has it. An item the server recorded from a label written only in
+  chat says **recorded from chat**, and one it closed from a struck label says
+  **Closed in chat**. Its chip previews it where the chat raised it.
 - **Changes (edit access):** the ✕ on an open stored item closes it, recorded
   as closed by a person with the resolution "Closed from the Open items panel";
   expanded, you can write the resolution yourself, **Reopen** a closed item, or

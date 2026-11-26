@@ -212,6 +212,29 @@ describe("the Open items panel on a server that stores them", () => {
     expect(await patchBody(1)).toEqual({ updates: [{ label: "Q1", topic: "release" }] });
   });
 
+  it("marks items the server recorded or closed from the chat", () => {
+    renderPanel(
+      [ITEMS, "~~[Q2]~~ dropped it.", "Looking at the rest."],
+      [
+        storedItem("Q1", { raised_by: "auto" }),
+        storedItem("Q2", {
+          status: "closed",
+          closed_by: "auto",
+          resolution: "~~[Q2]~~ dropped it.",
+          closed_at: 1_764_100_500,
+        }),
+      ],
+    );
+    const panel = openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Item Q1" }));
+    expect(within(panel).getByTestId("open-item-details").textContent).toContain(
+      "recorded from chat",
+    );
+    fireEvent.click(within(panel).getByRole("button", { name: "Closed (1)" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Item Q2 (closed)" }));
+    expect(within(panel).getByTestId("open-item-details").textContent).toContain("Closed in chat");
+  });
+
   it("closes an item the chat closed with the chat's sentence as its resolution", async () => {
     renderPanel([ITEMS, "~~[Q1]~~ We batch it nightly."], [storedItem("Q1"), storedItem("Q2")]);
     const panel = openPanel();

@@ -14,8 +14,16 @@ import {
   type ItemLabelIndex,
   type ItemLabelSource,
 } from "@/lib/itemLabels";
+import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
-import { isLinkItemLabel, linksInMarkdown } from "@/lib/sessionLinks";
+import {
+  PINNED_LINK_KIND,
+  SESSION_LINK_MATCHERS,
+  isLinkItemLabel,
+  linksInMarkdown,
+  shortLinkName,
+  type SessionLink,
+} from "@/lib/sessionLinks";
 
 export type OpenItemKind = "question" | "risk" | "finding" | "follow_up" | "link";
 export type OpenItemStatus = "open" | "answered" | "closed";
@@ -57,7 +65,8 @@ export interface StoredOpenItem {
   updated_at: number;
   closed_at: number | null;
   resolution: string | null;
-  closed_by: "agent" | "user" | null;
+  /** `"auto"` when the server closed it because the agent struck it in chat. */
+  closed_by: "agent" | "user" | "auto" | null;
   answers: OpenItemAnswer[];
 }
 
@@ -277,6 +286,68 @@ function storeClosingSource(entry: ItemLabelEntry, item: StoredOpenItem): ItemLa
     text: resolution ? `~~[${item.label}]~~ ${resolution}` : `~~[${item.label}]~~`,
     ...(item.closed_at !== null ? { createdAtS: item.closed_at } : {}),
   };
+}
+
+/** `raised_by` of an item the server recorded from a label the agent wrote only in chat. */
+export const RAISED_FROM_CHAT = "auto";
+
+/** What identifies the page `url` opens, as the Links list keys its rows. */
+function linkPageKey(url: URL): string {
+  for (const matcher of SESSION_LINK_MATCHERS) {
+    const key = matcher.pageKey(url);
+    if (key) return key;
+  }
+  return url.href;
+}
+
+/** A stored link's name in the Links list: the agent's title, else a short form of its URL. */
+export function storedLinkTitle(item: StoredOpenItem, url: URL): string {
+  const title = item.title.trim();
+  return title && !/^https?:\/\//i.test(title) ? title : shortLinkName(url);
+}
+
+/**
+ * The Links list with the session's stored link items. An open stored link is
+ * pinned under the title the agent gave it, in label order, whether or not a
+ * loaded message pins it; a closed one takes its pin and its page off the
+ * list. Pins and pages the store does not hold follow as the chat lists them.
+ */
+export function withStoredLinks(
+  links: readonly SessionLink[],
+  stored: readonly StoredOpenItem[] | null,
+): readonly SessionLink[] {
+  const storedLinks = (stored ?? []).filter((item) => item.kind === "link");
+  if (storedLinks.length === 0) return links;
+  const chatPins = new Map(
+    links.flatMap((link) => (link.item ? [[link.item.label, link] as const] : [])),
+  );
+  const pinned: SessionLink[] = [];
+  const replaced = new Set<SessionLink>();
+  const pages = new Set<string>();
+  for (const item of storedLinks) {
+    const chat = chatPins.get(item.label);
+    if (chat) replaced.add(chat);
+    const url = item.url ? parseHttpUrl(item.url) : null;
+    if (!url) continue;
+    const key = linkPageKey(url);
+    pages.add(key);
+    if (item.status === "closed") continue;
+    const source = {
+      messageId: "",
+      role: "assistant" as const,
+      text: `[${item.label}] ${item.title}`,
+    };
+    pinned.push({
+      key,
+      href: url.href,
+      title: storedLinkTitle(item, url),
+      kind: PINNED_LINK_KIND,
+      item: chat?.item ?? null,
+      lastMention: chat?.lastMention ?? source,
+    });
+  }
+  const rest = links.filter((link) => !replaced.has(link) && !pages.has(link.key));
+  return [...pinned, ...rest];
 }
 
 /** One row of the Open items panel: a stored item, or a label only the chat has. */
