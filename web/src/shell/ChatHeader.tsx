@@ -67,6 +67,7 @@ import { useChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
+import { SessionItemsHeaderSlot } from "./SessionItemsHeaderSlot";
 import { SessionMenuHeader } from "./SessionMenuHeader";
 
 /**
@@ -706,6 +707,8 @@ export function ChatHeader({
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
+        {/* Open items and links: the transcript portals its button here. */}
+        {!pending && conversationId && <SessionItemsHeaderSlot sessionId={conversationId} />}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (

@@ -40,6 +40,8 @@ import {
 import { publishItemLabelIndex } from "@/lib/itemCommentDrafts";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+import { SessionItemsButton } from "@/components/chat/SessionItemsButton";
+import { useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
 import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
 import { LinkRulesScope } from "@/components/chat/LinkRulesScope";
@@ -416,6 +418,8 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
+  // With a session header, open items live behind its button instead of a pinned bar.
+  const itemsHeaderHost = useSessionItemsHeaderHost(display.conversationId);
   const showWorkingIndicator =
     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const itemLabelIndex = useMemo(
@@ -428,7 +432,7 @@ function TranscriptImpl({
     if (display.conversationId) publishItemLabelIndex(display.conversationId, itemLabelIndex);
   }, [display.conversationId, itemLabelIndex]);
   const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
-  const hasPinnedBanner = display.hasTasks || hasOpenItems;
+  const hasPinnedBanner = display.hasTasks || (hasOpenItems && !itemsHeaderHost);
   return (
     <TaskMarkersProvider value={taskMarkers}>
       <ItemLabelScope index={itemLabelIndex} sessionId={display.conversationId ?? null}>
@@ -442,11 +446,15 @@ function TranscriptImpl({
             className="mt-14 md:mt-12"
           />
         )}
-        {/* The first pinned row clears the header; chat-tasks-preview adds the
-      native shells' safe-area shift (index.css). */}
-        <OpenItemsPanel
-          className={display.hasTasks ? undefined : "chat-tasks-preview mt-14 md:mt-12"}
-        />
+        {itemsHeaderHost ? (
+          <SessionItemsButton host={itemsHeaderHost} />
+        ) : (
+          // The first pinned row clears the header; chat-tasks-preview adds the
+          // native shells' safe-area shift (index.css).
+          <OpenItemsPanel
+            className={display.hasTasks ? undefined : "chat-tasks-preview mt-14 md:mt-12"}
+          />
+        )}
         {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
         <div

@@ -16,6 +16,7 @@ import {
   encodeDismissedItems,
   itemLabelTitle,
   mentionedInLatestReply,
+  type ItemLabelIndex,
   type ItemLabelEntry,
 } from "@/lib/itemLabels";
 import { revealItemCommentTray, useItemCommentDraftCounts } from "@/lib/itemCommentDrafts";
@@ -77,9 +78,10 @@ function useFittedChipCount(chipKey: string) {
  * Collapses an expanded `<details>` when the user presses outside it. Presses
  * inside a popover don't count, since the panel's chips open popovers.
  */
-export function useCollapseOnOutsidePress() {
+export function useCollapseOnOutsidePress(enabled = true) {
   const detailsRef = useRef<HTMLDetailsElement>(null);
   useEffect(() => {
+    if (!enabled) return;
     const onPointerDown = (event: PointerEvent) => {
       const details = detailsRef.current;
       const target = event.target as Element | null;
@@ -89,7 +91,7 @@ export function useCollapseOnOutsidePress() {
     };
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, []);
+  }, [enabled]);
   return detailsRef;
 }
 
@@ -114,6 +116,19 @@ function useDismissedItems(sessionId: string | null) {
     dismiss: (label: string) => write([...dismissed, label]),
     restore: (label: string) => write([...dismissed].filter((other) => other !== label)),
   };
+}
+
+/** The items the tracker lists: every labelled item, once the transcript uses labels. */
+export function trackedItems(index: ItemLabelIndex | null): ItemLabelEntry[] {
+  return index?.enabled ? [...index.items.values()] : [];
+}
+
+/** How many of the transcript's tracked items are open: neither closed nor dismissed. */
+export function useOpenItemCount(): number {
+  const index = useContext(ItemLabelIndexContext);
+  const { dismissed } = useDismissedItems(useContext(ItemLabelSessionContext));
+  return trackedItems(index).filter((item) => item.closedBy === null && !dismissed.has(item.label))
+    .length;
 }
 
 function ItemRow({
@@ -189,13 +204,20 @@ function ItemRow({
  * "dismissed" list at the bottom. Self-hides until the transcript uses item
  * labels.
  */
-export function OpenItemsPanel({ className }: { className?: string }) {
+export function OpenItemsPanel({
+  className,
+  layout = "bar",
+}: {
+  className?: string;
+  /** "section" lists the items inside another panel: expanded, without the bar's card. */
+  layout?: "bar" | "section";
+}) {
   const index = useContext(ItemLabelIndexContext);
   const sessionId = useContext(ItemLabelSessionContext);
   const draftCounts = useItemCommentDraftCounts(sessionId);
   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
   const [showDismissed, setShowDismissed] = useState(false);
-  const allItems = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
+  const allItems = useMemo(() => trackedItems(index), [index]);
   // A dismissal hides an open item; closing it later lists it as closed as usual.
   const isDismissed = (item: ItemLabelEntry) => item.closedBy === null && dismissed.has(item.label);
   const items = allItems.filter((item) => !isDismissed(item));
@@ -213,17 +235,23 @@ export function OpenItemsPanel({ className }: { className?: string }) {
     )
     .join(" ");
   const fit = useFittedChipCount(chipKey);
-  const detailsRef = useCollapseOnOutsidePress();
+  const section = layout === "section";
+  const detailsRef = useCollapseOnOutsidePress(!section);
   if (allItems.length === 0) return null;
   const headerChips = chips.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
   const draftTotal = [...draftCounts.values()].reduce((total, count) => total + count, 0);
 
   return (
-    <div className={cn("shrink-0 px-3 md:px-4", className)}>
+    <div className={cn(!section && "shrink-0 px-3 md:px-4", className)}>
       <details
         ref={detailsRef}
         data-testid="open-items"
-        className="group mx-auto mb-1 max-w-3xl overflow-hidden rounded-xl border border-border bg-card shadow-sm"
+        open={section || undefined}
+        className={cn(
+          "group",
+          !section &&
+            "mx-auto mb-1 max-w-3xl overflow-hidden rounded-xl border border-border bg-card shadow-sm",
+        )}
       >
         <summary className="relative flex cursor-pointer list-none select-none items-center gap-2 px-3 py-2 text-ui font-medium [&::-webkit-details-marker]:hidden">
           <MessageSquareDotIcon className="size-4 shrink-0 text-muted-foreground" />
@@ -306,7 +334,12 @@ export function OpenItemsPanel({ className }: { className?: string }) {
           <ChevronDownIcon className="size-4 shrink-0 transition-transform group-open:rotate-180" />
         </summary>
         {/* Capped like the Plan tracker so a long list can't swallow the chat. */}
-        <div className="max-h-[180px] overflow-y-auto border-t border-border py-1">
+        <div
+          className={cn(
+            "overflow-y-auto border-t border-border py-1",
+            section ? "max-h-[min(20rem,40vh)]" : "max-h-[180px]",
+          )}
+        >
           {recent.length > 0 && (
             <div className="px-3 pt-1 pb-1 text-xs text-muted-foreground">In the latest reply</div>
           )}
