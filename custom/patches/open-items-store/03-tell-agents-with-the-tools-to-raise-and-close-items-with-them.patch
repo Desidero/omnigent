@@ -10,9 +10,10 @@ the open items tools available, that would leave the store unused and
 the numbers made up.
 
 Agents whose spec keeps the open_items tool group now get a second part
-after the item-label instruction: raise items with sys_open_items_raise
-before presenting them and write each with the returned label, never
-pick a number, adopt a label already written in chat by raising it with
+after the item-label instruction: record every item, pinned links
+included, with sys_open_items_raise before presenting it, with a topic,
+and write each with the returned label, never pick a number or write a
+new label without recording it, adopt a label already written in chat by raising it with
 that label, close with sys_open_items_update and a one-line resolution
 and then strike the label in chat, list instead of relying on memory,
 and still write every item and close in chat. It ends with the fallback:
@@ -34,9 +35,9 @@ Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/AGENT_YAML_SPEC.md                       |  3 +-
  docs/chat-item-labels.md                      |  5 ++
- docs/open-items.md                            |  6 +++
+ docs/open-items.md                            |  7 +++
  feature-map/open-items.md                     |  2 +
- omnigent/runtime/prompt.py                    | 52 ++++++++++++++++++-
+ omnigent/runtime/prompt.py                    | 54 ++++++++++++++++++-
  .../claude_native/test_claude_native.py       | 14 +++--
  .../session/test_terminal_prepare.py          | 10 +++-
  .../codex_native/test_codex_native.py         | 14 +++--
@@ -47,7 +48,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  tests/runner/test_runner_entry.py             |  5 ++
  tests/runtime/test_prompt.py                  | 22 +++++++-
  tests/spec/test_resolve_agent_bundle.py       | 10 +++-
- 15 files changed, 165 insertions(+), 31 deletions(-)
+ 15 files changed, 168 insertions(+), 31 deletions(-)
 
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
 index 3edb6188b02e1a3723751c3dc2387c119cd176ac..53ddc5ac6b2812198019137083d219ddecc9b134 100644
@@ -80,16 +81,17 @@ index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..e105c2cf4da3c25c91b18c3550d3a84f
  instructions only at launch, so it joins the stable guidance appended to the
  agent's own instructions there: through Claude Code's `--append-system-prompt`
 diff --git a/docs/open-items.md b/docs/open-items.md
-index 01aa67999a5e5730a6bc7cbb247d9c991bb176ed..f741cd92b60c03fa648a3406c2ee51da8b75e9c1 100644
+index fee612b2eea945e0b345eaefd88c826c35294591..edcf7fc66dc08c37925141727f98c0dd4fb6a136 100644
 --- a/docs/open-items.md
 +++ b/docs/open-items.md
-@@ -50,6 +50,12 @@ its first attempt allocated. Two raises at once in one session never get the
+@@ -50,6 +50,13 @@ its first attempt allocated. Two raises at once in one session never get the
  same label. Adopting a label from chat takes it only if no item has it, and
  moves counting past it.
  
-+The framework instruction for item labels gains a part for these tools: raise
-+an item before presenting it and write it with the returned label, never pick a
-+number, close with `sys_open_items_update` and a one-line resolution and then
++The framework instruction for item labels gains a part for these tools: record
++every item, pinned links included, with `sys_open_items_raise` before presenting
++it, with a topic, and write it with the returned label, never pick a number or
++write a new label without recording it, close with `sys_open_items_update` and a one-line resolution and then
 +strike the label in chat, list instead of relying on memory, and label in chat
 +only if the tools are missing.
 +
@@ -114,7 +116,7 @@ index c123168e0ffca740a9090beb92d20b02cd1326e0..2e5e10b9e470677aa50e496de84dfb86
 +- A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the instruction's last sentence covers that.
  - Labels are unique per session, not across a session tree: a child session counts from Q1.
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..76c7674d38e46e513062c79d80bb61e893e558c8 100644
+index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..da19205196d23b4f9ec7415137cd1e640b0345c0 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
 @@ -2,6 +2,8 @@
@@ -126,7 +128,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..76c7674d38e46e513062c79d80bb61e8
  import json
  import re
  from collections.abc import Sequence
-@@ -91,6 +93,47 @@ ITEM_LABEL_INSTRUCTION = (
+@@ -91,6 +93,49 @@ ITEM_LABEL_INSTRUCTION = (
      "closing settled ones keeps that list accurate."
  )
  
@@ -134,10 +136,12 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..76c7674d38e46e513062c79d80bb61e8
 +# the store, not the chat text, then decides an item's state.
 +OPEN_ITEMS_INSTRUCTION = (
 +    "Stored items: this session keeps its items with the sys_open_items_* tools. "
-+    "Before you present new items in chat, record them with sys_open_items_raise "
-+    "(several in one call) and write each with the label it returns; never pick a "
-+    "number yourself. To keep an item you already labelled in chat without the "
-+    "tool, raise it with that label. When an item is settled, call "
++    "Every time you raise an item, including a pinned link, record it with "
++    "sys_open_items_raise first (several in one call, each with a topic for the "
++    "work it belongs to) and write it with the label it returns; never pick a "
++    "number yourself or write a new label without recording it. To keep an item "
++    "you already labelled in chat without the tool, raise it with that label. "
++    "When an item is settled, call "
 +    "sys_open_items_update with status closed and a one-line resolution, then "
 +    "strike its label in chat as above; reopen it with status open. Call "
 +    "sys_open_items_list to see what is open instead of relying on memory. Still "
@@ -174,7 +178,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..76c7674d38e46e513062c79d80bb61e8
  
  def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      """
-@@ -107,7 +150,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -107,7 +152,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      agent unless the spec sets ``tool_groups.browser: false``, in which
      case the prompt must not steer the model toward tools it lacks. The
      item-label guidance applies to every agent, since every transcript
@@ -184,7 +188,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..76c7674d38e46e513062c79d80bb61e8
  
      :param spec: The parsed AgentSpec.
      :returns: The applicable spec-level framework instructions.
-@@ -119,7 +163,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -119,7 +165,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      if spec.tool_groups.browser:
          instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
      instructions.append(WORKSPACE_IMAGE_INSTRUCTION)
@@ -193,7 +197,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..76c7674d38e46e513062c79d80bb61e8
      return instructions
  
  
-@@ -271,6 +315,10 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
+@@ -271,6 +317,10 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
      return append_framework_instructions(authored, framework) or "\n\n".join(framework)
  
  

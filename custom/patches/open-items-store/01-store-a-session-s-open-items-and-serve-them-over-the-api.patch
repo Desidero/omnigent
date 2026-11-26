@@ -40,7 +40,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/open-items.md                            |  56 ++
- omnigent/entities/open_items.py               | 436 +++++++++++++
+ omnigent/entities/open_items.py               | 453 +++++++++++++
  omnigent/server/API.md                        |  88 +++
  omnigent/server/app.py                        |  16 +
  omnigent/server/open_items.py                 | 373 +++++++++++
@@ -50,8 +50,8 @@ Signed-off-by: Desidero <desidero@gmail.com>
  omnigent/stores/open_items_store.py           | 611 ++++++++++++++++++
  openapi.json                                  | 503 ++++++++++++++
  tests/server/routes/test_open_items_routes.py | 305 +++++++++
- tests/stores/test_open_items_store.py         | 322 +++++++++
- 12 files changed, 2843 insertions(+)
+ tests/stores/test_open_items_store.py         | 323 +++++++++
+ 12 files changed, 2861 insertions(+)
  create mode 100644 docs/open-items.md
  create mode 100644 omnigent/entities/open_items.py
  create mode 100644 omnigent/server/open_items.py
@@ -62,7 +62,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
 
 diff --git a/docs/open-items.md b/docs/open-items.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..47c10a2f7a5d5c22e10e6d542e7ea54bbf22e5a5
+index 0000000000000000000000000000000000000000..f87880c28500b8aed1669e4ed41783adf9e06f56
 --- /dev/null
 +++ b/docs/open-items.md
 @@ -0,0 +1,56 @@
@@ -89,7 +89,7 @@ index 0000000000000000000000000000000000000000..47c10a2f7a5d5c22e10e6d542e7ea54b
 +| `status` | `open`, `answered` (you replied and the agent has not closed it yet) or `closed`. |
 +| `title`, `detail` | A few words (at most 160 characters), then the full item (at most 6,000). |
 +| `topic` | Optional short slug naming the piece of work, such as `cache-rollout`, so items of one coordinator session group. |
-+| `links` | Up to 8 http(s) links supporting the item. A link item (`L`) is a pinned URL; pinning one URL twice returns the same item. |
++| `links` | Up to 8 http(s) links supporting the item. A link item (`L`) is a pinned URL; pinning one URL twice returns the same item, and one pinned without a title is named by a short form of its URL (`example.com/reports/…`). |
 +| `raised_by` | The sub-agent an item speaks for, when the agent raising it relays it. |
 +| `resolution`, `closed_by` | How a closed item ended, and whether the agent or a person closed it. |
 +| `answers` | Your latest five replies. |
@@ -124,10 +124,10 @@ index 0000000000000000000000000000000000000000..47c10a2f7a5d5c22e10e6d542e7ea54b
 +deployment may encrypt their content.
 diff --git a/omnigent/entities/open_items.py b/omnigent/entities/open_items.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2ef996818af5bb018ea13c8a289b4252a555b2aa
+index 0000000000000000000000000000000000000000..14f3584749523c67615bb8a3c9fbf440a3b69abb
 --- /dev/null
 +++ b/omnigent/entities/open_items.py
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,453 @@
 +"""Open items: the questions, risks, findings, follow-ups and links a session raises.
 +
 +An item belongs to the session that raised it and is named by a label, the
@@ -353,6 +353,23 @@ index 0000000000000000000000000000000000000000..2ef996818af5bb018ea13c8a289b4252
 +    return [normalize_link(link) for link in value]
 +
 +
++def short_link_name(url: str) -> str:
++    """A short readable name for a link nothing names, e.g. ``"example.com/reports/q3"``.
++
++    The host and the start of the path, never the whole address; the web's
++    ``shortLinkName`` (``web/src/lib/sessionLinks.ts``) gives the same.
++    """
++    from urllib.parse import urlsplit
++
++    parts = urlsplit(url)
++    host = (parts.hostname or "").removeprefix("www.")
++    segments = [segment for segment in parts.path.split("/") if segment]
++    shown = [segment if len(segment) <= 16 else f"{segment[:12]}…" for segment in segments[:2]]
++    if len(segments) > 2:
++        shown.append("…")
++    return "/".join([host, *shown])[:TITLE_MAX_CHARS]
++
++
 +def link_dedupe_key(url: str) -> str:
 +    """The key that makes pinning one URL twice return one item."""
 +    return hashlib.sha256(_canonical_url(url).encode("utf-8")).hexdigest()
@@ -378,7 +395,7 @@ index 0000000000000000000000000000000000000000..2ef996818af5bb018ea13c8a289b4252
 +        dedupe_key = link_dedupe_key(url)
 +        content["url"] = url
 +        title = _text(value.get("title"), "title", TITLE_MAX_CHARS, required=False)
-+        content["title"] = title or url[:TITLE_MAX_CHARS]
++        content["title"] = title or short_link_name(url)
 +    else:
 +        if value.get("url") is not None:
 +            raise _invalid("only a link item has a url; attach links with links")
@@ -2751,10 +2768,10 @@ index 0000000000000000000000000000000000000000..e791dc2e8a0af66a827f1ed41502237a
 +    raise RuntimeError(f"no open items store at {storage_location}")
 diff --git a/tests/stores/test_open_items_store.py b/tests/stores/test_open_items_store.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..766caa8ad2701156dab2759fc3afef5a449d455d
+index 0000000000000000000000000000000000000000..fc7507384747667d1ab1b76789f560f3a28c1557
 --- /dev/null
 +++ b/tests/stores/test_open_items_store.py
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,323 @@
 +"""Tests for :class:`OpenItemsStore`, the ``open_items`` side store, against a real database."""
 +
 +from __future__ import annotations
@@ -2891,7 +2908,8 @@ index 0000000000000000000000000000000000000000..766caa8ad2701156dab2759fc3afef5a
 +    )
 +    assert _labels(pinned) == _labels(again) == ["L1"]
 +    assert again[0].duplicate
-+    assert pinned[0].item.content["title"] == "https://github.com/a/b/pull/7"  # type: ignore[union-attr]
++    # A link pinned without a title is named by a short form of its URL.
++    assert pinned[0].item.content["title"] == "github.com/a/b/…"  # type: ignore[union-attr]
 +
 +
 +def test_a_label_from_chat_is_adopted_once_and_counting_moves_past_it(

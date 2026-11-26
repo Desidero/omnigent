@@ -1,7 +1,7 @@
 # open-items-store
 
 Needs: side-schemas, chat-item-labels
-Covers: 50e7509e27d3b738
+Covers: f99b380b23b8a174
 
 Open items (the questions, risks, findings, follow-ups and pinned links an
 agent raises) become records of their session, in the `open_items` side
@@ -22,6 +22,8 @@ and the Open items bar still follow the chat text.
 - Labels are unique per session: two raises at once never get the same label, a label is never reused for another item, and a retried raise with the same tool call ID returns the labels its first attempt allocated.
 - The tools only write to their own session: raises and agent updates are accepted only from the session's bound runner (source header and tunnel token), for an agent whose spec keeps the `open_items` group.
 - A server or host without the series keeps text labels working: a runner keeps the tools only when the bundle download carries `X-Omnigent-Open-Items: 1`, and without the tools the agent gets the text-only item-label instruction. Nothing is backfilled.
+- A link pinned without a title is named by a short form of its URL (host and the start of the path), never the whole URL.
+- Agents with the tools are told to record every item, pinned links included, with `sys_open_items_raise` before writing it, with a topic.
 - Deleting a session removes its items and counters; forks start with none.
 - Reads need read access; people's changes and answers need edit access.
 - The open_items tables stay out of the main migration chain, and a build without the series starts against a database that holds them.
