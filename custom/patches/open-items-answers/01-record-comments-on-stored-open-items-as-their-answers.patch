@@ -1,0 +1,407 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 16:08:59 +0000
+Subject: [PATCH] feat(web): record comments on stored open items as their
+ answers
+
+Answering several items at once sends one "Comments on N items" message,
+which tells the agent but leaves every stored item open in the panel until
+the agent gets round to closing it, so the panel cannot tell what still
+waits on the user.
+
+When that message posts (the moment its drafts are settled), the browser
+that sent it records each item's comments as the item's answer through
+POST /v1/sessions/{id}/open-items/answers: an open stored item becomes
+answered, shows the answer, and leaves the badge. The message goes through
+the normal send path first and nothing waits on the record: on a server
+without open items nothing is sent, and a refused or failed call only
+leaves the items open. An expanded row in the panel also offers Comment.
+
+Not proposed upstream yet: the comments and the store it joins are not
+upstream either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-item-labels.md                      |  5 +-
+ docs/open-items.md                            |  8 ++
+ feature-map/open-items.md                     |  2 +
+ .../chat/StoredOpenItemsPanel.test.tsx        | 23 ++++++
+ .../components/chat/StoredOpenItemsPanel.tsx  | 13 +++
+ web/src/hooks/useItemCommentMode.test.tsx     | 32 ++++++++
+ web/src/hooks/useItemCommentMode.ts           |  3 +
+ web/src/lib/openItemAnswers.test.ts           | 75 +++++++++++++++++
+ web/src/lib/openItemAnswers.ts                | 80 +++++++++++++++++++
+ 9 files changed, 240 insertions(+), 1 deletion(-)
+ create mode 100644 web/src/lib/openItemAnswers.test.ts
+ create mode 100644 web/src/lib/openItemAnswers.ts
+
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+index 45f689f9b2896be7c1ccffb905ab0dd1c6ea889d..f46ae66f3c80fc55774af6a945cdc4ef2890ba8e 100644
+--- a/docs/chat-item-labels.md
++++ b/docs/chat-item-labels.md
+@@ -159,4 +159,7 @@ next reply. A comment on a closed item leaves it closed.
+ 
+ Sent comments are read back from the transcript, so they show on every device.
+ Drafts stay in this browser only (attachments included) and survive a reload;
+-a failed or cancelled send puts them back as drafts.
++a failed or cancelled send puts them back as drafts. Where the server stores
++open items, each comment on a stored item is also recorded as its answer once
++the message posts, so the item shows as answered (see
++[Open items in the web UI](open-items.md#in-the-web-ui)).
+diff --git a/docs/open-items.md b/docs/open-items.md
+index 5ff2bb4bede5c9872f06f38ada9662fe485de350..639b2f690e5907f7f3a94ee9a6aa95051a0ea087 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -106,6 +106,14 @@ stays current as the agent raises and closes them.
+   the item is marked **closed in chat** and its details offer **Close** with
+   the chat's sentence as the resolution. The agent sees every change in
+   `sys_open_items_list`.
++- **Answers from comments:** with [comments on items](chat-item-labels.md#comment-on-items),
++  an expanded item also offers **Comment**. When a "Comments on N items"
++  message posts, the browser that sent it records each item's comments as
++  that item's answer (`POST …/open-items/answers`): an open stored item
++  becomes **Answered** and lists the answer, and the agent sees it in
++  `sys_open_items_list`. The message itself goes through the normal send path
++  first, so if recording fails the item just stays open. Labels the server
++  does not hold are skipped.
+ - **Chat-only items** keep their dismiss button; dismissals are still stored
+   as the `omnigent.items_dismissed` session label, which is read for chat-only
+   items and never written for stored ones.
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index 9cf108cfa3849f83c132fedefe0e737b42bccbdb..8444a293afee0eb6e4c1385332a7dc8bf49bf321 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -14,6 +14,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
+ - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
+ - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
+ - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
++- `items-comment-answers`: a posted "Comments on N items" message records each stored item's comments as its answer, so it shows answered; a failed record leaves it open and never touches the message.
+ 
+ ## How to get to it (user POV)
+ 
+@@ -30,6 +31,7 @@ Preconditions: a local server and runner from this checkout; any harness.
+ 
+ - Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
+ - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
++- Answers from comments (web): `web/src/lib/openItemAnswers.test.ts`, `web/src/hooks/useItemCommentMode.test.tsx`. Human check: with an open stored item, choose **Comment** on its chip or in its expanded panel row, send the comment; the item moves to **Answered** with your text under it, and the badge drops by one.
+ - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
+ - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
+ - Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge and user changes: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; the live event: `web/src/store/chatStore.openItems.test.ts`.
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.test.tsx b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+index 4e122253fda8dccc1b99f17a635038392db686c6..7bd04c84297dbfac5d3555264233c1a086fb624e 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.test.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+@@ -14,6 +14,11 @@ vi.mock(import("@/lib/identity"), async (importOriginal) => ({
+ }));
+ 
+ import { TooltipProvider } from "@/components/ui/tooltip";
++import {
++  registerItemCommentComposer,
++  resetItemCommentDraftsForTests,
++  useItemCommentRequest,
++} from "@/lib/itemCommentDrafts";
+ import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
+ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+ import type { ServerInfo } from "@/lib/capabilities";
+@@ -250,6 +255,24 @@ describe("the Open items panel on a server that stores them", () => {
+     expect(within(panel).queryByText("chat only")).toBeNull();
+   });
+ 
++  it("starts a comment on a stored item from its details, closing the panel", () => {
++    const unregister = registerItemCommentComposer("conv_1");
++    let request: ReturnType<typeof useItemCommentRequest> = null;
++    function RequestProbe() {
++      request = useItemCommentRequest("conv_1");
++      return null;
++    }
++    render(<RequestProbe />);
++    renderPanel(["Nothing labelled."], [storedItem("Q7", { title: "Cache rows?" })]);
++    const panel = openPanel();
++    fireEvent.click(within(panel).getByRole("button", { name: "Item Q7" }));
++    fireEvent.click(within(panel).getByRole("button", { name: "Comment" }));
++    expect(request).toMatchObject({ label: "Q7", title: "Cache rows?" });
++    expect(screen.queryByTestId("session-items-panel")).toBeNull();
++    unregister();
++    resetItemCommentDraftsForTests();
++  });
++
+   it("offers no changes to a viewer without edit access", () => {
+     access.canEdit = false;
+     renderPanel([ITEMS, "More on [Q2]."], [storedItem("Q1"), storedItem("Q2")]);
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.tsx b/web/src/components/chat/StoredOpenItemsPanel.tsx
+index 50e865e7ee96203890c3a284f336e2e0ef42bdaf..21650677637fe9012087d4981bc38bab3e648bd9 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.tsx
+@@ -8,6 +8,7 @@ import {
+ import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
+ import { Button } from "@/components/ui/button";
+ import { useCanEdit } from "@/hooks/usePermissions";
++import { requestItemComment, useCanCommentOnItems } from "@/lib/itemCommentDrafts";
+ import {
+   useImportChatItems,
+   useStoredOpenItems,
+@@ -159,6 +160,8 @@ function RowDetails({
+   onUpdate: (update: OpenItemUpdate) => void;
+ }) {
+   const [, setSearchParams] = useSearchParams();
++  const sessionId = useContext(ItemLabelSessionContext);
++  const canComment = useCanCommentOnItems(sessionId);
+   const [resolution, setResolution] = useState("");
+   const item = row.stored;
+   const messageId = row.entry?.source.messageId;
+@@ -209,6 +212,16 @@ function RowDetails({
+             Show in conversation
+           </button>
+         )}
++        {canComment && sessionId !== null && (
++          // Comments sent on a stored item are recorded as its answers once they post.
++          <button
++            type="button"
++            className="text-xs text-link hover:underline"
++            onClick={() => requestItemComment(sessionId, { label: row.label, title: row.title })}
++          >
++            Comment
++          </button>
++        )}
+         {item && canEdit && item.status !== "closed" && (
+           <form
+             className="flex min-w-0 flex-1 items-center gap-1"
+diff --git a/web/src/hooks/useItemCommentMode.test.tsx b/web/src/hooks/useItemCommentMode.test.tsx
+index be214929ccab50a1f1d51a2554b51d7bb9d86779..82366e0f5007da93eb823dce6f736c8c02ec531d 100644
+--- a/web/src/hooks/useItemCommentMode.test.tsx
++++ b/web/src/hooks/useItemCommentMode.test.tsx
+@@ -24,6 +24,9 @@ import { buildItemLabelIndex } from "@/lib/itemLabels";
+ import { useChatStore } from "@/store/chatStore";
+ import { useItemCommentMode, type ComposerContent } from "./useItemCommentMode";
+ 
++const recordAnswers = vi.hoisted(() => vi.fn(() => Promise.resolve()));
++vi.mock("@/lib/openItemAnswers", () => ({ recordItemCommentAnswers: recordAnswers }));
++
+ const SESSION_ID = "conv_comments";
+ const DEFINING_TEXT = [
+   "Before I continue:",
+@@ -349,6 +352,35 @@ describe("useItemCommentMode", () => {
+     expect(getItemCommentState(SESSION_ID)).toEqual({ drafts: [], submissions: [] });
+   });
+ 
++  it("records the comments as the items' answers once, when the message posts", async () => {
++    recordAnswers.mockClear();
++    const { result } = renderCommentMode();
++    comment(result, "R1", "Batch it.");
++    await act(() => result.current.submitComments());
++    const [text] = send.mock.calls[0];
++    act(() => {
++      useChatStore.setState({
++        queuedMessages: [{ queueId: "q_1", text, conversationId: SESSION_ID }],
++      });
++      vi.advanceTimersByTime(10);
++    });
++    expect(recordAnswers).not.toHaveBeenCalled();
++    act(() => {
++      useChatStore.setState({
++        queuedMessages: [],
++        pendingUserMessages: [
++          { tempId: "pend_1", content: [{ type: "input_text", text }], posted: true },
++        ],
++      });
++      vi.advanceTimersByTime(10);
++    });
++    act(() => {
++      useChatStore.setState({ pendingUserMessages: [] });
++      vi.advanceTimersByTime(10);
++    });
++    expect(recordAnswers.mock.calls).toEqual([[SESSION_ID, text]]);
++  });
++
+   it("gives the comments and the typed message back when the queued message is cancelled", async () => {
+     const { result } = renderCommentMode();
+     comment(result, "R1", "Batch it.");
+diff --git a/web/src/hooks/useItemCommentMode.ts b/web/src/hooks/useItemCommentMode.ts
+index b8e8219cfa2d7651c1fcbc06035536103b3d137b..9c5ded96300a0ccdfc52bc14c0bca69feda63fa1 100644
+--- a/web/src/hooks/useItemCommentMode.ts
++++ b/web/src/hooks/useItemCommentMode.ts
+@@ -43,6 +43,7 @@ import {
+   type ItemCommentRequest,
+   type ItemCommentSubmission,
+ } from "@/lib/itemCommentDrafts";
++import { recordItemCommentAnswers } from "@/lib/openItemAnswers";
+ import { itemLabelTitleParts, type ItemLabelEntry } from "@/lib/itemLabels";
+ import type { ComposerSendOptions } from "@/lib/messageQueue";
+ import type { StoredReplyDraft } from "@/lib/replyDraft";
+@@ -550,6 +551,8 @@ export function useItemCommentMode({
+         } else if (fate === "posted") {
+           generalFilesBySubmission.delete(submission.id);
+           completeItemCommentSubmission(sessionId, submission.id);
++          // Stored items it comments on become answered; a failure leaves them open.
++          void recordItemCommentAnswers(sessionId, submission.text);
+         } else if (!owned) {
+           // Orphaned by a page that went away: the transcript has loaded, and
+           // the message isn't in it.
+diff --git a/web/src/lib/openItemAnswers.test.ts b/web/src/lib/openItemAnswers.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..488f0d1840819c57413c039140bbac2a184a0c34
+--- /dev/null
++++ b/web/src/lib/openItemAnswers.test.ts
+@@ -0,0 +1,75 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++const fetchMock = vi.hoisted(() => vi.fn());
++const serverInfo = vi.hoisted(() => ({ current: { open_items: true } as object | null }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
++vi.mock(import("@/lib/capabilities"), async (importOriginal) => ({
++  ...(await importOriginal()),
++  getCachedServerInfo: () => serverInfo.current as never,
++}));
++
++import { buildItemCommentMessage } from "@/lib/itemComments";
++import { answersInCommentMessage, recordItemCommentAnswers } from "./openItemAnswers";
++
++afterEach(() => {
++  fetchMock.mockReset();
++  serverInfo.current = { open_items: true };
++  vi.restoreAllMocks();
++});
++
++const MESSAGE = buildItemCommentMessage(
++  [
++    {
++      label: "Q2",
++      title: "Soft-deleted rows",
++      comments: [
++        { text: "Drop them.", attachments: [] },
++        { text: "", attachments: ["rows.png"] },
++      ],
++    },
++    { label: "A4", title: "Other letter", comments: [{ text: "Fine.", attachments: [] }] },
++    { label: "R1", title: "Flaky", comments: [{ text: "x".repeat(2100), attachments: [] }] },
++  ],
++  { text: "Thanks!", attachments: [] },
++);
++
++describe("answersInCommentMessage", () => {
++  it("gives one answer per stored-kind item, its comments joined", () => {
++    expect(answersInCommentMessage(MESSAGE)).toEqual([
++      { label: "Q2", text: "Drop them.\n\nAttachments: rows.png" },
++      { label: "R1", text: "x".repeat(2000) },
++    ]);
++    expect(answersInCommentMessage("Just a message about [Q2].")).toEqual([]);
++  });
++});
++
++describe("recordItemCommentAnswers", () => {
++  it("posts the answers where the server stores open items", async () => {
++    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ items: [] })));
++    await recordItemCommentAnswers("conv 1", MESSAGE);
++    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
++    expect(url).toBe("/v1/sessions/conv%201/open-items/answers");
++    expect(init.method).toBe("POST");
++    expect(JSON.parse(init.body as string).answers.map((a: { label: string }) => a.label)).toEqual([
++      "Q2",
++      "R1",
++    ]);
++  });
++
++  it("does nothing on a server without open items", async () => {
++    serverInfo.current = { open_items: false };
++    await recordItemCommentAnswers("conv_1", MESSAGE);
++    serverInfo.current = null;
++    await recordItemCommentAnswers("conv_1", MESSAGE);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it("never throws: a refused or failed call only leaves the items open", async () => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 403 }));
++    await expect(recordItemCommentAnswers("conv_1", MESSAGE)).resolves.toBeUndefined();
++    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
++    await expect(recordItemCommentAnswers("conv_1", MESSAGE)).resolves.toBeUndefined();
++    expect(warn).toHaveBeenCalledTimes(2);
++  });
++});
+diff --git a/web/src/lib/openItemAnswers.ts b/web/src/lib/openItemAnswers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1f113fade1b2f2a46f9b130ae0885e6fd222544
+--- /dev/null
++++ b/web/src/lib/openItemAnswers.ts
+@@ -0,0 +1,80 @@
++// Records the user's comments on stored open items as their answers, once the
++// "Comments on N items" message that carries them has posted, so the items
++// show as answered. Best effort: the message already reached the agent, so a
++// failed record only leaves the items open.
++
++import { getCachedServerInfo } from "@/lib/capabilities";
++import { authenticatedFetch } from "@/lib/identity";
++import { parseItemCommentMessage } from "@/lib/itemComments";
++import { kindOfLabel } from "@/lib/openItems";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
++
++// The store's limits: one answer's length, answers per request.
++const ANSWER_MAX_CHARS = 2000;
++const ANSWERS_PER_REQUEST = 20;
++
++export interface OpenItemAnswerInput {
++  label: string;
++  text: string;
++}
++
++/**
++ * The answers a comment message gives: per item section, its comments joined,
++ * for labels the store could hold. Attachment-only comments name their files.
++ */
++export function answersInCommentMessage(text: string): OpenItemAnswerInput[] {
++  const parsed = parseItemCommentMessage(text);
++  if (!parsed) return [];
++  return parsed.sections.flatMap((section) => {
++    if (!kindOfLabel(section.label)) return [];
++    const answer = section.comments
++      .map(
++        (comment) =>
++          comment.text.trim() ||
++          (comment.attachments.length > 0 ? `Attachments: ${comment.attachments.join(", ")}` : ""),
++      )
++      .filter(Boolean)
++      .join("\n\n")
++      .slice(0, ANSWER_MAX_CHARS);
++    return answer ? [{ label: section.label, text: answer }] : [];
++  });
++}
++
++/** `POST /v1/sessions/{id}/open-items/answers`; a label the store lacks is skipped there. */
++export async function recordOpenItemAnswers(
++  sessionId: string,
++  answers: readonly OpenItemAnswerInput[],
++): Promise<void> {
++  /* oxlint-disable no-await-in-loop -- a few small requests, in order */
++  for (let start = 0; start < answers.length; start += ANSWERS_PER_REQUEST) {
++    const response = await authenticatedFetch(
++      `/v1/sessions/${encodeURIComponent(sessionId)}/open-items/answers`,
++      {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ answers: answers.slice(start, start + ANSWERS_PER_REQUEST) }),
++      },
++    );
++    if (!response.ok) throw await apiErrorFromResponse(response);
++  }
++  /* oxlint-enable no-await-in-loop */
++}
++
++/**
++ * After a comment message posted: record its comments on the stored items
++ * they name, where the server stores open items. Never throws.
++ */
++export async function recordItemCommentAnswers(
++  sessionId: string,
++  messageText: string,
++): Promise<void> {
++  if (getCachedServerInfo()?.open_items !== true) return;
++  const answers = answersInCommentMessage(messageText);
++  if (answers.length === 0) return;
++  try {
++    await recordOpenItemAnswers(sessionId, answers);
++  } catch (error) {
++    // The agent has the message; the items just stay open in the panel.
++    console.warn("Couldn't record the comments as answers to the open items", error);
++  }
++}
