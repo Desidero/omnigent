@@ -21,6 +21,14 @@ The instruction suggests `[Q1]`, `[Q2]` for questions, `[R1]` for risks,
 a settled item by writing its label struck through (`~~[Q2]~~`) in the
 sentence that says how it ended.
 
+The same instruction covers pages worth reopening: the agent pins a page it
+publishes or keeps coming back to with a link label, `[L1]`, then a short bold
+title and the URL. Pinned links show under **Links** (below).
+
+```markdown
+[L1] **Release checklist** https://example.com/checklist
+```
+
 SDK harnesses get the instruction with every turn. Native harnesses take
 instructions only at launch, so it joins the stable guidance appended to the
 agent's own instructions there: through Claude Code's `--append-system-prompt`
@@ -49,13 +57,30 @@ you or the agent write them.
   the number of open items as a badge. Click it for a panel (on a phone, tap
   it for a sheet at the bottom of the screen) that lists the open labels as
   chips and every item with its title, closed ones under **Closed (N)**. The
-  button appears once the transcript uses labels. A transcript shown without
-  the session header keeps the list as a bar pinned above the thread.
-- **Loaded history only:** items are read from the messages loaded in your
-  browser; the list is not stored on the server. In a long session whose early
-  history has not been loaded, an item mentioned only there is missing until
-  you scroll up far enough to load it, and a label whose first message is not
-  loaded is described by its earliest loaded mention.
+  button appears once the transcript has an item or a link. A transcript shown
+  without the session header keeps the list as a bar pinned above the thread.
+- **Links:** under the items, the same panel lists the session's links, each
+  opening the way a link in chat does. Pinned links come first, in the order
+  they were pinned: a link label (`[L1]`, `[L2]`), written by the agent or by
+  you, pins the first link in its own block under its bold title, and its chip
+  previews that block like any item. Then come the pages the agent's messages
+  link to at `https://claude.ai/artifact/…` or `https://claude.ai/code/artifact/…`,
+  collected without the agent doing anything: one row per page, newest mention
+  first, titled by the newest link text written for it. A link written as a
+  bare URL is named from the words around it: a heading or bold title on its
+  line (or on the line just above, when the link starts its line), else the
+  last few words of the sentence before it; with none of these a page shows
+  as a short name such as `Artifact 1f3a9c20` or `example.com/reports`, never
+  the whole address. Pages are never fetched for a title. Links inside fenced
+  code are skipped. `~~[L1]~~` takes a pinned link off the list, together with
+  the collected row for the same page, and a later plain `[L1]` puts it back.
+  A link label is not an open item: it is left out of the badge and the items.
+- **Loaded history only:** items and links are read from the messages loaded
+  in your browser; neither list is stored on the server. In a long session
+  whose early history has not been loaded, an item or link mentioned only
+  there is missing until you scroll up far enough to load it, and a label
+  whose first message is not loaded is described by its earliest loaded
+  mention, so a pinned link shows only if that mention carries the link.
 - **Latest reply:** the Open items list puts the items the agent's newest reply
   mentions first, tinted, and includes an item that reply just closed, struck
   through. Expanded, they sit under **In the latest reply**, ahead of the other

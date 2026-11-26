@@ -56,6 +56,7 @@ import {
   BubbleView,
   ConversationScrollRefBridge,
   buildBubbleItemLabelIndex,
+  collectBubbleSessionLinks,
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
@@ -447,7 +448,11 @@ function TranscriptImpl({
           />
         )}
         {itemsHeaderHost ? (
-          <SessionItemsButton host={itemsHeaderHost} />
+          <TranscriptSessionItems
+            host={itemsHeaderHost}
+            bubbles={display.bubbles}
+            index={itemLabelIndex}
+          />
         ) : (
           // The first pinned row clears the header; chat-tasks-preview adds the
           // native shells' safe-area shift (index.css).
@@ -627,6 +632,20 @@ function ItemLabelScope({
       </ItemLabelSessionContext.Provider>
     </ItemLabelIndexContext.Provider>
   );
+}
+
+/** The header's open-items button, with the links this transcript's messages carry. */
+function TranscriptSessionItems({
+  host,
+  bubbles,
+  index,
+}: {
+  host: HTMLElement;
+  bubbles: readonly Bubble[];
+  index: ItemLabelIndex;
+}) {
+  const links = useMemo(() => collectBubbleSessionLinks(bubbles, index), [bubbles, index]);
+  return <SessionItemsButton host={host} links={links} />;
 }
 
 /**
