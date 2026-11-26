@@ -33,6 +33,7 @@ import {
   type ItemLabelSource,
 } from "@/lib/itemLabels";
 import { mergeStoredOpenItems, openItemsKey, type StoredOpenItem } from "@/lib/openItems";
+import { NO_OPEN_ITEM_FILTERS, writeOpenItemsView } from "@/lib/openItemFilters";
 import { collectSessionLinks } from "@/lib/sessionLinks";
 import { SessionItemsHeaderSlot, useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
 import { storedItem } from "@/test/openItemsFixtures";
@@ -47,6 +48,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   fetchMock.mockReset();
+  writeOpenItemsView("conv_1", { filters: NO_OPEN_ITEM_FILTERS, toggledGroups: [] });
+  window.localStorage.clear();
 });
 
 /** The header button inside the label scope the transcript gives it, store merged in. */
@@ -354,5 +357,91 @@ describe("the Open items panel on a server that stores them", () => {
     expect(panel.tagName).toBe("DETAILS");
     expect(within(panel).getByRole("button", { name: "Dismiss item Q1" })).toBeTruthy();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("search, filters and grouping", () => {
+  const MANY = [
+    storedItem("Q1", { title: "Backfill window", topic: "cache" }),
+    storedItem("Q2", { title: "Soft-deleted rows", detail: "Copy or drop?", topic: "cache" }),
+    storedItem("Q3", { title: "Retention", status: "answered" }),
+    storedItem("R1", { title: "Flaky CI", status: "closed", topic: "release" }),
+    storedItem("T1", { title: "Rename the flag", topic: "release" }),
+  ];
+  const search = () => screen.getByRole("searchbox", { name: "Search open items" });
+  const chip = (name: string) => screen.getByRole("button", { name });
+
+  it("hides search and chips while the list is short", () => {
+    renderPanel(["Nothing labelled."], MANY.slice(0, 3));
+    openPanel();
+    expect(screen.queryByTestId("open-items-filters")).toBeNull();
+  });
+
+  it("searches title, detail and topic, and filters with chips that count", () => {
+    renderPanel(["Nothing labelled."], MANY);
+    const panel = openPanel();
+    expect(rowLabels(panel)).toEqual(["Q1", "Q2", "T1", "Q3"]);
+    fireEvent.change(search(), { target: { value: "drop" } });
+    expect(rowLabels(panel)).toEqual(["Q2"]);
+    fireEvent.change(search(), { target: { value: "release" } });
+    // A search opens the folded Closed group too.
+    expect(rowLabels(panel)).toEqual(["T1", "R1"]);
+
+    fireEvent.click(chip("Clear filters"));
+    expect(chip("Closed 1").getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip("Closed 1"));
+    expect(rowLabels(panel)).toEqual(["R1"]);
+    fireEvent.click(chip("Closed 1"));
+    fireEvent.click(chip("#cache 2"));
+    expect(rowLabels(panel)).toEqual(["Q1", "Q2"]);
+    expect(chip("Answered 0")).toBeTruthy();
+    fireEvent.click(chip("#cache 2"));
+    fireEvent.click(chip("Risks 1"));
+    expect(rowLabels(panel)).toEqual(["R1"]);
+    fireEvent.change(search(), { target: { value: "no such words" } });
+    expect(panel.textContent).toContain("No items match.");
+    fireEvent.click(within(panel).getByText("Clear filters"));
+    expect(rowLabels(panel)).toEqual(["Q1", "Q2", "T1", "Q3"]);
+  });
+
+  it("groups by topic or kind, remembered in this browser", () => {
+    renderPanel(["Nothing labelled."], MANY);
+    let panel = openPanel();
+    fireEvent.change(screen.getByRole("combobox", { name: "Group items by" }), {
+      target: { value: "topic" },
+    });
+    expect(
+      within(panel)
+        .getAllByRole("button", { expanded: true })
+        .map((heading) => heading.textContent),
+    ).toEqual(["cache (2)", "release (2)", "No topic (1)"]);
+    expect(rowLabels(panel)).toEqual(["Q1", "Q2", "T1", "R1", "Q3"]);
+    cleanup();
+
+    renderPanel(["Nothing labelled."], MANY);
+    panel = openPanel();
+    expect(
+      (screen.getByRole("combobox", { name: "Group items by" }) as HTMLSelectElement).value,
+    ).toBe("topic");
+    // A group folds from its heading.
+    fireEvent.click(within(panel).getByRole("button", { name: "cache (2)" }));
+    expect(rowLabels(panel)).toEqual(["T1", "R1", "Q3"]);
+  });
+
+  it("keeps the search and folds when the phone sheet closes and reopens", () => {
+    viewport.mobile = true;
+    renderPanel(["Nothing labelled."], MANY);
+    const panel = openPanel();
+    const filterBar = within(panel).getByTestId("open-items-filters");
+    // Search first, then one row of chips that scrolls sideways.
+    expect(filterBar.firstElementChild?.contains(search())).toBe(true);
+    expect(within(filterBar).getByRole("group").className).toContain("overflow-x-auto");
+    fireEvent.change(search(), { target: { value: "cache" } });
+    fireEvent.click(screen.getByTestId("session-items-trigger"));
+    expect(screen.queryByTestId("session-items-panel")).toBeNull();
+
+    const reopened = openPanel();
+    expect((search() as HTMLInputElement).value).toBe("cache");
+    expect(rowLabels(reopened)).toEqual(["Q1", "Q2"]);
   });
 });
