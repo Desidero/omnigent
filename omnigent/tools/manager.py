@@ -204,6 +204,7 @@ class ToolManager:
         self._register_policy_tools()
         self._register_scheduled_task_tools()
         self._register_journal_tools()
+        self._register_open_items_tools()
         self._register_user_inbox_tools()
         self._register_memory_tools()
         self._register_link_rule_tools()
@@ -260,6 +261,21 @@ class ToolManager:
         from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 
         for tool_class in JOURNAL_TOOLS:
+            self._tools[tool_class.name()] = tool_class()
+
+    def _register_open_items_tools(self) -> None:
+        """
+        Auto-register the ``sys_open_items_*`` tools.
+
+        Registered without spec opt-in; ``tool_groups.open_items: false`` drops
+        them. The runner dispatches them via the server's
+        ``/v1/sessions/{id}/open-items`` routes.
+        """
+        if not self._spec.tool_groups.open_items:
+            return
+        from omnigent.tools.builtins.open_items import OPEN_ITEMS_TOOLS
+
+        for tool_class in OPEN_ITEMS_TOOLS:
             self._tools[tool_class.name()] = tool_class()
 
     def _register_user_inbox_tools(self) -> None:

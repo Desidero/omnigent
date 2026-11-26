@@ -1397,6 +1397,7 @@ tool_groups:
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
   journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
+  open_items: false       # sys_open_items_raise / _update / _list
   projects: false         # sys_project_* / sys_session_update
   user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
   memory: false           # memory_search / _get / _list / _write / _delete
@@ -1413,6 +1414,10 @@ requires the server's `workflows` feature flag, which defaults off; enable it
 with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
 posts to and reads the session owner's Inbox, requires the server's `user_inbox`
 feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
+The `open_items` group keeps the session's questions, risks, findings,
+follow-ups and pinned links with labels the server allocates (see
+[Open items](open-items.md)); the runner drops it when the server does not
+store open items.
 Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt, and
 disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see

@@ -138,6 +138,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Session orchestration](./session-orchestration.md) covers owner-controlled
   messaging, sibling worker creation, polling results and sharing restrictions.
 
+- [Open items](./open-items.md) covers the agent tools that raise, close and list
+  a session's labelled items, their routes and live event, and sessions without them.
+
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
 
