@@ -101,24 +101,25 @@ stays current as the agent raises and closes them.
 - **One list:** each stored item shows its stored status. A label written in
   the chat that the server does not hold is listed too, marked **chat only**,
   with its state read from the chat as before. Pinned links stay under
-  **Links**.
-- **Chips:** a label's chips in the chat follow the stored status: a stored
-  item is closed exactly when the server says so, whatever the chat wrote, and
-  its popover shows the stored resolution when the chat never struck it.
+  **Links**, which lists every open stored link first, under the title the
+  agent gave it (a short form of its URL when it gave none), whether or not a
+  loaded message pins it; a closed stored link leaves the list with its page.
+- **Chips:** a stored item's label in the chat is its anchor: its chips
+  follow the stored status (struck once the item is closed, whatever the chat
+  wrote), and a plain or struck mention never changes the item.
 - **Groups:** items the latest reply mentions come first, then the open ones,
-  then **Answered** (you replied and the agent has not closed it yet), with
+  then **Answered** (you replied and the agent has not replied yet), with
   **Closed (N)** folded at the end. The badge counts open items: answered and
   closed ones, chat-only items you dismissed and pinned links are left out.
-- **Details:** select an item to expand it: its detail, links, your latest
-  answers, how it was closed, and **Show in conversation** when a loaded
-  message has it. Its chip previews it where the chat raised it.
+- **Details:** select an item to expand it: its detail, links, its thread
+  (your comments and the agent's replies, each once, in order), how it was
+  closed (left out when the resolution only repeats the last reply), and
+  **Show in conversation** when a loaded message has it. Its chip previews it
+  where the chat raised it.
 - **Changes (edit access):** the ✕ on an open stored item closes it, recorded
   as closed by a person with the resolution "Closed from the Open items panel";
   expanded, you can write the resolution yourself, **Reopen** a closed item, or
-  **Set topic**. When the chat struck a label that is still open in the store,
-  the item is marked **closed in chat** and its details offer **Close** with
-  the chat's sentence as the resolution. The agent sees every change in
-  `sys_open_items_list`.
+  **Set topic**. The agent sees every change in `sys_open_items_list`.
 - **Chat-only items** keep their dismiss button; dismissals are still stored
   as the `omnigent.items_dismissed` session label, which is read for chat-only
   items and never written for stored ones.
