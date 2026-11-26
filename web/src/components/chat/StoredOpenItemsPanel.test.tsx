@@ -224,6 +224,32 @@ describe("the Open items panel on a server that stores them", () => {
     });
   });
 
+  it("imports the chat's own labels into the store", async () => {
+    renderPanel([ITEMS, "- [R1] **Flaky.**", "~~[R1]~~ fixed."], [storedItem("Q2")]);
+    const panel = openPanel();
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          items: [
+            { item: storedItem("Q1", { title: "Backfill window." }) },
+            { item: storedItem("R1", { status: "closed", title: "Flaky." }) },
+          ],
+        }),
+      ),
+    );
+    fireEvent.click(within(panel).getByRole("button", { name: "Import 2 from chat" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_1/open-items/import");
+    expect(
+      JSON.parse(init.body as string).items.map((item: { label: string }) => item.label),
+    ).toEqual(["Q1", "R1"]);
+    await waitFor(() =>
+      expect(within(panel).queryByRole("button", { name: /from chat$/ })).toBeNull(),
+    );
+    expect(within(panel).queryByText("chat only")).toBeNull();
+  });
+
   it("offers no changes to a viewer without edit access", () => {
     access.canEdit = false;
     renderPanel([ITEMS, "More on [Q2]."], [storedItem("Q1"), storedItem("Q2")]);
@@ -232,6 +258,7 @@ describe("the Open items panel on a server that stores them", () => {
     fireEvent.click(within(panel).getByRole("button", { name: "Item Q2" }));
     expect(within(panel).queryByRole("button", { name: "Close" })).toBeNull();
     expect(within(panel).queryByRole("button", { name: "Set topic" })).toBeNull();
+    expect(within(panel).queryByRole("button", { name: /from chat$/ })).toBeNull();
   });
 
   it("keeps the chat's tracker, unchanged, where the server stores no items", () => {
