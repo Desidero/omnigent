@@ -132,6 +132,67 @@ async def test_registry_tools_are_attached_discovered_and_executed_on_server(
     execute.assert_not_awaited()
 
 
+async def test_allowlist_patterns_filter_discovery_and_gate_each_call(client, app, monkeypatch):
+    registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="tracker",
+                    title="Tracker",
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_*"],
+                )
+            ]
+        ),
+        None,
+    )
+    app.state.mcp_registry = registry
+    upstream = [
+        Tool(name=name, inputSchema={"type": "object"})
+        for name in ("read_ticket", "read_comment", "delete_ticket")
+    ]
+    execute = AsyncMock(
+        side_effect=[
+            upstream,
+            CallToolResult(content=[TextContent(type="text", text="Comment 1")]),
+        ]
+    )
+    monkeypatch.setattr(registry, "execute", execute)
+    session = await create_test_session(client, name="registry-agent")
+    session_id = session["id"]
+    attached = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "tracker", "transport": "registry"},
+    )
+    assert attached.status_code == 200, attached.text
+    listed = await client.post(
+        "/v1/mcp/tracker",
+        headers={"X-Omnigent-Session-Id": session_id},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["read_ticket", "read_comment"]
+
+    async def call(rpc_id, tool):
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "method": "tools/call",
+                "params": {"name": f"tracker__{tool}", "arguments": {}},
+            },
+        )
+        return response.json()
+
+    allowed = await call(2, "read_comment")
+    assert allowed["result"]["content"][0]["text"] == "Comment 1", allowed
+    # No pattern admits delete_ticket, so it is refused before any upstream call.
+    refused = await call(3, "delete_ticket")
+    assert "not allowed by the MCP registry" in json.dumps(refused), refused
+    assert execute.await_count == 2
+
+
 @pytest.fixture
 def launch_registry(app):
     app.state.mcp_registry = McpRegistry(

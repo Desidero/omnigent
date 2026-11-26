@@ -92,7 +92,7 @@ class McpPolicyAdapter:
         return [
             t.model_dump(by_alias=True, exclude_none=True)
             for t in tools
-            if t.name in context.service.tools
+            if context.service.allows_tool(t.name)
             and (context.config.tools is None or t.name in context.config.tools)
         ]
 

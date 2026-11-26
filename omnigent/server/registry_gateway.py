@@ -43,7 +43,7 @@ async def registry_tools(
                 service, user
             )
             for tool in definitions:
-                if tool.name in service.tools and (
+                if service.allows_tool(tool.name) and (
                     config.tools is None or tool.name in config.tools
                 ):
                     tools.append(
@@ -76,7 +76,7 @@ async def execute_registry_tool(
             raise ConnectionError("Tool is not enabled for this session")
         user = registry_user({"run_as": credential_user} if credential_user else None)
         service = registry.service(config.name, user)
-        if tool not in service.tools:
+        if not service.allows_tool(tool):
             raise ConnectionError("Tool is not allowed by the MCP registry")
         result = await gateway_backend(registry, request.app.state).call_tool(
             service, user, tool, arguments
