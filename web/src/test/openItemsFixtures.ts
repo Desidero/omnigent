@@ -20,7 +20,7 @@ export function storedItem(label: string, fields: Partial<StoredOpenItem> = {}):
     closed_at: null,
     resolution: null,
     closed_by: null,
-    answers: [],
+    replies: [],
     ...fields,
   };
 }

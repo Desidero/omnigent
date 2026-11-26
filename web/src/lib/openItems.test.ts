@@ -12,7 +12,6 @@ import {
 import {
   DISMISSED_RESOLUTION,
   chatItemsToImport,
-  chatResolution,
   compareItemLabels,
   countOpenRows,
   fetchStoredOpenItems,
@@ -20,9 +19,11 @@ import {
   mergeStoredOpenItems,
   openItemRows,
   storedItemOf,
+  withStoredLinks,
   withWrittenItems,
   type StoredOpenItem,
 } from "./openItems";
+import { collectSessionLinks } from "@/lib/sessionLinks";
 import { storedItem } from "@/test/openItemsFixtures";
 
 afterEach(() => {
@@ -55,14 +56,14 @@ describe("mergeStoredOpenItems", () => {
     ]);
     const q1 = merged.items.get("Q1")!;
     const q2 = merged.items.get("Q2")!;
-    // The chat struck Q1 but the store keeps it open: open, with the chat's close offered.
+    // The chat struck Q1 but the store keeps it open: open, and nothing offers the chat's close.
     expect(q1.closedBy).toBeNull();
     expect(storedItemOf(q1)?.status).toBe("open");
-    expect((q1 as { closedInChat?: ItemLabelSource }).closedInChat?.messageId).toBe("m1");
-    // Closed only in the store: closed, described by its resolution at its latest mention.
+    expect(Object.keys(q1)).not.toContain("closedInChat");
+    // Closed only in the store: closed at its latest mention, with the bare resolution.
     expect(q2.closedBy).toMatchObject({
       messageId: "m0",
-      text: "~~[Q2]~~ Dropped them",
+      text: "Dropped them",
       createdAtS: 1_764_100_500,
     });
     // The parsed entry's own fields are kept.
@@ -117,13 +118,6 @@ describe("openItemRows", () => {
       ["Q4", null],
       ["F1", null],
     ]);
-  });
-
-  it("offers the chat's closing sentence as the resolution", () => {
-    const chat = index([ITEMS, "~~[Q1]~~ We batch it nightly. More later."]);
-    const merged = mergeStoredOpenItems(chat, [storedItem("Q1")]);
-    const [row] = openItemRows(merged, [storedItem("Q1")], new Set());
-    expect(chatResolution(row)).toBe("[Q1] We batch it nightly.");
   });
 });
 
@@ -260,5 +254,54 @@ describe("importChatItems", () => {
     expect(bodies.map((body) => body.items.length)).toEqual([10, 2]);
     expect(bodies[0].idempotency_key).toMatch(/^import:.+:0$/);
     expect(bodies[1].idempotency_key).toMatch(/^import:.+:10$/);
+  });
+});
+
+describe("withStoredLinks", () => {
+  function chatLinks(texts: string[]) {
+    const sources = texts.map((text, position): ItemLabelSource => ({
+      messageId: `m${position}`,
+      role: "assistant",
+      text,
+    }));
+    return collectSessionLinks(sources, index(texts));
+  }
+
+  it("pins stored links under the agent's title, else a short form of the URL", () => {
+    const links = withStoredLinks(
+      chatLinks([
+        "[L1] **Old name** https://example.com/board",
+        "Made https://claude.ai/artifact/aaa",
+      ]),
+      [
+        storedItem("L1", { title: "Release board", url: "https://example.com/board" }),
+        storedItem("L2", {
+          title: "https://docs.example.com/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
+          url: "https://docs.example.com/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
+        }),
+      ],
+    );
+    expect(links.map((link) => [link.title, link.kind, link.item?.label ?? null])).toEqual([
+      ["Release board", "pinned", "L1"],
+      ["docs.example.com/d/1AbCdEfGhIjK…/…", "pinned", null],
+      ["Artifact aaa", "artifact", null],
+    ]);
+  });
+
+  it("takes a stored link closed in the store off the list, with its page", () => {
+    const links = withStoredLinks(
+      chatLinks([
+        "[L1] **Catalog** https://claude.ai/artifact/aaa",
+        "See https://claude.ai/artifact/aaa",
+      ]),
+      [storedItem("L1", { status: "closed", url: "https://claude.ai/artifact/aaa" })],
+    );
+    expect(links).toEqual([]);
+  });
+
+  it("leaves the chat's list alone without stored links", () => {
+    const links = chatLinks(["[L1] **Catalog** https://example.com/c"]);
+    expect(withStoredLinks(links, [storedItem("Q1")])).toBe(links);
+    expect(withStoredLinks(links, null)).toBe(links);
   });
 });

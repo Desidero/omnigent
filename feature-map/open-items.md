@@ -13,7 +13,7 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
 - `items-delete`: deleting a session deletes its items; a fork starts with none.
 - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
 - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
-- `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
+- `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; the expanded row shows the stored thread.
 
 ## How to get to it (user POV)
 
