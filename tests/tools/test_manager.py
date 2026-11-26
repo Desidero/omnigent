@@ -106,6 +106,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_workflow_save",
         "sys_workflow_load",
         "sys_workflow_list",
+        # The session's open items tools register on every agent; the runner
+        # drops them unless the server stores open items. Runner-dispatched.
+        "sys_open_items_raise",
+        "sys_open_items_update",
+        "sys_open_items_list",
         # The owner-Inbox tools register on every agent too; the runner drops
         # them unless the server offers the Inbox. Schema-only; runner-dispatched.
         "sys_user_inbox_post",
