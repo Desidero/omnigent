@@ -88,7 +88,9 @@ backend; it reads the **store-level** key `OMNIGENT_CREDENTIAL_KMS_KEY_ID` (id,
 ARN, or `alias/…`) and returns the cipher, or `None` when unset — the store, and
 every integration on it, is then disabled. **There is no non-KMS fallback:** no
 key configured means the feature is off, not that it silently encrypts with a
-local key.
+local key. The [local key file](#local-key-file-explicit-opt-in) backend below
+keeps that rule: it is used only when the operator selects it by name, never
+because nothing else is configured or something else failed.
 
 The key belongs to the **credential store**, not to any one provider: every
 provider façade shares the one cipher, so connecting an MCP server or Datadog
@@ -225,6 +227,70 @@ that doesn't enable the credential store — or uses the other backend — needs
 server; the chosen backend's key env var is then required. Leave it unset to
 auto-detect the single configured backend — configuring more than one without the
 selector is an error (no silent precedence), and configuring none disables the store.
+
+## Local key file (explicit opt-in)
+
+A trial or single-machine server with neither AWS KMS nor Vault can encrypt the
+store with a key the operator keeps in a file (`LocalKeySecretCipher`,
+AES-256-GCM from `cryptography`, which the base install already has):
+
+```bash
+(umask 077 && openssl rand -base64 32 > /etc/omnigent/credential.key)
+export OMNIGENT_CREDENTIAL_CIPHER=local
+export OMNIGENT_CREDENTIAL_LOCAL_KEY_FILE=/etc/omnigent/credential.key
+```
+
+**This gives up what the store's design is for.** With KMS or Vault the key
+never enters the server. Here it is in the server process and on its disk:
+
+- Anyone who can read the key file and the database, or a backup of each, can
+  read every user's stored tokens, offline.
+- Nothing logs a decrypt and a leaked key cannot be disabled. The only response
+  is a new key, every user reconnecting, and revoking the old tokens at each
+  provider.
+- There are no key versions and no re-encryption: **changing the key means every
+  user reconnects.**
+
+What still holds: a copy of the database alone yields only ciphertext, and each
+ciphertext is bound to its row's `{workspace, user, provider, account}` as the
+cipher's associated data, so it cannot be moved to another user's row. Secrets
+are not limited to 4096 bytes as they are with KMS.
+
+**It cannot be reached by accident.** `build_secret_cipher()` raises, which
+stops a server that has a feature on the store configured, unless all of these
+hold:
+
+- `OMNIGENT_CREDENTIAL_CIPHER=local` names it. The key file variable without
+  the selector is an error: the backend is never auto-detected.
+- No KMS or Vault key is configured beside it (`OMNIGENT_CREDENTIAL_KMS_KEY_ID`,
+  `OMNIGENT_CREDENTIAL_VAULT_KEY`). With `kms` or `vault` selected the key file
+  is ignored, and a failing KMS or Vault call fails: nothing falls back to the
+  local key.
+- The key file exists, is a regular file, gives no access to group or others
+  (`chmod 600`; a symlink's target is what is checked), and holds exactly one
+  32-byte key in base64, at most 128 bytes with surrounding whitespace.
+- The server runs on a POSIX system, where those file modes mean something.
+
+The server never creates the file, generates a key or writes one anywhere, and
+logs only the file's path (a warning each time the cipher is built). Keep the
+file out of the database's backups; in a container, mount it as a secret with
+mode `0400`.
+
+**Stored format.** `oslocal:v1:<key id>:<base64(nonce + ciphertext + tag)>`. KMS
+rows are bare base64 and Vault rows start with `osvault:`, so the three can be
+told apart in the `connections` table. The key id is a truncated SHA-256
+fingerprint of the key, not key material. A row from another backend, a row
+read under another identity and an altered row read as disconnected
+(`decrypt` returns `None`). A row written under a *different local key* raises
+instead, as the Vault backend does for a repointed key: a wrong or regenerated
+key file is a store-wide mistake, and showing every user as disconnected would
+have their reconnects overwrite ciphertext the right key can still open.
+
+**Changing the key.** Replace the file and restart. Each stored connection then
+fails with an error naming the key mismatch until its user reconnects in
+Settings, which overwrites the row under the new key; deleting the rows first
+shows users as disconnected instead. Moving to KMS or Vault later is the same
+step: old rows read as disconnected and users reconnect.
 
 ## MCP auth & roadmap
 
