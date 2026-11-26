@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useItemCommentRequest } from "@/lib/itemCommentDrafts";
 import { ItemLabelIndexContext, ItemLabelSessionContext } from "@/lib/itemLabels";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
@@ -105,6 +106,11 @@ export function SessionItemsButton({
   useEffect(() => {
     if (jumpTarget) setOpen(false);
   }, [jumpTarget]);
+  // So does "Comment", which moves to the composer.
+  const commentRequest = useItemCommentRequest(useContext(ItemLabelSessionContext));
+  useEffect(() => {
+    if (commentRequest) setOpen(false);
+  }, [commentRequest]);
   if (trackedItems(index).length === 0 && links.length === 0) return null;
 
   const trigger = (

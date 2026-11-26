@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,6 +16,7 @@ import {
   struckItemLabelsIn,
   type ItemLabelSource,
 } from "@/lib/itemLabels";
+import { requestItemComment } from "@/lib/itemCommentDrafts";
 import { collectSessionLinks } from "@/lib/sessionLinks";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SessionItemsHeaderSlot, useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
@@ -168,6 +169,17 @@ describe("SessionItemsButton", () => {
     fireEvent.click(within(panel).getAllByRole("button", { name: /^Show item Q2/ })[0]);
     fireEvent.click(screen.getByRole("button", { name: "Show in conversation" }));
     expect(screen.queryByTestId("session-items-panel")).toBeNull();
+  });
+
+  it("closes when a comment on an item is started, on desktop and on a phone", () => {
+    for (const mobile of [false, true]) {
+      viewport.mobile = mobile;
+      renderButton([ITEMS, "Still need [Q2]."]);
+      openPanel();
+      act(() => requestItemComment("conv_1", { label: "Q2", title: "Soft-deleted rows." }));
+      expect(screen.queryByTestId("session-items-panel")).toBeNull();
+      cleanup();
+    }
   });
 
   it("opens as a dialog on a phone, with the same sections", () => {

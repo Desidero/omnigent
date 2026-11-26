@@ -96,8 +96,9 @@ you or the agent write them.
 To answer several items at once, comment on each and send the comments
 together, like reviewing a document:
 
-1. Click an item's chip (in a message, in the Open items bar, or the label in
-   its own defining message) and choose **Comment** in its popover.
+1. Click an item's chip (in a message, in the Open items panel, or the label
+   in its own defining message) and choose **Comment** in its popover. From
+   the Open items panel, this closes the panel.
 2. The composer switches to comment mode for that item: a card names it, and
    whatever you had typed is set aside until you save. Attachments, paste,
    @-mentions of files and sessions, and dictation work as usual; a draft keeps
