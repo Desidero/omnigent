@@ -38,7 +38,6 @@ import {
   Suspense,
   useCallback,
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
@@ -132,6 +131,7 @@ import {
   PEER_SESSION_MESSAGES_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
   PANE_CORNERS_ENTRY,
+  TERMINAL_EXTRA_KEYS_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
@@ -782,13 +782,15 @@ function PaneCornersRow() {
 function TerminalExtraKeysControl() {
   const isDark = useResolvedThemeMode() === "dark";
   const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
-  const labelId = useId();
   const choose = useCallback((next: TerminalExtraKeysMode) => {
     setMode(next);
     writeTerminalExtraKeysMode(next);
   }, []);
   return (
-    <div className="overflow-hidden rounded-xl border bg-card/55">
+    <SettingsItem
+      entry={TERMINAL_EXTRA_KEYS_ENTRY}
+      className="overflow-hidden rounded-xl border bg-card/55"
+    >
       <div className="flex flex-col gap-3 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 items-center gap-3">
           <div
@@ -801,39 +803,44 @@ function TerminalExtraKeysControl() {
             />
           </div>
           <div className="min-w-0">
-            <div id={labelId} className="text-ui font-medium">
-              Extra keys row
+            <div id={settingsLabelId(TERMINAL_EXTRA_KEYS_ENTRY)} className="text-ui font-medium">
+              {TERMINAL_EXTRA_KEYS_ENTRY.label}
             </div>
-            <div className="text-sm text-muted-foreground">
-              Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.
+            <div
+              id={settingsDescriptionId(TERMINAL_EXTRA_KEYS_ENTRY)}
+              className="text-sm text-muted-foreground"
+            >
+              {TERMINAL_EXTRA_KEYS_ENTRY.description}
             </div>
           </div>
         </div>
-        <Select
-          value={mode}
-          onValueChange={(next) => {
-            if (isTerminalExtraKeysMode(next)) choose(next);
-          }}
-          componentId="settings.appearance.terminal_extra_keys"
-          valueHasNoPii
-        >
-          <SelectTrigger
-            aria-labelledby={labelId}
-            data-testid="terminal-extra-keys-select"
-            className="w-full shrink-0 sm:w-48"
+        <SettingsOwner entry={TERMINAL_EXTRA_KEYS_ENTRY}>
+          <Select
+            value={mode}
+            onValueChange={(next) => {
+              if (isTerminalExtraKeysMode(next)) choose(next);
+            }}
+            componentId="settings.appearance.terminal_extra_keys"
+            valueHasNoPii
           >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {terminalExtraKeysModes.map((value) => (
-              <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
-                {terminalExtraKeysLabels[value]}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+            <SelectTrigger
+              {...settingsControlProps(TERMINAL_EXTRA_KEYS_ENTRY)}
+              data-testid="terminal-extra-keys-select"
+              className="w-full shrink-0 sm:w-48"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent {...settingsOverlayProps(TERMINAL_EXTRA_KEYS_ENTRY)}>
+              {terminalExtraKeysModes.map((value) => (
+                <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
+                  {terminalExtraKeysLabels[value]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingsOwner>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
