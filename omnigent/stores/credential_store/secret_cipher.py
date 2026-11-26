@@ -97,24 +97,43 @@ def build_secret_cipher() -> SecretCipher | None:
     error (no silent precedence), and configuring none disables the store
     (``None`` — the caller decides how to surface that). Adding a backend is a new
     registry entry, not a new branch. See ``designs/CREDENTIAL_STORE.md``.
+
+    The local key file backend (``local``) is the exception to auto-detection: it
+    is used only when the selector names it, and never beside a KMS or Vault key,
+    so it cannot be reached by accident or as a fallback.
     """
     # hvac / boto3 stay optional: each builder only reads env and constructs, so
     # importing and calling them here pulls no SDK and makes no network call.
+    from omnigent.stores.credential_store.local_cipher import (
+        CREDENTIAL_LOCAL_KEY_FILE_ENV_VAR,
+        build_local_secret_cipher,
+    )
     from omnigent.stores.credential_store.vault_cipher import build_vault_secret_cipher
 
     builders: dict[str, Callable[[], SecretCipher | None]] = {
         "kms": build_kms_secret_cipher,
         "vault": build_vault_secret_cipher,
     }
+    # Usable only by name: the key is in the server process, so no auto-detection.
+    explicit_only: dict[str, Callable[[], SecretCipher | None]] = {
+        "local": build_local_secret_cipher,
+    }
 
     selected = os.environ.get(CREDENTIAL_CIPHER_ENV_VAR, "").strip().lower()
     if selected:
-        builder = builders.get(selected)
+        builder = builders.get(selected) or explicit_only.get(selected)
         if builder is None:
             raise ValueError(
                 f"{CREDENTIAL_CIPHER_ENV_VAR}={selected!r} is not a known credential "
-                f"backend; expected one of {sorted(builders)}."
+                f"backend; expected one of {sorted({**builders, **explicit_only})}."
             )
+        if selected in explicit_only:
+            others = sorted(name for name, build in builders.items() if build() is not None)
+            if others:
+                raise ValueError(
+                    f"{CREDENTIAL_CIPHER_ENV_VAR}={selected!r} cannot be combined with "
+                    f"a configured {' or '.join(others)} key; unset one."
+                )
         cipher = builder()
         if cipher is None:
             raise ValueError(
@@ -122,6 +141,13 @@ def build_secret_cipher() -> SecretCipher | None:
                 "set the backend's key env var."
             )
         return cipher
+
+    if os.environ.get(CREDENTIAL_LOCAL_KEY_FILE_ENV_VAR, "").strip():
+        raise ValueError(
+            f"{CREDENTIAL_LOCAL_KEY_FILE_ENV_VAR} is set, but the local key file is used "
+            f"only when {CREDENTIAL_CIPHER_ENV_VAR}=local selects it; it is never "
+            "auto-detected."
+        )
 
     # No explicit selector: use the single configured backend, or None if none.
     configured = {name: c for name, build in builders.items() if (c := build()) is not None}
