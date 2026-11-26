@@ -8141,6 +8141,69 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  function mockDatabricksConnection(connected: boolean) {
+    authenticatedFetchMock.mockImplementation(((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const body = url === "/v1/connections/databricks/status" ? { enabled: true, connected } : {};
+      return Promise.resolve({ ok: true, json: async () => body } as unknown as Response);
+    }) as unknown as typeof authenticatedFetch);
+  }
+
+  const ownerSandboxInfo: Partial<ServerInfo> = {
+    managed_sandboxes_enabled: true,
+    sandbox_provider: "databricks",
+    sandbox_provider_owner_connections: { databricks: "databricks" },
+    enabled_connections: ["databricks"],
+  };
+
+  it("disables a sandbox that launches as its owner until the user connects", async () => {
+    mockDatabricksConnection(false);
+    renderLanding(ownerSandboxInfo);
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-sandbox-option")).toHaveAttribute(
+        "data-disabled",
+      ),
+    );
+    // The sandbox is still the default pick, so Start says what is missing.
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+      "Connect Databricks to use Databricks Sandbox",
+    );
+    const connect = screen.getByTestId("new-chat-landing-sandbox-connect-databricks");
+    expect(connect).toHaveTextContent("Connect Databricks to use Databricks Sandbox");
+    fireEvent.click(connect);
+    await waitFor(() =>
+      expect(screen.getByTestId("landing-location").textContent).toBe("/settings/integrations"),
+    );
+  });
+
+  it("offers a sandbox that launches as its owner once the user is connected", async () => {
+    mockDatabricksConnection(true);
+    renderLanding(ownerSandboxInfo);
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    await waitFor(() =>
+      expect(authenticatedFetchMock).toHaveBeenCalledWith("/v1/connections/databricks/status"),
+    );
+    expect(screen.getByTestId("new-chat-landing-sandbox-option")).not.toHaveAttribute(
+      "data-disabled",
+    );
+    expect(screen.queryByTestId("new-chat-landing-sandbox-connect-databricks")).toBeNull();
+  });
+
+  it("says a sandbox is unavailable when the server has no connection for its owner", () => {
+    renderLanding({ ...ownerSandboxInfo, enabled_connections: [] });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-sandbox-option")).toHaveAttribute("data-disabled");
+    expect(screen.getByTestId("new-chat-landing-sandbox-unavailable-databricks")).toHaveTextContent(
+      "Databricks Sandbox is unavailable: this server has no Databricks connection set up",
+    );
+    // Nothing to ask the server: the status route does not exist there.
+    expect(authenticatedFetchMock).not.toHaveBeenCalledWith("/v1/connections/databricks/status");
+  });
+
   it("defaults to New Sandbox when no hosts are connected and sandboxes are enabled", async () => {
     // The screenshot regression: zero hosts used to leave the chip stuck
     // on "No hosts" even though the sandbox option was one click away.

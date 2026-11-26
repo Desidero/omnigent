@@ -586,6 +586,10 @@ token they connected under **Settings → Connections → Databricks** (a Databr
 account connection). The token inside the Sandbox and its proxy bearer are that
 user's, and the server's own identity is never used: a user who has not connected
 is refused with a "Connect Databricks first" message and no Sandbox is created.
+The New session host menu shows the option disabled, with a row that opens the
+connect page, until the user has connected; `GET /v1/info` tells the web which
+connection the provider needs in `sandbox_provider_owner_connections`. That is a
+hint only: the launch is still refused on the server, for every way of starting one.
 Code running in a Sandbox, including the agent, can read that token and act in
 the workspace as its owner.
 

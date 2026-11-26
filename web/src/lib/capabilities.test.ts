@@ -154,6 +154,17 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
+  it("keeps the connection each provider launches as, dropping malformed entries", async () => {
+    const result = await probe({
+      sandbox_provider_owner_connections: { databricks: "databricks", modal: null, e2b: "" },
+    });
+    expect(result.sandbox_provider_owner_connections).toEqual({ databricks: "databricks" });
+  });
+
+  it("reads a server without the owner-connection map as needing none", async () => {
+    expect((await probe({})).sandbox_provider_owner_connections).toEqual({});
+  });
+
   it.each([undefined, null, "invalid", ["note"]])(
     "reads a missing or malformed notice map as no notices (%j)",
     async (value) => {

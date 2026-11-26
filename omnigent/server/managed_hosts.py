@@ -1091,6 +1091,27 @@ class ManagedSandboxDeployment:
                     notices[config.provider] = notice
         return notices
 
+    def provider_owner_connections(self) -> dict[str, str]:
+        """
+        The per-user connection each launchable provider launches as, for ``/v1/info``.
+
+        A provider whose launcher acts as the session owner can only launch for
+        a user who has connected that account, so the web checks the caller's
+        connection status before offering it. Deployment facts only: ``/v1/info``
+        is unauthenticated, and the launch itself still refuses without one.
+
+        :returns: Connection provider keyed by sandbox provider, e.g.
+            ``{"databricks": "databricks"}``; a provider that needs none is absent.
+        """
+        connections: dict[str, str] = {}
+        for config in self.configs:
+            if config.managed_launch_supported and config.provider is not None:
+                # getattr: embedding deployments may inject duck-typed launchers.
+                needed = getattr(config.launcher_factory(), "owner_credential_provider", None)
+                if needed:
+                    connections[config.provider] = needed
+        return connections
+
 
 @dataclass
 class ManagedHostLaunch:

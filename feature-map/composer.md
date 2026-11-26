@@ -324,6 +324,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   dismissed or the missing setup is completed.
 - `sandbox-profiles`: participating providers add a [profile picker](sandbox-profiles.md)
   to New session; Start waits for an authorized, current selection.
+- `sandbox-connection-gate`: a sandbox provider that launches as the signed-in
+  user (Databricks Sandbox) is disabled in the New session host menu until that
+  user has connected the account. A row under it, **Connect Databricks to use
+  Databricks Sandbox**, opens Settings → Sandbox Integrations. While that sandbox
+  is the current pick, Start is blocked with the same reason. States: connected
+  (normal row), not connected, server has no such connection set up (a plain
+  line, nothing to click), and status unknown or failed (row stays enabled; the
+  server refuses the launch). Code and tests:
+  `web/src/hooks/useSandboxConnectionBlocks.ts`,
+  `web/src/shell/SandboxConnectionMenuNotices.tsx`, and the "launches as its
+  owner" cases in `web/src/shell/NewChatDialog.test.tsx`. Fork, Switch host,
+  workflow, project and automation pickers do not show the gate.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.

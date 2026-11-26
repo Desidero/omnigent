@@ -164,6 +164,7 @@ export {
   isValidSandboxRepoUrl,
   splitSandboxWorkspace,
 } from "@/lib/sandboxRepositories";
+import { SandboxConnectionMenuNotices } from "./SandboxConnectionMenuNotices";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessFixDialog } from "@/pages/settings/HarnessFixDialog";
@@ -345,6 +346,10 @@ import {
   noReachableModelsMessage,
   useNewSandboxModelCatalog,
 } from "@/hooks/useNewSandboxModelCatalog";
+import {
+  sandboxConnectionBlockMessage,
+  useSandboxConnectionBlocks,
+} from "@/hooks/useSandboxConnectionBlocks";
 import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
@@ -2976,6 +2981,10 @@ function NewChatLandingContent({
       sandboxProfile,
       rememberedSandboxProfileId,
     );
+  // A provider that launches as its owner stays unavailable until the user connects.
+  const sandboxConnectionBlocks = useSandboxConnectionBlocks(info, cacheUser);
+  const sandboxConnectionBlock =
+    (sandboxSelected && sandboxConnectionBlocks.get(effectiveSandboxProvider ?? "")) || null;
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
@@ -5817,6 +5826,15 @@ function NewChatLandingContent({
     if (pickerLoading || workspaceStartLoading || worktreeRequestPending) {
       return { field: "other", message: "Loading session configuration…" };
     }
+    if (sandboxConnectionBlock !== null) {
+      return {
+        field: "other",
+        message: sandboxConnectionBlockMessage(
+          sandboxOptionLabel(effectiveSandboxProvider),
+          sandboxConnectionBlock,
+        ),
+      };
+    }
     if (
       pickerSelectionError !== null ||
       sandboxCatalogError !== null ||
@@ -7930,6 +7948,7 @@ function NewChatLandingContent({
                                 <DropdownMenuItem
                                   key={provider ?? "default"}
                                   onSelect={() => selectSandbox(provider)}
+                                  disabled={sandboxConnectionBlocks.has(provider ?? "")}
                                   // First row keeps the original testid; later
                                   // rows get a scoped one.
                                   data-testid={
@@ -7985,6 +8004,12 @@ function NewChatLandingContent({
                                 </Tooltip>
                               </DropdownMenuItem>
                             ))}
+                          {managedSandboxesEnabled && (
+                            <SandboxConnectionMenuNotices
+                              blocks={sandboxConnectionBlocks}
+                              onConnect={() => openAppPage("/settings/integrations")}
+                            />
+                          )}
                           {cloudHosts.map(renderHostMenuItem)}
                           {showArcaOption && (
                             <DropdownMenuItem
