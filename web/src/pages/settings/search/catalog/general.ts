@@ -64,6 +64,15 @@ export const OPEN_SUBAGENTS_IN_PANEL_ENTRY = settingsEntry({
   keywords: ["sessions", "sub-agents", "subagents", "workspace", "panel", "side by side"],
 });
 
+export const NEW_CHAT_PROJECT_PROMPT_ENTRY = settingsEntry({
+  id: "new-chat-project-prompt",
+  section: "general",
+  label: "Ask for a project when starting a session",
+  description:
+    "When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer.",
+  keywords: ["sessions", "projects", "new session", "new chat", "picker", "prompt", "defaults"],
+});
+
 export const TERMINAL_CLIPBOARD_ENTRY = settingsEntry({
   id: "terminal-clipboard",
   section: "general",
@@ -235,6 +244,7 @@ export const GENERAL_SETTINGS = [
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
   SESSION_TITLE_INSTRUCTIONS_ENTRY,
+  NEW_CHAT_PROJECT_PROMPT_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,

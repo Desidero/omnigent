@@ -22,6 +22,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { settingsSearchCommand } from "@/shell/settingsSearch/settingsSearchCommand";
+import { startNewSession } from "@/store/newSessionProjectPrompt";
 
 export interface ActionCommand {
   id: string;
@@ -61,7 +62,7 @@ export function useAppCommands({
         label: "New chat",
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
+        run: () => startNewSession(navigate),
         shortcut: newSessionShortcutKeys(),
       },
       {

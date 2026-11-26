@@ -111,6 +111,7 @@ import {
   ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  NEW_CHAT_PROJECT_PROMPT_ENTRY,
   OPEN_IN_DESKTOP_APP_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
@@ -347,6 +348,10 @@ import {
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import {
+  useNewChatProjectPromptPreference,
+  writeNewChatProjectPromptEnabled,
+} from "@/lib/newChatProjectPromptPreferences";
 import {
   readDeleteWorktreesOnArchive,
   writeDeleteWorktreesOnArchive,
@@ -2159,6 +2164,26 @@ function OpenSubagentsInPanelControl() {
   );
 }
 
+function NewChatProjectPromptControl() {
+  const enabled = useNewChatProjectPromptPreference();
+  return (
+    <SettingsItem
+      entry={NEW_CHAT_PROJECT_PROMPT_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={NEW_CHAT_PROJECT_PROMPT_ENTRY} className="flex-1" />
+      <Switch
+        {...settingsControlProps(NEW_CHAT_PROJECT_PROMPT_ENTRY)}
+        checked={enabled}
+        onCheckedChange={writeNewChatProjectPromptEnabled}
+        data-testid="new-chat-project-prompt-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.new_chat_project_prompt"
+      />
+    </SettingsItem>
+  );
+}
+
 function TerminalClipboardControl() {
   const canRemember = canRememberTerminalClipboardPreference();
   const [preference, setPreference] = useState<TerminalClipboardPreference>(
@@ -2291,6 +2316,9 @@ function GeneralSection() {
           )}
           <div className="mt-4 border-t border-border pt-4">
             <OpenSubagentsInPanelControl />
+          </div>
+          <div className="mt-4 border-t border-border pt-4">
+            <NewChatProjectPromptControl />
           </div>
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">

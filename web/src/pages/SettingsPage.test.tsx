@@ -25,6 +25,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import {
+  NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY,
+  writeNewChatProjectPromptEnabled,
+} from "@/lib/newChatProjectPromptPreferences";
 import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
 import { fetchGithubStatus } from "@/lib/githubIntegration";
@@ -742,6 +746,19 @@ describe("SettingsPage", () => {
 
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+  });
+
+  it("asks for a project on new sessions by default and persists turning it off", async () => {
+    onTestFinished(() => void writeNewChatProjectPromptEnabled(true));
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("new-chat-project-prompt-toggle");
+    expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
+    expect(toggle).toHaveAccessibleName("Ask for a project when starting a session");
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("false");
   });
 
   it("opens sub-agents full screen by default and persists the panel setting", async () => {
