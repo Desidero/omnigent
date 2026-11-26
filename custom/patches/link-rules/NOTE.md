@@ -1,7 +1,7 @@
 # link-rules
 
 Needs: chat-item-labels
-Covers: 1af1d71054a781d0
+Covers: 898e2eaa1d6f5aa9
 
 Short references in chat messages (`BST-2135`, `PR #123`, `!123`,
 `owner/repo#123`, `session:<id>`) render as links, from rules each user sets in

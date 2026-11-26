@@ -92,8 +92,8 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/components/chat/itemCommentActions.ts |  16 +
  .../composer/ItemCommentTray.test.tsx         | 222 +++++++
  .../components/composer/ItemCommentTray.tsx   | 456 +++++++++++++
- web/src/hooks/useItemCommentMode.test.tsx     | 455 +++++++++++++
- web/src/hooks/useItemCommentMode.ts           | 618 ++++++++++++++++++
+ web/src/hooks/useItemCommentMode.test.tsx     | 466 +++++++++++++
+ web/src/hooks/useItemCommentMode.ts           | 623 ++++++++++++++++++
  web/src/lib/itemCommentDrafts.test.ts         | 100 +++
  web/src/lib/itemCommentDrafts.ts              | 463 +++++++++++++
  web/src/lib/itemCommentFiles.test.ts          |  36 +
@@ -102,11 +102,11 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/lib/itemComments.ts                   | 348 ++++++++++
  web/src/lib/itemLabels.test.ts                |  92 +++
  web/src/lib/itemLabels.ts                     | 122 +++-
- web/src/pages/ChatPage.composer.test.tsx      | 337 ++++++++++
- web/src/pages/ChatPage.tsx                    | 427 +++++++++---
+ web/src/pages/ChatPage.composer.test.tsx      | 359 ++++++++++
+ web/src/pages/ChatPage.tsx                    | 434 +++++++++---
  web/src/pages/QueuedMessagesStrip.test.tsx    |  22 +
  web/src/pages/QueuedMessagesStrip.tsx         |  29 +-
- 25 files changed, 4773 insertions(+), 173 deletions(-)
+ 25 files changed, 4815 insertions(+), 176 deletions(-)
  create mode 100644 web/src/components/chat/itemCommentActions.ts
  create mode 100644 web/src/components/composer/ItemCommentTray.test.tsx
  create mode 100644 web/src/components/composer/ItemCommentTray.tsx
@@ -1278,10 +1278,10 @@ index ec3b175ccd4e0809459d724c0de07924504b3052..4479079f58ebb2e246622ff745638c92
    index,
    sessionId,
 diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
-index 85c5192a56927dc9fcbed026334b97bd65a7082f..6065414a260f4aa453eefd052a9b377cf0d2400b 100644
+index 2d22dceb782d6550fe2421f48fa8ea5ff2bbda44..fc9538b73e406c03f9be8b9e7adaf2ca70e78a93 100644
 --- a/web/src/components/chat/chatBubbleParts.tsx
 +++ b/web/src/components/chat/chatBubbleParts.tsx
-@@ -122,12 +122,12 @@ import { buildMessageDeepLink } from "@/lib/messageDeepLink";
+@@ -124,12 +124,12 @@ import { buildMessageDeepLink } from "@/lib/messageDeepLink";
  import {
    ItemLabelMessageContext,
    buildItemLabelIndex,
@@ -1296,7 +1296,7 @@ index 85c5192a56927dc9fcbed026334b97bd65a7082f..6065414a260f4aa453eefd052a9b377c
  import { copyText } from "@/lib/clipboard";
  import { copyMarkdown } from "@/lib/copyMarkdown";
  import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
-@@ -265,35 +265,57 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
+@@ -267,35 +267,57 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
  // Finalized bubbles are reused by reference across rebuilds, so each is scanned once.
  const itemLabelScans = new WeakMap<Bubble, ItemLabelScan>();
  
@@ -2077,10 +2077,10 @@ index 0000000000000000000000000000000000000000..cf344fae712c84464e04e1fcce94036b
 +}
 diff --git a/web/src/hooks/useItemCommentMode.test.tsx b/web/src/hooks/useItemCommentMode.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..6b938e847b29ebdc4a45f27e1b6564f6a814892c
+index 0000000000000000000000000000000000000000..be214929ccab50a1f1d51a2554b51d7bb9d86779
 --- /dev/null
 +++ b/web/src/hooks/useItemCommentMode.test.tsx
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,466 @@
 +// Comment mode against a stand-in composer: drafting sets the typed message
 +// aside, submit sends one structured message through the send callback, and
 +// the drafts settle with the send path (posted, cancelled, or orphaned).
@@ -2133,7 +2133,7 @@ index 0000000000000000000000000000000000000000..6b938e847b29ebdc4a45f27e1b6564f6
 +      // The composer's own expansion, so tags come out as an ordinary send has them.
 +      expandMentions: (text, mentions, sessions) => {
 +        const present = presentMentions(
-+          composerInlineMentions(mentions, sessions, "claude-native"),
++          composerInlineMentions({ files: mentions, sessions }, "claude-native"),
 +          [text],
 +        );
 +        return {
@@ -2301,6 +2301,17 @@ index 0000000000000000000000000000000000000000..6b938e847b29ebdc4a45f27e1b6564f6
 +    );
 +    expect(composer).toBe(typed);
 +    expect(getItemCommentState(SESSION_ID).submissions[0]?.general).toBeUndefined();
++  });
++
++  it("passes the queue override to the send, and nothing extra without it", async () => {
++    const { result } = renderCommentMode();
++    comment(result, "R1", "Batch it.");
++    await act(() => result.current.submitComments({ queue: true }));
++    expect(send.mock.calls[0]).toEqual([expect.any(String), undefined, { queue: true }]);
++
++    comment(result, "R1", "And log it.");
++    await act(() => result.current.submitComments());
++    expect(send.mock.calls[1]).toHaveLength(2);
 +  });
 +
 +  it("appends extra General text after the typed message and gives it back on cancel", async () => {
@@ -2538,10 +2549,10 @@ index 0000000000000000000000000000000000000000..6b938e847b29ebdc4a45f27e1b6564f6
 +});
 diff --git a/web/src/hooks/useItemCommentMode.ts b/web/src/hooks/useItemCommentMode.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..47981055c57a296582e07bbb768724da51f5e7e9
+index 0000000000000000000000000000000000000000..b8e8219cfa2d7651c1fcbc06035536103b3d137b
 --- /dev/null
 +++ b/web/src/hooks/useItemCommentMode.ts
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,623 @@
 +// Comment mode for the chat composer. Commenting on an item turns the real
 +// composer into that comment's editor: whatever the user had typed is set
 +// aside and comes back when the comment is saved to the drafts tray. Submit
@@ -2588,6 +2599,7 @@ index 0000000000000000000000000000000000000000..47981055c57a296582e07bbb768724da
 +  type ItemCommentSubmission,
 +} from "@/lib/itemCommentDrafts";
 +import { itemLabelTitleParts, type ItemLabelEntry } from "@/lib/itemLabels";
++import type { ComposerSendOptions } from "@/lib/messageQueue";
 +import type { StoredReplyDraft } from "@/lib/replyDraft";
 +import { useChatStore, type ChatState } from "@/store/chatStore";
 +
@@ -2632,7 +2644,7 @@ index 0000000000000000000000000000000000000000..47981055c57a296582e07bbb768724da
 +    mentions: MentionItem[],
 +    sessions: SessionMention[],
 +  ) => ExpandedMentions;
-+  send: (text: string, files?: File[]) => void;
++  send: (text: string, files?: File[], options?: ComposerSendOptions) => void;
 +  /**
 +   * Holds the composer content set aside while commenting. Owned by the
 +   * composer, which saves it as the session draft in place of the comment.
@@ -2645,6 +2657,8 @@ index 0000000000000000000000000000000000000000..47981055c57a296582e07bbb768724da
 +  withMessage?: boolean;
 +  /** Text sent after the typed message in the General section. */
 +  appendGeneral?: string;
++  /** Queue the message behind the running turn even with Always steer on. */
++  queue?: boolean;
 +}
 +
 +const EMPTY_CONTENT: ComposerContent = { text: "", files: [], mentions: [], sessions: [] };
@@ -2946,7 +2960,7 @@ index 0000000000000000000000000000000000000000..47981055c57a296582e07bbb768724da
 +   */
 +  const submitComments = useCallback(
 +    async (options: SubmitCommentsOptions = {}) => {
-+      const { withMessage = true, appendGeneral = "" } = options;
++      const { withMessage = true, appendGeneral = "", queue = false } = options;
 +      if (sessionId === null || submittingRef.current) return false;
 +      submittingRef.current = true;
 +      try {
@@ -3042,7 +3056,9 @@ index 0000000000000000000000000000000000000000..47981055c57a296582e07bbb768724da
 +        if (withMessage || inComment) io.current.write(withMessage ? EMPTY_CONTENT : typed);
 +        if (missing > 0)
 +          toast.error("Some draft attachments were no longer available and were left out.");
-+        io.current.send(message, files.length > 0 ? files : undefined);
++        const sendFiles = files.length > 0 ? files : undefined;
++        if (queue) io.current.send(message, sendFiles, { queue });
++        else io.current.send(message, sendFiles);
 +        return true;
 +      } finally {
 +        submittingRef.current = false;
@@ -4833,7 +4849,7 @@ index 8b6814ea6f55290f1797750ed673b22cc966bf58..1b08ae22005b367f42f8685b08b0abfd
  }
  
 diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
-index 9f2682a6cb9133017bf79badb2071d175e887ed0..32e1213a2df108003ca73a3dab7b6f61a6359a24 100644
+index d228c1872eb9bf7e40181b1a32aebeb0eb34c5c2..ea658ceb910fb34d19d20fca27218fbd8efae251 100644
 --- a/web/src/pages/ChatPage.composer.test.tsx
 +++ b/web/src/pages/ChatPage.composer.test.tsx
 @@ -65,6 +65,15 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -4852,7 +4868,7 @@ index 9f2682a6cb9133017bf79badb2071d175e887ed0..32e1213a2df108003ca73a3dab7b6f61
  import * as host from "@/lib/host";
  import * as identity from "@/lib/identity";
  import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
-@@ -609,6 +618,334 @@ describe("Composer session drafts", () => {
+@@ -614,6 +623,356 @@ describe("Composer session drafts", () => {
    });
  });
  
@@ -5064,6 +5080,28 @@ index 9f2682a6cb9133017bf79badb2071d175e887ed0..32e1213a2df108003ca73a3dab7b6f61
 +      expect(onStop).not.toHaveBeenCalled();
 +    });
 +
++    it("queues the comment message behind the turn on Mod+Enter with Always steer on", async () => {
++      const previousAlwaysSteer = readAlwaysSteer();
++      onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
++      writeAlwaysSteer(true);
++      const onSend = vi.fn();
++      render(<Composer {...composerProps({ onSend, isWorking: true, status: "streaming" })} />);
++      saveDraft("d1", "R1", "Batch it.");
++      fireEvent.change(textarea(), { target: { value: "Thanks." } });
++
++      fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
++
++      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
++      expect(onSend.mock.calls[0]).toEqual([
++        ["Comments on 1 item:", "#### [R1] R1 title", "Batch it.", "#### General", "Thanks."].join(
++          "\n\n",
++        ),
++        undefined,
++        undefined,
++        { queue: true },
++      ]);
++    });
++
 +    it("folds attached file review comments into the General section", async () => {
 +      const onSend = vi.fn();
 +      render(
@@ -5188,7 +5226,7 @@ index 9f2682a6cb9133017bf79badb2071d175e887ed0..32e1213a2df108003ca73a3dab7b6f61
    beforeEach(() => {
      clearSessionDrafts();
 diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
-index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07dceebaab6 100644
+index 6d1f7aa0679ca8901b7a6b2edcbfdd1326397bce..7a1b93954dc2a948eb6045471930471def0e6285 100644
 --- a/web/src/pages/ChatPage.tsx
 +++ b/web/src/pages/ChatPage.tsx
 @@ -1,5 +1,6 @@
@@ -5236,7 +5274,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
    findMentionTokens,
    mergeTaggedDrafts,
    presentMentions,
-@@ -373,6 +382,20 @@ function authoredOutgoingText(fullText: string, trimmed: string): string {
+@@ -375,6 +384,20 @@ function authoredOutgoingText(fullText: string, trimmed: string): string {
    return isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
  }
  
@@ -5257,7 +5295,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
  /**
   * A sent, queued or failed message as an editable composer draft: generated
   * session markers become tokens again and their tags come back with them.
-@@ -2768,6 +2791,9 @@ function ComposerImpl(
+@@ -2791,6 +2814,9 @@ function ComposerImpl(
    valueRef.current = fullText;
    const replyDraftRef = useRef(storedReplyDraft);
    replyDraftRef.current = storedReplyDraft;
@@ -5267,7 +5305,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
    // Guards against React StrictMode double-invoke in development:
    // setup → cleanup → setup runs cleanup before the user has touched
    // the input, which would delete the draft. Only save when the user
-@@ -2854,14 +2880,27 @@ function ComposerImpl(
+@@ -2890,14 +2916,27 @@ function ComposerImpl(
      // The store binds a clicked session a moment later; keep focus in a rename started meanwhile.
      if (!isMobileRef.current && !isInlineRenameFocused()) textareaRef.current?.focus();
  
@@ -5277,7 +5315,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
        if (!conversationId || !dirtyRef.current) return;
 -      setSessionDraft(conversationId, {
 -        text: valueRef.current,
--        files: filesRef.current,
+-        files: draftFilesRef.current,
 -        replyDraft: replyDraftRef.current,
 -        mentions: taggedMentionsRef.current,
 -      });
@@ -5293,7 +5331,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +            }
 +          : {
 +              text: valueRef.current,
-+              files: filesRef.current,
++              files: draftFilesRef.current,
 +              replyDraft: replyDraftRef.current,
 +              mentions: taggedMentionsRef.current,
 +            },
@@ -5301,13 +5339,13 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
      };
    }, [conversationId, replaceText]);
  
-@@ -2899,13 +2938,24 @@ function ComposerImpl(
+@@ -2935,13 +2974,24 @@ function ComposerImpl(
    // rather than only learning about a draft when this composer unmounts.
    useEffect(() => {
      if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
 -    setSessionDraft(conversationId, {
 -      text: fullText,
--      files,
+-      files: draftFilesRef.current,
 -      replyDraft: storedReplyDraft,
 -      // Tagging always edits the text too, so fullText re-runs this effect.
 -      mentions: taggedMentionsRef.current,
@@ -5324,7 +5362,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +          }
 +        : {
 +            text: fullText,
-+            files,
++            files: draftFilesRef.current,
 +            replyDraft: storedReplyDraft,
 +            // Tagging always edits the text too, so fullText re-runs this effect.
 +            mentions: taggedMentionsRef.current,
@@ -5333,18 +5371,18 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
    }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
  
    const terminalPending = useChatStore((s) => s.terminalPending);
-@@ -3137,6 +3187,7 @@ function ComposerImpl(
+@@ -3173,6 +3223,7 @@ function ComposerImpl(
      attachMention,
      openMentionDir,
      mentionedSessions,
 +    setMentionedSessions,
      attachSession,
-     mentionTokens,
-     tagFiles,
-@@ -3204,12 +3255,6 @@ function ComposerImpl(
-   });
-   const hasDraft =
-     fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
+     attachPastedFiles,
+     mentionedAttachments,
+@@ -3262,12 +3313,6 @@ function ComposerImpl(
+     attachedFiles.length > 0 ||
+     hasMentions ||
+     localReviewComments.length > 0;
 -  const showInterruptButton =
 -    isWorking &&
 -    (!hasDraft ||
@@ -5354,7 +5392,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
  
    // Drain externally-queued attachments (file viewer "Attach to agent") into
    // tagged items and inline tokens, deduping against what's already tagged,
-@@ -3247,6 +3292,86 @@ function ComposerImpl(
+@@ -3305,6 +3350,89 @@ function ComposerImpl(
      return () => useChatStore.getState().clearPendingComposerAttachments();
    }, [pendingComposerAttachments, editText]);
  
@@ -5373,7 +5411,8 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +    read: () => ({
 +      text: valueRef.current,
 +      ...(replyDraftRef.current ? { replyDraft: replyDraftRef.current } : {}),
-+      files: filesRef.current,
++      // Like a saved draft, a pasted chip leaves with its file among the tray's.
++      files: draftFilesRef.current,
 +      mentions: taggedMentionsRef.current.files,
 +      sessions: taggedMentionsRef.current.sessions,
 +    }),
@@ -5392,15 +5431,17 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +      if (!isMobileRef.current) tailTextareaRef.current?.focus();
 +    },
 +    expandMentions: (text, mentions, sessions) => {
-+      const present = presentMentions(composerInlineMentions(mentions, sessions, sessionHarness), [
-+        text,
-+      ]);
++      const present = presentMentions(
++        composerInlineMentions({ files: mentions, sessions }, sessionHarness),
++        [text],
++      );
 +      return {
 +        text: expandMentionTokens(text, present),
 +        tagsSessions: present.some((m) => m.marker.startsWith("[Session: ")),
 +      };
 +    },
-+    send: (text, sendFiles) => onSend(text, sendFiles),
++    send: (text, sendFiles, options) =>
++      options ? onSend(text, sendFiles, undefined, options) : onSend(text, sendFiles),
 +  });
 +  const commentTarget = commentMode.target;
 +  const takeFailedCommentSend = commentMode.takeFailedSend;
@@ -5441,7 +5482,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
    // Restore the text (and attachments) of a send that failed, so the user can
    // fix and resend instead of retyping. The composer is empty in the normal
    // case — `submit` clears it optimistically — so only fill it when the user
-@@ -3263,9 +3388,17 @@ function ComposerImpl(
+@@ -3321,9 +3449,17 @@ function ComposerImpl(
      // conversation's draft and wrongly conclude the user is mid-sentence,
      // dropping the failed message on the way back to the session it failed in.
      if (settledConversationId !== conversationId) return;
@@ -5460,7 +5501,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
      if (!failed) return;
      // The failed text carries expanded markers; bring its session tags back as tokens.
      const recalled = recallComposerDraft(failed.text, failed.replyDraft);
-@@ -3286,7 +3419,14 @@ function ComposerImpl(
+@@ -3344,7 +3480,14 @@ function ComposerImpl(
      dirtyRef.current = true;
      if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
      if (!isMobileRef.current) textareaRef.current?.focus();
@@ -5476,7 +5517,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
  
    // Retract a restored failed-send draft once its send proves delivered (its
    // committed item arrived over the stream or a reconnect snapshot). Edits win:
-@@ -3912,18 +4052,59 @@ function ComposerImpl(
+@@ -3970,22 +4113,60 @@ function ComposerImpl(
      textareaRef.current = tailTextareaRef.current;
    };
  
@@ -5485,7 +5526,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +   * typed message and any file review comments go along as its General
 +   * section, unless `withMessage` is false, which leaves them in the composer.
 +   */
-+  const sendCommentDrafts = (withMessage = true): Promise<void> => {
++  const sendCommentDrafts = (withMessage = true, queue = false): Promise<void> => {
 +    setCommandError(null);
 +    const hasAuthoredText =
 +      !!draft.text.trim() || draft.quotes.some((quote) => quote.before.trim());
@@ -5495,7 +5536,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +        : "";
 +    const reviewSessionId = conversationId;
 +    return commentMode
-+      .submitComments({ withMessage, appendGeneral: reviewContext })
++      .submitComments({ withMessage, appendGeneral: reviewContext, ...(queue ? { queue } : {}) })
 +      .then((sent) => {
 +        if (sent && reviewContext && reviewSessionId) clearLocalReviewContexts(reviewSessionId);
 +      });
@@ -5508,12 +5549,13 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +   */
    const submit = ({
      resetNativeInputSession = false,
--  }: { resetNativeInputSession?: boolean } = {}) => {
+     queue = false,
+-  }: { resetNativeInputSession?: boolean } & ComposerSendOptions = {}) => {
 +    withCommentDrafts = true,
 +  }: {
 +    resetNativeInputSession?: boolean;
 +    withCommentDrafts?: boolean;
-+  } = {}): Promise<void> | void => {
++  } & ComposerSendOptions = {}): Promise<void> | void => {
      // The /btw overlay locks the composer — never send while it's open.
      if (composerLockedByBtw) return;
 +    // In comment mode, Enter and ✓ save the comment to the drafts tray.
@@ -5526,10 +5568,10 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +    const withDrafts = withCommentDrafts && sendCarriesCommentDrafts;
 +    // Allow send if there's text, attached files, "@"-tagged paths, or comment drafts.
      if (
--      (!trimmed && files.length === 0 && !hasMentions && localReviewComments.length === 0) ||
-+      (!trimmed &&
-+        files.length === 0 &&
-+        !hasMentions &&
+       (!trimmed &&
+         attachedFiles.length === 0 &&
+         !hasMentions &&
+-        localReviewComments.length === 0) ||
 +        localReviewComments.length === 0 &&
 +        !withDrafts) ||
        disabled ||
@@ -5540,19 +5582,19 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
      )
        return;
      if (highlight.refusal !== null) {
-@@ -3952,6 +4133,11 @@ function ComposerImpl(
+@@ -4014,6 +4195,11 @@ function ComposerImpl(
      // guard so guarded no-ops don't emit, matching the disabled Send button.
      trackClick("chat.composer.send", "button");
  
 +    if (withDrafts) {
 +      setMention(null);
-+      return sendCommentDrafts();
++      return sendCommentDrafts(true, queue);
 +    }
 +
      // A generic (non-Codex) side chat forks the conversation and runs it on the
      // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
      // tab; the typed text seeds the new side chat's composer so it isn't fired
-@@ -4163,7 +4349,7 @@ function ComposerImpl(
+@@ -4228,7 +4414,7 @@ function ComposerImpl(
  
    const handleSubmit = (e: FormEvent) => {
      e.preventDefault();
@@ -5561,10 +5603,10 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
        onStop();
        return;
      }
-@@ -4215,11 +4401,21 @@ function ComposerImpl(
-     // steers everything: the draft, if any, is submitted first so it joins the
-     // queue tail (or sends directly when idle), then every queued message is
-     // sent into the running turn in FIFO order instead of draining one per idle.
+@@ -4282,16 +4468,27 @@ function ComposerImpl(
+     // Mod+Enter inverts Always steer mid-turn: with it on, the draft waits in the
+     // queue; otherwise the draft joins the queue tail (or sends when idle) and the
+     // whole queue is steered into the running turn.
 -    if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
 +    if (
 +      conversationId !== null &&
@@ -5573,6 +5615,15 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
 +      shouldSteerAllFromKeyboard
 +    ) {
        e.preventDefault();
+-      // An empty composer has nothing to queue, so it still steers the backlog.
+-      if (hasDraft && isWorking && readAlwaysSteer()) {
+-        if (!mentionListingPending) submit({ queue: true });
++      // An empty composer with no comment drafts to send has nothing to queue,
++      // so it still steers the backlog.
++      if ((hasDraft || sendCarriesCommentDrafts) && isWorking && readAlwaysSteer()) {
++        if (!mentionListingPending) void submit({ queue: true });
+         return;
+       }
 -      if (!mentionListingPending) submit();
 +      const sent = mentionListingPending ? undefined : submit();
        // While unreachable the queue waits for the host, so nothing is steered.
@@ -5586,7 +5637,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
        return;
      }
      // "@"-mention menu navigation (shared useMentionBrowser) — mutually
-@@ -4249,6 +4445,12 @@ function ComposerImpl(
+@@ -4321,6 +4518,12 @@ function ComposerImpl(
        submit();
        return;
      }
@@ -5599,7 +5650,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
      // Esc closes slash-command output before it can reach the turn.
      if (e.key === "Escape" && commandError !== null) {
        e.preventDefault();
-@@ -4272,6 +4474,7 @@ function ComposerImpl(
+@@ -4344,6 +4547,7 @@ function ComposerImpl(
      // Recall starts from empty text; boundary checks preserve caret movement
      // through wrapped recalled entries. Modified arrows belong to global hotkeys.
      if (
@@ -5607,7 +5658,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
        (draft.quotes.length === 0 || recallingRef.current) &&
        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
        !e.metaKey &&
-@@ -4283,6 +4486,11 @@ function ComposerImpl(
+@@ -4355,6 +4559,11 @@ function ComposerImpl(
          // Empty-composer recall takes the last queued row before browsing history.
          if (composerEmptyForRecall) {
            const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -5619,7 +5670,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
            if (target !== undefined) {
              e.preventDefault();
              resetCursor();
-@@ -4368,6 +4576,27 @@ function ComposerImpl(
+@@ -4440,6 +4649,27 @@ function ComposerImpl(
        <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
          {/* Design tool requests still on their way to this session. */}
          <DesignOutboxStrip conversationId={conversationId} widthClassName="mx-3 w-auto" />
@@ -5647,7 +5698,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
          {/* Queued messages — peeks above the workspace bar like the
              sub-agent tray. Lists follow-ups held while the agent is busy;
              drains FIFO on idle. Scope to this conversation so a queue held
-@@ -4375,7 +4604,12 @@ function ComposerImpl(
+@@ -4447,7 +4677,12 @@ function ComposerImpl(
          <QueuedMessagesStrip
            messages={composerQueuedMessages}
            arrowUpRecallQueueId={arrowUpRecallQueueId}
@@ -5661,7 +5712,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
            onEdit={(queueId) => {
              // Pull the queued message back into the composer for editing:
              // replace the composer's text + attachments with the queued
-@@ -4383,6 +4617,11 @@ function ComposerImpl(
+@@ -4455,6 +4690,11 @@ function ComposerImpl(
              // Re-sending re-queues it (busy) or sends it (idle).
              const target = queuedMessages.find((m) => m.queueId === queueId);
              if (!target) return;
@@ -5673,7 +5724,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
              dequeueMessage(queueId);
              loadIntoComposer(target.text, target.files ?? [], { replyDraft: target.replyDraft });
            }}
-@@ -4399,7 +4638,7 @@ function ComposerImpl(
+@@ -4471,7 +4711,7 @@ function ComposerImpl(
            <ComposerWorkspaceBar
              data-testid="composer-workspace-controls"
              className={cn(
@@ -5682,7 +5733,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
                  "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
              )}
            >
-@@ -4487,19 +4726,21 @@ function ComposerImpl(
+@@ -4559,19 +4799,21 @@ function ComposerImpl(
            "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
            placeholder: composerLockedByBtw
              ? "Side chat open — press Esc to close"
@@ -5717,7 +5768,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
            rows: 1,
            heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
            disabled: inputDisabled,
-@@ -4561,6 +4802,17 @@ function ComposerImpl(
+@@ -4633,6 +4875,17 @@ function ComposerImpl(
                    }}
                  />
                )}
@@ -5735,7 +5786,7 @@ index 9c10a6cc1eff2779949205ad17cb3a7e0099fc64..70882473a220ec78d72a9a623ef7e07d
                {/* Slash-command suggestions — floats above the composer box */}
                {slashCompletion.open && (
                  <SlashCommandMenu
-@@ -4800,41 +5052,60 @@ function ComposerImpl(
+@@ -4872,41 +5125,60 @@ function ComposerImpl(
                    resetCursor();
                  }}
                />

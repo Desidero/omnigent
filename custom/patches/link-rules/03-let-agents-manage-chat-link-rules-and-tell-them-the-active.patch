@@ -48,7 +48,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  omnigent/native/native_terminal.py            |  36 ++++
  omnigent/policies/builtins/safety.py          |  37 ++++
  omnigent/runner/app.py                        |  50 +++++-
- omnigent/runner/native/orchestration.py       |  41 ++++-
+ omnigent/runner/native/orchestration.py       |  29 ++-
  omnigent/runner/pr_resource.py                |  25 +++
  omnigent/runner/tool_dispatch.py              | 120 +++++++++++++
  omnigent/runtime/policies/builder.py          |  24 ++-
@@ -64,7 +64,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  tests/runtime/test_prompt.py                  |  96 ++++++++++
  tests/test_native_terminal.py                 |  26 +++
  tests/tools/test_manager.py                   |   8 +-
- 24 files changed, 950 insertions(+), 26 deletions(-)
+ 24 files changed, 940 insertions(+), 24 deletions(-)
  create mode 100644 omnigent/tools/builtins/link_rules.py
  create mode 100644 tests/runner/test_link_rules_tool_dispatch.py
 
@@ -332,10 +332,10 @@ index dbb220911284746057e30f19b2d6d984c088269e..25b1e936c2963bbdcca3fa92ce7d2bf7
      client: httpx.AsyncClient,
      session_id: str,
 diff --git a/omnigent/policies/builtins/safety.py b/omnigent/policies/builtins/safety.py
-index 15326413d18530486f47684a2d5889e059baaeed..7cea50906ca5e80fcbb3df3e9287f3df1baa72d4 100644
+index 00efa6ead9d76f3a1f0b7d27fd43aa8939e1b6bb..cf8dd02500657bf13600fbdb57f9a0e4479badb4 100644
 --- a/omnigent/policies/builtins/safety.py
 +++ b/omnigent/policies/builtins/safety.py
-@@ -614,6 +614,43 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+@@ -679,6 +679,43 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
      }
  
  
@@ -380,7 +380,7 @@ index 15326413d18530486f47684a2d5889e059baaeed..7cea50906ca5e80fcbb3df3e9287f3df
  
  
 diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
-index 46966ea8400ada40b19b9fed00aa8c7f062d4924..578463b747bef1bf9b34a7915a7928594185b4db 100644
+index 99e4daec68353299180cc96b65ab0cbfd449b239..b9173cbcd46093f5935b1273ccb5f96dd69d9286 100644
 --- a/omnigent/runner/app.py
 +++ b/omnigent/runner/app.py
 @@ -76,12 +76,14 @@ from omnigent.harness_plugins import (
@@ -426,7 +426,7 @@ index 46966ea8400ada40b19b9fed00aa8c7f062d4924..578463b747bef1bf9b34a7915a792859
      _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool]] = {}
      _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
      _session_cursor_model_names: dict[str, dict[str, str]] = {}
-@@ -6330,6 +6339,29 @@ def create_runner_app(
+@@ -6354,6 +6363,29 @@ def create_runner_app(
                  if _turn_message_bodies.get(conv) is msg_body:
                      _turn_message_bodies.pop(conv, None)
  
@@ -456,7 +456,7 @@ index 46966ea8400ada40b19b9fed00aa8c7f062d4924..578463b747bef1bf9b34a7915a792859
      def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
          """Reasoning block to forward on a turn, or ``None`` when unset.
  
-@@ -6460,15 +6492,20 @@ def create_runner_app(
+@@ -6484,15 +6516,20 @@ def create_runner_app(
              )
              # Gated harnesses use nullable to avoid the fallback literal.
              _authored_bg = raw_author_instructions(cached_spec) is not None
@@ -478,7 +478,7 @@ index 46966ea8400ada40b19b9fed00aa8c7f062d4924..578463b747bef1bf9b34a7915a792859
                  )
              # Warn once per (conversation, harness, delivery) if the agent has
              # authored instructions but the harness can't deliver them.
-@@ -7252,10 +7289,14 @@ def create_runner_app(
+@@ -7276,10 +7313,14 @@ def create_runner_app(
                      if _instr_spec_ds is not None:
                          _per_req_instr = cast(str | None, body.get("instructions"))
                          _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
@@ -494,7 +494,7 @@ index 46966ea8400ada40b19b9fed00aa8c7f062d4924..578463b747bef1bf9b34a7915a792859
                              ),
                          )
                          # Gated harnesses get nullable — skip the fallback literal.
-@@ -7267,7 +7308,10 @@ def create_runner_app(
+@@ -7291,7 +7332,10 @@ def create_runner_app(
                              _instr_body = {
                                  **body,
                                  "instructions": build_instructions(
@@ -507,7 +507,7 @@ index 46966ea8400ada40b19b9fed00aa8c7f062d4924..578463b747bef1bf9b34a7915a792859
                              }
                          if _authored_ds and harness_name:
 diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
-index f4e3c82e74bacd02f58a58529f185efeafca7d22..873e1c8ceb6a6e974e791f570ccf64916a13ba69 100644
+index 708f89d80db0153e200a61213770d3a85898b12f..6de62fb7257542885f0747e96686c3c25cb0f214 100644
 --- a/omnigent/runner/native/orchestration.py
 +++ b/omnigent/runner/native/orchestration.py
 @@ -76,6 +76,7 @@ from omnigent.harness_plugins import native_provider_for_key
@@ -526,22 +526,16 @@ index f4e3c82e74bacd02f58a58529f185efeafca7d22..873e1c8ceb6a6e974e791f570ccf6491
  from omnigent.pi_prompt import pi_prompt_args
  from omnigent.process_logging import process_log_reference
  from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
-@@ -6033,7 +6035,13 @@ async def _auto_create_codex_terminal(
- 
-         _codex_routing_note = smart_routing_spawn_note("codex-native")
-     _codex_developer_instructions = await _native_startup_instructions(
--        agent_spec, server_client, session_id, _codex_routing_note, workspace=workspace
-+        agent_spec,
-+        server_client,
-+        session_id,
-+        _codex_routing_note,
-+        workspace=workspace,
+@@ -6094,6 +6096,8 @@ async def _auto_create_codex_terminal(
+         _codex_routing_note,
+         _codex_memory_import,
+         workspace=workspace,
 +        link_rules=await _launch_link_rules(server_client),
 +        git_workspace=await fetch_git_workspace(workspace),
      )
      # SDK initialization can block on DNS/auth before model discovery times out.
      # Keep it off the runner loop so heartbeats and other sessions can progress.
-@@ -8025,8 +8033,21 @@ def _opencode_session_instructions_from_spec(
+@@ -8104,8 +8108,21 @@ def _opencode_session_instructions_from_spec(
      return build_instructions_nullable(spec, None, [])
  
  
@@ -563,7 +557,7 @@ index f4e3c82e74bacd02f58a58529f185efeafca7d22..873e1c8ceb6a6e974e791f570ccf6491
  ) -> str:
      """Compose native startup instructions without turn-bound framework metadata.
  
-@@ -8036,12 +8057,14 @@ def _native_startup_instructions_from_spec(
+@@ -8115,12 +8132,14 @@ def _native_startup_instructions_from_spec(
  
      :param agent_spec: Agent spec object, or a resolved wrapper carrying a
          ``spec`` attribute. ``None`` means no spec was available.
@@ -579,7 +573,7 @@ index f4e3c82e74bacd02f58a58529f185efeafca7d22..873e1c8ceb6a6e974e791f570ccf6491
  
  
  async def _native_startup_instructions(
-@@ -8050,6 +8073,8 @@ async def _native_startup_instructions(
+@@ -8129,6 +8148,8 @@ async def _native_startup_instructions(
      session_id: str,
      *launch_notes: str | None,
      workspace: str | Path | None = None,
@@ -588,7 +582,7 @@ index f4e3c82e74bacd02f58a58529f185efeafca7d22..873e1c8ceb6a6e974e791f570ccf6491
  ) -> str:
      """
      Compose a native harness's startup instructions, including long-term memory.
-@@ -8064,10 +8089,12 @@ async def _native_startup_instructions(
+@@ -8143,10 +8164,12 @@ async def _native_startup_instructions(
      :param launch_notes: Additional framework notes, in order; ``None`` skipped.
      :param workspace: The session's working directory, which names its project
          in the memory guidance.
@@ -602,34 +596,28 @@ index f4e3c82e74bacd02f58a58529f185efeafca7d22..873e1c8ceb6a6e974e791f570ccf6491
          *launch_notes,
          await memory_startup_guidance(server_client, session_id, agent_spec, workspace=workspace),
      ]
-@@ -10204,7 +10231,13 @@ async def _auto_create_claude_terminal(
-         model_overrides=claude_config.model_overrides if claude_config is not None else None,
-         subagent_router_dir=subagent_router_dir,
-         append_system_prompt=await _native_startup_instructions(
--            agent_spec, server_client, session_id, routed_spawn_note, workspace=workspace
-+            agent_spec,
-+            server_client,
-+            session_id,
-+            routed_spawn_note,
-+            workspace=workspace,
+@@ -10416,6 +10439,8 @@ async def _auto_create_claude_terminal(
+             routed_spawn_note,
+             claude_memory_import,
+             workspace=workspace,
 +            link_rules=await _launch_link_rules(server_client),
 +            git_workspace=await fetch_git_workspace(workspace),
          ),
          allowed_tools=routed_spawn_tools,
          # The route-turn hook is registered only when this session can
 diff --git a/omnigent/runner/pr_resource.py b/omnigent/runner/pr_resource.py
-index c8d4baf2d2e1e03005c1bd4df3e8ee7e1b2b52bd..ff3156d5d522dbaa00db0ab51243b667883bed0e 100644
+index 39a93eac859f72ed129cd1e2431674e8c895433d..9896fab252fd6e3654d022c6ceeada2f3b295cae 100644
 --- a/omnigent/runner/pr_resource.py
 +++ b/omnigent/runner/pr_resource.py
-@@ -23,6 +23,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
+@@ -26,6 +26,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
  from contextlib import contextmanager, suppress
  from contextvars import ContextVar
  from dataclasses import dataclass
 +from pathlib import Path
  from threading import Lock
- from typing import Any
+ from typing import Any, ParamSpec, TypeVar
  
-@@ -37,6 +38,7 @@ from omnigent.git_providers import (
+@@ -40,6 +41,7 @@ from omnigent.git_providers import (
      providers,
      resolve_remote,
  )
@@ -637,7 +625,7 @@ index c8d4baf2d2e1e03005c1bd4df3e8ee7e1b2b52bd..ff3156d5d522dbaa00db0ab51243b667
  from omnigent.runner import pr_reports
  from omnigent.runner.git_providers import (
      PR_DIFF_OBJECT,
-@@ -266,6 +268,29 @@ def resolve_provider(
+@@ -316,6 +318,29 @@ def resolve_provider(
      return _resolve(root, _default_pr(session_id, pr_url))
  
  
@@ -668,7 +656,7 @@ index c8d4baf2d2e1e03005c1bd4df3e8ee7e1b2b52bd..ff3156d5d522dbaa00db0ab51243b667
      """Return the provider's pull request facet, or ``None`` when it has none."""
      return load_facet(provider_id, "pull_requests") if provider_id else None
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index ff418c0ed295e0a5cb1dbbbc8bf0ecccdb801fd5..6b2ff2315aebcccbd4e5bdaa86eb1dd60b9bf752 100644
+index ad0b2dcfa898c4499d636e1299857d07f715997e..48f8226b4594e7a7d6334a9b7d6c55a8f1581b53 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
 @@ -38,6 +38,7 @@ from datetime import UTC, datetime
@@ -705,7 +693,7 @@ index ff418c0ed295e0a5cb1dbbbc8bf0ecccdb801fd5..6b2ff2315aebcccbd4e5bdaa86eb1dd6
  )
  _PLACEHOLDER_CWDS = (None, "", ".", "./")
  
-@@ -6088,6 +6094,118 @@ def _with_memory_dates(value: object) -> object:
+@@ -6099,6 +6105,118 @@ def _with_memory_dates(value: object) -> object:
      return converted
  
  
@@ -824,7 +812,7 @@ index ff418c0ed295e0a5cb1dbbbc8bf0ecccdb801fd5..6b2ff2315aebcccbd4e5bdaa86eb1dd6
  @dataclass
  class _ParsedTitle:
      """
-@@ -8615,6 +8733,8 @@ async def execute_tool(
+@@ -8686,6 +8804,8 @@ async def execute_tool(
                  server_client=server_client,
                  conversation_id=conversation_id,
              )
@@ -1666,7 +1654,7 @@ index 193c63819c81de8249ce788604b75d4f709a777b..fd60e817645d5fc8ba22bd4248dfbe03
 +
 +    assert tuple(rule.name for rule in rules) == expected
 diff --git a/tests/tools/test_manager.py b/tests/tools/test_manager.py
-index 9cd14f4fe9d072cf12420a79cdc298dc1afb286f..caee301207eee9dd5f19a46b0eaaf95a751a9349 100644
+index b1366004b76b667aabe047b879e744db08b7ddf4..18b1645316a8c71b50a5151ac843bb9144932ecc 100644
 --- a/tests/tools/test_manager.py
 +++ b/tests/tools/test_manager.py
 @@ -110,6 +110,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
@@ -1679,7 +1667,7 @@ index 9cd14f4fe9d072cf12420a79cdc298dc1afb286f..caee301207eee9dd5f19a46b0eaaf95a
          # Embedded-browser tools are always auto-registered (framework-
          # owned) so any agent can drive the desktop app's browser without
          # the spec opting in. Schema-only; runner-dispatched.
-@@ -1834,6 +1837,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
+@@ -1835,6 +1838,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
          {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
      ),
      "files": frozenset({"sys_files_upload", "sys_files_list", "sys_files_download"}),
@@ -1687,7 +1675,7 @@ index 9cd14f4fe9d072cf12420a79cdc298dc1afb286f..caee301207eee9dd5f19a46b0eaaf95a
  }
  
  
-@@ -1870,13 +1874,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
+@@ -1871,13 +1875,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
  
  def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
      """

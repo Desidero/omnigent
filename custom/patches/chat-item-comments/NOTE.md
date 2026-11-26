@@ -1,7 +1,7 @@
 # chat-item-comments
 
 Needs: chat-item-labels
-Covers: d4c2312045f8a611
+Covers: 270dc893b8d48716
 
 Comment on labelled items and send the comments together as one structured
 message the agent answers item by item. The composer's ordinary send takes the
@@ -16,8 +16,8 @@ alone, and the tray's menu sends only the comments or only the message.
 
 ## Must hold
 
-- Comment in an item's popover puts the composer in comment mode for that item: what was typed is set aside, and Enter saves the comment as a draft in the tray and never sends.
-- Outside comment mode the composer's ordinary send, and the tray's send button, send every draft and the typed message (as a `#### General` section) as one user message through the normal send path, so it queues like any message. Sections follow the order the items were defined, and comments are numbered only when an item has several.
+- Comment in an item's popover puts the composer in comment mode for that item: what was typed is set aside (a pasted chip's file as an attached file, as in a saved draft), and Enter saves the comment as a draft in the tray and never sends.
+- Outside comment mode the composer's ordinary send, and the tray's send button, send every draft and the typed message (as a `#### General` section) as one user message through the normal send path, so it queues like any message, and Mod+Enter with Always steer on queues it behind the turn. Sections follow the order the items were defined, and comments are numbered only when an item has several.
 - A slash command, skill or `!` shell input goes alone and leaves the drafts in the tray; the tray's menu sends only the comments or only the message.
 - Sent comments are stored nowhere new: the label index parses them back out of user messages, so `parseItemCommentMessage` must read what `buildItemCommentMessage` writes. A comment heading counts as a mention but leaves the item open or closed as it was.
 - Drafts stay in the browser (localStorage per session, synced between tabs, attachment bytes in IndexedDB). Submitted drafts are kept until the message posts; a cancelled, edited, failed or orphaned send puts them back as drafts.
