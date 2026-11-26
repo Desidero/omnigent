@@ -29,6 +29,8 @@ import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
+import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
+import { mergeStoredOpenItems } from "@/lib/openItems";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
@@ -625,8 +627,11 @@ function ItemLabelScope({
   sessionId: string | null;
   children: React.ReactNode;
 }) {
+  // Where the server stores open items, a stored label takes its state from the store.
+  const stored = useStoredOpenItems(sessionId);
+  const merged = useMemo(() => mergeStoredOpenItems(index, stored), [index, stored]);
   return (
-    <ItemLabelIndexContext.Provider value={index}>
+    <ItemLabelIndexContext.Provider value={merged}>
       <ItemLabelSessionContext.Provider value={sessionId}>
         <LinkRulesScope sessionId={sessionId}>{children}</LinkRulesScope>
       </ItemLabelSessionContext.Provider>

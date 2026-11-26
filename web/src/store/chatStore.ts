@@ -127,6 +127,7 @@ import {
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
+import { refreshStoredOpenItems } from "@/lib/openItems";
 import { isFirstPlan } from "@/lib/sessionJournal";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
@@ -10422,6 +10423,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       ) {
         showTasksTabBesideChat(event.conversationId, "first-plan");
       }
+      return;
+    case "session_open_items_changed":
+      // The Open items panel, badge and chips read the stored list again.
+      if (queryClient) refreshStoredOpenItems(queryClient, event.conversationId);
       return;
     case "session_changed_files_invalidated":
       // Coarse "something changed" signal. Coalesce bursts into one
