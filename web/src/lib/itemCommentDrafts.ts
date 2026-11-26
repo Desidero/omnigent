@@ -42,6 +42,8 @@ export interface ItemCommentDraft {
   createdAt: number;
   /** The submission this draft went out in, until that message posts. */
   submissionId?: string;
+  /** Sending closes the item with its comments ("Comment and close"). */
+  closes?: boolean;
 }
 
 /** A comment message sent but not yet posted. */
@@ -58,6 +60,8 @@ export interface ItemCommentSubmission {
   };
   /** The page that sent it went away before the post succeeded. */
   orphaned?: boolean;
+  /** Items the message closes once it posts. */
+  closes?: string[];
 }
 
 export interface ItemCommentState {
@@ -71,6 +75,8 @@ export interface ItemCommentRequest {
   title: string;
   /** The draft to edit; a new comment when absent. */
   draftId?: string;
+  /** Start the comment as "Comment and close". */
+  closes?: boolean;
   nonce: number;
 }
 
