@@ -1,0 +1,401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 05:05:45 +0000
+Subject: [PATCH] feat(web): start a new chat in a project from the command
+ palette
+
+The palette's "New chat" always opens a plain composer, so starting a
+session with a project's stored defaults (host, workspace, agent, model,
+worktree) means leaving the keyboard for the sidebar.
+
+Typing in the palette now also lists "New chat in <project>" rows, which
+open the composer at /?project=<name>. Every typed word must appear in
+the row label or its group heading, so "new omni", "omni" and "project"
+all match. The rows stay hidden while the query is empty, so a long
+project list doesn't push Actions out of view, and the sessions-only
+switcher leaves them out.
+
+Both palettes list them: the classic CommandPalette, and the QuickPick
+palette (quick_pick_palette), where they rank by its own matcher, stay
+below sessions that match the same word and are left out of Recent. The
+shared cases in CommandPalette.test.tsx run against both.
+
+The feature map documents the rows.
+
+Not upstream yet: proposed from feat/palette-new-chat-in-project
+(https://github.com/omnigent-ai/omnigent/pull/11394); drop this copy
+once it merges.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/composer.md                   | 14 ++++
+ web/src/shell/CommandPalette.test.tsx     | 81 +++++++++++++++++++++++
+ web/src/shell/CommandPalette.tsx          | 43 +++++++++++-
+ web/src/shell/QuickPickCommandPalette.tsx | 37 ++++++++++-
+ web/src/shell/newChatInProject.ts         | 47 +++++++++++++
+ web/src/shell/paletteTarget.ts            |  2 +
+ 6 files changed, 218 insertions(+), 6 deletions(-)
+ create mode 100644 web/src/shell/newChatInProject.ts
+
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index 8300037883f2f2f47c267a9499447230000d4dda..263f011a6eaea59479bfa67889f1eb992089b8e1 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -332,6 +332,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+ - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
+   opens and focuses the new-session composer in browsers. Native shells use
+   ⌘/Ctrl+N. Embedded apps require focus inside the app.
++- `palette-new-chat-in-project`: typing in the ⌘K command palette lists a
++  "New chat in <project>" row per project, in the classic palette and with
++  `quick_pick_palette` on; every typed word must match, so `project`,
++  `new omni` and `omni` all find it. Choosing a row opens the new-session
++  composer with that project's defaults. The rows are hidden while the query is
++  empty and absent from the sessions-only switcher.
+ - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
+   can be steered into the running turn. Mod+Enter inverts Always steer for one
+   message: with it on, the draft waits in the queue until the turn ends; with it
+@@ -542,6 +548,9 @@ and opens the composer with its prompt`).
+ - With the browser app focused, press ⌘+Shift+O (macOS) or
+   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
+   composer.
++- Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
++  **New chat in <project>** to open the new-session composer with that
++  project's host, workspace and agent prefilled.
+ - Hover the model/effort pill to see the tooltip.
+ - Hover the host chip to see the selected host or sandbox and its connection.
+ - Pick a harness, then open its configuration for model, effort (Codex, Claude,
+@@ -1192,6 +1201,11 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+   a deployment that does.
+ - **`new-session-hotkey`:**
+   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
++- **`palette-new-chat-in-project`:** component coverage in
++  `web/src/shell/CommandPalette.test.tsx` (`new chat in project`), which
++  `CommandPalette.quickPick.test.tsx` also runs against the QuickPick palette.
++  Manually: ⌘K, type part of a project name, press Enter on the row, and check
++  the composer shows that project's host, workspace and agent.
+ - **`import-bundle`:** no browser-level coverage; the web unit tests for the
+   Create custom agent and new-session dialogs cover it. Manually: open the agent
+   picker's custom agents, then Create custom agent → Import bundle, and pick a
+diff --git a/web/src/shell/CommandPalette.test.tsx b/web/src/shell/CommandPalette.test.tsx
+index 55098f96434ef1e86fac5d8b66337a1767f7cb93..f3075d10830a24562c8164fe0a9ec7f9e346a65b 100644
+--- a/web/src/shell/CommandPalette.test.tsx
++++ b/web/src/shell/CommandPalette.test.tsx
+@@ -688,6 +688,87 @@ describe("CommandPalette — match preview", () => {
+   });
+ });
+ 
++describe("CommandPalette — new chat in project", () => {
++  beforeEach(() => {
++    useProjects.mockReturnValue({
++      data: [
++        { id: "p1", name: "omnigent", icon: "🔥" },
++        { id: null, name: "docs site", icon: null },
++      ],
++    });
++  });
++
++  const type = (value: string) =>
++    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value } });
++  const projectRow = (name: string) =>
++    screen.queryByRole("option", { name: `New chat in ${name}` });
++
++  it("hides project rows until the user types", () => {
++    renderPalette();
++
++    expect(screen.queryByText("New chat in project")).toBeNull();
++    expect(projectRow("omnigent")).toBeNull();
++  });
++
++  it("matches every typed word against the row label", () => {
++    renderPalette();
++    type("new omni");
++
++    expect(projectRow("omnigent")).toBeTruthy();
++    expect(projectRow("docs site")).toBeNull();
++    expect(screen.getByTestId("project-icon").textContent).toBe("🔥");
++  });
++
++  it("lists every project when the query is the group heading's word", () => {
++    renderPalette();
++    type("project");
++
++    expect(projectRow("omnigent")).toBeTruthy();
++    expect(projectRow("docs site")).toBeTruthy();
++  });
++
++  it("opens the highlighted project row with Enter", async () => {
++    const { onOpenChange } = renderPalette();
++    type("omni");
++    await vi.waitFor(() => expect(projectRow("omnigent")).toHaveAttribute("aria-selected", "true"));
++    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
++
++    expect(navigate).toHaveBeenCalledWith("/?project=omnigent");
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++  });
++
++  it("opens the composer with the project's defaults and closes", () => {
++    const { onOpenChange } = renderPalette();
++    type("docs");
++    fireEvent.click(projectRow("docs site")!);
++
++    expect(navigate).toHaveBeenCalledWith("/?project=docs%20site");
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++  });
++
++  it("omits project rows in the sessions-only switcher", () => {
++    renderPalette({ sessionsOnly: true });
++    type("omni");
++
++    expect(projectRow("omnigent")).toBeNull();
++  });
++
++  it("keeps sessions that match the same word above the project rows", () => {
++    vi.useFakeTimers();
++    onTestFinished(() => void vi.useRealTimers());
++    setSearchGroups({ title: searchPages([conv("fix", "omnigent fix")]) });
++    renderPalette();
++    type("omnigent");
++    act(() => {
++      vi.advanceTimersByTime(300);
++    });
++
++    const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
++    expect(options[0]).toContain("omnigent fix");
++    expect(options[1]).toContain("New chat in omnigent");
++  });
++});
++
+ describe("CommandPalette — input", () => {
+   it("uses the sessions-first placeholder", () => {
+     renderPalette();
+diff --git a/web/src/shell/CommandPalette.tsx b/web/src/shell/CommandPalette.tsx
+index 1430b3c1ab9740b6d7c357a67310749787639a76..3b84d515cc08e25ab378cc03e260d6c703a9627a 100644
+--- a/web/src/shell/CommandPalette.tsx
++++ b/web/src/shell/CommandPalette.tsx
+@@ -1,6 +1,7 @@
+-// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions.
++// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions,
++// and New chat in project (a row per project, once the user types).
+ // Sessions are searched server-side (one loaded page can't find older ones), so
+-// cmdk filtering is off and the static actions are filtered here.
++// cmdk filtering is off and the static rows are filtered here.
+ 
+ import type React from "react";
+ import { useEffect, useMemo, useRef, useState } from "react";
+@@ -21,7 +22,16 @@ import {
+   CommandList,
+ } from "@/components/ui/command";
+ import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
++import {
++  matchNewChatInProject,
++  NEW_CHAT_IN_PROJECT_HEADING,
++  newChatInProjectLabel,
++  newChatInProjectPath,
++  newChatInProjectRowId,
++  useNewChatInProjectChoices,
++} from "./newChatInProject";
+ import { PaletteSessionContext } from "./PaletteSessionContext";
++import { ProjectRowIcon } from "./ProjectPicker";
+ import { type FeaturePaletteRow, useFeaturePaletteCommands } from "./useFeaturePaletteCommands";
+ import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
+ 
+@@ -131,6 +141,11 @@ export function CommandPalette({
+     () => groupByHeading(filterAppCommands(featureCommands.rows, query)),
+     [featureCommands.rows, query],
+   );
++  const projectChoices = useNewChatInProjectChoices(open && !sessionsOnly, query);
++  const filteredProjects = useMemo(
++    () => matchNewChatInProject(projectChoices, query),
++    [projectChoices, query],
++  );
+ 
+   // The two search groups resolve independently, so a title match can render
+   // above an already-highlighted content match. Keep the top row selected
+@@ -143,7 +158,8 @@ export function CommandPalette({
+     visibleSessions[0]?.id ??
+     contentSessions[0]?.id ??
+     (filteredActions[0] ? `action:${filteredActions[0].id}` : undefined) ??
+-    (firstRunnableFeature ? `feature:${firstRunnableFeature.id}` : "");
++    (firstRunnableFeature ? `feature:${firstRunnableFeature.id}` : undefined) ??
++    (filteredProjects[0] ? newChatInProjectRowId(filteredProjects[0].name) : "");
+   const [selectedValue, setSelectedValue] = useState("");
+   const userMovedSelection = useRef(false);
+   useEffect(() => {
+@@ -163,6 +179,11 @@ export function CommandPalette({
+     action.run();
+   };
+ 
++  const newChatInProject = (projectName: string): void => {
++    close();
++    navigate(newChatInProjectPath(projectName));
++  };
++
+   const goToSession = (id: string): void => {
+     rememberSearchRow(id);
+     close();
+@@ -394,6 +415,22 @@ export function CommandPalette({
+                 ))}
+               </CommandGroup>
+             ))}
++            {filteredProjects.length > 0 && (
++              <CommandGroup heading={NEW_CHAT_IN_PROJECT_HEADING}>
++                {filteredProjects.map((project) => (
++                  <CommandItem
++                    key={project.name}
++                    value={newChatInProjectRowId(project.name)}
++                    onSelect={() => newChatInProject(project.name)}
++                  >
++                    <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
++                    <span className="flex-1 truncate text-left">
++                      {newChatInProjectLabel(project.name)}
++                    </span>
++                  </CommandItem>
++                ))}
++              </CommandGroup>
++            )}
+           </CommandList>
+         </Command>
+       </DialogContent>
+diff --git a/web/src/shell/QuickPickCommandPalette.tsx b/web/src/shell/QuickPickCommandPalette.tsx
+index dac11d5c36dd797d0dcec342a51886f83201f66b..6390baadbcac9f2cf52d68d51f0e811c1a2f1428 100644
+--- a/web/src/shell/QuickPickCommandPalette.tsx
++++ b/web/src/shell/QuickPickCommandPalette.tsx
+@@ -1,6 +1,6 @@
+-// ⌘K on QuickPick: the same Sessions, In messages and Actions rows as CommandPalette,
+-// with fuzzy-ranked actions and keyboard navigation from the QuickPick list, and the
+-// commands features on screen offer through `usePaletteCommands`, under their headings.
++// ⌘K on QuickPick: the same Sessions, In messages, Actions and New chat in project rows as
++// CommandPalette, with fuzzy-ranked actions and keyboard navigation from the QuickPick list,
++// and the commands features on screen offer through `usePaletteCommands`, under their headings.
+ 
+ import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+ import { useStore } from "zustand";
+@@ -35,9 +35,17 @@ import {
+   paletteChildPageStore,
+   resetPaletteToRoot,
+ } from "./commandPaletteChildPage";
++import {
++  NEW_CHAT_IN_PROJECT_HEADING,
++  newChatInProjectLabel,
++  newChatInProjectPath,
++  newChatInProjectRowId,
++  useNewChatInProjectChoices,
++} from "./newChatInProject";
+ import { currentPaletteCommand, paletteCommandItems } from "./paletteCommandRows";
+ import { PaletteSessionContext } from "./PaletteSessionContext";
+ import type { PaletteTarget as PaletteRow } from "./paletteTarget";
++import { ProjectRowIcon } from "./ProjectPicker";
+ import { useSettingChoicesPage } from "./settingChoicesPage";
+ import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
+ 
+@@ -216,6 +224,7 @@ export function QuickPickCommandPalette({
+       : [];
+ 
+   const { visibleSessions, contentSessions, searching } = search;
++  const projectChoices = useNewChatInProjectChoices(open && !sessionsOnly, query);
+   // Picked by kind, so a page kind nothing builds yet lists no rows instead of another page's.
+   const activePage = (() => {
+     switch (childPage?.kind) {
+@@ -285,6 +294,24 @@ export function QuickPickCommandPalette({
+             .filter((item) => item.group !== undefined)
+             .map((item) => ({ ...item, matchHighlight: "underline" })),
+     },
++    {
++      sourceId: "new-chat-in-project",
++      ranking: "client",
++      fuzzyMatching: "words",
++      items: projectChoices.map((project): QuickPickItem<PaletteRow> => ({
++        id: newChatInProjectRowId(project.name),
++        label: newChatInProjectLabel(project.name),
++        keywords: ["project"],
++        group: NEW_CHAT_IN_PROJECT_HEADING,
++        matchHighlight: "underline",
++        icon: <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />,
++        // The label names the user's project, so sessions matching the same word stay first.
++        leadsSources: false,
++        // These rows are hidden without a query, so Recent couldn't list them.
++        rememberInHistory: false,
++        value: { kind: "new-chat-in-project", projectName: project.name },
++      })),
++    },
+   ];
+   // A page kind nothing builds yet lists nothing, rather than the root's rows.
+   const unbuiltPage = childPage !== null && activePage === null;
+@@ -304,6 +331,10 @@ export function QuickPickCommandPalette({
+       row.action.run();
+       return undefined;
+     }
++    if (row.kind === "new-chat-in-project") {
++      navigate(newChatInProjectPath(row.projectName));
++      return undefined;
++    }
+     if (row.kind === "setting-choice") return settingPage.acceptChoice(row.value);
+     if (row.kind === "command-option") return optionsPage.acceptOption(row.optionId);
+     // No page lists a session's actions yet.
+diff --git a/web/src/shell/newChatInProject.ts b/web/src/shell/newChatInProject.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f3ead7f7437115e6a6eea3a97f3c4e52357f05bc
+--- /dev/null
++++ b/web/src/shell/newChatInProject.ts
+@@ -0,0 +1,47 @@
++// ⌘K's "New chat in <project>" rows, one per project, as both palettes list them. They show
++// only once the user types, so a long project list doesn't push Actions out of view.
++
++import { type ProjectSummary, useProjects } from "@/hooks/useConversations";
++
++export const NEW_CHAT_IN_PROJECT_HEADING = "New chat in project";
++
++const NO_PROJECTS: readonly ProjectSummary[] = [];
++
++/** Where a new session filed under `projectName` starts: the composer with its defaults. */
++export function newChatInProjectPath(projectName: string): string {
++  return `/?project=${encodeURIComponent(projectName)}`;
++}
++
++export function newChatInProjectLabel(projectName: string): string {
++  return `New chat in ${projectName}`;
++}
++
++/** The palette's row id for a project, unique among its rows. */
++export function newChatInProjectRowId(projectName: string): string {
++  return `project:${projectName}`;
++}
++
++/** The projects to offer rows for: none until the user types, or while `listed` is false. */
++export function useNewChatInProjectChoices(
++  listed: boolean,
++  query: string,
++): readonly ProjectSummary[] {
++  const { data: projects = NO_PROJECTS } = useProjects({ enabled: listed });
++  return listed && query.trim() !== "" ? projects : NO_PROJECTS;
++}
++
++/**
++ * The projects whose row holds every typed word in its label or group heading, so
++ * "new omni", "omni" and "project" all reach "New chat in omnigent".
++ */
++export function matchNewChatInProject(
++  projects: readonly ProjectSummary[],
++  query: string,
++): readonly ProjectSummary[] {
++  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
++  if (words.length === 0) return NO_PROJECTS;
++  return projects.filter((project) => {
++    const text = `${NEW_CHAT_IN_PROJECT_HEADING} ${project.name}`.toLowerCase();
++    return words.every((word) => text.includes(word));
++  });
++}
+diff --git a/web/src/shell/paletteTarget.ts b/web/src/shell/paletteTarget.ts
+index a42f6a3928036ddd88ecc499af12592072ac8f22..1fd14b727e8ed2f954de70e60dee0a85ce8605c7 100644
+--- a/web/src/shell/paletteTarget.ts
++++ b/web/src/shell/paletteTarget.ts
+@@ -6,6 +6,8 @@ import type { SessionCommandId } from "./sessionCommands/commandIds";
+ export type PaletteTarget =
+   | { kind: "session"; id: string }
+   | { kind: "action"; action: ActionCommand }
++  /** A "New chat in <project>" row. */
++  | { kind: "new-chat-in-project"; projectName: string }
+   | PaletteCommandRow
+   /** A session group's paging row; the selection parks on `lastRowId` while more load. */
+   | { kind: "more"; load: () => void; lastRowId: string | undefined }
