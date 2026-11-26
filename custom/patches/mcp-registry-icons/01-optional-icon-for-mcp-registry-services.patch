@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 24 Nov 2026 18:12:26 +0000
+Subject: [PATCH] feat(mcp): optional icon for MCP registry services
+
+Every service in the managed MCP picker shows the same plug icon, which
+makes a list of more than a handful hard to scan, and the registry
+schema has no icon field and rejects unknown keys.
+
+A registry entry may now set `icon`:
+
+- McpService.icon takes a `data:image/svg+xml;base64,` or
+  `data:image/png;base64,` URI of at most 16,384 characters. Embedded
+  images only: a remote URL is rejected, so the web app never loads an
+  address from the registry file. The payload must be strict base64 that
+  decodes to an SVG document or a PNG, so an empty or non-image payload
+  fails registry validation instead of rendering blank.
+- GET /v1/mcp-registry/services returns `icon`, null when unset.
+- The picker draws an SVG as a CSS mask in the muted text colour, so it
+  follows light and dark themes, a PNG as an image, and the plug
+  otherwise.
+
+A server without this field rejects a registry file that sets it, so the
+server is upgraded before the file gains `icon`; the registry README says
+so.
+
+Carried on custom for registries with many services; not proposed
+upstream yet.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ examples/mcp-registry/README.md         | 12 +++++
+ feature-map/composer.md                 |  5 ++
+ omnigent/server/mcp_registry.py         | 41 +++++++++++++++
+ omnigent/server/routes/mcp_registry.py  |  1 +
+ tests/server/test_mcp_registry.py       | 69 +++++++++++++++++++++++++
+ web/src/components/McpRegistry.test.tsx | 35 +++++++++++++
+ web/src/components/McpRegistry.tsx      | 28 +++++++++-
+ web/src/lib/mcpRegistry.ts              |  2 +
+ 8 files changed, 192 insertions(+), 1 deletion(-)
+
+diff --git a/examples/mcp-registry/README.md b/examples/mcp-registry/README.md
+index bd9b03bf2f395b5b4f3684d792cfd8ad82e82b98..a52aaa636666ec16ce0dddcd5936c42c981323a0 100644
+--- a/examples/mcp-registry/README.md
++++ b/examples/mcp-registry/README.md
+@@ -288,6 +288,7 @@ admin database/UI. Settings shows users only the entries they can access.
+ | --- | --- |
+ | `public_url` | External Omnigent base URL used for OAuth callbacks; HTTPS except localhost. |
+ | `services[].id` | Stable service key, also used in agent bundles and `service__tool` names. |
++| `icon` | Optional icon shown beside the service in the launch picker: a `data:image/svg+xml;base64,` or `data:image/png;base64,` URI, at most 16,384 characters. |
+ | `url` | Administrator-approved Streamable HTTP MCP destination. |
+ | `tools` | Required, nonempty list of allowed upstream tool names. |
+ | `allowed_users` | Optional list of authenticated user IDs; omitted permits all users. |
+@@ -296,6 +297,17 @@ admin database/UI. Settings shows users only the entries they can access.
+ | `timeout` | Overall MCP request timeout in seconds; default 60, maximum 300. |
+ | `allow_http` | Explicit local-development opt-in for upstream HTTP URLs. |
+ 
++`icon` must embed the image. A remote URL is rejected, so the web app never
++loads an address from the registry file. The value must be strict base64 that
++decodes to an SVG document or a PNG; anything else, including an empty payload,
++fails startup like any other invalid field. The launch picker draws an SVG as a
++mask in the muted text colour, so it follows light and dark themes and works
++best as a monochrome shape; a PNG is shown as it is. A service without `icon`
++shows a plug. `GET /v1/mcp-registry/services` returns the value as `icon`,
++`null` when unset. A server from before this field rejects it as an unknown key
++and fails startup, so upgrade the server before adding `icon` to the registry
++file, and remove it before rolling back.
++
+ For generic OAuth, register the callback
+ `<public_url>/v1/connections/mcp-<service-id>/callback` with the provider.
+ PKCE S256 is used. Confidential clients send the secret named by
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index 1f3e9bceece1f14eb33603a9539ec8ee390fe6f5..8e72925f02cc713119a9ba2db609b14358ef5f60 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -684,6 +684,11 @@ picker is hidden or the catalog is empty. Host and sandbox runners must support
+ managed MCP services. Use a fictional local OAuth provider for live sign-in
+ checks and allow popups; the browser tests below stub the catalog and callbacks.
+ Other connection providers alone do not enable the managed MCP picker.
++A service whose registry entry sets `icon` shows it in the picker in place of
++the plug: an SVG as a mask in the muted text colour, a PNG as it is. The
++[registry's administrator configuration](../examples/mcp-registry/README.md#administrator-configuration)
++describes the field; `web/src/components/McpRegistry.test.tsx` covers both
++forms and the fallback to the plug.
+ 
+ - **`touch-targets`, new-session and in-session composers:**
+   `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`
+diff --git a/omnigent/server/mcp_registry.py b/omnigent/server/mcp_registry.py
+index f3c17575cda09ad8c9790cb9e6626dc7078872b8..dad7b3d1ab067456acf6da2e85f6e04ac027367d 100644
+--- a/omnigent/server/mcp_registry.py
++++ b/omnigent/server/mcp_registry.py
+@@ -4,10 +4,12 @@ from __future__ import annotations
+ 
+ import asyncio
+ import base64
++import binascii
+ import hashlib
+ import logging
+ import math
+ import os
++import re
+ import secrets
+ import time
+ from builtins import ExceptionGroup
+@@ -85,6 +87,42 @@ class OAuthConfig(BaseModel):
+     resource: str | None = None
+ 
+ 
++_SVG_ICON_PREFIX = "data:image/svg+xml;base64,"
++_PNG_ICON_PREFIX = "data:image/png;base64,"
++_ICON_MAX_LENGTH = 16 * 1024
++_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
++_SVG_ELEMENT = re.compile(r"<svg[\s/>]")
++
++
++def _require_embedded_icon(icon: str) -> None:
++    """Accept only a base64 SVG or PNG data URI that holds such an image.
++
++    Self-contained images only, so clients never fetch an operator-supplied URL.
++    The payload is checked for its format's marker, not rendered or parsed.
++
++    :raises ValueError: Naming what is wrong with the icon.
++    """
++    prefix = next((p for p in (_SVG_ICON_PREFIX, _PNG_ICON_PREFIX) if icon.startswith(p)), None)
++    if prefix is None:
++        raise ValueError("icon must be a base64 data:image/svg+xml or data:image/png URI")
++    if len(icon) > _ICON_MAX_LENGTH:
++        raise ValueError(f"icon data URI exceeds {_ICON_MAX_LENGTH} characters")
++    try:
++        payload = base64.b64decode(icon[len(prefix) :], validate=True)
++    except binascii.Error:
++        raise ValueError("icon data URI is not valid base64") from None
++    if prefix == _PNG_ICON_PREFIX:
++        is_image = payload.startswith(_PNG_SIGNATURE)
++    else:
++        try:
++            is_image = _SVG_ELEMENT.search(payload.decode("utf-8")) is not None
++        except UnicodeDecodeError:
++            is_image = False
++    if not is_image:
++        kind = "a PNG" if prefix == _PNG_ICON_PREFIX else "an SVG"
++        raise ValueError(f"icon data URI does not hold {kind} image")
++
++
+ class McpService(BaseModel):
+     """A catalog entry. Only the server operator can choose upstream destinations."""
+ 
+@@ -92,6 +130,7 @@ class McpService(BaseModel):
+     id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")
+     title: str
+     description: str = ""
++    icon: str | None = None
+     url: str
+     auth: Literal["none", "bearer", "oauth", "github", "databricks"] = "bearer"
+     oauth: OAuthConfig | None = None
+@@ -106,6 +145,8 @@ class McpService(BaseModel):
+             raise ValueError("MCP service ids cannot contain the tool namespace separator '__'")
+         if (self.auth == "oauth") != (self.oauth is not None):
+             raise ValueError("oauth configuration is required only for auth=oauth")
++        if self.icon is not None:
++            _require_embedded_icon(self.icon)
+         urls = [self.url]
+         if self.oauth:
+             urls += [self.oauth.authorize_url, self.oauth.token_url]
+diff --git a/omnigent/server/routes/mcp_registry.py b/omnigent/server/routes/mcp_registry.py
+index 489fc9921f62291bf1ca9556b6cfb0de7ef6e950..b8ed161b0de811ce0a0b769e89d39ab300652e7f 100644
+--- a/omnigent/server/routes/mcp_registry.py
++++ b/omnigent/server/routes/mcp_registry.py
+@@ -57,6 +57,7 @@ def create_mcp_registry_router(
+                     "id": entry.id,
+                     "title": entry.title,
+                     "description": entry.description,
++                    "icon": entry.icon,
+                     "auth": entry.auth,
+                     "connected": connected,
+                     "tools": entry.tools,
+diff --git a/tests/server/test_mcp_registry.py b/tests/server/test_mcp_registry.py
+index dda9b6ec219a4796a35a19e92df9af4fb153ea3d..d01cd8dddfe40f8882348156af50980952cff732 100644
+--- a/tests/server/test_mcp_registry.py
++++ b/tests/server/test_mcp_registry.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import base64
+ import json
+ import threading
+ from builtins import ExceptionGroup
+@@ -213,6 +214,74 @@ def test_invalid_operator_configuration_fails_early(override):
+         service(**override)
+ 
+ 
++def _icon(media_type: str, payload: bytes) -> str:
++    return f"data:{media_type};base64,{base64.b64encode(payload).decode()}"
++
++
++_SVG_ICON = _icon(
++    "image/svg+xml", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"/>'
++)
++_PNG_ICON = _icon("image/png", b"\x89PNG\r\n\x1a\n" + bytes(16))
++
++
++@pytest.mark.parametrize("icon", [_SVG_ICON, _PNG_ICON, _icon("image/svg+xml", b"<svg/>")])
++def test_icon_accepts_a_self_contained_svg_or_png(icon):
++    assert service(icon=icon).icon == icon
++
++
++def test_icon_defaults_to_none():
++    assert service().icon is None
++
++
++@pytest.mark.parametrize(
++    "icon",
++    [
++        "https://cdn.example.test/icon.svg",
++        "data:image/svg+xml,%3Csvg/%3E",
++        "data:text/html;base64,PGI+",
++        "data:image/png;base64,not base64!",
++        "data:image/png;base64," + "A" * (16 * 1024),
++        # Well-formed data URIs that hold no image of their type.
++        "data:image/png;base64,",
++        "data:image/svg+xml;base64,",
++        _icon("image/png", b"<svg/>"),
++        _icon("image/png", b"not an image"),
++        _icon("image/svg+xml", b"<b>not an image</b>"),
++        _icon("image/svg+xml", b"<svgfoo/>"),
++        _icon("image/svg+xml", b"\x89PNG\r\n\x1a\n" + bytes(16)),
++    ],
++)
++def test_icon_rejects_remote_malformed_oversize_and_non_image_values(icon):
++    with pytest.raises(ValidationError, match="icon"):
++        service(icon=icon)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("icon", [_SVG_ICON, _PNG_ICON, None])
++async def test_catalog_returns_each_services_icon(db_uri, icon):
++    entry = service() if icon is None else service(icon=icon)
++    registry = McpRegistry(
++        McpRegistryConfig(services=[entry]), CredentialStore(db_uri, _FakeCipher())
++    )
++    app = FastAPI()
++    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
++    async with httpx.AsyncClient(
++        transport=httpx.ASGITransport(app=app),
++        base_url="http://test",
++        headers={"x-test-user": "alice"},
++    ) as client:
++        catalog = await client.get("/v1/mcp-registry/services")
++    assert catalog.status_code == 200, catalog.text
++    assert catalog.json()["data"][0]["icon"] == icon
++
++
++def test_a_registry_file_with_an_icon_loads(tmp_path, monkeypatch):
++    catalog = tmp_path / "mcp-registry.yaml"
++    catalog.write_text(json.dumps({"services": [service(icon=_PNG_ICON).model_dump()]}))
++    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
++    assert McpRegistryConfig.from_env().services[0].icon == _PNG_ICON
++
++
+ @pytest.mark.parametrize("url", ["http://public.example.test", "https://user:pass@example.test"])
+ def test_invalid_public_callback_url_is_rejected(url):
+     with pytest.raises(ValidationError, match="public_url"):
+diff --git a/web/src/components/McpRegistry.test.tsx b/web/src/components/McpRegistry.test.tsx
+index 856cfc174760dcc8589eea8b397fe263d4f19b79..6721dba9a28896b17edfa4223d828e6d25142e66 100644
+--- a/web/src/components/McpRegistry.test.tsx
++++ b/web/src/components/McpRegistry.test.tsx
+@@ -111,6 +111,41 @@ describe("MCP service selection", () => {
+     );
+   });
+ 
++  it.each([
++    ["an SVG as a mask in the text colour", "data:image/svg+xml;base64,PHN2Zy8+", "SPAN"],
++    ["a PNG as an image", "data:image/png;base64,iVBORw0KGgo=", "IMG"],
++  ])("shows a service's icon: %s", async (_name, icon, tagName) => {
++    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, icon }] });
++    render(<McpRegistryPicker attached={[]} onToggle={vi.fn()} busy={false} />);
++    await screen.findByRole("switch", { name: "Work tracker" });
++    const shown = screen.getByTestId("mcp-service-icon");
++    expect(shown.tagName).toBe(tagName);
++    if (shown instanceof HTMLImageElement) {
++      expect(shown.getAttribute("src")).toBe(icon);
++      expect(shown.getAttribute("alt")).toBe("");
++    } else {
++      expect(shown.style.mask).toContain(`url("${icon}")`);
++      expect(shown).toHaveClass("bg-muted-foreground");
++      expect(shown).toHaveAttribute("aria-hidden", "true");
++    }
++    expect(document.querySelector(".lucide-plug")).toBeNull();
++  });
++
++  it.each([
++    ["no icon", undefined],
++    ["a null icon", null],
++    ["a remote address", "https://cdn.example.test/icon.svg"],
++    ["another media type", "data:text/html;base64,PGI+"],
++    ["an SVG that is not base64", "data:image/svg+xml,%3Csvg/%3E"],
++  ])("shows the plug for %s and loads nothing", async (_name, icon) => {
++    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, icon }] });
++    render(<McpRegistryPicker attached={[]} onToggle={vi.fn()} busy={false} />);
++    await screen.findByRole("switch", { name: "Work tracker" });
++    expect(screen.queryByTestId("mcp-service-icon")).toBeNull();
++    expect(document.querySelector("img")).toBeNull();
++    expect(document.querySelector(".lucide-plug")).not.toBeNull();
++  });
++
+   it("reports a sign-in starting and finishing to its owner", async () => {
+     const oauth = { ...service, auth: "oauth" };
+     vi.mocked(registryRequest).mockResolvedValueOnce({ data: [oauth] });
+diff --git a/web/src/components/McpRegistry.tsx b/web/src/components/McpRegistry.tsx
+index 2c4617f58c3ed5ff108207236a294bb6265e9ca8..632c2f1e3c7be0011c2f5f11c9481e89098dc4ff 100644
+--- a/web/src/components/McpRegistry.tsx
++++ b/web/src/components/McpRegistry.tsx
+@@ -59,6 +59,32 @@ function connectAccount(service: RegistryService) {
+   );
+ }
+ 
++/** Operator-supplied connector icon; SVGs are masked so they follow the theme's text colour. */
++function RegistryServiceIcon({ icon }: { icon?: string | null }) {
++  if (icon?.startsWith("data:image/svg+xml;base64,")) {
++    const mask = `url("${icon}") center / contain no-repeat`;
++    return (
++      <span
++        aria-hidden="true"
++        data-testid="mcp-service-icon"
++        className="size-4 shrink-0 bg-muted-foreground"
++        style={{ mask, WebkitMask: mask }}
++      />
++    );
++  }
++  if (icon?.startsWith("data:image/png;base64,")) {
++    return (
++      <img
++        src={icon}
++        alt=""
++        data-testid="mcp-service-icon"
++        className="size-4 shrink-0 object-contain"
++      />
++    );
++  }
++  return <PlugIcon className="size-4 shrink-0 text-muted-foreground" />;
++}
++
+ function ServiceConnection({
+   service,
+   onChanged,
+@@ -310,7 +336,7 @@ export function McpRegistryPicker({
+             <li key={service.id} className="px-3 py-1.5">
+               <label className="flex items-center gap-3" title={service.description}>
+                 <span className="flex min-w-0 flex-1 items-center gap-2">
+-                  <PlugIcon className="size-4 shrink-0 text-muted-foreground" />
++                  <RegistryServiceIcon icon={service.icon} />
+                   <span className="min-w-0">
+                     <span className="block truncate text-sm text-foreground">{service.title}</span>
+                     <span
+diff --git a/web/src/lib/mcpRegistry.ts b/web/src/lib/mcpRegistry.ts
+index f1e4579ede424636188408280ef5a9ee651bfba8..ea9e163c8591eb820e505eb9c0c3db3fb2b1b9d5 100644
+--- a/web/src/lib/mcpRegistry.ts
++++ b/web/src/lib/mcpRegistry.ts
+@@ -6,6 +6,8 @@ export interface RegistryService {
+   id: string;
+   title: string;
+   description: string;
++  /** Base64 `data:image/svg+xml` or `data:image/png` URI; absent falls back to the plug. */
++  icon?: string | null;
+   auth: "none" | "bearer" | "oauth" | "github" | "databricks";
+   connected: boolean;
+   tools: string[];

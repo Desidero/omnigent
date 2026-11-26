@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 24 Nov 2026 18:06:15 +0000
+Subject: [PATCH] fix(deploy): pass the Databricks feature list by environment
+
+deploy.py handed the --features list to the bundle as
+`--var features=<list>`. The Databricks CLI splits --var values on
+commas, so the documented comma-separated usage failed as soon as a
+deploy named more than one feature:
+
+    Error: unexpected flag value for variable assignment: automations_v2
+
+The bind, deploy and run commands now go through one helper that gives
+the child process BUNDLE_VAR_features, which the CLI takes verbatim, and
+the --var pair is gone. The deploy's own environment is not changed.
+
+Not checked against a live workspace here; the environment form was used
+for multi-feature deploys with Databricks CLI v1.26.0 before this
+rewrite (https://github.com/Desidero/omnigent/issues/20).
+
+Not upstream yet: not proposed, and there is no contribution branch for
+it; drop this copy once upstream fixes the same bug.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Docs: none (fix: the documented --features list now deploys; deploy/databricks/README.md notes the variable for manual bundle runs)
+---
+ deploy/databricks/README.md                   |   5 +
+ deploy/databricks/databricks.yml              |   3 +-
+ deploy/databricks/deploy.py                   | 105 +++++++++---------
+ .../deploy/test_databricks_empty_features.py  |  78 +++++++++++--
+ 4 files changed, 128 insertions(+), 63 deletions(-)
+
+diff --git a/deploy/databricks/README.md b/deploy/databricks/README.md
+index 458620611979898ddb6caf365e5314909a4d4355..f4e665e23c31a96abbb995a6c164ee7052853a84 100644
+--- a/deploy/databricks/README.md
++++ b/deploy/databricks/README.md
+@@ -163,6 +163,11 @@ after the redeploy:
+ The Canvas page is off by default; include `canvas` in `--features` for the
+ apps that should show it.
+ 
++`deploy.py` hands the list to the bundle as the `BUNDLE_VAR_features`
++environment variable rather than as a `--var` pair, because the Databricks CLI
++splits `--var` values on commas. Set it the same way when you run
++`databricks bundle` by hand.
++
+ See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
+ inventory and rollback procedure. Runner overrides such as `-claude_osc_status`
+ also need to be set on separately running hosts; restart their host/runners
+diff --git a/deploy/databricks/databricks.yml b/deploy/databricks/databricks.yml
+index 64b06c472389add4c3b205902ddb8761c6b46777..5fc3448268e55fa624ab7eb5db1b08717c328790 100644
+--- a/deploy/databricks/databricks.yml
++++ b/deploy/databricks/databricks.yml
+@@ -2,7 +2,8 @@
+ #
+ # Every knob the app exposes lives here. deploy.py wraps `databricks
+ # bundle deploy` + `bundle run`; per-app values are passed as `--var`
+-# pairs (see deploy.py / README.md).
++# pairs, and `features` as BUNDLE_VAR_features because the CLI splits
++# `--var` values on commas (see deploy.py / README.md).
+ 
+ bundle:
+   name: omnigent
+diff --git a/deploy/databricks/deploy.py b/deploy/databricks/deploy.py
+index 54d597419a3f941b04621b1186d8f7c062db488e..8e6a00cc5e23b3d102e7e2b4e4e2593fcfea9637 100644
+--- a/deploy/databricks/deploy.py
++++ b/deploy/databricks/deploy.py
+@@ -34,7 +34,7 @@ import time
+ from collections.abc import Iterable
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Any
+ 
+ from packaging.version import InvalidVersion, Version
+ 
+@@ -970,21 +970,10 @@ def _ensure_bound(args: argparse.Namespace) -> None:
+         return
+ 
+     _log(f"binding bundle resource {_BUNDLE_RESOURCE_KEY!r} → app {args.app_name!r}")
+-    result = subprocess.run(
+-        [
+-            "databricks",
+-            "bundle",
+-            "deployment",
+-            "bind",
+-            _BUNDLE_RESOURCE_KEY,
+-            args.app_name,
+-            "--target",
+-            args.target,
+-            "--auto-approve",
+-            *_profile_arg(args),
+-            *_bundle_vars(args),
+-        ],
+-        cwd=_deploy_dir(),
++    result = _run_bundle(
++        args,
++        ["deployment", "bind", _BUNDLE_RESOURCE_KEY, args.app_name],
++        ["--auto-approve"],
+         capture_output=True,
+         text=True,
+     )
+@@ -1033,11 +1022,10 @@ def _ensure_compute_size(
+ 
+ 
+ def _bundle_vars(args: argparse.Namespace) -> list[str]:
+-    """CLI args to pass to `databricks bundle` as --var pairs."""
+-    # The Apps API rejects an environment entry with an empty source. A single
+-    # space is trimmed by the feature parser and therefore preserves the
+-    # documented "no features" behavior while providing a valid value source.
+-    features = args.features if args.features.strip() else " "
++    """CLI args to pass to `databricks bundle` as --var pairs.
++
++    ``features`` is not among them: see :func:`_bundle_env`.
++    """
+     return [
+         "--var",
+         f"app_name={args.app_name}",
+@@ -1049,11 +1037,53 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
+         f"volume_name={args.volume_name}",
+         "--var",
+         f"otel_table_schema={args.otel_table_schema}",
+-        "--var",
+-        f"features={features}",
+     ]
+ 
+ 
++def _bundle_env(args: argparse.Namespace) -> dict[str, str]:
++    """Environment for `databricks bundle`, carrying the ``features`` variable.
++
++    The CLI splits ``--var`` values on commas, so a list of features cannot go
++    through ``--var``; ``BUNDLE_VAR_<name>`` takes the value verbatim.
++    """
++    # The Apps API rejects an environment entry with an empty source. A single
++    # space is trimmed by the feature parser and therefore preserves the
++    # documented "no features" behavior while providing a valid value source.
++    features = args.features if args.features.strip() else " "
++    return {**os.environ, "BUNDLE_VAR_features": features}
++
++
++def _run_bundle(
++    args: argparse.Namespace,
++    command: list[str],
++    options: Iterable[str] = (),
++    **run_kwargs: Any,
++) -> subprocess.CompletedProcess:
++    """Run one `databricks bundle` command against the deploy's target.
++
++    :param command: Words after ``databricks bundle``, e.g. ``["deploy"]`` or
++        ``["run", "omnigent"]``.
++    :param options: Extra options placed after ``--target``, e.g.
++        ``["--auto-approve"]``.
++    :param run_kwargs: Passed to :func:`subprocess.run`, e.g. ``check=True``.
++    """
++    return subprocess.run(
++        [
++            "databricks",
++            "bundle",
++            *command,
++            "--target",
++            args.target,
++            *options,
++            *_profile_arg(args),
++            *_bundle_vars(args),
++        ],
++        cwd=_deploy_dir(),
++        env=_bundle_env(args),
++        **run_kwargs,
++    )
++
++
+ def _profile_arg(args: argparse.Namespace) -> list[str]:
+     return ["--profile", args.profile] if args.profile else []
+ 
+@@ -1238,37 +1268,12 @@ def main() -> int:
+     # 5) databricks bundle deploy --target <target> (syncs src/ to the
+     # bundle workspace folder and creates/updates the app resource).
+     _log(f"databricks bundle deploy --target {args.target}")
+-    subprocess.run(
+-        [
+-            "databricks",
+-            "bundle",
+-            "deploy",
+-            "--target",
+-            args.target,
+-            *_profile_arg(args),
+-            *_bundle_vars(args),
+-        ],
+-        cwd=_deploy_dir(),
+-        check=True,
+-    )
++    _run_bundle(args, ["deploy"], check=True)
+ 
+     # 5) databricks bundle run <key> --target <target> (starts/restarts
+     # the app with the just-deployed source).
+     _log(f"databricks bundle run {_BUNDLE_RESOURCE_KEY} --target {args.target}")
+-    subprocess.run(
+-        [
+-            "databricks",
+-            "bundle",
+-            "run",
+-            _BUNDLE_RESOURCE_KEY,
+-            "--target",
+-            args.target,
+-            *_profile_arg(args),
+-            *_bundle_vars(args),
+-        ],
+-        cwd=_deploy_dir(),
+-        check=True,
+-    )
++    _run_bundle(args, ["run", _BUNDLE_RESOURCE_KEY], check=True)
+ 
+     # 6) Resolve URL + smoke-check.
+     app = wc.apps.get(name=args.app_name)
+diff --git a/tests/deploy/test_databricks_empty_features.py b/tests/deploy/test_databricks_empty_features.py
+index e2d75a5c56e6aea4cf3c5426be3f6482ee8851b4..3a2330c29c36f57bc9ca6bd367679c3c190f537b 100644
+--- a/tests/deploy/test_databricks_empty_features.py
++++ b/tests/deploy/test_databricks_empty_features.py
+@@ -3,10 +3,13 @@
+ from __future__ import annotations
+ 
+ import importlib.util
++import os
++import subprocess
+ import sys
+ from argparse import Namespace
+ from pathlib import Path
+ from types import ModuleType
++from typing import Any
+ 
+ import pytest
+ 
+@@ -24,6 +27,19 @@ def deploy_mod() -> ModuleType:
+     return module
+ 
+ 
++def _args(features: str) -> Namespace:
++    return Namespace(
++        app_name="omnigent",
++        lakebase_branch="projects/omnigent/branches/production",
++        lakebase_database="projects/omnigent/branches/production/databases/databricks-postgres",
++        volume_name="main.omnigent.artifacts",
++        otel_table_schema="main.omnigent_logs",
++        features=features,
++        target="prod",
++        profile=None,
++    )
++
++
+ @pytest.mark.parametrize(
+     ("features", "expected"),
+     [
+@@ -32,18 +48,56 @@ def deploy_mod() -> ModuleType:
+         ("usage_page,harness_install", "usage_page,harness_install"),
+     ],
+ )
+-def test_bundle_vars_provide_a_valid_empty_feature_source(
+-    deploy_mod: ModuleType, features: str, expected: str
++def test_bundle_env_provides_a_valid_feature_source(
++    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch, features: str, expected: str
+ ) -> None:
+-    args = Namespace(
+-        app_name="omnigent",
+-        lakebase_branch="projects/omnigent/branches/production",
+-        lakebase_database="projects/omnigent/branches/production/databases/databricks-postgres",
+-        volume_name="main.omnigent.artifacts",
+-        otel_table_schema="main.omnigent_logs",
+-        features=features,
+-    )
++    monkeypatch.delenv("BUNDLE_VAR_features", raising=False)
++
++    env = deploy_mod._bundle_env(_args(features))
++
++    assert env["BUNDLE_VAR_features"] == expected
++    # The deploy's own environment is left alone; only the child sees the value.
++    assert "BUNDLE_VAR_features" not in os.environ
++    assert env["PATH"] == os.environ["PATH"]
++
++
++def test_feature_list_never_travels_as_a_var_pair(deploy_mod: ModuleType) -> None:
++    """The CLI splits ``--var`` values on commas, which breaks a feature list."""
++    values = deploy_mod._bundle_vars(_args("usage_page,harness_install"))
++
++    assert not any(value.startswith("features=") for value in values)
++    assert not any("," in value for value in values)
++
++
++@pytest.mark.parametrize(
++    ("command", "options"),
++    [
++        (["deployment", "bind", "omnigent", "omnigent"], ["--auto-approve"]),
++        (["deploy"], []),
++        (["run", "omnigent"], []),
++    ],
++)
++def test_every_bundle_command_gets_the_features_by_environment(
++    deploy_mod: ModuleType,
++    monkeypatch: pytest.MonkeyPatch,
++    command: list[str],
++    options: list[str],
++) -> None:
++    calls: list[tuple[list[str], dict[str, Any]]] = []
++
++    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
++        calls.append((cmd, kwargs))
++        return subprocess.CompletedProcess(cmd, 0)
++
++    monkeypatch.setattr(deploy_mod.subprocess, "run", fake_run)
+ 
+-    values = deploy_mod._bundle_vars(args)
++    deploy_mod._run_bundle(_args("usage_page,canvas,-chat"), command, options, check=True)
+ 
+-    assert values[-2:] == ["--var", f"features={expected}"]
++    ((cmd, kwargs),) = calls
++    assert cmd[: 2 + len(command)] == ["databricks", "bundle", *command]
++    assert cmd[2 + len(command) :][:2] == ["--target", "prod"]
++    assert all(option in cmd for option in options)
++    assert not any("features" in part for part in cmd)
++    assert kwargs["env"]["BUNDLE_VAR_features"] == "usage_page,canvas,-chat"
++    assert kwargs["cwd"] == deploy_mod._deploy_dir()
++    assert kwargs["check"] is True

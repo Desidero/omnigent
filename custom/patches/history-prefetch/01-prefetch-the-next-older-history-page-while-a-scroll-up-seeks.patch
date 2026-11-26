@@ -1,0 +1,551 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 24 Nov 2026 18:06:51 +0000
+Subject: [PATCH] perf(web): prefetch the next older history page while a
+ scroll-up seeks
+
+Older history only goes on the wire once the loader decides to land a
+page, and on touch that decision waits for the fling to settle, so the
+reader stops at the top and waits a full round trip for every page. Even
+with 100-item pages, a slow link still leaves the reader parked at the top
+for part of the way back.
+
+The history loader now fetches the next older page as soon as a seeking
+gesture brings the pane within the load threshold, ahead of the landing
+decision; `loadMoreHistory` then lands the prefetched page from memory.
+One page per cursor is ever in flight, a failed prefetch is forgotten so
+the reader's own request retries it, and the page is dropped with its
+conversation. A downward gesture, a new history window or the pane's own
+movement never prefetches.
+
+The per-gesture chaining budget is now counted in items (600, the bound
+the 30 x 20-item budget gave) rather than pages, so a larger scroll-up
+page does not multiply how much one gesture can page in with the
+reader's hands off: with 100-item pages, 30 pages would be 3,000 items.
+
+The larger scroll-up page this patch used to carry is upstream now (100
+items for every viewport), so only the prefetch and the item budget remain.
+
+Not upstream yet: proposed from fix/history-prefetch; drop this copy once it merges.
+
+Docs: none (performance: older history loads ahead of the scroll; no setting)
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ .../test_touch_drag_bounded_history_paging.py |  13 ++-
+ web/src/components/chat/chatBubbleParts.tsx   |  38 ++++--
+ web/src/pages/ChatPage.historyLoad.test.tsx   | 103 +++++++++++++++--
+ web/src/store/chatStore.test.ts               | 108 ++++++++++++++++++
+ web/src/store/chatStore.ts                    |  52 ++++++++-
+ 5 files changed, 283 insertions(+), 31 deletions(-)
+
+diff --git a/tests/e2e_ui/mobile/test_touch_drag_bounded_history_paging.py b/tests/e2e_ui/mobile/test_touch_drag_bounded_history_paging.py
+index d41f94eee422298e58520ed8bdb15e007c96e38f..01fcf8a09fc31093d11162d5c0ebc196b010e1b4 100644
+--- a/tests/e2e_ui/mobile/test_touch_drag_bounded_history_paging.py
++++ b/tests/e2e_ui/mobile/test_touch_drag_bounded_history_paging.py
+@@ -30,7 +30,7 @@ from tests.e2e_ui.conftest import seed_committed_items
+ # viewport, matching the report's surface.
+ _VIEWPORT = {"width": 390, "height": 844}
+ 
+-# Older real text turns above the window — many 20-item history pages remain.
++# Older real text turns above the window — more history pages remain.
+ _OLD_TURNS = 30
+ # Tool calls per giant settled turn. Two such turns (~1000 items) mirror the
+ # reported lengthy Otto session whose recent history is one huge tool chain.
+@@ -38,10 +38,11 @@ _CALLS_PER_BIG_TURN = 250
+ 
+ # One drag keeps paging while every page folds into the giant turn already on
+ # screen and stops at the first page that shows something new — bounded by the
+-# loader's per-gesture budget (a first page plus 30 chained) so it can never
+-# run through the whole transcript. The buggy build chained ~47 pages from one
+-# drag and kept going after a new row had appeared.
+-_MAX_PAGES_PER_GESTURE = 31
++# loader's per-gesture budget (a first page plus 600 items chained: six
++# 100-item pages) so it can never run through the whole transcript. The buggy
++# build chained ~47 pages from one drag and kept going after a new row had
++# appeared.
++_MAX_PAGES_PER_GESTURE = 7
+ 
+ # Paging is considered settled once no new /items request lands for this long.
+ _SETTLE_SECONDS = 3.0
+@@ -241,7 +242,7 @@ def test_one_touch_drag_loads_bounded_history(
+             f"first page that shows something new or at its budget"
+         )
+         # And it paged far enough to show the reader something new: the newest
+-        # giant turn alone is ~20 pages of folded tool calls above the opening
++        # giant turn alone is hundreds of folded tool-call items above the opening
+         # window, and the drag must carry through them to the turn before it.
+         expect(page.get_by_text("FINAL SUMMARY 0", exact=False)).to_be_attached()
+         # And the loading row must not still be churning after the settle.
+diff --git a/web/src/components/chat/chatBubbleParts.tsx b/web/src/components/chat/chatBubbleParts.tsx
+index 66b4025e73faeda3bfa18d99c54fbfb91f3c2809..cef26b0df843ea0343f4835bb52825bdcbe54dcd 100644
+--- a/web/src/components/chat/chatBubbleParts.tsx
++++ b/web/src/components/chat/chatBubbleParts.tsx
+@@ -99,7 +99,12 @@ import { forkFromResponseAvailability, userMessageLinkId } from "./messageAction
+ import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
+ import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
+ import { QueryClientContext } from "@tanstack/react-query";
+-import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
++import {
++  ApiError,
++  continueFailedTurn,
++  OLDER_HISTORY_PAGE_ITEMS,
++  retrySession,
++} from "@/lib/sessionsApi";
+ import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
+ import { conversationRegistry } from "@/store/conversationRegistry";
+ import { supersedePlanStop } from "@/store/planStops";
+@@ -1904,12 +1909,13 @@ const TOUCH_DRAG_SLOP_PX = 8;
+ const WHEEL_GESTURE_QUIET_MS = 300;
+ 
+ /**
+- * Pages one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
+- * may chain beyond its first while every page folds into a turn already on
+- * screen. One enormous turn would otherwise let a single gesture page in the
+- * whole transcript with the reader's hands off.
++ * Items one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
++ * may chain beyond its first page while every page folds into a turn already
++ * on screen. One enormous turn would otherwise let a single gesture page in
++ * the whole transcript with the reader's hands off.
+  */
+-const SEEK_PAGES_PER_GESTURE = 30;
++export const SEEK_ITEMS_PER_GESTURE = 600;
++const SEEK_PAGES_PER_GESTURE = Math.ceil(SEEK_ITEMS_PER_GESTURE / OLDER_HISTORY_PAGE_ITEMS);
+ 
+ /**
+  * Quiet time after the last scroll event before a touch-armed page may land.
+@@ -1991,6 +1997,11 @@ export function HistoryAutoLoader({
+   // later one — chained or from a further tick of the same gesture — spends
+   // the budget, even after a page that added a row ended the seek.
+   const gestureFetchedRef = useRef(false);
++  // Whether the gesture in hand is still asking for older history. While it
++  // is, the next page is fetched as soon as the pane comes within the load
++  // threshold, so the landing — which may wait for the pane to settle, or for
++  // the reader's next tick — comes from memory rather than the network.
++  const prefetchArmedRef = useRef(false);
+ 
+   // Position across a prepend is held by the transcript (VirtualBubbleList), not
+   // by this component. Writing scrollTop here instead used to interrupt the
+@@ -2001,6 +2012,7 @@ export function HistoryAutoLoader({
+     const noteUpwardGesture = (seekPages: number, viaTouch = false) => {
+       touchArmedRef.current = viaTouch;
+       scrolledUpRef.current = true;
++      prefetchArmedRef.current = true;
+       // A fresh gesture seeks from what is on screen now, with a fresh budget.
+       seekBaseRowsRef.current = null;
+       seekPagesLeftRef.current = seekPages;
+@@ -2011,6 +2023,7 @@ export function HistoryAutoLoader({
+     // lands, but nothing chains after it.
+     const noteDownwardGesture = () => {
+       scrolledUpRef.current = false;
++      prefetchArmedRef.current = false;
+       seekBaseRowsRef.current = null;
+     };
+     // Scroll movement alone is never intent: the virtualizer, the bottom lock,
+@@ -2033,6 +2046,7 @@ export function HistoryAutoLoader({
+         return;
+       }
+       scrolledUpRef.current = true;
++      prefetchArmedRef.current = true;
+       setScrollRevision((revision) => revision + 1);
+     };
+     // The transcript draws its own scrollbar; a thumb drag reports its direction
+@@ -2142,6 +2156,7 @@ export function HistoryAutoLoader({
+       generationRef.current = historyGeneration;
+       // A new window is a new open: require a fresh gesture, with a fresh budget.
+       scrolledUpRef.current = false;
++      prefetchArmedRef.current = false;
+       seekBaseRowsRef.current = null;
+       seekPagesLeftRef.current = SEEK_PAGES_PER_GESTURE;
+       gestureFetchedRef.current = false;
+@@ -2149,15 +2164,14 @@ export function HistoryAutoLoader({
+     }
+ 
+     const state = useChatStore.getState();
+-    if (
+-      !state.oldestItemId ||
+-      !state.hasMoreHistory ||
+-      state.loadingMoreHistory ||
+-      !(itemsChanged || scrollPositionChanged)
+-    ) {
++    if (!state.oldestItemId || !state.hasMoreHistory || !(itemsChanged || scrollPositionChanged)) {
+       return;
+     }
+     if (el.scrollTop >= historyLoadThreshold(el)) return;
++    // The gesture is still seeking and the pane is within the threshold: get
++    // the next page on the wire now, ahead of the landing decided below.
++    if (prefetchArmedRef.current) state.prefetchMoreHistory();
++    if (state.loadingMoreHistory) return;
+     // A finger-armed request waits while the pane is still moving, so the page
+     // cannot land mid-fling. A pane that has been still for the settle window
+     // fetches at once — a slow drag that stopped at the top has no momentum to
+diff --git a/web/src/pages/ChatPage.historyLoad.test.tsx b/web/src/pages/ChatPage.historyLoad.test.tsx
+index 80eecd2298753b03bd6a8a2fbbce05a0869dad35..517c09ad3fb357acef4092071073af6673037184 100644
+--- a/web/src/pages/ChatPage.historyLoad.test.tsx
++++ b/web/src/pages/ChatPage.historyLoad.test.tsx
+@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
+ import { Profiler, useEffect, useState } from "react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { UserMessageBlock } from "@/lib/blocks";
++import { SEEK_ITEMS_PER_GESTURE } from "@/components/chat/chatBubbleParts";
++import { OLDER_HISTORY_PAGE_ITEMS } from "@/lib/sessionsApi";
+ import { TRANSCRIPT_SCROLLBAR_DRAG_EVENT } from "@/pages/TranscriptScrollbar";
+ import { useChatStore } from "@/store/chatStore";
+ import {
+@@ -25,6 +27,7 @@ vi.mock("use-stick-to-bottom", () => ({
+ }));
+ 
+ const originalLoadMoreHistory = useChatStore.getState().loadMoreHistory;
++const originalPrefetchMoreHistory = useChatStore.getState().prefetchMoreHistory;
+ 
+ function userBlock(id: string, text = id): UserMessageBlock {
+   return {
+@@ -405,12 +408,17 @@ describe("HistoryAutoLoader", () => {
+       loadingMoreHistory: false,
+       oldestItemId: "item_2",
+       historyGeneration: 0,
++      // A seeking gesture also prefetches; keep that off the network here.
++      prefetchMoreHistory: vi.fn(),
+     });
+   });
+ 
+   afterEach(() => {
+     cleanup();
+-    useChatStore.setState({ loadMoreHistory: originalLoadMoreHistory });
++    useChatStore.setState({
++      loadMoreHistory: originalLoadMoreHistory,
++      prefetchMoreHistory: originalPrefetchMoreHistory,
++    });
+     vi.unstubAllGlobals();
+     vi.useRealTimers();
+   });
+@@ -1027,14 +1035,88 @@ describe("HistoryAutoLoader", () => {
+       stalled = loadMoreHistory.mock.calls.length === before;
+     }
+     expect(stalled).toBe(true);
+-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
+-    expect(loadMoreHistory.mock.calls.length).toBeGreaterThan(10);
++    // The gesture's first page is free; the item budget bounds the chained ones.
++    const chainedPages = Math.ceil(SEEK_ITEMS_PER_GESTURE / OLDER_HISTORY_PAGE_ITEMS);
++    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 1);
+ 
+     // The next flick, after a quiet gap, is a new gesture and continues from there.
+     now += 1000;
+     fireEvent.wheel(scrollRoot, { deltaY: -120 });
+     nowSpy.mockRestore();
+-    expect(loadMoreHistory.mock.calls.length).toBe(32);
++    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 2);
++  });
++
++  it("prefetches the page a finger-armed request is waiting to land", () => {
++    // The landing waits for the pane to settle (see the hold tests); the page
++    // itself need not — by the time the pane is still it is in memory.
++    let now = 1000;
++    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
++    const loadMoreHistory = vi.fn(async () => {
++      useChatStore.setState({ loadingMoreHistory: true });
++    });
++    const prefetchMoreHistory = vi.fn();
++    useChatStore.setState({
++      hasMoreHistory: true,
++      oldestItemId: "item_50",
++      loadMoreHistory,
++      prefetchMoreHistory,
++    });
++    const scrollRoot = document.createElement("div");
++    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
++    stickContext.scrollRef.current = scrollRoot;
++
++    render(<HistoryAutoLoader rowCount={1} />);
++    // The open alone asks for nothing.
++    expect(prefetchMoreHistory).not.toHaveBeenCalled();
++
++    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
++    fireEvent.scroll(scrollRoot);
++    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
++    // Still moving: the landing is held, but the page is already on the wire.
++    expect(prefetchMoreHistory).toHaveBeenCalled();
++    expect(loadMoreHistory).not.toHaveBeenCalled();
++
++    now += 200;
++    act(() => {
++      vi.advanceTimersByTime(200);
++    });
++    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
++
++    // The page lands with the pane still near the top: the one after it is
++    // fetched ahead of the gesture's next page.
++    prefetchMoreHistory.mockClear();
++    act(() => {
++      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_40" });
++    });
++    expect(prefetchMoreHistory).toHaveBeenCalled();
++    nowSpy.mockRestore();
++  });
++
++  it("prefetches only for a gesture that asked for older history", () => {
++    const loadMoreHistory = vi.fn(async () => {});
++    const prefetchMoreHistory = vi.fn();
++    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory, prefetchMoreHistory });
++    const scrollRoot = document.createElement("div");
++    const metrics = { scrollTop: 300, scrollHeight: 4000, clientHeight: 800 };
++    setScrollMetrics(scrollRoot, metrics);
++    stickContext.scrollRef.current = scrollRoot;
++
++    render(<HistoryAutoLoader rowCount={1} />);
++    // The pane moving near the top on its own is not a request.
++    fireEvent.scroll(scrollRoot);
++    expect(prefetchMoreHistory).not.toHaveBeenCalled();
++
++    // A wheel-up inside the threshold asks: the page is fetched and landed.
++    fireEvent.wheel(scrollRoot, { deltaY: -120 });
++    expect(prefetchMoreHistory).toHaveBeenCalledTimes(1);
++    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
++
++    // Wheeling back down withdraws: later movement near the top prefetches nothing.
++    prefetchMoreHistory.mockClear();
++    fireEvent.wheel(scrollRoot, { deltaY: 120 });
++    metrics.scrollTop = 200;
++    fireEvent.scroll(scrollRoot);
++    expect(prefetchMoreHistory).not.toHaveBeenCalled();
+   });
+ 
+   it("ignores a wheel-down, which is not a request for older history", () => {
+@@ -1125,8 +1207,11 @@ describe("HistoryAutoLoader", () => {
+     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+ 
+     // Page after page folds into the turn already on screen and shows the
+-    // reader nothing; each settle asks for the next.
+-    for (const cursor of ["item_49", "item_48", "item_47", "item_46", "item_45"]) {
++    // reader nothing; each settle asks for the next. Stop one page short of
++    // the gesture's budget so the row, not the budget, ends the seek.
++    const chainedPages = Math.ceil(SEEK_ITEMS_PER_GESTURE / OLDER_HISTORY_PAGE_ITEMS);
++    const cursors = Array.from({ length: chainedPages - 1 }, (_, index) => `item_${49 - index}`);
++    for (const cursor of cursors) {
+       const before = loadMoreHistory.mock.calls.length;
+       act(() => {
+         useChatStore.setState({ loadingMoreHistory: false, oldestItemId: cursor });
+@@ -1141,7 +1226,7 @@ describe("HistoryAutoLoader", () => {
+     // standalone, the store notification renders on its own, so the row first.
+     rerender(<HistoryAutoLoader rowCount={2} />);
+     act(() => {
+-      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_44" });
++      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_10" });
+     });
+     expect(loadMoreHistory).toHaveBeenCalledTimes(before);
+   });
+@@ -1283,8 +1368,8 @@ describe("HistoryAutoLoader", () => {
+       stalled = loadMoreHistory.mock.calls.length === before;
+     }
+     expect(stalled).toBe(true);
+-    expect(loadMoreHistory.mock.calls.length).toBeGreaterThan(10);
+-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
++    const chainedPages = Math.ceil(SEEK_ITEMS_PER_GESTURE / OLDER_HISTORY_PAGE_ITEMS);
++    expect(loadMoreHistory.mock.calls.length).toBe(chainedPages + 1);
+   });
+ 
+   it("resumes seeking on the reader's next gesture", () => {
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 78596a25ac73fa39f8aedab09d6c8a3fd2bf165e..888f5b3a815e1670f455cd1f8ebe1b6deca1c19f 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -2434,6 +2434,114 @@ describe("chatStore — switchTo", () => {
+     ]);
+   });
+ 
++  it("lands a prefetched page from memory and never fetches the same cursor twice", async () => {
++    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS + 5;
++    const items = Array.from({ length: total }, (_, idx) =>
++      userMessage(`pf_${idx.toString().padStart(4, "0")}`, `pf ${idx}`),
++    );
++    seedSession("conv_pf", items);
++    await useChatStore.getState().switchTo("conv_pf");
++    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
++    const olderPageRequests = () =>
++      fetchMock.mock.calls.filter(([u]) =>
++        /\/v1\/sessions\/conv_pf\/items\?.*after=/.test(String(u)),
++      );
++
++    // The loader asks on every re-evaluation; one page per cursor goes on the wire.
++    useChatStore.getState().prefetchMoreHistory();
++    useChatStore.getState().prefetchMoreHistory();
++    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(1));
++    // A prefetch is not a prepend: nothing lands and no loading row shows.
++    expect(useChatStore.getState().blocks).toHaveLength(INITIAL_WINDOW_ITEMS);
++    expect(useChatStore.getState().loadingMoreHistory).toBe(false);
++
++    await useChatStore.getState().loadMoreHistory();
++    expect(olderPageRequests()).toHaveLength(1);
++    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
++      ...items.slice(5, 5 + OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
++      ...windowIds,
++    ]);
++    expect(useChatStore.getState().hasMoreHistory).toBe(true);
++
++    // The cursor moved on, so the next prefetch is a new page.
++    useChatStore.getState().prefetchMoreHistory();
++    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(2));
++  });
++
++  it("refetches an older page whose prefetch failed when the reader asks for it", async () => {
++    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS;
++    const items = Array.from({ length: total }, (_, idx) =>
++      userMessage(`pff_${idx.toString().padStart(4, "0")}`, `pff ${idx}`),
++    );
++    seedSession("conv_pff", items);
++    await useChatStore.getState().switchTo("conv_pff");
++    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
++
++    let failed = false;
++    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === "string" ? input : input.toString();
++      if (/\/v1\/sessions\/conv_pff\/items\?.*after=/.test(url) && !failed) {
++        failed = true;
++        return Promise.reject(new TypeError("network down"));
++      }
++      return defaultFetchHandler(input, init);
++    });
++
++    useChatStore.getState().prefetchMoreHistory();
++    await vi.waitFor(() => expect(failed).toBe(true));
++    // The rejection settles within the task it arrives in; let that task end.
++    await new Promise<void>((resolve) => {
++      setTimeout(resolve, 0);
++    });
++    // A failed prefetch is silent: scroll-up stays armed rather than disabled.
++    expect(useChatStore.getState().hasMoreHistory).toBe(true);
++
++    await useChatStore.getState().loadMoreHistory();
++    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
++      ...items.slice(0, OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
++      ...windowIds,
++    ]);
++    expect(useChatStore.getState().hasMoreHistory).toBe(false);
++  });
++
++  it("does not prefetch while a page is in flight or once history is exhausted", async () => {
++    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS;
++    const items = Array.from({ length: total }, (_, idx) =>
++      userMessage(`pfx_${idx.toString().padStart(4, "0")}`, `pfx ${idx}`),
++    );
++    seedSession("conv_pfx", items);
++    await useChatStore.getState().switchTo("conv_pfx");
++    const olderPageRequests = () =>
++      fetchMock.mock.calls.filter(([u]) =>
++        /\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(String(u)),
++      );
++
++    let releasePage: (() => void) | null = null;
++    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === "string" ? input : input.toString();
++      if (/\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(url) && releasePage === null) {
++        return new Promise<Response>((resolve) => {
++          releasePage = () => resolve(defaultFetchHandler(input, init));
++        });
++      }
++      return defaultFetchHandler(input, init);
++    });
++
++    const page = useChatStore.getState().loadMoreHistory();
++    await vi.waitFor(() => expect(releasePage).not.toBeNull());
++    // The page in flight is the one a prefetch would fetch.
++    useChatStore.getState().prefetchMoreHistory();
++    await Promise.resolve();
++    expect(olderPageRequests()).toHaveLength(1);
++
++    releasePage!();
++    await page;
++    expect(useChatStore.getState().hasMoreHistory).toBe(false);
++    useChatStore.getState().prefetchMoreHistory();
++    await Promise.resolve();
++    expect(olderPageRequests()).toHaveLength(1);
++  });
++
+   it("keeps each conversation's own effort across a warm A→B→A switch", async () => {
+     // `sessionReasoningEffort` is a single app-global sticky pick, so it cannot answer
+     // "what is THIS conversation at" once a warm switch skips hydration: cold
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 1c77fe0527f97dd60bb5bdeb72de155e28ad5217..7c4ba1f6e24a87a4b5fccbc17a64fd91e7994bd9 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -1552,6 +1552,13 @@ export interface ChatActions {
+    * or there is no active conversation / oldest-item cursor yet.
+    */
+   loadMoreHistory: (sessionId?: string) => Promise<void>;
++  /**
++   * Start fetching the next older page without prepending it, so the
++   * `loadMoreHistory` that follows lands it from memory. One page per
++   * conversation, keyed by the cursor it was fetched for; a repeat call for
++   * the same cursor, or while a page is in flight, is a no-op.
++   */
++  prefetchMoreHistory: (sessionId?: string) => void;
+   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
+   flashUserMessage: (itemId: string) => void;
+   /** Queue an "@"-mention chip into the active composer from outside it. */
+@@ -1624,6 +1631,21 @@ conversationRegistry.subscribeDisposed((id) => {
+   streamTurnEdgeRevisions.delete(id);
+ });
+ 
++// The older page `prefetchMoreHistory` has in flight or ready per conversation,
++// consumed by the `loadMoreHistory` that asks for the same cursor.
++const prefetchedHistoryPages = new Map<
++  string,
++  { cursor: string; page: Promise<SessionItemsPage> }
++>();
++conversationRegistry.subscribeDisposed((id) => prefetchedHistoryPages.delete(id));
++
++function fetchOlderHistoryPage(conversationId: string, cursor: string): Promise<SessionItemsPage> {
++  return fetchSessionItemsPage(conversationId, {
++    olderThan: cursor,
++    limit: OLDER_HISTORY_PAGE_ITEMS,
++  });
++}
++
+ // Reconnects share a binding; only one usage request may hydrate it at a time.
+ const sessionUsageHydrations = new WeakSet<AbortController>();
+ // An entry's latest first usage read: only it clears `sessionUsageLoading`. Once a read
+@@ -4481,10 +4503,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+       (setterForState(conversationId)?.historyGeneration ?? historyGeneration) !==
+         historyGeneration;
+     try {
+-      const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
+-        olderThan: oldestItemId,
+-        limit: OLDER_HISTORY_PAGE_ITEMS,
+-      });
++      const prefetched = prefetchedHistoryPages.get(conversationId);
++      prefetchedHistoryPages.delete(conversationId);
++      const { items, hasMore } = await (prefetched?.cursor === oldestItemId
++        ? prefetched.page
++        : fetchOlderHistoryPage(conversationId, oldestItemId));
+       if (stale()) return;
+       const newBlocks = itemsToBlocks(items);
+       pageSet((state) => {
+@@ -4513,6 +4536,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
+     }
+   },
++
++  prefetchMoreHistory: (sessionId) => {
++    const conversationId = sessionId ?? get().conversationId;
++    const conversation = sessionId ? conversationRegistry.peek(sessionId)?.getState() : get();
++    if (!conversation || !conversationId) return;
++    const { oldestItemId, loadingMoreHistory, hasMoreHistory } = conversation;
++    if (!oldestItemId || loadingMoreHistory || !hasMoreHistory) return;
++    if (prefetchedHistoryPages.get(conversationId)?.cursor === oldestItemId) return;
++    const entry = {
++      cursor: oldestItemId,
++      page: fetchOlderHistoryPage(conversationId, oldestItemId),
++    };
++    prefetchedHistoryPages.set(conversationId, entry);
++    // A failed prefetch is forgotten: the reader's own request refetches and
++    // reports the failure the usual way.
++    entry.page.catch(() => {
++      if (prefetchedHistoryPages.get(conversationId) === entry) {
++        prefetchedHistoryPages.delete(conversationId);
++      }
++    });
++  },
+ }));
+ 
+ // ── Store-action setter ──────────────────────────────────

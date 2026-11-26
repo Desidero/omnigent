@@ -587,6 +587,15 @@ request carries it, and the series holds a copy until it merges).
 | `tolerate-retired-preferences` | A stored shared preference of a kind this build doesn't know (one a parked or newer series saved) is skipped on read instead of failing every preferences read with a 500; the row stays stored. | proposed |
 | `link-rules` | Short references in chat (`BST-2135`, `#123`, `session:<id>`) render as links from per-user rules set in Settings → Chat links; agents can change them with `sys_link_rules`, each change approved, and are told the active syntaxes. While any rule is on, the rules replace upstream's built-in pull request links ([#14191](https://github.com/omnigent-ai/omnigent/pull/14191)). Needs `chat-item-labels`. | proposed (related issue [#11176](https://github.com/omnigent-ai/omnigent/issues/11176)) |
 | `antigravity-cooldown` | The `antigravity` extra locks `google-antigravity` 0.1.23 instead of 0.1.2 (the fixed-date cooldown exemption in `uv.toml` is gone), and the antigravity harness reads a turn's token usage from the conversation, where the newer SDK reports it. On a refresh conflict in `uv.lock`, re-lock with `uv lock --upgrade-package google-antigravity` instead of merging the hunk. | PR open ([#14704](https://github.com/omnigent-ai/omnigent/pull/14704), draft) |
+| `mcp-registry-icons` | A service in the MCP registry file can set `icon`, an embedded SVG or PNG data URI, shown in the managed MCP picker in place of the plug. A build without the series rejects the field, so upgrade the server before adding it. Docs in `examples/mcp-registry/README.md`. | not filed |
+| `deploy-features-list` | `deploy/databricks/deploy.py --features a,b` deploys: the list goes to the bundle as `BUNDLE_VAR_features` instead of a `--var` pair, which the Databricks CLI splits on commas. | not filed (fork issue [#20](https://github.com/Desidero/omnigent/issues/20)) |
+| `deploy-overlay` | `deploy.py --overlay <file>`: a Databricks Apps deployment's own workspace host, extras, env vars, secret-backed env vars and app-source files come from one untracked YAML file instead of hand edits to tracked files. | not filed (fork issue [#21](https://github.com/Desidero/omnigent/issues/21)) |
+| `kms-uc-service-credential` | The credential store's KMS backend can sign with a Unity Catalog service credential (`OMNIGENT_CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL`), so a server with no AWS identity, such as a Databricks App, needs no static keys or helper files. | not filed (fork issue [#22](https://github.com/Desidero/omnigent/issues/22)) |
+| `databricks-apps-docs` | Docs only: what a Databricks App needs after the first deploy (server config, smart routing, MCP registry, the per-user connection, sharing, hosts, telemetry). Needs `deploy-overlay` and `kms-uc-service-credential`. | not filed (fork issue [#17](https://github.com/Desidero/omnigent/issues/17)) |
+| `subagent-only-routing` | A Claude Code or Codex session keeps the model the user picked and lets Smart Routing choose the model of each sub-agent it starts: "Route sub-agents" in the new-session and session model menus, or `subagent_routing_override: "on"` at create. The host installs the routing gate at launch, so hosts need the build too. | issue open ([#14897](https://github.com/omnigent-ai/omnigent/issues/14897)) |
+| `transcript-hold-position` | Scrolled up in a transcript, the reader keeps their place while rows above change height (a reply streaming, a tool group settling, an image loading, rows measured during a scroll back): the transcript holds the row being read instead of leaving it to the virtual list's own correction. | proposed (the streaming re-key that first motivated it is fixed upstream by [#12923](https://github.com/omnigent-ai/omnigent/pull/12923)) |
+| `history-prefetch` | The next older page of history is fetched as soon as a scroll-up comes near the top, ahead of its landing; one gesture pages in at most 600 items. | PR open ([#13257](https://github.com/omnigent-ai/omnigent/pull/13257), draft; issue [#13255](https://github.com/omnigent-ai/omnigent/issues/13255); the larger page landed as [#13247](https://github.com/omnigent-ai/omnigent/pull/13247)) |
+| `lean-history-items` | History pages carry only the head of long tool outputs (`tool_output=preview`), and expanding a tool row fetches the full result from a per-item read; both reads are gzipped. Needs `history-prefetch`. | PR open ([#13259](https://github.com/omnigent-ai/omnigent/pull/13259), draft; issue [#13255](https://github.com/omnigent-ai/omnigent/issues/13255)) |
 
 ### Parked series
 
@@ -614,8 +623,6 @@ anything is wrong with it.
 | `new-chat-project-prompt` | optional |
 | `palette-new-chat-in-project` | optional |
 | `chat-features` | optional |
-| `lean-history-items` | optional |
-| `history-prefetch` | optional |
 
 To restore one, apply it from that commit onto the foundation it will have
 now (`BASE`, or the series it needs: what its `# needs:` lines named, less
