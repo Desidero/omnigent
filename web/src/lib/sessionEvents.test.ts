@@ -1864,6 +1864,24 @@ describe("session.journal.appended (FLAT envelope)", () => {
   });
 });
 
+describe("session.open_items.changed (FLAT envelope)", () => {
+  it("carries the session and the labels written", () => {
+    expect(
+      parse("session.open_items.changed", {
+        type: "session.open_items.changed",
+        conversation_id: "conv_abc",
+        labels: ["Q7", 3, "R1"],
+        open_count: 2,
+      }),
+    ).toEqual([
+      { type: "session_open_items_changed", conversationId: "conv_abc", labels: ["Q7", "R1"] },
+    ]);
+    expect(
+      parse("session.open_items.changed", { type: "session.open_items.changed", labels: [] }),
+    ).toEqual([]);
+  });
+});
+
 describe("session.changed_files.invalidated (FLAT envelope)", () => {
   it("lifts session id and defaults environment", () => {
     const out = parse("session.changed_files.invalidated", {

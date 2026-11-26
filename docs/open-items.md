@@ -90,6 +90,42 @@ item.
   A host whose Omnigent predates the group rejects an agent spec that names
   it, so set the key only once every host has it.
 
+## In the web UI
+
+Where the server stores open items (`GET /v1/info` reports `open_items: true`),
+the **Open items** section of the session header's panel (see
+[item labels](chat-item-labels.md#what-the-chat-shows)) lists the session's
+stored items, whether or not their messages are loaded in your browser, and
+stays current as the agent raises and closes them.
+
+- **One list:** each stored item shows its stored status. A label written in
+  the chat that the server does not hold is listed too, marked **chat only**,
+  with its state read from the chat as before. Pinned links stay under
+  **Links**.
+- **Chips:** a label's chips in the chat follow the stored status: a stored
+  item is closed exactly when the server says so, whatever the chat wrote, and
+  its popover shows the stored resolution when the chat never struck it.
+- **Groups:** items the latest reply mentions come first, then the open ones,
+  then **Answered** (you replied and the agent has not closed it yet), with
+  **Closed (N)** folded at the end. The badge counts open items: answered and
+  closed ones, chat-only items you dismissed and pinned links are left out.
+- **Details:** select an item to expand it: its detail, links, your latest
+  answers, how it was closed, and **Show in conversation** when a loaded
+  message has it. Its chip previews it where the chat raised it.
+- **Changes (edit access):** the ✕ on an open stored item closes it, recorded
+  as closed by a person with the resolution "Closed from the Open items panel";
+  expanded, you can write the resolution yourself, **Reopen** a closed item, or
+  **Set topic**. When the chat struck a label that is still open in the store,
+  the item is marked **closed in chat** and its details offer **Close** with
+  the chat's sentence as the resolution. The agent sees every change in
+  `sys_open_items_list`.
+- **Chat-only items** keep their dismiss button; dismissals are still stored
+  as the `omnigent.items_dismissed` session label, which is read for chat-only
+  items and never written for stored ones.
+
+On a server without open items the panel reads the chat alone, exactly as
+[item labels](chat-item-labels.md) describe.
+
 ## HTTP API
 
 | Route (under `/v1`) | Caller | Purpose |
@@ -108,8 +144,8 @@ when the server stores them. The request and response shapes are in
 
 Nothing is backfilled: items a session labelled in chat before stay chat
 labels. A server or host without this
-feature keeps working with text labels, and the web chips read the chat text
-as before. The items live in their own tables, apart from the main migration
+feature keeps working with text labels, and the web reads the chat text as
+before. The items live in their own tables, apart from the main migration
 chain (see [side stores](extending/side_schemas.md)): a build without the
 feature starts against a database that holds them and leaves them alone.
 Search runs over the session's items in the server, not in SQL, because a
