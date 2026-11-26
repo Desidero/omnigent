@@ -2,7 +2,9 @@ import { useContext, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { BookmarkIcon, ExternalLinkIcon, LinkIcon } from "lucide-react";
 import { ItemLabelPopover, itemLabelChipClass } from "@/components/blocks/ChatMarkdown";
-import { OpenItemsPanel, trackedItems, useOpenItemCount } from "@/components/chat/OpenItemsPanel";
+import { trackedItems } from "@/components/chat/OpenItemsPanel";
+import { SessionOpenItemsSection } from "@/components/chat/StoredOpenItemsPanel";
+import { useSessionItemsIndex, useSessionOpenItemCount } from "@/hooks/useStoredOpenItems";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -54,12 +56,12 @@ function LinkRow({ link, sessionId }: { link: SessionLink; sessionId: string | n
   );
 }
 
-/** The panel's two sections: the Open items tracker, then the session's links. */
+/** The panel's two sections: the open items (stored, or the chat's), then the session's links. */
 function SessionItemsPanel({ links }: { links: readonly SessionLink[] }) {
   const sessionId = useContext(ItemLabelSessionContext);
   return (
     <>
-      <OpenItemsPanel layout="section" />
+      <SessionOpenItemsSection />
       <section data-testid="session-links" aria-label="Links">
         <div className="flex items-center gap-2 px-3 py-2 text-ui font-medium">
           <LinkIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -96,9 +98,9 @@ export function SessionItemsButton({
   host: HTMLElement;
   links: readonly SessionLink[];
 }) {
-  const index = useContext(ItemLabelIndexContext);
+  const index = useSessionItemsIndex(useContext(ItemLabelIndexContext));
   const isMobile = useIsMobileViewport();
-  const openCount = useOpenItemCount();
+  const openCount = useSessionOpenItemCount();
   const [open, setOpen] = useState(false);
   // "Show in conversation" in an item's preview jumps to a message: get out of its way.
   const [searchParams] = useSearchParams();

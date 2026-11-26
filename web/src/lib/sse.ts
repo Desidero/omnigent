@@ -42,6 +42,7 @@ import type {
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
   SessionJournalAppendedEvent,
+  SessionOpenItemsChangedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -976,6 +977,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       entry: entry as JournalEntry,
     } satisfies SessionJournalAppendedEvent;
+  }
+  if (eventType === "session.open_items.changed") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const labels = Array.isArray(data.labels)
+      ? data.labels.filter((label): label is string => typeof label === "string")
+      : [];
+    return {
+      type: "session_open_items_changed",
+      conversationId,
+      labels,
+    } satisfies SessionOpenItemsChangedEvent;
   }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;

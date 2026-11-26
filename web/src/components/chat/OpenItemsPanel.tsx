@@ -101,7 +101,7 @@ export function useCollapseOnOutsidePress(enabled = true) {
  * written to the session's labels so they stay dismissed on every device. A
  * write in flight shows its own value so a dismiss takes effect at once.
  */
-function useDismissedItems(sessionId: string | null) {
+export function useDismissedItems(sessionId: string | null) {
   const { session } = useSession(sessionId);
   const update = useUpdateSessionLabels(sessionId);
   const pending = update.isPending ? update.variables?.[DISMISSED_ITEMS_LABEL_KEY] : undefined;
