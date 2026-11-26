@@ -102,10 +102,24 @@ stays current as the agent raises and closes them.
 - **Chips:** a stored item's label in the chat is its anchor: its chips
   follow the stored status (struck once the item is closed, whatever the chat
   wrote), and a plain or struck mention never changes the item.
-- **Groups:** items the latest reply mentions come first, then the open ones,
-  then **Answered** (you replied and the agent has not replied yet), with
-  **Closed (N)** folded at the end. The badge counts open items: answered and
-  closed ones, chat-only items you dismissed and pinned links are left out.
+- **Groups:** by default, items the latest reply mentions come first, then
+  **Open**, **Answered** (you replied and the agent has not replied yet) and
+  **Closed**, folded. **By topic** groups items under their topic (items
+  without one under **No topic**, last) and **By kind** under Questions,
+  Risks, Findings, Follow-ups and Other, open items first in each group. Each
+  group's heading folds it. The grouping is remembered in this browser. The
+  badge counts open items: answered and closed ones, chat-only items you
+  dismissed and pinned links are left out.
+- **Search and filters:** once the list holds five items or more, a search box
+  and one row of chips sit above it: **Open**, **Answered** and **Closed** with
+  their counts, the kinds present, and the topics in use (`#cache-rollout`).
+  The search matches every word you type in an item's label, title, detail or
+  topic; a chip keeps only its status, kind or topic, and selecting it again
+  clears it. Each count is what selecting that chip would list. Filtering runs
+  in the browser over the loaded list. A search shows every match, folded
+  groups included. On a phone the search stays at the top of the sheet and
+  the chips scroll sideways in one row. The search, chips and folds stay as
+  you left them when the panel closes, until the page reloads.
 - **Details:** select an item to expand it: its detail, links, its thread
   (your comments and the agent's replies, each once, in order), how it was
   closed (left out when the resolution only repeats the last reply), and
