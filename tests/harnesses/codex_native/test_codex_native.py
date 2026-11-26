@@ -34,7 +34,11 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.inner.native_attachments import attachment_cache_dir
-from omnigent.runtime.prompt import ITEM_LABEL_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import (
+    ITEM_LABEL_INSTRUCTION,
+    OPEN_ITEMS_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
@@ -9199,7 +9203,9 @@ def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> No
     result = codex_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Codex is running in the session terminal" in result
-    assert result.endswith(f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}")
+    assert result.endswith(
+        f"{WORKSPACE_IMAGE_INSTRUCTION}\n\n{ITEM_LABEL_INSTRUCTION}\n\n{OPEN_ITEMS_INSTRUCTION}"
+    )
 
 
 @pytest.mark.asyncio
@@ -9439,7 +9445,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
 
     assert captured.get("developer_instructions") is not None
     assert "Codex is running in the session terminal" in captured["developer_instructions"]
-    assert captured["developer_instructions"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
+    assert captured["developer_instructions"].endswith(f"\n\n{OPEN_ITEMS_INSTRUCTION}")
 
 
 def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
@@ -9522,7 +9528,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
 
     assert captured.get("developer_instructions") is not None
     assert "Codex is running in the session terminal" in captured["developer_instructions"]
-    assert captured["developer_instructions"].endswith(f"\n\n{ITEM_LABEL_INSTRUCTION}")
+    assert captured["developer_instructions"].endswith(f"\n\n{OPEN_ITEMS_INSTRUCTION}")
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,14 @@ its first attempt allocated. Two raises at once in one session never get the
 same label. Adopting a label from chat takes it only if no item has it, and
 moves counting past it.
 
+The framework instruction for item labels gains a part for these tools: record
+every item, pinned links included, with `sys_open_items_raise` before presenting
+it, with a topic, and write it with the returned label, never pick a number or
+write a new label without recording it, close with `sys_open_items_update` and a one-line resolution and then
+strike the label in chat, list instead of relying on memory, leave an item the
+user closed closed (one whose comment heading ends `(closed by me)` included)
+unless the user asks again, and label in chat only if the tools are missing.
+
 ### Which sessions get the tools
 
 - **SDK harnesses** get them with the turn's tools; **claude-native**,

@@ -1417,7 +1417,8 @@ feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox
 The `open_items` group keeps the session's questions, risks, findings,
 follow-ups and pinned links with labels the server allocates (see
 [Open items](open-items.md)); the runner drops it when the server does not
-store open items.
+store open items, and turning it off also drops the instruction's part about
+these tools.
 Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt, and
 disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see

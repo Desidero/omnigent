@@ -103,6 +103,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     ITEM_LABEL_INSTRUCTION,
+    OPEN_ITEMS_INSTRUCTION,
     WORKSPACE_IMAGE_INSTRUCTION,
 )
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
@@ -14597,6 +14598,7 @@ def _contract_composed_instructions(*parts: str) -> str:
             EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
             WORKSPACE_IMAGE_INSTRUCTION,
             ITEM_LABEL_INSTRUCTION,
+            OPEN_ITEMS_INSTRUCTION,
         )
     )
 
