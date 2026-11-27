@@ -323,6 +323,10 @@ _FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
     "sys_session_rename",
     "sys_scheduled_task_create",
     "sys_scheduled_task_update",
+    # Read and write only the calling session's own open items list.
+    "sys_open_items_raise",
+    "sys_open_items_update",
+    "sys_open_items_list",
 )
 
 #: Additionally pre-approved for an auto-harness Smart Routing session, whose
