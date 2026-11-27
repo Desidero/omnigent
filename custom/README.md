@@ -609,6 +609,9 @@ request carries it, and the series holds a copy until it merges).
 | `web-reconnect-shell-inputs` | A queued `!command` no longer stays stuck at the bottom of the chat after the connection drops. | PR open ([#11395](https://github.com/omnigent-ai/omnigent/pull/11395)) |
 | `chat-item-comments` | Comment on labelled items and send the comments together as one structured message. Needs `chat-item-labels`. | proposed |
 | `session-labels-ui` | View and edit a session's labels in the web UI, delete labels through the API, and default labels per project. | PR open ([#11398](https://github.com/omnigent-ai/omnigent/pull/11398) for the server, [#11399](https://github.com/omnigent-ai/omnigent/pull/11399) for the web UI (draft)) |
+| `palette-new-chat-in-project` | Typing in ⌘K lists a "New chat in <project>" row for every project, in both the classic and the QuickPick palette. | PR open ([#11394](https://github.com/omnigent-ai/omnigent/pull/11394), draft) |
+| `new-chat-project-prompt` | Starting a new session asks which project it belongs to (a picker, a bottom sheet on phones); a setting turns it off. | PR open ([#11397](https://github.com/omnigent-ai/omnigent/pull/11397), draft; issue [#11083](https://github.com/omnigent-ai/omnigent/issues/11083)) |
+| `terminal-touch` | On touch devices the terminal gets an extra-keys row (Esc, Tab, arrows, sticky Ctrl, Alt and Shift) and long-press select with Copy and Paste; the iOS app pastes natively. | the extra-keys row is carried from [#6136](https://github.com/omnigent-ai/omnigent/pull/6136) (not ours, open); the rest is proposed |
 | `gateway-request-tags` | Requests to a Databricks Unity Gateway carry the session id and labels as request tags. | proposed (issue drafted) |
 | `claude-native-delegate-idle` | A Claude lead stops showing Working, and takes follow-ups without Steer, once its turn ends while agent-team teammates keep running: teammates count as background agents for upstream's background-agent hold ([#12561](https://github.com/omnigent-ai/omnigent/pull/12561)). | proposed (the status-file and OSC parts landed upstream as #12561) |
 | `delete-stops-runner` | Deleting a session stops its host-launched runner once no remaining session uses it, instead of leaving the process running until its idle timeout. | PR open ([#11391](https://github.com/omnigent-ai/omnigent/pull/11391)) |
@@ -647,9 +650,6 @@ anything is wrong with it.
 |---|---|
 | `backport-sidebar-filter-submenus` | landed upstream (#13481) |
 | `toast-safe-area` | superseded by upstream #13607 |
-| `terminal-touch` | mobile |
-| `new-chat-project-prompt` | optional |
-| `palette-new-chat-in-project` | optional |
 | `skip-gzip-binary-files` | landed upstream (#12362); dropped at the 2026-11-24 refresh |
 | `chat-features` | optional |
 | `pr-watch` | optional |

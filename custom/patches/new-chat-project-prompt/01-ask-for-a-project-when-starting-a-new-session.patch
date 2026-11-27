@@ -1,0 +1,1808 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 05:21:05 +0000
+Subject: [PATCH] feat(web): ask for a project when starting a new session
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A project carries the settings a new session needs (host, workspace,
+agent, model, worktree), but every "new session" entry point opens a
+plain composer, so filing a session in its project and getting those
+defaults is an extra, easily forgotten step.
+
+When projects exist, the new-session hotkey, the sidebar's New session
+links (also reached from the phone drawer) and the palette's New chat,
+in either palette, now open a "Start a new session in…" picker: No
+project first, then every project, filtered by name as you type.
+Picking one opens /?project=<name>; Escape stays on the page. Modified
+clicks on the links still open the composer in a new tab, and Settings
+> General > Sessions has a switch to turn the prompt off, with its
+Settings-search entry.
+
+The prompt is its own picker rather than a mode of the command palette,
+so it is the same under the classic palette and the QuickPick one. It
+and the palette replace each other instead of stacking. On a project's
+home page none of the entry points ask: the session starts in that
+project, in the home's composer over the board as its New session
+button does (on phones, /?project=<name>). The picker is for places
+with no project in view; on the composer already filed under a
+project, that project starts highlighted.
+
+The picker is offered while the project list is still loading and
+steps aside for the plain composer when the list fails or comes back
+empty. Below the md breakpoint it is a bottom sheet instead, whose
+missing search field keeps the keyboard down: a grab handle, "Start a
+new session in", then No project and every project as 48px rows. The
+sheet is a small controlled BottomSheet primitive on the Radix dialog
+(the UI kit had none).
+
+Browser tests that click New session and expect the composer turn the
+prompt off (omnigent:new-chat-project-prompt=false). The feature map
+documents the prompt.
+
+Not upstream yet: proposed from feat/new-chat-project-prompt
+(https://github.com/omnigent-ai/omnigent/pull/11397); drop this copy
+once it merges.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ feature-map/composer.md                       |  31 ++
+ tests/e2e_ui/conftest.py                      |  10 +
+ .../test_initial_prompt_session_switch.py     |   3 +
+ .../test_sidebar_pinned_project_collapse.py   |   5 +-
+ .../start_session/test_start_session.py       |   4 +
+ web/src/components/ui/bottom-sheet.test.tsx   |  98 +++++
+ web/src/components/ui/bottom-sheet.tsx        | 157 ++++++++
+ web/src/hooks/useNewSessionHotkey.test.tsx    |  14 +
+ web/src/hooks/useNewSessionHotkey.ts          |   5 +-
+ .../newChatProjectPromptPreferences.test.ts   |  29 ++
+ .../lib/newChatProjectPromptPreferences.ts    |  21 ++
+ web/src/pages/SettingsPage.test.tsx           |  17 +
+ web/src/pages/SettingsPage.tsx                |  28 ++
+ .../pages/settings/search/catalog/general.ts  |  10 +
+ web/src/shell/AppShellOverlays.test.tsx       |  17 +
+ web/src/shell/AppShellOverlays.tsx            |  13 +
+ web/src/shell/CommandPalette.test.tsx         |  14 +
+ .../shell/NewSessionProjectPrompt.test.tsx    | 337 ++++++++++++++++++
+ web/src/shell/NewSessionProjectPrompt.tsx     | 185 ++++++++++
+ web/src/shell/NewSessionProjectSheet.tsx      |  80 +++++
+ .../shell/Sidebar.newSessionPrompt.test.tsx   |  87 +++++
+ web/src/shell/Sidebar.tsx                     |   3 +
+ web/src/shell/appCommands.test.tsx            |  15 +-
+ web/src/shell/appCommands.ts                  |   3 +-
+ web/src/store/newSessionProjectPrompt.test.ts |  93 +++++
+ web/src/store/newSessionProjectPrompt.ts      |  45 +++
+ 26 files changed, 1319 insertions(+), 5 deletions(-)
+ create mode 100644 web/src/components/ui/bottom-sheet.test.tsx
+ create mode 100644 web/src/components/ui/bottom-sheet.tsx
+ create mode 100644 web/src/lib/newChatProjectPromptPreferences.test.ts
+ create mode 100644 web/src/lib/newChatProjectPromptPreferences.ts
+ create mode 100644 web/src/shell/NewSessionProjectPrompt.test.tsx
+ create mode 100644 web/src/shell/NewSessionProjectPrompt.tsx
+ create mode 100644 web/src/shell/NewSessionProjectSheet.tsx
+ create mode 100644 web/src/shell/Sidebar.newSessionPrompt.test.tsx
+ create mode 100644 web/src/store/newSessionProjectPrompt.test.ts
+ create mode 100644 web/src/store/newSessionProjectPrompt.ts
+
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index 8300037883f2f2f47c267a9499447230000d4dda..a7402e295e74221df0b3a104f45f753646e55eb0 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -329,6 +329,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+   (numbers increment) and ends it after an empty item.
+ - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
+   in the session view (not on mobile).
++- `new-session-project-prompt`: when projects exist, the new-session hotkey,
++  the sidebar's New session links and the palette's New chat (either palette)
++  first ask for a project: a "Start a new session in…" picker with No project
++  first, then every project, filtered as you type. Picking one opens the
++  composer with its defaults (`/?project=<name>`). On a project's home page
++  they don't ask: the session starts in that project, in the home's composer
++  over the board (on phones, `/?project=<name>`). The composer already filed
++  under a project starts highlighted. Settings › General › Sessions turns the
++  prompt off. Modified clicks on the links still open a new tab. Below the `md`
++  breakpoint the prompt is a bottom sheet with no search field.
+ - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
+   opens and focuses the new-session composer in browsers. Native shells use
+   ⌘/Ctrl+N. Embedded apps require focus inside the app.
+@@ -539,6 +549,20 @@ and opens the composer with its prompt`).
+ - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
+   same menu on mobile and with a managed sandbox available. Offline rows remain
+   disabled; a remembered offline selection still requires an explicit switch.
++- With at least one project, press the new-session hotkey or click New session
++  on a desktop-width window: a "Start a new session in…" picker opens over the
++  page you were on. Type part of a project name and press Enter to land on
++  `/?project=<name>` with its defaults; choose No project for a plain composer;
++  Escape leaves you where you were. On a project's home page the hotkey, the
++  sidebar's New session and ⌘K's New chat each open the home's own composer
++  with no picker. Turn off **Ask for a project when starting a session** in
++  Settings and the same actions open the plain composer directly.
++- On a phone with at least one project, tap New session in the drawer: a
++  "Start a new session in" sheet slides up with No project and each project,
++  and the keyboard stays down. Tap a project to land on `/?project=<name>`, or
++  tap outside it, press Escape or drag its handle down to stay where you were.
++  From a project's home page, New session opens that project's composer with
++  no sheet.
+ - With the browser app focused, press ⌘+Shift+O (macOS) or
+   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
+   composer.
+@@ -1190,6 +1214,13 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+   `tests/server/integration/test_host_session_binding.py::test_managed_launch_action_required_reaches_snapshot_and_stream`
+   covers the server. Nothing in this repo emits the stage, so a live check needs
+   a deployment that does.
++- **`new-session-project-prompt`:** no browser-level coverage; component
++  coverage in `web/src/shell/NewSessionProjectPrompt.test.tsx` (picker, sheet,
++  each entry point on a project home), `web/src/store/newSessionProjectPrompt.test.ts` (which clicks
++  and shortcuts ask) and `web/src/shell/Sidebar.newSessionPrompt.test.tsx`.
++  Browser tests that expect New session to open the composer on a server that
++  holds projects install `DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT`
++  (`tests/e2e_ui/conftest.py`) first.
+ - **`new-session-hotkey`:**
+   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
+ - **`import-bundle`:** no browser-level coverage; the web unit tests for the
+diff --git a/tests/e2e_ui/conftest.py b/tests/e2e_ui/conftest.py
+index 9098d00f4e8ffc348a2d8532513ec8179681d9cc..b410c723780f09da83a656a973911e82db684f30 100644
+--- a/tests/e2e_ui/conftest.py
++++ b/tests/e2e_ui/conftest.py
+@@ -225,6 +225,16 @@ def open_previewable_files_in_preview(page: Page) -> None:
+     )
+ 
+ 
++# Turns off the "Start a new session in…" project picker, which otherwise
++# opens in front of the composer whenever the shared server holds a project.
++# Install it with ``page.add_init_script`` before ``page.goto`` in any test that
++# starts a session through the New session link, button, or hotkey and expects
++# the plain composer; the picker's own test leaves it out.
++DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT = (
++    'window.localStorage.setItem("omnigent:new-chat-project-prompt", "false");'
++)
++
++
+ # Populated by live_server for fixtures that need the server PID or runner ID.
+ _server_state: dict[str, object] = ServerState()
+ 
+diff --git a/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py b/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py
+index 553f4a7aa2b005783a3df9409f315bba254cf915..b1d5b2fc07e16590d7ecbd1ff65d04e5b0ad05c2 100644
+--- a/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py
++++ b/tests/e2e_ui/sessions/test_initial_prompt_session_switch.py
+@@ -47,6 +47,7 @@ from playwright.async_api import Route, async_playwright
+ 
+ from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+ from tests._helpers.polling import poll_until_async
++from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT
+ from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+ 
+ # Unique sentinels so each POST body is unambiguously identifiable.
+@@ -167,6 +168,8 @@ async def _drive_initial_prompt_switch(base_url: str, session_a: str, session_b:
+                 else:
+                     await route.continue_()
+ 
++            # The shared server may hold projects; keep New session on the composer.
++            await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+             await page.route("**/v1/sessions/*/events", handle_events)
+             await page.route("**/v1/hosts", handle_hosts)
+             await stub_empty_host_picker_data(page, "host_e2e")
+diff --git a/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py b/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py
+index d474379f918078227a736224126cdbd1cb176111..5913e4b3ab97d73f7500ffb5e638414c0a630d68 100644
+--- a/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py
++++ b/tests/e2e_ui/sessions/test_sidebar_pinned_project_collapse.py
+@@ -27,7 +27,7 @@ from playwright.sync_api import Locator, Page, expect
+ 
+ from tests._helpers.polling import poll_until
+ from tests._helpers.session import send_user_text
+-from tests.e2e_ui.conftest import configure_mock_llm
++from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT, configure_mock_llm
+ 
+ 
+ def _set_title(base_url: str, session_id: str, title: str) -> None:
+@@ -94,6 +94,9 @@ def test_click_pinned_project_session_keeps_project_collapsed(
+     _file_into_project(base_url, session_a, project)
+     _file_into_project(base_url, session_b, project)
+ 
++    # This test files sessions into a project; New session must still open the
++    # composer rather than the project picker.
++    page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+     page.goto(f"{base_url}/c/{session_a}")
+ 
+     row_a = _row(page, session_a)
+diff --git a/tests/e2e_ui/start_session/test_start_session.py b/tests/e2e_ui/start_session/test_start_session.py
+index c9e26da39b74728d53d22eedebcdaa73a61e9eae..2d7801fd5ebaf88322c66992a2355bfc1c3db264 100644
+--- a/tests/e2e_ui/start_session/test_start_session.py
++++ b/tests/e2e_ui/start_session/test_start_session.py
+@@ -56,6 +56,7 @@ from playwright.async_api import Request, Route, async_playwright, expect
+ from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+ from tests._helpers.picker_routes import OWN_AGENTS
+ from tests._helpers.polling import poll_until_async
++from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT
+ from tests.e2e_ui.start_session.helpers import (
+     commit_landing_workspace_picker,
+     open_landing_workspace_picker,
+@@ -365,6 +366,8 @@ async def _register_common_routes(
+         else:
+             await route.continue_()
+ 
++    # The shared server may hold projects; keep New session on the plain composer.
++    await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+     await page.route("**/v1/hosts", handle_hosts)
+     # Fake hosts have no backend probes; tests with catalogs or git repos override these.
+     await page.route(
+@@ -1107,6 +1110,7 @@ async def _drive_landing_clears_after_navigating_away(
+ 
+             page.on("response", note_create_response)
+ 
++            await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
+             await page.add_init_script(
+                 f"""window.localStorage.setItem(
+                     "omnigent:recent-workspaces",
+diff --git a/web/src/components/ui/bottom-sheet.test.tsx b/web/src/components/ui/bottom-sheet.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3eb80c7f511c4c62056a5dbed10d7fcadcc9a96
+--- /dev/null
++++ b/web/src/components/ui/bottom-sheet.test.tsx
+@@ -0,0 +1,98 @@
++import { useState } from "react";
++import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++import { BottomSheet, BottomSheetContent } from "./bottom-sheet";
++
++afterEach(cleanup);
++
++let setSheetOpen: (open: boolean) => void = () => {};
++
++function StatefulSheet({ onOpenChange }: { onOpenChange: (open: boolean) => void }) {
++  const [open, setOpen] = useState(true);
++  setSheetOpen = setOpen;
++  return (
++    <BottomSheet
++      open={open}
++      onOpenChange={(next) => {
++        onOpenChange(next);
++        setOpen(next);
++      }}
++    >
++      <BottomSheetContent title="Pick one">
++        <button type="button">Row</button>
++      </BottomSheetContent>
++    </BottomSheet>
++  );
++}
++
++function renderSheet() {
++  const onOpenChange = vi.fn();
++  render(<StatefulSheet onOpenChange={onOpenChange} />);
++  return onOpenChange;
++}
++
++const handle = () => screen.getByText("Pick one");
++const sheet = () => screen.queryByRole("dialog", { name: "Pick one" });
++
++function press(clientY: number) {
++  fireEvent.pointerDown(handle(), { pointerId: 1, button: 0, clientY });
++}
++function move(clientY: number) {
++  fireEvent.pointerMove(handle(), { pointerId: 1, clientY });
++}
++function release(clientY: number) {
++  fireEvent.pointerUp(handle(), { pointerId: 1, clientY });
++}
++
++describe("BottomSheet", () => {
++  it("names the dialog by its title and focuses the sheet, not its first row", () => {
++    renderSheet();
++    expect(sheet()).toHaveFocus();
++  });
++
++  it("follows the drag and closes when released far enough down", () => {
++    const onOpenChange = renderSheet();
++    press(100);
++    move(220);
++    expect(sheet()!.style.transform).toBe("translateY(120px)");
++    release(220);
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++    expect(sheet()).toBeNull();
++  });
++
++  it("springs back from a short drag", () => {
++    const onOpenChange = renderSheet();
++    press(100);
++    move(130);
++    expect(sheet()!.style.transform).toBe("translateY(30px)");
++    release(130);
++    expect(onOpenChange).not.toHaveBeenCalled();
++    expect(sheet()!.style.transform).toBe("");
++  });
++
++  it("ignores pointer moves without a press", () => {
++    renderSheet();
++    move(220);
++    expect(sheet()!.style.transform).toBe("");
++  });
++
++  it("drops an unfinished drag when it closes another way", () => {
++    renderSheet();
++    press(100);
++    move(140);
++    fireEvent.keyDown(sheet()!, { key: "Escape" });
++    expect(sheet()).toBeNull();
++
++    act(() => setSheetOpen(true));
++    expect(sheet()!.style.transform).toBe("");
++    move(240);
++    expect(sheet()!.style.transform).toBe("");
++  });
++
++  it("closes on Escape", () => {
++    const onOpenChange = renderSheet();
++    fireEvent.keyDown(sheet()!, { key: "Escape" });
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++  });
++});
+diff --git a/web/src/components/ui/bottom-sheet.tsx b/web/src/components/ui/bottom-sheet.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ee88b0b49d44cc02b2b22af15f3b6f4ab737a65
+--- /dev/null
++++ b/web/src/components/ui/bottom-sheet.tsx
+@@ -0,0 +1,157 @@
++// Bottom sheet for phones: a Radix dialog that slides up from the bottom edge,
++// with a grab handle and title that can be dragged down to dismiss it.
++
++import * as React from "react";
++import * as DialogPrimitive from "radix-ui/dialog";
++
++import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
++import { cn } from "@/lib/utils";
++import { Dialog, DialogOverlay, DialogPortal, DialogTitle } from "@/components/ui/dialog";
++
++/** How far the handle must be dragged down before releasing it dismisses the sheet. */
++const SWIPE_DISMISS_PX = 80;
++
++const BottomSheetContext = React.createContext<{ open: boolean; close: () => void }>({
++  open: false,
++  close: () => {},
++});
++
++/** Controlled only: a swipe closes the sheet through `onOpenChange(false)`. */
++function BottomSheet({
++  open,
++  onOpenChange,
++  ...props
++}: Omit<
++  React.ComponentProps<typeof DialogPrimitive.Root>,
++  "open" | "defaultOpen" | "onOpenChange"
++> & {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++}) {
++  const sheet = React.useMemo(
++    () => ({ open, close: () => onOpenChange(false) }),
++    [open, onOpenChange],
++  );
++  return (
++    <BottomSheetContext.Provider value={sheet}>
++      <Dialog open={open} onOpenChange={onOpenChange} {...props} />
++    </BottomSheetContext.Provider>
++  );
++}
++
++/** Puts the sheet back at rest, e.g. after a drag that didn't dismiss it. */
++function resetSheetOffset(sheet: HTMLElement | null, animate: boolean) {
++  if (!sheet) return;
++  sheet.style.transition = animate ? "transform 200ms ease-out" : "";
++  sheet.style.transform = "";
++}
++
++/**
++ * Grab handle and title: the sheet follows a downward drag on them, and
++ * releasing past the threshold closes it, so it slides out from where it was
++ * dropped.
++ */
++function BottomSheetHandle({
++  sheetRef,
++  title,
++}: {
++  sheetRef: React.RefObject<HTMLElement | null>;
++  title: React.ReactNode;
++}) {
++  const { open, close } = React.useContext(BottomSheetContext);
++  const start = React.useRef<{ pointerId: number; y: number } | null>(null);
++  // The handle stays mounted through the exit animation, and a reopen in that
++  // window reuses it: a drag the sheet closed under must not carry over.
++  React.useEffect(() => {
++    if (!open) start.current = null;
++  }, [open]);
++  const distance = (event: React.PointerEvent<HTMLElement>) =>
++    Math.max(0, event.clientY - (start.current?.y ?? event.clientY));
++  const cancel = () => {
++    if (!start.current) return;
++    start.current = null;
++    resetSheetOffset(sheetRef.current, true);
++  };
++  return (
++    <div
++      className="shrink-0 cursor-grab touch-none select-none"
++      onPointerDown={(event) => {
++        if (event.button !== 0) return;
++        start.current = { pointerId: event.pointerId, y: event.clientY };
++        event.currentTarget.setPointerCapture?.(event.pointerId);
++      }}
++      onPointerMove={(event) => {
++        const sheet = sheetRef.current;
++        if (start.current?.pointerId !== event.pointerId || !sheet) return;
++        sheet.style.transition = "none";
++        sheet.style.transform = `translateY(${distance(event)}px)`;
++      }}
++      onPointerUp={(event) => {
++        if (start.current?.pointerId !== event.pointerId) return;
++        if (distance(event) > SWIPE_DISMISS_PX) {
++          start.current = null;
++          close();
++        } else {
++          cancel();
++        }
++      }}
++      onPointerCancel={cancel}
++      onLostPointerCapture={cancel}
++    >
++      <div
++        aria-hidden="true"
++        className="mx-auto mt-2 mb-2.5 h-[5px] w-[38px] rounded-full bg-muted-foreground/30"
++      />
++      <DialogTitle className="min-h-0 px-6 pb-2 text-[17px] leading-6">{title}</DialogTitle>
++    </div>
++  );
++}
++
++function BottomSheetContent({
++  className,
++  children,
++  title,
++  style,
++  onOpenAutoFocus,
++  ...props
++}: Omit<React.ComponentProps<typeof DialogPrimitive.Content>, "title"> & {
++  /** Heading shown under the grab handle; also the dialog's accessible name. */
++  title: React.ReactNode;
++}) {
++  const contentRef = React.useRef<HTMLDivElement>(null);
++  // Reopening during the exit animation reuses the node a swipe moved down.
++  const { open } = React.useContext(BottomSheetContext);
++  React.useLayoutEffect(() => {
++    if (open) resetSheetOffset(contentRef.current, false);
++  }, [open]);
++  return (
++    <DialogPortal>
++      <DialogOverlay />
++      <DialogPrimitive.Content
++        ref={contentRef}
++        data-slot="bottom-sheet-content"
++        aria-describedby={undefined}
++        className={cn(
++          "fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-[26px] bg-popover text-ui text-popover-foreground shadow-dialog outline-none duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] data-open:animate-in data-open:slide-in-from-bottom data-closed:animate-out data-closed:slide-out-to-bottom",
++          className,
++        )}
++        style={{ paddingBottom: "var(--omnigent-safe-bottom, 0px)", ...style }}
++        // Focus the sheet itself rather than its first row, so opening it
++        // doesn't paint a focus ring on a row the user hasn't reached yet.
++        onOpenAutoFocus={(event) => {
++          onOpenAutoFocus?.(event);
++          if (event.defaultPrevented) return;
++          event.preventDefault();
++          contentRef.current?.focus();
++        }}
++        {...props}
++      >
++        <SuppressBrowserView />
++        <BottomSheetHandle sheetRef={contentRef} title={title} />
++        {children}
++      </DialogPrimitive.Content>
++    </DialogPortal>
++  );
++}
++
++export { BottomSheet, BottomSheetContent };
+diff --git a/web/src/hooks/useNewSessionHotkey.test.tsx b/web/src/hooks/useNewSessionHotkey.test.tsx
+index b1706fc9815305fcc7423e031af00dbcdefd0d6b..fbcd01f8c1e2a0bbb1169e5f163bf22447c2f544 100644
+--- a/web/src/hooks/useNewSessionHotkey.test.tsx
++++ b/web/src/hooks/useNewSessionHotkey.test.tsx
+@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { EmbeddedProvider } from "@/lib/embedded";
+ import { setEmbedRoot } from "@/lib/host";
+ 
++import { useNewSessionProjectPromptStore } from "@/store/newSessionProjectPrompt";
++
+ import { isNewSessionHotkey, useNewSessionHotkey } from "./useNewSessionHotkey";
+ 
+ const navigate = vi.fn();
+@@ -13,6 +15,7 @@ afterEach(() => {
+   cleanup();
+   setEmbedRoot(null);
+   navigate.mockReset();
++  useNewSessionProjectPromptStore.setState({ open: false, hosted: false });
+   document.body.innerHTML = "";
+ });
+ 
+@@ -120,6 +123,17 @@ describe("useNewSessionHotkey", () => {
+     expect(e.defaultPrevented).toBe(true);
+   });
+ 
++  it("asks for a project instead of navigating where the shell mounts the prompt", () => {
++    useNewSessionProjectPromptStore.setState({ hosted: true });
++    renderHook(() => useNewSessionHotkey(true, false));
++
++    const e = press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
++
++    expect(useNewSessionProjectPromptStore.getState().open).toBe(true);
++    expect(navigate).not.toHaveBeenCalled();
++    expect(e.defaultPrevented).toBe(true);
++  });
++
+   it("claims the displayed O from a different physical key", () => {
+     renderHook(() => useNewSessionHotkey(true, false));
+ 
+diff --git a/web/src/hooks/useNewSessionHotkey.ts b/web/src/hooks/useNewSessionHotkey.ts
+index caf94d02c8e6c2002cb47ddd6d572321ff01ea8f..72e32b57d263e104b05b4042bf4ae2ea24e513a9 100644
+--- a/web/src/hooks/useNewSessionHotkey.ts
++++ b/web/src/hooks/useNewSessionHotkey.ts
+@@ -6,6 +6,7 @@ import { isMacPlatform } from "@/lib/hotkeys";
+ import { isNativeShell } from "@/lib/nativeBridge";
+ import { useNavigate } from "@/lib/routing";
+ import { matchesShortcut } from "@/lib/shortcuts/registry";
++import { startNewSession } from "@/store/newSessionProjectPrompt";
+ 
+ /** Browser Cmd/Ctrl+Shift+O; native shells Cmd/Ctrl+N. */
+ export function isNewSessionHotkey(
+@@ -16,7 +17,7 @@ export function isNewSessionHotkey(
+   return matchesShortcut(e, "session.new", { mac: isMac, native });
+ }
+ 
+-/** Navigate to the same new-session route used by the command palette. */
++/** Start a new session as the command palette does: its project prompt, or the plain composer. */
+ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): void {
+   const navigate = useNavigate();
+   const isEmbedded = useIsEmbedded();
+@@ -29,7 +30,7 @@ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): vo
+       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
+       e.preventDefault();
+       e.stopPropagation();
+-      navigate("/");
++      startNewSession(navigate);
+     };
+     window.addEventListener("keydown", handler);
+     return () => window.removeEventListener("keydown", handler);
+diff --git a/web/src/lib/newChatProjectPromptPreferences.test.ts b/web/src/lib/newChatProjectPromptPreferences.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..88412b62aa5b853affdbe15efffe5767fd08cc51
+--- /dev/null
++++ b/web/src/lib/newChatProjectPromptPreferences.test.ts
+@@ -0,0 +1,29 @@
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY,
++  readNewChatProjectPromptEnabled,
++  writeNewChatProjectPromptEnabled,
++} from "./newChatProjectPromptPreferences";
++
++describe("newChatProjectPromptPreferences", () => {
++  afterEach(() => localStorage.clear());
++
++  it("defaults on when storage is unset", () => {
++    expect(readNewChatProjectPromptEnabled()).toBe(true);
++  });
++
++  it("persists an off preference and restores the default by clearing it", () => {
++    writeNewChatProjectPromptEnabled(false);
++    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("false");
++    expect(readNewChatProjectPromptEnabled()).toBe(false);
++
++    writeNewChatProjectPromptEnabled(true);
++    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBeNull();
++    expect(readNewChatProjectPromptEnabled()).toBe(true);
++  });
++
++  it("still reads the value an earlier build stored for off", () => {
++    localStorage.setItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY, "off");
++    expect(readNewChatProjectPromptEnabled()).toBe(false);
++  });
++});
+diff --git a/web/src/lib/newChatProjectPromptPreferences.ts b/web/src/lib/newChatProjectPromptPreferences.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6774c9acc9bbbf5bac540002a0c45b8a505e7577
+--- /dev/null
++++ b/web/src/lib/newChatProjectPromptPreferences.ts
+@@ -0,0 +1,21 @@
++// Per-device choice of whether starting a new session first asks which project it
++// belongs to (the default), when the user has projects.
++
++import { createStoredPreference } from "./storedChoicePreference";
++
++export const NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY = "omnigent:new-chat-project-prompt";
++
++const promptPreference = createStoredPreference<boolean>(
++  NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY,
++  // "off" is what this switch stored before it shared the stored-preference format.
++  (stored) => (stored === "false" || stored === "off" ? false : undefined),
++  true,
++);
++
++export const readNewChatProjectPromptEnabled = promptPreference.read;
++export const writeNewChatProjectPromptEnabled = promptPreference.write;
++
++/** Live switch value, including changes made in other windows. */
++export function useNewChatProjectPromptPreference(): boolean {
++  return promptPreference.use();
++}
+diff --git a/web/src/pages/SettingsPage.test.tsx b/web/src/pages/SettingsPage.test.tsx
+index cd8bcb5ce0bc53125d11646b80eddc75543786be..590036d680a0944d6ec3ff239a6d562b24b5d553 100644
+--- a/web/src/pages/SettingsPage.test.tsx
++++ b/web/src/pages/SettingsPage.test.tsx
+@@ -25,6 +25,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import type { Conversation } from "@/hooks/useConversations";
+ import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+ import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
++import {
++  NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY,
++  writeNewChatProjectPromptEnabled,
++} from "@/lib/newChatProjectPromptPreferences";
+ import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
+ import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
+ import { fetchGithubStatus } from "@/lib/githubIntegration";
+@@ -744,6 +748,19 @@ describe("SettingsPage", () => {
+     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+   });
+ 
++  it("asks for a project on new sessions by default and persists turning it off", async () => {
++    onTestFinished(() => void writeNewChatProjectPromptEnabled(true));
++    renderPage("/settings/general");
++    const toggle = await screen.findByTestId("new-chat-project-prompt-toggle");
++    expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
++    expect(toggle).toHaveAccessibleName("Ask for a project when starting a session");
++    expect(toggle).toBeChecked();
++
++    fireEvent.click(toggle);
++    expect(toggle).not.toBeChecked();
++    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("false");
++  });
++
+   it("opens sub-agents full screen by default and persists the panel setting", async () => {
+     renderPage("/settings/general");
+     const toggle = await screen.findByTestId("open-subagents-in-panel-toggle");
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index dafeb23d4b29cc0439322b6eab294043bf4fefed..e5b7d7634530ee0b34ba2733e73b44705afde37c 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -111,6 +111,7 @@ import {
+   ADMIN_VIEW_ENTRY,
+   ALWAYS_STEER_ENTRY,
+   BACKGROUND_SESSION_TITLES_ENTRY,
++  NEW_CHAT_PROJECT_PROMPT_ENTRY,
+   OPEN_IN_DESKTOP_APP_ENTRY,
+   OPEN_LINKS_IN_APP_ENTRY,
+   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+@@ -347,6 +348,10 @@ import {
+   writeSubmitWithModEnter,
+ } from "@/lib/composerSendShortcutPreferences";
+ import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
++import {
++  useNewChatProjectPromptPreference,
++  writeNewChatProjectPromptEnabled,
++} from "@/lib/newChatProjectPromptPreferences";
+ import {
+   readDeleteWorktreesOnArchive,
+   writeDeleteWorktreesOnArchive,
+@@ -2159,6 +2164,26 @@ function OpenSubagentsInPanelControl() {
+   );
+ }
+ 
++function NewChatProjectPromptControl() {
++  const enabled = useNewChatProjectPromptPreference();
++  return (
++    <SettingsItem
++      entry={NEW_CHAT_PROJECT_PROMPT_ENTRY}
++      className="flex items-start justify-between gap-6"
++    >
++      <SettingsEntryLabel entry={NEW_CHAT_PROJECT_PROMPT_ENTRY} className="flex-1" />
++      <Switch
++        {...settingsControlProps(NEW_CHAT_PROJECT_PROMPT_ENTRY)}
++        checked={enabled}
++        onCheckedChange={writeNewChatProjectPromptEnabled}
++        data-testid="new-chat-project-prompt-toggle"
++        className="mt-0.5 shrink-0"
++        componentId="settings.general.new_chat_project_prompt"
++      />
++    </SettingsItem>
++  );
++}
++
+ function TerminalClipboardControl() {
+   const canRemember = canRememberTerminalClipboardPreference();
+   const [preference, setPreference] = useState<TerminalClipboardPreference>(
+@@ -2292,6 +2317,9 @@ function GeneralSection() {
+           <div className="mt-4 border-t border-border pt-4">
+             <OpenSubagentsInPanelControl />
+           </div>
++          <div className="mt-4 border-t border-border pt-4">
++            <NewChatProjectPromptControl />
++          </div>
+         </SettingsGroup>
+         <SettingsGroup title="Terminal" testId="settings-group-terminal">
+           <TerminalClipboardControl />
+diff --git a/web/src/pages/settings/search/catalog/general.ts b/web/src/pages/settings/search/catalog/general.ts
+index 39540e4204fa6e2503a4239980943f5355653827..cc6aa389b20497b0d95b9986a46bbb55843d1cd8 100644
+--- a/web/src/pages/settings/search/catalog/general.ts
++++ b/web/src/pages/settings/search/catalog/general.ts
+@@ -64,6 +64,15 @@ export const OPEN_SUBAGENTS_IN_PANEL_ENTRY = settingsEntry({
+   keywords: ["sessions", "sub-agents", "subagents", "workspace", "panel", "side by side"],
+ });
+ 
++export const NEW_CHAT_PROJECT_PROMPT_ENTRY = settingsEntry({
++  id: "new-chat-project-prompt",
++  section: "general",
++  label: "Ask for a project when starting a session",
++  description:
++    "When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer.",
++  keywords: ["sessions", "projects", "new session", "new chat", "picker", "prompt", "defaults"],
++});
++
+ export const TERMINAL_CLIPBOARD_ENTRY = settingsEntry({
+   id: "terminal-clipboard",
+   section: "general",
+@@ -235,6 +244,7 @@ export const GENERAL_SETTINGS = [
+   ALWAYS_STEER_ENTRY,
+   BACKGROUND_SESSION_TITLES_ENTRY,
+   SESSION_TITLE_INSTRUCTIONS_ENTRY,
++  NEW_CHAT_PROJECT_PROMPT_ENTRY,
+   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+   TERMINAL_CLIPBOARD_ENTRY,
+   OPEN_LINKS_IN_APP_ENTRY,
+diff --git a/web/src/shell/AppShellOverlays.test.tsx b/web/src/shell/AppShellOverlays.test.tsx
+index ad7cf2ba0a5057ff8a904cc2cdf243437bb4c5ce..e3b31ba8a3be2d948666afe508ffa83aa67b9fba 100644
+--- a/web/src/shell/AppShellOverlays.test.tsx
++++ b/web/src/shell/AppShellOverlays.test.tsx
+@@ -14,6 +14,11 @@ vi.mock("./CommandPalette", () => ({
+ vi.mock("@/components/KeyboardShortcutsDialog", () => ({ KeyboardShortcutsDialog: () => null }));
+ vi.mock("@/components/onboarding/HostImportReview", () => ({ ImportReviewGate: () => null }));
+ vi.mock("./RecentSessionsSwitcher", () => ({ RecentSessionsSwitcher: () => null }));
++vi.mock("./NewSessionProjectPrompt", () => ({
++  NewSessionProjectPrompt: ({ paletteOpen }: { paletteOpen: boolean }) => (
++    <div data-testid="new-session-project-prompt" data-palette-open={String(paletteOpen)} />
++  ),
++}));
+ 
+ afterEach(cleanup);
+ // Which flagged modules this case imported. Each case loads the shell and these mocks afresh,
+@@ -64,6 +69,18 @@ async function renderOverlays(
+   );
+ }
+ 
++describe("AppShellOverlays new-session project prompt", () => {
++  it.each([false, true])(
++    "mounts the prompt beside the palette (quick_pick_palette: %s)",
++    async (quickPick) => {
++      const { findByTestId } = await renderOverlays({ quick_pick_palette: quickPick });
++      const prompt = await findByTestId("new-session-project-prompt");
++      // The prompt and the palette replace each other, so it follows the palette's state.
++      expect(prompt.dataset.paletteOpen).toBe("true");
++    },
++  );
++});
++
+ describe("AppShellOverlays palette flag", () => {
+   const notOn = [
+     ["off", { quick_pick_palette: false }],
+diff --git a/web/src/shell/AppShellOverlays.tsx b/web/src/shell/AppShellOverlays.tsx
+index e6c7cabeb888c260650e8826b7a353f9bdee1703..5f90705b6ab3c3e7f4a3355446a58001ee24049d 100644
+--- a/web/src/shell/AppShellOverlays.tsx
++++ b/web/src/shell/AppShellOverlays.tsx
+@@ -20,6 +20,12 @@ const QuickPickCommandPalette = lazy(() =>
+ const ThemePicker = lazy(() =>
+   import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
+ );
++// Mounts closed, to load before the first new session asks for its project.
++const NewSessionProjectPrompt = lazy(() =>
++  import("./NewSessionProjectPrompt").then((module) => ({
++    default: module.NewSessionProjectPrompt,
++  })),
++);
+ 
+ // Dev-only preview; lazy so the sample data never ships in production bundles.
+ const ImportContextPreview = import.meta.env.DEV
+@@ -93,6 +99,13 @@ export function AppShellOverlays({
+           onGoToSession={goToSession}
+         />
+       </Suspense>
++      {/* "Start a new session in…", from the shortcut, the sidebar's links and ⌘K's New chat. */}
++      <Suspense fallback={null}>
++        <NewSessionProjectPrompt
++          paletteOpen={commandPaletteOpen}
++          closePalette={() => setCommandPaletteOpen(false)}
++        />
++      </Suspense>
+       {/* "Select theme…" from ⌘K; previews each theme as the user moves through them. */}
+       {quickPick && (
+         <Suspense fallback={null}>
+diff --git a/web/src/shell/CommandPalette.test.tsx b/web/src/shell/CommandPalette.test.tsx
+index 55098f96434ef1e86fac5d8b66337a1767f7cb93..c157b5aef890d1be6279836c8d78db1f298e604b 100644
+--- a/web/src/shell/CommandPalette.test.tsx
++++ b/web/src/shell/CommandPalette.test.tsx
+@@ -6,6 +6,7 @@ import type * as SidebarDataModule from "@/hooks/useSidebarData";
+ import { type ComponentProps, type ReactNode, useState } from "react";
+ 
+ import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
++import { useNewSessionProjectPromptStore } from "@/store/newSessionProjectPrompt";
+ import * as commandPaletteModule from "./CommandPalette";
+ import { CommandPalette } from "./CommandPalette";
+ import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
+@@ -1235,6 +1236,19 @@ describe("CommandPalette — actions", () => {
+     expect(onOpenChange).toHaveBeenCalledWith(false);
+   });
+ 
++  it("starts New chat on the project prompt where the shell mounts it", () => {
++    useNewSessionProjectPromptStore.setState({ hosted: true });
++    onTestFinished(() => useNewSessionProjectPromptStore.setState({ open: false, hosted: false }));
++    const onOpenChange = vi.fn();
++    renderPalette({ onOpenChange });
++
++    fireEvent.click(screen.getByText("New chat"));
++
++    expect(useNewSessionProjectPromptStore.getState().open).toBe(true);
++    expect(navigate).not.toHaveBeenCalled();
++    expect(onOpenChange).toHaveBeenCalledWith(false);
++  });
++
+   it("invokes the sidebar-toggle callbacks", () => {
+     const onToggleLeftSidebar = vi.fn();
+     const onToggleRightSidebar = vi.fn();
+diff --git a/web/src/shell/NewSessionProjectPrompt.test.tsx b/web/src/shell/NewSessionProjectPrompt.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffcb5a0450a4bfc09a4fd6d9cb4f3ac47a4317ae
+--- /dev/null
++++ b/web/src/shell/NewSessionProjectPrompt.test.tsx
+@@ -0,0 +1,337 @@
++// The "Start a new session in…" prompt as the app shell mounts it: a picker on desktop, a
++// bottom sheet on phones, and where each choice starts the session.
++
++import {
++  act,
++  cleanup,
++  fireEvent,
++  render,
++  renderHook,
++  screen,
++  waitFor,
++} from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
++import { writeNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPreferences";
++import { useProjectComposerStore } from "@/projectHome/ProjectHomeHeader";
++import {
++  askForProjectOnNewSessionClick,
++  startNewSession,
++  useNewSessionProjectPromptStore,
++} from "@/store/newSessionProjectPrompt";
++
++import { useAppCommands } from "./appCommands";
++import { NewSessionProjectPrompt, projectInView } from "./NewSessionProjectPrompt";
++
++const navigate = vi.fn();
++const location = { pathname: "/c/conv_1", search: "" };
++vi.mock("@/lib/routing", async (importOriginal) => ({
++  ...(await importOriginal<object>()),
++  useNavigate: () => navigate,
++  useLocation: () => ({ ...location, hash: "", state: null, key: "default" }),
++}));
++
++const useProjects = vi.fn();
++vi.mock("@/hooks/useConversations", async (importOriginal) => ({
++  ...(await importOriginal<object>()),
++  useProjects: () => useProjects(),
++}));
++
++let mobile = false;
++vi.mock("@/hooks/useIsMobileViewport", async (importOriginal) => ({
++  ...(await importOriginal<object>()),
++  useIsMobileViewport: () => mobile,
++}));
++
++const PROJECTS = [
++  { id: "p1", name: "omnigent", icon: "🔥" },
++  { id: null, name: "docs site", icon: null },
++];
++const loaded = (data: unknown[]) => ({ data, isError: false });
++
++const closePalette = vi.fn();
++function renderPrompt(paletteOpen = false) {
++  const view = render(
++    <NewSessionProjectPrompt paletteOpen={paletteOpen} closePalette={closePalette} />,
++  );
++  return {
++    openPalette: () =>
++      view.rerender(<NewSessionProjectPrompt paletteOpen closePalette={closePalette} />),
++  };
++}
++const ask = () => act(() => startNewSession(navigate));
++const promptOpen = () => useNewSessionProjectPromptStore.getState().open;
++const input = () => screen.getByTestId("new-session-project-input");
++const rowLabels = () =>
++  screen.getAllByRole("option").map((row) => row.querySelector(".truncate")?.textContent);
++
++// The three ways to start a new session, each through its real handler.
++const ENTRY_POINTS = [
++  [
++    "the new-session shortcut",
++    () => {
++      renderHook(() => useNewSessionHotkey(true, false));
++      act(() => {
++        fireEvent.keyDown(window, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
++      });
++    },
++  ],
++  [
++    "a sidebar New session link",
++    () => {
++      // Follows its href as a router link does, unless the prompt takes the click.
++      render(
++        <a
++          href="/"
++          onClick={(event) => {
++            askForProjectOnNewSessionClick(event);
++            if (event.defaultPrevented) return;
++            event.preventDefault();
++            navigate("/");
++          }}
++        >
++          New session
++        </a>,
++      );
++      act(() => {
++        fireEvent.click(screen.getByRole("link", { name: "New session" }));
++      });
++    },
++  ],
++  [
++    "the palette's New chat",
++    () => {
++      const { result } = renderHook(() =>
++        useAppCommands({
++          onToggleLeftSidebar: vi.fn(),
++          onToggleRightSidebar: vi.fn(),
++          rightSidebarShortcutEnabled: true,
++        }),
++      );
++      act(() => result.current.find((command) => command.id === "new-chat")!.run());
++    },
++  ],
++] as const;
++
++beforeEach(() => {
++  mobile = false;
++  location.pathname = "/c/conv_1";
++  location.search = "";
++  navigate.mockReset();
++  closePalette.mockReset();
++  useProjects.mockReturnValue(loaded(PROJECTS));
++  useProjectComposerStore.setState({ open: false });
++});
++afterEach(() => {
++  cleanup();
++  localStorage.clear();
++});
++
++describe("projectInView", () => {
++  it("names the project whose home or composer is open", () => {
++    expect(projectInView("/projects/docs%20site", "")).toBe("docs site");
++    expect(projectInView("/", "?project=omnigent")).toBe("omnigent");
++    expect(projectInView("/c/conv_1", "")).toBeNull();
++  });
++});
++
++describe("NewSessionProjectPrompt on desktop", () => {
++  it("lists No project, then every project, and closes the palette it replaces", () => {
++    renderPrompt();
++    expect(screen.queryByRole("dialog")).toBeNull();
++
++    ask();
++
++    expect(rowLabels()).toEqual(["No project", "omnigent", "docs site"]);
++    expect(input()).toHaveAttribute("placeholder", "Start a new session in…");
++    expect(closePalette).toHaveBeenCalled();
++    expect(navigate).not.toHaveBeenCalled();
++  });
++
++  it("starts the session in the project picked by name", async () => {
++    renderPrompt();
++    ask();
++    fireEvent.change(input(), { target: { value: "docs" } });
++    expect(rowLabels()).toEqual(["docs site"]);
++    fireEvent.keyDown(input(), { key: "Enter" });
++
++    await waitFor(() => expect(navigate).toHaveBeenCalledExactlyOnceWith("/?project=docs%20site"));
++    expect(promptOpen()).toBe(false);
++  });
++
++  it("opens the plain composer for No project, the top row", async () => {
++    renderPrompt();
++    ask();
++    fireEvent.keyDown(input(), { key: "Enter" });
++
++    await waitFor(() => expect(navigate).toHaveBeenCalledExactlyOnceWith("/"));
++  });
++
++  it("starts on the project in view, so Enter keeps the session there", async () => {
++    location.pathname = "/";
++    location.search = "?project=docs%20site";
++    renderPrompt();
++    ask();
++
++    const current = screen.getByRole("option", { name: /docs site/ });
++    await waitFor(() => expect(current).toHaveAttribute("aria-selected", "true"));
++    expect(current).toHaveTextContent("Current project");
++    fireEvent.keyDown(input(), { key: "Enter" });
++
++    await waitFor(() => expect(navigate).toHaveBeenCalledExactlyOnceWith("/?project=docs%20site"));
++  });
++
++  it.each(ENTRY_POINTS)(
++    "starts from %s on a project's home in its composer, without asking",
++    (_entry, startFromEntryPoint) => {
++      location.pathname = "/projects/omnigent";
++      renderPrompt();
++      startFromEntryPoint();
++
++      expect(screen.queryByRole("dialog")).toBeNull();
++      expect(promptOpen()).toBe(false);
++      expect(useProjectComposerStore.getState().open).toBe(true);
++      expect(navigate).not.toHaveBeenCalled();
++    },
++  );
++
++  it.each(ENTRY_POINTS)(
++    "asks from %s away from a project's home",
++    (_entry, startFromEntryPoint) => {
++      renderPrompt();
++      startFromEntryPoint();
++
++      expect(rowLabels()).toEqual(["No project", "omnigent", "docs site"]);
++      expect(navigate).not.toHaveBeenCalled();
++    },
++  );
++
++  it.each(ENTRY_POINTS)(
++    "opens the plain composer from %s on a project's home with the prompt off",
++    (_entry, startFromEntryPoint) => {
++      writeNewChatProjectPromptEnabled(false);
++      location.pathname = "/projects/omnigent";
++      renderPrompt();
++      startFromEntryPoint();
++
++      expect(screen.queryByRole("dialog")).toBeNull();
++      expect(useProjectComposerStore.getState().open).toBe(false);
++      expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
++    },
++  );
++
++  it("starts on a project's home without waiting for the project list", () => {
++    useProjects.mockReturnValue({ data: undefined, isError: false });
++    location.pathname = "/projects/omnigent";
++    renderPrompt();
++    ask();
++
++    expect(screen.queryByRole("dialog")).toBeNull();
++    expect(useProjectComposerStore.getState().open).toBe(true);
++  });
++
++  it("lists projects as they arrive when it opens before the list has loaded", () => {
++    useProjects.mockReturnValue({ data: undefined, isError: false });
++    const view = render(
++      <NewSessionProjectPrompt paletteOpen={false} closePalette={closePalette} />,
++    );
++    ask();
++
++    expect(rowLabels()).toEqual(["No project"]);
++    expect(screen.getByText("Loading projects…")).toBeTruthy();
++
++    useProjects.mockReturnValue(loaded(PROJECTS));
++    view.rerender(<NewSessionProjectPrompt paletteOpen={false} closePalette={closePalette} />);
++    expect(rowLabels()).toEqual(["No project", "omnigent", "docs site"]);
++  });
++
++  it.each([
++    ["has no project", loaded([])],
++    ["failed to load", { data: undefined, isError: true }],
++  ])("steps aside for the plain composer when the list %s", (_case, projects) => {
++    useProjects.mockReturnValue(projects);
++    renderPrompt();
++    ask();
++
++    expect(screen.queryByRole("dialog")).toBeNull();
++    expect(promptOpen()).toBe(false);
++    expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
++  });
++
++  it("closes without starting anything on Escape", () => {
++    renderPrompt();
++    ask();
++    fireEvent.keyDown(input(), { key: "Escape" });
++
++    expect(promptOpen()).toBe(false);
++    expect(navigate).not.toHaveBeenCalled();
++  });
++
++  it("gives way to the command palette opening over it", () => {
++    const { openPalette } = renderPrompt();
++    ask();
++    openPalette();
++
++    expect(promptOpen()).toBe(false);
++  });
++
++  it("stops asking once the shell unmounts it", () => {
++    renderPrompt();
++    cleanup();
++    startNewSession(navigate);
++
++    expect(promptOpen()).toBe(false);
++    expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
++  });
++});
++
++describe("NewSessionProjectPrompt on phones", () => {
++  beforeEach(() => {
++    mobile = true;
++  });
++
++  it("asks in a sheet with no search field and marks the project in view", () => {
++    location.pathname = "/";
++    location.search = "?project=omnigent";
++    renderPrompt();
++    ask();
++
++    const sheet = screen.getByRole("dialog", { name: "Start a new session in" });
++    expect(sheet.querySelector("input")).toBeNull();
++    const rows = screen.getAllByRole("button").map((row) => row.textContent);
++    expect(rows).toEqual(["No project", "🔥omnigentCurrent", "docs site"]);
++    expect(screen.getByRole("button", { name: /omnigent/ })).toHaveAttribute(
++      "aria-current",
++      "true",
++    );
++  });
++
++  it("opens the composer for the tapped project", () => {
++    renderPrompt();
++    ask();
++    fireEvent.click(screen.getByRole("button", { name: /omnigent/ }));
++
++    expect(navigate).toHaveBeenCalledExactlyOnceWith("/?project=omnigent");
++    expect(promptOpen()).toBe(false);
++  });
++
++  it("opens a project home's project in the composer without asking", () => {
++    location.pathname = "/projects/omnigent";
++    renderPrompt();
++    ask();
++
++    expect(screen.queryByRole("dialog")).toBeNull();
++    expect(navigate).toHaveBeenCalledExactlyOnceWith("/?project=omnigent");
++    expect(useProjectComposerStore.getState().open).toBe(false);
++    expect(promptOpen()).toBe(false);
++  });
++
++  it("opens the plain composer for No project", () => {
++    renderPrompt();
++    ask();
++    fireEvent.click(screen.getByRole("button", { name: "No project" }));
++
++    expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
++  });
++});
+diff --git a/web/src/shell/NewSessionProjectPrompt.tsx b/web/src/shell/NewSessionProjectPrompt.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ce7e804e136461bb2aa8c02f1ccbcec4246e465
+--- /dev/null
++++ b/web/src/shell/NewSessionProjectPrompt.tsx
+@@ -0,0 +1,185 @@
++// Asks which project a new session belongs to, for the store's entry points: a picker on
++// desktop, and on phones a bottom sheet with no search field, so the keyboard stays down.
++// On a project's home it doesn't ask: the session starts in that project.
++
++import { useCallback, useEffect, useState } from "react";
++import { CircleSlashIcon } from "lucide-react";
++
++import { type QuickPickItem, QuickPickDialog } from "@/components/ui/quick-pick";
++import { type ProjectSummary, useProjects } from "@/hooks/useConversations";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import { useLocation, useNavigate } from "@/lib/routing";
++import { useProjectComposerStore } from "@/projectHome/ProjectHomeHeader";
++import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
++import {
++  closeNewSessionProjectPrompt,
++  useNewSessionProjectPromptStore,
++} from "@/store/newSessionProjectPrompt";
++
++import { NewSessionProjectSheet } from "./NewSessionProjectSheet";
++import { ProjectRowIcon } from "./ProjectPicker";
++
++const NO_PROJECTS: readonly ProjectSummary[] = [];
++const NO_PROJECT_ROW_ID = "no-project";
++const projectRowId = (projectName: string) => `project:${projectName}`;
++
++/** Where a new session starts: the composer with `projectName`'s defaults, or the plain one. */
++export function newSessionPath(projectName: string | null): string {
++  return projectName === null ? "/" : `/?project=${encodeURIComponent(projectName)}`;
++}
++
++/** The project the user is already in: its home page, or the composer filed under it. */
++export function projectInView(pathname: string, search: string): string | null {
++  return projectNameFromHomePath(pathname) ?? new URLSearchParams(search).get("project");
++}
++
++export interface NewSessionProjectPromptProps {
++  /** The command palette is open; it and the prompt replace each other rather than stacking. */
++  paletteOpen: boolean;
++  closePalette: () => void;
++}
++
++/** Mount once, inside the app shell. */
++export function NewSessionProjectPrompt({
++  paletteOpen,
++  closePalette,
++}: NewSessionProjectPromptProps) {
++  const open = useNewSessionProjectPromptStore((state) => state.open);
++  const isMobile = useIsMobileViewport();
++  const navigate = useNavigate();
++  const { pathname, search } = useLocation();
++  const { data: projects, isError } = useProjects();
++  const setProjectComposerOpen = useProjectComposerStore((state) => state.setOpen);
++
++  useEffect(() => {
++    useNewSessionProjectPromptStore.setState({ hosted: true });
++    return () => useNewSessionProjectPromptStore.setState({ open: false, hosted: false });
++  }, []);
++  // Whichever of the two opened last stays.
++  useEffect(() => {
++    if (open) closePalette();
++    // oxlint-disable-next-line react-hooks/exhaustive-deps -- only as the prompt opens.
++  }, [open]);
++  useEffect(() => {
++    if (paletteOpen) closeNewSessionProjectPrompt();
++  }, [paletteOpen]);
++
++  const homeProject = projectNameFromHomePath(pathname);
++  const start = useCallback(
++    (projectName: string | null) => {
++      closeNewSessionProjectPrompt();
++      // On that project's home, as its New session button: the composer over the board.
++      if (projectName !== null && projectName === homeProject && !isMobile) {
++        setProjectComposerOpen(true);
++      } else {
++        navigate(newSessionPath(projectName));
++      }
++    },
++    [homeProject, isMobile, navigate, setProjectComposerOpen],
++  );
++
++  // Nothing to ask on a project's home, which takes the session, or with no project to choose.
++  const nothingToOffer = projects ? projects.length === 0 : isError;
++  const startUnasked = homeProject !== null || nothingToOffer;
++  useEffect(() => {
++    if (open && startUnasked) start(homeProject);
++  }, [open, startUnasked, homeProject, start]);
++
++  const shown = open && !startUnasked;
++  const prompt = {
++    open: shown,
++    onOpenChange: (next: boolean) => {
++      if (!next) closeNewSessionProjectPrompt();
++    },
++    projects: projects ?? NO_PROJECTS,
++    loading: projects === undefined,
++    currentProject: projectInView(pathname, search),
++    onStart: start,
++  };
++  return isMobile ? (
++    <NewSessionProjectSheet {...prompt} />
++  ) : (
++    <NewSessionProjectPicker {...prompt} />
++  );
++}
++
++export interface NewSessionProjectChoiceProps {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++  projects: readonly ProjectSummary[];
++  /** The project list hasn't arrived; its rows are listed as it does. */
++  loading: boolean;
++  /** The project in view, which the prompt marks as the likely choice. */
++  currentProject: string | null;
++  /** Start the session in `projectName`, or in no project for null. */
++  onStart: (projectName: string | null) => void;
++}
++
++function NewSessionProjectPicker({
++  open,
++  onOpenChange,
++  projects,
++  loading,
++  currentProject,
++  onStart,
++}: NewSessionProjectChoiceProps) {
++  const [query, setQuery] = useState("");
++  // The project in view starts active, so Enter starts the session there.
++  const [activeId, setActiveId] = useState<string | null>(null);
++  useEffect(() => {
++    if (!open) return;
++    setQuery("");
++    setActiveId(
++      currentProject !== null && projects.some((project) => project.name === currentProject)
++        ? projectRowId(currentProject)
++        : null,
++    );
++    // oxlint-disable-next-line react-hooks/exhaustive-deps -- set once per opening.
++  }, [open]);
++
++  const items: QuickPickItem<string | null>[] = [
++    {
++      id: NO_PROJECT_ROW_ID,
++      label: "No project",
++      icon: <CircleSlashIcon aria-hidden className="size-4 text-muted-foreground" />,
++      value: null,
++    },
++    ...projects.map((project) => ({
++      id: projectRowId(project.name),
++      label: project.name,
++      icon: <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />,
++      detail: project.name === currentProject ? "Current project" : undefined,
++      value: project.name,
++    })),
++  ];
++
++  return (
++    <QuickPickDialog<string | null>
++      open={open}
++      onOpenChange={onOpenChange}
++      title="New session"
++      description="Choose the project the new session belongs to, or No project."
++      label="New session"
++      placeholder="Start a new session in…"
++      segments={[{ sourceId: "projects", ranking: "client", fuzzyMatching: "words", items }]}
++      query={query}
++      onQueryChange={(next) => {
++        setActiveId(null);
++        setQuery(next);
++      }}
++      activeId={activeId}
++      onActiveIdChange={() => setActiveId(null)}
++      // Once the picker has closed, so the composer it opens keeps the focus.
++      onAccept={(item) => ({ afterClose: () => onStart(item.value) })}
++      status={
++        loading ? (
++          <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
++            Loading projects…
++          </p>
++        ) : undefined
++      }
++      emptyMessage="No matching projects"
++      inputTestId="new-session-project-input"
++    />
++  );
++}
+diff --git a/web/src/shell/NewSessionProjectSheet.tsx b/web/src/shell/NewSessionProjectSheet.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..552cd89cb0d15cdbdc86d9ed9ec086b988d7804f
+--- /dev/null
++++ b/web/src/shell/NewSessionProjectSheet.tsx
+@@ -0,0 +1,80 @@
++// Phone form of the new-session project prompt: a bottom sheet listing No project and
++// every project, without a search field so the keyboard stays down.
++
++import type React from "react";
++import { CircleSlashIcon } from "lucide-react";
++
++import { BottomSheet, BottomSheetContent } from "@/components/ui/bottom-sheet";
++import { cn } from "@/lib/utils";
++
++import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
++import type { NewSessionProjectChoiceProps } from "./NewSessionProjectPrompt";
++import { ProjectRowIcon } from "./ProjectPicker";
++
++function SheetRow({
++  icon,
++  label,
++  current = false,
++  onClick,
++}: {
++  icon: React.ReactNode;
++  label: string;
++  /** The project in view. */
++  current?: boolean;
++  onClick: () => void;
++}) {
++  return (
++    <button
++      type="button"
++      onClick={onClick}
++      aria-current={current ? "true" : undefined}
++      className={cn(
++        "flex min-h-12 w-full items-center gap-3.5 px-4 text-left text-[17px] text-foreground outline-none active:bg-foreground/[0.06] focus-visible:bg-foreground/[0.06]",
++        current && "font-medium",
++      )}
++    >
++      {icon}
++      <span className="min-w-0 flex-1 truncate">{label}</span>
++      {current && <span className="shrink-0 text-[15px] text-muted-foreground">Current</span>}
++    </button>
++  );
++}
++
++export function NewSessionProjectSheet({
++  open,
++  onOpenChange,
++  projects,
++  loading,
++  currentProject,
++  onStart,
++}: NewSessionProjectChoiceProps) {
++  return (
++    <BottomSheet open={open} onOpenChange={onOpenChange}>
++      <BottomSheetContent title="Start a new session in" className={MOBILE_GLASS_SURFACE}>
++        <div className="min-h-0 overflow-y-auto overscroll-contain px-2 pb-2">
++          <div className="flex flex-col divide-y divide-border overflow-hidden rounded-2xl bg-foreground/[0.04]">
++            <SheetRow
++              icon={<CircleSlashIcon aria-hidden="true" className="size-5 text-muted-foreground" />}
++              label="No project"
++              onClick={() => onStart(null)}
++            />
++            {projects.map((project) => (
++              <SheetRow
++                key={project.name}
++                icon={<ProjectRowIcon icon={project.icon} className="size-5 text-[18px]" />}
++                label={project.name}
++                current={project.name === currentProject}
++                onClick={() => onStart(project.name)}
++              />
++            ))}
++            {loading && (
++              <p role="status" className="px-4 py-3 text-[15px] text-muted-foreground">
++                Loading projects…
++              </p>
++            )}
++          </div>
++        </div>
++      </BottomSheetContent>
++    </BottomSheet>
++  );
++}
+diff --git a/web/src/shell/Sidebar.newSessionPrompt.test.tsx b/web/src/shell/Sidebar.newSessionPrompt.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3b1f7a875908821c69a13e9f00d773984ef8f07
+--- /dev/null
++++ b/web/src/shell/Sidebar.newSessionPrompt.test.tsx
+@@ -0,0 +1,87 @@
++// The sidebar's New session links hand a plain click to the project prompt
++// (store/newSessionProjectPrompt.test.ts covers which clicks it takes).
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { MemoryRouter, useLocation } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
++vi.mock("@/hooks/useConversations", async () => {
++  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
++  return conversationHooksMock();
++});
++vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
++
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { useConversations } from "@/hooks/useConversations";
++import { SidebarDataProvider } from "@/hooks/useSidebarData";
++import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
++import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
++import { useNewSessionProjectPromptStore } from "@/store/newSessionProjectPrompt";
++import { conversationPage } from "@/test/sidebarMockHelpers";
++
++import { Sidebar } from "./Sidebar";
++
++function CurrentPath() {
++  return <output data-testid="current-path">{useLocation().pathname}</output>;
++}
++
++function renderSidebar() {
++  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  render(
++    <QueryClientProvider client={queryClient}>
++      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
++        <SidebarDataProvider>
++          <TooltipProvider>
++            <MemoryRouter initialEntries={["/c/conv_1"]}>
++              <Sidebar open={true} onClose={vi.fn()} />
++              <CurrentPath />
++            </MemoryRouter>
++          </TooltipProvider>
++        </SidebarDataProvider>
++      </CapabilitiesProvider>
++    </QueryClientProvider>,
++  );
++}
++
++const promptOpen = () => useNewSessionProjectPromptStore.getState().open;
++const currentPath = () => screen.getByTestId("current-path").textContent;
++
++beforeEach(() => {
++  const noSessions = conversationPage([]);
++  vi.mocked(useConversations).mockImplementation(() => noSessions);
++});
++afterEach(() => {
++  cleanup();
++  useNewSessionProjectPromptStore.setState({ open: false, hosted: false });
++  localStorage.clear();
++});
++
++describe("Sidebar New session links", () => {
++  it.each(["new-chat-button", "sessions-new-session"])(
++    "%s asks for a project on a plain click, and still opens a new tab on a modified one",
++    (testId) => {
++      useNewSessionProjectPromptStore.setState({ hosted: true });
++      renderSidebar();
++      const link = screen.getByTestId(testId).closest("a") ?? screen.getByTestId(testId);
++
++      // The browser opens the new tab: nothing here prevents the click.
++      expect(fireEvent.click(link, { metaKey: true })).toBe(true);
++      expect(promptOpen()).toBe(false);
++
++      fireEvent.click(link);
++      expect(promptOpen()).toBe(true);
++      expect(currentPath()).toBe("/c/conv_1");
++    },
++  );
++
++  it("follows the link where no shell mounts the prompt", () => {
++    renderSidebar();
++
++    fireEvent.click(screen.getByTestId("new-chat-button"));
++
++    expect(promptOpen()).toBe(false);
++    expect(currentPath()).toBe("/");
++  });
++});
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index e11eaffeb1cac83e1221c962082e7fcf51ef0d47..444b23ef7207d9f699eaa2c3ee3423d06bf87650 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -303,6 +303,7 @@ import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/c
+ import { NewProjectButton } from "./NewProjectButton";
+ import { SessionImportStatus } from "./SessionImportStatus";
+ import { useSessionImportStore } from "@/store/sessionImport";
++import { askForProjectOnNewSessionClick } from "@/store/newSessionProjectPrompt";
+ import { useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
+ import { SettingsSidebar } from "./settingsSearch/SettingsSidebar";
+ import {
+@@ -1495,6 +1496,7 @@ function SidebarImpl({
+                   onClick={(e) => {
+                     switchTab("mine");
+                     onNavClick(e);
++                    askForProjectOnNewSessionClick(e);
+                   }}
+                 >
+                   <MessageCirclePlusIcon
+@@ -3589,6 +3591,7 @@ function ConversationList({
+                 event.stopPropagation();
+                 onActiveTabChange("mine");
+                 onRowClick(event);
++                askForProjectOnNewSessionClick(event);
+               }}
+             >
+               <MessageCirclePlusIcon className="size-3.5" />
+diff --git a/web/src/shell/appCommands.test.tsx b/web/src/shell/appCommands.test.tsx
+index 2c37c187f3414e49cf49bdfe2d45a50619a33df5..b094df8cc708a0c5be55f291517edf88edb14929 100644
+--- a/web/src/shell/appCommands.test.tsx
++++ b/web/src/shell/appCommands.test.tsx
+@@ -1,5 +1,5 @@
+ import { renderHook } from "@testing-library/react";
+-import { beforeEach, describe, expect, it, vi } from "vitest";
++import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+ 
+ const navigate = vi.fn();
+ vi.mock("@/lib/routing", () => ({
+@@ -8,6 +8,7 @@ vi.mock("@/lib/routing", () => ({
+ }));
+ 
+ import { SHORTCUT_BINDINGS, type ShortcutId, shortcutKeys } from "@/lib/shortcuts/registry";
++import { useNewSessionProjectPromptStore } from "@/store/newSessionProjectPrompt";
+ 
+ import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
+ import { type OpenSessionCommandId, openSessionCommands } from "./openSessionCommands";
+@@ -44,6 +45,18 @@ describe("useAppCommands", () => {
+     expect(navigate.mock.calls).toEqual([["/inbox"], ["/settings"]]);
+   });
+ 
++  it("starts New chat on the plain composer, or on the project prompt where it's mounted", () => {
++    const newChat = () => commands().find((command) => command.id === "new-chat")!;
++    newChat().run();
++    expect(navigate.mock.calls).toEqual([["/"]]);
++
++    useNewSessionProjectPromptStore.setState({ hosted: true });
++    onTestFinished(() => useNewSessionProjectPromptStore.setState({ open: false, hosted: false }));
++    newChat().run();
++    expect(useNewSessionProjectPromptStore.getState().open).toBe(true);
++    expect(navigate.mock.calls).toEqual([["/"]]);
++  });
++
+   it("drops the workspace sidebar's chord where the route owns it", () => {
+     const toggle = (enabled: boolean) =>
+       commands(enabled).find((command) => command.id === "toggle-right-sidebar")!;
+diff --git a/web/src/shell/appCommands.ts b/web/src/shell/appCommands.ts
+index 95de8604a4cff1c86692ad1409f75790f55bc634..3f17cf8a0271f440b1c1e7768d9f6b578f8c3a5d 100644
+--- a/web/src/shell/appCommands.ts
++++ b/web/src/shell/appCommands.ts
+@@ -22,6 +22,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { useLocation, useNavigate } from "@/lib/routing";
+ import { useSettingsRoute } from "@/shell/settingsNav";
+ import { settingsSearchCommand } from "@/shell/settingsSearch/settingsSearchCommand";
++import { startNewSession } from "@/store/newSessionProjectPrompt";
+ 
+ export interface ActionCommand {
+   id: string;
+@@ -61,7 +62,7 @@ export function useAppCommands({
+         label: "New chat",
+         icon: SquarePenIcon,
+         keywords: ["compose", "start", "new session"],
+-        run: () => navigate("/"),
++        run: () => startNewSession(navigate),
+         shortcut: newSessionShortcutKeys(),
+       },
+       {
+diff --git a/web/src/store/newSessionProjectPrompt.test.ts b/web/src/store/newSessionProjectPrompt.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..68ca20e858a5f02364fbc093362f8b207ae3955e
+--- /dev/null
++++ b/web/src/store/newSessionProjectPrompt.test.ts
+@@ -0,0 +1,93 @@
++import type { MouseEvent } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import { writeNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPreferences";
++
++import {
++  askForProjectOnNewSessionClick,
++  startNewSession,
++  useNewSessionProjectPromptStore,
++} from "./newSessionProjectPrompt";
++
++const promptOpen = () => useNewSessionProjectPromptStore.getState().open;
++
++function click(init: Partial<MouseEvent<HTMLAnchorElement>> = {}) {
++  const event = {
++    button: 0,
++    defaultPrevented: false,
++    metaKey: false,
++    ctrlKey: false,
++    shiftKey: false,
++    altKey: false,
++    preventDefault: vi.fn(),
++    ...init,
++  };
++  askForProjectOnNewSessionClick(event as unknown as MouseEvent<HTMLAnchorElement>);
++  return event;
++}
++
++beforeEach(() => useNewSessionProjectPromptStore.setState({ open: false, hosted: true }));
++afterEach(() => {
++  useNewSessionProjectPromptStore.setState({ open: false, hosted: false });
++  localStorage.clear();
++});
++
++describe("startNewSession", () => {
++  it("asks for a project instead of navigating", () => {
++    const navigate = vi.fn();
++    startNewSession(navigate);
++
++    expect(promptOpen()).toBe(true);
++    expect(navigate).not.toHaveBeenCalled();
++  });
++
++  it("opens the plain composer when the prompt is turned off", () => {
++    writeNewChatProjectPromptEnabled(false);
++    const navigate = vi.fn();
++    startNewSession(navigate);
++
++    expect(promptOpen()).toBe(false);
++    expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
++  });
++
++  it("opens the plain composer where no shell mounts the prompt", () => {
++    useNewSessionProjectPromptStore.setState({ hosted: false });
++    const navigate = vi.fn();
++    startNewSession(navigate);
++
++    expect(promptOpen()).toBe(false);
++    expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
++  });
++});
++
++describe("askForProjectOnNewSessionClick", () => {
++  it("takes a plain click from the link", () => {
++    const event = click();
++
++    expect(event.preventDefault).toHaveBeenCalledTimes(1);
++    expect(promptOpen()).toBe(true);
++  });
++
++  it.each([
++    { metaKey: true },
++    { ctrlKey: true },
++    { shiftKey: true },
++    { altKey: true },
++    { button: 1 },
++  ])("leaves a modified click %o to the link, which opens a new tab", (init) => {
++    const event = click(init);
++
++    expect(event.preventDefault).not.toHaveBeenCalled();
++    expect(promptOpen()).toBe(false);
++  });
++
++  it("leaves the link alone when the prompt is off or not mounted", () => {
++    writeNewChatProjectPromptEnabled(false);
++    expect(click().preventDefault).not.toHaveBeenCalled();
++
++    writeNewChatProjectPromptEnabled(true);
++    useNewSessionProjectPromptStore.setState({ hosted: false });
++    expect(click().preventDefault).not.toHaveBeenCalled();
++    expect(promptOpen()).toBe(false);
++  });
++});
+diff --git a/web/src/store/newSessionProjectPrompt.ts b/web/src/store/newSessionProjectPrompt.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..00d5e3fa7410b10a832cad718367fefe265e3edd
+--- /dev/null
++++ b/web/src/store/newSessionProjectPrompt.ts
+@@ -0,0 +1,45 @@
++import type { MouseEvent } from "react";
++import { create } from "zustand";
++
++import { readNewChatProjectPromptEnabled } from "@/lib/newChatProjectPromptPreferences";
++
++// The "Start a new session in…" project prompt, and the entry points that open it: the
++// new-session shortcut, the sidebar's New session links and ⌘K's New chat.
++
++interface NewSessionProjectPromptState {
++  open: boolean;
++  /** The app shell has mounted the prompt; without it, a new session starts unasked. */
++  hosted: boolean;
++}
++
++export const useNewSessionProjectPromptStore = create<NewSessionProjectPromptState>(() => ({
++  open: false,
++  hosted: false,
++}));
++
++export function closeNewSessionProjectPrompt(): void {
++  useNewSessionProjectPromptStore.setState({ open: false });
++}
++
++/** Opens the prompt if it's on and mounted; false means the caller starts the session itself. */
++function askForProject(): boolean {
++  if (!useNewSessionProjectPromptStore.getState().hosted) return false;
++  if (!readNewChatProjectPromptEnabled()) return false;
++  useNewSessionProjectPromptStore.setState({ open: true });
++  return true;
++}
++
++/** Start a new session: ask for its project first, or open the plain composer. */
++export function startNewSession(navigate: (to: string) => void): void {
++  if (!askForProject()) navigate("/");
++}
++
++/**
++ * For a New session link's `onClick`: a plain click asks for a project instead of following
++ * the link. Modified clicks still open the composer in a new tab.
++ */
++export function askForProjectOnNewSessionClick(event: MouseEvent<HTMLAnchorElement>): void {
++  if (event.defaultPrevented || event.button !== 0) return;
++  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
++  if (askForProject()) event.preventDefault();
++}

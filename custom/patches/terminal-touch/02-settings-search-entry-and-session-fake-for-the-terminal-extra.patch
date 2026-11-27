@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 05:10:21 +0000
+Subject: [PATCH] fix(web): Settings search entry and session fake for the
+ terminal extra-keys row
+
+The carried extra-keys row does not pass the web tests on current main:
+
+- Its Extra keys row select in Settings > Appearance is left out of the
+  Settings search catalog and exempted in the unowned-controls baseline
+  instead. Settings search cannot find it, and the rendered-page guard
+  (settingsPageAudit.test.tsx: every control has an owner in the catalog)
+  fails on it.
+- The terminal view now calls setInputTransform on every session it
+  attaches, which the fake session in terminalPaneMoves.lifecycle.test.tsx
+  lacks, so that file ends with unhandled rejections.
+
+The select now belongs to a catalog entry, `terminal-extra-keys`: the row
+takes its label, description and choices from it, search finds it by
+"terminal", "touch" or a key name, and the three baseline exemptions go.
+The fake session gains the method.
+
+Not proposed upstream yet: both changes belong in the carried pull request,
+https://github.com/omnigent-ai/omnigent/pull/6136, whose own CI fails on
+them; drop this copy with the carried patch once that merges.
+
+Docs: none (the setting is documented with the extra-keys row; this only lets Settings search find it)
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ web/src/pages/SettingsPage.tsx                | 67 ++++++++++---------
+ .../settings/search/catalog/appearance.ts     | 12 ++++
+ .../search/settingsUnownedBaseline.ts         | 12 ----
+ .../terminalPaneMoves.lifecycle.test.tsx      |  1 +
+ 4 files changed, 50 insertions(+), 42 deletions(-)
+
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index 001e66635e87a639f4ec72ea95480d5cee97b0bb..98e17ed2d945e1d23d2a675d87c3402bd66f2643 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -38,7 +38,6 @@ import {
+   Suspense,
+   useCallback,
+   useEffect,
+-  useId,
+   useMemo,
+   useRef,
+   useState,
+@@ -130,6 +129,7 @@ import {
+   PEER_SESSION_MESSAGES_ENTRY,
+   SHOW_FINAL_ANSWER_ENTRY,
+   PANE_CORNERS_ENTRY,
++  TERMINAL_EXTRA_KEYS_ENTRY,
+   TERMINAL_THEME_ENTRY,
+   THEME_MODE_ENTRY,
+   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
+@@ -776,13 +776,15 @@ function PaneCornersRow() {
+ function TerminalExtraKeysControl() {
+   const isDark = useResolvedThemeMode() === "dark";
+   const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
+-  const labelId = useId();
+   const choose = useCallback((next: TerminalExtraKeysMode) => {
+     setMode(next);
+     writeTerminalExtraKeysMode(next);
+   }, []);
+   return (
+-    <div className="overflow-hidden rounded-xl border bg-card/55">
++    <SettingsItem
++      entry={TERMINAL_EXTRA_KEYS_ENTRY}
++      className="overflow-hidden rounded-xl border bg-card/55"
++    >
+       <div className="flex flex-col gap-3 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+         <div className="flex min-w-0 items-center gap-3">
+           <div
+@@ -795,39 +797,44 @@ function TerminalExtraKeysControl() {
+             />
+           </div>
+           <div className="min-w-0">
+-            <div id={labelId} className="text-ui font-medium">
+-              Extra keys row
++            <div id={settingsLabelId(TERMINAL_EXTRA_KEYS_ENTRY)} className="text-ui font-medium">
++              {TERMINAL_EXTRA_KEYS_ENTRY.label}
+             </div>
+-            <div className="text-sm text-muted-foreground">
+-              Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.
++            <div
++              id={settingsDescriptionId(TERMINAL_EXTRA_KEYS_ENTRY)}
++              className="text-sm text-muted-foreground"
++            >
++              {TERMINAL_EXTRA_KEYS_ENTRY.description}
+             </div>
+           </div>
+         </div>
+-        <Select
+-          value={mode}
+-          onValueChange={(next) => {
+-            if (isTerminalExtraKeysMode(next)) choose(next);
+-          }}
+-          componentId="settings.appearance.terminal_extra_keys"
+-          valueHasNoPii
+-        >
+-          <SelectTrigger
+-            aria-labelledby={labelId}
+-            data-testid="terminal-extra-keys-select"
+-            className="w-full shrink-0 sm:w-48"
++        <SettingsOwner entry={TERMINAL_EXTRA_KEYS_ENTRY}>
++          <Select
++            value={mode}
++            onValueChange={(next) => {
++              if (isTerminalExtraKeysMode(next)) choose(next);
++            }}
++            componentId="settings.appearance.terminal_extra_keys"
++            valueHasNoPii
+           >
+-            <SelectValue />
+-          </SelectTrigger>
+-          <SelectContent>
+-            {terminalExtraKeysModes.map((value) => (
+-              <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
+-                {terminalExtraKeysLabels[value]}
+-              </SelectItem>
+-            ))}
+-          </SelectContent>
+-        </Select>
++            <SelectTrigger
++              {...settingsControlProps(TERMINAL_EXTRA_KEYS_ENTRY)}
++              data-testid="terminal-extra-keys-select"
++              className="w-full shrink-0 sm:w-48"
++            >
++              <SelectValue />
++            </SelectTrigger>
++            <SelectContent {...settingsOverlayProps(TERMINAL_EXTRA_KEYS_ENTRY)}>
++              {terminalExtraKeysModes.map((value) => (
++                <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
++                  {terminalExtraKeysLabels[value]}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++        </SettingsOwner>
+       </div>
+-    </div>
++    </SettingsItem>
+   );
+ }
+ 
+diff --git a/web/src/pages/settings/search/catalog/appearance.ts b/web/src/pages/settings/search/catalog/appearance.ts
+index 2db29d982dbfa9f6b265812150449d83617ba6dc..ec1c13a34e2e60387d97a6a0d6a9d54000c9e10e 100644
+--- a/web/src/pages/settings/search/catalog/appearance.ts
++++ b/web/src/pages/settings/search/catalog/appearance.ts
+@@ -116,6 +116,17 @@ export const CODE_FONT_WEIGHT_ENTRY = settingsEntry({
+   focus: "toggle",
+ });
+ 
++export const TERMINAL_EXTRA_KEYS_ENTRY = settingsEntry({
++  id: "terminal-extra-keys",
++  section: "appearance",
++  label: "Extra keys row",
++  description:
++    "Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.",
++  keywords: ["terminal", "touch", "mobile", "phone", "tablet", "keyboard", "escape", "arrows"],
++  // As the select names them.
++  choices: ["Auto (touch devices)", "Always", "Never"],
++});
++
+ export const APPEARANCE_DATA_ENTRY = settingsEntry({
+   id: "appearance-data",
+   section: "appearance",
+@@ -276,6 +287,7 @@ export const APPEARANCE_SETTINGS = [
+   CODE_FONT_SIZE_ENTRY,
+   CODE_FONT_FAMILY_ENTRY,
+   CODE_FONT_WEIGHT_ENTRY,
++  TERMINAL_EXTRA_KEYS_ENTRY,
+   APPEARANCE_DATA_ENTRY,
+   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
+   HIDE_UNCONFIGURED_HARNESSES_ENTRY,
+diff --git a/web/src/pages/settings/search/settingsUnownedBaseline.ts b/web/src/pages/settings/search/settingsUnownedBaseline.ts
+index cbc84de0b01276408d70bad534523c74f1e16dc3..b0a4c1c05c46ca339f31788efde5cc4c6f511b39 100644
+--- a/web/src/pages/settings/search/settingsUnownedBaseline.ts
++++ b/web/src/pages/settings/search/settingsUnownedBaseline.ts
+@@ -46,16 +46,4 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason:
+     reason:
+       "Credential card's button; its control is passed in as a prop, which the guard can't read.",
+   },
+-  "src/pages/SettingsPage.tsx › TerminalExtraKeysControl › SelectContent": {
+-    count: 1,
+-    reason: "added after the Settings catalog; no section entry yet",
+-  },
+-  "src/pages/SettingsPage.tsx › TerminalExtraKeysControl › SelectItem": {
+-    count: 1,
+-    reason: "added after the Settings catalog; no section entry yet",
+-  },
+-  "src/pages/SettingsPage.tsx › TerminalExtraKeysControl › SelectTrigger": {
+-    count: 1,
+-    reason: "added after the Settings catalog; no section entry yet",
+-  },
+ };
+diff --git a/web/src/shell/terminalPaneMoves.lifecycle.test.tsx b/web/src/shell/terminalPaneMoves.lifecycle.test.tsx
+index ed208dec4c050b98b787e620b81c0bc86621e579..27b619f9ec1914c69a31da6dedb0ecb78ea8ee43 100644
+--- a/web/src/shell/terminalPaneMoves.lifecycle.test.tsx
++++ b/web/src/shell/terminalPaneMoves.lifecycle.test.tsx
+@@ -78,6 +78,7 @@ vi.mock("@/components/blocks/TerminalSession", async (importOriginal) => ({
+     setTheme() {}
+     setFont() {}
+     setClipboardEnabled() {}
++    setInputTransform() {}
+     pasteCommand() {
+       return () => {};
+     }
