@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 27 Nov 2026 19:44:33 +0000
+Subject: [PATCH] feat(open-items): let codex-native run the open items tools
+ without a prompt
+
+In Codex's default "Ask for approval" mode, every call to
+sys_open_items_raise, sys_open_items_update and sys_open_items_list stopped
+the turn at an MCP elicitation ("Allow the omnigent MCP server to run tool
+...?"). The instruction asks the agent to raise every question as an item,
+so a session that plans anything stalled on prompts for its own
+bookkeeping.
+
+Add the three names to the tools codex-native pre-approves, the same
+per-tool `approval_mode = "approve"` tables `sys_session_rename` already
+gets. Pre-approval is safe because the tools read and write only the
+calling session's own open items list: the server accepts raises and agent
+updates only from that session's bound runner, and nothing else in the
+session or on the host changes. Every other MCP tool keeps the session's
+approval mode.
+
+Not proposed upstream yet; it goes with the open items tools.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/open-items.md                            |  5 ++++
+ feature-map/open-items.md                     |  1 +
+ omnigent/harnesses/codex_native/app_server.py |  4 +++
+ .../codex_native/app_server/_support.py       |  3 +++
+ .../app_server/test_session_profiles.py       | 26 +++++++++++++++++++
+ 5 files changed, 39 insertions(+)
+
+diff --git a/docs/open-items.md b/docs/open-items.md
+index d59ff995cacfa58f469e61e98df6892f51c5e863..8126cb5479b3caf053c5ba8fe71c3a038e1f7785 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -71,6 +71,11 @@ item.
+   **codex-native**, **pi-native**, **antigravity-native** and **hermes** get
+   them through the Omnigent tool relay, like the Inbox tools. Native harnesses
+   without the relay never see them and keep the text-label instruction.
++- **codex-native** pre-approves the three tools (`approval_mode = "approve"`
++  in the session's generated Codex config, like `sys_session_rename`), so
++  Codex never stops a turn to ask before raising, updating or listing items.
++  They reach only the session's own items. Other MCP tools still follow the
++  session's Codex approval mode.
+ - The runner keeps the group only when the server says, on the agent bundle
+   download, that it stores open items (`X-Omnigent-Open-Items: 1`). A server
+   without this feature sends no such header, so its sessions keep the
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index 83fce6a7ff2fbf7d909327786081fc5f33f0c69d..0249c3f16dcb107f6538938c1ce1477762483dbe 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -26,6 +26,7 @@ Preconditions: a local server and runner from this checkout; any harness.
+ - Store (labels under concurrency, retries, imported labels, caps, close and reopen, reply threads, list filters, session delete, the migration that drops the retired chat notes table): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
+ - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
+ - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
++- Codex approval: `tests/harnesses/codex_native/app_server/test_session_profiles.py::test_the_open_items_tools_run_without_a_prompt_and_no_other_tool_is_added`.
+ - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`, `::test_stored_items_guidance_names_the_tools_and_never_strikes_labels`.
+ - Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row with a `reply`, and the item `closed` with `closed_by: agent` and the reply in its `replies` in the API. The agent does not strike labels.
+ 
+diff --git a/omnigent/harnesses/codex_native/app_server.py b/omnigent/harnesses/codex_native/app_server.py
+index 4da094951358adf63f6be6f98d08da619f08bfee..618cbe2069e9f152f60b7e48ec46ca05bcd028c2 100644
+--- a/omnigent/harnesses/codex_native/app_server.py
++++ b/omnigent/harnesses/codex_native/app_server.py
+@@ -323,6 +323,10 @@ _FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+     "sys_session_rename",
+     "sys_scheduled_task_create",
+     "sys_scheduled_task_update",
++    # Read and write only the calling session's own open items list.
++    "sys_open_items_raise",
++    "sys_open_items_update",
++    "sys_open_items_list",
+ )
+ 
+ #: Additionally pre-approved for an auto-harness Smart Routing session, whose
+diff --git a/tests/harnesses/codex_native/app_server/_support.py b/tests/harnesses/codex_native/app_server/_support.py
+index 1950ff3736a03db2100425ec1c5d7b1e3d4359b8..aff63cc44ed59305c51e2a3fd67314d9624d26d0 100644
+--- a/tests/harnesses/codex_native/app_server/_support.py
++++ b/tests/harnesses/codex_native/app_server/_support.py
+@@ -21,6 +21,9 @@ _PLAIN_TOOL_APPROVALS = {
+     "sys_session_rename": {"approval_mode": "approve"},
+     "sys_scheduled_task_create": {"approval_mode": "approve"},
+     "sys_scheduled_task_update": {"approval_mode": "approve"},
++    "sys_open_items_raise": {"approval_mode": "approve"},
++    "sys_open_items_update": {"approval_mode": "approve"},
++    "sys_open_items_list": {"approval_mode": "approve"},
+ }
+ 
+ 
+diff --git a/tests/harnesses/codex_native/app_server/test_session_profiles.py b/tests/harnesses/codex_native/app_server/test_session_profiles.py
+index 4ad004591241ff9bd10694cc721792c3ea155609..4fbb3e9e433088046161727dee5e764d5f64f67c 100644
+--- a/tests/harnesses/codex_native/app_server/test_session_profiles.py
++++ b/tests/harnesses/codex_native/app_server/test_session_profiles.py
+@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
+ from omnigent.harnesses.codex_native.app_server import (
+     _FRAMEWORK_APPROVED_TOOLS,
+     _build_native_codex_app_server_argv,
++    _codex_mcp_server_config_section,
+     framework_approved_tools,
+ )
+ from omnigent.inner.codex_executor import (
+@@ -32,6 +33,9 @@ _ROUTED_TOOL_APPROVALS = {
+     "sys_scheduled_task_create": {"approval_mode": "approve"},
+     "sys_scheduled_task_update": {"approval_mode": "approve"},
+     "sys_session_rename": {"approval_mode": "approve"},
++    "sys_open_items_raise": {"approval_mode": "approve"},
++    "sys_open_items_update": {"approval_mode": "approve"},
++    "sys_open_items_list": {"approval_mode": "approve"},
+     "sys_session_create": {"approval_mode": "approve"},
+     "sys_agent_list": {"approval_mode": "approve"},
+     "sys_session_send": {"approval_mode": "approve"},
+@@ -47,6 +51,28 @@ def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
+     assert set(_FRAMEWORK_APPROVED_TOOLS) <= set(_ROUTED_TOOL_APPROVALS)
+ 
+ 
++def test_the_open_items_tools_run_without_a_prompt_and_no_other_tool_is_added(
++    tmp_path: Path,
++) -> None:
++    from omnigent.tools.builtins.open_items import OPEN_ITEMS_TOOL_NAMES
++
++    section = tomllib.loads(_codex_mcp_server_config_section(tmp_path))
++    approvals = section["mcp_servers"]["omnigent"]["tools"]
++
++    # Exactly the three tool names, so a renamed tool shows up here.
++    assert OPEN_ITEMS_TOOL_NAMES == {
++        "sys_open_items_raise",
++        "sys_open_items_update",
++        "sys_open_items_list",
++    }
++    assert all(approvals[name] == {"approval_mode": "approve"} for name in OPEN_ITEMS_TOOL_NAMES)
++    assert set(approvals) - OPEN_ITEMS_TOOL_NAMES == {
++        "sys_session_rename",
++        "sys_scheduled_task_create",
++        "sys_scheduled_task_update",
++    }
++
++
+ # ── The codex-native session classes ────────────────────────────────
+ #
+ # Everything below is a per-class snapshot of the private CODEX_HOME a
