@@ -1,7 +1,7 @@
 # link-rules
 
 Needs: chat-item-labels
-Covers: 42090a4e68f7522f
+Covers: 251ea4e855b6687b
 
 Short references in chat messages (`BST-2135`, `PR #123`, `!123`,
 `owner/repo#123`, `session:<id>`) render as links, from rules each user sets in
@@ -39,6 +39,7 @@ already links; while any rule is on, the rules take the place of the built-in
 - No `git` rule links a bare `#123`, on any provider, and none guesses a repository for it: with rules on or off it follows upstream's built-in links, to the one pull request the session links with that number, else text. A `url` rule that matches a bare `#123` still links it, and a qualified reference no rule links stays text while any rule is on.
 - Every `sys_link_rules` `add`, `update` and `remove` waits for the user's approval even when no other policy applies (`__ask_on_link_rule_change`); `list` is not gated, and `tool_groups.link_rules: false` removes the tool.
 - Agents are told each enabled rule's syntax in one framework instruction, with the `issue #123` / `PR #123` sentence only when the workspace is a git checkout and no instruction when every rule is off. SDK harnesses get it per turn; native Claude and Codex get it at launch only.
+- Looking up the workspace's remote never holds an SDK turn for long: outside a checkout nothing is looked up, a workspace's first turn waits at most a second, and later turns use the last lookup while one older than a minute is redone in the background.
 
 ## Key code
 
@@ -47,6 +48,7 @@ already links; while any rule is on, the rules take the place of the built-in
 - `web/src/lib/linkRules.ts`: `compileLinkRules`, `remarkLinkRules`, `findLinks`, `sessionGitRule`
 - `omnigent/runner/tool_dispatch.py`: `_execute_link_rules_tool`, `_changed_link_rules` (the approval policy, ask_on_link_rule_change, is in the built-in safety policies)
 - `omnigent/runtime/prompt.py`: `link_rule_instructions`, `build_native_startup_instructions`, `is_git_checkout`
+- `omnigent/runner/pr_resource.py`: `workspace_git`, `WorkspaceGitCache`
 
 ## Tests
 
@@ -54,4 +56,5 @@ already links; while any rule is on, the rules take the place of the built-in
 - `tests/server/routes/test_link_rules.py::test_stale_version_is_refused_without_storing_a_conflict`
 - `tests/runner/test_link_rules_tool_dispatch.py::test_every_change_asks_and_listing_does_not`
 - `tests/runtime/test_prompt.py::test_git_wording_only_in_a_git_checkout`
+- `tests/runner/test_pr_resource.py::test_workspace_git_cache_serves_the_last_remote_while_it_refreshes`
 - `web/src/components/blocks/ChatMarkdown.linkRules.test.tsx` ("chat link rules": where links apply and how git references resolve)

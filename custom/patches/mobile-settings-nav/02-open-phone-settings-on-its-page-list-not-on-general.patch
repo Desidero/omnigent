@@ -1,0 +1,799 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 21:39:40 +0000
+Subject: [PATCH] feat(web): open phone Settings on its page list, not on
+ General
+
+Where the Settings menu covers the page (phones, and tablets held
+upright), tapping the cog opened General and laid the menu drawer over
+it: bare /settings redirected to General, and the drawer stayed open
+over it with only a 56px strip of the page showing. Pages reached with
+the drawer open, such as from a link in it, also opened under the menu.
+Users read that as Settings jumping into General with the menu in the
+way.
+
+There, bare /settings now stays the page list: the route renders no
+page, and the menu shows full width with no strip to tap and no swipe to
+close. Choosing a page opens it with the menu closed, and so does any
+other way onto a page (a deep link, a link elsewhere in the app, a
+reload, or a tablet turned upright while the menu sat beside the page).
+On a page the header's menu toggle becomes a Back chevron to the list,
+which goes back through history when the page was opened from the list
+and otherwise replaces the page with the list. The list marks no row as
+current.
+
+The desktop layout and the docked mobile layout (600px or wider at a
+squarish or wider aspect) keep upstream's behaviour: bare /settings
+opens General beside the menu, which leaves the page in view.
+
+Not proposed upstream yet: upstream's shell deliberately keeps the phone
+Settings menu open at bare /settings, so changing what it opens on is a
+design question to raise there first.
+
+Docs: none (phone Settings navigation; nothing to configure)
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ web/src/App.test.tsx                        | 52 +++++++++--
+ web/src/App.tsx                             | 17 +++-
+ web/src/hooks/useAtSettingsRoot.ts          |  9 ++
+ web/src/shell/AppShell.test.tsx             | 87 +++++++++++++++++-
+ web/src/shell/AppShell.tsx                  | 20 +++--
+ web/src/shell/ChatHeader.test.tsx           | 15 ++++
+ web/src/shell/ChatHeader.tsx                | 19 +++-
+ web/src/shell/Sidebar.mobileDrawer.test.tsx | 37 +++++++-
+ web/src/shell/Sidebar.tsx                   | 11 ++-
+ web/src/shell/settingsNav.test.tsx          | 99 ++++++++++++++++++++-
+ web/src/shell/settingsNav.tsx               | 24 ++++-
+ 11 files changed, 359 insertions(+), 31 deletions(-)
+ create mode 100644 web/src/hooks/useAtSettingsRoot.ts
+
+diff --git a/web/src/App.test.tsx b/web/src/App.test.tsx
+index 7de79f77072e68959537e060db100e5dc6b140fa..acfdafbabd43966c3fd72f9e91f74be1f45cc644 100644
+--- a/web/src/App.test.tsx
++++ b/web/src/App.test.tsx
+@@ -10,15 +10,19 @@ vi.mock("@/lib/analytics", () => ({
+   useOmnigentPageView: vi.fn(),
+   useOmnigentAnalytics: () => ({ trackClick: vi.fn() }),
+ }));
+-vi.mock("@/shell/AppShell", () => ({
+-  AppShell: () => (
+-    <div>
+-      <span>app shell</span>
+-      <Link to="/inbox">Inbox</Link>
+-      <Outlet />
+-    </div>
+-  ),
+-}));
++vi.mock("@/shell/AppShell", async () => {
++  const { useLocation } = await import("react-router-dom");
++  return {
++    AppShell: () => (
++      <div>
++        <span>app shell</span>
++        <span data-testid="shell-location">{useLocation().pathname}</span>
++        <Link to="/inbox">Inbox</Link>
++        <Outlet />
++      </div>
++    ),
++  };
++});
+ vi.mock("@/pages/ChatPage", async () => {
+   const { useLocation } = await import("react-router-dom");
+   return {
+@@ -539,6 +543,36 @@ describe("Settings routes", () => {
+     expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
+   });
+ 
++  describe("on the mobile layout", () => {
++    // Matches the overlay drawer's query, and with `docked` the side-by-side one too.
++    function stubMobileLayout({ docked }: { docked: boolean }) {
++      vi.stubGlobal("matchMedia", (query: string) => ({
++        matches: query.includes("max-width") && (docked || !query.includes("min-width")),
++        media: query,
++        addEventListener: () => {},
++        removeEventListener: () => {},
++      }));
++    }
++    afterEach(() => {
++      vi.unstubAllGlobals();
++    });
++
++    it("keeps bare settings as the page list where the menu covers the page", () => {
++      stubMobileLayout({ docked: false });
++      renderRoute("/settings");
++
++      expect(screen.getByTestId("shell-location")).toHaveTextContent(/^\/settings$/);
++      expect(screen.queryByTestId("settings-location")).toBeNull();
++    });
++
++    it("opens General where the menu docks beside the page", async () => {
++      stubMobileLayout({ docked: true });
++      renderRoute("/settings");
++
++      expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
++    });
++  });
++
+   it("preserves an explicit settings section", async () => {
+     renderRoute("/settings/appearance");
+ 
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 71015a765c72b970473dd4ec03425e9d43949c37..98fe86d87d0ea83df965385b7e9417ff8ebc86dc 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -13,6 +13,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import { AppShell } from "@/shell/AppShell";
+ import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
+ import { isElectronShell } from "@/lib/nativeBridge";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
+ import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
+ 
+ // Bind a page component to its analytics page-view id. Declaring the id here,
+@@ -154,6 +156,16 @@ function AppRedirect({ to }: { to: string }) {
+   return null;
+ }
+ 
++/**
++ * Bare /settings. Where the Settings menu would cover the page (the phone drawer), the menu is
++ * the page list on its own and no page opens; elsewhere it opens the canonical General section.
++ */
++function SettingsIndexRoute({ to }: { to: string }) {
++  const mobileLayout = useIsMobileViewport();
++  const docked = useIsSideBySideSidebarViewport();
++  return mobileLayout && !docked ? null : <AppRedirect to={to} />;
++}
++
+ interface AppProps {
+   /**
+    * Mount prefix when embedded (e.g. `/ml/omnigent-embed`). The route table
+@@ -346,10 +358,11 @@ function AppRoutes({ basename }: AppProps) {
+               sidebar stays put — entering settings only swaps the card's
+               content (the section nav) and the main area. The active section
+               is carried in the URL (/settings/<section>); bare /settings
+-              redirects to the canonical General section. */}
++              redirects to the canonical General section, except on the
++              phone layout, where it is the page list. */}
+           <Route
+             path={`${prefix}/settings`}
+-            element={<AppRedirect to={`${prefix}/settings/general`} />}
++            element={<SettingsIndexRoute to={`${prefix}/settings/general`} />}
+           />
+           <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
+           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
+diff --git a/web/src/hooks/useAtSettingsRoot.ts b/web/src/hooks/useAtSettingsRoot.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..12f987179ddfc944bcd3234f3029da7f0c307105
+--- /dev/null
++++ b/web/src/hooks/useAtSettingsRoot.ts
+@@ -0,0 +1,9 @@
++// Whether the route is bare /settings, with no Settings page open.
++
++import { useLocation } from "@/lib/routing";
++
++/** True on bare `/settings`, where no page is open; the phone layout shows the page list there. */
++export function useAtSettingsRoot(): boolean {
++  const segments = useLocation().pathname.split("/").filter(Boolean);
++  return segments.length > 0 && segments.lastIndexOf("settings") === segments.length - 1;
++}
+diff --git a/web/src/shell/AppShell.test.tsx b/web/src/shell/AppShell.test.tsx
+index 7ffe2df0b1b182c898642bbf385160c27a0c30d6..d023adb8d0ce14e832e2b89f093f6c19c0fa5c0b 100644
+--- a/web/src/shell/AppShell.test.tsx
++++ b/web/src/shell/AppShell.test.tsx
+@@ -491,6 +491,14 @@ function NavProbe() {
+       <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
+         to-home
+       </button>
++      <button
++        type="button"
++        data-testid="nav-settings-appearance"
++        onClick={() => navigate("/settings/appearance")}
++      >
++        to-settings-appearance
++      </button>
++      <span data-testid="nav-path">{useLocation().pathname}</span>
+     </div>
+   );
+ }
+@@ -2779,12 +2787,18 @@ describe("Workspace rail maximize", () => {
+ describe("Sidebar across the md breakpoint", () => {
+   // Resizable viewport: matchMedia answers the md queries from `width` and
+   // fires change listeners for the queries a resize flips.
+-  function mockViewportWidth(initialWidth: number) {
++  // A height makes the mobile layout dock the sidebar beside the page (600px wide and 3:4 or
++  // wider); the default is tall enough to keep the overlay drawer at every mobile width.
++  function mockViewportWidth(initialWidth: number, initialHeight = 2000) {
+     let width = initialWidth;
++    let height = initialHeight;
+     const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+     const matches = (query: string) => {
+       if (query === "(min-width: 1181px)") return width >= 1181;
+       if (query === "(max-width: 1180.98px)") return width < 1181;
++      if (query.includes("min-aspect-ratio: 3/4")) {
++        return width >= 600 && width < 1181 && width / height >= 3 / 4;
++      }
+       return false;
+     };
+     const baseMatchMedia = window.matchMedia;
+@@ -2800,10 +2814,11 @@ describe("Sidebar across the md breakpoint", () => {
+       },
+     }));
+     onTestFinished(() => matchMedia.mockRestore());
+-    return (nextWidth: number) =>
++    return (nextWidth: number, nextHeight = height) =>
+       act(() => {
+         const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
+         width = nextWidth;
++        height = nextHeight;
+         for (const [query, queryListeners] of listeners) {
+           const event = { matches: matches(query), media: query } as MediaQueryListEvent;
+           if (before.get(query) === event.matches) continue;
+@@ -2918,6 +2933,74 @@ describe("Sidebar across the md breakpoint", () => {
+     resize(740);
+     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+   });
++
++  // Where the Settings menu covers the page (a phone, or a tablet held upright), bare /settings
++  // is the menu on its own and every page opens with the menu closed.
++  describe.each([
++    ["a phone", 390, 844],
++    ["a portrait tablet", 820, 1180],
++  ])("on %s", (_name, width, height) => {
++    it("opens the menu from the drawer's cog and closes it onto the page chosen", () => {
++      mockViewportWidth(width, height);
++      mockConversations([{ id: "conv_abc", permission_level: null }]);
++      renderShell("/c/conv_abc");
++      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
++
++      fireEvent.click(screen.getByTestId("nav-settings"));
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
++
++      fireEvent.click(screen.getByTestId("nav-settings-appearance"));
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
++    });
++
++    it("opens a deep-linked page with the menu closed, even from an open drawer", () => {
++      mockViewportWidth(width, height);
++      mockConversations([{ id: "conv_abc", permission_level: null }]);
++      renderShell("/c/conv_abc");
++      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
++
++      fireEvent.click(screen.getByTestId("nav-settings-appearance"));
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
++    });
++
++    it("reloads a page with the menu closed and goes Back to the list", () => {
++      mockViewportWidth(width, height);
++      mockConversations([]);
++      renderShell("/settings/appearance");
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
++      expect(screen.queryByRole("button", { name: "Open settings menu" })).toBeNull();
++
++      fireEvent.click(screen.getByRole("button", { name: "Back to Settings" }));
++      expect(screen.getByTestId("nav-path")).toHaveTextContent(/^\/settings$/);
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
++    });
++  });
++
++  describe("where the menu docks beside the page", () => {
++    it("keeps the menu the user had open on a page, and the menu toggle", () => {
++      mockViewportWidth(900, 700);
++      mockConversations([{ id: "conv_abc", permission_level: null }]);
++      renderShell("/c/conv_abc");
++      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
++
++      fireEvent.click(screen.getByTestId("nav-settings-appearance"));
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
++      expect(screen.queryByRole("button", { name: "Back to Settings" })).toBeNull();
++    });
++
++    it("closes the menu over a page once turning upright makes it cover the page", () => {
++      const resize = mockViewportWidth(900, 700);
++      mockConversations([]);
++      renderShell("/settings/appearance");
++      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
++
++      resize(700, 1000);
++      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
++      expect(screen.getByRole("button", { name: "Back to Settings" })).toBeInTheDocument();
++    });
++  });
+ });
+ 
+ describe("Subagents tab", () => {
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index db4bfa52e9acc5362e69e76841bcf4147fe89f05..54542f31a7d9c2aa52b5f8f462054d1f7dfcb6cb 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -180,7 +180,7 @@ import { isMobileViewport, Sidebar } from "./Sidebar";
+ import { MobilePanelDrawer } from "./MobilePanelDrawer";
+ import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
+ import { SidebarHeaderActions } from "./SidebarHeaderActions";
+-import { useSettingsRoute } from "./settingsNav";
++import { useBackToSettingsList, useSettingsRoute } from "./settingsNav";
+ import { useOpenSidebarForSettingsSearch } from "./settingsSearch/settingsSearchFocus";
+ import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
+ import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+@@ -491,10 +491,12 @@ function AppShellImpl() {
+     if (canvasMode) setSidebarPeek(false);
+   }, [canvasMode]);
+ 
+-  // Desktop settings need the sidebar's Back row. Mobile section links keep
+-  // the drawer state chosen by navigation; the header can reopen the menu.
++  // Desktop settings need the sidebar's Back row. On the phone layout bare
++  // /settings is the menu on its own, and a page opens with the menu closed;
++  // docked beside the page, the menu keeps the state navigation chose.
+   // Restore the prior sidebar preference when leaving settings.
+   const { inSettings } = useSettingsRoute();
++  const sideBySideSidebar = useIsSideBySideSidebarViewport();
+   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
+   useEffect(() => {
+     if (inSettings) {
+@@ -508,7 +510,7 @@ function AppShellImpl() {
+         return (
+           !isMobileViewport() ||
+           location.pathname.replace(/\/$/, "") === rebasePath("/settings") ||
+-          wasOpen
++          (wasOpen && sideBySideSidebar)
+         );
+       });
+       setSidebarPeek(false);
+@@ -520,7 +522,7 @@ function AppShellImpl() {
+       setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
+       sidebarOpenBeforeSettingsRef.current = null;
+     }
+-  }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
++  }, [inSettings, location.pathname, rebasePath, setSidebarOpen, sideBySideSidebar]);
+ 
+   // ⌘K's "Search settings…" opens the sidebar so its field can be seen. From outside Settings the
+   // sidebar's state is recorded first, so Back restores a collapsed sidebar, as after any other trip.
+@@ -538,9 +540,14 @@ function AppShellImpl() {
+   const mobileViewport = useIsMobileViewport();
+   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
+   const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
+-  const sideBySideSidebar = useIsSideBySideSidebarViewport();
+   const atSettingsRoot =
+     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
++  // A phone Settings page goes Back to the page list rather than opening the menu over it.
++  const backToSettingsList = useBackToSettingsList();
++  const settingsPageBack =
++    inSettings && !atSettingsRoot && mobileViewport && !sideBySideSidebar
++      ? backToSettingsList
++      : undefined;
+   const lastMobileViewportRef = useRef(mobileViewport);
+   const lastSidebarOpenRef = useRef(sidebarOpen);
+   const sidebarOpenBeforeNarrowRef = useRef(false);
+@@ -3492,6 +3499,7 @@ function AppShellImpl() {
+                     // the floating card (and in the title-bar strip on mac).
+                     sidebarOpen={sidebarOpen}
+                     settingsMode={inSettings}
++                    onBackToSettings={settingsPageBack}
+                     onOpenSidebar={handleSidebarOpen}
+                     isChildSession={isChildSession}
+                     subAgentName={activeSession?.subAgentName ?? null}
+diff --git a/web/src/shell/ChatHeader.test.tsx b/web/src/shell/ChatHeader.test.tsx
+index d69014c82e1b2e7d4dc95015569d70537364201a..a74e4ff30c17c0fb9f87a0216a14086c53d22291 100644
+--- a/web/src/shell/ChatHeader.test.tsx
++++ b/web/src/shell/ChatHeader.test.tsx
+@@ -98,6 +98,7 @@ function renderHeader(props: {
+   onOpenSidebar?: (peek?: boolean) => void;
+   onFork?: () => void;
+   settingsMode?: boolean;
++  onBackToSettings?: () => void;
+ }) {
+   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   return render(
+@@ -108,6 +109,7 @@ function renderHeader(props: {
+             sidebarOpen={props.sidebarOpen}
+             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
+             settingsMode={props.settingsMode}
++            onBackToSettings={props.onBackToSettings}
+             isChildSession={props.isChildSession ?? false}
+             subAgentName={props.subAgentName ?? null}
+             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
+@@ -326,6 +328,19 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
+     expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
+   });
+ 
++  it("goes Back to the Settings list instead of opening the menu on a phone Settings page", () => {
++    const onBackToSettings = vi.fn();
++    const onOpenSidebar = vi.fn();
++    renderHeader({ sidebarOpen: false, settingsMode: true, onBackToSettings, onOpenSidebar });
++
++    expect(screen.queryByRole("button", { name: "Open settings menu" })).toBeNull();
++    const back = screen.getByRole("button", { name: "Back to Settings" });
++    expect(back.querySelector("svg")).toHaveClass("lucide-chevron-left");
++    fireEvent.click(back);
++    expect(onBackToSettings).toHaveBeenCalledTimes(1);
++    expect(onOpenSidebar).not.toHaveBeenCalled();
++  });
++
+   it("drops the settings header fade while the sidebar is open", () => {
+     const { container } = renderHeader({ sidebarOpen: true, settingsMode: true });
+ 
+diff --git a/web/src/shell/ChatHeader.tsx b/web/src/shell/ChatHeader.tsx
+index bba2dc347659448333fc7ef78523560207a8dd88..fa7ecb71858759fca3f161e1db8ab3ced2d785ff 100644
+--- a/web/src/shell/ChatHeader.tsx
++++ b/web/src/shell/ChatHeader.tsx
+@@ -4,6 +4,7 @@ import { isIndentedSibling } from "@/lib/sessionFamilies";
+ import {
+   ArrowLeftIcon,
+   BotIcon,
++  ChevronLeftIcon,
+   EllipsisVerticalIcon,
+   FileIcon,
+   FolderPlusIcon,
+@@ -155,6 +156,8 @@ interface ChatHeaderProps {
+   onOpenSidebar: (peek?: boolean) => void;
+   /** Render the mobile settings-menu toggle and fade. */
+   settingsMode?: boolean;
++  /** On a phone Settings page: a Back to the page list replaces the menu toggle. */
++  onBackToSettings?: () => void;
+   /** Whether the active session is a sub-agent (appends its identity). */
+   isChildSession: boolean;
+   /**
+@@ -360,6 +363,7 @@ export function ChatHeader({
+   sidebarOpen,
+   onOpenSidebar,
+   settingsMode = false,
++  onBackToSettings,
+   isChildSession,
+   subAgentName,
+   conversationId,
+@@ -631,7 +635,20 @@ export function ChatHeader({
+           !sidebarOpen && !canvas && "traffic-light-clearance",
+         )}
+       >
+-        {!sidebarOpen && (!canvas || canvas.compact || canvas.focused) && (
++        {!sidebarOpen && onBackToSettings && (
++          <MobileHeaderButton
++            type="button"
++            variant="ghost"
++            size="icon-xs"
++            aria-label="Back to Settings"
++            componentId="settings.header.back"
++            onClick={onBackToSettings}
++            className="mobile-touch-target pointer-events-auto border-none text-muted-foreground hover:text-foreground"
++          >
++            <ChevronLeftIcon className="size-5" />
++          </MobileHeaderButton>
++        )}
++        {!sidebarOpen && !onBackToSettings && (!canvas || canvas.compact || canvas.focused) && (
+           <SidebarOpenButton
+             onOpenSidebar={onOpenSidebar}
+             settingsMode={settingsMode}
+diff --git a/web/src/shell/Sidebar.mobileDrawer.test.tsx b/web/src/shell/Sidebar.mobileDrawer.test.tsx
+index 303e35bdb77864f3043fefa1e228abc95d20fc5d..ae7d4bf2bd1624da8d6bfbc42aeab17945b87915 100644
+--- a/web/src/shell/Sidebar.mobileDrawer.test.tsx
++++ b/web/src/shell/Sidebar.mobileDrawer.test.tsx
+@@ -4,7 +4,7 @@ import { conversation as conv, conversationPage } from "@/test/sidebarMockHelper
+ // floats at the top, and Settings sits in the profile footer.
+ 
+ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
+-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+ import type { Conversation } from "@/hooks/useConversations";
+ 
+ vi.mock("@/hooks/useConversations", async () => {
+@@ -92,9 +92,13 @@ describe("mobile sidebar drawer", () => {
+     );
+   });
+ 
+-  it("keeps the peek strip and the scrim on the settings page, so its content shows", () => {
++  it("keeps the peek strip and the scrim on a settings page, so its content shows", () => {
++    stubMobileLayout(true);
++    onTestFinished(() => {
++      vi.unstubAllGlobals();
++    });
+     const onClose = vi.fn();
+-    renderSidebar({ route: "/settings", onClose });
++    renderSidebar({ route: "/settings/appearance", onClose });
+ 
+     expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
+       "max-md:right-14",
+@@ -103,6 +107,20 @@ describe("mobile sidebar drawer", () => {
+     expect(onClose).toHaveBeenCalledTimes(1);
+   });
+ 
++  it("shows the bare /settings menu full width with no page behind it to tap back to", () => {
++    stubMobileLayout(true);
++    onTestFinished(() => {
++      vi.unstubAllGlobals();
++    });
++    renderSidebar({ route: "/settings" });
++
++    expect(screen.getByRole("complementary", { name: "Conversations" })).not.toHaveClass(
++      "max-md:right-14",
++    );
++    expect(screen.queryByTestId("sidebar-scrim")).toBeNull();
++    expect(screen.getByTestId("settings-nav-general")).toBeInTheDocument();
++  });
++
+   it("keeps Settings in the profile footer and hides the desktop collapse toggle on mobile", async () => {
+     renderSidebar();
+ 
+@@ -293,6 +311,19 @@ describe("mobile sidebar drawer swipe to close", () => {
+     expect(drawer.style.transform).toBe("");
+   });
+ 
++  it("stays open under a swipe on the bare /settings menu, which has no page behind it", () => {
++    stubMobileLayout(true);
++    const { onClose, drawer } = renderDrawer({ route: "/settings" });
++
++    touch(drawer, "touchstart", 300, 0);
++    touch(drawer, "touchmove", 250, 60);
++    touch(drawer, "touchmove", 100, 120);
++    touch(drawer, "touchend", 0, 400);
++
++    expect(drawer.style.transform).toBe("");
++    expect(onClose).not.toHaveBeenCalled();
++  });
++
+   it("springs back open without closing after a short drag", () => {
+     stubMobileLayout(true);
+     const { onClose, drawer } = renderDrawer();
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index e11eaffeb1cac83e1221c962082e7fcf51ef0d47..54499ffbb4243a3657ff48a8eb4824f577ab38e1 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -266,6 +266,7 @@ import {
+   isSideBySideSidebarViewport,
+   useIsSideBySideSidebarViewport,
+ } from "@/hooks/useIsSideBySideSidebarViewport";
++import { useAtSettingsRoot } from "@/hooks/useAtSettingsRoot";
+ import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
+ import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
+ import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
+@@ -1012,6 +1013,7 @@ function SidebarImpl({
+   // for the settings section nav (see settingsNav.tsx) — entering settings
+   // shouldn't replace the whole sidebar.
+   const { inSettings } = useSettingsRoute();
++  const atSettingsRoot = useAtSettingsRoot();
+   // Fetched only in Settings, whose nav drops Harnesses when none is offered.
+   const curatedOutHarnesses = useCuratedOutHarnesses(inSettings);
+   // Remember the pre-settings location so the Back row returns to the
+@@ -1125,8 +1127,11 @@ function SidebarImpl({
+       if (shouldOpen) onOpen?.();
+     },
+   });
++  // On the phone layout bare /settings is the Settings menu on its own: full width, with no page
++  // behind it to swipe or tap back to.
++  const settingsPageList = atSettingsRoot && mobileLayout && !sideBySide;
+   useSidebarSwipeToClose({
+-    enabled: closeSwipeEnabled,
++    enabled: closeSwipeEnabled && !settingsPageList,
+     drawerRef,
+     scrimRef,
+     holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+@@ -1256,7 +1261,7 @@ function SidebarImpl({
+       pill) and renders after the sidebar, so a same-z peer that ever takes
+       pointer events would win the tie inside the exposed strip and swallow the
+       dismiss. Strictly between chat chrome and the drawer's z-50. */}
+-      {!sideBySide && (
++      {!sideBySide && !settingsPageList && (
+         <button
+           type="button"
+           ref={scrimRef}
+@@ -1309,7 +1314,7 @@ function SidebarImpl({
+           // most of the phone but stops short of the right edge so the chat stays
+           // visible (and tappable through the scrim) behind it.
+           "fixed inset-0 z-50",
+-          !sideBySide && "max-md:right-14",
++          !sideBySide && !settingsPageList && "max-md:right-14",
+           // Mobile only: animate the slide so the iOS edge-swipe settles
+           // smoothly on release. Suppressed inline while a drag is live (the
+           // overlay must track the finger 1:1). Scoped to transform so it can't
+diff --git a/web/src/shell/settingsNav.test.tsx b/web/src/shell/settingsNav.test.tsx
+index 46f65b441d93c3e3604ce4e5b9ee8cd1c71f7ade..d6e1bcdfad06278074a2b93370c8f9222c605996 100644
+--- a/web/src/shell/settingsNav.test.tsx
++++ b/web/src/shell/settingsNav.test.tsx
+@@ -8,7 +8,14 @@
+ import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
+ import { SettingsIcon } from "lucide-react";
+ import type { ReactNode } from "react";
+-import { MemoryRouter, useNavigate } from "react-router-dom";
++import {
++  MemoryRouter,
++  Route,
++  Routes,
++  useLocation,
++  useNavigate,
++  useNavigationType,
++} from "react-router-dom";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ 
+@@ -46,9 +53,11 @@ vi.mock("@/hooks/useIsAdmin", () => ({
+   useIsAdmin: () => mocks.isAdmin,
+ }));
+ 
++import { useAtSettingsRoot } from "@/hooks/useAtSettingsRoot";
+ import {
+   SettingsSidebarBody,
+   settingsNavGroups,
++  useBackToSettingsList,
+   useSettingsRoute,
+   useTrackSettingsReturn,
+ } from "./settingsNav";
+@@ -459,7 +468,12 @@ describe("SettingsSidebarBody on phones", () => {
+     expect(general.parentElement).not.toHaveClass("gap-px");
+   });
+ 
+-  // Bare /settings redirects to /settings/general, so the open section is always set.
++  it("marks no page current on the bare /settings list", () => {
++    renderBody({ route: "/settings" });
++    expect(screen.getByTestId("settings-nav-general")).toBeInTheDocument();
++    expect(document.querySelector('[aria-current="page"]')).toBeNull();
++  });
++
+   it.each(["/settings/general", "/settings/appearance"])(
+     "shows no selected row at %s but keeps aria-current",
+     (route) => {
+@@ -515,6 +529,87 @@ it("loads beside a mock of the viewport hook that has only the hook", async () =
+   }
+ });
+ 
++// The phone page list at bare /settings and the Settings page it opens.
++function SettingsListFlow() {
++  const location = useLocation();
++  const navigationType = useNavigationType();
++  return (
++    <>
++      <span data-testid="flow-location" data-navigation-type={navigationType}>
++        {location.pathname}
++      </span>
++      <Routes>
++        <Route path="/settings" element={<SettingsSidebarBody onNavClick={() => {}} />} />
++        <Route path="/settings/:section" element={<SettingsPageBack />} />
++        <Route path="*" element={null} />
++      </Routes>
++    </>
++  );
++}
++
++function SettingsPageBack() {
++  const back = useBackToSettingsList();
++  return (
++    <button type="button" onClick={back}>
++      Back to Settings
++    </button>
++  );
++}
++
++describe("Back from a phone Settings page", () => {
++  beforeEach(() => {
++    stubMobileLayout({ docked: false });
++  });
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  function renderFlow(entries: string[]) {
++    render(
++      <TooltipProvider>
++        <MemoryRouter initialEntries={entries} initialIndex={entries.length - 1}>
++          <SettingsListFlow />
++        </MemoryRouter>
++      </TooltipProvider>,
++    );
++  }
++
++  it("pops back to the list a page was opened from", () => {
++    renderFlow(["/c/conv_a", "/settings"]);
++    fireEvent.click(screen.getByTestId("settings-nav-appearance"));
++    expect(screen.getByTestId("flow-location")).toHaveTextContent("/settings/appearance");
++
++    fireEvent.click(screen.getByRole("button", { name: "Back to Settings" }));
++    const location = screen.getByTestId("flow-location");
++    expect(location).toHaveTextContent(/^\/settings$/);
++    expect(location).toHaveAttribute("data-navigation-type", "POP");
++  });
++
++  it("replaces a deep-linked page with the list", () => {
++    renderFlow(["/c/conv_a", "/settings/archived"]);
++    fireEvent.click(screen.getByRole("button", { name: "Back to Settings" }));
++    const location = screen.getByTestId("flow-location");
++    expect(location).toHaveTextContent(/^\/settings$/);
++    expect(location).toHaveAttribute("data-navigation-type", "REPLACE");
++  });
++});
++
++describe("useAtSettingsRoot", () => {
++  it.each([
++    ["/settings", true],
++    ["/settings/", true],
++    ["/ml/omnigent-embed/settings", true],
++    ["/settings/general", false],
++    ["/settings/harnesses/codex", false],
++    ["/inbox", false],
++  ])("reads %s as the root: %s", (path, root) => {
++    const wrapper = ({ children }: { children: ReactNode }) => (
++      <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
++    );
++    expect(renderHook(() => useAtSettingsRoot(), { wrapper }).result.current).toBe(root);
++  });
++});
++
+ describe("useSettingsRoute", () => {
+   it.each([false, true])("gates the admin general route on nesting=%s", (enabled) => {
+     mocks.nestedAgents = enabled;
+diff --git a/web/src/shell/settingsNav.tsx b/web/src/shell/settingsNav.tsx
+index 869220877939586db3e0d10697a1945f5523bd32..463c1341216692a0bf1ba63b85d574218b8da5a1 100644
+--- a/web/src/shell/settingsNav.tsx
++++ b/web/src/shell/settingsNav.tsx
+@@ -6,7 +6,7 @@
+ // selection is URL-driven (/settings/<section>) so the nav (in the sidebar)
+ // and the content (in the outlet) stay in sync without shared state.
+ 
+-import { type ReactNode, useEffect } from "react";
++import { type ReactNode, useCallback, useEffect } from "react";
+ import {
+   ArchiveIcon,
+   ArrowLeftIcon,
+@@ -28,7 +28,7 @@ import {
+   UsersIcon,
+   VectorSquareIcon,
+ } from "lucide-react";
+-import { Link, useLocation } from "@/lib/routing";
++import { Link, useLocation, useNavigate } from "@/lib/routing";
+ import { Button } from "@/components/ui/button";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import {
+@@ -36,6 +36,7 @@ import {
+   customAgentsSettingsEnabled,
+   isSingleUserMode,
+ } from "@/lib/capabilities";
++import { useAtSettingsRoot } from "@/hooks/useAtSettingsRoot";
+ import { useIsAdmin } from "@/hooks/useIsAdmin";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { isElectronShell } from "@/lib/nativeBridge";
+@@ -237,6 +238,20 @@ export function useSettingsRoute(): {
+   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
+ }
+ 
++/** Location state of a page opened from the phone page list, so its Back can pop to the list. */
++const FROM_SETTINGS_LIST = { fromSettingsList: true };
++
++/** Back from a Settings page to the phone page list: pops to the list when the page came from it. */
++export function useBackToSettingsList(): () => void {
++  const navigate = useNavigate();
++  const state: unknown = useLocation().state;
++  const fromList = typeof state === "object" && state !== null && "fromSettingsList" in state;
++  return useCallback(() => {
++    if (fromList) navigate(-1);
++    else navigate("/settings", { replace: true });
++  }, [fromList, navigate]);
++}
++
+ // Last location the user was on before entering /settings — path + search so
+ // the conversation (and its ?file= etc.) is preserved. The Back row
+ // returns here instead of the home page. Module-scoped: the sidebar stays
+@@ -304,6 +319,7 @@ export function SettingsSidebarBody({
+   searching?: boolean;
+ }) {
+   const { section } = useSettingsRoute();
++  const atRoot = useAtSettingsRoot();
+   // The phone drawer covers the page, so it reads as a list of pages; docked beside
+   // the page (the only time the sidebar passes onCollapse) it stays the sidebar nav.
+   const phoneMenu = useIsMobileViewport() && onCollapse === undefined;
+@@ -373,7 +389,8 @@ export function SettingsSidebarBody({
+               >
+                 {group.items.map((item) => {
+                   const Icon = item.icon;
+-                  const current = section === item.id;
++                  // The phone list at bare /settings opens no page, though the route reads General.
++                  const current = section === item.id && !(phoneMenu && atRoot);
+                   // No page shows beside the phone menu, so no row looks selected.
+                   const selected = current && !phoneMenu;
+                   return (
+@@ -395,6 +412,7 @@ export function SettingsSidebarBody({
+                       <Link
+                         to={settingsSectionPath(item.id)}
+                         onClick={onNavClick}
++                        state={atRoot ? FROM_SETTINGS_LIST : undefined}
+                         data-testid={`settings-nav-${item.id}`}
+                         componentId={`settings.nav.${item.id}`}
+                         aria-current={current ? "page" : undefined}

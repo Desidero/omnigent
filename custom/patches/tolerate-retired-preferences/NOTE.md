@@ -11,7 +11,7 @@ refused.
 
 - **Turn on:** on by default.
 - **Docs:** none (fix).
-- **Upstream:** proposed from `fix/tolerate-retired-preferences`.
+- **Upstream:** not proposed upstream yet.
 
 ## Must hold
 

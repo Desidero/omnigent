@@ -609,6 +609,9 @@ request carries it, and the series holds a copy until it merges).
 | `web-reconnect-shell-inputs` | A queued `!command` no longer stays stuck at the bottom of the chat after the connection drops. | PR open ([#11395](https://github.com/omnigent-ai/omnigent/pull/11395)) |
 | `chat-item-comments` | Comment on labelled items and send the comments together as one structured message. Needs `chat-item-labels`. | proposed |
 | `session-labels-ui` | View and edit a session's labels in the web UI, delete labels through the API, and default labels per project. | PR open ([#11398](https://github.com/omnigent-ai/omnigent/pull/11398) for the server, [#11399](https://github.com/omnigent-ai/omnigent/pull/11399) for the web UI (draft)) |
+| `palette-new-chat-in-project` | Typing in ⌘K lists a "New chat in <project>" row for every project, in both the classic and the QuickPick palette. | PR open ([#11394](https://github.com/omnigent-ai/omnigent/pull/11394), draft) |
+| `new-chat-project-prompt` | Starting a new session asks which project it belongs to (a picker, a bottom sheet on phones); a setting turns it off. | PR open ([#11397](https://github.com/omnigent-ai/omnigent/pull/11397), draft; issue [#11083](https://github.com/omnigent-ai/omnigent/issues/11083)) |
+| `terminal-touch` | On touch devices the terminal gets an extra-keys row (Esc, Tab, arrows, sticky Ctrl, Alt and Shift) and long-press select with Copy and Paste; the iOS app pastes natively. | the extra-keys row is carried from [#6136](https://github.com/omnigent-ai/omnigent/pull/6136) (not ours, open); the rest is proposed |
 | `gateway-request-tags` | Requests to a Databricks Unity Gateway carry the session id and labels as request tags. | proposed (issue drafted) |
 | `claude-native-delegate-idle` | A Claude lead stops showing Working, and takes follow-ups without Steer, once its turn ends while agent-team teammates keep running: teammates count as background agents for upstream's background-agent hold ([#12561](https://github.com/omnigent-ai/omnigent/pull/12561)). | proposed (the status-file and OSC parts landed upstream as #12561) |
 | `delete-stops-runner` | Deleting a session stops its host-launched runner once no remaining session uses it, instead of leaving the process running until its idle timeout. | PR open ([#11391](https://github.com/omnigent-ai/omnigent/pull/11391)) |
@@ -625,6 +628,12 @@ request carries it, and the series holds a copy until it merges).
 | `transcript-hold-position` | Scrolled up in a transcript, the reader keeps their place while rows above change height (a reply streaming, a tool group settling, an image loading, rows measured during a scroll back): the transcript holds the row being read instead of leaving it to the virtual list's own correction. | proposed (the streaming re-key that first motivated it is fixed upstream by [#12923](https://github.com/omnigent-ai/omnigent/pull/12923)) |
 | `history-prefetch` | The next older page of history is fetched as soon as a scroll-up comes near the top, ahead of its landing; one gesture pages in at most 600 items. | PR open ([#13257](https://github.com/omnigent-ai/omnigent/pull/13257), draft; issue [#13255](https://github.com/omnigent-ai/omnigent/issues/13255); the larger page landed as [#13247](https://github.com/omnigent-ai/omnigent/pull/13247)) |
 | `lean-history-items` | History pages carry only the head of long tool outputs (`tool_output=preview`), and expanding a tool row fetches the full result from a per-item read; both reads are gzipped. Needs `history-prefetch`. | PR open ([#13259](https://github.com/omnigent-ai/omnigent/pull/13259), draft; issue [#13255](https://github.com/omnigent-ai/omnigent/issues/13255)) |
+| `composer-send-tap` | On touch screens one tap on Send sends, even while the on-screen keyboard is up. | proposed |
+| `mobile-settings-nav` | Phone Settings opens on a full-width list of pages (Back row, title, search, inset groups of 44px rows with a chevron, none highlighted), not on General; a page opens with the menu closed and its header goes Back to the list. | PR open ([#13484](https://github.com/omnigent-ai/omnigent/pull/13484), draft) |
+| `mobile-landing-project-chip` | The phone new-session landing names its project in a chip whose menu switches it and keeps the draft. | PR open ([#13487](https://github.com/omnigent-ai/omnigent/pull/13487)) |
+| `mobile-sidebar-nav-strip` | The phone drawer's New session, Automations, Workflows and Inbox rows fold into one strip of icon-over-label cells. | PR open ([#13488](https://github.com/omnigent-ai/omnigent/pull/13488), draft; issue [#13482](https://github.com/omnigent-ai/omnigent/issues/13482)) |
+| `sidebar-updated-filter` | A sidebar filter for sessions updated in the last 24 hours, 3, 7 or 30 days, with a chip while it is on. | proposed |
+| `sidebar-sticky-toolbar` | The sidebar's filter, Select sessions and bulk-action bar stay in view while the session list scrolls. | proposed |
 
 ### Parked series
 
@@ -642,18 +651,9 @@ anything is wrong with it.
 | `backport-sidebar-filter-submenus` | landed upstream (#13481) |
 | `toast-safe-area` | superseded by upstream #13607 |
 | `skip-gzip-binary-files` | landed upstream (#12362); dropped at the 2026-11-24 refresh |
-| `terminal-touch` | mobile |
-| `composer-send-tap` | mobile |
-| `mobile-settings-nav` | mobile |
-| `mobile-landing-project-chip` | mobile |
-| `mobile-sidebar-nav-strip` | mobile |
+| `chat-features` | optional |
 | `pr-watch` | optional |
 | `queue-combine` | optional |
-| `sidebar-updated-filter` | optional |
-| `sidebar-sticky-toolbar` | optional |
-| `new-chat-project-prompt` | optional |
-| `palette-new-chat-in-project` | optional |
-| `chat-features` | optional |
 
 To restore one, apply it from that commit onto the foundation it will have
 now (`BASE`, or the series it needs: what its `# needs:` lines named, less

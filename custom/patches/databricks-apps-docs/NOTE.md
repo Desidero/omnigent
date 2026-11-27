@@ -1,7 +1,7 @@
 # databricks-apps-docs
 
 Needs: deploy-overlay, kms-uc-service-credential
-Covers: e2100adc51c88e9e
+Covers: 4cb58d4a38ad86c0
 
 Documentation only: what a Databricks App needs after the first deploy. How the
 server config and the MCP registry reach the app, which config keys the Apps

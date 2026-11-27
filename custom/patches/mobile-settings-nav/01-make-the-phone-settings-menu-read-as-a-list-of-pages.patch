@@ -1,0 +1,294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 11 Nov 2026 01:38:53 +0000
+Subject: [PATCH] feat(web): make the phone Settings menu read as a list of
+ pages
+
+On phones the Settings drawer is the whole menu, but it looked exactly
+like the sidebar: bare /settings highlighted General although no page
+was open, rows had no disclosure cue, and rows stayed about 33px tall
+while the primary navigation already has 44px touch targets.
+
+In the phone drawer the settings nav now shows a chevron Back row, a large
+Settings title, the search field under the title, sections as rounded
+inset groups with hairline separators, and 44px rows with a trailing
+chevron. Like a phone settings list, no row is highlighted (bare
+/settings redirects to General, which used to look selected); the open
+section keeps aria-current for assistive tech. While a search shows
+results they take the place of the groups as before, under the title.
+The desktop layout, and a window wide enough to dock the menu beside the
+page, keep the sidebar rows and the highlight.
+The menu counts as docked when the sidebar hands it onCollapse, which it
+does only then. Importing the side-by-side hook instead would read the
+breakpoint from the mobile hook's module, which many tests mock with the
+hook alone.
+
+Not upstream yet: proposed from feat/mobile-settings-nav; drop this copy once it merges.
+
+Docs: none (layout polish of the phone Settings menu; nothing to configure)
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ web/src/shell/settingsNav.test.tsx | 113 ++++++++++++++++++++++++++++-
+ web/src/shell/settingsNav.tsx      |  39 +++++++++-
+ 2 files changed, 145 insertions(+), 7 deletions(-)
+
+diff --git a/web/src/shell/settingsNav.test.tsx b/web/src/shell/settingsNav.test.tsx
+index 57a5addfd36bf7efc1ef69f1cf62a92263058a8a..46f65b441d93c3e3604ce4e5b9ee8cd1c71f7ade 100644
+--- a/web/src/shell/settingsNav.test.tsx
++++ b/web/src/shell/settingsNav.test.tsx
+@@ -53,12 +53,27 @@ import {
+   useTrackSettingsReturn,
+ } from "./settingsNav";
+ 
+-function renderBody(opts: { onNavClick?: () => void; harnessesOffered?: boolean } = {}) {
++function renderBody(
++  opts: {
++    onNavClick?: () => void;
++    harnessesOffered?: boolean;
++    route?: string;
++    search?: ReactNode;
++    searching?: boolean;
++    onCollapse?: () => void;
++  } = {},
++) {
+   const onNavClick = opts.onNavClick ?? vi.fn();
+   render(
+     <TooltipProvider>
+-      <MemoryRouter initialEntries={["/settings/appearance"]}>
+-        <SettingsSidebarBody onNavClick={onNavClick} harnessesOffered={opts.harnessesOffered} />
++      <MemoryRouter initialEntries={[opts.route ?? "/settings/appearance"]}>
++        <SettingsSidebarBody
++          onNavClick={onNavClick}
++          harnessesOffered={opts.harnessesOffered}
++          search={opts.search}
++          searching={opts.searching}
++          onCollapse={opts.onCollapse}
++        />
+       </MemoryRouter>
+     </TooltipProvider>,
+   );
+@@ -292,6 +307,10 @@ describe("SettingsSidebarBody", () => {
+     expect(selected.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
+     expect(selected.querySelector("svg")).not.toHaveClass("text-muted-foreground");
+     expect(unselected.querySelector("svg")).toHaveClass("text-muted-foreground");
++    // Desktop keeps plain sidebar rows: no phone touch floor or disclosure chevron.
++    expect(unselected).not.toHaveClass("mobile-touch-target");
++    expect(unselected.querySelectorAll("svg")).toHaveLength(1);
++    expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
+   });
+ 
+   it("renders group subtitles in sentence case at the text-sm tier", () => {
+@@ -408,6 +427,94 @@ describe("SettingsSidebarBody", () => {
+   });
+ });
+ 
++// The mobile layout's queries: the overlay drawer matches only the max-width one,
++// the docked (side-by-side) menu also the min-width one.
++function stubMobileLayout({ docked }: { docked: boolean }): void {
++  vi.stubGlobal("matchMedia", (query: string) => ({
++    matches: query.includes("max-width") && (docked || !query.includes("min-width")),
++    media: query,
++    addEventListener: () => {},
++    removeEventListener: () => {},
++  }));
++}
++
++describe("SettingsSidebarBody on phones", () => {
++  beforeEach(() => {
++    stubMobileLayout({ docked: false });
++  });
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it("renders the menu as titled, grouped disclosure rows", () => {
++    renderBody({ route: "/settings/general" });
++    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeInTheDocument();
++    const back = screen.getByRole("link", { name: "Back" });
++    expect(back).toHaveClass("mobile-touch-target");
++    expect(back.querySelector("svg")).toHaveClass("lucide-chevron-left");
++    const general = screen.getByTestId("settings-nav-general");
++    expect(general).toHaveClass("mobile-touch-target", "rounded-none", "focus-visible:ring-inset");
++    expect(general.querySelectorAll("svg")).toHaveLength(2);
++    expect(general.parentElement).toHaveClass("divide-y", "rounded-xl", "overflow-hidden");
++    expect(general.parentElement).not.toHaveClass("gap-px");
++  });
++
++  // Bare /settings redirects to /settings/general, so the open section is always set.
++  it.each(["/settings/general", "/settings/appearance"])(
++    "shows no selected row at %s but keeps aria-current",
++    (route) => {
++      renderBody({ route });
++      const current = document.querySelector('[aria-current="page"]');
++      expect(current).toHaveAttribute("href", route);
++      for (const row of screen.getAllByRole("link")) {
++        expect(row).not.toHaveClass("bg-[var(--sidebar-active)]");
++        expect(row.querySelector("svg")).not.toHaveClass("text-[var(--sidebar-active-foreground)]");
++      }
++    },
++  );
++
++  it("stays the sidebar nav when the menu docks beside the page", () => {
++    stubMobileLayout({ docked: true });
++    // The sidebar passes onCollapse only while the menu docks beside the page.
++    renderBody({ route: "/settings/appearance", onCollapse: vi.fn() });
++    expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
++    const selected = screen.getByTestId("settings-nav-appearance");
++    expect(selected).toHaveClass("bg-[var(--sidebar-active)]");
++    expect(selected).not.toHaveClass("mobile-touch-target");
++    expect(selected.querySelectorAll("svg")).toHaveLength(1);
++    expect(selected.parentElement).toHaveClass("gap-px");
++  });
++
++  it("puts the search field between the title and the pages", () => {
++    renderBody({ search: <input aria-label="Search settings" /> });
++    const title = screen.getByRole("heading", { level: 1, name: "Settings" });
++    const field = screen.getByRole("textbox", { name: "Search settings" });
++    const firstPage = screen.getByTestId("settings-nav-general");
++    expect(title.compareDocumentPosition(field)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
++    expect(field.compareDocumentPosition(firstPage)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
++  });
++
++  it("keeps the title and Back while search results replace the pages", () => {
++    renderBody({ search: <input aria-label="Search settings" />, searching: true });
++    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Back" })).toBeInTheDocument();
++    expect(screen.queryByTestId("settings-nav-general")).toBeNull();
++  });
++});
++
++// Many tests mock the viewport hook's module with the hook alone; importing
++// settingsNav (as the settings search catalog does) must not need more of it.
++it("loads beside a mock of the viewport hook that has only the hook", async () => {
++  vi.resetModules();
++  vi.doMock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => true }));
++  try {
++    await expect(import("./settingsNav")).resolves.toHaveProperty("SettingsSidebarBody");
++  } finally {
++    vi.doUnmock("@/hooks/useIsMobileViewport");
++    vi.resetModules();
++  }
++});
++
+ describe("useSettingsRoute", () => {
+   it.each([false, true])("gates the admin general route on nesting=%s", (enabled) => {
+     mocks.nestedAgents = enabled;
+diff --git a/web/src/shell/settingsNav.tsx b/web/src/shell/settingsNav.tsx
+index c4db33fe63c11848bffd90c7c5ee1e7f85fbc9ad..869220877939586db3e0d10697a1945f5523bd32 100644
+--- a/web/src/shell/settingsNav.tsx
++++ b/web/src/shell/settingsNav.tsx
+@@ -12,6 +12,8 @@ import {
+   ArrowLeftIcon,
+   BlocksIcon,
+   BotIcon,
++  ChevronLeftIcon,
++  ChevronRightIcon,
+   DownloadIcon,
+   GitBranchIcon,
+   KeyboardIcon,
+@@ -35,8 +37,10 @@ import {
+   isSingleUserMode,
+ } from "@/lib/capabilities";
+ import { useIsAdmin } from "@/hooks/useIsAdmin";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { isElectronShell } from "@/lib/nativeBridge";
+ import { cn } from "@/lib/utils";
++import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
+ import { SIDEBAR_ROW } from "./sidebarStyles";
+ 
+ export type SettingsSectionId =
+@@ -300,6 +304,9 @@ export function SettingsSidebarBody({
+   searching?: boolean;
+ }) {
+   const { section } = useSettingsRoute();
++  // The phone drawer covers the page, so it reads as a list of pages; docked beside
++  // the page (the only time the sidebar passes onCollapse) it stays the sidebar nav.
++  const phoneMenu = useIsMobileViewport() && onCollapse === undefined;
+   const groups = useSettingsNavGroups(harnessesOffered);
+ 
+   return (
+@@ -315,6 +322,7 @@ export function SettingsSidebarBody({
+           className={cn(
+             SIDEBAR_ROW,
+             "w-fit justify-start border-0 font-normal text-muted-foreground",
++            phoneMenu && "mobile-touch-target",
+           )}
+         >
+           {/* Returns to wherever the user was before entering settings (the
+@@ -325,7 +333,11 @@ export function SettingsSidebarBody({
+           closing onto the content behind it. On desktop onNavClick is a no-op
+           (persistent card), so dropping it changes nothing there. */}
+           <Link to={settingsReturnPath} componentId="settings.back_to_omnigent">
+-            <ArrowLeftIcon className="ui-icon" />
++            {phoneMenu ? (
++              <ChevronLeftIcon className="ui-icon" />
++            ) : (
++              <ArrowLeftIcon className="ui-icon" />
++            )}
+             Back
+           </Link>
+         </Button>
+@@ -342,6 +354,7 @@ export function SettingsSidebarBody({
+           </Button>
+         )}
+       </div>
++      {phoneMenu && <h1 className="px-5 pt-2 text-2xl font-semibold tracking-tight">Settings</h1>}
+       {search}
+       {searching ? null : (
+         <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
+@@ -350,10 +363,19 @@ export function SettingsSidebarBody({
+               <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
+                 {group.title}
+               </h2>
+-              <div className="mt-1 flex flex-col gap-px">
++              <div
++                className={cn(
++                  "mt-1 flex flex-col",
++                  phoneMenu
++                    ? cn(MOBILE_GLASS_SURFACE, "divide-y divide-border overflow-hidden rounded-xl")
++                    : "gap-px",
++                )}
++              >
+                 {group.items.map((item) => {
+                   const Icon = item.icon;
+-                  const selected = section === item.id;
++                  const current = section === item.id;
++                  // No page shows beside the phone menu, so no row looks selected.
++                  const selected = current && !phoneMenu;
+                   return (
+                     <Button
+                       key={item.id}
+@@ -365,6 +387,9 @@ export function SettingsSidebarBody({
+                         selected &&
+                           "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
+                         item.hideOnMobile && "max-md:hidden",
++                        // Inset focus ring: the rounded group clips an outer one.
++                        phoneMenu &&
++                          "mobile-touch-target rounded-none px-3 focus-visible:ring-inset",
+                       )}
+                     >
+                       <Link
+@@ -372,7 +397,7 @@ export function SettingsSidebarBody({
+                         onClick={onNavClick}
+                         data-testid={`settings-nav-${item.id}`}
+                         componentId={`settings.nav.${item.id}`}
+-                        aria-current={selected ? "page" : undefined}
++                        aria-current={current ? "page" : undefined}
+                       >
+                         <Icon
+                           className={cn(
+@@ -383,6 +408,12 @@ export function SettingsSidebarBody({
+                           )}
+                         />
+                         {item.label}
++                        {phoneMenu && (
++                          <ChevronRightIcon
++                            aria-hidden
++                            className="ui-icon ml-auto text-muted-foreground"
++                          />
++                        )}
+                       </Link>
+                     </Button>
+                   );
