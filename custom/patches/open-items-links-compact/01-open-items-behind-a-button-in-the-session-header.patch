@@ -1,0 +1,639 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 05:19:22 +0000
+Subject: [PATCH] feat(web): open items behind a button in the session header
+
+The Open items bar takes a full-width row above every transcript that uses
+item labels, whether or not the reader wants the list right now, and it has
+no room to grow into more than a list of items.
+
+The list now opens from a compact button in the session header, beside
+Agent info, sized and named like the other header buttons. Its badge is the
+number of open items (closed and dismissed ones left out). Clicking it
+opens a popover on desktop; on a phone it opens a sheet docked to the
+bottom of the screen. The panel holds the tracker itself, expanded: the
+same chips, titles, latest-reply grouping, Closed fold, dismiss and restore,
+and each item's preview with "Show in conversation", which closes the panel
+so the message it jumps to is not covered.
+
+The transcript still derives the items, so it owns the button and portals
+it into a slot the header provides (one line in ChatHeader). OpenItemsPanel
+gains a "section" layout for use inside another panel instead of being
+copied. Where a transcript is shown without the session header there is no
+slot, and the pinned bar stays as before.
+
+Nothing is stored: as with the bar, the items are read from the loaded
+transcript, so an item mentioned only in history that has not been loaded
+is missing until the reader scrolls up to it.
+
+Phone sheet placement and the look of the badge are covered by unit tests
+and reading only; no browser run was made.
+
+Local only: this extends the chat-item-labels series (the open-items
+tracker), which is not upstream, and is not proposed upstream yet.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-item-labels.md                      |  19 ++-
+ tests/e2e_ui/chat/test_item_label_chips.py    |  16 +-
+ web/src/components/chat/OpenItemsPanel.tsx    |  49 +++++-
+ .../chat/SessionItemsButton.test.tsx          | 148 ++++++++++++++++++
+ .../components/chat/SessionItemsButton.tsx    |  98 ++++++++++++
+ web/src/components/chat/Transcript.tsx        |  20 ++-
+ web/src/shell/ChatHeader.test.tsx             |  18 +++
+ web/src/shell/ChatHeader.tsx                  |   3 +
+ web/src/shell/SessionItemsHeaderSlot.tsx      |  41 +++++
+ 9 files changed, 388 insertions(+), 24 deletions(-)
+ create mode 100644 web/src/components/chat/SessionItemsButton.test.tsx
+ create mode 100644 web/src/components/chat/SessionItemsButton.tsx
+ create mode 100644 web/src/shell/SessionItemsHeaderSlot.tsx
+
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+index 0a646453b76da0326f4c46af7b8f2bf5e5caff9e..53e52e9d8bdcf683242ee7c6b0e62102b12cd913 100644
+--- a/docs/chat-item-labels.md
++++ b/docs/chat-item-labels.md
+@@ -45,14 +45,23 @@ you or the agent write them.
+ - **Closing:** a struck-through mention, `~~[Q2]~~`, closes the item. Its chips
+   are struck through everywhere and the popover adds the sentence that closed
+   it. The newest mention decides, so a later plain mention reopens it.
+-- **Open items:** a bar above the thread lists the open labels as chips.
+-  Expand it for every item with its title, closed ones under **Closed (N)**.
+-- **Latest reply:** the Open items bar puts the items the agent's newest reply
++- **Open items:** a button in the session header, beside Agent info, carries
++  the number of open items as a badge. Click it for a panel (on a phone, tap
++  it for a sheet at the bottom of the screen) that lists the open labels as
++  chips and every item with its title, closed ones under **Closed (N)**. The
++  button appears once the transcript uses labels. A transcript shown without
++  the session header keeps the list as a bar pinned above the thread.
++- **Loaded history only:** items are read from the messages loaded in your
++  browser; the list is not stored on the server. In a long session whose early
++  history has not been loaded, an item mentioned only there is missing until
++  you scroll up far enough to load it, and a label whose first message is not
++  loaded is described by its earliest loaded mention.
++- **Latest reply:** the Open items list puts the items the agent's newest reply
+   mentions first, tinted, and includes an item that reply just closed, struck
+   through. Expanded, they sit under **In the latest reply**, ahead of the other
+   open items.
+-- **Dismiss:** each open item in the expanded bar has a dismiss button. A
+-  dismissed item leaves the bar's chips and open count; **Show dismissed (N)**
++- **Dismiss:** each open item in the list has a dismiss button. A dismissed
++  item leaves the chips, the open count and the badge; **Show dismissed (N)**
+   at the bottom lists it with **Restore**. An item the agent later closes shows
+   as closed as usual. Dismissals are stored on the session, as the
+   `omnigent.items_dismissed` label, so they follow you to other devices.
+diff --git a/tests/e2e_ui/chat/test_item_label_chips.py b/tests/e2e_ui/chat/test_item_label_chips.py
+index d4bb89de6735438a06e1e6413e3c197783361cd1..0a23323abb3e1ed0e9e5c83b458b533e0e3c0276 100644
+--- a/tests/e2e_ui/chat/test_item_label_chips.py
++++ b/tests/e2e_ui/chat/test_item_label_chips.py
+@@ -113,17 +113,23 @@ def test_item_label_chip_previews_defining_item(
+     expect(popover).to_contain_text("keeping our index naming")
+     page.keyboard.press("Escape")
+ 
+-    # The panel lists what is still open; closed items fold under "Closed".
++    # The header button counts what is still open; its panel lists every item,
++    # closed ones under "Closed".
++    items_button = page.get_by_test_id("session-items-trigger")
++    expect(items_button).to_contain_text("2")
++    items_button.click()
+     panel = page.get_by_test_id("open-items")
+     expect(panel).to_contain_text("Open items")
+     expect(panel).to_contain_text("(2)")
+-    panel.get_by_role("button", name="Show item R1").first.click()
+-    expect(popover).to_contain_text("ON DELETE CASCADE")
+-    page.keyboard.press("Escape")
+-    panel.locator("summary").click()
+     expect(panel.get_by_role("button", name="Show item Q2 (closed)")).to_contain_text(
+         "Soft-deleted rows"
+     )
++    # An item's preview opens over the panel; Escape closes the preview, then the panel.
++    panel.get_by_role("button", name="Show item R1").first.click()
++    expect(popover.last).to_contain_text("ON DELETE CASCADE")
++    page.keyboard.press("Escape")
++    page.keyboard.press("Escape")
++    expect(panel).to_have_count(0)
+ 
+     status.get_by_role("button", name="Show item Q2 (closed)").click()
+     popover.get_by_role("button", name="Show in conversation").click()
+diff --git a/web/src/components/chat/OpenItemsPanel.tsx b/web/src/components/chat/OpenItemsPanel.tsx
+index fa90a49ca033aae6929add93951b05182b4f203b..7e52db24a01257c0a08a589b42e38a7f707b21c2 100644
+--- a/web/src/components/chat/OpenItemsPanel.tsx
++++ b/web/src/components/chat/OpenItemsPanel.tsx
+@@ -15,6 +15,7 @@ import {
+   encodeDismissedItems,
+   itemLabelTitle,
+   mentionedInLatestReply,
++  type ItemLabelIndex,
+   type ItemLabelEntry,
+ } from "@/lib/itemLabels";
+ import { cn } from "@/lib/utils";
+@@ -75,9 +76,10 @@ function useFittedChipCount(chipKey: string) {
+  * Collapses an expanded `<details>` when the user presses outside it. Presses
+  * inside a popover don't count, since the panel's chips open popovers.
+  */
+-export function useCollapseOnOutsidePress() {
++export function useCollapseOnOutsidePress(enabled = true) {
+   const detailsRef = useRef<HTMLDetailsElement>(null);
+   useEffect(() => {
++    if (!enabled) return;
+     const onPointerDown = (event: PointerEvent) => {
+       const details = detailsRef.current;
+       const target = event.target as Element | null;
+@@ -87,7 +89,7 @@ export function useCollapseOnOutsidePress() {
+     };
+     document.addEventListener("pointerdown", onPointerDown);
+     return () => document.removeEventListener("pointerdown", onPointerDown);
+-  }, []);
++  }, [enabled]);
+   return detailsRef;
+ }
+ 
+@@ -114,6 +116,19 @@ function useDismissedItems(sessionId: string | null) {
+   };
+ }
+ 
++/** The items the tracker lists: every labelled item, once the transcript uses labels. */
++export function trackedItems(index: ItemLabelIndex | null): ItemLabelEntry[] {
++  return index?.enabled ? [...index.items.values()] : [];
++}
++
++/** How many of the transcript's tracked items are open: neither closed nor dismissed. */
++export function useOpenItemCount(): number {
++  const index = useContext(ItemLabelIndexContext);
++  const { dismissed } = useDismissedItems(useContext(ItemLabelSessionContext));
++  return trackedItems(index).filter((item) => item.closedBy === null && !dismissed.has(item.label))
++    .length;
++}
++
+ function ItemRow({
+   item,
+   recent,
+@@ -175,12 +190,19 @@ function ItemRow({
+  * restored from the "dismissed" list at the bottom. Self-hides until the
+  * transcript uses item labels.
+  */
+-export function OpenItemsPanel({ className }: { className?: string }) {
++export function OpenItemsPanel({
++  className,
++  layout = "bar",
++}: {
++  className?: string;
++  /** "section" lists the items inside another panel: expanded, without the bar's card. */
++  layout?: "bar" | "section";
++}) {
+   const index = useContext(ItemLabelIndexContext);
+   const sessionId = useContext(ItemLabelSessionContext);
+   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
+   const [showDismissed, setShowDismissed] = useState(false);
+-  const allItems = useMemo(() => (index?.enabled ? [...index.items.values()] : []), [index]);
++  const allItems = useMemo(() => trackedItems(index), [index]);
+   // A dismissal hides an open item; closing it later lists it as closed as usual.
+   const isDismissed = (item: ItemLabelEntry) => item.closedBy === null && dismissed.has(item.label);
+   const items = allItems.filter((item) => !isDismissed(item));
+@@ -195,16 +217,22 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+     .map((item) => `${item.label}:${isRecent(item) ? "r" : ""}${item.closedBy ? "c" : ""}`)
+     .join(" ");
+   const fit = useFittedChipCount(chipKey);
+-  const detailsRef = useCollapseOnOutsidePress();
++  const section = layout === "section";
++  const detailsRef = useCollapseOnOutsidePress(!section);
+   if (allItems.length === 0) return null;
+   const headerChips = chips.slice(0, fit.count ?? UNMEASURED_CHIP_LIMIT);
+ 
+   return (
+-    <div className={cn("shrink-0 px-3 md:px-4", className)}>
++    <div className={cn(!section && "shrink-0 px-3 md:px-4", className)}>
+       <details
+         ref={detailsRef}
+         data-testid="open-items"
+-        className="group mx-auto mb-1 max-w-3xl overflow-hidden rounded-xl border border-border bg-card shadow-sm"
++        open={section || undefined}
++        className={cn(
++          "group",
++          !section &&
++            "mx-auto mb-1 max-w-3xl overflow-hidden rounded-xl border border-border bg-card shadow-sm",
++        )}
+       >
+         <summary className="relative flex cursor-pointer list-none select-none items-center gap-2 px-3 py-2 text-ui font-medium [&::-webkit-details-marker]:hidden">
+           <MessageSquareDotIcon className="size-4 shrink-0 text-muted-foreground" />
+@@ -259,7 +287,12 @@ export function OpenItemsPanel({ className }: { className?: string }) {
+           <ChevronDownIcon className="size-4 shrink-0 transition-transform group-open:rotate-180" />
+         </summary>
+         {/* Capped like the Plan tracker so a long list can't swallow the chat. */}
+-        <div className="max-h-[180px] overflow-y-auto border-t border-border py-1">
++        <div
++          className={cn(
++            "overflow-y-auto border-t border-border py-1",
++            section ? "max-h-[min(20rem,40vh)]" : "max-h-[180px]",
++          )}
++        >
+           {recent.length > 0 && (
+             <div className="px-3 pt-1 pb-1 text-xs text-muted-foreground">In the latest reply</div>
+           )}
+diff --git a/web/src/components/chat/SessionItemsButton.test.tsx b/web/src/components/chat/SessionItemsButton.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..9510ba7aed2ac5c0c6cd36a969b1b3bbf125af52
+--- /dev/null
++++ b/web/src/components/chat/SessionItemsButton.test.tsx
+@@ -0,0 +1,148 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const viewport = vi.hoisted(() => ({ mobile: false }));
++vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => viewport.mobile }));
++
++import type { Session } from "@/lib/types";
++import {
++  DISMISSED_ITEMS_LABEL_KEY,
++  ItemLabelIndexContext,
++  ItemLabelSessionContext,
++  buildItemLabelIndex,
++  itemLabelsIn,
++  struckItemLabelsIn,
++  type ItemLabelSource,
++} from "@/lib/itemLabels";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { SessionItemsHeaderSlot, useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
++import { SessionItemsButton } from "./SessionItemsButton";
++
++beforeEach(() => {
++  viewport.mobile = false;
++});
++
++afterEach(() => {
++  cleanup();
++});
++
++/** The button as the transcript mounts it: in the header slot, or nothing without one. */
++function TranscriptItems({ sources }: { sources: ItemLabelSource[] }) {
++  const host = useSessionItemsHeaderHost("conv_1");
++  const index = buildItemLabelIndex(
++    sources.map((source) => ({
++      source,
++      labels: itemLabelsIn(source.text),
++      struck: struckItemLabelsIn(source.text),
++    })),
++  );
++  return (
++    <ItemLabelIndexContext.Provider value={index}>
++      <ItemLabelSessionContext.Provider value="conv_1">
++        {host ? <SessionItemsButton host={host} /> : <span data-testid="no-header-slot" />}
++      </ItemLabelSessionContext.Provider>
++    </ItemLabelIndexContext.Provider>
++  );
++}
++
++function renderButton(texts: string[], labels: Session["labels"] = {}, header = true) {
++  const queryClient = new QueryClient();
++  queryClient.setQueryData(["session", "conv_1"], { id: "conv_1", labels });
++  const sources = texts.map((text, position): ItemLabelSource => ({
++    messageId: `m${position}`,
++    role: "assistant",
++    text,
++  }));
++  return render(
++    <QueryClientProvider client={queryClient}>
++      <MemoryRouter>
++        <TooltipProvider>
++          <header data-testid="header">
++            {header && <SessionItemsHeaderSlot sessionId="conv_1" />}
++          </header>
++          <main data-testid="transcript">
++            <TranscriptItems sources={sources} />
++          </main>
++        </TooltipProvider>
++      </MemoryRouter>
++    </QueryClientProvider>,
++  );
++}
++
++const ITEMS = "- [Q1] **Backfill window.** Batch it?\n- [Q2] **Soft-deleted rows.** Copy or drop?";
++
++const trigger = () => screen.getByTestId("session-items-trigger");
++const openPanel = () => {
++  fireEvent.click(trigger());
++  return screen.getByTestId("session-items-panel");
++};
++
++describe("SessionItemsButton", () => {
++  it("renders in the header slot with the open count as its badge", () => {
++    renderButton([ITEMS, "~~[Q1]~~ batching it."]);
++
++    expect(within(screen.getByTestId("header")).getByTestId("session-items-trigger")).toBe(
++      trigger(),
++    );
++    expect(screen.getByTestId("transcript").contains(trigger())).toBe(false);
++    expect(screen.getByTestId("session-items-count").textContent).toBe("1");
++    expect(trigger().getAttribute("aria-label")).toBe("Open items (1 open)");
++    expect(screen.queryByTestId("session-items-panel")).toBeNull();
++  });
++
++  it("leaves dismissed items out of the badge", () => {
++    renderButton([ITEMS, "Looking."], { [DISMISSED_ITEMS_LABEL_KEY]: "Q2" });
++    expect(screen.getByTestId("session-items-count").textContent).toBe("1");
++  });
++
++  it("shows no badge once every item is closed, and no button until labels are in use", () => {
++    renderButton([ITEMS, "~~[Q1]~~ and ~~[Q2]~~ are settled."]);
++    expect(trigger().getAttribute("aria-label")).toBe("Open items");
++    expect(screen.queryByTestId("session-items-count")).toBeNull();
++    cleanup();
++
++    renderButton(["Use [A4] paper."]);
++    expect(screen.queryByTestId("session-items-trigger")).toBeNull();
++  });
++
++  it("is not rendered without a header slot", () => {
++    renderButton([ITEMS], {}, false);
++    expect(screen.getByTestId("no-header-slot")).toBeTruthy();
++    expect(screen.queryByTestId("session-items-trigger")).toBeNull();
++  });
++
++  it("opens a panel with the open items tracker, expanded", () => {
++    renderButton([ITEMS, "~~[Q1]~~ batching it.", "Tests pass."]);
++    const items = within(openPanel()).getByTestId("open-items") as HTMLDetailsElement;
++
++    expect(items.open).toBe(true);
++    expect(items.textContent).toContain("Open items(1)");
++    expect(items.textContent).toContain("Closed (1)");
++    expect(within(items).getAllByRole("button", { name: "Show item Q2" })).toHaveLength(2);
++    expect(within(items).getByRole("button", { name: "Dismiss item Q2" })).toBeTruthy();
++    // Unlike the pinned bar, a press elsewhere in the panel leaves the list expanded.
++    fireEvent.pointerDown(document.body);
++    expect(items.open).toBe(true);
++  });
++
++  it("closes when an item's preview jumps to its message", () => {
++    renderButton([ITEMS, "Still need [Q2]."]);
++    const panel = openPanel();
++    fireEvent.click(within(panel).getAllByRole("button", { name: /^Show item Q2/ })[0]);
++    fireEvent.click(screen.getByRole("button", { name: "Show in conversation" }));
++    expect(screen.queryByTestId("session-items-panel")).toBeNull();
++  });
++
++  it("opens as a dialog on a phone, with the same tracker", () => {
++    viewport.mobile = true;
++    renderButton([ITEMS, "Looking."]);
++    expect(screen.getByTestId("session-items-count").textContent).toBe("2");
++
++    const panel = openPanel();
++    expect(panel.getAttribute("role")).toBe("dialog");
++    expect(within(panel).getByRole("heading", { name: "Open items" })).toBeTruthy();
++    expect((within(panel).getByTestId("open-items") as HTMLDetailsElement).open).toBe(true);
++  });
++});
+diff --git a/web/src/components/chat/SessionItemsButton.tsx b/web/src/components/chat/SessionItemsButton.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..45822f6495cc05bb6751427707ea9d239b73f6c2
+--- /dev/null
++++ b/web/src/components/chat/SessionItemsButton.tsx
+@@ -0,0 +1,98 @@
++import { useContext, useEffect, useState } from "react";
++import { createPortal } from "react-dom";
++import { BookmarkIcon } from "lucide-react";
++import { OpenItemsPanel, trackedItems, useOpenItemCount } from "@/components/chat/OpenItemsPanel";
++import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
++import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
++import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import { ItemLabelIndexContext } from "@/lib/itemLabels";
++import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
++import { useSearchParams } from "@/lib/routing";
++import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
++
++const PANEL_NAME = "Open items";
++
++/**
++ * The session header's button for the transcript's open items, with the open
++ * count as a badge: a popover on desktop, a bottom sheet on phones. Rendered
++ * by the transcript into `host`, the header's slot. Hidden until the
++ * transcript uses item labels.
++ */
++export function SessionItemsButton({ host }: { host: HTMLElement }) {
++  const index = useContext(ItemLabelIndexContext);
++  const isMobile = useIsMobileViewport();
++  const openCount = useOpenItemCount();
++  const [open, setOpen] = useState(false);
++  // "Show in conversation" in an item's preview jumps to a message: get out of its way.
++  const [searchParams] = useSearchParams();
++  const jumpTarget = searchParams.get(MESSAGE_QUERY_PARAM);
++  useEffect(() => {
++    if (jumpTarget) setOpen(false);
++  }, [jumpTarget]);
++  if (trackedItems(index).length === 0) return null;
++
++  const trigger = (
++    <MobileHeaderButton
++      type="button"
++      variant="ghost"
++      size="icon-xs"
++      glass={false}
++      aria-label={openCount > 0 ? `${PANEL_NAME} (${openCount} open)` : PANEL_NAME}
++      data-testid="session-items-trigger"
++      className="border-none text-muted-foreground hover:text-foreground"
++    >
++      <span className="relative flex">
++        <BookmarkIcon className="size-4 max-md:size-5" />
++        {openCount > 0 && (
++          <span
++            data-testid="session-items-count"
++            aria-hidden="true"
++            className="absolute -top-1.5 -right-2 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-0.5 text-[10px] leading-none font-medium text-primary-foreground tabular-nums"
++          >
++            {openCount > 99 ? "99+" : openCount}
++          </span>
++        )}
++      </span>
++    </MobileHeaderButton>
++  );
++
++  if (isMobile) {
++    return createPortal(
++      // Not modal, so an item's preview can hand focus to the page behind, which closes the sheet.
++      <Dialog open={open} onOpenChange={setOpen} modal={false}>
++        <DialogTrigger asChild>{trigger}</DialogTrigger>
++        {/* Docked to the bottom edge as a sheet; the inline top beats the iOS shell's centering. */}
++        <DialogContent
++          data-testid="session-items-panel"
++          aria-describedby={undefined}
++          className="top-auto bottom-0 max-h-[80dvh] max-w-full translate-y-0 gap-2 overflow-y-auto rounded-b-none px-2 pt-4 pb-[calc(1rem+var(--omnigent-safe-bottom,0px))] sm:max-w-full"
++          style={{ top: "auto" }}
++        >
++          <DialogTitle className="px-3">{PANEL_NAME}</DialogTitle>
++          <OpenItemsPanel layout="section" />
++        </DialogContent>
++      </Dialog>,
++      host,
++    );
++  }
++  return createPortal(
++    <Popover open={open} onOpenChange={setOpen}>
++      <Tooltip>
++        <TooltipTrigger asChild>
++          <PopoverTrigger asChild>{trigger}</PopoverTrigger>
++        </TooltipTrigger>
++        <TooltipContent>{PANEL_NAME}</TooltipContent>
++      </Tooltip>
++      <PopoverContent
++        align="end"
++        aria-label={PANEL_NAME}
++        data-testid="session-items-panel"
++        className="menu-surface max-h-[var(--radix-popover-content-available-height)] w-96 max-w-[calc(100vw-1rem)] gap-1 overflow-y-auto rounded-[12px] p-1.5 ring-0"
++      >
++        <OpenItemsPanel layout="section" />
++      </PopoverContent>
++    </Popover>,
++    host,
++  );
++}
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index ec3b175ccd4e0809459d724c0de07924504b3052..57d0037daae356934dc35d5417de476f10e8996a 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -39,6 +39,8 @@ import {
+ } from "@/lib/itemLabels";
+ import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
+ import { useUserMessageNav } from "@/hooks/useUserMessageNav";
++import { SessionItemsButton } from "@/components/chat/SessionItemsButton";
++import { useSessionItemsHeaderHost } from "@/shell/SessionItemsHeaderSlot";
+ import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
+ import { OpenItemsPanel } from "@/components/chat/OpenItemsPanel";
+ import {
+@@ -414,6 +416,8 @@ function TranscriptImpl({
+     return () => window.removeEventListener("keydown", handler);
+   }, [nav]);
+ 
++  // With a session header, open items live behind its button instead of a pinned bar.
++  const itemsHeaderHost = useSessionItemsHeaderHost(display.conversationId);
+   const showWorkingIndicator =
+     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+   const itemLabelIndex = useMemo(
+@@ -421,7 +425,7 @@ function TranscriptImpl({
+     [display.bubbles],
+   );
+   const hasOpenItems = itemLabelIndex.enabled && itemLabelIndex.items.size > 0;
+-  const hasPinnedBanner = display.hasTasks || hasOpenItems;
++  const hasPinnedBanner = display.hasTasks || (hasOpenItems && !itemsHeaderHost);
+   return (
+     <TaskMarkersProvider value={taskMarkers}>
+       <ItemLabelScope index={itemLabelIndex} sessionId={display.conversationId ?? null}>
+@@ -435,11 +439,15 @@ function TranscriptImpl({
+             className="mt-14 md:mt-12"
+           />
+         )}
+-        {/* The first pinned row clears the header; chat-tasks-preview adds the
+-      native shells' safe-area shift (index.css). */}
+-        <OpenItemsPanel
+-          className={display.hasTasks ? undefined : "chat-tasks-preview mt-14 md:mt-12"}
+-        />
++        {itemsHeaderHost ? (
++          <SessionItemsButton host={itemsHeaderHost} />
++        ) : (
++          // The first pinned row clears the header; chat-tasks-preview adds the
++          // native shells' safe-area shift (index.css).
++          <OpenItemsPanel
++            className={display.hasTasks ? undefined : "chat-tasks-preview mt-14 md:mt-12"}
++          />
++        )}
+         {/* Wrapper div gives us a ref to scope the SelectionPopup to the
+       conversation area without requiring Conversation to forward refs. */}
+         <div
+diff --git a/web/src/shell/ChatHeader.test.tsx b/web/src/shell/ChatHeader.test.tsx
+index d69014c82e1b2e7d4dc95015569d70537364201a..3ebc417fab2978e9cba95572fdcfb583d11eef6a 100644
+--- a/web/src/shell/ChatHeader.test.tsx
++++ b/web/src/shell/ChatHeader.test.tsx
+@@ -226,6 +226,24 @@ describe("ChatHeader — pending session presentation", () => {
+   });
+ });
+ 
++describe("ChatHeader — open items slot", () => {
++  it("gives a session's transcript a slot for its open-items button, on desktop and mobile", () => {
++    const session = { sidebarOpen: true, conversationId: "conv_1", conversationTitle: "Audit" };
++    renderHeader(session);
++    expect(screen.getByTestId("session-items-slot")).toBeEmptyDOMElement();
++    cleanup();
++
++    isMobileMock.mockReturnValue(true);
++    renderHeader(session);
++    expect(screen.getByTestId("session-items-slot")).toBeEmptyDOMElement();
++  });
++
++  it("has no slot while the session is pending", () => {
++    renderHeader({ sidebarOpen: true, conversationId: "temp:12345678", pending: true });
++    expect(screen.queryByTestId("session-items-slot")).toBeNull();
++  });
++});
++
+ describe("ChatHeader — workspace pane alignment", () => {
+   it("uses the desktop workspace offset without changing the mobile inset", () => {
+     const { container } = renderHeader({ sidebarOpen: true });
+diff --git a/web/src/shell/ChatHeader.tsx b/web/src/shell/ChatHeader.tsx
+index bba2dc347659448333fc7ef78523560207a8dd88..01ed4ae41439719d99b8dc0afdb2c187c3bab516 100644
+--- a/web/src/shell/ChatHeader.tsx
++++ b/web/src/shell/ChatHeader.tsx
+@@ -66,6 +66,7 @@ import { useChatPaneViewToggleHost } from "./chatPaneToolbarHost";
+ import { SidebarOpenButton } from "./SidebarOpenButton";
+ import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
+ import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
++import { SessionItemsHeaderSlot } from "./SessionItemsHeaderSlot";
+ import { SessionMenuHeader } from "./SessionMenuHeader";
+ 
+ /**
+@@ -689,6 +690,8 @@ export function ChatHeader({
+             the three-dot "Session actions" menu below. Fork is also
+             available from the session menus and assistant messages. */}
+         {pending && <PendingHeaderActions isMobile={isMobile} />}
++        {/* Open items and links: the transcript portals its button here. */}
++        {!pending && conversationId && <SessionItemsHeaderSlot sessionId={conversationId} />}
+         {/* Agent info: tools & policies for the bound agent. Desktop-only
+             popover; self-hides when the agent has neither configured. */}
+         {!pending && conversationId && (
+diff --git a/web/src/shell/SessionItemsHeaderSlot.tsx b/web/src/shell/SessionItemsHeaderSlot.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2c7c82129ac77aa89f08f631a7056830ef2c293
+--- /dev/null
++++ b/web/src/shell/SessionItemsHeaderSlot.tsx
+@@ -0,0 +1,41 @@
++// The session header's spot for the open-items button. The transcript owns
++// the button (it derives the items) and portals it here; a surface without the
++// header has no slot, and the transcript keeps its Open items bar instead.
++
++import { useCallback, useSyncExternalStore } from "react";
++
++const hosts = new Map<string, HTMLElement>();
++const listeners = new Set<() => void>();
++
++function setHost(sessionId: string, element: HTMLElement | null): void {
++  if (element) hosts.set(sessionId, element);
++  else hosts.delete(sessionId);
++  for (const listener of listeners) listener();
++}
++
++function subscribe(listener: () => void): () => void {
++  listeners.add(listener);
++  return () => listeners.delete(listener);
++}
++
++/** Where `sessionId`'s open-items button renders in the header, or null without one. */
++export function useSessionItemsHeaderHost(
++  sessionId: string | null | undefined,
++): HTMLElement | null {
++  return useSyncExternalStore(subscribe, () => (sessionId ? (hosts.get(sessionId) ?? null) : null));
++}
++
++/** The header slot `sessionId`'s transcript fills; takes no room while empty. */
++export function SessionItemsHeaderSlot({ sessionId }: { sessionId: string }) {
++  const register = useCallback(
++    (element: HTMLDivElement | null) => setHost(sessionId, element),
++    [sessionId],
++  );
++  return (
++    <div
++      ref={register}
++      data-testid="session-items-slot"
++      className="no-drag flex items-center empty:hidden"
++    />
++  );
++}
