@@ -9,21 +9,30 @@ numbers themselves and close an item only by striking it in chat. With
 the open items tools available, that would leave the store unused, the
 numbers made up and the chat text deciding what is open.
 
-Agents whose spec keeps the open_items tool group get one shorter block
-in its place: raise first (several per call, each with a topic), write
-each item once in chat with the returned label and a bold title, refer
-to it by label afterwards and never write a label the tool did not
-return; answer comments on items ("Comments on N items:") with
-sys_open_items_update replies, closing with a one-line resolution only
-what that settles; leave items the user closed ("(closed by me)") closed
-unless asked again; list instead of relying on memory. It never asks for
-struck labels, so nothing written in chat changes an item. SDK harnesses
-get it every turn in place of the item-label instruction; native
-harnesses get it at launch, swapped in for the item-label paragraph
-(build_native_startup_instructions is wrapped rather than edited, so
-guidance other changes add to its list composes with it). The runner
-drops the group when the server does not store open items, so those
-sessions, and launches without a spec, keep the text-label instruction.
+Agents whose spec keeps the open_items tool group get one block in its
+place: every question the agent asks and every risk, finding or follow-up
+(and a page worth pinning) is an item, raised before the reply that has
+it (several per call, each with a topic), never asked as an unlabelled
+list or a question form; each is written once in chat with the returned
+label and a bold title, referred to by label afterwards, and no label the
+tool did not return is written; comments on items ("Comments on N
+items:") are answered with sys_open_items_update replies, closing with a
+one-line resolution only what that settles; items the user closed ("(closed
+by me)") stay closed unless asked again; the list is read instead of
+memory; and chat talks about the items, not about recording them. It
+never asks for struck labels, so nothing written in chat changes an item.
+The wording was tried on real sessions: without the "every question" and
+"not an unlabelled list or a question form" parts, claude-native asked
+its questions as a plain numbered list and the Claude SDK harness as an
+AskUserQuestion form, raising nothing.
+
+SDK harnesses get it every turn in place of the item-label instruction;
+native harnesses get it at launch, swapped in for the item-label
+paragraph (build_native_startup_instructions is wrapped rather than
+edited, so guidance other changes add to its list composes with it). The
+runner drops the group when the server does not store open items, so
+those sessions, and launches without a spec, keep the text-label
+instruction.
 
 Not proposed upstream yet.
 
@@ -34,18 +43,18 @@ Signed-off-by: Desidero <desidero@gmail.com>
  docs/chat-item-labels.md                      |  5 ++
  docs/open-items.md                            |  8 +++
  feature-map/open-items.md                     |  2 +
- omnigent/runtime/prompt.py                    | 54 ++++++++++++++++++-
+ omnigent/runtime/prompt.py                    | 56 ++++++++++++++++++-
  .../claude_native/test_claude_native.py       | 14 +++--
  .../session/test_terminal_prepare.py          | 10 +++-
  .../codex_native/test_codex_native.py         | 14 +++--
  .../test_app_native_startup_instructions.py   | 14 +++--
- ...pp_sessions_native_terminals_autocreate.py | 27 +++++++---
- ...t_app_sessions_native_terminals_runtime.py | 10 ++--
+ ...pp_sessions_native_terminals_autocreate.py | 27 ++++++---
+ ...t_app_sessions_native_terminals_runtime.py | 10 +++-
  tests/runner/test_runner_dispatch.py          |  4 +-
  tests/runner/test_runner_entry.py             |  5 ++
  tests/runtime/test_prompt.py                  | 32 ++++++++++-
  tests/spec/test_resolve_agent_bundle.py       | 13 +++--
- 15 files changed, 180 insertions(+), 35 deletions(-)
+ 15 files changed, 182 insertions(+), 35 deletions(-)
 
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
 index 3edb6188b02e1a3723751c3dc2387c119cd176ac..a5543ff583706b3232702180198437a654d9cd79 100644
@@ -114,7 +123,7 @@ index c123168e0ffca740a9090beb92d20b02cd1326e0..2e5e10b9e470677aa50e496de84dfb86
 +- A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the instruction's last sentence covers that.
  - Labels are unique per session, not across a session tree: a child session counts from Q1.
 diff --git a/omnigent/runtime/prompt.py b/omnigent/runtime/prompt.py
-index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..64c61ed5c3ccc5febee22c1c416bb9e50b47f028 100644
+index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..a641c85df686b59392080ed00cc57be5998b15d8 100644
 --- a/omnigent/runtime/prompt.py
 +++ b/omnigent/runtime/prompt.py
 @@ -2,6 +2,8 @@
@@ -126,25 +135,27 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..64c61ed5c3ccc5febee22c1c416bb9e5
  import json
  import re
  from collections.abc import Sequence
-@@ -91,6 +93,49 @@ ITEM_LABEL_INSTRUCTION = (
+@@ -91,6 +93,51 @@ ITEM_LABEL_INSTRUCTION = (
      "closing settled ones keeps that list accurate."
  )
  
 +# Replaces ITEM_LABEL_INSTRUCTION for agents with the ``open_items`` tool group:
 +# the store keeps each item and its replies, and a label in chat only points at it.
 +OPEN_ITEMS_INSTRUCTION = (
-+    "Open items: when you raise something the user must decide or look at later (a "
-+    "question, risk, finding, follow-up, or a page worth pinning), call "
-+    "sys_open_items_raise first (several per call, each with a topic). It returns a "
-+    "label such as Q7. Write the item once in chat starting with that label and a bold "
-+    "title: [Q7] **Docker socket access?** detail. Afterwards refer to it by label. A "
-+    "label is only a pointer to the stored item: never write one the tool did not "
-+    'return. When the user comments on items ("Comments on N items:", one '
-+    '"#### [Q7] title" section each), call sys_open_items_update for each with your '
-+    "reply, adding status closed and a one-line resolution only if that settles it. "
-+    "Close other items the same way once settled. Items the user closed "
-+    '("(closed by me)") stay closed unless they ask again. Use sys_open_items_list, '
-+    "not memory, for what is open."
++    "Open items: every question you ask the user, and every risk, finding or "
++    "follow-up they should come back to, is an open item, as is a page worth pinning. "
++    "Before writing a reply that has any, call sys_open_items_raise for them (several "
++    "per call, each with a topic); it is the only way to create an item, and it "
++    "returns labels such as Q7. Then write each item once, starting with its label "
++    "and a bold title: [Q7] **Docker socket access?** detail. Don't ask them as an "
++    "unlabelled list or a question form instead. Afterwards refer to items by label, "
++    "and never write a label the tool did not return. When the user comments on items "
++    '("Comments on N items:", one "#### [Q7] title" section each), call '
++    "sys_open_items_update for each with your reply, adding status closed and a "
++    "one-line resolution only if that settles it, then answer in chat as usual. Close "
++    'other items the same way once settled. Items the user closed ("(closed by me)") '
++    "stay closed unless they ask again. Use sys_open_items_list, not memory, for what "
++    "is open. In chat, talk about the items, not about recording them."
 +)
 +
 +
@@ -176,7 +187,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..64c61ed5c3ccc5febee22c1c416bb9e5
  
  def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      """
-@@ -107,7 +152,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -107,7 +154,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      agent unless the spec sets ``tool_groups.browser: false``, in which
      case the prompt must not steer the model toward tools it lacks. The
      item-label guidance applies to every agent, since every transcript
@@ -186,7 +197,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..64c61ed5c3ccc5febee22c1c416bb9e5
  
      :param spec: The parsed AgentSpec.
      :returns: The applicable spec-level framework instructions.
-@@ -119,7 +165,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+@@ -119,7 +167,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
      if spec.tool_groups.browser:
          instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
      instructions.append(WORKSPACE_IMAGE_INSTRUCTION)
@@ -195,7 +206,7 @@ index a99a3f3a786ea052ba07cf95a9e36ebaab34facd..64c61ed5c3ccc5febee22c1c416bb9e5
      return instructions
  
  
-@@ -271,6 +317,10 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
+@@ -271,6 +319,10 @@ def build_native_startup_instructions(spec: AgentSpec | None) -> str:
      return append_framework_instructions(authored, framework) or "\n\n".join(framework)
  
  

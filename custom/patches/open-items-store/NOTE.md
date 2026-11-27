@@ -1,7 +1,7 @@
 # open-items-store
 
 Needs: side-schemas, chat-item-labels
-Covers: 93fbff3ce7aeddae
+Covers: 35e95762cbe69a30
 
 Open items (the questions, risks, findings, follow-ups and pinned links an
 agent raises) become records of their session, in the `open_items` side
@@ -28,7 +28,7 @@ follow the chat text.
 - A server or host without the series keeps text labels working: a runner keeps the tools only when the bundle download carries `X-Omnigent-Open-Items: 1`, and without the tools the agent gets the text-only item-label instruction. Nothing is backfilled.
 - A link pinned without a title is named by a short form of its URL (host and the start of the path), never the whole URL.
 - A reply joins the item's thread once per `ref` (a retried tool call or comment adds nothing) and never closes or reopens the item; the user replying makes an open item answered, the agent replying makes an answered one open. The latest ten replies that fit are kept.
-- Agents with the tools get one instruction block in place of the text-label one: raise first with a topic, write each item once with the returned label, never write a label the tool did not return, answer comments with `sys_open_items_update` replies and close only what that settles, keep items the user closed (`(closed by me)`) closed unless asked again, list instead of memory. It never asks for struck labels, and has no chat-only fallback. Agents without the tools keep the text-label instruction.
+- Agents with the tools get one instruction block in place of the text-label one: every question asked and every risk, finding or follow-up is an item, raised (with a topic) before the reply that has it and never asked as an unlabelled list or question form; each is written once with the returned label; no label the tool did not return is written; comments get `sys_open_items_update` replies, closing only what that settles; items the user closed (`(closed by me)`) stay closed unless asked again; the list beats memory; chat talks about items, not recording them. No struck labels, no chat-only fallback. Agents without the tools keep the text-label instruction.
 - The tool descriptions say raising is the only way to create an item and that items and replies show to the user.
 - A database that ran the retired chat-notes revision (`open_items0002`) starts: `open_items0003` drops that table, and its downgrade restores it.
 - Deleting a session removes its items and counters; forks start with none.

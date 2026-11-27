@@ -32,7 +32,7 @@ Not proposed upstream yet.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/open-items.md                            |  57 +++++-----
+ docs/open-items.md                            |  60 +++++-----
  feature-map/open-items.md                     |  22 ++--
  omnigent/entities/open_items.py               |  27 +++--
  omnigent/runner/open_items_tools.py           |   8 +-
@@ -43,10 +43,10 @@ Signed-off-by: Desidero <desidero@gmail.com>
  openapi.json                                  |  64 ++++++-----
  tests/server/routes/test_open_items_routes.py |  32 ++++--
  tests/stores/test_open_items_store.py         |  87 ++++++++++++---
- 11 files changed, 339 insertions(+), 181 deletions(-)
+ 11 files changed, 342 insertions(+), 181 deletions(-)
 
 diff --git a/docs/open-items.md b/docs/open-items.md
-index be8ef7323d7070209e1c15aacb0d6b0323406285..a5f38b8aa3ede0ef6240ef968696849a2779dabc 100644
+index be8ef7323d7070209e1c15aacb0d6b0323406285..d59ff995cacfa58f469e61e98df6892f51c5e863 100644
 --- a/docs/open-items.md
 +++ b/docs/open-items.md
 @@ -7,24 +7,26 @@ Omnigent allocates, so a label is never reused in its session and an item's
@@ -83,7 +83,7 @@ index be8ef7323d7070209e1c15aacb0d6b0323406285..a5f38b8aa3ede0ef6240ef968696849a
  
  A session holds at most 500 items. Items are deleted with their session. A fork
  or a side chat starts with none, and session export and import leave them out;
-@@ -37,34 +39,35 @@ calling session's items:
+@@ -37,34 +39,38 @@ calling session's items:
  
  | Tool | Arguments | Result |
  | --- | --- | --- |
@@ -115,13 +115,16 @@ index be8ef7323d7070209e1c15aacb0d6b0323406285..a5f38b8aa3ede0ef6240ef968696849a
 +raises at once in one session never get the same label.
 +
 +Agents with the tools get one framework instruction for them in place of the
-+text-label one: raise first (several per call, each with a topic), write each
++text-label one: every question the agent asks and every risk, finding or
++follow-up is an item (not an unlabelled list or a question form); raise them
++before writing the reply (several per call, each with a topic), write each
 +item once in chat as `[Q7] **Title** detail` with the returned label, refer to
 +it by label afterwards and never write a label the tool did not return; answer
 +comments on items with `sys_open_items_update` replies, closing with a one-line
 +resolution only what that settles; leave items the user closed (a comment
-+heading ending `(closed by me)`) closed unless the user asks again; and list
-+instead of relying on memory. The tool descriptions say that items and replies
++heading ending `(closed by me)`) closed unless the user asks again; list
++instead of relying on memory; and talk about the items in chat, not about
++recording them. The tool descriptions say that items and replies
 +show to the user. Nothing in the chat text creates, closes or reopens an
 +item.
  
@@ -136,7 +139,7 @@ index be8ef7323d7070209e1c15aacb0d6b0323406285..a5f38b8aa3ede0ef6240ef968696849a
  - The runner keeps the group only when the server says, on the agent bundle
    download, that it stores open items (`X-Omnigent-Open-Items: 1`). A server
    without this feature sends no such header, so its sessions keep the
-@@ -85,8 +88,8 @@ unless the user asks again, and label in chat only if the tools are missing.
+@@ -85,8 +91,8 @@ unless the user asks again, and label in chat only if the tools are missing.
  | --- | --- | --- |
  | `GET /sessions/{id}/open-items` | read access | One page in label order, with counts by status and kind over all items and the topics in use. Filters: `status` (repeatable; `all` for every status), `kind` (repeatable), `topic`, `raised_by`, `has_links`, `q` (text search), `limit` (1 to 200), `after` (a label). |
  | `POST /sessions/{id}/open-items` | the session's runner | Raise items for an agent with the `open_items` group. |
@@ -147,7 +150,7 @@ index be8ef7323d7070209e1c15aacb0d6b0323406285..a5f38b8aa3ede0ef6240ef968696849a
  
  Each write publishes `session.open_items.changed` on the session's stream with
  the labels written and the open count. `GET /v1/info` reports `open_items: true`
-@@ -96,7 +99,7 @@ when the server stores them. The request and response shapes are in
+@@ -96,7 +102,7 @@ when the server stores them. The request and response shapes are in
  ## Compatibility
  
  Nothing is backfilled: items a session labelled in chat before stay chat
