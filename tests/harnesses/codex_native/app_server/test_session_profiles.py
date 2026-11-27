@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
 from omnigent.harnesses.codex_native.app_server import (
     _FRAMEWORK_APPROVED_TOOLS,
     _build_native_codex_app_server_argv,
+    _codex_mcp_server_config_section,
     framework_approved_tools,
 )
 from omnigent.inner.codex_executor import (
@@ -32,6 +33,9 @@ _ROUTED_TOOL_APPROVALS = {
     "sys_scheduled_task_create": {"approval_mode": "approve"},
     "sys_scheduled_task_update": {"approval_mode": "approve"},
     "sys_session_rename": {"approval_mode": "approve"},
+    "sys_open_items_raise": {"approval_mode": "approve"},
+    "sys_open_items_update": {"approval_mode": "approve"},
+    "sys_open_items_list": {"approval_mode": "approve"},
     "sys_session_create": {"approval_mode": "approve"},
     "sys_agent_list": {"approval_mode": "approve"},
     "sys_session_send": {"approval_mode": "approve"},
@@ -45,6 +49,28 @@ def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
     # The base set is a subset of the routed one, so a routed session never
     # loses an approval a plain session has.
     assert set(_FRAMEWORK_APPROVED_TOOLS) <= set(_ROUTED_TOOL_APPROVALS)
+
+
+def test_the_open_items_tools_run_without_a_prompt_and_no_other_tool_is_added(
+    tmp_path: Path,
+) -> None:
+    from omnigent.tools.builtins.open_items import OPEN_ITEMS_TOOL_NAMES
+
+    section = tomllib.loads(_codex_mcp_server_config_section(tmp_path))
+    approvals = section["mcp_servers"]["omnigent"]["tools"]
+
+    # Exactly the three tool names, so a renamed tool shows up here.
+    assert OPEN_ITEMS_TOOL_NAMES == {
+        "sys_open_items_raise",
+        "sys_open_items_update",
+        "sys_open_items_list",
+    }
+    assert all(approvals[name] == {"approval_mode": "approve"} for name in OPEN_ITEMS_TOOL_NAMES)
+    assert set(approvals) - OPEN_ITEMS_TOOL_NAMES == {
+        "sys_session_rename",
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_update",
+    }
 
 
 # ── The codex-native session classes ────────────────────────────────

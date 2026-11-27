@@ -71,6 +71,11 @@ item.
   **codex-native**, **pi-native**, **antigravity-native** and **hermes** get
   them through the Omnigent tool relay, like the Inbox tools. Native harnesses
   without the relay never see them and keep the text-label instruction.
+- **codex-native** pre-approves the three tools (`approval_mode = "approve"`
+  in the session's generated Codex config, like `sys_session_rename`), so
+  Codex never stops a turn to ask before raising, updating or listing items.
+  They reach only the session's own items. Other MCP tools still follow the
+  session's Codex approval mode.
 - The runner keeps the group only when the server says, on the agent bundle
   download, that it stores open items (`X-Omnigent-Open-Items: 1`). A server
   without this feature sends no such header, so its sessions keep the
