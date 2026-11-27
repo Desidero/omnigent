@@ -9,6 +9,8 @@ import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPa
 import { StoredItemThread } from "@/components/chat/StoredItemThread";
 import { Button } from "@/components/ui/button";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { requestItemComment, useCanCommentOnItems } from "@/lib/itemCommentDrafts";
+import { useItemCommentClosingLabels } from "@/lib/openItemAnswers";
 import {
   useImportChatItems,
   useStoredOpenItems,
@@ -143,6 +145,8 @@ function RowDetails({
   onUpdate: (update: OpenItemUpdate) => void;
 }) {
   const [, setSearchParams] = useSearchParams();
+  const sessionId = useContext(ItemLabelSessionContext);
+  const canComment = useCanCommentOnItems(sessionId);
   const [resolution, setResolution] = useState("");
   const item = row.stored;
   const messageId = row.entry?.source.messageId;
@@ -168,6 +172,28 @@ function RowDetails({
             }
           >
             Show in conversation
+          </button>
+        )}
+        {canComment && sessionId !== null && (
+          // Comments sent on a stored item are recorded as its answers once they post.
+          <button
+            type="button"
+            className="text-xs text-link hover:underline"
+            onClick={() => requestItemComment(sessionId, { label: row.label, title: row.title })}
+          >
+            Comment
+          </button>
+        )}
+        {canComment && sessionId !== null && item && item.status !== "closed" && (
+          // Closes the item with the comment once the message posts.
+          <button
+            type="button"
+            className="text-xs text-link hover:underline"
+            onClick={() =>
+              requestItemComment(sessionId, { label: row.label, title: row.title, closes: true })
+            }
+          >
+            Comment and close
           </button>
         )}
         {item && canEdit && item.status !== "closed" && (
@@ -223,12 +249,15 @@ function RowDetails({
 function ItemRowView({
   row,
   expanded,
+  closing = false,
   onToggle,
   action,
   children,
 }: {
   row: OpenItemRow;
   expanded: boolean;
+  /** A comment draft closes the item when it is sent. */
+  closing?: boolean;
   onToggle: () => void;
   action?: ReactNode;
   children?: ReactNode;
@@ -265,6 +294,11 @@ function ItemRowView({
             {row.title || row.label}
           </span>
           {row.status === "answered" && <span className={TAG_CLASS}>answered</span>}
+          {closing && row.status !== "closed" && (
+            <span className={cn(TAG_CLASS, "border-success/40 text-success")}>
+              closes when sent
+            </span>
+          )}
           {!row.stored && <span className={TAG_CLASS}>chat only</span>}
           {row.topic && <span className={cn(TAG_CLASS, "ml-auto")}>{row.topic}</span>}
         </button>
@@ -343,6 +377,7 @@ export function StoredOpenItemsPanel({
   const index = useContext(ItemLabelIndexContext);
   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
   const canEdit = useCanEdit(sessionId ?? "");
+  const closingLabels = useItemCommentClosingLabels(sessionId);
   const update = useUpdateStoredOpenItems(sessionId);
   const importItems = useImportChatItems(sessionId);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -394,6 +429,7 @@ export function StoredOpenItemsPanel({
         key={row.label}
         row={row}
         expanded={expanded === row.label}
+        closing={closingLabels.has(row.label)}
         onToggle={() => setExpanded((open) => (open === row.label ? null : row.label))}
         action={action}
       >

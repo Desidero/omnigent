@@ -14,6 +14,9 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
 - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
 - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
 - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; the expanded row shows the stored thread.
+- `items-comment-replies`: sending a "Comments on N items" message first records each stored item's comments in its thread (once per message), so it shows answered; a failed or slow record never holds or changes the message.
+- `items-card`: a stored item's chip previews the store's thread and resolution, each once; a chat-only label's chip offers **Record**.
+- `items-comment-close`: **Comment and close**, chosen per item in comment mode (header card, tray ✓, panel row), marks the item's heading `(closed by me)` and, before the message goes, closes it as the user with the comment as its resolution; only on stored items that are not closed.
 
 ## How to get to it (user POV)
 
@@ -30,6 +33,7 @@ Preconditions: a local server and runner from this checkout; any harness.
 
 - Store (labels under concurrency, retries, imported labels, caps, close and reopen, reply threads, list filters, session delete, the migration that drops the retired chat notes table): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
 - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
+- Answers from comments (web): `web/src/lib/openItemAnswers.test.ts`, `web/src/hooks/useItemCommentMode.test.tsx`. Human check: with an open stored item, choose **Comment** on its chip or in its expanded panel row, send the comment; the item moves to **Answered** with your text under it, and the badge drops by one. With **Comment and close** on, the row says **closes when sent** before sending and the item moves to **Closed** with your comment as its resolution after.
 - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
 - Codex approval: `tests/harnesses/codex_native/app_server/test_session_profiles.py::test_the_open_items_tools_run_without_a_prompt_and_no_other_tool_is_added`.
 - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`, `::test_stored_items_guidance_names_the_tools_and_never_strikes_labels`.

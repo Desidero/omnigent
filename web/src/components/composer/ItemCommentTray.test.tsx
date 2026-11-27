@@ -219,4 +219,80 @@ describe("ItemCommentModeHeader", () => {
     expect(screen.queryByRole("button", { name: /Q2 text/ })).toBeNull();
     expect(screen.getByText("UTC or the account's zone?")).toBeTruthy();
   });
+
+  it("offers Comment and close only when asked to, and shows when it is on", () => {
+    renderHeader();
+    expect(screen.queryByRole("button", { name: "Comment and close" })).toBeNull();
+    cleanup();
+    const onClosesChange = vi.fn();
+    const props = {
+      label: "Q2",
+      title: "Report cutoff timezone",
+      item: ITEM ?? null,
+      excerpt: "",
+      editing: false,
+      onLeave: vi.fn(),
+      onClosesChange,
+    };
+    const { rerender } = render(<ItemCommentModeHeader {...props} closes={false} />);
+    const toggle = screen.getByRole("button", { name: "Comment and close" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(toggle);
+    expect(onClosesChange).toHaveBeenCalledWith(true);
+    rerender(<ItemCommentModeHeader {...props} closes />);
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByTestId("item-comment-mode").dataset.closes).toBe("true");
+    fireEvent.click(toggle);
+    expect(onClosesChange).toHaveBeenLastCalledWith(false);
+  });
+});
+
+describe("ItemCommentTray with Comment and close", () => {
+  const CLOSING = [{ ...DRAFTS[0], closes: true }, { ...DRAFTS[1], closes: true }, DRAFTS[2]];
+
+  it("marks the items sending closes, collapsed and expanded, and toggles them per item", () => {
+    const onToggleClose = vi.fn();
+    renderTray({ drafts: CLOSING, closableLabels: new Set(["Q2", "R1"]), onToggleClose });
+    expect(screen.getByRole("button", { name: "Show comment drafts" }).textContent).toContain(
+      "3 comments · Q2 ×2 · R1 · closes Q2",
+    );
+    expandTray();
+    const rows = screen.getAllByTestId("item-comment-draft-row");
+    expect(rows.map((row) => within(row).queryByText("closes") !== null)).toEqual([
+      true,
+      true,
+      false,
+    ]);
+    const r1Toggle = within(rows[2]).getByRole("button", { name: "Close R1 when sent" });
+    expect(r1Toggle.getAttribute("aria-pressed")).toBe("false");
+    expect(
+      within(rows[0])
+        .getByRole("button", { name: "Close Q2 when sent" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    fireEvent.click(r1Toggle);
+    expect(onToggleClose).toHaveBeenCalledWith("R1");
+  });
+
+  it("shows no closing on items that cannot be closed", () => {
+    renderTray({ drafts: CLOSING, onToggleClose: vi.fn() });
+    expect(screen.getByRole("button", { name: "Show comment drafts" }).textContent).not.toContain(
+      "closes",
+    );
+    expandTray();
+    expect(screen.queryByText("closes")).toBeNull();
+    expect(screen.queryByRole("button", { name: /when sent/ })).toBeNull();
+  });
+
+  it("marks a new comment being written that closes its item", () => {
+    renderTray({
+      drafts: [DRAFTS[2]],
+      composingLabel: "Q2",
+      composingCloses: true,
+      closableLabels: new Set(["Q2"]),
+    });
+    expect(screen.getByRole("button", { name: "Show comment drafts" }).textContent).toContain(
+      "2 comments · R1 · Q2 · closes Q2",
+    );
+  });
 });

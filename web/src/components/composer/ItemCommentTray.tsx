@@ -4,6 +4,7 @@ import {
   CheckIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  CircleCheckIcon,
   EllipsisIcon,
   MessageSquareTextIcon,
   PaperclipIcon,
@@ -34,21 +35,31 @@ const ACTION_BUTTON_CLASS =
 const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
 const LABEL_BADGE_CLASS = cn(itemLabelChipClass(false), "pointer-events-none shrink-0");
 const NOTHING_SENDING_ELSEWHERE: { submissionId: string; commentCount: number }[] = [];
+const NO_LABELS: ReadonlySet<string> = new Set();
+/** Marks an item that sending closes ("Comment and close"). */
+const CLOSES_TAG_CLASS = "shrink-0 rounded bg-success/15 px-1 text-xs font-medium text-success";
 
 function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
-/** "3 comments · Q2 ×2 · R1"; `composingLabel` counts a comment still being written. */
+/**
+ * "3 comments · Q2 ×2 · R1 · closes Q2"; `composingLabel` counts a comment
+ * still being written, and `composingCloses` whether it closes its item.
+ */
 export function summarizeItemCommentDrafts(
   drafts: readonly ItemCommentDraft[],
   composingLabel: string | null = null,
+  composingCloses = false,
 ): string {
   const labels = drafts.map((draft) => draft.label);
   if (composingLabel !== null) labels.push(composingLabel);
   const counts = new Map<string, number>();
   for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
   const parts = [...counts].map(([label, count]) => (count > 1 ? `${label} ×${count}` : label));
+  const closing = new Set(drafts.filter((draft) => draft.closes).map((draft) => draft.label));
+  if (composingLabel !== null && composingCloses) closing.add(composingLabel);
+  if (closing.size > 0) parts.push(`closes ${[...closing].join(", ")}`);
   return [plural(labels.length, "comment"), ...parts].join(" · ");
 }
 
@@ -66,17 +77,49 @@ function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim() !== "") ?? "";
 }
 
+/** Switches "Comment and close" for one item's comments. */
+function CloseToggle({
+  label,
+  closes,
+  onToggle,
+}: {
+  label: string;
+  closes: boolean;
+  onToggle: (label: string) => void;
+}) {
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-xs"
+      aria-pressed={closes}
+      aria-label={`Close ${label} when sent`}
+      title={closes ? `Sending closes ${label}; tap to only comment` : `Comment and close ${label}`}
+      className={cn(ACTION_BUTTON_CLASS, closes && "text-success hover:text-success")}
+      onClick={() => onToggle(label)}
+    >
+      <CircleCheckIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
+    </Button>
+  );
+}
+
 function DraftRow({
   draft,
   editing,
+  closable,
   onEdit,
   onDelete,
+  onToggleClose,
 }: {
   draft: ItemCommentDraft;
   editing: boolean;
+  /** Whether "Comment and close" is offered on the draft's item. */
+  closable: boolean;
   onEdit: (draftId: string) => void;
   onDelete: (draftId: string) => void;
+  onToggleClose?: (label: string) => void;
 }) {
+  const closes = closable && draft.closes === true;
   const preview = firstLine(draft.text);
   return (
     <div
@@ -85,6 +128,7 @@ function DraftRow({
       className="flex min-w-0 items-center gap-1.5 py-0.5 text-sm text-foreground"
     >
       <span className={LABEL_BADGE_CLASS}>{draft.label}</span>
+      {closes && <span className={CLOSES_TAG_CLASS}>closes</span>}
       <span
         className={cn("min-w-0 flex-1 truncate", !preview && "text-muted-foreground")}
         title={draft.text}
@@ -102,6 +146,9 @@ function DraftRow({
         </span>
       )}
       <span className="flex shrink-0 items-center">
+        {closable && onToggleClose && (
+          <CloseToggle label={draft.label} closes={closes} onToggle={onToggleClose} />
+        )}
         <Button
           type="button"
           variant="ghost"
@@ -135,6 +182,12 @@ interface ItemCommentTrayProps {
   editingDraftId: string | null;
   /** The item of a new comment being written, which sending includes. */
   composingLabel?: string | null;
+  /** Whether the comment being written closes its item. */
+  composingCloses?: boolean;
+  /** Items "Comment and close" is offered on: stored items that are not closed. */
+  closableLabels?: ReadonlySet<string>;
+  /** Switches whether an item's comments close it. */
+  onToggleClose?: (label: string) => void;
   /** Whether a typed message goes along as the General section. */
   withMessage?: boolean;
   /** Why sending is unavailable right now; null when it can send. */
@@ -163,6 +216,9 @@ export function ItemCommentTray({
   drafts,
   editingDraftId,
   composingLabel = null,
+  composingCloses = false,
+  closableLabels = NO_LABELS,
+  onToggleClose,
   withMessage = false,
   sendDisabledReason = null,
   onSend,
@@ -209,7 +265,15 @@ export function ItemCommentTray({
             </span>
           ) : (
             <span className="truncate text-foreground">
-              {summarizeItemCommentDrafts(drafts, composingLabel)}
+              {summarizeItemCommentDrafts(
+                drafts.map((draft) =>
+                  draft.closes && !closableLabels.has(draft.label)
+                    ? { ...draft, closes: false }
+                    : draft,
+                ),
+                composingLabel,
+                composingCloses,
+              )}
             </span>
           )}
           {expanded ? (
@@ -326,8 +390,10 @@ export function ItemCommentTray({
               key={draft.id}
               draft={draft}
               editing={draft.id === editingDraftId}
+              closable={closableLabels.has(draft.label)}
               onEdit={onEdit}
               onDelete={onDelete}
+              {...(onToggleClose ? { onToggleClose } : {})}
             />
           ))}
           {composingLabel !== null && (
@@ -336,6 +402,7 @@ export function ItemCommentTray({
               className="flex min-w-0 items-center gap-1.5 py-0.5 text-sm text-muted-foreground"
             >
               <span className={LABEL_BADGE_CLASS}>{composingLabel}</span>
+              {composingCloses && <span className={CLOSES_TAG_CLASS}>closes</span>}
               <span className="min-w-0 flex-1 truncate">Writing…</span>
             </div>
           )}
@@ -371,7 +438,8 @@ const DEFINITION_MAX_HEIGHT_CLASS = "max-h-[calc(var(--omnigent-viewport-height,
 /**
  * Comment mode's header card at the top of the composer: names the item the
  * comment is for and shows its definition, expanded until collapsed to one
- * line. × leaves comment mode and keeps the draft.
+ * line. × leaves comment mode and keeps the draft. Where `onClosesChange` is
+ * given, "Comment and close" switches whether sending closes the item.
  */
 export function ItemCommentModeHeader({
   label,
@@ -379,6 +447,8 @@ export function ItemCommentModeHeader({
   item,
   excerpt,
   editing,
+  closes = false,
+  onClosesChange,
   onLeave,
 }: {
   label: string;
@@ -387,6 +457,10 @@ export function ItemCommentModeHeader({
   item: ItemLabelEntry | null;
   excerpt: string;
   editing: boolean;
+  /** Whether sending closes the item with this comment. */
+  closes?: boolean;
+  /** Offered only on a stored item that is not closed. */
+  onClosesChange?: (closes: boolean) => void;
   onLeave: () => void;
 }) {
   const [expanded, setExpanded] = useState(true);
@@ -395,7 +469,11 @@ export function ItemCommentModeHeader({
   return (
     <div
       data-testid="item-comment-mode"
-      className="mx-3 mt-3 flex flex-col rounded-md border-l-2 border-l-warning bg-muted/40 text-sm"
+      data-closes={closes || undefined}
+      className={cn(
+        "mx-3 mt-3 flex flex-col rounded-md border-l-2 bg-muted/40 text-sm",
+        closes ? "border-l-success" : "border-l-warning",
+      )}
     >
       <div className="flex items-start gap-2 px-2 py-1.5">
         <div className="flex min-w-0 flex-1 flex-col">
@@ -410,6 +488,31 @@ export function ItemCommentModeHeader({
             <span className="truncate text-muted-foreground">{excerpt}</span>
           )}
         </div>
+        {onClosesChange && (
+          <button
+            type="button"
+            aria-pressed={closes}
+            aria-label="Comment and close"
+            data-testid="item-comment-close-toggle"
+            onClick={() => onClosesChange(!closes)}
+            title={
+              closes
+                ? `Sending closes ${label} with this comment; tap to only comment`
+                : `Close ${label} with this comment when it is sent`
+            }
+            className={cn(
+              "flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-xs max-md:min-h-9",
+              closes
+                ? "border-success/40 bg-success/15 font-medium text-success"
+                : "border-border text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <CircleCheckIcon className="size-3.5" aria-hidden="true" />
+            {/* Phones get the short label, leaving room for the item's title. */}
+            <span className="max-sm:hidden">Comment and close</span>
+            <span className="sm:hidden">Close</span>
+          </button>
+        )}
         {item !== null && (
           <button
             type="button"

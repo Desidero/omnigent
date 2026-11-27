@@ -120,6 +120,33 @@ stays current as the agent raises and closes them.
   as closed by a person with the resolution "Closed from the Open items panel";
   expanded, you can write the resolution yourself, **Reopen** a closed item, or
   **Set topic**. The agent sees every change in `sys_open_items_list`.
+- **Comments join the thread:** with [comments on items](chat-item-labels.md#comment-on-items),
+  an expanded item also offers **Comment**. When you send a "Comments on N
+  items" message, the browser first records each stored item's comments in
+  its thread (`POST …/open-items/replies`, named after the message so sending
+  it again records nothing new), then sends the message as one turn: an open
+  item becomes **Answered**, and the agent finds the comments in
+  `sys_open_items_list`. The send waits at most a few seconds for that record,
+  and a failed record never holds or changes the message. Labels the server
+  does not hold are skipped.
+- **The item card:** a stored item's chip previews where it was raised, then
+  its thread from the store (your comments and the agent's replies, each once)
+  and how it was closed, the resolution left out when it only repeats the last
+  reply. Replies and closing sentences in the chat text are not read for it.
+- **Record:** a chip of a label written only in the chat (one the server does
+  not hold, of a letter it uses) says so and offers **Record** to a person who
+  can comment, which stores it under its own label as **Import** does. Nothing
+  is recorded from the chat unless someone asks.
+- **Comment and close:** on a stored item that is not closed, the comment's
+  header card offers **Comment and close** (on a phone, **Close**), the
+  tray's ✓ switches it per item, and an expanded panel row offers it next to
+  **Comment**. The item is marked **closes when sent** in the panel and
+  **closes** in the tray until the message goes. The message tells the agent
+  with a heading ending `(closed by me)`; just before it goes, the comment is
+  recorded and the item is closed by you (`PATCH …/open-items`, `closed_by`
+  `user`) with the comment as its resolution, cut to 2,000 characters. If the
+  close fails, the item stays open with the comment and a toast says so. A
+  close is never read from what a comment says.
 - **Chat-only items** keep their dismiss button; dismissals are still stored
   as the `omnigent.items_dismissed` session label, which is read for chat-only
   items and never written for stored ones.
