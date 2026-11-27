@@ -399,6 +399,9 @@ _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
 # Footer rows Claude Code draws under the input box (mode hints, status line).
 _SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
+# Label Claude Code puts on the box's opening rule when a draft taller than
+# the box has scrolled its first rows, ``❯`` row included, out of view.
+_BOX_SCROLLED_LABEL_RE = re.compile(r"\s↑ \d+ more\s")
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -7494,7 +7497,9 @@ def _composer_box(pane: str) -> _ComposerBox | None:
     first non-blank one under the opening rule, led by a composer glyph. The
     rows run to the closing rule, or to the bottom of the pane when there is
     none on screen. A draft taller than the pane is read as well
-    (:func:`_scrolled_draft_rows`), without its first rows.
+    (:func:`_scrolled_draft_rows`), without its first rows, and so is one
+    taller than the box, whose opening rule reads ``↑ N more`` above the
+    draft's last rows.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The box's visible rows and whether both of its rules were on
@@ -7508,6 +7513,13 @@ def _composer_box(pane: str) -> _ComposerBox | None:
         first = _first_non_blank(lines, rules[-2] + 1, rules[-1])
         if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return _ComposerBox(lines[first : rules[-1]], framed=True)
+        rows = lines[first : rules[-1]]
+        if (
+            rows
+            and _BOX_SCROLLED_LABEL_RE.search(lines[rules[-2]])
+            and all(row.startswith("  ") for row in rows if row.strip())
+        ):
+            return _ComposerBox(rows, framed=False)
     first = _first_non_blank(lines, rules[-1] + 1, len(lines))
     if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
         return _ComposerBox(lines[first:], framed=False)
@@ -7890,6 +7902,8 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
     Claude Code keeps in the draft but does not render.
     A shell-mode box (``!`` glyph) is read too: Claude Code turns a draft's
     leading ``!`` into that glyph, so the needle is matched without it.
+    So is a draft scrolled past its glyph row (:func:`_composer_box`),
+    whose visible rows hold its end.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: Marker from :func:`_submit_needle`, e.g.
@@ -7906,6 +7920,8 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
     elif first_row.startswith(_SHELL_MODE_GLYPH):
         tail = "\n".join([first_row[len(_SHELL_MODE_GLYPH) :], *rows[1:]])
         needle = needle.removeprefix(_SHELL_MODE_GLYPH)
+    elif not rows and (box := _composer_box(pane)) is not None:
+        tail = "\n".join(box.rows)
     else:
         glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
         if not glyph_lines:

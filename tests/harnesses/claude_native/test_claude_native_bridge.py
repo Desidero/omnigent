@@ -11401,6 +11401,52 @@ def test_a_draft_scrolled_past_its_first_line_is_seen_by_its_end() -> None:
     assert not claude_native_bridge._draft_in_input_box(empty_box, needle, tail_needle=tail_needle)
 
 
+# Claude Code 2.1.332 in a 47-column pane after a long paste: the box keeps the
+# draft's last rows and counts the rows above them on its opening rule.
+_BOX_SCROLLED_DRAFT_PANE = "\n".join(
+    [
+        "  that the retry path is covered as well.",
+        "",
+        "✻ Cogitated for 5m 18s · done 4:28 AM",
+        "",
+        "       new task? /clear to save 132.6k tokens",
+        "─── ↑ 11 more ─────────────────────────────────",
+        "  Then ask a reviewer to weigh the general idea,",
+        "  what we have seen, and what they think makes",
+        "  the most sense.",
+        "───────────────────────────────────────────────",
+        "  ⏵⏵ auto mode on (shift+tab to cycle)",
+    ]
+)
+
+
+def test_a_draft_scrolled_inside_its_box_is_seen_by_its_end() -> None:
+    """
+    A draft taller than the input box scrolls its ``❯`` row away under an ``↑ N more`` rule.
+
+    Read as no input box, the pasted draft went unseen and delivery waited for
+    a ``❯`` row that never returned, so the turn timed out and the pane was reaped.
+    """
+    content = (
+        "Please look at the delivery change again.\n\n"
+        + "Check each caller and the retry path. " * 8
+        + "Then ask a reviewer to weigh the general idea, what we have seen, "
+        "and what they think makes the most sense."
+    )
+    needle = claude_native_bridge._submit_needle(content)
+    tail_needle = claude_native_bridge._submit_tail_needle(content)
+
+    assert claude_native_bridge._composer_box(_BOX_SCROLLED_DRAFT_PANE) == (
+        claude_native_bridge._ComposerBox(_BOX_SCROLLED_DRAFT_PANE.splitlines()[6:9], framed=False)
+    )
+    assert claude_native_bridge._draft_in_input_box(
+        _BOX_SCROLLED_DRAFT_PANE, needle, tail_needle=tail_needle
+    )
+    assert claude_native_bridge._occupying_surface(_BOX_SCROLLED_DRAFT_PANE) == (
+        claude_native_bridge._SCROLLED_DRAFT_SURFACE
+    )
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
@@ -13219,6 +13265,7 @@ class _EditableComposer:
         cursor: int,
         visible_rows: int | None = None,
         pane_rows: int | None = None,
+        box_rows: int | None = None,
         unavailable_clear_captures: int = 0,
     ) -> None:
         """
@@ -13232,6 +13279,9 @@ class _EditableComposer:
         :param pane_rows: When set, the pane has this many lines and keeps the
             bottom of the screen in view, as Claude Code 2.1.309 does: a draft
             too tall for it scrolls the opening rule and glyph row off the top.
+        :param box_rows: When set, the box shows at most this many rows, as
+            Claude Code 2.1.332 does: a taller draft keeps its last rows and
+            labels the opening rule ``↑ N more``.
         :param unavailable_clear_captures: Captures that fail after clearing
             starts; readiness captures remain readable.
         """
@@ -13239,6 +13289,7 @@ class _EditableComposer:
         self.cursor = cursor
         self._visible_rows = visible_rows
         self._pane_rows = pane_rows
+        self._box_rows = box_rows
         self._unavailable_clear_captures = unavailable_clear_captures
         self._clearing_started = False
         self.submitted: list[str] = []
@@ -13290,7 +13341,11 @@ class _EditableComposer:
             # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
             return f"⏺ done\n{self._RULE}\n{clipped}\n"
-        screen = ["⏺ done", self._RULE, *rows, self._RULE, "  ? for shortcuts"]
+        opening = self._RULE
+        if self._box_rows is not None and len(rows) > self._box_rows:
+            hidden = len(rows) - self._box_rows
+            opening, rows = f"─── ↑ {hidden} more {self._RULE}", rows[hidden:]
+        screen = ["⏺ done", opening, *rows, self._RULE, "  ? for shortcuts"]
         if self._pane_rows is not None:
             screen = screen[-self._pane_rows :]
         return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
@@ -13525,6 +13580,26 @@ def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
     inject(bridge_dir)
 
     assert [text.strip() for text in composer.submitted] == [expected]
+
+
+def test_a_message_taller_than_the_input_box_is_submitted_and_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A pasted message that scrolls inside the input box is submitted, not waited on.
+
+    Its ``❯`` row scrolls away under an ``↑ N more`` rule, so delivery read the
+    box as missing, waited for a prompt row that could not return, and failed
+    the turn with the message left unsent in the box.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer("", cursor=0, box_rows=3)
+    composer.install(monkeypatch)
+    message = "\n".join(f"step {idx} of the plan" for idx in range(1, 8))
+
+    inject_user_message(bridge_dir, content=message)
+
+    assert [text.strip() for text in composer.submitted] == [message]
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
