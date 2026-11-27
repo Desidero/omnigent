@@ -1,0 +1,1212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 27 Nov 2026 07:19:18 +0000
+Subject: [PATCH] feat(open-items): keep a reply thread on each item, created
+ only by the tool
+
+An item is meant to work like a comment thread on a document: created by
+one action, discussed inside it, and resolved. The store kept only the
+user's answers, the agent's reply to a comment existed only as chat text
+that the web had to find again, and a raise could adopt any label the
+agent had already written in chat, so a label made up in the text could
+still become an item.
+
+- sys_open_items_update takes `reply`, the agent's answer on the item's
+  thread; on its own it never closes the item, and with status closed and
+  a resolution it answers and settles in one call. People reply through
+  PATCH or `POST .../open-items/replies` (renamed from `/answers`).
+- Each item keeps `replies` (author user or agent, text, time, and who
+  for a person), the latest ten that fit its stored size. A reply carries
+  the write that made it (`ref`: the tool call, or the web's comment
+  submission), so a retry adds it once. The user replying makes an open
+  item answered; the agent replying hands an answered item back as open.
+- A raise no longer takes `label`; the server allocates every label and
+  refuses an item that names one. The tool descriptions say that raising
+  is the only way to create an item and that items and replies show to
+  the user. sys_open_items_list shows the latest three replies.
+- Stored labels can still be given by an import of chat labels, which is
+  the only caller of a raise with a number.
+
+Not proposed upstream yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/open-items.md                            |  57 +++++-----
+ feature-map/open-items.md                     |  22 ++--
+ omnigent/entities/open_items.py               |  27 +++--
+ omnigent/runner/open_items_tools.py           |   8 +-
+ omnigent/server/API.md                        |  38 ++++---
+ omnigent/server/open_items.py                 |  44 ++++----
+ omnigent/stores/open_items_store.py           | 105 +++++++++++++-----
+ omnigent/tools/builtins/open_items.py         |  36 +++---
+ openapi.json                                  |  64 ++++++-----
+ tests/server/routes/test_open_items_routes.py |  32 ++++--
+ tests/stores/test_open_items_store.py         |  87 ++++++++++++---
+ 11 files changed, 339 insertions(+), 181 deletions(-)
+
+diff --git a/docs/open-items.md b/docs/open-items.md
+index be8ef7323d7070209e1c15aacb0d6b0323406285..a5f38b8aa3ede0ef6240ef968696849a2779dabc 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -7,24 +7,26 @@ Omnigent allocates, so a label is never reused in its session and an item's
+ state does not depend on how much of the transcript is loaded. It is on by
+ default; an agent opts out with `tool_groups.open_items: false`.
+ 
+-Agents still write each item once in the chat, as
+-[item labels](chat-item-labels.md) describe (`[Q7] **Title** detail`, and
+-`~~[Q7]~~` when it ends), so the chat reads as before and its label chips work
+-as before. What changes is where the state lives: the agent records items with
+-its tools, and the store decides whether an item is open.
++An item works like a comment thread on a document. The agent creates it with
++its tool, which is the only way an item is made, and then writes it once in the
++chat as `[Q7] **Title** detail`. That label in the chat is an anchor: it points
++at the stored item and never changes it. Replies (your comments and the
++agent's answers) and the resolution live on the item, and the store alone
++decides whether an item is open. Agents without the tools keep writing
++[item labels](chat-item-labels.md) as text.
+ 
+ ## What an item holds
+ 
+ | Field | Notes |
+ | --- | --- |
+ | `label` | The kind's letter and a number: `Q` question, `R` risk, `F` finding, `T` follow-up, `L` link. Numbers count up per session and kind, 1 to 999. |
+-| `status` | `open`, `answered` (you replied and the agent has not closed it yet) or `closed`. |
++| `status` | `open`, `answered` (you replied and the agent has not replied or closed it yet) or `closed`. A reply never closes an item. |
+ | `title`, `detail` | A few words (at most 160 characters), then the full item (at most 6,000). |
+ | `topic` | Optional short slug naming the piece of work, such as `cache-rollout`, so items of one coordinator session group. |
+ | `links` | Up to 8 http(s) links supporting the item. A link item (`L`) is a pinned URL; pinning one URL twice returns the same item, and one pinned without a title is named by a short form of its URL (`example.com/reports/…`). |
+ | `raised_by` | The sub-agent an item speaks for, when the agent raising it relays it. |
+ | `resolution`, `closed_by` | How a closed item ended, and whether the agent or a person closed it. |
+-| `answers` | Your latest five replies. |
++| `replies` | The item's thread, oldest first: each with `author` (`user` or `agent`), `text` (at most 2,000 characters), `at`, and `by` for a person. The latest ten are kept, fewer if they would not fit the item's stored size. |
+ 
+ A session holds at most 500 items. Items are deleted with their session. A fork
+ or a side chat starts with none, and session export and import leave them out;
+@@ -37,34 +39,35 @@ calling session's items:
+ 
+ | Tool | Arguments | Result |
+ | --- | --- | --- |
+-| `sys_open_items_raise` | `items` (1 to 10): `kind` (`question`, `risk`, `finding`, `follow_up`, `link`), `title`, `detail`, and optionally `topic`, `links`, `url` (a link item's URL), `raised_by`, `label` (a label already written in chat, to adopt it) | Per item its `label`, `status` and `title`, `duplicate: true` for a link already pinned, or an `error`; then `open_count` and the `topics` in use. |
+-| `sys_open_items_update` | `updates` (1 to 20): `label` and any of `status` (`open` or `closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty clears it), `add_links`, `remove_links` | Per label its new state, or its own error. |
+-| `sys_open_items_list` | Optionally `status` (`open`, `answered`, `closed` or `all`; default open and answered), `kind`, `topic`, `query`, `limit` (1 to 100, default 50), `after` (a label) | Compact rows in label order: a 300-character detail preview, the latest answer, how closed items ended; `truncated` and `next_after` when more remain, counts by status and the topics. |
++| `sys_open_items_raise` | `items` (1 to 10): `kind` (`question`, `risk`, `finding`, `follow_up`, `link`), `title`, `detail`, and optionally `topic`, `links`, `url` (a link item's URL), `raised_by` | Per item its `label`, `status` and `title`, `duplicate: true` for a link already pinned, or an `error`; then `open_count` and the `topics` in use. |
++| `sys_open_items_update` | `updates` (1 to 20): `label` and any of `reply` (the agent's reply on the item's thread), `status` (`open` or `closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty clears it), `add_links`, `remove_links` | Per label its new state, or its own error. |
++| `sys_open_items_list` | Optionally `status` (`open`, `answered`, `closed` or `all`; default open and answered), `kind`, `topic`, `query`, `limit` (1 to 100, default 50), `after` (a label) | Compact rows in label order: a 300-character detail preview, the latest three replies, how closed items ended; `truncated` and `next_after` when more remain, counts by status and the topics. |
+ 
+ Errors start with a code: `invalid_input`, `too_large`, `session_full`,
+ `label_taken`, `not_found`, or `unavailable` when the server does not store open
+-items (the agent then labels items in chat only).
++items. The agent cannot pick a label: a raise that names one is refused.
+ 
+ A raise retried by the harness with the same tool call ID returns the labels
+-its first attempt allocated. Two raises at once in one session never get the
+-same label. Adopting a label from chat takes it only if no item has it, and
+-moves counting past it.
+-
+-The framework instruction for item labels gains a part for these tools: record
+-every item, pinned links included, with `sys_open_items_raise` before presenting
+-it, with a topic, and write it with the returned label, never pick a number or
+-write a new label without recording it, close with `sys_open_items_update` and a one-line resolution and then
+-strike the label in chat, list instead of relying on memory, leave an item the
+-user closed closed (one whose comment heading ends `(closed by me)` included)
+-unless the user asks again, and label in chat only if the tools are missing.
++its first attempt allocated, and a retried update adds its reply once. Two
++raises at once in one session never get the same label.
++
++Agents with the tools get one framework instruction for them in place of the
++text-label one: raise first (several per call, each with a topic), write each
++item once in chat as `[Q7] **Title** detail` with the returned label, refer to
++it by label afterwards and never write a label the tool did not return; answer
++comments on items with `sys_open_items_update` replies, closing with a one-line
++resolution only what that settles; leave items the user closed (a comment
++heading ending `(closed by me)`) closed unless the user asks again; and list
++instead of relying on memory. The tool descriptions say that items and replies
++show to the user. Nothing in the chat text creates, closes or reopens an
++item.
+ 
+ ### Which sessions get the tools
+ 
+ - **SDK harnesses** get them with the turn's tools; **claude-native**,
+   **codex-native**, **pi-native**, **antigravity-native** and **hermes** get
+   them through the Omnigent tool relay, like the Inbox tools. Native harnesses
+-  without the relay never see them and keep text labels, as the instruction's
+-  last sentence tells them.
++  without the relay never see them and keep the text-label instruction.
+ - The runner keeps the group only when the server says, on the agent bundle
+   download, that it stores open items (`X-Omnigent-Open-Items: 1`). A server
+   without this feature sends no such header, so its sessions keep the
+@@ -85,8 +88,8 @@ unless the user asks again, and label in chat only if the tools are missing.
+ | --- | --- | --- |
+ | `GET /sessions/{id}/open-items` | read access | One page in label order, with counts by status and kind over all items and the topics in use. Filters: `status` (repeatable; `all` for every status), `kind` (repeatable), `topic`, `raised_by`, `has_links`, `q` (text search), `limit` (1 to 200), `after` (a label). |
+ | `POST /sessions/{id}/open-items` | the session's runner | Raise items for an agent with the `open_items` group. |
+-| `PATCH /sessions/{id}/open-items` | the session's runner, or a person with edit access | Close, reopen, retitle, retopic or relink items. |
+-| `POST /sessions/{id}/open-items/answers` | edit access | Record replies; an open item becomes answered. |
++| `PATCH /sessions/{id}/open-items` | the session's runner, or a person with edit access | Reply to, close, reopen, retitle, retopic or relink items. |
++| `POST /sessions/{id}/open-items/replies` | edit access | Record a person's replies (a `ref` makes a retry add nothing); an open item becomes answered. |
+ 
+ Each write publishes `session.open_items.changed` on the session's stream with
+ the labels written and the open count. `GET /v1/info` reports `open_items: true`
+@@ -96,7 +99,7 @@ when the server stores them. The request and response shapes are in
+ ## Compatibility
+ 
+ Nothing is backfilled: items a session labelled in chat before stay chat
+-labels until an agent adopts them with `label`. A server or host without this
++labels. A server or host without this
+ feature keeps working with text labels, and the web chips read the chat text
+ as before. The items live in their own tables, apart from the main migration
+ chain (see [side stores](extending/side_schemas.md)): a build without the
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index 2e5e10b9e470677aa50e496de84dfb8604a745eb..83fce6a7ff2fbf7d909327786081fc5f33f0c69d 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -1,37 +1,37 @@
+ # Open items
+ 
+-A session's agent records the questions, risks, findings and follow-ups it raises, and the links it pins, as stored open items with labels the server allocates (`Q7`), and still writes each one once in the chat. Agents close, reopen and list items through their tools; people read them over the API and may close, reopen, retopic or answer them. There is no panel for them yet: the chat's label chips and Open items bar still read the chat text.
++A session's agent creates the questions, risks, findings and follow-ups it raises, and the links it pins, as stored open items with labels the server allocates (`Q7`), and writes each one once in the chat, where the label only points at it. Each item keeps a reply thread: people's comments and the agent's replies. Agents reply to, close, reopen and list items through their tools; people read them over the API and may reply to, close, reopen or retopic them. There is no panel for them yet: the chat's label chips and Open items bar still read the chat text.
+ 
+ ## Sub-features
+ 
+-- `items-raise`: `sys_open_items_raise` allocates labels per session and kind; a retried call gets the same labels; a pinned URL pinned again returns the same item; `label` adopts a chat label if it is free.
+-- `items-update`: `sys_open_items_update` closes with a resolution, reopens, and edits title, detail, topic and links, each label with its own result.
++- `items-raise`: `sys_open_items_raise` allocates labels per session and kind; a retried call gets the same labels; a pinned URL pinned again returns the same item; the agent cannot choose a label.
++- `items-update`: `sys_open_items_update` replies on the item's thread, closes with a resolution, reopens, and edits title, detail, topic and links, each label with its own result; a reply alone never closes an item.
+ - `items-list`: `sys_open_items_list` and `GET /v1/sessions/{id}/open-items` list in label order with status, kind, topic and text filters, counts and topics.
+-- `items-answers`: a person's replies, recorded with `POST …/open-items/answers`, mark an open item answered.
++- `items-replies`: a person's replies, recorded with `POST …/open-items/replies` (once per `ref`), mark an open item answered; the agent's reply hands it back as open.
+ - `items-event`: every write publishes `session.open_items.changed` on the session's stream.
+-- `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
++- `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent gets the text-label instruction.
+ - `items-delete`: deleting a session deletes its items; a fork starts with none.
+ 
+ ## How to get to it (user POV)
+ 
+ - Chat: ask an agent with the default tool groups something that leaves it open questions; it calls `sys_open_items_raise`, which shows as a tool row, and writes the items with the returned labels.
+-- Chat: answer or settle an item; the agent closes it with `sys_open_items_update` and strikes its label.
+-- API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/answers` with edit access.
++- Chat: answer or settle an item; the agent replies and closes it with `sys_open_items_update`.
++- API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/replies` with edit access.
+ - Agent spec: `tool_groups.open_items: false` turns the tools off for that agent.
+ 
+ ## Driving it with the repro environment
+ 
+ Preconditions: a local server and runner from this checkout; any harness.
+ 
+-- Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
++- Store (labels under concurrency, retries, imported labels, caps, close and reopen, reply threads, list filters, session delete, the migration that drops the retired chat notes table): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
+ - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
+ - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
+-- Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
+-- Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row, a struck `~~[Q1]~~`, and the item `closed` with `closed_by: agent` in the API.
++- Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`, `::test_stored_items_guidance_names_the_tools_and_never_strikes_labels`.
++- Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row with a `reply`, and the item `closed` with `closed_by: agent` and the reply in its `replies` in the API. The agent does not strike labels.
+ 
+ ## Gotchas
+ 
+ - The web UI does not read the store yet: chips and the Open items bar still follow the chat text, so an item closed only through the API still shows open in the bar.
+ - Hosts without the series do not know the `open_items` key in `tool_groups:`, and an agent spec naming it fails to load there.
+-- A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the instruction's last sentence covers that.
++- A CLI-launched claude-native or codex-native session composes its startup instruction from the local wrapper spec, so it mentions the tools even when the server lacks them; the tools then answer `unavailable`.
+ - Labels are unique per session, not across a session tree: a child session counts from Q1.
+diff --git a/omnigent/entities/open_items.py b/omnigent/entities/open_items.py
+index 14f3584749523c67615bb8a3c9fbf440a3b69abb..5d01882b1a66c9b0d8d9449afc13451814d77170 100644
+--- a/omnigent/entities/open_items.py
++++ b/omnigent/entities/open_items.py
+@@ -4,7 +4,8 @@ An item belongs to the session that raised it and is named by a label, the
+ kind's letter and a number, e.g. ``Q7``. The store allocates numbers, so a
+ label never changes and is never reused within its session. An item is
+ ``open`` until it is closed with a resolution, or ``answered`` once the user
+-has replied and the agent has not closed it yet.
++has replied and the agent has not replied or closed it yet. Each item keeps its
++reply chain: the user's comments and the agent's replies, in order.
+ 
+ The normalizers here check every field a write carries and return what to
+ store; the store and the routes run them, so every write path applies them. Links and
+@@ -40,12 +41,13 @@ TITLE_MAX_CHARS = 160
+ DETAIL_MAX_CHARS = 6000
+ TOPIC_MAX_CHARS = 48
+ RESOLUTION_MAX_CHARS = 2000
+-ANSWER_MAX_CHARS = 2000
++REPLY_MAX_CHARS = 2000
+ RAISED_BY_MAX_CHARS = 64
+ LINK_LABEL_MAX_CHARS = 120
+ URL_MAX_CHARS = 2048
+ LINKS_PER_ITEM = 8
+-ANSWERS_KEPT = 5
++REPLIES_KEPT = 10
++REPLY_AUTHORS = ("agent", "user")
+ # The chat parses labels of one to three digits.
+ NUMBER_MAX = 999
+ ITEMS_PER_SESSION = 500
+@@ -86,8 +88,8 @@ class OpenItem:
+         (``[{"url", "label"?}]``), ``url`` (a link item's target) and
+         ``raised_by``.
+     :ivar outcome: ``resolution``, ``closed_by``, ``closed_ref`` and
+-        ``answers`` (``[{"text", "at", "by"}]``, the latest five); empty until
+-        the item is answered or closed.
++        ``replies`` (``[{"author", "text", "at", "by"?, "ref"?}]``, oldest
++        first, the latest ten); empty until someone replies or closes it.
+     """
+ 
+     conversation_id: str
+@@ -126,6 +128,7 @@ class OpenItemChange:
+     """A checked change to one item; see :func:`normalize_change`.
+ 
+     :ivar status: ``"open"`` or ``"closed"``; ``None`` leaves it.
++    :ivar reply: Text added to the item's reply chain.
+     :ivar fields: Content fields to set; a ``None`` topic clears it.
+     """
+ 
+@@ -133,6 +136,7 @@ class OpenItemChange:
+     number: int
+     status: str | None = None
+     resolution: str | None = None
++    reply: str | None = None
+     fields: dict[str, Any] = field(default_factory=dict)
+     add_links: tuple[dict[str, str], ...] = ()
+     remove_links: tuple[str, ...] = ()
+@@ -293,7 +297,7 @@ def normalize_change(value: object) -> OpenItemChange:
+     """
+     if not isinstance(value, Mapping):
+         raise _invalid("each update must be an object")
+-    allowed = {"label", "status", "resolution", "title", "detail", "topic"}
++    allowed = {"label", "status", "resolution", "reply", "title", "detail", "topic"}
+     allowed |= {"add_links", "remove_links"}
+     if unknown := sorted(set(value) - allowed):
+         raise _invalid(f"unknown update fields: {', '.join(unknown)}")
+@@ -306,6 +310,9 @@ def normalize_change(value: object) -> OpenItemChange:
+         resolution = _text(value["resolution"], "resolution", RESOLUTION_MAX_CHARS, required=True)
+     if status == "closed" and resolution is None:
+         raise _invalid("closing an item needs a one-line resolution")
++    reply = None
++    if "reply" in value:
++        reply = _text(value["reply"], "reply", REPLY_MAX_CHARS, required=True)
+     fields: dict[str, Any] = {}
+     if "title" in value:
+         fields["title"] = _text(value["title"], "title", TITLE_MAX_CHARS, required=True)
+@@ -321,6 +328,7 @@ def normalize_change(value: object) -> OpenItemChange:
+         number=number,
+         status=status,
+         resolution=resolution,
++        reply=reply,
+         fields=fields,
+         add_links=tuple(_links(value.get("add_links"), "add_links")),
+         remove_links=tuple(_canonical_url(url) for url in removed),
+@@ -385,7 +393,7 @@ def _searchable(item: OpenItem) -> str:
+     parts += [content.get("url"), content.get("raised_by"), outcome.get("resolution")]
+     parts += [link.get("url") for link in content.get("links") or []]
+     parts += [link.get("label") for link in content.get("links") or []]
+-    parts += [answer.get("text") for answer in outcome.get("answers") or []]
++    parts += [reply.get("text") for reply in outcome.get("replies") or []]
+     return "\n".join(str(part) for part in parts if part).casefold()
+ 
+ 
+@@ -449,5 +457,8 @@ def item_to_json(item: OpenItem) -> dict[str, Any]:
+         "closed_at": item.closed_at,
+         "resolution": outcome.get("resolution"),
+         "closed_by": outcome.get("closed_by"),
+-        "answers": outcome.get("answers") or [],
++        "replies": [
++            {name: reply[name] for name in ("author", "text", "at", "by") if name in reply}
++            for reply in outcome.get("replies") or []
++        ],
+     }
+diff --git a/omnigent/runner/open_items_tools.py b/omnigent/runner/open_items_tools.py
+index ea03a0f0cf7ce0137ae4cd6fba6be7d826a06a7d..4e62d92b6cd4432b64ddc84588c0117d9892ceba 100644
+--- a/omnigent/runner/open_items_tools.py
++++ b/omnigent/runner/open_items_tools.py
+@@ -30,6 +30,7 @@ _UNAVAILABLE = (
+ _WRITE_ATTEMPTS = 3
+ _RETRYABLE_STATUSES = frozenset({502, 503, 504})
+ _DETAIL_PREVIEW_CHARS = 300
++_REPLIES_SHOWN = 3
+ 
+ 
+ def _url(session_id: str) -> str:
+@@ -125,8 +126,11 @@ def _row(item: dict[str, Any]) -> dict[str, Any]:
+             row[name] = item[name]
+     if item.get("links"):
+         row["links"] = [link["url"] for link in item["links"]]
+-    if item.get("answers"):
+-        row["latest_answer"] = item["answers"][-1]["text"]
++    if replies := item.get("replies"):
++        row["latest_replies"] = [
++            {"from": reply["author"], "text": reply["text"][:_DETAIL_PREVIEW_CHARS]}
++            for reply in replies[-_REPLIES_SHOWN:]
++        ]
+     if item.get("closed_by"):
+         row["closed_by"] = item["closed_by"]
+     return row
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index 3deb200700b96eb839d1a28d9c6d08e7daa552d4..9d4c528666bebeb19271bbd958d737e5602e495b 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -1558,7 +1558,8 @@ GET /v1/sessions/{session_id}/open-items?status=open&kind=question&q=cache&limit
+   "links": [{"url": "https://...", "label": "PR"}], "url": null,
+   "raised_by": null, "created_at": 1764100000, "updated_at": 1764100000,
+   "closed_at": null, "resolution": null, "closed_by": null,
+-  "answers": [{"text": "Link them", "at": 1764100100, "by": "bob@example.com"}]}],
++  "replies": [{"author": "user", "text": "Link them?", "at": 1764100100, "by": "bob@example.com"},
++              {"author": "agent", "text": "Yes, both.", "at": 1764100160}]}],
+   "has_more": false, "next_after": null,
+   "counts": {"status": {"open": 3, "answered": 1, "closed": 2},
+              "kind": {"question": 4, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}},
+@@ -1568,7 +1569,7 @@ GET /v1/sessions/{session_id}/open-items?status=open&kind=question&q=cache&limit
+ Read access. Items come in label order (by kind, then number). `status` and
+ `kind` repeat; `status` defaults to `open` and `answered`, and `all` means
+ every status. `topic`, `raised_by`, `has_links` and `q` (case-insensitive text
+-in the label, title, detail, topic, links, resolution and answers) narrow the
++in the label, title, detail, topic, links, resolution and replies) narrow the
+ page; `limit` is 1 to 200 (default 100) and `after` takes a label, the previous
+ page's `next_after`. `counts` and `topics` cover all of the session's items.
+ 
+@@ -1577,7 +1578,7 @@ POST /v1/sessions/{session_id}/open-items
+ X-Omnigent-Orchestration-Source: <session_id>
+ 
+ {"items": [{"kind": "question", "title": "Cache rows?", "detail": "...",
+-  "topic": "cache", "links": ["https://..."], "label": "Q7"}],
++  "topic": "cache", "links": ["https://..."]}],
+  "idempotency_key": "tool:toolu_01"}
+ 
+ 200 OK — {"items": [{"item": {...}, "duplicate": false} | {"error": {"code", "message"}}],
+@@ -1592,14 +1593,15 @@ Only the session's runner raises items, for its agent. One to ten items; item
+ `i` is written under `<idempotency_key>:<i>`, so a retry returns the items the
+ first attempt wrote. `kind` is `question`, `risk`, `finding`, `follow_up` or
+ `link` (which needs `url`; pinning a URL the session already pinned returns that
+-item with `duplicate: true`). `label` adopts a label written in chat if it is
+-free. An item that cannot be taken carries its own error: `session_full` (500
+-items, or 999 of the kind) or `label_taken`.
++item with `duplicate: true`). The server allocates every label: an item that
++names one is refused with `invalid_input`. An item that cannot be taken carries
++its own error: `session_full` (500 items, or 999 of the kind).
+ 
+ ```
+ PATCH /v1/sessions/{session_id}/open-items
+ 
+-{"updates": [{"label": "Q7", "status": "closed", "resolution": "Linked them"},
++{"updates": [{"label": "Q7", "reply": "Linked both.", "status": "closed",
++              "resolution": "Linked them"},
+              {"label": "R2", "topic": "release", "add_links": ["https://..."],
+               "remove_links": ["https://..."]}],
+  "ref": "tool:toolu_02"}
+@@ -1608,23 +1610,27 @@ PATCH /v1/sessions/{session_id}/open-items
+ ```
+ 
+ From the session's runner (with the source header, as above) or from a person
+-with edit access. One to twenty updates; each sets any of `status` (`open` or
+-`closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty
+-clears it), `add_links` and `remove_links`. A close records `closed_by`
+-(`agent` or `user`) and `ref`; a reopen clears the resolution and keeps the
+-answers. A label the session lacks gets `not_found`, a change that would not
++with edit access. One to twenty updates; each sets any of `reply` (added to the
++item's thread as the agent's or the person's, once per `ref`; it never closes
++the item), `status` (`open` or `closed`), `resolution` (required to close),
++`title`, `detail`, `topic` (empty clears it), `add_links` and `remove_links`. A
++close records `closed_by` (`agent` or `user`) and `ref`; a reopen clears the
++resolution and keeps the replies. A person's reply makes an open item
++`answered`; the agent's makes an `answered` one `open`. A label the session lacks gets `not_found`, a change that would not
+ fit gets `too_large`; the others still apply.
+ 
+ ```
+-POST /v1/sessions/{session_id}/open-items/answers
++POST /v1/sessions/{session_id}/open-items/replies
+ 
+-{"answers": [{"label": "Q7", "text": "Link them"}]}
++{"replies": [{"label": "Q7", "text": "Link them?"}], "ref": "comment:4f1c"}
+ 
+ 200 OK — {"items": [{"label": "Q7", "item": {...}}]}
+ ```
+ 
+-Edit access. Records each reply (the latest five are kept); an open item
+-becomes `answered`.
++Edit access. Records each reply as the person's (the latest ten per item are
++kept, fewer if they would not fit); an open item becomes `answered`. A reply
++whose `ref` the item already holds is not added again, so a retried request
++writes nothing new.
+ 
+ Each write publishes `session.open_items.changed` on the session's stream.
+ Deleting a session deletes its items; a fork starts with none.
+diff --git a/omnigent/server/open_items.py b/omnigent/server/open_items.py
+index c338b4099ef4b1f6a4078cf0d905654fd9490113..6ee9f95584b644ef4b7f2dcdfadf52a359fc4f81 100644
+--- a/omnigent/server/open_items.py
++++ b/omnigent/server/open_items.py
+@@ -2,7 +2,7 @@
+ 
+ A session's agent raises and updates items through its ``sys_open_items_*``
+ tools, which its runner sends here; people read them and may close, reopen,
+-retopic or answer them. Items live in the ``open_items`` side store
++retopic or reply to them. Items live in the ``open_items`` side store
+ (:mod:`omnigent.stores.open_items_store`). Every write publishes
+ ``session.open_items.changed`` on the session's stream.
+ 
+@@ -16,8 +16,8 @@ Routes, under ``/v1``:
+   tunnel token (edit access).
+ * ``PATCH /sessions/{session_id}/open-items`` changes items: from the session's
+   runner as above, or from a person with edit access.
+-* ``POST /sessions/{session_id}/open-items/answers`` records a person's replies
+-  (edit access); an open item becomes answered.
++* ``POST /sessions/{session_id}/open-items/replies`` records a person's replies,
++  such as their comments on items (edit access); an open item becomes answered.
+ """
+ 
+ from __future__ import annotations
+@@ -34,11 +34,11 @@ from pydantic import BaseModel, Field
+ 
+ from omnigent.entities import Conversation
+ from omnigent.entities.open_items import (
+-    ANSWER_MAX_CHARS,
+     BATCH_KEY_MAX_CHARS,
+     IDEMPOTENCY_KEY_MAX_CHARS,
+     LIST_PAGE_MAX,
+     RAISE_BATCH_MAX,
++    REPLY_MAX_CHARS,
+     UPDATE_BATCH_MAX,
+     OpenItemError,
+     OpenItemFilter,
+@@ -104,21 +104,23 @@ class OpenItemsUpdateRequest(BaseModel):
+     """Changes to items; see ``sys_open_items_update``."""
+ 
+     updates: list[dict[str, Any]] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
+-    # What made an agent's change, e.g. "tool:<call id>"; recorded on a close.
++    # What made the change, e.g. "tool:<call id>"; recorded on a close and a reply.
+     ref: str | None = Field(default=None, max_length=IDEMPOTENCY_KEY_MAX_CHARS)
+ 
+ 
+-class OpenItemAnswer(BaseModel):
++class OpenItemReply(BaseModel):
+     """A person's reply to one item."""
+ 
+     label: str = Field(min_length=2, max_length=4)
+-    text: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
++    text: str = Field(min_length=1, max_length=REPLY_MAX_CHARS)
+ 
+ 
+-class OpenItemsAnswerRequest(BaseModel):
++class OpenItemsReplyRequest(BaseModel):
+     """Replies to record, one per item."""
+ 
+-    answers: list[OpenItemAnswer] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
++    replies: list[OpenItemReply] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
++    # Names the write, e.g. "comment:<id>", so a retry records each reply once.
++    ref: str | None = Field(default=None, max_length=IDEMPOTENCY_KEY_MAX_CHARS)
+ 
+ 
+ def _require_store(conversation_store: ConversationStore) -> OpenItemsStore:
+@@ -305,6 +307,10 @@ def create_open_items_router(
+         store = _require_store(conversation_store)
+         user_id = get_user_id(request, auth_provider)
+         with _item_errors():
++            if any("label" in item for item in body.items):
++                raise OpenItemError(
++                    "invalid_input", "labels are allocated here; raise items without a label"
++                )
+             items = [normalize_new_item(item) for item in body.items]
+             owner = await asyncio.to_thread(_owner, session, user_id)
+             results = await asyncio.to_thread(
+@@ -337,35 +343,35 @@ def create_open_items_router(
+         """Change items, from the session's runner or a person with edit access."""
+         if request.headers.get(ORCHESTRATION_SOURCE_HEADER) is not None:
+             session = await _agent_session(request, session_id)
+-            closed_by = "agent"
++            actor, user_id = "agent", None
+         else:
+             session = await _session(request, session_id, LEVEL_EDIT)
+-            closed_by = "user"
++            actor, user_id = "user", get_user_id(request, auth_provider)
+         store = _require_store(conversation_store)
+         with _item_errors():
+             changes = [normalize_change(update) for update in body.updates]
+             results = await asyncio.to_thread(
+                 lambda: store.change_items(
+-                    session.id, changes, closed_by=closed_by, closed_ref=body.ref
++                    session.id, changes, actor=actor, ref=body.ref, user_id=user_id
+                 )
+             )
+         await _publish(store, session.id, [r.label for r in results if r.item is not None])
+         return {"items": _changed_json(results)}
+ 
+-    @router.post("/sessions/{session_id}/open-items/answers")
+-    async def answer_open_items(
+-        request: Request, session_id: str, body: OpenItemsAnswerRequest
++    @router.post("/sessions/{session_id}/open-items/replies")
++    async def reply_to_open_items(
++        request: Request, session_id: str, body: OpenItemsReplyRequest
+     ) -> dict[str, Any]:
+         """Record a person's replies; needs edit access."""
+         session = await _session(request, session_id, LEVEL_EDIT)
+         store = _require_store(conversation_store)
+         user_id = get_user_id(request, auth_provider)
+         with _item_errors():
+-            answers = [(answer.label, answer.text.strip()) for answer in body.answers]
+-            if not all(text for _, text in answers):
+-                raise OpenItemError("invalid_input", "an answer needs text")
++            replies = [(reply.label, reply.text.strip()) for reply in body.replies]
++            if not all(text for _, text in replies):
++                raise OpenItemError("invalid_input", "a reply needs text")
+             results = await asyncio.to_thread(
+-                lambda: store.record_answers(session.id, answers, user_id=user_id)
++                lambda: store.record_replies(session.id, replies, user_id=user_id, ref=body.ref)
+             )
+         await _publish(store, session.id, [r.label for r in results if r.item is not None])
+         return {"items": _changed_json(results)}
+diff --git a/omnigent/stores/open_items_store.py b/omnigent/stores/open_items_store.py
+index 376651467cceeba94da1f299d71c39d1623aa9e5..2760c5065653bd05babaaf261b4e24fb82289724 100644
+--- a/omnigent/stores/open_items_store.py
++++ b/omnigent/stores/open_items_store.py
+@@ -49,12 +49,12 @@ from omnigent.db.envelope import EnvelopedJSON, seal
+ from omnigent.db.side_schemas import SideStore, register_side_store, side_metadata
+ from omnigent.db.utils import now_epoch, run_write_transaction
+ from omnigent.entities.open_items import (
+-    ANSWERS_KEPT,
+     IDEMPOTENCY_KEY_MAX_CHARS,
+     ITEMS_PER_SESSION,
+     KIND_BY_CODE,
+     KINDS,
+     NUMBER_MAX,
++    REPLIES_KEPT,
+     SESSION_HEAD_KIND,
+     STATUS_BY_CODE,
+     STATUSES,
+@@ -106,7 +106,7 @@ class SqlOpenItem(OpenItemsBase):
+         EnvelopedJSON(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
+     )
+     # How it went, written apart from the content:
+-    # {"resolution", "closed_by", "closed_ref", "answers"}.
++    # {"resolution", "closed_by", "closed_ref", "replies"}.
+     outcome: Mapped[dict[str, Any] | None] = mapped_column(
+         EnvelopedJSON(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=True
+     )
+@@ -244,6 +244,40 @@ def _check_size(content: dict[str, Any], label: str) -> None:
+         )
+ 
+ 
++def _add_reply(
++    row: SqlOpenItem,
++    outcome: dict[str, Any],
++    author: str,
++    text: str,
++    ref: str | None,
++    user_id: str | None,
++    now: int,
++) -> None:
++    """Add a reply to an item's chain, unless the write *ref* names already added it.
++
++    The user replying makes an open item answered, the agent replying makes an
++    answered one open again; a reply never closes or reopens an item. The
++    latest :data:`REPLIES_KEPT` replies are kept, fewer if they would not fit.
++    """
++    replies = list(outcome.get("replies") or [])
++    if ref is not None and any(reply.get("ref") == ref for reply in replies):
++        return
++    reply: dict[str, Any] = {"author": author, "text": text, "at": now}
++    if user_id is not None and author == "user":
++        reply["by"] = user_id
++    if ref is not None:
++        reply["ref"] = ref
++    replies = [*replies, reply][-REPLIES_KEPT:]
++    outcome["replies"] = replies
++    while len(replies) > 1 and len(seal(outcome)) > MAX_STORED_VALUE_BYTES:
++        replies = replies[1:]
++        outcome["replies"] = replies
++    if author == "user" and row.status == STATUSES["open"]:
++        row.status = STATUSES["answered"]
++    elif author == "agent" and row.status == STATUSES["answered"]:
++        row.status = STATUSES["open"]
++
++
+ class OpenItemsStore:
+     """SQLAlchemy-backed store of each session's open items."""
+ 
+@@ -346,7 +380,8 @@ class OpenItemsStore:
+         Item ``i`` is written under ``<idempotency_key>:<i>``; a retry with the
+         same key returns the items the first attempt wrote. A link whose URL
+         the session already pinned returns that item as a duplicate. An item
+-        with its own number adopts that label if it is free.
++        with its own number (an import of a label written in chat) takes that
++        label if it is free.
+ 
+         :param items: Checked items, see
+             :func:`~omnigent.entities.open_items.normalize_new_item`.
+@@ -414,8 +449,8 @@ class OpenItemsStore:
+             return RaisedItem(
+                 error=OpenItemError(
+                     "session_full",
+-                    f"this session holds {ITEMS_PER_SESSION} items; close and reuse topics, "
+-                    "or label further items in chat",
++                    f"this session holds {ITEMS_PER_SESSION} items, the most it can; "
++                    "write further points in chat without a label",
+                 )
+             )
+         next_number = self._lock_head(session, conversation_id, kind)
+@@ -430,8 +465,7 @@ class OpenItemsStore:
+             return RaisedItem(
+                 error=OpenItemError(
+                     "label_taken",
+-                    f"{format_label(item.kind, number)} is already an item in this session; "
+-                    "raise without a label to get a new one",
++                    f"{format_label(item.kind, number)} is already an item in this session",
+                 )
+             )
+         now = now_epoch()
+@@ -461,23 +495,28 @@ class OpenItemsStore:
+         conversation_id: str,
+         changes: Sequence[OpenItemChange],
+         *,
+-        closed_by: str,
+-        closed_ref: str | None = None,
++        actor: str,
++        ref: str | None = None,
++        user_id: str | None = None,
+     ) -> list[ChangedItem]:
+-        """Change items: status, resolution, title, detail, topic and links.
++        """Change items: status, resolution, reply, title, detail, topic and links.
+ 
+         Closing records the resolution and who closed it; reopening clears
+-        them and keeps the answers.
+-
+-        :param closed_by: ``"agent"`` or ``"user"``, recorded on a close.
+-        :param closed_ref: What closed it, e.g. ``"tool:<call id>"``.
++        them and keeps the replies. A reply joins the item's chain (see
++        :meth:`_add_reply`) and never closes it.
++
++        :param actor: ``"agent"`` or ``"user"``: who closes, and who replies.
++        :param ref: What made the change, e.g. ``"tool:<call id>"``; recorded on
++            a close and on a reply, so a retried change replies once.
++        :param user_id: The person replying, or ``None`` for the agent or in
++            single-user mode.
+         :returns: One result per change, in order; a label the session lacks
+             carries ``not_found``.
+         """
+ 
+         def write(session: Session) -> list[ChangedItem]:
+             return [
+-                self._change_one(session, conversation_id, change, closed_by, closed_ref)
++                self._change_one(session, conversation_id, change, actor, ref, user_id)
+                 for change in changes
+             ]
+ 
+@@ -488,8 +527,9 @@ class OpenItemsStore:
+         session: Session,
+         conversation_id: str,
+         change: OpenItemChange,
+-        closed_by: str,
+-        closed_ref: str | None,
++        actor: str,
++        ref: str | None,
++        user_id: str | None,
+     ) -> ChangedItem:
+         label = format_label(change.kind, change.number)
+         row = self._row(session, conversation_id, KINDS[change.kind][0], change.number, lock=True)
+@@ -512,15 +552,17 @@ class OpenItemsStore:
+         except OpenItemError as exc:
+             return ChangedItem(label, error=exc)
+         now = now_epoch()
++        if change.reply is not None:
++            _add_reply(row, outcome, actor, change.reply, ref, user_id, now)
+         if change.resolution is not None:
+             outcome["resolution"] = change.resolution
+         if change.status == "closed":
+             if row.status != STATUSES["closed"]:
+                 row.closed_at = now
+             row.status = STATUSES["closed"]
+-            outcome["closed_by"] = closed_by
+-            if closed_ref is not None:
+-                outcome["closed_ref"] = closed_ref
++            outcome["closed_by"] = actor
++            if ref is not None:
++                outcome["closed_ref"] = ref
+         elif change.status == "open":
+             row.status = STATUSES["open"]
+             row.closed_at = None
+@@ -531,18 +573,24 @@ class OpenItemsStore:
+         row.updated_at = now
+         return ChangedItem(label, item=_to_item(row))
+ 
+-    def record_answers(
+-        self, conversation_id: str, answers: Sequence[tuple[str, str]], *, user_id: str | None
++    def record_replies(
++        self,
++        conversation_id: str,
++        replies: Sequence[tuple[str, str]],
++        *,
++        user_id: str | None,
++        ref: str | None = None,
+     ) -> list[ChangedItem]:
+-        """Record the user's replies; an open item becomes answered.
++        """Record a person's replies, e.g. their comments on items; an open item becomes answered.
+ 
+-        :param answers: ``(label, text)`` pairs, checked by the caller.
++        :param replies: ``(label, text)`` pairs, checked by the caller.
+         :param user_id: Who replied, or ``None`` in single-user mode.
++        :param ref: Names the write, e.g. ``"comment:<id>"``, so a retry adds nothing.
+         """
+ 
+         def write(session: Session) -> list[ChangedItem]:
+             results = []
+-            for label, text in answers:
++            for label, text in replies:
+                 kind, number = parse_label(label)
+                 label = format_label(kind, number)
+                 row = self._row(session, conversation_id, KINDS[kind][0], number, lock=True)
+@@ -553,16 +601,13 @@ class OpenItemsStore:
+                     continue
+                 now = now_epoch()
+                 outcome = dict(row.outcome or {})
+-                answer = {"text": text, "at": now, "by": user_id}
+-                outcome["answers"] = [*(outcome.get("answers") or []), answer][-ANSWERS_KEPT:]
++                _add_reply(row, outcome, "user", text, ref, user_id, now)
+                 row.outcome = outcome
+-                if row.status == STATUSES["open"]:
+-                    row.status = STATUSES["answered"]
+                 row.updated_at = now
+                 results.append(ChangedItem(label, item=_to_item(row)))
+             return results
+ 
+-        return run_write_transaction(self._writes, "record_open_item_answers", write)
++        return run_write_transaction(self._writes, "record_open_item_replies", write)
+ 
+     # ── Reads ─────────────────────────────────────────
+ 
+diff --git a/omnigent/tools/builtins/open_items.py b/omnigent/tools/builtins/open_items.py
+index 04a763687972f5a1c350d02b69aaf922126ec430..860a2ca8b13ef1e2f886031c6fa982a25df369d0 100644
+--- a/omnigent/tools/builtins/open_items.py
++++ b/omnigent/tools/builtins/open_items.py
+@@ -9,7 +9,7 @@ labels such as ``Q7``.
+     Raise items and get their labels.
+ 
+ ``sys_open_items_update``
+-    Close, reopen, retitle, retopic or relink items.
++    Reply to, close, reopen, retitle, retopic or relink items.
+ 
+ ``sys_open_items_list``
+     List the session's items, open and answered by default.
+@@ -71,12 +71,11 @@ class SysOpenItemsRaiseTool(Tool):
+     def description(cls) -> str:
+         """:returns: Human-readable description of the tool."""
+         return (
+-            "Record items that need the user's decision or attention later in this session's "
+-            "open items list, which the user sees beside the chat: a question, risk, finding "
+-            "or follow-up, or a link worth keeping. Returns each item's label (e.g. Q7); write "
+-            "that label in chat when you present the item. Pass label to adopt a label you "
+-            "already wrote in chat without the tool. Reuse a topic for items about the same "
+-            "piece of work."
++            "Create items that need the user's decision or attention later: a question, risk, "
++            "finding or follow-up, or a link worth keeping. This is the only way to create an "
++            "item; each one appears at once in the open items list the user sees beside the "
++            "chat. Returns each item's label (e.g. Q7), the only label you may write for it. "
++            "Reuse a topic for items about the same piece of work."
+         )
+ 
+     def get_schema(self) -> dict[str, Any]:
+@@ -97,7 +96,6 @@ class SysOpenItemsRaiseTool(Tool):
+                     "type": "string",
+                     "description": "The sub-agent this item speaks for, if not you.",
+                 },
+-                "label": {"type": "string", "description": "A label already used in chat."},
+             },
+             "required": ["kind"],
+             "additionalProperties": False,
+@@ -129,10 +127,12 @@ class SysOpenItemsUpdateTool(Tool):
+     def description(cls) -> str:
+         """:returns: Human-readable description of the tool."""
+         return (
+-            "Change this session's open items by label. Close an item with status closed and a "
+-            "one-line resolution as soon as it is resolved, decided, rejected, done or no "
+-            "longer relevant; reopen it with status open. Also edits title, detail, topic and "
+-            "links. Each label gets its new state or its own error."
++            "Change this session's open items by label. reply adds your answer to the item's "
++            "thread, which the user reads on the item; it does not close it. Close an item with "
++            "status closed and a one-line resolution once it is resolved, decided, rejected, "
++            "done or no longer relevant, with or without a reply; reopen it with status open. "
++            "Also edits title, detail, topic and links. Each label gets its new state or its "
++            "own error."
+         )
+ 
+     def get_schema(self) -> dict[str, Any]:
+@@ -142,6 +142,10 @@ class SysOpenItemsUpdateTool(Tool):
+             "properties": {
+                 "label": {"type": "string", "description": "e.g. Q7"},
+                 "status": {"type": "string", "enum": ["open", "closed"]},
++                "reply": {
++                    "type": "string",
++                    "description": "Your reply on the item's thread, Markdown.",
++                },
+                 "resolution": {
+                     "type": "string",
+                     "description": "How it ended, one line; required to close.",
+@@ -182,10 +186,10 @@ class SysOpenItemsListTool(Tool):
+     def description(cls) -> str:
+         """:returns: Human-readable description of the tool."""
+         return (
+-            "List this session's open items in label order: open and answered ones unless "
+-            "status says otherwise, with a detail preview, the user's latest answer and how "
+-            "closed items ended. Use it instead of relying on memory before referring to, "
+-            "closing or raising items."
++            "List this session's open items in label order: open and answered ones (the user "
++            "replied) unless status says otherwise, with a detail preview, the latest replies "
++            "and how closed items ended. Use it instead of relying on memory before referring "
++            "to, closing or raising items."
+         )
+ 
+     def get_schema(self) -> dict[str, Any]:
+diff --git a/openapi.json b/openapi.json
+index cf39deaa38a64436c6ee4e7fa982d09cb0093373..4d93254c83c79e75919fa8874bafc979c4d74061 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -5932,7 +5932,7 @@
+         "title": "OpenFileResponse",
+         "type": "object"
+       },
+-      "OpenItemAnswer": {
++      "OpenItemReply": {
+         "description": "A person's reply to one item.",
+         "properties": {
+           "label": {
+@@ -5952,26 +5952,7 @@
+           "label",
+           "text"
+         ],
+-        "title": "OpenItemAnswer",
+-        "type": "object"
+-      },
+-      "OpenItemsAnswerRequest": {
+-        "description": "Replies to record, one per item.",
+-        "properties": {
+-          "answers": {
+-            "items": {
+-              "$ref": "#/components/schemas/OpenItemAnswer"
+-            },
+-            "maxItems": 20,
+-            "minItems": 1,
+-            "title": "Answers",
+-            "type": "array"
+-          }
+-        },
+-        "required": [
+-          "answers"
+-        ],
+-        "title": "OpenItemsAnswerRequest",
++        "title": "OpenItemReply",
+         "type": "object"
+       },
+       "OpenItemsRaiseRequest": {
+@@ -6001,6 +5982,37 @@
+         "title": "OpenItemsRaiseRequest",
+         "type": "object"
+       },
++      "OpenItemsReplyRequest": {
++        "description": "Replies to record, one per item.",
++        "properties": {
++          "ref": {
++            "anyOf": [
++              {
++                "maxLength": 128,
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Ref"
++          },
++          "replies": {
++            "items": {
++              "$ref": "#/components/schemas/OpenItemReply"
++            },
++            "maxItems": 20,
++            "minItems": 1,
++            "title": "Replies",
++            "type": "array"
++          }
++        },
++        "required": [
++          "replies"
++        ],
++        "title": "OpenItemsReplyRequest",
++        "type": "object"
++      },
+       "OpenItemsUpdateRequest": {
+         "description": "Changes to items; see `sys_open_items_update`.",
+         "properties": {
+@@ -25397,10 +25409,10 @@
+         ]
+       }
+     },
+-    "/v1/sessions/{session_id}/open-items/answers": {
++    "/v1/sessions/{session_id}/open-items/replies": {
+       "post": {
+         "description": "Record a person's replies; needs edit access.",
+-        "operationId": "answer_open_items_v1_sessions__session_id__open_items_answers_post",
++        "operationId": "reply_to_open_items_v1_sessions__session_id__open_items_replies_post",
+         "parameters": [
+           {
+             "in": "path",
+@@ -25416,7 +25428,7 @@
+           "content": {
+             "application/json": {
+               "schema": {
+-                "$ref": "#/components/schemas/OpenItemsAnswerRequest"
++                "$ref": "#/components/schemas/OpenItemsReplyRequest"
+               }
+             }
+           },
+@@ -25428,7 +25440,7 @@
+               "application/json": {
+                 "schema": {
+                   "additionalProperties": true,
+-                  "title": "Response Answer Open Items V1 Sessions  Session Id  Open Items Answers Post",
++                  "title": "Response Reply To Open Items V1 Sessions  Session Id  Open Items Replies Post",
+                   "type": "object"
+                 }
+               }
+@@ -25446,7 +25458,7 @@
+             "description": "Validation Error"
+           }
+         },
+-        "summary": "Answer Open Items",
++        "summary": "Reply To Open Items",
+         "tags": [
+           "open_items"
+         ]
+diff --git a/tests/server/routes/test_open_items_routes.py b/tests/server/routes/test_open_items_routes.py
+index 8f9c148b9ba5f294d634b51240a911b06b4050b2..1face6cd65afd9d3131ac9928acc0137e7a9abbe 100644
+--- a/tests/server/routes/test_open_items_routes.py
++++ b/tests/server/routes/test_open_items_routes.py
+@@ -187,7 +187,7 @@ async def test_the_runner_raises_people_read_and_every_write_is_announced(
+     assert [item["label"] for item in rest.json()["data"]] == ["R1"]
+ 
+ 
+-async def test_viewers_read_editors_close_and_answer_and_others_are_refused(
++async def test_viewers_read_editors_close_and_reply_and_others_are_refused(
+     client: httpx.AsyncClient, stores: SimpleNamespace, events: list[Any]
+ ) -> None:
+     session_id = _session(stores)
+@@ -196,12 +196,12 @@ async def test_viewers_read_editors_close_and_answer_and_others_are_refused(
+     url = f"/v1/sessions/{session_id}/open-items"
+     await client.post(url, json=_raise_body(_QUESTION, _QUESTION), headers=_runner(session_id))
+     close = {"updates": [{"label": "Q1", "status": "closed", "resolution": "Not needed"}]}
+-    answer = {"answers": [{"label": "Q2", "text": "Link them"}]}
++    answer = {"replies": [{"label": "Q2", "text": "Link them"}], "ref": "comment:s1"}
+ 
+     assert (await client.get(url, headers=_user(BOB))).status_code == 200
+     assert (await client.patch(url, json=close, headers=_user(BOB))).status_code == 403
+     assert (
+-        await client.post(f"{url}/answers", json=answer, headers=_user(BOB))
++        await client.post(f"{url}/replies", json=answer, headers=_user(BOB))
+     ).status_code == 403
+     for refused in (
+         await client.get(url, headers=_user(DAVE)),
+@@ -212,15 +212,16 @@ async def test_viewers_read_editors_close_and_answer_and_others_are_refused(
+     by_carol = await client.patch(url, json=close, headers=_user(CAROL))
+     assert by_carol.status_code == 200, by_carol.text
+     assert by_carol.json()["items"][0]["item"]["closed_by"] == "user"
+-    answered = await client.post(f"{url}/answers", json=answer, headers=_user(CAROL))
++    answered = await client.post(f"{url}/replies", json=answer, headers=_user(CAROL))
+     assert answered.status_code == 200, answered.text
++    # A retried comment records it once.
++    answered = await client.post(f"{url}/replies", json=answer, headers=_user(CAROL))
+     item = answered.json()["items"][0]["item"]
+-    assert (item["status"], item["answers"][0]["text"], item["answers"][0]["by"]) == (
++    assert (item["status"], item["replies"]) == (
+         "answered",
+-        "Link them",
+-        CAROL,
++        [{"author": "user", "text": "Link them", "at": item["replies"][0]["at"], "by": CAROL}],
+     )
+-    assert [event[1]["labels"] for event in events[-2:]] == [["Q1"], ["Q2"]]
++    assert [event[1]["labels"] for event in events[-3:]] == [["Q1"], ["Q2"], ["Q2"]]
+ 
+ 
+ async def test_only_the_sessions_own_runner_raises(
+@@ -276,10 +277,11 @@ async def test_invalid_input_and_per_item_errors(
+         assert bad.status_code == 400 and "invalid_input" in bad.text, bad.text
+     assert events == []
+     await client.post(url, json=_raise_body(_QUESTION), headers=headers)
+-    taken = await client.post(
+-        url, json=_raise_body({**_QUESTION, "label": "Q1"}, key="tool:2"), headers=headers
++    # The server allocates labels; an agent cannot pick or adopt one.
++    labelled = await client.post(
++        url, json=_raise_body({**_QUESTION, "label": "Q7"}, key="tool:2"), headers=headers
+     )
+-    assert taken.json()["items"][0]["error"]["code"] == "label_taken"
++    assert labelled.status_code == 400 and "without a label" in labelled.text
+     missing = await client.patch(
+         url, json={"updates": [{"label": "T4", "topic": "x"}]}, headers=headers
+     )
+@@ -371,7 +373,12 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
+         "sys_open_items_update",
+         {
+             "updates": [
+-                {"label": "Q1", "status": "closed", "resolution": "Copied as is"},
++                {
++                    "label": "Q1",
++                    "reply": "Copied, since the rows are small.",
++                    "status": "closed",
++                    "resolution": "Copied as is",
++                },
+                 {"label": "R9", "status": "open"},
+             ]
+         },
+@@ -399,6 +406,7 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
+             "resolution": "Copied as is",
+             "kind": "question",
+             "detail": "Copy or link?",
++            "latest_replies": [{"from": "agent", "text": "Copied, since the rows are small."}],
+             "closed_by": "agent",
+         }
+     ]
+diff --git a/tests/stores/test_open_items_store.py b/tests/stores/test_open_items_store.py
+index fc7507384747667d1ab1b76789f560f3a28c1557..43fb09c710f75287608ac2665fe4663a84e4edd9 100644
+--- a/tests/stores/test_open_items_store.py
++++ b/tests/stores/test_open_items_store.py
+@@ -12,6 +12,7 @@ from collections.abc import Sequence
+ import pytest
+ 
+ from omnigent.entities.open_items import (
++    OpenItem,
+     OpenItemError,
+     OpenItemFilter,
+     normalize_change,
+@@ -138,7 +139,7 @@ def test_pinning_a_link_twice_returns_one_item(
+     assert pinned[0].item.content["title"] == "github.com/a/b/…"  # type: ignore[union-attr]
+ 
+ 
+-def test_a_label_from_chat_is_adopted_once_and_counting_moves_past_it(
++def test_an_imported_label_is_taken_once_and_counting_moves_past_it(
+     store: OpenItemsStore, conversations: SqlAlchemyConversationStore
+ ) -> None:
+     session = _session(conversations)
+@@ -189,8 +190,8 @@ def test_close_needs_a_resolution_and_reopen_clears_it(
+             normalize_change({"label": "Q1", "status": "closed", "resolution": "Kept as is"}),
+             normalize_change({"label": "Q9", "topic": "x"}),
+         ],
+-        closed_by="agent",
+-        closed_ref="tool:c1",
++        actor="agent",
++        ref="tool:c1",
+     )
+     assert closed.item is not None and closed.item.status == "closed"
+     assert closed.item.closed_at is not None
+@@ -202,7 +203,7 @@ def test_close_needs_a_resolution_and_reopen_clears_it(
+     assert missing.error is not None and missing.error.code == "not_found"
+     assert store.open_count(session) == 1
+     (reopened,) = store.change_items(
+-        session, [normalize_change({"label": "Q1", "status": "open"})], closed_by="user"
++        session, [normalize_change({"label": "Q1", "status": "open"})], actor="user"
+     )
+     assert reopened.item is not None
+     assert (reopened.item.status, reopened.item.closed_at, reopened.item.outcome) == (
+@@ -230,7 +231,7 @@ def test_edits_change_content_topic_and_links(
+                 }
+             )
+         ],
+-        closed_by="agent",
++        actor="agent",
+     )
+     assert changed.item is not None
+     assert changed.item.content == {
+@@ -248,24 +249,81 @@ def test_edits_change_content_topic_and_links(
+     (too_big,) = store.change_items(
+         session,
+         [normalize_change({"label": "Q1", "detail": detail, "add_links": links})],
+-        closed_by="agent",
++        actor="agent",
+     )
+     assert too_big.error is not None and too_big.error.code == "too_large"
+     assert store.list_items(session)[0].content["title"] == "Cache everything?"
+ 
+ 
+-def test_answers_mark_open_items_answered_and_keep_the_latest_five(
++def _reply(
++    store: OpenItemsStore, session: str, actor: str, *, ref: str | None = None, **change: object
++) -> OpenItem:
++    (result,) = store.change_items(
++        session, [normalize_change({"label": "Q1", **change})], actor=actor, ref=ref
++    )
++    assert result.item is not None, result.error
++    return result.item
++
++
++def test_replies_build_one_chain_and_never_close_the_item(
+     store: OpenItemsStore, conversations: SqlAlchemyConversationStore
+ ) -> None:
+     session = _session(conversations)
+     _raise(store, session, _question())
+-    for index in range(7):
+-        (answered,) = store.record_answers(session, [("Q1", f"answer {index}")], user_id="bob")
+-    assert answered.item is not None and answered.item.status == "answered"
+-    assert [answer["text"] for answer in answered.item.outcome["answers"]] == [
+-        f"answer {index}" for index in range(2, 7)
++    (commented,) = store.record_replies(
++        session, [("Q1", "Which region?")], user_id="bob", ref="comment:s1"
++    )
++    assert commented.item is not None and commented.item.status == "answered"
++    # A retried comment adds nothing; the agent's reply hands the item back to the user.
++    store.record_replies(session, [("Q1", "Which region?")], user_id="bob", ref="comment:s1")
++    replied = _reply(store, session, "agent", ref="tool:c1", reply="eu-west-1, as before.")
++    assert replied.status == "open"
++    assert _reply(store, session, "agent", ref="tool:c1", reply="again").status == "open"
++    closed = _reply(
++        store,
++        session,
++        "agent",
++        ref="tool:c2",
++        reply="Done.",
++        status="closed",
++        resolution="Kept eu-west-1",
++    )
++    assert closed.status == "closed"
++    assert [
++        {key: value for key, value in reply.items() if key != "at"}
++        for reply in closed.outcome["replies"]
++    ] == [
++        {"author": "user", "text": "Which region?", "by": "bob", "ref": "comment:s1"},
++        {"author": "agent", "text": "eu-west-1, as before.", "ref": "tool:c1"},
++        {"author": "agent", "text": "Done.", "ref": "tool:c2"},
+     ]
+-    (missing,) = store.record_answers(session, [("R4", "?")], user_id=None)
++    assert closed.outcome["resolution"] == "Kept eu-west-1"
++    # A reply on a closed item keeps it closed, and reopening keeps the chain.
++    assert _reply(store, session, "user", reply="Thanks").status == "closed"
++    reopened = _reply(store, session, "user", status="open")
++    assert len(reopened.outcome["replies"]) == 4
++    with pytest.raises(OpenItemError, match="reply is required"):
++        normalize_change({"label": "Q1", "reply": "  "})
++
++
++def test_replies_keep_the_latest_ten_that_fit(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    _raise(store, session, _question())
++    for index in range(12):
++        (replied,) = store.record_replies(session, [("Q1", f"reply {index}")], user_id="bob")
++    assert replied.item is not None
++    assert [reply["text"] for reply in replied.item.outcome["replies"]] == [
++        f"reply {index}" for index in range(2, 12)
++    ]
++    # Replies that would not fit the stored cap drop the oldest first.
++    noise = random.Random(1)
++    for _ in range(10):
++        text = "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(2000))
++        (replied,) = store.record_replies(session, [("Q1", text)], user_id="bob")
++    assert replied.item is not None and 1 <= len(replied.item.outcome["replies"]) < 10
++    (missing,) = store.record_replies(session, [("R4", "?")], user_id=None)
+     assert missing.error is not None and missing.error.code == "not_found"
+ 
+ 
+@@ -300,7 +358,7 @@ def test_lists_filter_page_and_count_in_label_order(
+     store.change_items(
+         session,
+         [normalize_change({"label": "Q2", "status": "closed", "resolution": "Renamed it"})],
+-        closed_by="agent",
++        actor="agent",
+     )
+     items = store.list_items(session)
+ 
+@@ -321,3 +379,4 @@ def test_lists_filter_page_and_count_in_label_order(
+     assert page.status_counts == {"open": 3, "answered": 0, "closed": 1}
+     assert page.kind_counts == {"question": 2, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}
+     assert page.topics == ["cache", "release"]
++

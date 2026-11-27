@@ -1,0 +1,802 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 21:25:53 +0000
+Subject: [PATCH] feat(web): list stored links under Links, and show each
+ item's stored thread
+
+A link the agent pins with sys_open_items_raise was stored but never
+shown: the panel's rows leave links out, and the Links list read only
+the chat. The Links list now pins every open stored link first, under
+the title the agent gave it (a short form of the URL when it gave none,
+including older rows titled by their URL), whether or not a loaded
+message pins it; a closed stored link takes its pin and its page off the
+list. Pins and pages the store does not hold follow as before.
+
+A stored item is a thread, and its label in the chat only points at it.
+An expanded row now shows the item's replies as the store keeps them
+(the user's comments and the agent's replies, each once, in order), then
+how it was closed, leaving out a resolution that only repeats the last
+reply (StoredItemThread, which the chips' preview can reuse). The chat's
+text no longer bears on a stored item: a label struck in the chat while
+the store keeps it open is no longer flagged "closed in chat" or offered
+for closing with the chat's sentence, and a closed item's chips describe
+the close from the store. chatItemImport builds the import of one
+chat-only label, for actions that record a single label.
+
+Local only: extends the open-items-panel series, not proposed upstream
+yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/open-items.md                            |  25 +--
+ feature-map/open-items.md                     |   2 +-
+ web/src/components/chat/StoredItemThread.tsx  |  62 ++++++
+ .../chat/StoredOpenItemsPanel.test.tsx        |  49 +++--
+ .../components/chat/StoredOpenItemsPanel.tsx  |  58 +-----
+ web/src/components/chat/Transcript.tsx        |  19 +-
+ web/src/lib/openItems.test.ts                 |  67 +++++--
+ web/src/lib/openItems.ts                      | 187 ++++++++++++------
+ web/src/test/openItemsFixtures.ts             |   2 +-
+ 9 files changed, 319 insertions(+), 152 deletions(-)
+ create mode 100644 web/src/components/chat/StoredItemThread.tsx
+
+diff --git a/docs/open-items.md b/docs/open-items.md
+index 4aa5418388509e775eca3674ff33af05cc28de58..2a095c0f2eaa82f10f9580dea31efa8e7b2b8be2 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -93,24 +93,25 @@ stays current as the agent raises and closes them.
+ - **One list:** each stored item shows its stored status. A label written in
+   the chat that the server does not hold is listed too, marked **chat only**,
+   with its state read from the chat as before. Pinned links stay under
+-  **Links**.
+-- **Chips:** a label's chips in the chat follow the stored status: a stored
+-  item is closed exactly when the server says so, whatever the chat wrote, and
+-  its popover shows the stored resolution when the chat never struck it.
++  **Links**, which lists every open stored link first, under the title the
++  agent gave it (a short form of its URL when it gave none), whether or not a
++  loaded message pins it; a closed stored link leaves the list with its page.
++- **Chips:** a stored item's label in the chat is its anchor: its chips
++  follow the stored status (struck once the item is closed, whatever the chat
++  wrote), and a plain or struck mention never changes the item.
+ - **Groups:** items the latest reply mentions come first, then the open ones,
+-  then **Answered** (you replied and the agent has not closed it yet), with
++  then **Answered** (you replied and the agent has not replied yet), with
+   **Closed (N)** folded at the end. The badge counts open items: answered and
+   closed ones, chat-only items you dismissed and pinned links are left out.
+-- **Details:** select an item to expand it: its detail, links, your latest
+-  answers, how it was closed, and **Show in conversation** when a loaded
+-  message has it. Its chip previews it where the chat raised it.
++- **Details:** select an item to expand it: its detail, links, its thread
++  (your comments and the agent's replies, each once, in order), how it was
++  closed (left out when the resolution only repeats the last reply), and
++  **Show in conversation** when a loaded message has it. Its chip previews it
++  where the chat raised it.
+ - **Changes (edit access):** the ✕ on an open stored item closes it, recorded
+   as closed by a person with the resolution "Closed from the Open items panel";
+   expanded, you can write the resolution yourself, **Reopen** a closed item, or
+-  **Set topic**. When the chat struck a label that is still open in the store,
+-  the item is marked **closed in chat** and its details offer **Close** with
+-  the chat's sentence as the resolution. The agent sees every change in
+-  `sys_open_items_list`.
++  **Set topic**. The agent sees every change in `sys_open_items_list`.
+ - **Chat-only items** keep their dismiss button; dismissals are still stored
+   as the `omnigent.items_dismissed` session label, which is read for chat-only
+   items and never written for stored ones.
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index f9a097a1c43dc01579817ee266a457fe8bad7ef1..dacb2727592dd292c8ab10971fc03156e23587c5 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -13,7 +13,7 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
+ - `items-delete`: deleting a session deletes its items; a fork starts with none.
+ - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
+ - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
+-- `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
++- `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; the expanded row shows the stored thread.
+ 
+ ## How to get to it (user POV)
+ 
+diff --git a/web/src/components/chat/StoredItemThread.tsx b/web/src/components/chat/StoredItemThread.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5d76414a32a2917ec6d456b166d634ff76f57af
+--- /dev/null
++++ b/web/src/components/chat/StoredItemThread.tsx
+@@ -0,0 +1,62 @@
++import type { ReactNode } from "react";
++import { ItemLabelMessageContext } from "@/lib/itemLabels";
++import type { OpenItemReply, StoredOpenItem } from "@/lib/openItems";
++import { relativeTime } from "@/lib/relativeTime";
++
++function ago(epochSeconds: number): string {
++  const age = relativeTime(epochSeconds * 1000);
++  return age === "now" ? "just now" : `${age} ago`;
++}
++
++function replyAuthor(reply: OpenItemReply): string {
++  return reply.author === "agent" ? "Agent" : (reply.by ?? "You");
++}
++
++/**
++ * A stored item's thread as the store holds it: each comment and reply once,
++ * in order, then how it was closed. The resolution is left out when it only
++ * repeats the last reply. `messageId` resolves labels inside the text, which
++ * `markdown` renders (the chat's renderer, passed in by its callers).
++ */
++export function StoredItemThread({
++  item,
++  messageId,
++  markdown,
++}: {
++  item: StoredOpenItem;
++  messageId: string | null;
++  markdown: (text: string) => ReactNode;
++}) {
++  const last = item.replies.at(-1)?.text.trim();
++  const resolution = item.resolution?.trim();
++  return (
++    <ItemLabelMessageContext.Provider value={messageId}>
++      {item.replies.length > 0 && (
++        <section aria-label="Thread" className="flex flex-col gap-1.5">
++          {item.replies.map((reply) => (
++            <div
++              key={`${reply.at}:${reply.author}:${reply.text.slice(0, 40)}`}
++              data-testid="open-item-reply"
++              data-author={reply.author}
++              className="border-l-2 border-border pl-2"
++            >
++              <div className="text-xs text-muted-foreground">
++                {`${replyAuthor(reply)} · ${ago(reply.at)}`}
++              </div>
++              {markdown(reply.text)}
++            </div>
++          ))}
++        </section>
++      )}
++      {item.status === "closed" && (
++        <div data-testid="open-item-resolution" className="border-l-2 border-border pl-2">
++          <div className="text-xs text-muted-foreground">
++            {`Closed by ${item.closed_by === "user" ? "a person" : "the agent"}`}
++            {item.closed_at !== null && ` · ${ago(item.closed_at)}`}
++          </div>
++          {resolution && resolution !== last && <p className="whitespace-pre-wrap">{resolution}</p>}
++        </div>
++      )}
++    </ItemLabelMessageContext.Provider>
++  );
++}
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.test.tsx b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+index 4e122253fda8dccc1b99f17a635038392db686c6..17af493dd4c85d66d36ed0770315a0aae4701b9e 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.test.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+@@ -135,8 +135,9 @@ describe("the Open items panel on a server that stores them", () => {
+     expect(panel.textContent).toContain("Answered (1)");
+     const r1 = within(panel).getByRole("button", { name: "Item R1, chat only" });
+     expect(r1.textContent).toContain("chat only");
++    // The chat struck Q1, but chat text never changes a stored item.
+     const q1 = within(panel).getByRole("button", { name: "Item Q1" });
+-    expect(q1.textContent).toContain("closed in chat");
++    expect(q1.textContent).not.toContain("closed in chat");
+     expect(within(panel).getByRole("button", { name: "Dismiss item R1" })).toBeTruthy();
+     expect(within(panel).getByRole("button", { name: "Close item Q1" })).toBeTruthy();
+   });
+@@ -172,7 +173,7 @@ describe("the Open items panel on a server that stores them", () => {
+     expect(session?.labels[DISMISSED_ITEMS_LABEL_KEY]).toBeUndefined();
+   });
+ 
+-  it("expands a row to its detail, answers and outcome, and reopens or retopics it", async () => {
++  it("expands a row to its detail, thread and outcome, and reopens or retopics it", async () => {
+     renderPanel(
+       [ITEMS, "~~[Q1]~~ done.", "Looking at the rest."],
+       [
+@@ -182,7 +183,10 @@ describe("the Open items panel on a server that stores them", () => {
+           resolution: "Nightly batches",
+           closed_by: "agent",
+           closed_at: 1_764_100_500,
+-          answers: [{ text: "Yes, nightly", at: 1_764_100_100, by: "bob@example.com" }],
++          replies: [
++            { author: "user", text: "Nightly?", at: 1_764_100_100, by: "bob@example.com" },
++            { author: "agent", text: "Yes, nightly", at: 1_764_100_200 },
++          ],
+           links: [{ url: "https://example.com/pr/1", label: "PR 1" }],
+           topic: "cache",
+         }),
+@@ -195,7 +199,15 @@ describe("the Open items panel on a server that stores them", () => {
+     fireEvent.click(within(panel).getByRole("button", { name: "Item Q1 (closed)" }));
+     const details = within(panel).getByTestId("open-item-details");
+     expect(details.textContent).toContain("backfill");
+-    expect(details.textContent).toContain("Yes, nightly");
++    expect(
++      within(details)
++        .getAllByTestId("open-item-reply")
++        .map((reply) => [reply.dataset.author, reply.textContent]),
++    ).toEqual([
++      ["user", expect.stringContaining("Nightly?")],
++      ["agent", expect.stringContaining("Yes, nightly")],
++    ]);
++    expect(details.textContent).toContain("bob@example.com");
+     expect(details.textContent).toContain("Closed by the agent");
+     expect(details.textContent).toContain("Nightly batches");
+     expect(within(details).getByRole("link", { name: "PR 1" })).toBeTruthy();
+@@ -212,16 +224,27 @@ describe("the Open items panel on a server that stores them", () => {
+     expect(await patchBody(1)).toEqual({ updates: [{ label: "Q1", topic: "release" }] });
+   });
+ 
+-  it("closes an item the chat closed with the chat's sentence as its resolution", async () => {
+-    renderPanel([ITEMS, "~~[Q1]~~ We batch it nightly."], [storedItem("Q1"), storedItem("Q2")]);
++  it("shows each reply once and leaves out a resolution that repeats the last one", () => {
++    renderPanel(
++      [ITEMS, "Looking at the rest."],
++      [
++        storedItem("Q1", {
++          status: "closed",
++          closed_by: "user",
++          resolution: "Copy them as they are.",
++          closed_at: 1_764_100_500,
++          replies: [{ author: "user", text: "Copy them as they are.", at: 1_764_100_400 }],
++        }),
++      ],
++    );
+     const panel = openPanel();
+-    fireEvent.click(within(panel).getByRole("button", { name: "Item Q1" }));
+-    respondWith([storedItem("Q1", { status: "closed" })]);
+-    const notice = within(panel).getByText(/The chat closed this item/).parentElement!;
+-    fireEvent.click(within(notice).getByRole("button", { name: "Close" }));
+-    expect(await patchBody()).toEqual({
+-      updates: [{ label: "Q1", status: "closed", resolution: "[Q1] We batch it nightly." }],
+-    });
++    fireEvent.click(within(panel).getByRole("button", { name: "Closed (1)" }));
++    fireEvent.click(within(panel).getByRole("button", { name: "Item Q1 (closed)" }));
++    const details = within(panel).getByTestId("open-item-details");
++    expect(details.textContent?.split("Copy them as they are.").length).toBe(2);
++    expect(within(details).getByTestId("open-item-resolution").textContent).toContain(
++      "Closed by a person",
++    );
+   });
+ 
+   it("imports the chat's own labels into the store", async () => {
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.tsx b/web/src/components/chat/StoredOpenItemsPanel.tsx
+index 50e865e7ee96203890c3a284f336e2e0ef42bdaf..f5aa1c3a9c55d7d9abce0b4740752552ba144234 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.tsx
+@@ -6,6 +6,7 @@ import {
+   itemLabelChipClass,
+ } from "@/components/blocks/ChatMarkdown";
+ import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
++import { StoredItemThread } from "@/components/chat/StoredItemThread";
+ import { Button } from "@/components/ui/button";
+ import { useCanEdit } from "@/hooks/usePermissions";
+ import {
+@@ -21,7 +22,6 @@ import {
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+ import {
+   chatItemsToImport,
+-  chatResolution,
+   countOpenRows,
+   openItemRows,
+   type OpenItemRow,
+@@ -58,7 +58,11 @@ function ItemMarkdown({ row, text }: { row: OpenItemRow; text: string }) {
+   );
+ }
+ 
+-function StoredItemFacts({ item }: { item: StoredOpenItem }) {
++const threadMarkdown = (text: string) => (
++  <FilePathAwareMessageResponse>{text}</FilePathAwareMessageResponse>
++);
++
++function StoredItemFacts({ item, messageId }: { item: StoredOpenItem; messageId: string | null }) {
+   return (
+     <>
+       {item.links.length > 0 && (
+@@ -77,27 +81,7 @@ function StoredItemFacts({ item }: { item: StoredOpenItem }) {
+           ))}
+         </ul>
+       )}
+-      {item.answers.length > 0 && (
+-        <section aria-label="Answers" className="flex flex-col gap-1">
+-          {item.answers.map((answer) => (
+-            <div key={`${answer.at}:${answer.text}`} className="border-l-2 border-border pl-2">
+-              <div className="text-xs text-muted-foreground">
+-                {`Answered · ${answer.by ?? "You"} · ${ago(answer.at)}`}
+-              </div>
+-              <p className="whitespace-pre-wrap">{answer.text}</p>
+-            </div>
+-          ))}
+-        </section>
+-      )}
+-      {item.status === "closed" && (
+-        <div className="border-l-2 border-border pl-2">
+-          <div className="text-xs text-muted-foreground">
+-            {`Closed by ${item.closed_by === "user" ? "a person" : "the agent"}`}
+-            {item.closed_at !== null && ` · ${ago(item.closed_at)}`}
+-          </div>
+-          {item.resolution && <p className="whitespace-pre-wrap">{item.resolution}</p>}
+-        </div>
+-      )}
++      <StoredItemThread item={item} messageId={messageId} markdown={threadMarkdown} />
+       <div className="text-xs text-muted-foreground">
+         {`Raised ${ago(item.created_at)}`}
+         {item.raised_by && ` for ${item.raised_by}`}
+@@ -162,7 +146,6 @@ function RowDetails({
+   const [resolution, setResolution] = useState("");
+   const item = row.stored;
+   const messageId = row.entry?.source.messageId;
+-  const closedInChat = item && row.entry?.closedInChat ? chatResolution(row) : null;
+   return (
+     <div className="flex flex-col gap-2 px-3 pt-1 pb-2 text-sm" data-testid="open-item-details">
+       {row.detail ? (
+@@ -170,29 +153,7 @@ function RowDetails({
+       ) : (
+         <p className="text-muted-foreground">{row.title}</p>
+       )}
+-      {item && <StoredItemFacts item={item} />}
+-      {closedInChat !== null && (
+-        <div className="flex items-center justify-between gap-2 rounded-md bg-muted px-2 py-1 text-xs">
+-          <span>The chat closed this item; it is still open here.</span>
+-          {canEdit && (
+-            <Button
+-              type="button"
+-              size="sm"
+-              variant="outline"
+-              className="h-6 px-2 text-xs"
+-              onClick={() =>
+-                onUpdate({
+-                  label: row.label,
+-                  status: "closed",
+-                  resolution: closedInChat || PANEL_CLOSE_RESOLUTION,
+-                })
+-              }
+-            >
+-              Close
+-            </Button>
+-          )}
+-        </div>
+-      )}
++      {item && <StoredItemFacts item={item} messageId={messageId ?? null} />}
+       <div className="flex flex-wrap items-center gap-2">
+         {messageId && (
+           <button
+@@ -304,9 +265,6 @@ function ItemRowView({
+             {row.title || row.label}
+           </span>
+           {row.status === "answered" && <span className={TAG_CLASS}>answered</span>}
+-          {row.entry?.closedInChat && row.status !== "closed" && (
+-            <span className={TAG_CLASS}>closed in chat</span>
+-          )}
+           {!row.stored && <span className={TAG_CLASS}>chat only</span>}
+           {row.topic && <span className={cn(TAG_CLASS, "ml-auto")}>{row.topic}</span>}
+         </button>
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index acb0adac62ebf9b66f6f19dd998ecf061a7fdc79..e535cdb332a2acaa2859aadf68b9745771186f3c 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -1,4 +1,13 @@
+-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
++import {
++  memo,
++  useCallback,
++  useContext,
++  useEffect,
++  useLayoutEffect,
++  useMemo,
++  useRef,
++  useState,
++} from "react";
+ import { flushSync } from "react-dom";
+ import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
+ import { useStickToBottomContext } from "use-stick-to-bottom";
+@@ -30,7 +39,7 @@ import { TurnRail, type Turn } from "@/pages/TurnRail";
+ import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+ import { useSessionTasks } from "@/hooks/useSessionTasks";
+ import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
+-import { mergeStoredOpenItems } from "@/lib/openItems";
++import { mergeStoredOpenItems, withStoredLinks } from "@/lib/openItems";
+ import { useSearchParams } from "@/lib/routing";
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+ import { onFindOpened } from "@/lib/nativeBridge";
+@@ -642,7 +651,11 @@ function TranscriptSessionItems({
+   bubbles: readonly Bubble[];
+   index: ItemLabelIndex;
+ }) {
+-  const links = useMemo(() => collectBubbleSessionLinks(bubbles, index), [bubbles, index]);
++  const stored = useStoredOpenItems(useContext(ItemLabelSessionContext));
++  const links = useMemo(
++    () => withStoredLinks(collectBubbleSessionLinks(bubbles, index), stored),
++    [bubbles, index, stored],
++  );
+   return <SessionItemsButton host={host} links={links} />;
+ }
+ 
+diff --git a/web/src/lib/openItems.test.ts b/web/src/lib/openItems.test.ts
+index db81c2ec5e8b6d66ee6b00cf8d37fdc2ccba4884..058694e1e393424786e29836d07b88cc1313df69 100644
+--- a/web/src/lib/openItems.test.ts
++++ b/web/src/lib/openItems.test.ts
+@@ -12,7 +12,6 @@ import {
+ import {
+   DISMISSED_RESOLUTION,
+   chatItemsToImport,
+-  chatResolution,
+   compareItemLabels,
+   countOpenRows,
+   fetchStoredOpenItems,
+@@ -20,9 +19,11 @@ import {
+   mergeStoredOpenItems,
+   openItemRows,
+   storedItemOf,
++  withStoredLinks,
+   withWrittenItems,
+   type StoredOpenItem,
+ } from "./openItems";
++import { collectSessionLinks } from "@/lib/sessionLinks";
+ import { storedItem } from "@/test/openItemsFixtures";
+ 
+ afterEach(() => {
+@@ -55,14 +56,14 @@ describe("mergeStoredOpenItems", () => {
+     ]);
+     const q1 = merged.items.get("Q1")!;
+     const q2 = merged.items.get("Q2")!;
+-    // The chat struck Q1 but the store keeps it open: open, with the chat's close offered.
++    // The chat struck Q1 but the store keeps it open: open, and nothing offers the chat's close.
+     expect(q1.closedBy).toBeNull();
+     expect(storedItemOf(q1)?.status).toBe("open");
+-    expect((q1 as { closedInChat?: ItemLabelSource }).closedInChat?.messageId).toBe("m1");
+-    // Closed only in the store: closed, described by its resolution at its latest mention.
++    expect(Object.keys(q1)).not.toContain("closedInChat");
++    // Closed only in the store: closed at its latest mention, with the bare resolution.
+     expect(q2.closedBy).toMatchObject({
+       messageId: "m0",
+-      text: "~~[Q2]~~ Dropped them",
++      text: "Dropped them",
+       createdAtS: 1_764_100_500,
+     });
+     // The parsed entry's own fields are kept.
+@@ -118,13 +119,6 @@ describe("openItemRows", () => {
+       ["F1", null],
+     ]);
+   });
+-
+-  it("offers the chat's closing sentence as the resolution", () => {
+-    const chat = index([ITEMS, "~~[Q1]~~ We batch it nightly. More later."]);
+-    const merged = mergeStoredOpenItems(chat, [storedItem("Q1")]);
+-    const [row] = openItemRows(merged, [storedItem("Q1")], new Set());
+-    expect(chatResolution(row)).toBe("[Q1] We batch it nightly.");
+-  });
+ });
+ 
+ describe("compareItemLabels", () => {
+@@ -262,3 +256,52 @@ describe("importChatItems", () => {
+     expect(bodies[1].idempotency_key).toMatch(/^import:.+:10$/);
+   });
+ });
++
++describe("withStoredLinks", () => {
++  function chatLinks(texts: string[]) {
++    const sources = texts.map((text, position): ItemLabelSource => ({
++      messageId: `m${position}`,
++      role: "assistant",
++      text,
++    }));
++    return collectSessionLinks(sources, index(texts));
++  }
++
++  it("pins stored links under the agent's title, else a short form of the URL", () => {
++    const links = withStoredLinks(
++      chatLinks([
++        "[L1] **Old name** https://example.com/board",
++        "Made https://claude.ai/artifact/aaa",
++      ]),
++      [
++        storedItem("L1", { title: "Release board", url: "https://example.com/board" }),
++        storedItem("L2", {
++          title: "https://docs.example.com/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
++          url: "https://docs.example.com/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
++        }),
++      ],
++    );
++    expect(links.map((link) => [link.title, link.kind, link.item?.label ?? null])).toEqual([
++      ["Release board", "pinned", "L1"],
++      ["docs.example.com/d/1AbCdEfGhIjK…/…", "pinned", null],
++      ["Artifact aaa", "artifact", null],
++    ]);
++  });
++
++  it("takes a stored link closed in the store off the list, with its page", () => {
++    const links = withStoredLinks(
++      chatLinks([
++        "[L1] **Catalog** https://claude.ai/artifact/aaa",
++        "See https://claude.ai/artifact/aaa",
++      ]),
++      [storedItem("L1", { status: "closed", url: "https://claude.ai/artifact/aaa" })],
++    );
++    expect(links).toEqual([]);
++  });
++
++  it("leaves the chat's list alone without stored links", () => {
++    const links = chatLinks(["[L1] **Catalog** https://example.com/c"]);
++    expect(withStoredLinks(links, [storedItem("Q1")])).toBe(links);
++    expect(withStoredLinks(links, null)).toBe(links);
++  });
++});
+diff --git a/web/src/lib/openItems.ts b/web/src/lib/openItems.ts
+index 823bd8745eec9177db44b92e5a647da73477bbed..5afc8bc302e2610c6ca0183280f8164d4ff20470 100644
+--- a/web/src/lib/openItems.ts
++++ b/web/src/lib/openItems.ts
+@@ -1,7 +1,7 @@
+ // A session's stored open items (`/v1/sessions/{id}/open-items`), and the one
+ // index the chat and the panel read: a label the store holds takes its state
+-// from the store; a label only in the chat keeps the state the chat text gives
+-// it, shown as "chat only".
++// and its thread from the store, whatever the chat text says; a label only in
++// the chat keeps the state the chat text gives it, shown as "chat only".
+ 
+ import type { QueryClient } from "@tanstack/react-query";
+ import { authenticatedFetch } from "@/lib/identity";
+@@ -14,8 +14,16 @@ import {
+   type ItemLabelIndex,
+   type ItemLabelSource,
+ } from "@/lib/itemLabels";
++import { parseHttpUrl } from "@/lib/openLinkInApp";
+ import { apiErrorFromResponse } from "@/lib/sessionsApi";
+-import { isLinkItemLabel, linksInMarkdown } from "@/lib/sessionLinks";
++import {
++  PINNED_LINK_KIND,
++  SESSION_LINK_MATCHERS,
++  isLinkItemLabel,
++  linksInMarkdown,
++  shortLinkName,
++  type SessionLink,
++} from "@/lib/sessionLinks";
+ 
+ export type OpenItemKind = "question" | "risk" | "finding" | "follow_up" | "link";
+ export type OpenItemStatus = "open" | "answered" | "closed";
+@@ -34,11 +42,14 @@ export interface OpenItemLink {
+   label?: string;
+ }
+ 
+-export interface OpenItemAnswer {
++/** One message of an item's thread: the user's comment or the agent's reply. */
++export interface OpenItemReply {
++  author: "user" | "agent";
+   text: string;
+   /** Epoch seconds. */
+   at: number;
+-  by: string | null;
++  /** The person, for a user reply on a shared server. */
++  by?: string | null;
+ }
+ 
+ /** One stored item, as `GET /v1/sessions/{id}/open-items` returns it. */
+@@ -58,7 +69,8 @@ export interface StoredOpenItem {
+   closed_at: number | null;
+   resolution: string | null;
+   closed_by: "agent" | "user" | null;
+-  answers: OpenItemAnswer[];
++  /** The thread, oldest first. */
++  replies: OpenItemReply[];
+ }
+ 
+ interface OpenItemsPage {
+@@ -220,11 +232,9 @@ export function kindOfLabel(label: string): OpenItemKind | null {
+   return match ? (OPEN_ITEM_KINDS.find(({ letter }) => letter === match[1])?.kind ?? null) : null;
+ }
+ 
+-/** What the store adds to a chat item: its stored record, and a close only the chat made. */
++/** What the store adds to a chat item: its stored record. */
+ export interface StoredItemFields {
+   stored?: StoredOpenItem;
+-  /** The chat struck the label while the store keeps the item open; offered as a one-tap close. */
+-  closedInChat?: ItemLabelSource;
+ }
+ 
+ export type MergedItemLabelEntry = ItemLabelEntry & StoredItemFields;
+@@ -236,8 +246,8 @@ export function storedItemOf(entry: ItemLabelEntry): StoredOpenItem | undefined
+ 
+ /**
+  * The transcript's label index with stored state applied: a stored item is
+- * closed exactly when the store says so. A store close the chat never wrote
+- * is described by its resolution, at the label's latest mention.
++ * closed exactly when the store says so, whatever the chat wrote; the label in
++ * the chat is only its anchor. Its close is described from the store.
+  *
+  * @returns `index` itself without stored items, so a session the store knows
+  *   nothing about renders as before.
+@@ -257,28 +267,85 @@ export function mergeStoredOpenItems(
+       continue;
+     }
+     storedInChat = true;
+-    const merged: MergedItemLabelEntry = { ...entry, stored: item };
+-    if (item.status === "closed") {
+-      merged.closedBy = entry.closedBy ?? storeClosingSource(entry, item);
+-    } else {
+-      merged.closedBy = null;
+-      if (entry.closedBy) merged.closedInChat = entry.closedBy;
+-    }
++    const merged: MergedItemLabelEntry = {
++      ...entry,
++      stored: item,
++      closedBy: item.status === "closed" ? storeClosingSource(entry, item) : null,
++    };
+     items.set(label, merged);
+   }
+   return { ...index, enabled: index.enabled || storedInChat, items };
+ }
+ 
++/** Who closed a stored item and when; the resolution itself is the store's, shown from it. */
+ function storeClosingSource(entry: ItemLabelEntry, item: StoredOpenItem): ItemLabelSource {
+-  const resolution = item.resolution?.trim();
+   return {
+     messageId: entry.lastMention.messageId,
+     role: item.closed_by === "user" ? "user" : "assistant",
+-    text: resolution ? `~~[${item.label}]~~ ${resolution}` : `~~[${item.label}]~~`,
++    text: item.resolution?.trim() ?? "",
+     ...(item.closed_at !== null ? { createdAtS: item.closed_at } : {}),
+   };
+ }
+ 
++/** What identifies the page `url` opens, as the Links list keys its rows. */
++function linkPageKey(url: URL): string {
++  for (const matcher of SESSION_LINK_MATCHERS) {
++    const key = matcher.pageKey(url);
++    if (key) return key;
++  }
++  return url.href;
++}
++
++/** A stored link's name in the Links list: the agent's title, else a short form of its URL. */
++export function storedLinkTitle(item: StoredOpenItem, url: URL): string {
++  const title = item.title.trim();
++  return title && !/^https?:\/\//i.test(title) ? title : shortLinkName(url);
++}
++
++/**
++ * The Links list with the session's stored link items. An open stored link is
++ * pinned under the title the agent gave it, in label order, whether or not a
++ * loaded message pins it; a closed one takes its pin and its page off the
++ * list. Pins and pages the store does not hold follow as the chat lists them.
++ */
++export function withStoredLinks(
++  links: readonly SessionLink[],
++  stored: readonly StoredOpenItem[] | null,
++): readonly SessionLink[] {
++  const storedLinks = (stored ?? []).filter((item) => item.kind === "link");
++  if (storedLinks.length === 0) return links;
++  const chatPins = new Map(
++    links.flatMap((link) => (link.item ? [[link.item.label, link] as const] : [])),
++  );
++  const pinned: SessionLink[] = [];
++  const replaced = new Set<SessionLink>();
++  const pages = new Set<string>();
++  for (const item of storedLinks) {
++    const chat = chatPins.get(item.label);
++    if (chat) replaced.add(chat);
++    const url = item.url ? parseHttpUrl(item.url) : null;
++    if (!url) continue;
++    const key = linkPageKey(url);
++    pages.add(key);
++    if (item.status === "closed") continue;
++    const source = {
++      messageId: "",
++      role: "assistant" as const,
++      text: `[${item.label}] ${item.title}`,
++    };
++    pinned.push({
++      key,
++      href: url.href,
++      title: storedLinkTitle(item, url),
++      kind: PINNED_LINK_KIND,
++      item: chat?.item ?? null,
++      lastMention: chat?.lastMention ?? source,
++    });
++  }
++  const rest = links.filter((link) => !replaced.has(link) && !pages.has(link.key));
++  return [...pinned, ...rest];
++}
++
+ /** One row of the Open items panel: a stored item, or a label only the chat has. */
+ export interface OpenItemRow {
+   label: string;
+@@ -357,10 +424,42 @@ export function countOpenRows(rows: readonly OpenItemRow[]): number {
+ export const DISMISSED_RESOLUTION = "Dismissed from the Open items panel";
+ 
+ /**
+- * The chat's labels the store does not hold, as an import would store them:
+- * items of the store's letters, and pinned links whose block has a URL.
+- * Closed items keep the sentence that closed them; dismissed ones are closed.
++ * A chat-only label as an import would store it, or null when the store
++ * cannot hold it: a letter it does not use, or a pinned link without a URL.
++ * A closed item keeps the sentence that closed it; a dismissed one is closed.
+  */
++export function chatItemImport(
++  entry: ItemLabelEntry,
++  dismissed: ReadonlySet<string>,
++): ChatItemImport | null {
++  const kind = kindOfLabel(entry.label);
++  if (!kind) return null;
++  const block = extractItemBlock(entry.source.text, entry.label) ?? "";
++  const item: ChatItemImport = {
++    kind,
++    label: entry.label,
++    title: (itemLabelTitle(entry.source.text, entry.label) || entry.label).slice(
++      0,
++      TITLE_MAX_CHARS,
++    ),
++    detail: block.slice(0, DETAIL_MAX_CHARS),
++  };
++  if (kind === "link") {
++    const url = linksInMarkdown(block)[0]?.url.href;
++    if (!url) return null;
++    item.url = url;
++  }
++  if (entry.closedBy) {
++    const sentence = extractLabelSentence(entry.closedBy.text, entry.label);
++    item.resolution =
++      sentence?.replace(/~~/g, "").trim().slice(0, RESOLUTION_MAX_CHARS) || "Closed in the chat";
++  } else if (dismissed.has(entry.label)) {
++    item.resolution = DISMISSED_RESOLUTION;
++  }
++  return item;
++}
++
++/** The chat's labels the store does not hold, as an import would store them. */
+ export function chatItemsToImport(
+   index: ItemLabelIndex | null,
+   stored: readonly StoredOpenItem[],
+@@ -368,41 +467,9 @@ export function chatItemsToImport(
+ ): ChatItemImport[] {
+   if (!index?.enabled) return [];
+   const storedLabels = new Set(stored.map((item) => item.label));
+-  const imports: ChatItemImport[] = [];
+-  for (const entry of index.items.values()) {
+-    const kind = kindOfLabel(entry.label);
+-    if (!kind || storedLabels.has(entry.label)) continue;
+-    const block = extractItemBlock(entry.source.text, entry.label) ?? "";
+-    const item: ChatItemImport = {
+-      kind,
+-      label: entry.label,
+-      title: (itemLabelTitle(entry.source.text, entry.label) || entry.label).slice(
+-        0,
+-        TITLE_MAX_CHARS,
+-      ),
+-      detail: block.slice(0, DETAIL_MAX_CHARS),
+-    };
+-    if (kind === "link") {
+-      const url = linksInMarkdown(block)[0]?.url.href;
+-      if (!url) continue;
+-      item.url = url;
+-    }
+-    if (entry.closedBy) {
+-      const sentence = extractLabelSentence(entry.closedBy.text, entry.label);
+-      item.resolution =
+-        sentence?.replace(/~~/g, "").trim().slice(0, RESOLUTION_MAX_CHARS) || "Closed in the chat";
+-    } else if (dismissed.has(entry.label)) {
+-      item.resolution = DISMISSED_RESOLUTION;
+-    }
+-    imports.push(item);
+-  }
+-  return imports;
+-}
+-
+-/** The sentence that closed an item in chat, as a resolution for the store. */
+-export function chatResolution(row: OpenItemRow): string | null {
+-  const closing = row.entry?.closedInChat ?? (row.stored ? null : row.entry?.closedBy);
+-  if (!closing) return null;
+-  const sentence = extractLabelSentence(closing.text, row.label);
+-  return sentence ? sentence.replace(/~~/g, "").trim().slice(0, RESOLUTION_MAX_CHARS) : null;
++  return [...index.items.values()].flatMap((entry) => {
++    if (storedLabels.has(entry.label)) return [];
++    const item = chatItemImport(entry, dismissed);
++    return item ? [item] : [];
++  });
+ }
+diff --git a/web/src/test/openItemsFixtures.ts b/web/src/test/openItemsFixtures.ts
+index 47122c9a4cce9deaa3c57bf65090aaee9574da38..895d8b9f1ae00042a6ece7e35d5d3bc4d474c6b7 100644
+--- a/web/src/test/openItemsFixtures.ts
++++ b/web/src/test/openItemsFixtures.ts
+@@ -20,7 +20,7 @@ export function storedItem(label: string, fields: Partial<StoredOpenItem> = {}):
+     closed_at: null,
+     resolution: null,
+     closed_by: null,
+-    answers: [],
++    replies: [],
+     ...fields,
+   };
+ }

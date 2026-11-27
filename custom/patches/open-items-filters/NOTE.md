@@ -1,7 +1,7 @@
 # open-items-filters
 
 Needs: open-items-panel
-Covers: 1c041fa9ba35a1a0
+Covers: e34fa20b2130d8b7
 
 The Open items panel gets a search box and one row of chips (Open,
 Answered and Closed with counts, the kinds present, the topics in use) once

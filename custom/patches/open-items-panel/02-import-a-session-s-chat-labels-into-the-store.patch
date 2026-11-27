@@ -24,7 +24,7 @@ Not proposed upstream yet: the store it extends is not upstream either.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/open-items.md                            | 11 ++-
+ docs/open-items.md                            | 10 +-
  feature-map/open-items.md                     |  2 +
  omnigent/server/API.md                        | 17 ++++
  omnigent/server/open_items.py                 | 76 +++++++++++++++
@@ -35,13 +35,13 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/hooks/useStoredOpenItems.ts           | 26 +++++
  web/src/lib/openItems.test.ts                 | 90 +++++++++++++++++
  web/src/lib/openItems.ts                      | 96 ++++++++++++++++++-
- 11 files changed, 493 insertions(+), 4 deletions(-)
+ 11 files changed, 492 insertions(+), 4 deletions(-)
 
 diff --git a/docs/open-items.md b/docs/open-items.md
-index 88b94527f68f3fda674d7724c893cca817d14789..694a493297b02b3d78e3b645a8fec31605342d6d 100644
+index f95471658a14ccfd669b0376cd645a7fdc5a2219..4aa5418388509e775eca3674ff33af05cc28de58 100644
 --- a/docs/open-items.md
 +++ b/docs/open-items.md
-@@ -111,6 +111,13 @@ stays current as the agent raises and closes them.
+@@ -114,6 +114,13 @@ stays current as the agent raises and closes them.
  - **Chat-only items** keep their dismiss button; dismissals are still stored
    as the `omnigent.items_dismissed` session label, which is read for chat-only
    items and never written for stored ones.
@@ -55,51 +55,50 @@ index 88b94527f68f3fda674d7724c893cca817d14789..694a493297b02b3d78e3b645a8fec316
  
  On a server without open items the panel reads the chat alone, exactly as
  [item labels](chat-item-labels.md) describe.
-@@ -123,6 +130,7 @@ On a server without open items the panel reads the chat alone, exactly as
+@@ -126,6 +133,7 @@ On a server without open items the panel reads the chat alone, exactly as
  | `POST /sessions/{id}/open-items` | the session's runner | Raise items for an agent with the `open_items` group. |
- | `PATCH /sessions/{id}/open-items` | the session's runner, or a person with edit access | Close, reopen, retitle, retopic or relink items. |
- | `POST /sessions/{id}/open-items/answers` | edit access | Record replies; an open item becomes answered. |
+ | `PATCH /sessions/{id}/open-items` | the session's runner, or a person with edit access | Reply to, close, reopen, retitle, retopic or relink items. |
+ | `POST /sessions/{id}/open-items/replies` | edit access | Record a person's replies (a `ref` makes a retry add nothing); an open item becomes answered. |
 +| `POST /sessions/{id}/open-items/import` | edit access | Store items written in the chat under their own labels, closed if the chat closed them. |
  
  Each write publishes `session.open_items.changed` on the session's stream with
  the labels written and the open count. `GET /v1/info` reports `open_items: true`
-@@ -132,7 +140,8 @@ when the server stores them. The request and response shapes are in
+@@ -135,7 +143,7 @@ when the server stores them. The request and response shapes are in
  ## Compatibility
  
  Nothing is backfilled: items a session labelled in chat before stay chat
--labels until an agent adopts them with `label`. A server or host without this
-+labels until an agent adopts them with `label` or you import them from the
-+panel. A server or host without this
+-labels. A server or host without this
++labels until you import them from the panel. A server or host without this
  feature keeps working with text labels, and the web reads the chat text as
  before. The items live in their own tables, apart from the main migration
  chain (see [side stores](extending/side_schemas.md)): a build without the
 diff --git a/feature-map/open-items.md b/feature-map/open-items.md
-index 0b07926602e637a5041a56e83e94fe3ca8b82205..9cf108cfa3849f83c132fedefe0e737b42bccbdb 100644
+index 3165e74e4e349b785ede47212a6e0c78abfa4e37..f9a097a1c43dc01579817ee266a457fe8bad7ef1 100644
 --- a/feature-map/open-items.md
 +++ b/feature-map/open-items.md
-@@ -12,6 +12,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
- - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
+@@ -12,6 +12,7 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
+ - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent gets the text-label instruction.
  - `items-delete`: deleting a session deletes its items; a fork starts with none.
  - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
 +- `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
  - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
  
  ## How to get to it (user POV)
-@@ -19,6 +20,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
+@@ -19,6 +20,7 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
  - Chat: ask an agent with the default tool groups something that leaves it open questions; it calls `sys_open_items_raise`, which shows as a tool row, and writes the items with the returned labels.
- - Chat: answer or settle an item; the agent closes it with `sys_open_items_update` and strikes its label.
- - API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/answers` with edit access.
+ - Chat: answer or settle an item; the agent replies and closes it with `sys_open_items_update`.
+ - API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/replies` with edit access.
 +- API: `POST …/open-items/import` with edit access, items with their `label`.
  - Web: the bookmark button in the session header (badge = open items) opens the panel; select a row to expand it; ✕ closes a stored item.
  - Agent spec: `tool_groups.open_items: false` turns the tools off for that agent.
  
 diff --git a/omnigent/server/API.md b/omnigent/server/API.md
-index 3deb200700b96eb839d1a28d9c6d08e7daa552d4..1d5257dd317a17eca176e35b992fd4c3958e7880 100644
+index 9d4c528666bebeb19271bbd958d737e5602e495b..fa16e0e4c9bd3a8863242e84eae6586f7acc2663 100644
 --- a/omnigent/server/API.md
 +++ b/omnigent/server/API.md
-@@ -1626,6 +1626,23 @@ POST /v1/sessions/{session_id}/open-items/answers
- Edit access. Records each reply (the latest five are kept); an open item
- becomes `answered`.
+@@ -1632,6 +1632,23 @@ kept, fewer if they would not fit); an open item becomes `answered`. A reply
+ whose `ref` the item already holds is not added again, so a retried request
+ writes nothing new.
  
 +```
 +POST /v1/sessions/{session_id}/open-items/import
@@ -122,13 +121,13 @@ index 3deb200700b96eb839d1a28d9c6d08e7daa552d4..1d5257dd317a17eca176e35b992fd4c3
  Deleting a session deletes its items; a fork starts with none.
  
 diff --git a/omnigent/server/open_items.py b/omnigent/server/open_items.py
-index c338b4099ef4b1f6a4078cf0d905654fd9490113..9d8a49a6b6ab96336de3d1e7f799824c6d106007 100644
+index 6ee9f95584b644ef4b7f2dcdfadf52a359fc4f81..250bebcaf8c3a1ea069600b0af0867ceacd10e1e 100644
 --- a/omnigent/server/open_items.py
 +++ b/omnigent/server/open_items.py
 @@ -18,6 +18,9 @@ Routes, under ``/v1``:
    runner as above, or from a person with edit access.
- * ``POST /sessions/{session_id}/open-items/answers`` records a person's replies
-   (edit access); an open item becomes answered.
+ * ``POST /sessions/{session_id}/open-items/replies`` records a person's replies,
+   such as their comments on items (edit access); an open item becomes answered.
 +* ``POST /sessions/{session_id}/open-items/import`` stores items written in the
 +  chat under their own labels (edit access), so chat labels written before the
 +  store, or by an agent without the tools, join the list and are never reused.
@@ -143,8 +142,8 @@ index c338b4099ef4b1f6a4078cf0d905654fd9490113..9d8a49a6b6ab96336de3d1e7f799824c
      item_to_json,
      normalize_change,
      normalize_new_item,
-@@ -121,6 +125,17 @@ class OpenItemsAnswerRequest(BaseModel):
-     answers: list[OpenItemAnswer] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
+@@ -123,6 +127,17 @@ class OpenItemsReplyRequest(BaseModel):
+     ref: str | None = Field(default=None, max_length=IDEMPOTENCY_KEY_MAX_CHARS)
  
  
 +class OpenItemsImportRequest(BaseModel):
@@ -161,7 +160,7 @@ index c338b4099ef4b1f6a4078cf0d905654fd9490113..9d8a49a6b6ab96336de3d1e7f799824c
  def _require_store(conversation_store: ConversationStore) -> OpenItemsStore:
      store = open_store(conversation_store)
      if store is None:
-@@ -330,6 +345,67 @@ def create_open_items_router(
+@@ -336,6 +351,67 @@ def create_open_items_router(
              "topics": sorted({t for item in everything if (t := item.content.get("topic"))}),
          }
  
@@ -210,7 +209,7 @@ index c338b4099ef4b1f6a4078cf0d905654fd9490113..9d8a49a6b6ab96336de3d1e7f799824c
 +            ]
 +            closed = (
 +                await asyncio.to_thread(
-+                    lambda: store.change_items(session.id, to_close, closed_by="user")
++                    lambda: store.change_items(session.id, to_close, actor="user")
 +                )
 +                if to_close
 +                else []
@@ -230,11 +229,11 @@ index c338b4099ef4b1f6a4078cf0d905654fd9490113..9d8a49a6b6ab96336de3d1e7f799824c
      async def update_open_items(
          request: Request, session_id: str, body: OpenItemsUpdateRequest
 diff --git a/openapi.json b/openapi.json
-index cf39deaa38a64436c6ee4e7fa982d09cb0093373..754fac9975fd5a38a2ea4aab8fa654f88fbf1df1 100644
+index 4d93254c83c79e75919fa8874bafc979c4d74061..23a860f0a0fac15d6683913577a11fc1358c40cd 100644
 --- a/openapi.json
 +++ b/openapi.json
-@@ -5974,6 +5974,33 @@
-         "title": "OpenItemsAnswerRequest",
+@@ -5955,6 +5955,33 @@
+         "title": "OpenItemReply",
          "type": "object"
        },
 +      "OpenItemsImportRequest": {
@@ -267,7 +266,7 @@ index cf39deaa38a64436c6ee4e7fa982d09cb0093373..754fac9975fd5a38a2ea4aab8fa654f8
        "OpenItemsRaiseRequest": {
          "description": "Items the session's agent raises; see `sys_open_items_raise`.",
          "properties": {
-@@ -25452,6 +25479,61 @@
+@@ -25464,6 +25491,61 @@
          ]
        }
      },
@@ -330,10 +329,10 @@ index cf39deaa38a64436c6ee4e7fa982d09cb0093373..754fac9975fd5a38a2ea4aab8fa654f8
        "get": {
          "description": "Return the owner of a session.\n\nRequires read-level access.\n\n**Returns:** `{\"owner\": \"<user_id>\"}` or `{\"owner\": null}`.",
 diff --git a/tests/server/routes/test_open_items_routes.py b/tests/server/routes/test_open_items_routes.py
-index 8f9c148b9ba5f294d634b51240a911b06b4050b2..0fe7c857a36751abdd494e38ddea14fa5fb35946 100644
+index 1face6cd65afd9d3131ac9928acc0137e7a9abbe..314edf6125d8925416c1e660dc25c9790001df64 100644
 --- a/tests/server/routes/test_open_items_routes.py
 +++ b/tests/server/routes/test_open_items_routes.py
-@@ -408,3 +408,48 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
+@@ -416,3 +416,48 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
      )
      refused = await run("sys_open_items_raise", {"items": [{"kind": "question"}]})
      assert refused == {"error": "invalid_input: title is required"}
