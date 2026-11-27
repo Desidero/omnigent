@@ -2,7 +2,7 @@
 
 A session's agent raises and updates items through its ``sys_open_items_*``
 tools, which its runner sends here; people read them and may close, reopen,
-retopic or answer them. Items live in the ``open_items`` side store
+retopic or reply to them. Items live in the ``open_items`` side store
 (:mod:`omnigent.stores.open_items_store`). Every write publishes
 ``session.open_items.changed`` on the session's stream.
 
@@ -16,8 +16,8 @@ Routes, under ``/v1``:
   tunnel token (edit access).
 * ``PATCH /sessions/{session_id}/open-items`` changes items: from the session's
   runner as above, or from a person with edit access.
-* ``POST /sessions/{session_id}/open-items/answers`` records a person's replies
-  (edit access); an open item becomes answered.
+* ``POST /sessions/{session_id}/open-items/replies`` records a person's replies,
+  such as their comments on items (edit access); an open item becomes answered.
 """
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ from pydantic import BaseModel, Field
 
 from omnigent.entities import Conversation
 from omnigent.entities.open_items import (
-    ANSWER_MAX_CHARS,
     BATCH_KEY_MAX_CHARS,
     IDEMPOTENCY_KEY_MAX_CHARS,
     LIST_PAGE_MAX,
     RAISE_BATCH_MAX,
+    REPLY_MAX_CHARS,
     UPDATE_BATCH_MAX,
     OpenItemError,
     OpenItemFilter,
@@ -104,21 +104,23 @@ class OpenItemsUpdateRequest(BaseModel):
     """Changes to items; see ``sys_open_items_update``."""
 
     updates: list[dict[str, Any]] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
-    # What made an agent's change, e.g. "tool:<call id>"; recorded on a close.
+    # What made the change, e.g. "tool:<call id>"; recorded on a close and a reply.
     ref: str | None = Field(default=None, max_length=IDEMPOTENCY_KEY_MAX_CHARS)
 
 
-class OpenItemAnswer(BaseModel):
+class OpenItemReply(BaseModel):
     """A person's reply to one item."""
 
     label: str = Field(min_length=2, max_length=4)
-    text: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
+    text: str = Field(min_length=1, max_length=REPLY_MAX_CHARS)
 
 
-class OpenItemsAnswerRequest(BaseModel):
+class OpenItemsReplyRequest(BaseModel):
     """Replies to record, one per item."""
 
-    answers: list[OpenItemAnswer] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
+    replies: list[OpenItemReply] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
+    # Names the write, e.g. "comment:<id>", so a retry records each reply once.
+    ref: str | None = Field(default=None, max_length=IDEMPOTENCY_KEY_MAX_CHARS)
 
 
 def _require_store(conversation_store: ConversationStore) -> OpenItemsStore:
@@ -305,6 +307,10 @@ def create_open_items_router(
         store = _require_store(conversation_store)
         user_id = get_user_id(request, auth_provider)
         with _item_errors():
+            if any("label" in item for item in body.items):
+                raise OpenItemError(
+                    "invalid_input", "labels are allocated here; raise items without a label"
+                )
             items = [normalize_new_item(item) for item in body.items]
             owner = await asyncio.to_thread(_owner, session, user_id)
             results = await asyncio.to_thread(
@@ -337,35 +343,35 @@ def create_open_items_router(
         """Change items, from the session's runner or a person with edit access."""
         if request.headers.get(ORCHESTRATION_SOURCE_HEADER) is not None:
             session = await _agent_session(request, session_id)
-            closed_by = "agent"
+            actor, user_id = "agent", None
         else:
             session = await _session(request, session_id, LEVEL_EDIT)
-            closed_by = "user"
+            actor, user_id = "user", get_user_id(request, auth_provider)
         store = _require_store(conversation_store)
         with _item_errors():
             changes = [normalize_change(update) for update in body.updates]
             results = await asyncio.to_thread(
                 lambda: store.change_items(
-                    session.id, changes, closed_by=closed_by, closed_ref=body.ref
+                    session.id, changes, actor=actor, ref=body.ref, user_id=user_id
                 )
             )
         await _publish(store, session.id, [r.label for r in results if r.item is not None])
         return {"items": _changed_json(results)}
 
-    @router.post("/sessions/{session_id}/open-items/answers")
-    async def answer_open_items(
-        request: Request, session_id: str, body: OpenItemsAnswerRequest
+    @router.post("/sessions/{session_id}/open-items/replies")
+    async def reply_to_open_items(
+        request: Request, session_id: str, body: OpenItemsReplyRequest
     ) -> dict[str, Any]:
         """Record a person's replies; needs edit access."""
         session = await _session(request, session_id, LEVEL_EDIT)
         store = _require_store(conversation_store)
         user_id = get_user_id(request, auth_provider)
         with _item_errors():
-            answers = [(answer.label, answer.text.strip()) for answer in body.answers]
-            if not all(text for _, text in answers):
-                raise OpenItemError("invalid_input", "an answer needs text")
+            replies = [(reply.label, reply.text.strip()) for reply in body.replies]
+            if not all(text for _, text in replies):
+                raise OpenItemError("invalid_input", "a reply needs text")
             results = await asyncio.to_thread(
-                lambda: store.record_answers(session.id, answers, user_id=user_id)
+                lambda: store.record_replies(session.id, replies, user_id=user_id, ref=body.ref)
             )
         await _publish(store, session.id, [r.label for r in results if r.item is not None])
         return {"items": _changed_json(results)}

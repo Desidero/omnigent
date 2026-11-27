@@ -4,7 +4,8 @@ An item belongs to the session that raised it and is named by a label, the
 kind's letter and a number, e.g. ``Q7``. The store allocates numbers, so a
 label never changes and is never reused within its session. An item is
 ``open`` until it is closed with a resolution, or ``answered`` once the user
-has replied and the agent has not closed it yet.
+has replied and the agent has not replied or closed it yet. Each item keeps its
+reply chain: the user's comments and the agent's replies, in order.
 
 The normalizers here check every field a write carries and return what to
 store; the store and the routes run them, so every write path applies them. Links and
@@ -40,12 +41,13 @@ TITLE_MAX_CHARS = 160
 DETAIL_MAX_CHARS = 6000
 TOPIC_MAX_CHARS = 48
 RESOLUTION_MAX_CHARS = 2000
-ANSWER_MAX_CHARS = 2000
+REPLY_MAX_CHARS = 2000
 RAISED_BY_MAX_CHARS = 64
 LINK_LABEL_MAX_CHARS = 120
 URL_MAX_CHARS = 2048
 LINKS_PER_ITEM = 8
-ANSWERS_KEPT = 5
+REPLIES_KEPT = 10
+REPLY_AUTHORS = ("agent", "user")
 # The chat parses labels of one to three digits.
 NUMBER_MAX = 999
 ITEMS_PER_SESSION = 500
@@ -86,8 +88,8 @@ class OpenItem:
         (``[{"url", "label"?}]``), ``url`` (a link item's target) and
         ``raised_by``.
     :ivar outcome: ``resolution``, ``closed_by``, ``closed_ref`` and
-        ``answers`` (``[{"text", "at", "by"}]``, the latest five); empty until
-        the item is answered or closed.
+        ``replies`` (``[{"author", "text", "at", "by"?, "ref"?}]``, oldest
+        first, the latest ten); empty until someone replies or closes it.
     """
 
     conversation_id: str
@@ -126,6 +128,7 @@ class OpenItemChange:
     """A checked change to one item; see :func:`normalize_change`.
 
     :ivar status: ``"open"`` or ``"closed"``; ``None`` leaves it.
+    :ivar reply: Text added to the item's reply chain.
     :ivar fields: Content fields to set; a ``None`` topic clears it.
     """
 
@@ -133,6 +136,7 @@ class OpenItemChange:
     number: int
     status: str | None = None
     resolution: str | None = None
+    reply: str | None = None
     fields: dict[str, Any] = field(default_factory=dict)
     add_links: tuple[dict[str, str], ...] = ()
     remove_links: tuple[str, ...] = ()
@@ -293,7 +297,7 @@ def normalize_change(value: object) -> OpenItemChange:
     """
     if not isinstance(value, Mapping):
         raise _invalid("each update must be an object")
-    allowed = {"label", "status", "resolution", "title", "detail", "topic"}
+    allowed = {"label", "status", "resolution", "reply", "title", "detail", "topic"}
     allowed |= {"add_links", "remove_links"}
     if unknown := sorted(set(value) - allowed):
         raise _invalid(f"unknown update fields: {', '.join(unknown)}")
@@ -306,6 +310,9 @@ def normalize_change(value: object) -> OpenItemChange:
         resolution = _text(value["resolution"], "resolution", RESOLUTION_MAX_CHARS, required=True)
     if status == "closed" and resolution is None:
         raise _invalid("closing an item needs a one-line resolution")
+    reply = None
+    if "reply" in value:
+        reply = _text(value["reply"], "reply", REPLY_MAX_CHARS, required=True)
     fields: dict[str, Any] = {}
     if "title" in value:
         fields["title"] = _text(value["title"], "title", TITLE_MAX_CHARS, required=True)
@@ -321,6 +328,7 @@ def normalize_change(value: object) -> OpenItemChange:
         number=number,
         status=status,
         resolution=resolution,
+        reply=reply,
         fields=fields,
         add_links=tuple(_links(value.get("add_links"), "add_links")),
         remove_links=tuple(_canonical_url(url) for url in removed),
@@ -385,7 +393,7 @@ def _searchable(item: OpenItem) -> str:
     parts += [content.get("url"), content.get("raised_by"), outcome.get("resolution")]
     parts += [link.get("url") for link in content.get("links") or []]
     parts += [link.get("label") for link in content.get("links") or []]
-    parts += [answer.get("text") for answer in outcome.get("answers") or []]
+    parts += [reply.get("text") for reply in outcome.get("replies") or []]
     return "\n".join(str(part) for part in parts if part).casefold()
 
 
@@ -449,5 +457,8 @@ def item_to_json(item: OpenItem) -> dict[str, Any]:
         "closed_at": item.closed_at,
         "resolution": outcome.get("resolution"),
         "closed_by": outcome.get("closed_by"),
-        "answers": outcome.get("answers") or [],
+        "replies": [
+            {name: reply[name] for name in ("author", "text", "at", "by") if name in reply}
+            for reply in outcome.get("replies") or []
+        ],
     }

@@ -49,12 +49,12 @@ from omnigent.db.envelope import EnvelopedJSON, seal
 from omnigent.db.side_schemas import SideStore, register_side_store, side_metadata
 from omnigent.db.utils import now_epoch, run_write_transaction
 from omnigent.entities.open_items import (
-    ANSWERS_KEPT,
     IDEMPOTENCY_KEY_MAX_CHARS,
     ITEMS_PER_SESSION,
     KIND_BY_CODE,
     KINDS,
     NUMBER_MAX,
+    REPLIES_KEPT,
     SESSION_HEAD_KIND,
     STATUS_BY_CODE,
     STATUSES,
@@ -106,7 +106,7 @@ class SqlOpenItem(OpenItemsBase):
         EnvelopedJSON(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
     )
     # How it went, written apart from the content:
-    # {"resolution", "closed_by", "closed_ref", "answers"}.
+    # {"resolution", "closed_by", "closed_ref", "replies"}.
     outcome: Mapped[dict[str, Any] | None] = mapped_column(
         EnvelopedJSON(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=True
     )
@@ -244,6 +244,40 @@ def _check_size(content: dict[str, Any], label: str) -> None:
         )
 
 
+def _add_reply(
+    row: SqlOpenItem,
+    outcome: dict[str, Any],
+    author: str,
+    text: str,
+    ref: str | None,
+    user_id: str | None,
+    now: int,
+) -> None:
+    """Add a reply to an item's chain, unless the write *ref* names already added it.
+
+    The user replying makes an open item answered, the agent replying makes an
+    answered one open again; a reply never closes or reopens an item. The
+    latest :data:`REPLIES_KEPT` replies are kept, fewer if they would not fit.
+    """
+    replies = list(outcome.get("replies") or [])
+    if ref is not None and any(reply.get("ref") == ref for reply in replies):
+        return
+    reply: dict[str, Any] = {"author": author, "text": text, "at": now}
+    if user_id is not None and author == "user":
+        reply["by"] = user_id
+    if ref is not None:
+        reply["ref"] = ref
+    replies = [*replies, reply][-REPLIES_KEPT:]
+    outcome["replies"] = replies
+    while len(replies) > 1 and len(seal(outcome)) > MAX_STORED_VALUE_BYTES:
+        replies = replies[1:]
+        outcome["replies"] = replies
+    if author == "user" and row.status == STATUSES["open"]:
+        row.status = STATUSES["answered"]
+    elif author == "agent" and row.status == STATUSES["answered"]:
+        row.status = STATUSES["open"]
+
+
 class OpenItemsStore:
     """SQLAlchemy-backed store of each session's open items."""
 
@@ -346,7 +380,8 @@ class OpenItemsStore:
         Item ``i`` is written under ``<idempotency_key>:<i>``; a retry with the
         same key returns the items the first attempt wrote. A link whose URL
         the session already pinned returns that item as a duplicate. An item
-        with its own number adopts that label if it is free.
+        with its own number (an import of a label written in chat) takes that
+        label if it is free.
 
         :param items: Checked items, see
             :func:`~omnigent.entities.open_items.normalize_new_item`.
@@ -414,8 +449,8 @@ class OpenItemsStore:
             return RaisedItem(
                 error=OpenItemError(
                     "session_full",
-                    f"this session holds {ITEMS_PER_SESSION} items; close and reuse topics, "
-                    "or label further items in chat",
+                    f"this session holds {ITEMS_PER_SESSION} items, the most it can; "
+                    "write further points in chat without a label",
                 )
             )
         next_number = self._lock_head(session, conversation_id, kind)
@@ -430,8 +465,7 @@ class OpenItemsStore:
             return RaisedItem(
                 error=OpenItemError(
                     "label_taken",
-                    f"{format_label(item.kind, number)} is already an item in this session; "
-                    "raise without a label to get a new one",
+                    f"{format_label(item.kind, number)} is already an item in this session",
                 )
             )
         now = now_epoch()
@@ -461,23 +495,28 @@ class OpenItemsStore:
         conversation_id: str,
         changes: Sequence[OpenItemChange],
         *,
-        closed_by: str,
-        closed_ref: str | None = None,
+        actor: str,
+        ref: str | None = None,
+        user_id: str | None = None,
     ) -> list[ChangedItem]:
-        """Change items: status, resolution, title, detail, topic and links.
+        """Change items: status, resolution, reply, title, detail, topic and links.
 
         Closing records the resolution and who closed it; reopening clears
-        them and keeps the answers.
+        them and keeps the replies. A reply joins the item's chain (see
+        :meth:`_add_reply`) and never closes it.
 
-        :param closed_by: ``"agent"`` or ``"user"``, recorded on a close.
-        :param closed_ref: What closed it, e.g. ``"tool:<call id>"``.
+        :param actor: ``"agent"`` or ``"user"``: who closes, and who replies.
+        :param ref: What made the change, e.g. ``"tool:<call id>"``; recorded on
+            a close and on a reply, so a retried change replies once.
+        :param user_id: The person replying, or ``None`` for the agent or in
+            single-user mode.
         :returns: One result per change, in order; a label the session lacks
             carries ``not_found``.
         """
 
         def write(session: Session) -> list[ChangedItem]:
             return [
-                self._change_one(session, conversation_id, change, closed_by, closed_ref)
+                self._change_one(session, conversation_id, change, actor, ref, user_id)
                 for change in changes
             ]
 
@@ -488,8 +527,9 @@ class OpenItemsStore:
         session: Session,
         conversation_id: str,
         change: OpenItemChange,
-        closed_by: str,
-        closed_ref: str | None,
+        actor: str,
+        ref: str | None,
+        user_id: str | None,
     ) -> ChangedItem:
         label = format_label(change.kind, change.number)
         row = self._row(session, conversation_id, KINDS[change.kind][0], change.number, lock=True)
@@ -512,15 +552,17 @@ class OpenItemsStore:
         except OpenItemError as exc:
             return ChangedItem(label, error=exc)
         now = now_epoch()
+        if change.reply is not None:
+            _add_reply(row, outcome, actor, change.reply, ref, user_id, now)
         if change.resolution is not None:
             outcome["resolution"] = change.resolution
         if change.status == "closed":
             if row.status != STATUSES["closed"]:
                 row.closed_at = now
             row.status = STATUSES["closed"]
-            outcome["closed_by"] = closed_by
-            if closed_ref is not None:
-                outcome["closed_ref"] = closed_ref
+            outcome["closed_by"] = actor
+            if ref is not None:
+                outcome["closed_ref"] = ref
         elif change.status == "open":
             row.status = STATUSES["open"]
             row.closed_at = None
@@ -531,18 +573,24 @@ class OpenItemsStore:
         row.updated_at = now
         return ChangedItem(label, item=_to_item(row))
 
-    def record_answers(
-        self, conversation_id: str, answers: Sequence[tuple[str, str]], *, user_id: str | None
+    def record_replies(
+        self,
+        conversation_id: str,
+        replies: Sequence[tuple[str, str]],
+        *,
+        user_id: str | None,
+        ref: str | None = None,
     ) -> list[ChangedItem]:
-        """Record the user's replies; an open item becomes answered.
+        """Record a person's replies, e.g. their comments on items; an open item becomes answered.
 
-        :param answers: ``(label, text)`` pairs, checked by the caller.
+        :param replies: ``(label, text)`` pairs, checked by the caller.
         :param user_id: Who replied, or ``None`` in single-user mode.
+        :param ref: Names the write, e.g. ``"comment:<id>"``, so a retry adds nothing.
         """
 
         def write(session: Session) -> list[ChangedItem]:
             results = []
-            for label, text in answers:
+            for label, text in replies:
                 kind, number = parse_label(label)
                 label = format_label(kind, number)
                 row = self._row(session, conversation_id, KINDS[kind][0], number, lock=True)
@@ -553,16 +601,13 @@ class OpenItemsStore:
                     continue
                 now = now_epoch()
                 outcome = dict(row.outcome or {})
-                answer = {"text": text, "at": now, "by": user_id}
-                outcome["answers"] = [*(outcome.get("answers") or []), answer][-ANSWERS_KEPT:]
+                _add_reply(row, outcome, "user", text, ref, user_id, now)
                 row.outcome = outcome
-                if row.status == STATUSES["open"]:
-                    row.status = STATUSES["answered"]
                 row.updated_at = now
                 results.append(ChangedItem(label, item=_to_item(row)))
             return results
 
-        return run_write_transaction(self._writes, "record_open_item_answers", write)
+        return run_write_transaction(self._writes, "record_open_item_replies", write)
 
     # ── Reads ─────────────────────────────────────────
 

@@ -30,6 +30,7 @@ _UNAVAILABLE = (
 _WRITE_ATTEMPTS = 3
 _RETRYABLE_STATUSES = frozenset({502, 503, 504})
 _DETAIL_PREVIEW_CHARS = 300
+_REPLIES_SHOWN = 3
 
 
 def _url(session_id: str) -> str:
@@ -125,8 +126,11 @@ def _row(item: dict[str, Any]) -> dict[str, Any]:
             row[name] = item[name]
     if item.get("links"):
         row["links"] = [link["url"] for link in item["links"]]
-    if item.get("answers"):
-        row["latest_answer"] = item["answers"][-1]["text"]
+    if replies := item.get("replies"):
+        row["latest_replies"] = [
+            {"from": reply["author"], "text": reply["text"][:_DETAIL_PREVIEW_CHARS]}
+            for reply in replies[-_REPLIES_SHOWN:]
+        ]
     if item.get("closed_by"):
         row["closed_by"] = item["closed_by"]
     return row

@@ -1626,7 +1626,8 @@ GET /v1/sessions/{session_id}/open-items?status=open&kind=question&q=cache&limit
   "links": [{"url": "https://...", "label": "PR"}], "url": null,
   "raised_by": null, "created_at": 1764100000, "updated_at": 1764100000,
   "closed_at": null, "resolution": null, "closed_by": null,
-  "answers": [{"text": "Link them", "at": 1764100100, "by": "bob@example.com"}]}],
+  "replies": [{"author": "user", "text": "Link them?", "at": 1764100100, "by": "bob@example.com"},
+              {"author": "agent", "text": "Yes, both.", "at": 1764100160}]}],
   "has_more": false, "next_after": null,
   "counts": {"status": {"open": 3, "answered": 1, "closed": 2},
              "kind": {"question": 4, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}},
@@ -1636,7 +1637,7 @@ GET /v1/sessions/{session_id}/open-items?status=open&kind=question&q=cache&limit
 Read access. Items come in label order (by kind, then number). `status` and
 `kind` repeat; `status` defaults to `open` and `answered`, and `all` means
 every status. `topic`, `raised_by`, `has_links` and `q` (case-insensitive text
-in the label, title, detail, topic, links, resolution and answers) narrow the
+in the label, title, detail, topic, links, resolution and replies) narrow the
 page; `limit` is 1 to 200 (default 100) and `after` takes a label, the previous
 page's `next_after`. `counts` and `topics` cover all of the session's items.
 
@@ -1645,7 +1646,7 @@ POST /v1/sessions/{session_id}/open-items
 X-Omnigent-Orchestration-Source: <session_id>
 
 {"items": [{"kind": "question", "title": "Cache rows?", "detail": "...",
-  "topic": "cache", "links": ["https://..."], "label": "Q7"}],
+  "topic": "cache", "links": ["https://..."]}],
  "idempotency_key": "tool:toolu_01"}
 
 200 OK — {"items": [{"item": {...}, "duplicate": false} | {"error": {"code", "message"}}],
@@ -1660,14 +1661,15 @@ Only the session's runner raises items, for its agent. One to ten items; item
 `i` is written under `<idempotency_key>:<i>`, so a retry returns the items the
 first attempt wrote. `kind` is `question`, `risk`, `finding`, `follow_up` or
 `link` (which needs `url`; pinning a URL the session already pinned returns that
-item with `duplicate: true`). `label` adopts a label written in chat if it is
-free. An item that cannot be taken carries its own error: `session_full` (500
-items, or 999 of the kind) or `label_taken`.
+item with `duplicate: true`). The server allocates every label: an item that
+names one is refused with `invalid_input`. An item that cannot be taken carries
+its own error: `session_full` (500 items, or 999 of the kind).
 
 ```
 PATCH /v1/sessions/{session_id}/open-items
 
-{"updates": [{"label": "Q7", "status": "closed", "resolution": "Linked them"},
+{"updates": [{"label": "Q7", "reply": "Linked both.", "status": "closed",
+              "resolution": "Linked them"},
              {"label": "R2", "topic": "release", "add_links": ["https://..."],
               "remove_links": ["https://..."]}],
  "ref": "tool:toolu_02"}
@@ -1676,23 +1678,27 @@ PATCH /v1/sessions/{session_id}/open-items
 ```
 
 From the session's runner (with the source header, as above) or from a person
-with edit access. One to twenty updates; each sets any of `status` (`open` or
-`closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty
-clears it), `add_links` and `remove_links`. A close records `closed_by`
-(`agent` or `user`) and `ref`; a reopen clears the resolution and keeps the
-answers. A label the session lacks gets `not_found`, a change that would not
+with edit access. One to twenty updates; each sets any of `reply` (added to the
+item's thread as the agent's or the person's, once per `ref`; it never closes
+the item), `status` (`open` or `closed`), `resolution` (required to close),
+`title`, `detail`, `topic` (empty clears it), `add_links` and `remove_links`. A
+close records `closed_by` (`agent` or `user`) and `ref`; a reopen clears the
+resolution and keeps the replies. A person's reply makes an open item
+`answered`; the agent's makes an `answered` one `open`. A label the session lacks gets `not_found`, a change that would not
 fit gets `too_large`; the others still apply.
 
 ```
-POST /v1/sessions/{session_id}/open-items/answers
+POST /v1/sessions/{session_id}/open-items/replies
 
-{"answers": [{"label": "Q7", "text": "Link them"}]}
+{"replies": [{"label": "Q7", "text": "Link them?"}], "ref": "comment:4f1c"}
 
 200 OK — {"items": [{"label": "Q7", "item": {...}}]}
 ```
 
-Edit access. Records each reply (the latest five are kept); an open item
-becomes `answered`.
+Edit access. Records each reply as the person's (the latest ten per item are
+kept, fewer if they would not fit); an open item becomes `answered`. A reply
+whose `ref` the item already holds is not added again, so a retried request
+writes nothing new.
 
 Each write publishes `session.open_items.changed` on the session's stream.
 Deleting a session deletes its items; a fork starts with none.
