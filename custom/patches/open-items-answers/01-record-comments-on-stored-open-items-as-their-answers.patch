@@ -1,0 +1,1451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 16:08:59 +0000
+Subject: [PATCH] feat(web): record comments on stored open items as their
+ answers
+
+Answering several items at once sends one "Comments on N items" message,
+which tells the agent but leaves every stored item open in the panel until
+the agent gets round to closing it, so the panel cannot tell what still
+waits on the user.
+
+When that message posts (the moment its drafts are settled), the browser
+that sent it records each item's comments as the item's answer through
+POST /v1/sessions/{id}/open-items/answers: an open stored item becomes
+answered, shows the answer, and leaves the badge. The message goes through
+the normal send path first and nothing waits on the record: on a server
+without open items nothing is sent, and a refused or failed call only
+leaves the items open. An expanded row in the panel also offers Comment.
+
+"Comment and close", chosen per item in comment mode (the comment's header
+card, the tray's toggle, or an expanded panel row), settles an item with
+the comment itself. The item's heading in the message ends "(closed by me)",
+so the agent knows, and once the message posts the item is also closed
+through PATCH /v1/sessions/{id}/open-items as the user, the comment its
+resolution. It is offered only on stored items that are not closed; a close
+that fails leaves the item open with its answer and says so in a toast.
+
+Not proposed upstream yet: the comments and the store it joins are not
+upstream either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/chat-item-labels.md                      |   8 +-
+ docs/open-items.md                            |  18 ++
+ feature-map/open-items.md                     |   3 +
+ .../chat/StoredOpenItemsPanel.test.tsx        |  64 +++++
+ .../components/chat/StoredOpenItemsPanel.tsx  |  36 +++
+ .../composer/ItemCommentTray.test.tsx         |  76 ++++++
+ .../components/composer/ItemCommentTray.tsx   | 111 ++++++++-
+ web/src/hooks/useItemCommentMode.test.tsx     | 130 ++++++++++
+ web/src/hooks/useItemCommentMode.ts           |  60 ++++-
+ web/src/hooks/useStoredOpenItems.ts           |   8 +-
+ web/src/lib/itemCommentDrafts.ts              |   6 +
+ web/src/lib/openItemAnswers.test.ts           | 230 ++++++++++++++++++
+ web/src/lib/openItemAnswers.ts                | 203 ++++++++++++++++
+ web/src/pages/ChatPage.tsx                    |   7 +
+ 14 files changed, 952 insertions(+), 8 deletions(-)
+ create mode 100644 web/src/lib/openItemAnswers.test.ts
+ create mode 100644 web/src/lib/openItemAnswers.ts
+
+diff --git a/docs/chat-item-labels.md b/docs/chat-item-labels.md
+index 48aa1b910f24f5eb9723946f66b28f91fedbfdec..1eb020959fb7a6add136097a18b162d0b6e96c05 100644
+--- a/docs/chat-item-labels.md
++++ b/docs/chat-item-labels.md
+@@ -164,4 +164,10 @@ next reply. A comment on a closed item leaves it closed.
+ 
+ Sent comments are read back from the transcript, so they show on every device.
+ Drafts stay in this browser only (attachments included) and survive a reload;
+-a failed or cancelled send puts them back as drafts.
++a failed or cancelled send puts them back as drafts. Where the server stores
++open items, each comment on a stored item is also recorded as its answer once
++the message posts, so the item shows as answered (see
++[Open items in the web UI](open-items.md#in-the-web-ui)). On a stored item
++that is not closed, **Comment and close** in the comment's header card (or a
++draft's ✓ in the tray) closes the item with the comment once it posts; its
++heading in the message then ends `(closed by me)`.
+diff --git a/docs/open-items.md b/docs/open-items.md
+index 1b0781b17c8253268a26dbacfc2552360cdc456a..06225fc007194a3766760bd69331736093548abe 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -112,6 +112,24 @@ stays current as the agent raises and closes them.
+   the item is marked **closed in chat** and its details offer **Close** with
+   the chat's sentence as the resolution. The agent sees every change in
+   `sys_open_items_list`.
++- **Answers from comments:** with [comments on items](chat-item-labels.md#comment-on-items),
++  an expanded item also offers **Comment**. When a "Comments on N items"
++  message posts, the browser that sent it records each item's comments as
++  that item's answer (`POST …/open-items/answers`): an open stored item
++  becomes **Answered** and lists the answer, and the agent sees it in
++  `sys_open_items_list`. The message itself goes through the normal send path
++  first, so if recording fails the item just stays open. Labels the server
++  does not hold are skipped.
++- **Comment and close:** on a stored item that is not closed, the comment's
++  header card offers **Comment and close** (on a phone, **Close**), the
++  tray's ✓ switches it per item, and an expanded panel row offers it next to
++  **Comment**. The item is marked **closes when sent** in the panel and
++  **closes** in the tray until the message posts. The message tells the agent
++  with a heading ending `(closed by me)`; after it posts, the item's answer is
++  recorded and the item is closed by you (`PATCH …/open-items`, `closed_by`
++  `user`) with the comment as its resolution, cut to 2,000 characters. If the
++  close fails, the item stays open with its answer and a toast says so. A
++  close is never read from what a comment says.
+ - **Chat-only items** keep their dismiss button; dismissals are still stored
+   as the `omnigent.items_dismissed` session label, which is read for chat-only
+   items and never written for stored ones.
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index 9cf108cfa3849f83c132fedefe0e737b42bccbdb..5fb1f6dde52a7cfec769f069301c716ab15ce09e 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -14,6 +14,8 @@ A session's agent records the questions, risks, findings and follow-ups it raise
+ - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
+ - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
+ - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
++- `items-comment-answers`: a posted "Comments on N items" message records each stored item's comments as its answer, so it shows answered; a failed record leaves it open and never touches the message.
++- `items-comment-close`: **Comment and close**, chosen per item in comment mode (header card, tray ✓, panel row), marks the item's heading `(closed by me)` and, after the post, closes it as the user with the comment as its resolution; only on stored items that are not closed.
+ 
+ ## How to get to it (user POV)
+ 
+@@ -30,6 +32,7 @@ Preconditions: a local server and runner from this checkout; any harness.
+ 
+ - Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
+ - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
++- Answers from comments (web): `web/src/lib/openItemAnswers.test.ts`, `web/src/hooks/useItemCommentMode.test.tsx`. Human check: with an open stored item, choose **Comment** on its chip or in its expanded panel row, send the comment; the item moves to **Answered** with your text under it, and the badge drops by one. With **Comment and close** on, the row says **closes when sent** before sending and the item moves to **Closed** with your comment as its resolution after.
+ - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
+ - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
+ - Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge and user changes: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; the live event: `web/src/store/chatStore.openItems.test.ts`.
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.test.tsx b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+index d119da5e4dd01e0fd6e59d995d24b278c11533ad..03ac917f14d876437e7ab99654c96c3f90ff0a72 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.test.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+@@ -14,6 +14,12 @@ vi.mock(import("@/lib/identity"), async (importOriginal) => ({
+ }));
+ 
+ import { TooltipProvider } from "@/components/ui/tooltip";
++import {
++  registerItemCommentComposer,
++  resetItemCommentDraftsForTests,
++  saveItemCommentDraft,
++  useItemCommentRequest,
++} from "@/lib/itemCommentDrafts";
+ import { useStoredOpenItems } from "@/hooks/useStoredOpenItems";
+ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+ import type { ServerInfo } from "@/lib/capabilities";
+@@ -273,6 +279,64 @@ describe("the Open items panel on a server that stores them", () => {
+     expect(within(panel).queryByText("chat only")).toBeNull();
+   });
+ 
++  it("starts a comment on a stored item from its details, closing the panel", () => {
++    const unregister = registerItemCommentComposer("conv_1");
++    let request: ReturnType<typeof useItemCommentRequest> = null;
++    function RequestProbe() {
++      request = useItemCommentRequest("conv_1");
++      return null;
++    }
++    render(<RequestProbe />);
++    renderPanel(["Nothing labelled."], [storedItem("Q7", { title: "Cache rows?" })]);
++    const panel = openPanel();
++    fireEvent.click(within(panel).getByRole("button", { name: "Item Q7" }));
++    fireEvent.click(within(panel).getByRole("button", { name: "Comment" }));
++    expect(request).toMatchObject({ label: "Q7", title: "Cache rows?" });
++    expect(request).not.toHaveProperty("closes");
++    expect(screen.queryByTestId("session-items-panel")).toBeNull();
++    unregister();
++    resetItemCommentDraftsForTests();
++  });
++
++  it("offers Comment and close on a stored item that is not closed, and marks closing rows", () => {
++    const unregister = registerItemCommentComposer("conv_1");
++    let request: ReturnType<typeof useItemCommentRequest> = null;
++    function RequestProbe() {
++      request = useItemCommentRequest("conv_1");
++      return null;
++    }
++    render(<RequestProbe />);
++    saveItemCommentDraft("conv_1", {
++      id: "d1",
++      label: "Q8",
++      title: "",
++      text: "Done.",
++      files: [],
++      createdAt: 1,
++      closes: true,
++    });
++    renderPanel(
++      ["Nothing labelled."],
++      [
++        storedItem("Q7", { title: "Cache rows?" }),
++        storedItem("Q8"),
++        storedItem("Q9", { status: "closed", resolution: "Done" }),
++      ],
++    );
++    const panel = openPanel();
++    const row = (label: string) =>
++      within(panel)
++        .getAllByTestId("open-item-row")
++        .find((element) => element.dataset.label === label)!;
++    expect(within(row("Q8")).getByText("closes when sent")).toBeTruthy();
++    expect(within(row("Q7")).queryByText("closes when sent")).toBeNull();
++    fireEvent.click(within(panel).getByRole("button", { name: "Item Q7" }));
++    fireEvent.click(within(panel).getByRole("button", { name: "Comment and close" }));
++    expect(request).toMatchObject({ label: "Q7", title: "Cache rows?", closes: true });
++    unregister();
++    resetItemCommentDraftsForTests();
++  });
++
+   it("offers no changes to a viewer without edit access", () => {
+     access.canEdit = false;
+     renderPanel([ITEMS, "More on [Q2]."], [storedItem("Q1"), storedItem("Q2")]);
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.tsx b/web/src/components/chat/StoredOpenItemsPanel.tsx
+index 9325c85b43849e4117292287b390d7f7da1be0c9..ad054d67a0e7ea0335d9129564f061e80421d916 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.tsx
+@@ -8,6 +8,8 @@ import {
+ import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
+ import { Button } from "@/components/ui/button";
+ import { useCanEdit } from "@/hooks/usePermissions";
++import { requestItemComment, useCanCommentOnItems } from "@/lib/itemCommentDrafts";
++import { useItemCommentClosingLabels } from "@/lib/openItemAnswers";
+ import {
+   useImportChatItems,
+   useStoredOpenItems,
+@@ -164,6 +166,8 @@ function RowDetails({
+   onUpdate: (update: OpenItemUpdate) => void;
+ }) {
+   const [, setSearchParams] = useSearchParams();
++  const sessionId = useContext(ItemLabelSessionContext);
++  const canComment = useCanCommentOnItems(sessionId);
+   const [resolution, setResolution] = useState("");
+   const item = row.stored;
+   const messageId = row.entry?.source.messageId;
+@@ -214,6 +218,28 @@ function RowDetails({
+             Show in conversation
+           </button>
+         )}
++        {canComment && sessionId !== null && (
++          // Comments sent on a stored item are recorded as its answers once they post.
++          <button
++            type="button"
++            className="text-xs text-link hover:underline"
++            onClick={() => requestItemComment(sessionId, { label: row.label, title: row.title })}
++          >
++            Comment
++          </button>
++        )}
++        {canComment && sessionId !== null && item && item.status !== "closed" && (
++          // Closes the item with the comment once the message posts.
++          <button
++            type="button"
++            className="text-xs text-link hover:underline"
++            onClick={() =>
++              requestItemComment(sessionId, { label: row.label, title: row.title, closes: true })
++            }
++          >
++            Comment and close
++          </button>
++        )}
+         {item && canEdit && item.status !== "closed" && (
+           <form
+             className="flex min-w-0 flex-1 items-center gap-1"
+@@ -267,12 +293,15 @@ function RowDetails({
+ function ItemRowView({
+   row,
+   expanded,
++  closing = false,
+   onToggle,
+   action,
+   children,
+ }: {
+   row: OpenItemRow;
+   expanded: boolean;
++  /** A comment draft closes the item when it is sent. */
++  closing?: boolean;
+   onToggle: () => void;
+   action?: ReactNode;
+   children?: ReactNode;
+@@ -309,6 +338,11 @@ function ItemRowView({
+             {row.title || row.label}
+           </span>
+           {row.status === "answered" && <span className={TAG_CLASS}>answered</span>}
++          {closing && row.status !== "closed" && (
++            <span className={cn(TAG_CLASS, "border-success/40 text-success")}>
++              closes when sent
++            </span>
++          )}
+           {row.entry?.closedInChat && row.status !== "closed" && (
+             <span className={TAG_CLASS}>closed in chat</span>
+           )}
+@@ -390,6 +424,7 @@ export function StoredOpenItemsPanel({
+   const index = useContext(ItemLabelIndexContext);
+   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
+   const canEdit = useCanEdit(sessionId ?? "");
++  const closingLabels = useItemCommentClosingLabels(sessionId);
+   const update = useUpdateStoredOpenItems(sessionId);
+   const importItems = useImportChatItems(sessionId);
+   const [expanded, setExpanded] = useState<string | null>(null);
+@@ -441,6 +476,7 @@ export function StoredOpenItemsPanel({
+         key={row.label}
+         row={row}
+         expanded={expanded === row.label}
++        closing={closingLabels.has(row.label)}
+         onToggle={() => setExpanded((open) => (open === row.label ? null : row.label))}
+         action={action}
+       >
+diff --git a/web/src/components/composer/ItemCommentTray.test.tsx b/web/src/components/composer/ItemCommentTray.test.tsx
+index 149030e2243af5e6ef006f62e0fec4a3309e0fad..5eba04f7d490e8e5aa901dff3ceb912768202b62 100644
+--- a/web/src/components/composer/ItemCommentTray.test.tsx
++++ b/web/src/components/composer/ItemCommentTray.test.tsx
+@@ -219,4 +219,80 @@ describe("ItemCommentModeHeader", () => {
+     expect(screen.queryByRole("button", { name: /Q2 text/ })).toBeNull();
+     expect(screen.getByText("UTC or the account's zone?")).toBeTruthy();
+   });
++
++  it("offers Comment and close only when asked to, and shows when it is on", () => {
++    renderHeader();
++    expect(screen.queryByRole("button", { name: "Comment and close" })).toBeNull();
++    cleanup();
++    const onClosesChange = vi.fn();
++    const props = {
++      label: "Q2",
++      title: "Report cutoff timezone",
++      item: ITEM ?? null,
++      excerpt: "",
++      editing: false,
++      onLeave: vi.fn(),
++      onClosesChange,
++    };
++    const { rerender } = render(<ItemCommentModeHeader {...props} closes={false} />);
++    const toggle = screen.getByRole("button", { name: "Comment and close" });
++    expect(toggle.getAttribute("aria-pressed")).toBe("false");
++    fireEvent.click(toggle);
++    expect(onClosesChange).toHaveBeenCalledWith(true);
++    rerender(<ItemCommentModeHeader {...props} closes />);
++    expect(toggle.getAttribute("aria-pressed")).toBe("true");
++    expect(screen.getByTestId("item-comment-mode").dataset.closes).toBe("true");
++    fireEvent.click(toggle);
++    expect(onClosesChange).toHaveBeenLastCalledWith(false);
++  });
++});
++
++describe("ItemCommentTray with Comment and close", () => {
++  const CLOSING = [{ ...DRAFTS[0], closes: true }, { ...DRAFTS[1], closes: true }, DRAFTS[2]];
++
++  it("marks the items sending closes, collapsed and expanded, and toggles them per item", () => {
++    const onToggleClose = vi.fn();
++    renderTray({ drafts: CLOSING, closableLabels: new Set(["Q2", "R1"]), onToggleClose });
++    expect(screen.getByRole("button", { name: "Show comment drafts" }).textContent).toContain(
++      "3 comments · Q2 ×2 · R1 · closes Q2",
++    );
++    expandTray();
++    const rows = screen.getAllByTestId("item-comment-draft-row");
++    expect(rows.map((row) => within(row).queryByText("closes") !== null)).toEqual([
++      true,
++      true,
++      false,
++    ]);
++    const r1Toggle = within(rows[2]).getByRole("button", { name: "Close R1 when sent" });
++    expect(r1Toggle.getAttribute("aria-pressed")).toBe("false");
++    expect(
++      within(rows[0])
++        .getByRole("button", { name: "Close Q2 when sent" })
++        .getAttribute("aria-pressed"),
++    ).toBe("true");
++    fireEvent.click(r1Toggle);
++    expect(onToggleClose).toHaveBeenCalledWith("R1");
++  });
++
++  it("shows no closing on items that cannot be closed", () => {
++    renderTray({ drafts: CLOSING, onToggleClose: vi.fn() });
++    expect(screen.getByRole("button", { name: "Show comment drafts" }).textContent).not.toContain(
++      "closes",
++    );
++    expandTray();
++    expect(screen.queryByText("closes")).toBeNull();
++    expect(screen.queryByRole("button", { name: /when sent/ })).toBeNull();
++  });
++
++  it("marks a new comment being written that closes its item", () => {
++    renderTray({
++      drafts: [DRAFTS[2]],
++      composingLabel: "Q2",
++      composingCloses: true,
++      closableLabels: new Set(["Q2"]),
++    });
++    expect(screen.getByRole("button", { name: "Show comment drafts" }).textContent).toContain(
++      "2 comments · R1 · Q2 · closes Q2",
++    );
++  });
+ });
+diff --git a/web/src/components/composer/ItemCommentTray.tsx b/web/src/components/composer/ItemCommentTray.tsx
+index cf344fae712c84464e04e1fcce94036b09951322..ac868610e26f1448b6950bdc1f69f86a63ff930c 100644
+--- a/web/src/components/composer/ItemCommentTray.tsx
++++ b/web/src/components/composer/ItemCommentTray.tsx
+@@ -4,6 +4,7 @@ import {
+   CheckIcon,
+   ChevronDownIcon,
+   ChevronUpIcon,
++  CircleCheckIcon,
+   EllipsisIcon,
+   MessageSquareTextIcon,
+   PaperclipIcon,
+@@ -34,21 +35,31 @@ const ACTION_BUTTON_CLASS =
+ const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+ const LABEL_BADGE_CLASS = cn(itemLabelChipClass(false), "pointer-events-none shrink-0");
+ const NOTHING_SENDING_ELSEWHERE: { submissionId: string; commentCount: number }[] = [];
++const NO_LABELS: ReadonlySet<string> = new Set();
++/** Marks an item that sending closes ("Comment and close"). */
++const CLOSES_TAG_CLASS = "shrink-0 rounded bg-success/15 px-1 text-xs font-medium text-success";
+ 
+ function plural(count: number, noun: string): string {
+   return `${count} ${noun}${count === 1 ? "" : "s"}`;
+ }
+ 
+-/** "3 comments · Q2 ×2 · R1"; `composingLabel` counts a comment still being written. */
++/**
++ * "3 comments · Q2 ×2 · R1 · closes Q2"; `composingLabel` counts a comment
++ * still being written, and `composingCloses` whether it closes its item.
++ */
+ export function summarizeItemCommentDrafts(
+   drafts: readonly ItemCommentDraft[],
+   composingLabel: string | null = null,
++  composingCloses = false,
+ ): string {
+   const labels = drafts.map((draft) => draft.label);
+   if (composingLabel !== null) labels.push(composingLabel);
+   const counts = new Map<string, number>();
+   for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
+   const parts = [...counts].map(([label, count]) => (count > 1 ? `${label} ×${count}` : label));
++  const closing = new Set(drafts.filter((draft) => draft.closes).map((draft) => draft.label));
++  if (composingLabel !== null && composingCloses) closing.add(composingLabel);
++  if (closing.size > 0) parts.push(`closes ${[...closing].join(", ")}`);
+   return [plural(labels.length, "comment"), ...parts].join(" · ");
+ }
+ 
+@@ -66,17 +77,49 @@ function firstLine(text: string): string {
+   return text.split("\n").find((line) => line.trim() !== "") ?? "";
+ }
+ 
++/** Switches "Comment and close" for one item's comments. */
++function CloseToggle({
++  label,
++  closes,
++  onToggle,
++}: {
++  label: string;
++  closes: boolean;
++  onToggle: (label: string) => void;
++}) {
++  return (
++    <Button
++      type="button"
++      variant="ghost"
++      size="icon-xs"
++      aria-pressed={closes}
++      aria-label={`Close ${label} when sent`}
++      title={closes ? `Sending closes ${label}; tap to only comment` : `Comment and close ${label}`}
++      className={cn(ACTION_BUTTON_CLASS, closes && "text-success hover:text-success")}
++      onClick={() => onToggle(label)}
++    >
++      <CircleCheckIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
++    </Button>
++  );
++}
++
+ function DraftRow({
+   draft,
+   editing,
++  closable,
+   onEdit,
+   onDelete,
++  onToggleClose,
+ }: {
+   draft: ItemCommentDraft;
+   editing: boolean;
++  /** Whether "Comment and close" is offered on the draft's item. */
++  closable: boolean;
+   onEdit: (draftId: string) => void;
+   onDelete: (draftId: string) => void;
++  onToggleClose?: (label: string) => void;
+ }) {
++  const closes = closable && draft.closes === true;
+   const preview = firstLine(draft.text);
+   return (
+     <div
+@@ -85,6 +128,7 @@ function DraftRow({
+       className="flex min-w-0 items-center gap-1.5 py-0.5 text-sm text-foreground"
+     >
+       <span className={LABEL_BADGE_CLASS}>{draft.label}</span>
++      {closes && <span className={CLOSES_TAG_CLASS}>closes</span>}
+       <span
+         className={cn("min-w-0 flex-1 truncate", !preview && "text-muted-foreground")}
+         title={draft.text}
+@@ -102,6 +146,9 @@ function DraftRow({
+         </span>
+       )}
+       <span className="flex shrink-0 items-center">
++        {closable && onToggleClose && (
++          <CloseToggle label={draft.label} closes={closes} onToggle={onToggleClose} />
++        )}
+         <Button
+           type="button"
+           variant="ghost"
+@@ -135,6 +182,12 @@ interface ItemCommentTrayProps {
+   editingDraftId: string | null;
+   /** The item of a new comment being written, which sending includes. */
+   composingLabel?: string | null;
++  /** Whether the comment being written closes its item. */
++  composingCloses?: boolean;
++  /** Items "Comment and close" is offered on: stored items that are not closed. */
++  closableLabels?: ReadonlySet<string>;
++  /** Switches whether an item's comments close it. */
++  onToggleClose?: (label: string) => void;
+   /** Whether a typed message goes along as the General section. */
+   withMessage?: boolean;
+   /** Why sending is unavailable right now; null when it can send. */
+@@ -163,6 +216,9 @@ export function ItemCommentTray({
+   drafts,
+   editingDraftId,
+   composingLabel = null,
++  composingCloses = false,
++  closableLabels = NO_LABELS,
++  onToggleClose,
+   withMessage = false,
+   sendDisabledReason = null,
+   onSend,
+@@ -209,7 +265,15 @@ export function ItemCommentTray({
+             </span>
+           ) : (
+             <span className="truncate text-foreground">
+-              {summarizeItemCommentDrafts(drafts, composingLabel)}
++              {summarizeItemCommentDrafts(
++                drafts.map((draft) =>
++                  draft.closes && !closableLabels.has(draft.label)
++                    ? { ...draft, closes: false }
++                    : draft,
++                ),
++                composingLabel,
++                composingCloses,
++              )}
+             </span>
+           )}
+           {expanded ? (
+@@ -326,8 +390,10 @@ export function ItemCommentTray({
+               key={draft.id}
+               draft={draft}
+               editing={draft.id === editingDraftId}
++              closable={closableLabels.has(draft.label)}
+               onEdit={onEdit}
+               onDelete={onDelete}
++              {...(onToggleClose ? { onToggleClose } : {})}
+             />
+           ))}
+           {composingLabel !== null && (
+@@ -336,6 +402,7 @@ export function ItemCommentTray({
+               className="flex min-w-0 items-center gap-1.5 py-0.5 text-sm text-muted-foreground"
+             >
+               <span className={LABEL_BADGE_CLASS}>{composingLabel}</span>
++              {composingCloses && <span className={CLOSES_TAG_CLASS}>closes</span>}
+               <span className="min-w-0 flex-1 truncate">Writing…</span>
+             </div>
+           )}
+@@ -371,7 +438,8 @@ const DEFINITION_MAX_HEIGHT_CLASS = "max-h-[calc(var(--omnigent-viewport-height,
+ /**
+  * Comment mode's header card at the top of the composer: names the item the
+  * comment is for and shows its definition, expanded until collapsed to one
+- * line. × leaves comment mode and keeps the draft.
++ * line. × leaves comment mode and keeps the draft. Where `onClosesChange` is
++ * given, "Comment and close" switches whether sending closes the item.
+  */
+ export function ItemCommentModeHeader({
+   label,
+@@ -379,6 +447,8 @@ export function ItemCommentModeHeader({
+   item,
+   excerpt,
+   editing,
++  closes = false,
++  onClosesChange,
+   onLeave,
+ }: {
+   label: string;
+@@ -387,6 +457,10 @@ export function ItemCommentModeHeader({
+   item: ItemLabelEntry | null;
+   excerpt: string;
+   editing: boolean;
++  /** Whether sending closes the item with this comment. */
++  closes?: boolean;
++  /** Offered only on a stored item that is not closed. */
++  onClosesChange?: (closes: boolean) => void;
+   onLeave: () => void;
+ }) {
+   const [expanded, setExpanded] = useState(true);
+@@ -395,7 +469,11 @@ export function ItemCommentModeHeader({
+   return (
+     <div
+       data-testid="item-comment-mode"
+-      className="mx-3 mt-3 flex flex-col rounded-md border-l-2 border-l-warning bg-muted/40 text-sm"
++      data-closes={closes || undefined}
++      className={cn(
++        "mx-3 mt-3 flex flex-col rounded-md border-l-2 bg-muted/40 text-sm",
++        closes ? "border-l-success" : "border-l-warning",
++      )}
+     >
+       <div className="flex items-start gap-2 px-2 py-1.5">
+         <div className="flex min-w-0 flex-1 flex-col">
+@@ -410,6 +488,31 @@ export function ItemCommentModeHeader({
+             <span className="truncate text-muted-foreground">{excerpt}</span>
+           )}
+         </div>
++        {onClosesChange && (
++          <button
++            type="button"
++            aria-pressed={closes}
++            aria-label="Comment and close"
++            data-testid="item-comment-close-toggle"
++            onClick={() => onClosesChange(!closes)}
++            title={
++              closes
++                ? `Sending closes ${label} with this comment; tap to only comment`
++                : `Close ${label} with this comment when it is sent`
++            }
++            className={cn(
++              "flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-xs max-md:min-h-9",
++              closes
++                ? "border-success/40 bg-success/15 font-medium text-success"
++                : "border-border text-muted-foreground hover:text-foreground",
++            )}
++          >
++            <CircleCheckIcon className="size-3.5" aria-hidden="true" />
++            {/* Phones get the short label, leaving room for the item's title. */}
++            <span className="max-sm:hidden">Comment and close</span>
++            <span className="sm:hidden">Close</span>
++          </button>
++        )}
+         {item !== null && (
+           <button
+             type="button"
+diff --git a/web/src/hooks/useItemCommentMode.test.tsx b/web/src/hooks/useItemCommentMode.test.tsx
+index be214929ccab50a1f1d51a2554b51d7bb9d86779..c8975f145930d73bd9323a0c4875bf78fad14112 100644
+--- a/web/src/hooks/useItemCommentMode.test.tsx
++++ b/web/src/hooks/useItemCommentMode.test.tsx
+@@ -21,9 +21,17 @@ import {
+   type ItemCommentState,
+ } from "@/lib/itemCommentDrafts";
+ import { buildItemLabelIndex } from "@/lib/itemLabels";
++import { publishStoredOpenItems, resetClosableItemLabelsForTests } from "@/lib/openItemAnswers";
++import { storedItem } from "@/test/openItemsFixtures";
+ import { useChatStore } from "@/store/chatStore";
+ import { useItemCommentMode, type ComposerContent } from "./useItemCommentMode";
+ 
++const recordAnswers = vi.hoisted(() => vi.fn(() => Promise.resolve()));
++vi.mock(import("@/lib/openItemAnswers"), async (importOriginal) => ({
++  ...(await importOriginal()),
++  recordItemCommentAnswers: recordAnswers,
++}));
++
+ const SESSION_ID = "conv_comments";
+ const DEFINING_TEXT = [
+   "Before I continue:",
+@@ -99,6 +107,7 @@ afterEach(() => {
+   cleanup();
+   vi.useRealTimers();
+   resetItemCommentDraftsForTests();
++  resetClosableItemLabelsForTests();
+   localStorage.clear();
+ });
+ 
+@@ -112,6 +121,7 @@ describe("useItemCommentMode", () => {
+       label: "Q2",
+       title: "Report cutoff timezone",
+       draftId: null,
++      closes: false,
+     });
+     expect(composer.text).toBe("");
+     expect(result.current.excerpt).toBe("UTC or the account's zone?");
+@@ -349,6 +359,126 @@ describe("useItemCommentMode", () => {
+     expect(getItemCommentState(SESSION_ID)).toEqual({ drafts: [], submissions: [] });
+   });
+ 
++  it("records the comments as the items' answers once, when the message posts", async () => {
++    recordAnswers.mockClear();
++    const { result } = renderCommentMode();
++    comment(result, "R1", "Batch it.");
++    await act(() => result.current.submitComments());
++    const [text] = send.mock.calls[0];
++    act(() => {
++      useChatStore.setState({
++        queuedMessages: [{ queueId: "q_1", text, conversationId: SESSION_ID }],
++      });
++      vi.advanceTimersByTime(10);
++    });
++    expect(recordAnswers).not.toHaveBeenCalled();
++    act(() => {
++      useChatStore.setState({
++        queuedMessages: [],
++        pendingUserMessages: [
++          { tempId: "pend_1", content: [{ type: "input_text", text }], posted: true },
++        ],
++      });
++      vi.advanceTimersByTime(10);
++    });
++    act(() => {
++      useChatStore.setState({ pendingUserMessages: [] });
++      vi.advanceTimersByTime(10);
++    });
++    expect(recordAnswers.mock.calls).toEqual([[SESSION_ID, text, undefined]]);
++  });
++
++  it("sends Comment and close marked in the heading and closes the item once it posts", async () => {
++    recordAnswers.mockClear();
++    publishStoredOpenItems(SESSION_ID, [storedItem("Q2"), storedItem("R1")]);
++    const { result } = renderCommentMode();
++    act(() => result.current.startComment({ label: "Q2", title: "Q2 title" }));
++    expect(result.current.target?.closes).toBe(false);
++    act(() => result.current.setTargetCloses(true));
++    composer = { text: "Use the account's zone.", files: [], mentions: [], sessions: [] };
++    act(() => result.current.saveComment());
++    comment(result, "R1", "Batch it.");
++    expect(result.current.unsentDrafts.map((draft) => [draft.label, draft.closes])).toEqual([
++      ["R1", undefined],
++      ["Q2", true],
++    ]);
++
++    await act(() => result.current.submitComments());
++    const [text] = send.mock.calls[0];
++    expect(text).toBe(
++      [
++        "Comments on 2 items:",
++        "#### [R1] Backfill locking",
++        "Batch it.",
++        "#### [Q2] Report cutoff timezone (closed by me)",
++        "Use the account's zone.",
++      ].join("\n\n"),
++    );
++    act(() => {
++      useChatStore.setState({
++        pendingUserMessages: [
++          { tempId: "pend_1", content: [{ type: "input_text", text }], posted: true },
++        ],
++      });
++      vi.advanceTimersByTime(10);
++    });
++    expect(recordAnswers.mock.calls).toEqual([[SESSION_ID, text, ["Q2"]]]);
++  });
++
++  it("keeps Comment and close per item, and back in the drafts if the send is undone", async () => {
++    publishStoredOpenItems(SESSION_ID, [storedItem("Q2")]);
++    const { result } = renderCommentMode();
++    comment(result, "Q2", "First.");
++    comment(result, "Q2", "Second.");
++    act(() => result.current.toggleItemClose("Q2"));
++    expect(unsent(getItemCommentState(SESSION_ID)).map((draft) => draft.closes)).toEqual([
++      true,
++      true,
++    ]);
++    // A further comment on the item starts as closing it too.
++    act(() => result.current.startComment({ label: "Q2", title: "Q2 title" }));
++    expect(result.current.target?.closes).toBe(true);
++    act(() => result.current.leaveCommentMode());
++
++    await act(() => result.current.submitComments());
++    const [text] = send.mock.calls[0];
++    act(() => {
++      useChatStore.setState({
++        queuedMessages: [{ queueId: "q_1", text, conversationId: SESSION_ID }],
++      });
++    });
++    act(() => {
++      useChatStore.setState({ queuedMessages: [] });
++      expect(result.current.restoreQueuedMessage(text)).toBe(true);
++    });
++    expect(result.current.unsentDrafts.map((draft) => draft.closes)).toEqual([true, true]);
++
++    act(() => result.current.toggleItemClose("Q2"));
++    expect(result.current.unsentDrafts.map((draft) => draft.closes)).toEqual([
++      undefined,
++      undefined,
++    ]);
++  });
++
++  it("offers no Comment and close without a stored item that is still open", async () => {
++    recordAnswers.mockClear();
++    publishStoredOpenItems(SESSION_ID, [storedItem("R1", { status: "closed" })]);
++    const { result } = renderCommentMode();
++    act(() => result.current.startComment({ label: "Q2", title: "Q2 title", closes: true }));
++    expect(result.current.target?.closes).toBe(false);
++    composer = { text: "Use the account's zone.", files: [], mentions: [], sessions: [] };
++    act(() => result.current.saveComment());
++    act(() => result.current.toggleItemClose("R1"));
++    comment(result, "R1", "Batch it.");
++    expect(result.current.closableLabels.size).toBe(0);
++    expect(result.current.unsentDrafts.some((draft) => draft.closes)).toBe(false);
++
++    await act(() => result.current.submitComments());
++    const [text] = send.mock.calls[0];
++    expect(text).not.toContain("(closed by me)");
++    expect(getItemCommentState(SESSION_ID).submissions[0]).not.toHaveProperty("closes");
++  });
++
+   it("gives the comments and the typed message back when the queued message is cancelled", async () => {
+     const { result } = renderCommentMode();
+     comment(result, "R1", "Batch it.");
+diff --git a/web/src/hooks/useItemCommentMode.ts b/web/src/hooks/useItemCommentMode.ts
+index b8e8219cfa2d7651c1fcbc06035536103b3d137b..f303b26efad4c1ac6a55dc07d663bb1ab0aee86a 100644
+--- a/web/src/hooks/useItemCommentMode.ts
++++ b/web/src/hooks/useItemCommentMode.ts
+@@ -43,6 +43,13 @@ import {
+   type ItemCommentRequest,
+   type ItemCommentSubmission,
+ } from "@/lib/itemCommentDrafts";
++import {
++  closableItemLabels,
++  itemCommentHeadingTitle,
++  recordItemCommentAnswers,
++  setItemCommentsClose,
++  useClosableItemLabels,
++} from "@/lib/openItemAnswers";
+ import { itemLabelTitleParts, type ItemLabelEntry } from "@/lib/itemLabels";
+ import type { ComposerSendOptions } from "@/lib/messageQueue";
+ import type { StoredReplyDraft } from "@/lib/replyDraft";
+@@ -69,6 +76,8 @@ export interface ItemCommentTarget {
+   title: string;
+   /** The draft being edited; null for a new comment. */
+   draftId: string | null;
++  /** Sending closes the item with its comments. */
++  closes: boolean;
+ }
+ 
+ interface UseItemCommentModeOptions {
+@@ -216,6 +225,7 @@ export function useItemCommentMode({
+ 
+   const state = useItemCommentState(sessionId);
+   const labelOrder = useItemLabelOrder(sessionId);
++  const closableLabels = useClosableItemLabels(sessionId);
+   const request = useItemCommentRequest(enabled ? sessionId : null);
+ 
+   useEffect(() => {
+@@ -256,7 +266,10 @@ export function useItemCommentMode({
+         size: file.size,
+       })),
+       createdAt: existing?.createdAt ?? Date.now(),
++      ...(current.closes ? { closes: true } : {}),
+     });
++    // Closing is chosen per item: the item's other drafts follow.
++    setItemCommentsClose(sessionId, current.label, current.closes);
+     return true;
+   }, [sessionId]);
+ 
+@@ -278,7 +291,18 @@ export function useItemCommentMode({
+             (d) => d.id === next.draftId && !d.submissionId,
+           )
+         : undefined;
+-      const nextTarget = { label: next.label, title: next.title, draftId: draft?.id ?? null };
++      const closes =
++        closableItemLabels(sessionId).has(next.label) &&
++        (next.closes ??
++          getItemCommentState(sessionId).drafts.some(
++            (d) => d.label === next.label && !d.submissionId && d.closes,
++          ));
++      const nextTarget = {
++        label: next.label,
++        title: next.title,
++        draftId: draft?.id ?? null,
++        closes,
++      };
+       setTarget(nextTarget);
+       targetRef.current = nextTarget;
+       io.current.write({
+@@ -438,12 +462,17 @@ export function useItemCommentMode({
+           { prefix: "general", names: general.files.map(attachmentFilename) },
+         ]);
+         const groups = new Map<string, ItemCommentGroup & { comments: ItemCommentBody[] }>();
++        const closable = closableItemLabels(sessionId);
++        const closes = [
++          ...new Set(drafts.filter((d) => d.closes && closable.has(d.label)).map((d) => d.label)),
++        ];
+         let tagsSessions = false;
+         drafts.forEach((draft, at) => {
+           const entry = index?.items.get(draft.label);
++          const title = entry ? itemCommentTitle(entry.source.text, draft.label) : draft.title;
+           const group = groups.get(draft.label) ?? {
+             label: draft.label,
+-            title: entry ? itemCommentTitle(entry.source.text, draft.label) : draft.title,
++            title: itemCommentHeadingTitle(title, closes.includes(draft.label)),
+             comments: [],
+           };
+           const comment = draftComment(draft, io.current.expandMentions);
+@@ -477,6 +506,7 @@ export function useItemCommentMode({
+         const submission: ItemCommentSubmission = {
+           id: newDraftId(),
+           text: message,
++          ...(closes.length > 0 ? { closes } : {}),
+           ...(general.text.trim() !== ""
+             ? {
+                 general: {
+@@ -550,6 +580,9 @@ export function useItemCommentMode({
+         } else if (fate === "posted") {
+           generalFilesBySubmission.delete(submission.id);
+           completeItemCommentSubmission(sessionId, submission.id);
++          // Stored items it comments on become answered, or closed where the
++          // user chose to; a failure leaves them open.
++          void recordItemCommentAnswers(sessionId, submission.text, submission.closes);
+         } else if (!owned) {
+           // Orphaned by a page that went away: the transcript has loaded, and
+           // the message isn't in it.
+@@ -596,6 +629,29 @@ export function useItemCommentMode({
+     /** The item being commented on, when the transcript has loaded its definition. */
+     item,
+     excerpt: target ? itemExcerpt(item, target.label) : "",
++    /** Stored items that are not closed, the ones "Comment and close" is offered on. */
++    closableLabels,
++    /** Comment and close, or comment only, for the comment being written. */
++    setTargetCloses: (closes: boolean) => {
++      const current = targetRef.current;
++      if (current === null || current.closes === closes) return;
++      const nextTarget = { ...current, closes };
++      targetRef.current = nextTarget;
++      setTarget(nextTarget);
++    },
++    /** Switches whether an item's unsent drafts close it. */
++    toggleItemClose: (label: string) => {
++      if (sessionId === null) return;
++      const closes =
++        closableLabels.has(label) && !unsentDrafts.some((d) => d.label === label && d.closes);
++      setItemCommentsClose(sessionId, label, closes);
++      const current = targetRef.current;
++      if (current?.label === label) {
++        const nextTarget = { ...current, closes };
++        targetRef.current = nextTarget;
++        setTarget(nextTarget);
++      }
++    },
+     unsentDrafts,
+     sendingElsewhere,
+     startComment,
+diff --git a/web/src/hooks/useStoredOpenItems.ts b/web/src/hooks/useStoredOpenItems.ts
+index a86cd457ac0d8b9926799c9ae5400d972356dea1..a79de7cd7fd9ac752fee1a23f1bfbb93ca4df572 100644
+--- a/web/src/hooks/useStoredOpenItems.ts
++++ b/web/src/hooks/useStoredOpenItems.ts
+@@ -26,6 +26,7 @@ import {
+   type OpenItemUpdate,
+   type StoredOpenItem,
+ } from "@/lib/openItems";
++import { publishStoredOpenItems } from "@/lib/openItemAnswers";
+ import { isSessionStreamOpen, subscribeSessionStreams } from "@/lib/sessionStreamSignals";
+ import { isTempConvId } from "@/lib/tempConversationId";
+ 
+@@ -65,7 +66,12 @@ export function useStoredOpenItems(
+       }
+     });
+   }, [active, sessionId, queryClient]);
+-  return active && query.data ? query.data : null;
++  const items = active && query.data ? query.data : null;
++  // The composer offers "Comment and close" on the stored items still open.
++  useEffect(() => {
++    if (sessionId !== undefined) publishStoredOpenItems(sessionId, items);
++  }, [sessionId, items]);
++  return items;
+ }
+ 
+ /**
+diff --git a/web/src/lib/itemCommentDrafts.ts b/web/src/lib/itemCommentDrafts.ts
+index cb8c75beba844022e351c8847d7507d9063d3caa..152d23972d183bacb1ef14e7bc8f0319cc65a9b6 100644
+--- a/web/src/lib/itemCommentDrafts.ts
++++ b/web/src/lib/itemCommentDrafts.ts
+@@ -42,6 +42,8 @@ export interface ItemCommentDraft {
+   createdAt: number;
+   /** The submission this draft went out in, until that message posts. */
+   submissionId?: string;
++  /** Sending closes the item with its comments ("Comment and close"). */
++  closes?: boolean;
+ }
+ 
+ /** A comment message sent but not yet posted. */
+@@ -58,6 +60,8 @@ export interface ItemCommentSubmission {
+   };
+   /** The page that sent it went away before the post succeeded. */
+   orphaned?: boolean;
++  /** Items the message closes once it posts. */
++  closes?: string[];
+ }
+ 
+ export interface ItemCommentState {
+@@ -71,6 +75,8 @@ export interface ItemCommentRequest {
+   title: string;
+   /** The draft to edit; a new comment when absent. */
+   draftId?: string;
++  /** Start the comment as "Comment and close". */
++  closes?: boolean;
+   nonce: number;
+ }
+ 
+diff --git a/web/src/lib/openItemAnswers.test.ts b/web/src/lib/openItemAnswers.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..26b760a349fd7965db55af6d7987af02174063ac
+--- /dev/null
++++ b/web/src/lib/openItemAnswers.test.ts
+@@ -0,0 +1,230 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++const fetchMock = vi.hoisted(() => vi.fn());
++const serverInfo = vi.hoisted(() => ({ current: { open_items: true } as object | null }));
++const toastMock = vi.hoisted(() => vi.fn());
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
++vi.mock("@/components/ui/toast", () => ({ showToast: toastMock }));
++vi.mock(import("@/lib/capabilities"), async (importOriginal) => ({
++  ...(await importOriginal()),
++  getCachedServerInfo: () => serverInfo.current as never,
++}));
++
++import { act, renderHook } from "@testing-library/react";
++import {
++  getItemCommentState,
++  resetItemCommentDraftsForTests,
++  saveItemCommentDraft,
++} from "@/lib/itemCommentDrafts";
++import { buildItemCommentMessage, parseItemCommentMessage } from "@/lib/itemComments";
++import { storedItem } from "@/test/openItemsFixtures";
++import {
++  answersInCommentMessage,
++  closableItemLabels,
++  itemCommentHeadingTitle,
++  publishStoredOpenItems,
++  recordItemCommentAnswers,
++  resetClosableItemLabelsForTests,
++  setItemCommentsClose,
++  useItemCommentClosingLabels,
++} from "./openItemAnswers";
++
++afterEach(() => {
++  fetchMock.mockReset();
++  toastMock.mockReset();
++  serverInfo.current = { open_items: true };
++  vi.restoreAllMocks();
++  resetItemCommentDraftsForTests();
++  resetClosableItemLabelsForTests();
++  localStorage.clear();
++});
++
++const ok = (body: object) => new Response(JSON.stringify(body));
++const sentBodies = () =>
++  fetchMock.mock.calls.map((call) => {
++    const [url, init] = call as [string, RequestInit];
++    return [url, init.method, JSON.parse(init.body as string)];
++  });
++
++const MESSAGE = buildItemCommentMessage(
++  [
++    {
++      label: "Q2",
++      title: "Soft-deleted rows",
++      comments: [
++        { text: "Drop them.", attachments: [] },
++        { text: "", attachments: ["rows.png"] },
++      ],
++    },
++    { label: "A4", title: "Other letter", comments: [{ text: "Fine.", attachments: [] }] },
++    { label: "R1", title: "Flaky", comments: [{ text: "x".repeat(2100), attachments: [] }] },
++  ],
++  { text: "Thanks!", attachments: [] },
++);
++
++describe("answersInCommentMessage", () => {
++  it("gives one answer per stored-kind item, its comments joined", () => {
++    expect(answersInCommentMessage(MESSAGE)).toEqual([
++      { label: "Q2", text: "Drop them.\n\nAttachments: rows.png" },
++      { label: "R1", text: "x".repeat(2000) },
++    ]);
++    expect(answersInCommentMessage("Just a message about [Q2].")).toEqual([]);
++  });
++});
++
++describe("recordItemCommentAnswers", () => {
++  it("posts the answers where the server stores open items", async () => {
++    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ items: [] })));
++    await recordItemCommentAnswers("conv 1", MESSAGE);
++    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
++    expect(url).toBe("/v1/sessions/conv%201/open-items/answers");
++    expect(init.method).toBe("POST");
++    expect(JSON.parse(init.body as string).answers.map((a: { label: string }) => a.label)).toEqual([
++      "Q2",
++      "R1",
++    ]);
++  });
++
++  it("does nothing on a server without open items", async () => {
++    serverInfo.current = { open_items: false };
++    await recordItemCommentAnswers("conv_1", MESSAGE);
++    serverInfo.current = null;
++    await recordItemCommentAnswers("conv_1", MESSAGE);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it("never throws: a refused or failed call only leaves the items open", async () => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 403 }));
++    await expect(recordItemCommentAnswers("conv_1", MESSAGE)).resolves.toBeUndefined();
++    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
++    await expect(recordItemCommentAnswers("conv_1", MESSAGE)).resolves.toBeUndefined();
++    expect(warn).toHaveBeenCalledTimes(2);
++  });
++});
++
++describe("Comment and close", () => {
++  const CLOSING = buildItemCommentMessage([
++    {
++      label: "Q2",
++      title: itemCommentHeadingTitle("Soft-deleted rows", true),
++      comments: [{ text: "Drop them.", attachments: [] }],
++    },
++    {
++      label: "R1",
++      title: itemCommentHeadingTitle("Flaky", false),
++      comments: [{ text: "Retry once.", attachments: [] }],
++    },
++  ]);
++
++  it("marks the heading of an item the comments close, and reads back as before", () => {
++    expect(CLOSING).toContain("#### [Q2] Soft-deleted rows (closed by me)\n\nDrop them.");
++    expect(CLOSING).toContain("#### [R1] Flaky\n\nRetry once.");
++    expect(parseItemCommentMessage(CLOSING)?.sections.map((s) => [s.label, s.title])).toEqual([
++      ["Q2", "Soft-deleted rows (closed by me)"],
++      ["R1", "Flaky"],
++    ]);
++    expect(answersInCommentMessage(CLOSING)).toEqual([
++      { label: "Q2", text: "Drop them." },
++      { label: "R1", text: "Retry once." },
++    ]);
++  });
++
++  it("records every answer, then closes the chosen items as the user with their comments", async () => {
++    fetchMock.mockResolvedValueOnce(ok({ items: [] }));
++    fetchMock.mockResolvedValueOnce(ok({ items: [{ label: "Q2", item: storedItem("Q2") }] }));
++    await recordItemCommentAnswers("conv_1", CLOSING, ["Q2"]);
++    expect(sentBodies()).toEqual([
++      [
++        "/v1/sessions/conv_1/open-items/answers",
++        "POST",
++        {
++          answers: [
++            { label: "Q2", text: "Drop them." },
++            { label: "R1", text: "Retry once." },
++          ],
++        },
++      ],
++      [
++        "/v1/sessions/conv_1/open-items",
++        "PATCH",
++        { updates: [{ label: "Q2", status: "closed", resolution: "Drop them." }] },
++      ],
++    ]);
++    expect(toastMock).not.toHaveBeenCalled();
++  });
++
++  it("cuts the resolution to the store's limit", async () => {
++    fetchMock.mockResolvedValue(ok({ items: [] }));
++    await recordItemCommentAnswers("conv_1", MESSAGE, ["R1"]);
++    const [, , patch] = sentBodies()[1];
++    expect(patch.updates).toEqual([
++      { label: "R1", status: "closed", resolution: "x".repeat(2000) },
++    ]);
++  });
++
++  it("leaves an item it could not close open, with its answer, and says so", async () => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    fetchMock.mockResolvedValueOnce(ok({ items: [] }));
++    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 500 }));
++    await expect(recordItemCommentAnswers("conv_1", CLOSING, ["Q2"])).resolves.toBeUndefined();
++    expect(sentBodies().map(([url]) => url)).toEqual([
++      "/v1/sessions/conv_1/open-items/answers",
++      "/v1/sessions/conv_1/open-items",
++    ]);
++    expect(toastMock).toHaveBeenCalledWith(
++      "Your comments were sent, but Q2 couldn't be closed; it stays open.",
++    );
++    expect(warn).toHaveBeenCalledTimes(1);
++
++    fetchMock.mockResolvedValueOnce(ok({ items: [] }));
++    fetchMock.mockResolvedValueOnce(
++      ok({ items: [{ label: "Q2", error: { code: "not_found", message: "no item Q2" } }] }),
++    );
++    await recordItemCommentAnswers("conv_1", CLOSING, ["Q2"]);
++    expect(toastMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("never closes on a server without open items", async () => {
++    serverInfo.current = { open_items: false };
++    await recordItemCommentAnswers("conv_1", CLOSING, ["Q2"]);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it("offers closing only on stored items that are not closed", () => {
++    expect(closableItemLabels("conv_1").size).toBe(0);
++    publishStoredOpenItems("conv_1", [
++      storedItem("Q1"),
++      storedItem("Q2", { status: "answered" }),
++      storedItem("Q3", { status: "closed" }),
++    ]);
++    expect([...closableItemLabels("conv_1")]).toEqual(["Q1", "Q2"]);
++    expect(closableItemLabels("conv_2").size).toBe(0);
++    publishStoredOpenItems("conv_1", null);
++    expect(closableItemLabels("conv_1").size).toBe(0);
++  });
++
++  it("sets closing on every unsent draft of the item and lists the closing labels", () => {
++    const draft = (id: string, label: string) => ({
++      id,
++      label,
++      title: "",
++      text: id,
++      files: [],
++      createdAt: 1,
++    });
++    saveItemCommentDraft("conv_1", draft("d1", "Q2"));
++    saveItemCommentDraft("conv_1", draft("d2", "Q2"));
++    saveItemCommentDraft("conv_1", draft("d3", "R1"));
++    const { result } = renderHook(() => useItemCommentClosingLabels("conv_1"));
++    act(() => setItemCommentsClose("conv_1", "Q2", true));
++    expect(getItemCommentState("conv_1").drafts.map((d) => d.closes)).toEqual([
++      true,
++      true,
++      undefined,
++    ]);
++    expect([...result.current]).toEqual(["Q2"]);
++    act(() => setItemCommentsClose("conv_1", "Q2", false));
++    expect(result.current.size).toBe(0);
++  });
++});
+diff --git a/web/src/lib/openItemAnswers.ts b/web/src/lib/openItemAnswers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..be86dab2f598ffb66b3e707c07681e22aee2cac8
+--- /dev/null
++++ b/web/src/lib/openItemAnswers.ts
+@@ -0,0 +1,203 @@
++// Records the user's comments on stored open items as their answers, once the
++// "Comments on N items" message that carries them has posted, so the items
++// show as answered. Best effort: the message already reached the agent, so a
++// failed record only leaves the items open.
++//
++// "Comment and close" marks an item's comments to close it as well: its
++// heading says so to the agent, and after the post the item is closed by the
++// user with the comment as its resolution. Offered only for stored items that
++// are not closed, so never on a server without open items.
++
++import { useMemo, useSyncExternalStore } from "react";
++import { showToast } from "@/components/ui/toast";
++import { getCachedServerInfo } from "@/lib/capabilities";
++import { authenticatedFetch } from "@/lib/identity";
++import {
++  getItemCommentState,
++  saveItemCommentDraft,
++  useItemCommentState,
++} from "@/lib/itemCommentDrafts";
++import { parseItemCommentMessage } from "@/lib/itemComments";
++import {
++  kindOfLabel,
++  updateStoredOpenItems,
++  type OpenItemWriteResult,
++  type StoredOpenItem,
++} from "@/lib/openItems";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
++
++// The store's limits: one answer's (and resolution's) length, items per request.
++const ANSWER_MAX_CHARS = 2000;
++const ITEMS_PER_REQUEST = 20;
++
++/** Ends the heading of an item the user closes with the comment, in the user's voice. */
++export const CLOSED_BY_USER_MARK = "(closed by me)";
++
++export interface OpenItemAnswerInput {
++  label: string;
++  text: string;
++}
++
++/** The heading title of an item's comments, marked when they close it. */
++export function itemCommentHeadingTitle(title: string, closes: boolean): string {
++  return closes ? `${title} ${CLOSED_BY_USER_MARK}`.trim() : title;
++}
++
++/**
++ * The answers a comment message gives: per item section, its comments joined,
++ * for labels the store could hold. Attachment-only comments name their files.
++ */
++export function answersInCommentMessage(text: string): OpenItemAnswerInput[] {
++  const parsed = parseItemCommentMessage(text);
++  if (!parsed) return [];
++  return parsed.sections.flatMap((section) => {
++    if (!kindOfLabel(section.label)) return [];
++    const answer = section.comments
++      .map(
++        (comment) =>
++          comment.text.trim() ||
++          (comment.attachments.length > 0 ? `Attachments: ${comment.attachments.join(", ")}` : ""),
++      )
++      .filter(Boolean)
++      .join("\n\n")
++      .slice(0, ANSWER_MAX_CHARS);
++    return answer ? [{ label: section.label, text: answer }] : [];
++  });
++}
++
++/** `POST /v1/sessions/{id}/open-items/answers`; a label the store lacks is skipped there. */
++export async function recordOpenItemAnswers(
++  sessionId: string,
++  answers: readonly OpenItemAnswerInput[],
++): Promise<void> {
++  /* oxlint-disable no-await-in-loop -- a few small requests, in order */
++  for (let start = 0; start < answers.length; start += ITEMS_PER_REQUEST) {
++    const response = await authenticatedFetch(
++      `/v1/sessions/${encodeURIComponent(sessionId)}/open-items/answers`,
++      {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ answers: answers.slice(start, start + ITEMS_PER_REQUEST) }),
++      },
++    );
++    if (!response.ok) throw await apiErrorFromResponse(response);
++  }
++  /* oxlint-enable no-await-in-loop */
++}
++
++/** Closes `answers`' items as the user, each with its answer as the resolution. */
++async function closeAnsweredItems(
++  sessionId: string,
++  answers: readonly OpenItemAnswerInput[],
++): Promise<string[]> {
++  const refused: string[] = [];
++  /* oxlint-disable no-await-in-loop -- a few small requests, in order */
++  for (let start = 0; start < answers.length; start += ITEMS_PER_REQUEST) {
++    const batch = answers.slice(start, start + ITEMS_PER_REQUEST);
++    try {
++      const results: OpenItemWriteResult[] = await updateStoredOpenItems(
++        sessionId,
++        batch.map(({ label, text }) => ({ label, status: "closed", resolution: text })),
++      );
++      refused.push(...results.flatMap((result) => ("error" in result ? [result.label] : [])));
++    } catch (error) {
++      console.warn("Couldn't close the open items", error);
++      refused.push(...batch.map(({ label }) => label));
++    }
++  }
++  /* oxlint-enable no-await-in-loop */
++  return refused;
++}
++
++/**
++ * After a comment message posted: record its comments on the stored items
++ * they name, where the server stores open items, and close the items in
++ * `closes` with them. Never throws; a close that fails leaves the item open
++ * and says so in a toast.
++ */
++export async function recordItemCommentAnswers(
++  sessionId: string,
++  messageText: string,
++  closes: readonly string[] = [],
++): Promise<void> {
++  if (getCachedServerInfo()?.open_items !== true) return;
++  const answers = answersInCommentMessage(messageText);
++  if (answers.length === 0) return;
++  try {
++    await recordOpenItemAnswers(sessionId, answers);
++  } catch (error) {
++    // The agent has the message; the items just stay open in the panel.
++    console.warn("Couldn't record the comments as answers to the open items", error);
++  }
++  const closing = new Set(Array.isArray(closes) ? closes : []);
++  const toClose = answers.filter(({ label }) => closing.has(label));
++  if (toClose.length === 0) return;
++  const refused = await closeAnsweredItems(sessionId, toClose);
++  if (refused.length > 0) {
++    const open = refused.length === 1 ? "it stays open" : "they stay open";
++    showToast(`Your comments were sent, but ${refused.join(", ")} couldn't be closed; ${open}.`);
++  }
++}
++
++// Stored items that can still be closed, per session, published by the
++// stored-items query so the composer can offer "Comment and close" without it.
++const closableBySession = new Map<string, ReadonlySet<string>>();
++const closableListeners = new Set<() => void>();
++const NONE: ReadonlySet<string> = new Set();
++
++function subscribeClosable(listener: () => void): () => void {
++  closableListeners.add(listener);
++  return () => closableListeners.delete(listener);
++}
++
++/** Records a session's stored items as read; null where the store is unavailable. */
++export function publishStoredOpenItems(
++  sessionId: string,
++  stored: readonly StoredOpenItem[] | null,
++): void {
++  const labels = (stored ?? []).filter((item) => item.status !== "closed").map((i) => i.label);
++  const previous = closableBySession.get(sessionId) ?? NONE;
++  if (previous.size === labels.length && labels.every((label) => previous.has(label))) return;
++  if (labels.length === 0) closableBySession.delete(sessionId);
++  else closableBySession.set(sessionId, new Set(labels));
++  for (const listener of closableListeners) listener();
++}
++
++/** Labels of the session's stored items that are not closed. */
++export function closableItemLabels(sessionId: string | null): ReadonlySet<string> {
++  return (sessionId !== null && closableBySession.get(sessionId)) || NONE;
++}
++
++export function useClosableItemLabels(sessionId: string | null): ReadonlySet<string> {
++  return useSyncExternalStore(
++    subscribeClosable,
++    () => closableItemLabels(sessionId),
++    () => NONE,
++  );
++}
++
++/** Sets whether the item's unsent comments close it. */
++export function setItemCommentsClose(sessionId: string, label: string, closes: boolean): void {
++  for (const draft of getItemCommentState(sessionId).drafts) {
++    if (draft.label !== label || draft.submissionId || Boolean(draft.closes) === closes) continue;
++    const next = { ...draft };
++    if (closes) next.closes = true;
++    else delete next.closes;
++    saveItemCommentDraft(sessionId, next);
++  }
++}
++
++/** Labels whose drafts close them when sent, submitted ones until they post. */
++export function useItemCommentClosingLabels(sessionId: string | null): ReadonlySet<string> {
++  const { drafts } = useItemCommentState(sessionId);
++  return useMemo(
++    () => new Set(drafts.filter((draft) => draft.closes).map((draft) => draft.label)),
++    [drafts],
++  );
++}
++
++/** Forgets every published item, for tests. */
++export function resetClosableItemLabelsForTests(): void {
++  closableBySession.clear();
++  for (const listener of closableListeners) listener();
++}
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 7a1b93954dc2a948eb6045471930471def0e6285..05de00f124e8862ee857c6dd07c23830b117b01d 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -4654,6 +4654,9 @@ function ComposerImpl(
+           drafts={commentMode.unsentDrafts}
+           editingDraftId={commentTarget?.draftId ?? null}
+           composingLabel={composingCommentLabel}
++          composingCloses={commentTarget?.closes ?? false}
++          closableLabels={commentMode.closableLabels}
++          onToggleClose={commentMode.toggleItemClose}
+           withMessage={hasGeneralMessage}
+           sendDisabledReason={commentSendDisabledReason}
+           onSend={() => void sendCommentDrafts()}
+@@ -4883,6 +4886,10 @@ function ComposerImpl(
+                   item={commentMode.item}
+                   excerpt={commentMode.excerpt}
+                   editing={commentTarget.draftId !== null}
++                  closes={commentTarget.closes}
++                  {...(commentMode.closableLabels.has(commentTarget.label)
++                    ? { onClosesChange: commentMode.setTargetCloses }
++                    : {})}
+                   onLeave={commentMode.leaveCommentMode}
+                 />
+               )}
