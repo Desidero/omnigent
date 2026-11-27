@@ -187,7 +187,7 @@ async def test_the_runner_raises_people_read_and_every_write_is_announced(
     assert [item["label"] for item in rest.json()["data"]] == ["R1"]
 
 
-async def test_viewers_read_editors_close_and_answer_and_others_are_refused(
+async def test_viewers_read_editors_close_and_reply_and_others_are_refused(
     client: httpx.AsyncClient, stores: SimpleNamespace, events: list[Any]
 ) -> None:
     session_id = _session(stores)
@@ -196,12 +196,12 @@ async def test_viewers_read_editors_close_and_answer_and_others_are_refused(
     url = f"/v1/sessions/{session_id}/open-items"
     await client.post(url, json=_raise_body(_QUESTION, _QUESTION), headers=_runner(session_id))
     close = {"updates": [{"label": "Q1", "status": "closed", "resolution": "Not needed"}]}
-    answer = {"answers": [{"label": "Q2", "text": "Link them"}]}
+    answer = {"replies": [{"label": "Q2", "text": "Link them"}], "ref": "comment:s1"}
 
     assert (await client.get(url, headers=_user(BOB))).status_code == 200
     assert (await client.patch(url, json=close, headers=_user(BOB))).status_code == 403
     assert (
-        await client.post(f"{url}/answers", json=answer, headers=_user(BOB))
+        await client.post(f"{url}/replies", json=answer, headers=_user(BOB))
     ).status_code == 403
     for refused in (
         await client.get(url, headers=_user(DAVE)),
@@ -212,15 +212,16 @@ async def test_viewers_read_editors_close_and_answer_and_others_are_refused(
     by_carol = await client.patch(url, json=close, headers=_user(CAROL))
     assert by_carol.status_code == 200, by_carol.text
     assert by_carol.json()["items"][0]["item"]["closed_by"] == "user"
-    answered = await client.post(f"{url}/answers", json=answer, headers=_user(CAROL))
+    answered = await client.post(f"{url}/replies", json=answer, headers=_user(CAROL))
     assert answered.status_code == 200, answered.text
+    # A retried comment records it once.
+    answered = await client.post(f"{url}/replies", json=answer, headers=_user(CAROL))
     item = answered.json()["items"][0]["item"]
-    assert (item["status"], item["answers"][0]["text"], item["answers"][0]["by"]) == (
+    assert (item["status"], item["replies"]) == (
         "answered",
-        "Link them",
-        CAROL,
+        [{"author": "user", "text": "Link them", "at": item["replies"][0]["at"], "by": CAROL}],
     )
-    assert [event[1]["labels"] for event in events[-2:]] == [["Q1"], ["Q2"]]
+    assert [event[1]["labels"] for event in events[-3:]] == [["Q1"], ["Q2"], ["Q2"]]
 
 
 async def test_only_the_sessions_own_runner_raises(
@@ -276,10 +277,11 @@ async def test_invalid_input_and_per_item_errors(
         assert bad.status_code == 400 and "invalid_input" in bad.text, bad.text
     assert events == []
     await client.post(url, json=_raise_body(_QUESTION), headers=headers)
-    taken = await client.post(
-        url, json=_raise_body({**_QUESTION, "label": "Q1"}, key="tool:2"), headers=headers
+    # The server allocates labels; an agent cannot pick or adopt one.
+    labelled = await client.post(
+        url, json=_raise_body({**_QUESTION, "label": "Q7"}, key="tool:2"), headers=headers
     )
-    assert taken.json()["items"][0]["error"]["code"] == "label_taken"
+    assert labelled.status_code == 400 and "without a label" in labelled.text
     missing = await client.patch(
         url, json={"updates": [{"label": "T4", "topic": "x"}]}, headers=headers
     )
@@ -371,7 +373,12 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
         "sys_open_items_update",
         {
             "updates": [
-                {"label": "Q1", "status": "closed", "resolution": "Copied as is"},
+                {
+                    "label": "Q1",
+                    "reply": "Copied, since the rows are small.",
+                    "status": "closed",
+                    "resolution": "Copied as is",
+                },
                 {"label": "R9", "status": "open"},
             ]
         },
@@ -399,6 +406,7 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
             "resolution": "Copied as is",
             "kind": "question",
             "detail": "Copy or link?",
+            "latest_replies": [{"from": "agent", "text": "Copied, since the rows are small."}],
             "closed_by": "agent",
         }
     ]

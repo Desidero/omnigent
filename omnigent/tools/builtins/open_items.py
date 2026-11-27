@@ -9,7 +9,7 @@ labels such as ``Q7``.
     Raise items and get their labels.
 
 ``sys_open_items_update``
-    Close, reopen, retitle, retopic or relink items.
+    Reply to, close, reopen, retitle, retopic or relink items.
 
 ``sys_open_items_list``
     List the session's items, open and answered by default.
@@ -71,12 +71,11 @@ class SysOpenItemsRaiseTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Record items that need the user's decision or attention later in this session's "
-            "open items list, which the user sees beside the chat: a question, risk, finding "
-            "or follow-up, or a link worth keeping. Returns each item's label (e.g. Q7); write "
-            "that label in chat when you present the item. Pass label to adopt a label you "
-            "already wrote in chat without the tool. Reuse a topic for items about the same "
-            "piece of work."
+            "Create items that need the user's decision or attention later: a question, risk, "
+            "finding or follow-up, or a link worth keeping. This is the only way to create an "
+            "item; each one appears at once in the open items list the user sees beside the "
+            "chat. Returns each item's label (e.g. Q7), the only label you may write for it. "
+            "Reuse a topic for items about the same piece of work."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -97,7 +96,6 @@ class SysOpenItemsRaiseTool(Tool):
                     "type": "string",
                     "description": "The sub-agent this item speaks for, if not you.",
                 },
-                "label": {"type": "string", "description": "A label already used in chat."},
             },
             "required": ["kind"],
             "additionalProperties": False,
@@ -129,10 +127,12 @@ class SysOpenItemsUpdateTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Change this session's open items by label. Close an item with status closed and a "
-            "one-line resolution as soon as it is resolved, decided, rejected, done or no "
-            "longer relevant; reopen it with status open. Also edits title, detail, topic and "
-            "links. Each label gets its new state or its own error."
+            "Change this session's open items by label. reply adds your answer to the item's "
+            "thread, which the user reads on the item; it does not close it. Close an item with "
+            "status closed and a one-line resolution once it is resolved, decided, rejected, "
+            "done or no longer relevant, with or without a reply; reopen it with status open. "
+            "Also edits title, detail, topic and links. Each label gets its new state or its "
+            "own error."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -142,6 +142,10 @@ class SysOpenItemsUpdateTool(Tool):
             "properties": {
                 "label": {"type": "string", "description": "e.g. Q7"},
                 "status": {"type": "string", "enum": ["open", "closed"]},
+                "reply": {
+                    "type": "string",
+                    "description": "Your reply on the item's thread, Markdown.",
+                },
                 "resolution": {
                     "type": "string",
                     "description": "How it ended, one line; required to close.",
@@ -182,10 +186,10 @@ class SysOpenItemsListTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "List this session's open items in label order: open and answered ones unless "
-            "status says otherwise, with a detail preview, the user's latest answer and how "
-            "closed items ended. Use it instead of relying on memory before referring to, "
-            "closing or raising items."
+            "List this session's open items in label order: open and answered ones (the user "
+            "replied) unless status says otherwise, with a detail preview, the latest replies "
+            "and how closed items ended. Use it instead of relying on memory before referring "
+            "to, closing or raising items."
         )
 
     def get_schema(self) -> dict[str, Any]:

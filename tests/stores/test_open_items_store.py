@@ -12,6 +12,7 @@ from collections.abc import Sequence
 import pytest
 
 from omnigent.entities.open_items import (
+    OpenItem,
     OpenItemError,
     OpenItemFilter,
     normalize_change,
@@ -138,7 +139,7 @@ def test_pinning_a_link_twice_returns_one_item(
     assert pinned[0].item.content["title"] == "github.com/a/b/…"  # type: ignore[union-attr]
 
 
-def test_a_label_from_chat_is_adopted_once_and_counting_moves_past_it(
+def test_an_imported_label_is_taken_once_and_counting_moves_past_it(
     store: OpenItemsStore, conversations: SqlAlchemyConversationStore
 ) -> None:
     session = _session(conversations)
@@ -189,8 +190,8 @@ def test_close_needs_a_resolution_and_reopen_clears_it(
             normalize_change({"label": "Q1", "status": "closed", "resolution": "Kept as is"}),
             normalize_change({"label": "Q9", "topic": "x"}),
         ],
-        closed_by="agent",
-        closed_ref="tool:c1",
+        actor="agent",
+        ref="tool:c1",
     )
     assert closed.item is not None and closed.item.status == "closed"
     assert closed.item.closed_at is not None
@@ -202,7 +203,7 @@ def test_close_needs_a_resolution_and_reopen_clears_it(
     assert missing.error is not None and missing.error.code == "not_found"
     assert store.open_count(session) == 1
     (reopened,) = store.change_items(
-        session, [normalize_change({"label": "Q1", "status": "open"})], closed_by="user"
+        session, [normalize_change({"label": "Q1", "status": "open"})], actor="user"
     )
     assert reopened.item is not None
     assert (reopened.item.status, reopened.item.closed_at, reopened.item.outcome) == (
@@ -230,7 +231,7 @@ def test_edits_change_content_topic_and_links(
                 }
             )
         ],
-        closed_by="agent",
+        actor="agent",
     )
     assert changed.item is not None
     assert changed.item.content == {
@@ -248,24 +249,81 @@ def test_edits_change_content_topic_and_links(
     (too_big,) = store.change_items(
         session,
         [normalize_change({"label": "Q1", "detail": detail, "add_links": links})],
-        closed_by="agent",
+        actor="agent",
     )
     assert too_big.error is not None and too_big.error.code == "too_large"
     assert store.list_items(session)[0].content["title"] == "Cache everything?"
 
 
-def test_answers_mark_open_items_answered_and_keep_the_latest_five(
+def _reply(
+    store: OpenItemsStore, session: str, actor: str, *, ref: str | None = None, **change: object
+) -> OpenItem:
+    (result,) = store.change_items(
+        session, [normalize_change({"label": "Q1", **change})], actor=actor, ref=ref
+    )
+    assert result.item is not None, result.error
+    return result.item
+
+
+def test_replies_build_one_chain_and_never_close_the_item(
     store: OpenItemsStore, conversations: SqlAlchemyConversationStore
 ) -> None:
     session = _session(conversations)
     _raise(store, session, _question())
-    for index in range(7):
-        (answered,) = store.record_answers(session, [("Q1", f"answer {index}")], user_id="bob")
-    assert answered.item is not None and answered.item.status == "answered"
-    assert [answer["text"] for answer in answered.item.outcome["answers"]] == [
-        f"answer {index}" for index in range(2, 7)
+    (commented,) = store.record_replies(
+        session, [("Q1", "Which region?")], user_id="bob", ref="comment:s1"
+    )
+    assert commented.item is not None and commented.item.status == "answered"
+    # A retried comment adds nothing; the agent's reply hands the item back to the user.
+    store.record_replies(session, [("Q1", "Which region?")], user_id="bob", ref="comment:s1")
+    replied = _reply(store, session, "agent", ref="tool:c1", reply="eu-west-1, as before.")
+    assert replied.status == "open"
+    assert _reply(store, session, "agent", ref="tool:c1", reply="again").status == "open"
+    closed = _reply(
+        store,
+        session,
+        "agent",
+        ref="tool:c2",
+        reply="Done.",
+        status="closed",
+        resolution="Kept eu-west-1",
+    )
+    assert closed.status == "closed"
+    assert [
+        {key: value for key, value in reply.items() if key != "at"}
+        for reply in closed.outcome["replies"]
+    ] == [
+        {"author": "user", "text": "Which region?", "by": "bob", "ref": "comment:s1"},
+        {"author": "agent", "text": "eu-west-1, as before.", "ref": "tool:c1"},
+        {"author": "agent", "text": "Done.", "ref": "tool:c2"},
     ]
-    (missing,) = store.record_answers(session, [("R4", "?")], user_id=None)
+    assert closed.outcome["resolution"] == "Kept eu-west-1"
+    # A reply on a closed item keeps it closed, and reopening keeps the chain.
+    assert _reply(store, session, "user", reply="Thanks").status == "closed"
+    reopened = _reply(store, session, "user", status="open")
+    assert len(reopened.outcome["replies"]) == 4
+    with pytest.raises(OpenItemError, match="reply is required"):
+        normalize_change({"label": "Q1", "reply": "  "})
+
+
+def test_replies_keep_the_latest_ten_that_fit(
+    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    session = _session(conversations)
+    _raise(store, session, _question())
+    for index in range(12):
+        (replied,) = store.record_replies(session, [("Q1", f"reply {index}")], user_id="bob")
+    assert replied.item is not None
+    assert [reply["text"] for reply in replied.item.outcome["replies"]] == [
+        f"reply {index}" for index in range(2, 12)
+    ]
+    # Replies that would not fit the stored cap drop the oldest first.
+    noise = random.Random(1)
+    for _ in range(10):
+        text = "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(2000))
+        (replied,) = store.record_replies(session, [("Q1", text)], user_id="bob")
+    assert replied.item is not None and 1 <= len(replied.item.outcome["replies"]) < 10
+    (missing,) = store.record_replies(session, [("R4", "?")], user_id=None)
     assert missing.error is not None and missing.error.code == "not_found"
 
 
@@ -300,7 +358,7 @@ def test_lists_filter_page_and_count_in_label_order(
     store.change_items(
         session,
         [normalize_change({"label": "Q2", "status": "closed", "resolution": "Renamed it"})],
-        closed_by="agent",
+        actor="agent",
     )
     items = store.list_items(session)
 
@@ -321,3 +379,4 @@ def test_lists_filter_page_and_count_in_label_order(
     assert page.status_counts == {"open": 3, "answered": 0, "closed": 1}
     assert page.kind_counts == {"question": 2, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}
     assert page.topics == ["cache", "release"]
+
