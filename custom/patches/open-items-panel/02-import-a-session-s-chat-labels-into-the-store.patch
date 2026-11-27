@@ -1,0 +1,779 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 15:52:53 +0000
+Subject: [PATCH] feat(open-items): import a session's chat labels into the
+ store
+
+Sessions older than the store, or run by an agent without the open_items
+tools, have their items only as chat labels. The panel lists those as
+"chat only", but nothing stores them, so they miss the stored list's state
+and an agent with the tools can be handed a label the chat already uses.
+
+POST /v1/sessions/{id}/open-items/import (edit access) stores items under
+the labels they carry, as an agent's adoption does, so the session's
+counters move past them; an optional resolution stores an item closed by a
+person. A label already stored gets label_taken, and a retry with the same
+idempotency key returns what the first attempt stored. The panel offers
+"Import N from chat" to editors when the chat has labels the store lacks:
+each with its title and block from the chat, closed with the chat's closing
+sentence or as dismissed, and pinned links with their URL. Labels of other
+letters stay chat only. Nothing is imported unless a person asks.
+
+Not proposed upstream yet: the store it extends is not upstream either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/open-items.md                            | 11 ++-
+ feature-map/open-items.md                     |  2 +
+ omnigent/server/API.md                        | 17 ++++
+ omnigent/server/open_items.py                 | 76 +++++++++++++++
+ openapi.json                                  | 82 ++++++++++++++++
+ tests/server/routes/test_open_items_routes.py | 45 +++++++++
+ .../chat/StoredOpenItemsPanel.test.tsx        | 27 ++++++
+ .../components/chat/StoredOpenItemsPanel.tsx  | 25 ++++-
+ web/src/hooks/useStoredOpenItems.ts           | 26 +++++
+ web/src/lib/openItems.test.ts                 | 90 +++++++++++++++++
+ web/src/lib/openItems.ts                      | 96 ++++++++++++++++++-
+ 11 files changed, 493 insertions(+), 4 deletions(-)
+
+diff --git a/docs/open-items.md b/docs/open-items.md
+index 88b94527f68f3fda674d7724c893cca817d14789..694a493297b02b3d78e3b645a8fec31605342d6d 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -111,6 +111,13 @@ stays current as the agent raises and closes them.
+ - **Chat-only items** keep their dismiss button; dismissals are still stored
+   as the `omnigent.items_dismissed` session label, which is read for chat-only
+   items and never written for stored ones.
++- **Import from chat (edit access):** when the chat has labels the server
++  does not hold, such as a session's items from before the store, the panel
++  offers **Import N from chat**. It stores each under its own label, with the
++  title and block the chat gives it, closed (by you) if the chat closed or you
++  dismissed it, so counting moves past them and an agent never reuses one.
++  Pinned links (`[L1]`) are imported with their URL, and labels of other
++  letters (such as `[A4]`) stay chat only.
+ 
+ On a server without open items the panel reads the chat alone, exactly as
+ [item labels](chat-item-labels.md) describe.
+@@ -123,6 +130,7 @@ On a server without open items the panel reads the chat alone, exactly as
+ | `POST /sessions/{id}/open-items` | the session's runner | Raise items for an agent with the `open_items` group. |
+ | `PATCH /sessions/{id}/open-items` | the session's runner, or a person with edit access | Close, reopen, retitle, retopic or relink items. |
+ | `POST /sessions/{id}/open-items/answers` | edit access | Record replies; an open item becomes answered. |
++| `POST /sessions/{id}/open-items/import` | edit access | Store items written in the chat under their own labels, closed if the chat closed them. |
+ 
+ Each write publishes `session.open_items.changed` on the session's stream with
+ the labels written and the open count. `GET /v1/info` reports `open_items: true`
+@@ -132,7 +140,8 @@ when the server stores them. The request and response shapes are in
+ ## Compatibility
+ 
+ Nothing is backfilled: items a session labelled in chat before stay chat
+-labels until an agent adopts them with `label`. A server or host without this
++labels until an agent adopts them with `label` or you import them from the
++panel. A server or host without this
+ feature keeps working with text labels, and the web reads the chat text as
+ before. The items live in their own tables, apart from the main migration
+ chain (see [side stores](extending/side_schemas.md)): a build without the
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+index 0b07926602e637a5041a56e83e94fe3ca8b82205..9cf108cfa3849f83c132fedefe0e737b42bccbdb 100644
+--- a/feature-map/open-items.md
++++ b/feature-map/open-items.md
+@@ -12,6 +12,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
+ - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
+ - `items-delete`: deleting a session deletes its items; a fork starts with none.
+ - `items-panel`: on a server reporting `open_items`, the header panel, its badge and the chat's chips read the stored list (kept live by the event), with chat-only labels marked as such; without it, they read the chat alone.
++- `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
+ - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; a stored item struck only in the chat is offered for closing.
+ 
+ ## How to get to it (user POV)
+@@ -19,6 +20,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
+ - Chat: ask an agent with the default tool groups something that leaves it open questions; it calls `sys_open_items_raise`, which shows as a tool row, and writes the items with the returned labels.
+ - Chat: answer or settle an item; the agent closes it with `sys_open_items_update` and strikes its label.
+ - API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/answers` with edit access.
++- API: `POST …/open-items/import` with edit access, items with their `label`.
+ - Web: the bookmark button in the session header (badge = open items) opens the panel; select a row to expand it; ✕ closes a stored item.
+ - Agent spec: `tool_groups.open_items: false` turns the tools off for that agent.
+ 
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index 3deb200700b96eb839d1a28d9c6d08e7daa552d4..1d5257dd317a17eca176e35b992fd4c3958e7880 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -1626,6 +1626,23 @@ POST /v1/sessions/{session_id}/open-items/answers
+ Edit access. Records each reply (the latest five are kept); an open item
+ becomes `answered`.
+ 
++```
++POST /v1/sessions/{session_id}/open-items/import
++
++{"items": [{"kind": "question", "title": "Cache rows?", "detail": "...", "label": "Q7"},
++           {"kind": "risk", "title": "Flaky", "label": "R2", "resolution": "Fixed the test"}],
++ "idempotency_key": "import:2b1c9f"}
++
++200 OK — {"items": [{"item": {...}, "duplicate": false} | {"error": {"code", "message"}}]}
++```
++
++Edit access. Stores items written in the chat under their own labels, such as
++the labels of a session older than the store, so the list holds them and the
++session's counters move past them. Items are shaped as for a raise, each with
++its `label`; `resolution` stores an item closed (by a person), for one the
++chat closed. A label already stored gets `label_taken`; a retry with the same
++`idempotency_key` returns the items its first attempt stored.
++
+ Each write publishes `session.open_items.changed` on the session's stream.
+ Deleting a session deletes its items; a fork starts with none.
+ 
+diff --git a/omnigent/server/open_items.py b/omnigent/server/open_items.py
+index c338b4099ef4b1f6a4078cf0d905654fd9490113..9d8a49a6b6ab96336de3d1e7f799824c6d106007 100644
+--- a/omnigent/server/open_items.py
++++ b/omnigent/server/open_items.py
+@@ -18,6 +18,9 @@ Routes, under ``/v1``:
+   runner as above, or from a person with edit access.
+ * ``POST /sessions/{session_id}/open-items/answers`` records a person's replies
+   (edit access); an open item becomes answered.
++* ``POST /sessions/{session_id}/open-items/import`` stores items written in the
++  chat under their own labels (edit access), so chat labels written before the
++  store, or by an agent without the tools, join the list and are never reused.
+ """
+ 
+ from __future__ import annotations
+@@ -42,6 +45,7 @@ from omnigent.entities.open_items import (
+     UPDATE_BATCH_MAX,
+     OpenItemError,
+     OpenItemFilter,
++    format_label,
+     item_to_json,
+     normalize_change,
+     normalize_new_item,
+@@ -121,6 +125,17 @@ class OpenItemsAnswerRequest(BaseModel):
+     answers: list[OpenItemAnswer] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
+ 
+ 
++class OpenItemsImportRequest(BaseModel):
++    """Chat items a person stores under their chat labels.
++
++    Each item is shaped as for a raise and must carry its ``label``; an
++    optional ``resolution`` stores it closed, for an item the chat closed.
++    """
++
++    items: list[dict[str, Any]] = Field(min_length=1, max_length=RAISE_BATCH_MAX)
++    idempotency_key: str = Field(min_length=1, max_length=BATCH_KEY_MAX_CHARS)
++
++
+ def _require_store(conversation_store: ConversationStore) -> OpenItemsStore:
+     store = open_store(conversation_store)
+     if store is None:
+@@ -330,6 +345,67 @@ def create_open_items_router(
+             "topics": sorted({t for item in everything if (t := item.content.get("topic"))}),
+         }
+ 
++    @router.post("/sessions/{session_id}/open-items/import")
++    async def import_open_items(
++        request: Request, session_id: str, body: OpenItemsImportRequest
++    ) -> dict[str, Any]:
++        """Store chat items under their own labels; needs edit access."""
++        session = await _session(request, session_id, LEVEL_EDIT)
++        store = _require_store(conversation_store)
++        user_id = get_user_id(request, auth_provider)
++        with _item_errors():
++            items, closes = [], []
++            for raw in body.items:
++                fields = dict(raw)
++                resolution = fields.pop("resolution", None)
++                item = normalize_new_item(fields)
++                if item.number is None:
++                    raise OpenItemError("invalid_input", "an imported item needs its chat label")
++                label = format_label(item.kind, item.number)
++                items.append(item)
++                closes.append(
++                    None
++                    if resolution is None
++                    else normalize_change(
++                        {"label": label, "status": "closed", "resolution": resolution}
++                    )
++                )
++            owner = await asyncio.to_thread(_owner, session, user_id)
++            raised = await asyncio.to_thread(
++                lambda: store.raise_items(
++                    session.id,
++                    items,
++                    idempotency_key=body.idempotency_key,
++                    root_conversation_id=session.root_conversation_id or session.id,
++                    user_id=owner,
++                )
++            )
++            # Close what the chat closed, unless a retry finds it already settled.
++            to_close = [
++                change
++                for change, result in zip(closes, raised, strict=True)
++                if change is not None
++                and result.item is not None
++                and result.item.status != "closed"
++            ]
++            closed = (
++                await asyncio.to_thread(
++                    lambda: store.change_items(session.id, to_close, closed_by="user")
++                )
++                if to_close
++                else []
++            )
++        after_close = {result.label: result.item for result in closed if result.item is not None}
++        rows: list[dict[str, Any]] = []
++        for result in raised:
++            if result.item is None:
++                rows.append({"error": _error_json(result.error)})  # type: ignore[arg-type]
++                continue
++            item = after_close.get(result.item.label, result.item)
++            rows.append({"item": item_to_json(item), "duplicate": result.duplicate})
++        await _publish(store, session.id, [row["item"]["label"] for row in rows if "item" in row])
++        return {"items": rows}
++
+     @router.patch("/sessions/{session_id}/open-items")
+     async def update_open_items(
+         request: Request, session_id: str, body: OpenItemsUpdateRequest
+diff --git a/openapi.json b/openapi.json
+index cf39deaa38a64436c6ee4e7fa982d09cb0093373..754fac9975fd5a38a2ea4aab8fa654f88fbf1df1 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -5974,6 +5974,33 @@
+         "title": "OpenItemsAnswerRequest",
+         "type": "object"
+       },
++      "OpenItemsImportRequest": {
++        "description": "Chat items a person stores under their chat labels.\n\nEach item is shaped as for a raise and must carry its `label`; an\noptional `resolution` stores it closed, for an item the chat closed.",
++        "properties": {
++          "idempotency_key": {
++            "maxLength": 120,
++            "minLength": 1,
++            "title": "Idempotency Key",
++            "type": "string"
++          },
++          "items": {
++            "items": {
++              "additionalProperties": true,
++              "type": "object"
++            },
++            "maxItems": 10,
++            "minItems": 1,
++            "title": "Items",
++            "type": "array"
++          }
++        },
++        "required": [
++          "items",
++          "idempotency_key"
++        ],
++        "title": "OpenItemsImportRequest",
++        "type": "object"
++      },
+       "OpenItemsRaiseRequest": {
+         "description": "Items the session's agent raises; see `sys_open_items_raise`.",
+         "properties": {
+@@ -25452,6 +25479,61 @@
+         ]
+       }
+     },
++    "/v1/sessions/{session_id}/open-items/import": {
++      "post": {
++        "description": "Store chat items under their own labels; needs edit access.",
++        "operationId": "import_open_items_v1_sessions__session_id__open_items_import_post",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "session_id",
++            "required": true,
++            "schema": {
++              "title": "Session Id",
++              "type": "string"
++            }
++          }
++        ],
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/OpenItemsImportRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": true,
++                  "title": "Response Import Open Items V1 Sessions  Session Id  Open Items Import Post",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Import Open Items",
++        "tags": [
++          "open_items"
++        ]
++      }
++    },
+     "/v1/sessions/{session_id}/owner": {
+       "get": {
+         "description": "Return the owner of a session.\n\nRequires read-level access.\n\n**Returns:** `{\"owner\": \"<user_id>\"}` or `{\"owner\": null}`.",
+diff --git a/tests/server/routes/test_open_items_routes.py b/tests/server/routes/test_open_items_routes.py
+index 8f9c148b9ba5f294d634b51240a911b06b4050b2..0fe7c857a36751abdd494e38ddea14fa5fb35946 100644
+--- a/tests/server/routes/test_open_items_routes.py
++++ b/tests/server/routes/test_open_items_routes.py
+@@ -408,3 +408,48 @@ async def test_the_agents_tools_raise_update_and_list_through_the_runner(
+     )
+     refused = await run("sys_open_items_raise", {"items": [{"kind": "question"}]})
+     assert refused == {"error": "invalid_input: title is required"}
++
++
++async def test_editors_import_chat_labels_and_counting_moves_past_them(
++    client: httpx.AsyncClient, stores: SimpleNamespace, events: list[Any]
++) -> None:
++    session_id = _session(stores)
++    stores.permissions.grant(BOB, session_id, LEVEL_READ)
++    stores.permissions.grant(CAROL, session_id, LEVEL_EDIT)
++    url = f"/v1/sessions/{session_id}/open-items"
++    body = _raise_body(
++        {**_QUESTION, "label": "Q7"},
++        {"kind": "risk", "title": "Flaky", "label": "R2", "resolution": "Fixed the test"},
++        {"kind": "link", "url": "https://example.com/checklist", "label": "L1"},
++        key="import:1",
++    )
++    assert (await client.post(f"{url}/import", json=body, headers=_user(BOB))).status_code == 403
++    imported = await client.post(f"{url}/import", json=body, headers=_user(CAROL))
++    assert imported.status_code == 200, imported.text
++    rows = [row["item"] for row in imported.json()["items"]]
++    assert [(row["label"], row["status"], row["closed_by"]) for row in rows] == [
++        ("Q7", "open", None),
++        ("R2", "closed", "user"),
++        ("L1", "open", None),
++    ]
++    assert rows[1]["resolution"] == "Fixed the test"
++    assert events[-1][1]["labels"] == ["Q7", "R2", "L1"]
++    # A retry stores nothing new; the agent's next question counts on from the import.
++    again = await client.post(f"{url}/import", json=body, headers=_user(CAROL))
++    assert [row["item"]["label"] for row in again.json()["items"]] == ["Q7", "R2", "L1"]
++    raised = await client.post(url, json=_raise_body(_QUESTION), headers=_runner(session_id))
++    assert raised.json()["items"][0]["item"]["label"] == "Q8"
++
++    # A label in use is refused for that item alone; an item without a label is invalid.
++    taken = await client.post(
++        f"{url}/import",
++        json=_raise_body({**_QUESTION, "label": "Q8"}, {**_QUESTION, "label": "Q3"}, key="i:2"),
++        headers=_user(CAROL),
++    )
++    assert taken.json()["items"][0]["error"]["code"] == "label_taken"
++    assert taken.json()["items"][1]["item"]["label"] == "Q3"
++    for items in ([_QUESTION], [{**_QUESTION, "label": "Q4", "resolution": ""}]):
++        bad = await client.post(
++            f"{url}/import", json=_raise_body(*items, key="i:3"), headers=_user(CAROL)
++        )
++        assert bad.status_code == 400 and "invalid_input" in bad.text, bad.text
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.test.tsx b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+index 0bc211edfa5e6313c7b1da27dd7df652c7811d95..4e122253fda8dccc1b99f17a635038392db686c6 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.test.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
+@@ -224,6 +224,32 @@ describe("the Open items panel on a server that stores them", () => {
+     });
+   });
+ 
++  it("imports the chat's own labels into the store", async () => {
++    renderPanel([ITEMS, "- [R1] **Flaky.**", "~~[R1]~~ fixed."], [storedItem("Q2")]);
++    const panel = openPanel();
++    fetchMock.mockResolvedValueOnce(
++      new Response(
++        JSON.stringify({
++          items: [
++            { item: storedItem("Q1", { title: "Backfill window." }) },
++            { item: storedItem("R1", { status: "closed", title: "Flaky." }) },
++          ],
++        }),
++      ),
++    );
++    fireEvent.click(within(panel).getByRole("button", { name: "Import 2 from chat" }));
++    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
++    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
++    expect(url).toBe("/v1/sessions/conv_1/open-items/import");
++    expect(
++      JSON.parse(init.body as string).items.map((item: { label: string }) => item.label),
++    ).toEqual(["Q1", "R1"]);
++    await waitFor(() =>
++      expect(within(panel).queryByRole("button", { name: /from chat$/ })).toBeNull(),
++    );
++    expect(within(panel).queryByText("chat only")).toBeNull();
++  });
++
+   it("offers no changes to a viewer without edit access", () => {
+     access.canEdit = false;
+     renderPanel([ITEMS, "More on [Q2]."], [storedItem("Q1"), storedItem("Q2")]);
+@@ -232,6 +258,7 @@ describe("the Open items panel on a server that stores them", () => {
+     fireEvent.click(within(panel).getByRole("button", { name: "Item Q2" }));
+     expect(within(panel).queryByRole("button", { name: "Close" })).toBeNull();
+     expect(within(panel).queryByRole("button", { name: "Set topic" })).toBeNull();
++    expect(within(panel).queryByRole("button", { name: /from chat$/ })).toBeNull();
+   });
+ 
+   it("keeps the chat's tracker, unchanged, where the server stores no items", () => {
+diff --git a/web/src/components/chat/StoredOpenItemsPanel.tsx b/web/src/components/chat/StoredOpenItemsPanel.tsx
+index 5afef3dff0f112d39b4fe0a9c5eeb5ccd9b485c6..50e865e7ee96203890c3a284f336e2e0ef42bdaf 100644
+--- a/web/src/components/chat/StoredOpenItemsPanel.tsx
++++ b/web/src/components/chat/StoredOpenItemsPanel.tsx
+@@ -8,7 +8,11 @@ import {
+ import { OpenItemsPanel, useDismissedItems } from "@/components/chat/OpenItemsPanel";
+ import { Button } from "@/components/ui/button";
+ import { useCanEdit } from "@/hooks/usePermissions";
+-import { useStoredOpenItems, useUpdateStoredOpenItems } from "@/hooks/useStoredOpenItems";
++import {
++  useImportChatItems,
++  useStoredOpenItems,
++  useUpdateStoredOpenItems,
++} from "@/hooks/useStoredOpenItems";
+ import {
+   ItemLabelIndexContext,
+   ItemLabelMessageContext,
+@@ -16,6 +20,7 @@ import {
+ } from "@/lib/itemLabels";
+ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+ import {
++  chatItemsToImport,
+   chatResolution,
+   countOpenRows,
+   openItemRows,
+@@ -381,12 +386,17 @@ export function StoredOpenItemsPanel({
+   const { dismissed, dismiss, restore } = useDismissedItems(sessionId);
+   const canEdit = useCanEdit(sessionId ?? "");
+   const update = useUpdateStoredOpenItems(sessionId);
++  const importItems = useImportChatItems(sessionId);
+   const [expanded, setExpanded] = useState<string | null>(null);
+   const rows = useMemo(() => openItemRows(index, stored, dismissed), [index, stored, dismissed]);
+   const topics = useMemo(
+     () => [...new Set(stored.flatMap((item) => (item.topic ? [item.topic] : [])))].sort(),
+     [stored],
+   );
++  const imports = useMemo(
++    () => (canEdit ? chatItemsToImport(index, stored, dismissed) : []),
++    [canEdit, index, stored, dismissed],
++  );
+   if (rows.length === 0) return null;
+ 
+   const change = (patch: OpenItemUpdate) => update.mutate([patch]);
+@@ -446,6 +456,19 @@ export function StoredOpenItemsPanel({
+         <MessageSquareDotIcon className="size-4 shrink-0 text-muted-foreground" />
+         <span>Open items</span>
+         <span className="opacity-70">({countOpenRows(rows)})</span>
++        {imports.length > 0 && (
++          <Button
++            type="button"
++            size="sm"
++            variant="ghost"
++            className="ml-auto h-6 px-2 text-xs font-normal"
++            title="Store the chat's own labels with the session's items"
++            disabled={importItems.isPending}
++            onClick={() => importItems.mutate(imports)}
++          >
++            {importItems.isPending ? "Importing…" : `Import ${imports.length} from chat`}
++          </Button>
++        )}
+       </div>
+       <ul className="max-h-[min(24rem,50vh)] overflow-y-auto border-t border-border py-1">
+         {recent.length > 0 && <li className={GROUP_HEADING_CLASS}>In the latest reply</li>}
+diff --git a/web/src/hooks/useStoredOpenItems.ts b/web/src/hooks/useStoredOpenItems.ts
+index 059481a76d915deffffe783af1f303c71683eb5f..a86cd457ac0d8b9926799c9ae5400d972356dea1 100644
+--- a/web/src/hooks/useStoredOpenItems.ts
++++ b/web/src/hooks/useStoredOpenItems.ts
+@@ -16,11 +16,13 @@ import {
+ import {
+   countOpenRows,
+   fetchStoredOpenItems,
++  importChatItems,
+   openItemRows,
+   openItemsKey,
+   refreshStoredOpenItems,
+   updateStoredOpenItems,
+   withWrittenItems,
++  type ChatItemImport,
+   type OpenItemUpdate,
+   type StoredOpenItem,
+ } from "@/lib/openItems";
+@@ -91,6 +93,30 @@ export function useUpdateStoredOpenItems(sessionId: string | null) {
+   });
+ }
+ 
++/** Store the chat's own labels under their labels; says how it went in a toast. */
++export function useImportChatItems(sessionId: string | null) {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (items: ChatItemImport[]) => {
++      if (!sessionId) throw new Error("No session selected");
++      return importChatItems(sessionId, items);
++    },
++    onSuccess: (results) => {
++      if (!sessionId) return;
++      queryClient.setQueryData<StoredOpenItem[]>(openItemsKey(sessionId), (items) =>
++        withWrittenItems(items, results),
++      );
++      const imported = results.filter((result) => "item" in result).length;
++      const refused = results.length - imported;
++      showToast(
++        `Imported ${imported} item${imported === 1 ? "" : "s"} from the chat` +
++          (refused > 0 ? `; ${refused} already stored or refused` : ""),
++      );
++    },
++    onError: (error) => showToast(`Couldn't import the chat's items: ${error.message}`),
++  });
++}
++
+ /**
+  * The header button's badge: open items that wait on the user. With stored
+  * items, stored ones count by their stored status and the chat's own labels
+diff --git a/web/src/lib/openItems.test.ts b/web/src/lib/openItems.test.ts
+index 5dcae48e9800d84d2fa6bd9f4cf653c1071e155c..db81c2ec5e8b6d66ee6b00cf8d37fdc2ccba4884 100644
+--- a/web/src/lib/openItems.test.ts
++++ b/web/src/lib/openItems.test.ts
+@@ -10,10 +10,13 @@ import {
+   type ItemLabelSource,
+ } from "@/lib/itemLabels";
+ import {
++  DISMISSED_RESOLUTION,
++  chatItemsToImport,
+   chatResolution,
+   compareItemLabels,
+   countOpenRows,
+   fetchStoredOpenItems,
++  importChatItems,
+   mergeStoredOpenItems,
+   openItemRows,
+   storedItemOf,
+@@ -172,3 +175,90 @@ describe("fetchStoredOpenItems", () => {
+     await expect(fetchStoredOpenItems("conv_1")).rejects.toThrow("Open items are not available");
+   });
+ });
++
++describe("chatItemsToImport", () => {
++  it("takes the chat's labels the store lacks, closed as the chat left them", () => {
++    const chat = index([
++      ITEMS,
++      "- [R1] **Flaky test.**\n- [A4] **Other letter.**\n- [Q9] **Third.**",
++      "[L1] **Checklist** https://example.com/checklist\n\n[L2] **No link here.**",
++      "~~[R1]~~ Fixed the test. Done.",
++    ]);
++    const imports = chatItemsToImport(chat, [storedItem("Q2")], new Set(["Q9"]));
++    expect(imports).toEqual([
++      {
++        kind: "question",
++        label: "Q1",
++        title: "Backfill window.",
++        detail: "[Q1] **Backfill window.** Batch it?",
++      },
++      {
++        kind: "risk",
++        label: "R1",
++        title: "Flaky test.",
++        detail: "[R1] **Flaky test.**",
++        resolution: "[R1] Fixed the test.",
++      },
++      {
++        kind: "question",
++        label: "Q9",
++        title: "Third.",
++        detail: "[Q9] **Third.**",
++        resolution: DISMISSED_RESOLUTION,
++      },
++      {
++        kind: "link",
++        label: "L1",
++        title: "Checklist",
++        detail: expect.stringContaining("https://example.com/checklist"),
++        url: "https://example.com/checklist",
++      },
++    ]);
++    expect(chatItemsToImport(index(["[Q1] once"]), [], new Set())).toEqual([]);
++  });
++});
++
++describe("importChatItems", () => {
++  it("posts ten items per request and reports each label", async () => {
++    const items = Array.from({ length: 12 }, (_, position) => ({
++      kind: "question" as const,
++      label: `Q${position + 1}`,
++      title: `Item ${position + 1}`,
++      detail: "",
++    }));
++    fetchMock
++      .mockResolvedValueOnce(
++        new Response(
++          JSON.stringify({
++            items: items
++              .slice(0, 10)
++              .map((item, position) =>
++                position === 0
++                  ? { error: { code: "label_taken", message: "Q1 is already an item" } }
++                  : { item: storedItem(item.label) },
++              ),
++          }),
++        ),
++      )
++      .mockResolvedValueOnce(
++        new Response(
++          JSON.stringify({
++            items: items.slice(10).map((item) => ({ item: storedItem(item.label) })),
++          }),
++        ),
++      );
++    const results = await importChatItems("conv_1", items);
++    expect(results).toHaveLength(12);
++    expect(results[0]).toEqual({
++      label: "Q1",
++      error: { code: "label_taken", message: "Q1 is already an item" },
++    });
++    const bodies = fetchMock.mock.calls.map(([url, init]) => {
++      expect(url).toBe("/v1/sessions/conv_1/open-items/import");
++      return JSON.parse((init as RequestInit).body as string);
++    });
++    expect(bodies.map((body) => body.items.length)).toEqual([10, 2]);
++    expect(bodies[0].idempotency_key).toMatch(/^import:.+:0$/);
++    expect(bodies[1].idempotency_key).toMatch(/^import:.+:10$/);
++  });
++});
+diff --git a/web/src/lib/openItems.ts b/web/src/lib/openItems.ts
+index 68eba8bc8d3b82bb8dd2e561d96bf787f51ca60f..823bd8745eec9177db44b92e5a647da73477bbed 100644
+--- a/web/src/lib/openItems.ts
++++ b/web/src/lib/openItems.ts
+@@ -15,7 +15,7 @@ import {
+   type ItemLabelSource,
+ } from "@/lib/itemLabels";
+ import { apiErrorFromResponse } from "@/lib/sessionsApi";
+-import { isLinkItemLabel } from "@/lib/sessionLinks";
++import { isLinkItemLabel, linksInMarkdown } from "@/lib/sessionLinks";
+ 
+ export type OpenItemKind = "question" | "risk" | "finding" | "follow_up" | "link";
+ export type OpenItemStatus = "open" | "answered" | "closed";
+@@ -84,8 +84,12 @@ export type OpenItemWriteResult =
+ 
+ // The store caps a session at 500 items; pages of 200 read them all in three requests.
+ const PAGE_LIMIT = "200";
+-// The store's limit on a resolution.
++// The store's limits on what an item carries.
++const TITLE_MAX_CHARS = 160;
++const DETAIL_MAX_CHARS = 6000;
+ const RESOLUTION_MAX_CHARS = 2000;
++// Items per import request, as per raise.
++const IMPORT_BATCH = 10;
+ const MAX_PAGES = 5;
+ 
+ export function openItemsKey(sessionId: string | undefined) {
+@@ -134,6 +138,48 @@ export async function updateStoredOpenItems(
+   return ((await response.json()) as { items: OpenItemWriteResult[] }).items;
+ }
+ 
++/** A chat item to store under its chat label; see `POST …/open-items/import`. */
++export interface ChatItemImport {
++  kind: OpenItemKind;
++  label: string;
++  title: string;
++  detail: string;
++  url?: string;
++  /** Stores it closed, for an item the chat closed or the user dismissed. */
++  resolution?: string;
++}
++
++/**
++ * Store chat items under their own labels (edit access), ten per request.
++ * Labels already stored come back with `label_taken` and are left as they are.
++ */
++export async function importChatItems(
++  sessionId: string,
++  items: readonly ChatItemImport[],
++): Promise<OpenItemWriteResult[]> {
++  const batchKey = `import:${crypto.randomUUID()}`;
++  const results: OpenItemWriteResult[] = [];
++  /* oxlint-disable no-await-in-loop -- later batches move the counters past earlier ones */
++  for (let start = 0; start < items.length; start += IMPORT_BATCH) {
++    const batch = items.slice(start, start + IMPORT_BATCH);
++    const response = await authenticatedFetch(openItemsUrl(sessionId, "/import"), {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ items: batch, idempotency_key: `${batchKey}:${start}` }),
++    });
++    if (!response.ok) throw await apiErrorFromResponse(response);
++    const body = (await response.json()) as {
++      items: ({ item: StoredOpenItem } | { error: { code: string; message: string } })[];
++    };
++    body.items.forEach((row, position) => {
++      const label = batch[position].label;
++      results.push("item" in row ? { label, item: row.item } : { label, error: row.error });
++    });
++  }
++  /* oxlint-enable no-await-in-loop */
++  return results;
++}
++
+ /** The cached list with the items a write returned put in place. */
+ export function withWrittenItems(
+   items: readonly StoredOpenItem[] | undefined,
+@@ -307,6 +353,52 @@ export function countOpenRows(rows: readonly OpenItemRow[]): number {
+   return rows.filter((row) => row.status === "open" && !row.dismissed).length;
+ }
+ 
++/** What an import records for a chat item the user dismissed. */
++export const DISMISSED_RESOLUTION = "Dismissed from the Open items panel";
++
++/**
++ * The chat's labels the store does not hold, as an import would store them:
++ * items of the store's letters, and pinned links whose block has a URL.
++ * Closed items keep the sentence that closed them; dismissed ones are closed.
++ */
++export function chatItemsToImport(
++  index: ItemLabelIndex | null,
++  stored: readonly StoredOpenItem[],
++  dismissed: ReadonlySet<string>,
++): ChatItemImport[] {
++  if (!index?.enabled) return [];
++  const storedLabels = new Set(stored.map((item) => item.label));
++  const imports: ChatItemImport[] = [];
++  for (const entry of index.items.values()) {
++    const kind = kindOfLabel(entry.label);
++    if (!kind || storedLabels.has(entry.label)) continue;
++    const block = extractItemBlock(entry.source.text, entry.label) ?? "";
++    const item: ChatItemImport = {
++      kind,
++      label: entry.label,
++      title: (itemLabelTitle(entry.source.text, entry.label) || entry.label).slice(
++        0,
++        TITLE_MAX_CHARS,
++      ),
++      detail: block.slice(0, DETAIL_MAX_CHARS),
++    };
++    if (kind === "link") {
++      const url = linksInMarkdown(block)[0]?.url.href;
++      if (!url) continue;
++      item.url = url;
++    }
++    if (entry.closedBy) {
++      const sentence = extractLabelSentence(entry.closedBy.text, entry.label);
++      item.resolution =
++        sentence?.replace(/~~/g, "").trim().slice(0, RESOLUTION_MAX_CHARS) || "Closed in the chat";
++    } else if (dismissed.has(entry.label)) {
++      item.resolution = DISMISSED_RESOLUTION;
++    }
++    imports.push(item);
++  }
++  return imports;
++}
++
+ /** The sentence that closed an item in chat, as a resolution for the store. */
+ export function chatResolution(row: OpenItemRow): string | null {
+   const closing = row.entry?.closedInChat ?? (row.stored ? null : row.entry?.closedBy);
