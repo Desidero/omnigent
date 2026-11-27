@@ -15,7 +15,7 @@
 import type React from "react";
 import { useInRouterContext } from "react-router-dom";
 import { Link, useSearchParams } from "@/lib/routing";
-import { useContext, useMemo } from "react";
+import { useContext, useMemo, useState } from "react";
 import {
   BotIcon,
   CopyIcon,
@@ -97,6 +97,15 @@ import {
 } from "@/lib/linkRules";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { keyedAttachments } from "@/lib/blocks";
+import { StoredItemThread } from "@/components/chat/StoredItemThread";
+import { getCachedServerInfo } from "@/lib/capabilities";
+import {
+  chatItemImport,
+  importChatItems,
+  refreshStoredOpenItems,
+  storedItemOf,
+} from "@/lib/openItems";
+import { useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { parseMentionPillTitle } from "@/lib/mentionPills";
 import {
@@ -774,12 +783,60 @@ export function ItemLabelDefinition({ item }: { item: ItemLabelEntry }) {
   );
 }
 
+const threadMarkdown = (text: string) => (
+  <FilePathAwareMessageResponse>{text}</FilePathAwareMessageResponse>
+);
+
 /**
- * The block that defined an item, the comments sent on it (with the agent's
- * reply to each), this browser's unsent drafts, and how it was closed.
+ * Stores a label written only in chat, under its own label, when a person
+ * asks; nothing is recorded from the chat on its own.
+ */
+function RecordChatItem({ item, sessionId }: { item: ItemLabelEntry; sessionId: string }) {
+  const queryClient = useQueryClient();
+  const [recording, setRecording] = useState(false);
+  const record = async () => {
+    const entry = chatItemImport(item, new Set());
+    if (!entry) return;
+    setRecording(true);
+    try {
+      const [result] = await importChatItems(sessionId, [entry]);
+      showToast(
+        result && "item" in result
+          ? `Recorded ${item.label} as an open item`
+          : `${item.label} couldn't be recorded: ${result?.error.message ?? "refused"}`,
+      );
+      refreshStoredOpenItems(queryClient, sessionId);
+    } catch (error) {
+      showToast(`${item.label} couldn't be recorded: ${(error as Error).message}`);
+    } finally {
+      setRecording(false);
+    }
+  };
+  return (
+    <div className="flex items-center justify-between gap-3 border-t border-border pt-2 text-xs text-muted-foreground">
+      <span>Only in the chat: not an open item yet.</span>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={recording}
+        onClick={() => void record()}
+      >
+        Record
+      </Button>
+    </div>
+  );
+}
+
+/**
+ * The block that defined an item, then its thread: for a stored item the
+ * store's replies and resolution, each once; for a label only in the chat the
+ * comments sent on it (with the agent's reply to each) and how the chat closed
+ * it. Then this browser's unsent drafts.
  */
 function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: () => void }) {
   const { label, source, closedBy, comments } = item;
+  const stored = storedItemOf(item);
   // Only mounted inside a transcript, which always sits under a router.
   const [, setSearchParams] = useSearchParams();
   const sessionId = useContext(ItemLabelSessionContext);
@@ -832,7 +889,12 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
         </button>
       </div>
       <ItemLabelDefinition item={item} />
-      {comments.length > 0 && (
+      {stored && (
+        <section aria-label="Thread" className={POPOVER_SECTION_CLASS}>
+          <StoredItemThread item={stored} messageId={source.messageId} markdown={threadMarkdown} />
+        </section>
+      )}
+      {!stored && comments.length > 0 && (
         <section aria-label="Comments" className={POPOVER_SECTION_CLASS}>
           <div className="text-xs font-medium text-muted-foreground">
             Comments ({comments.length})
@@ -914,7 +976,14 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
           )}
         </section>
       ))}
-      {closedBy && (
+      {!stored &&
+        canComment &&
+        sessionId !== null &&
+        getCachedServerInfo()?.open_items === true &&
+        chatItemImport(item, new Set()) !== null && (
+          <RecordChatItem item={item} sessionId={sessionId} />
+        )}
+      {!stored && closedBy && (
         <div className={cn(POPOVER_SECTION_CLASS, "gap-1")}>
           <div className={POPOVER_META_CLASS}>
             <span>{`Closed · ${describeSource(closedBy)}`}</span>

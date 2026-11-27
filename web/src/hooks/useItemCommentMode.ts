@@ -43,6 +43,13 @@ import {
   type ItemCommentRequest,
   type ItemCommentSubmission,
 } from "@/lib/itemCommentDrafts";
+import {
+  closableItemLabels,
+  itemCommentHeadingTitle,
+  recordItemCommentsBeforeSend,
+  setItemCommentsClose,
+  useClosableItemLabels,
+} from "@/lib/openItemAnswers";
 import { itemLabelTitleParts, type ItemLabelEntry } from "@/lib/itemLabels";
 import type { ComposerSendOptions } from "@/lib/messageQueue";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
@@ -69,6 +76,8 @@ export interface ItemCommentTarget {
   title: string;
   /** The draft being edited; null for a new comment. */
   draftId: string | null;
+  /** Sending closes the item with its comments. */
+  closes: boolean;
 }
 
 interface UseItemCommentModeOptions {
@@ -216,6 +225,7 @@ export function useItemCommentMode({
 
   const state = useItemCommentState(sessionId);
   const labelOrder = useItemLabelOrder(sessionId);
+  const closableLabels = useClosableItemLabels(sessionId);
   const request = useItemCommentRequest(enabled ? sessionId : null);
 
   useEffect(() => {
@@ -256,7 +266,10 @@ export function useItemCommentMode({
         size: file.size,
       })),
       createdAt: existing?.createdAt ?? Date.now(),
+      ...(current.closes ? { closes: true } : {}),
     });
+    // Closing is chosen per item: the item's other drafts follow.
+    setItemCommentsClose(sessionId, current.label, current.closes);
     return true;
   }, [sessionId]);
 
@@ -278,7 +291,18 @@ export function useItemCommentMode({
             (d) => d.id === next.draftId && !d.submissionId,
           )
         : undefined;
-      const nextTarget = { label: next.label, title: next.title, draftId: draft?.id ?? null };
+      const closes =
+        closableItemLabels(sessionId).has(next.label) &&
+        (next.closes ??
+          getItemCommentState(sessionId).drafts.some(
+            (d) => d.label === next.label && !d.submissionId && d.closes,
+          ));
+      const nextTarget = {
+        label: next.label,
+        title: next.title,
+        draftId: draft?.id ?? null,
+        closes,
+      };
       setTarget(nextTarget);
       targetRef.current = nextTarget;
       io.current.write({
@@ -438,12 +462,17 @@ export function useItemCommentMode({
           { prefix: "general", names: general.files.map(attachmentFilename) },
         ]);
         const groups = new Map<string, ItemCommentGroup & { comments: ItemCommentBody[] }>();
+        const closable = closableItemLabels(sessionId);
+        const closes = [
+          ...new Set(drafts.filter((d) => d.closes && closable.has(d.label)).map((d) => d.label)),
+        ];
         let tagsSessions = false;
         drafts.forEach((draft, at) => {
           const entry = index?.items.get(draft.label);
+          const title = entry ? itemCommentTitle(entry.source.text, draft.label) : draft.title;
           const group = groups.get(draft.label) ?? {
             label: draft.label,
-            title: entry ? itemCommentTitle(entry.source.text, draft.label) : draft.title,
+            title: itemCommentHeadingTitle(title, closes.includes(draft.label)),
             comments: [],
           };
           const comment = draftComment(draft, io.current.expandMentions);
@@ -477,6 +506,7 @@ export function useItemCommentMode({
         const submission: ItemCommentSubmission = {
           id: newDraftId(),
           text: message,
+          ...(closes.length > 0 ? { closes } : {}),
           ...(general.text.trim() !== ""
             ? {
                 general: {
@@ -488,6 +518,8 @@ export function useItemCommentMode({
               }
             : {}),
         };
+        // The comments join their items' threads (and closes apply) before the agent's turn.
+        await recordItemCommentsBeforeSend(sessionId, message, closes);
         if (general.files.length > 0) generalFilesBySubmission.set(submission.id, general.files);
         markItemCommentsSubmitted(
           sessionId,
@@ -596,6 +628,29 @@ export function useItemCommentMode({
     /** The item being commented on, when the transcript has loaded its definition. */
     item,
     excerpt: target ? itemExcerpt(item, target.label) : "",
+    /** Stored items that are not closed, the ones "Comment and close" is offered on. */
+    closableLabels,
+    /** Comment and close, or comment only, for the comment being written. */
+    setTargetCloses: (closes: boolean) => {
+      const current = targetRef.current;
+      if (current === null || current.closes === closes) return;
+      const nextTarget = { ...current, closes };
+      targetRef.current = nextTarget;
+      setTarget(nextTarget);
+    },
+    /** Switches whether an item's unsent drafts close it. */
+    toggleItemClose: (label: string) => {
+      if (sessionId === null) return;
+      const closes =
+        closableLabels.has(label) && !unsentDrafts.some((d) => d.label === label && d.closes);
+      setItemCommentsClose(sessionId, label, closes);
+      const current = targetRef.current;
+      if (current?.label === label) {
+        const nextTarget = { ...current, closes };
+        targetRef.current = nextTarget;
+        setTarget(nextTarget);
+      }
+    },
     unsentDrafts,
     sendingElsewhere,
     startComment,
