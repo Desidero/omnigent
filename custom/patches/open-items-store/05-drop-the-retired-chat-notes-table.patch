@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 27 Nov 2026 07:19:18 +0000
+Subject: [PATCH] feat(open-items): drop the retired chat notes table
+
+An earlier build of open items read the agent's chat for labels after
+each turn and kept, per session, how far it had read and a note to give
+the agent (side revision open_items0002, table open_items_chat_notes).
+Items are now created only by the agent's tools, so that table has no
+reader. A database that ran open_items0002 must still find that revision,
+or the side store would refuse to start, so the revision is kept as it
+was and open_items0003 drops the table; its downgrade recreates it. A new
+database creates and drops it on the way to head.
+
+Not proposed upstream yet.
+
+Docs: none (storage only; nothing a caller sees changes)
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ .../open_items0002_chat_notes.py              | 61 +++++++++++++++++
+ .../open_items0003_drop_chat_notes.py         | 66 +++++++++++++++++++
+ tests/stores/test_open_items_store.py         | 56 ++++++++++++++++
+ 3 files changed, 183 insertions(+)
+ create mode 100644 omnigent/stores/open_items_migrations/open_items0002_chat_notes.py
+ create mode 100644 omnigent/stores/open_items_migrations/open_items0003_drop_chat_notes.py
+
+diff --git a/omnigent/stores/open_items_migrations/open_items0002_chat_notes.py b/omnigent/stores/open_items_migrations/open_items0002_chat_notes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..25e7daeb1e1a5ad706d82f67488982f250df0ef7
+--- /dev/null
++++ b/omnigent/stores/open_items_migrations/open_items0002_chat_notes.py
+@@ -0,0 +1,61 @@
++"""add the chat notes table
++
++Revision ID: open_items0002
++Revises: open_items0001
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++from alembic import op
++from sqlalchemy.dialects.mysql import VARBINARY
++
++from omnigent.db.db_models import Uuid16
++from omnigent.db.side_schemas import migration_schema
++
++revision: str = "open_items0002"
++down_revision: str | None = "open_items0001"
++branch_labels: str | None = None
++depends_on: str | None = None
++
++# As in open_items0001: a BLOB, or a VARBINARY of the cap on MySQL.
++_ENVELOPE = sa.LargeBinary().with_variant(VARBINARY(16_383), "mysql")
++_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
++_SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
++    (
++        "scanned_through IS NULL OR length(CAST(scanned_through AS BLOB)) <= 512",
++        "ck_open_items_chat_notes_scanned_through_bytes",
++    ),
++    (
++        "pending IS NULL OR length(CAST(pending AS BLOB)) <= 16383",
++        "ck_open_items_chat_notes_pending_bytes",
++    ),
++    ("typeof(notes_sent) = 'integer'", "ck_open_items_chat_notes_notes_sent_integer"),
++)
++
++
++def _sqlite_checks() -> list[sa.CheckConstraint]:
++    if op.get_bind().dialect.name not in _SQLITE_FAMILY:
++        return []
++    return [sa.CheckConstraint(expr, name=name) for expr, name in _SQLITE_CHECKS]
++
++
++def upgrade() -> None:
++    op.create_table(
++        "open_items_chat_notes",
++        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
++        sa.Column("conversation_id", Uuid16(), nullable=False),
++        sa.Column("scanned_through", sa.String(128), nullable=True),
++        sa.Column("notes_sent", sa.Integer(), nullable=False),
++        sa.Column("pending", _ENVELOPE, nullable=True),
++        sa.Column("updated_at", sa.BigInteger(), nullable=False),
++        sa.PrimaryKeyConstraint(
++            "workspace_id", "conversation_id", name="pk_open_items_chat_notes"
++        ),
++        *_sqlite_checks(),
++        schema=migration_schema(),
++    )
++
++
++def downgrade() -> None:
++    op.drop_table("open_items_chat_notes", schema=migration_schema())
+diff --git a/omnigent/stores/open_items_migrations/open_items0003_drop_chat_notes.py b/omnigent/stores/open_items_migrations/open_items0003_drop_chat_notes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8551e419c6996c663ebd68bad9ac6a92b68575d
+--- /dev/null
++++ b/omnigent/stores/open_items_migrations/open_items0003_drop_chat_notes.py
+@@ -0,0 +1,66 @@
++"""drop the chat notes table
++
++Revision ID: open_items0003
++Revises: open_items0002
++
++Items are created only by the agent's tools and changed only by the tools and
++people, so nothing reads the chat for labels or keeps notes for the agent any
++more. A database that ran open_items0002 holds the table; a new one creates
++and drops it on its way to head.
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++from alembic import op
++from sqlalchemy.dialects.mysql import VARBINARY
++
++from omnigent.db.db_models import Uuid16
++from omnigent.db.side_schemas import migration_schema
++
++revision: str = "open_items0003"
++down_revision: str | None = "open_items0002"
++branch_labels: str | None = None
++depends_on: str | None = None
++
++# The table as open_items0002 creates it, for the downgrade.
++_ENVELOPE = sa.LargeBinary().with_variant(VARBINARY(16_383), "mysql")
++_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
++_SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
++    (
++        "scanned_through IS NULL OR length(CAST(scanned_through AS BLOB)) <= 512",
++        "ck_open_items_chat_notes_scanned_through_bytes",
++    ),
++    (
++        "pending IS NULL OR length(CAST(pending AS BLOB)) <= 16383",
++        "ck_open_items_chat_notes_pending_bytes",
++    ),
++    ("typeof(notes_sent) = 'integer'", "ck_open_items_chat_notes_notes_sent_integer"),
++)
++
++
++def _sqlite_checks() -> list[sa.CheckConstraint]:
++    if op.get_bind().dialect.name not in _SQLITE_FAMILY:
++        return []
++    return [sa.CheckConstraint(expr, name=name) for expr, name in _SQLITE_CHECKS]
++
++
++def upgrade() -> None:
++    op.drop_table("open_items_chat_notes", schema=migration_schema())
++
++
++def downgrade() -> None:
++    op.create_table(
++        "open_items_chat_notes",
++        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
++        sa.Column("conversation_id", Uuid16(), nullable=False),
++        sa.Column("scanned_through", sa.String(128), nullable=True),
++        sa.Column("notes_sent", sa.Integer(), nullable=False),
++        sa.Column("pending", _ENVELOPE, nullable=True),
++        sa.Column("updated_at", sa.BigInteger(), nullable=False),
++        sa.PrimaryKeyConstraint(
++            "workspace_id", "conversation_id", name="pk_open_items_chat_notes"
++        ),
++        *_sqlite_checks(),
++        schema=migration_schema(),
++    )
+diff --git a/tests/stores/test_open_items_store.py b/tests/stores/test_open_items_store.py
+index 43fb09c710f75287608ac2665fe4663a84e4edd9..0dc5ac2050eeff57a811a02ef7b16b9a1404a987 100644
+--- a/tests/stores/test_open_items_store.py
++++ b/tests/stores/test_open_items_store.py
+@@ -3,11 +3,14 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import dataclasses
+ import random
++import shutil
+ import string
+ import threading
+ import uuid
+ from collections.abc import Sequence
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -380,3 +383,56 @@ def test_lists_filter_page_and_count_in_label_order(
+     assert page.kind_counts == {"question": 2, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}
+     assert page.topics == ["cache", "release"]
+ 
++
++def test_the_retired_chat_notes_table_is_dropped_and_a_downgrade_restores_it(
++    tmp_path: Path,
++) -> None:
++    """A database that ran open_items0002 loses its chat notes table and keeps its items."""
++    from alembic import command
++    from sqlalchemy import inspect, text
++
++    from omnigent.db import side_schemas
++    from omnigent.db.utils import get_or_create_engine
++
++    revisions = Path(open_items_store.__file__).parent / "open_items_migrations"
++    up_to_notes = tmp_path / "revisions"
++    up_to_notes.mkdir()
++    for name in ("open_items0001_create_tables.py", "open_items0002_chat_notes.py"):
++        shutil.copy(revisions / name, up_to_notes)
++    store = open_items_store.OPEN_ITEMS_SIDE_STORE
++    engine = get_or_create_engine(f"sqlite:///{tmp_path / 'copy.db'}")
++
++    def tables() -> set[str]:
++        return set(inspect(engine).get_table_names())
++
++    def revision() -> str | None:
++        with engine.connect() as connection:
++            return side_schemas._current_revision(connection, store)
++
++    side_schemas.ensure_side_store(dataclasses.replace(store, migrations=up_to_notes), engine)
++    assert revision() == "open_items0002" and "open_items_chat_notes" in tables()
++    with engine.begin() as connection:
++        connection.execute(
++            text(
++                "INSERT INTO open_items_heads (workspace_id, conversation_id, kind, next_number) "
++                "VALUES (0, :conversation, 1, 4)"
++            ),
++            {"conversation": uuid.uuid4().bytes},
++        )
++
++    side_schemas._migrated.pop(engine, None)
++    side_schemas.ensure_side_store(store, engine)
++    assert revision() == "open_items0003"
++    assert "open_items_chat_notes" not in tables()
++    with engine.connect() as connection:
++        assert connection.execute(text("SELECT next_number FROM open_items_heads")).all() == [(4,)]
++
++    config = side_schemas._alembic_config(store)
++    with engine.connect() as connection:
++        config.attributes.update(connection=connection, side_store=store)
++        command.downgrade(config, "open_items0002")
++        connection.commit()
++    assert revision() == "open_items0002" and "open_items_chat_notes" in tables()
++    side_schemas._migrated.pop(engine, None)
++    side_schemas.ensure_side_store(store, engine)
++    assert revision() == "open_items0003" and "open_items_chat_notes" not in tables()
