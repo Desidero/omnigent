@@ -1,0 +1,694 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Wed, 11 Nov 2026 02:29:46 +0000
+Subject: [PATCH] feat(web): fold the phone drawer's primary nav into one strip
+
+On a phone, the drawer's primary nav is a stack of 44px rows above the
+session list. In the overlay drawer the core destinations (New session,
+Automations, Workflows, Inbox) now share one strip of equal-width
+icon-over-label cells (at least 44px tall) in a rounded glass container:
+three or four rows of 134px to 179px become a strip of about 68px.
+Automations and Workflows keep their gates, so the strip has two to four
+cells in the order of the rows. The strip never scrolls: Canvas, Usage and
+extension pages, when enabled, stay full-width rows directly below it.
+Cell labels follow the Appearance interface font size.
+
+Every item now renders through PrimaryNavLink, which takes a row or cell
+layout, so both layouts share one definition per destination; a small
+PrimaryNavStrip wraps the core destinations only on the phone drawer. The
+cells keep their test ids, component ids, links, drawer closing and active
+highlight; New keeps the accessible name "New session" and its
+aria-keyshortcuts, and the Inbox count sits on the cell's corner with the
+same label. The strip follows the overlay drawer; the desktop layout and
+a mobile-layout window that docks the sidebar beside the chat keep the
+stacked rows.
+
+Refs #13482
+
+Not upstream yet: proposed from feat/mobile-sidebar-nav-strip; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/sessions.md                     |  20 ++
+ web/src/shell/PrimaryNavLink.tsx            |  55 ++++-
+ web/src/shell/Sidebar.mobileDrawer.test.tsx | 162 +++++++++++++
+ web/src/shell/Sidebar.test.tsx              |  20 ++
+ web/src/shell/Sidebar.tsx                   | 249 +++++++-------------
+ 5 files changed, 344 insertions(+), 162 deletions(-)
+
+diff --git a/feature-map/sessions.md b/feature-map/sessions.md
+index 71fe59ba39d4723f010c117372d9e68a1e289bae..8674c94a58d52dd427af1798cfa32d408d5bf478 100644
+--- a/feature-map/sessions.md
++++ b/feature-map/sessions.md
+@@ -317,6 +317,11 @@ the header menu), and each place is a separate entry point.
+   a third of its width, or after a quick flick, closes it; a shorter drag springs
+   back. List scrolling, row taps, long-press reordering and horizontal scrollers
+   keep their own touch handling.
++- `mobile-primary-nav-strip`: on phone layouts, the drawer shows New session,
++  Automations, Workflows (when its page is on) and Inbox as one strip of
++  equal-width icon-over-label cells under the header instead of stacked rows.
++  Cells are at least 44px tall. Canvas, Usage and extension pages stay
++  full-width rows below the strip.
+ - `session-overview`: behind the `session_overview` release flag (off by
+   default), the desktop chat header shows the session cost as a `$x.xx` chip
+   beside the right-panel toggle, styled as selected while the card shows.
+@@ -716,6 +721,17 @@ left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
+ third of the drawer's width or after a quick flick it closes on the current
+ chat, otherwise it springs back. Settings and desktop widths don't use it.
+ 
++**Primary navigation on phones:** at phone width, open the sidebar drawer. New
++(named New session for screen readers), Automations, Workflows and Inbox share
++one strip under the header, in the order of the desktop rows; the current
++page's cell keeps the active highlight and the Inbox count sits on its cell's
++corner. Automations and Workflows appear only where their rows would, so the
++strip has two to four cells. The strip never scrolls; Canvas, Usage and extension pages,
++when enabled, are ordinary rows directly below it. Tapping a cell or row opens
++the page and closes the drawer; a modifier-click leaves it open. The strip
++follows the overlay drawer; the desktop layout, and a mobile-layout window wide
++enough to show the sidebar beside the chat, keep the stacked rows.
++
+ **Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
+ sidebar menus, and message actions, and offers the same destinations as any
+ other session: connected hosts and each offered sandbox provider. Sessions
+@@ -937,6 +953,10 @@ plain `uv run pytest`, which starts a private server for the test.
+   These touch-drive the built SPA in desktop Chromium at a phone viewport with
+   mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
+   hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
++- **`mobile-primary-nav-strip`:** component coverage only, in
++  `web/src/shell/Sidebar.mobileDrawer.test.tsx` (strip cells with and
++  without Automations and Workflows, Canvas and Usage as rows below the strip, active state, Inbox badge, drawer closing, rows on desktop and
++  side by side) and `web/src/shell/Sidebar.test.tsx` (extension pages as rows).
+ - **`archive`:**
+   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
+   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
+diff --git a/web/src/shell/PrimaryNavLink.tsx b/web/src/shell/PrimaryNavLink.tsx
+index 9eef01c3d516d52d15ffdabc8845639b26633f66..1d9eea4663e24643017010c1e9271cea5b20f093 100644
+--- a/web/src/shell/PrimaryNavLink.tsx
++++ b/web/src/shell/PrimaryNavLink.tsx
+@@ -3,12 +3,39 @@ import type { LucideIcon } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+ import { Link } from "@/lib/routing";
+ import { cn } from "@/lib/utils";
++import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
+ import { SIDEBAR_ROW } from "./sidebarStyles";
+ 
+ const HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
+ const ACTIVE_HIGHLIGHT =
+   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
+ 
++/** Full-width sidebar rows, or the icon-over-label cells of the phone drawer's strip. */
++export type PrimaryNavLayout = "row" | "cell";
++
++// Equal-width cells at least 44px tall.
++const CELL =
++  "h-auto min-h-11 min-w-0 flex-1 basis-0 flex-col gap-1 rounded-xl border-0 px-0.5 py-2.5 font-normal mobile-touch-target";
++
++/** On the phone drawer, wraps the always-on destinations in one strip; elsewhere they stay rows. */
++export function PrimaryNavStrip({
++  layout,
++  children,
++}: {
++  layout: PrimaryNavLayout;
++  children: ReactNode;
++}) {
++  if (layout === "row") return children;
++  return (
++    <div
++      data-testid="sidebar-primary-nav-strip"
++      className={cn("mb-1 flex gap-1 rounded-2xl p-1", MOBILE_GLASS_SURFACE)}
++    >
++      {children}
++    </div>
++  );
++}
++
+ export interface PrimaryNavLinkProps {
+   to: string;
+   label: string;
+@@ -18,6 +45,11 @@ export interface PrimaryNavLinkProps {
+   testId?: string;
+   onClick?: (event: MouseEvent<HTMLAnchorElement>) => void;
+   trailing?: ReactNode;
++  layout?: PrimaryNavLayout;
++  /** Visible label in a cell; the accessible name stays `label`. */
++  shortLabel?: string;
++  className?: string;
++  ariaKeyShortcuts?: string;
+ }
+ 
+ export function PrimaryNavLink({
+@@ -29,16 +61,24 @@ export function PrimaryNavLink({
+   testId,
+   onClick,
+   trailing,
++  layout = "row",
++  shortLabel,
++  className,
++  ariaKeyShortcuts,
+ }: PrimaryNavLinkProps) {
++  const cell = layout === "cell";
++  const visibleLabel = cell ? (shortLabel ?? label) : label;
+   return (
+     <Button
+       asChild
+       variant="ghost"
+       className={cn(
+-        SIDEBAR_ROW,
+-        "w-full justify-start border-0 font-normal mobile-touch-target",
++        cell
++          ? CELL
++          : [SIDEBAR_ROW, "w-full justify-start border-0 font-normal mobile-touch-target"],
+         HOVER_HIGHLIGHT,
+         active && ACTIVE_HIGHLIGHT,
++        className,
+       )}
+       data-testid={testId}
+     >
+@@ -47,6 +87,8 @@ export function PrimaryNavLink({
+         onClick={onClick}
+         componentId={componentId}
+         aria-current={active ? "page" : undefined}
++        aria-label={visibleLabel === label ? undefined : label}
++        aria-keyshortcuts={ariaKeyShortcuts}
+       >
+         <Icon
+           className={cn(
+@@ -54,7 +96,14 @@ export function PrimaryNavLink({
+             active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+           )}
+         />
+-        {label}
++        {cell ? (
++          // 4px under the Appearance interface size (11px at the phone default).
++          <span className="max-w-full truncate text-[calc(var(--text-ui)-4px)] leading-tight tracking-tight">
++            {visibleLabel}
++          </span>
++        ) : (
++          label
++        )}
+         {trailing}
+       </Link>
+     </Button>
+diff --git a/web/src/shell/Sidebar.mobileDrawer.test.tsx b/web/src/shell/Sidebar.mobileDrawer.test.tsx
+index 303e35bdb77864f3043fefa1e228abc95d20fc5d..76e471123f21c31628074ebded91172c57e59542 100644
+--- a/web/src/shell/Sidebar.mobileDrawer.test.tsx
++++ b/web/src/shell/Sidebar.mobileDrawer.test.tsx
+@@ -6,6 +6,7 @@ import { conversation as conv, conversationPage } from "@/test/sidebarMockHelper
+ import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { Conversation } from "@/hooks/useConversations";
++import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+ 
+ vi.mock("@/hooks/useConversations", async () => {
+   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+@@ -443,3 +444,164 @@ describe("mobile sidebar drawer keyboard dismissal", () => {
+     expect(composer).toHaveFocus();
+   });
+ });
++
++// On a phone the primary nav folds into one strip of icon-over-label cells, so
++// the session list keeps the height four stacked rows would take.
++describe("mobile sidebar drawer primary nav strip", () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  const STRIP_FEATURES = { canvas: true, usage_page: true };
++
++  function cells(): HTMLElement[] {
++    return within(screen.getByTestId("sidebar-primary-nav")).getAllByRole("link");
++  }
++
++  function primaryNavLink(name: string | RegExp): HTMLElement {
++    return within(screen.getByTestId("sidebar-primary-nav")).getByRole("link", { name });
++  }
++
++  it("puts the core destinations in one strip of equal-width cells at least 44px tall", () => {
++    stubMobileLayout(true);
++    renderSidebar({ features: STRIP_FEATURES });
++
++    const strip = screen.getByTestId("sidebar-primary-nav-strip");
++    expect(strip).toHaveClass("flex", "rounded-2xl", "max-md:backdrop-blur-xl");
++    expect(strip).not.toHaveClass("flex-col", "overflow-x-auto");
++    const stripCells = within(strip).getAllByRole("link");
++    expect(stripCells.map((cell) => cell.dataset.testid)).toEqual([
++      "new-chat-button",
++      "scheduled-tasks-nav",
++      "inbox-button",
++    ]);
++    for (const cell of stripCells) {
++      expect(cell).toHaveClass("flex-1", "basis-0", "min-w-0", "flex-col", "min-h-11");
++      expect(cell).toHaveClass("mobile-touch-target");
++      expect(cell).not.toHaveClass("sidebar-row", "w-full");
++    }
++  });
++
++  it("keeps two cells when automations are off for the caller", () => {
++    stubMobileLayout(true);
++    renderSidebar({ info: { ...FALLBACK_SERVER_INFO, automations_enabled: false } });
++
++    const strip = screen.getByTestId("sidebar-primary-nav-strip");
++    expect(
++      within(strip)
++        .getAllByRole("link")
++        .map((cell) => cell.dataset.testid),
++    ).toEqual(["new-chat-button", "inbox-button"]);
++  });
++
++  it("adds Workflows as a cell between Automations and Inbox when its page is on", () => {
++    stubMobileLayout(true);
++    renderSidebar({ route: "/workflows", features: { ...STRIP_FEATURES, workflows: true } });
++
++    const strip = screen.getByTestId("sidebar-primary-nav-strip");
++    const stripCells = within(strip).getAllByRole("link");
++    expect(stripCells.map((cell) => cell.dataset.testid)).toEqual([
++      "new-chat-button",
++      "scheduled-tasks-nav",
++      "workflows-nav",
++      "inbox-button",
++    ]);
++    const workflows = screen.getByTestId("workflows-nav");
++    expect(workflows).toHaveAttribute("href", "/workflows");
++    expect(workflows).toHaveTextContent(/^Workflows$/);
++    expect(workflows).toHaveClass("flex-1", "min-h-11", "bg-[var(--sidebar-active)]");
++    expect(workflows).toHaveAttribute("aria-current", "page");
++  });
++
++  it("renders Canvas and Usage as full-width rows below the strip", () => {
++    stubMobileLayout(true);
++    renderSidebar({ route: "/canvas", features: STRIP_FEATURES });
++
++    const strip = screen.getByTestId("sidebar-primary-nav-strip");
++    const canvas = screen.getByTestId("canvas-nav");
++    const usage = screen.getByTestId("usage-nav");
++    for (const row of [canvas, usage]) {
++      expect(strip).not.toContainElement(row);
++      expect(screen.getByTestId("sidebar-primary-nav")).toContainElement(row);
++      expect(row).toHaveClass("sidebar-row", "w-full", "justify-start", "mobile-touch-target");
++      expect(row).not.toHaveClass("flex-1", "flex-col");
++    }
++    expect(strip.compareDocumentPosition(canvas) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++    expect(canvas.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++    expect(canvas).toHaveTextContent(/^Canvas$/);
++    expect(canvas).toHaveAttribute("aria-current", "page");
++    expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
++    expect(usage).not.toHaveAttribute("aria-current");
++  });
++
++  it("labels New as New session and drops the hover-only shortcut hint", () => {
++    stubMobileLayout(true);
++    renderSidebar();
++
++    const newSession = primaryNavLink("New session");
++    expect(newSession).toHaveAttribute("data-testid", "new-chat-button");
++    expect(newSession).toHaveAttribute("href", "/");
++    expect(newSession).toHaveTextContent(/^New$/);
++    // The label follows the Appearance interface font size rather than a fixed px.
++    expect(within(newSession).getByText("New")).toHaveClass("text-[calc(var(--text-ui)-4px)]");
++    expect(newSession).toHaveAttribute("aria-keyshortcuts");
++    expect(newSession).toHaveAttribute("aria-current", "page");
++    expect(newSession.querySelector('[data-slot="shortcut-keys"]')).toBeNull();
++  });
++
++  it("highlights the active cell and pins the Inbox count to its corner", () => {
++    stubMobileLayout(true);
++    mockConversations([conv("conv_a", { pending_elicitations_count: 2 })]);
++    renderSidebar({ route: "/inbox" });
++
++    const inbox = screen.getByTestId("inbox-button");
++    expect(inbox).toHaveClass(
++      "bg-[var(--sidebar-active)]",
++      "text-[var(--sidebar-active-foreground)]",
++    );
++    expect(inbox).toHaveAttribute("aria-current", "page");
++    expect(screen.getByTestId("new-chat-button")).not.toHaveAttribute("aria-current");
++    const badge = within(inbox).getByLabelText("2 inbox items waiting");
++    expect(badge).toHaveClass("absolute", "top-1", "right-1", "bg-transparent");
++    expect(badge).not.toHaveClass("ml-auto");
++  });
++
++  it("closes the drawer on a plain tap but not on a modifier click", () => {
++    stubMobileLayout(true);
++    const onClose = vi.fn();
++    renderSidebar({ onClose, features: STRIP_FEATURES });
++
++    fireEvent.click(screen.getByTestId("canvas-nav"), { metaKey: true });
++    expect(onClose).not.toHaveBeenCalled();
++
++    for (const testId of ["new-chat-button", "inbox-button", "usage-nav"]) {
++      fireEvent.click(screen.getByTestId(testId));
++    }
++    expect(onClose).toHaveBeenCalledTimes(3);
++  });
++
++  it.each([
++    ["desktop", false],
++    ["side-by-side", true],
++  ])("keeps full-width rows on the %s layout", (_layout, sideBySide) => {
++    if (sideBySide) {
++      // A wide phone matches both the mobile and the docked side-by-side queries.
++      vi.stubGlobal("matchMedia", (query: string) => ({
++        matches: query.includes("max-width"),
++        media: query,
++        addEventListener: () => {},
++        removeEventListener: () => {},
++      }));
++    } else stubMobileLayout(false);
++    renderSidebar({ features: STRIP_FEATURES });
++
++    expect(screen.queryByTestId("sidebar-primary-nav-strip")).toBeNull();
++    for (const cell of cells()) {
++      expect(cell).toHaveClass("sidebar-row", "w-full", "justify-start");
++      expect(cell).not.toHaveClass("flex-1");
++    }
++    const newSession = primaryNavLink(/^New session/);
++    expect(newSession).not.toHaveAttribute("aria-label");
++    expect(newSession.querySelector('[data-slot="shortcut-keys"]')).not.toBeNull();
++  });
++});
+diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
+index e2e94ef947172ec08255f27d51d853c8735cf7bd..59baff5873646a58729dcab0989bfb88b2b93524 100644
+--- a/web/src/shell/Sidebar.test.tsx
++++ b/web/src/shell/Sidebar.test.tsx
+@@ -1552,6 +1552,26 @@ describe("Sidebar session list", () => {
+     expect(onClose).toHaveBeenCalledOnce();
+   });
+ 
++  it("renders an extension page as a row below the phone drawer's strip", () => {
++    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
++    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
++      ...mediaQuery,
++      media: query,
++      matches: query === "(max-width: 1180.98px)",
++    }));
++    try {
++      mockConversations(THREE_TYPE_CONVERSATIONS);
++      renderSidebar(true, "/extensions/acme.review/inbox", undefined, undefined, [TEST_EXTENSION]);
++
++      const extension = screen.getByTestId("extension-nav-acme.review.primary-nav");
++      expect(screen.getByTestId("sidebar-primary-nav-strip")).not.toContainElement(extension);
++      expect(extension).toHaveClass("sidebar-row", "w-full", "mobile-touch-target");
++      expect(extension).toHaveAttribute("aria-current", "page");
++    } finally {
++      matchMedia.mockRestore();
++    }
++  });
++
+   it("leaves the primary nav unchanged for an empty extension catalog", () => {
+     mockConversations(THREE_TYPE_CONVERSATIONS);
+     renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index e11eaffeb1cac83e1221c962082e7fcf51ef0d47..3be89eaae0c9459ade15052cab91329eacbcff2a 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -296,7 +296,7 @@ import {
+   type SidebarViewPreferences,
+ } from "@/lib/sidebarViewPreferences";
+ import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
+-import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
++import { PrimaryNavLink, PrimaryNavStrip, type PrimaryNavLayout } from "@/shell/PrimaryNavLink";
+ import { useViewerId } from "@/hooks/useViewerId";
+ import { useExtensions } from "@/extensions/ExtensionProvider";
+ import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
+@@ -1113,6 +1113,8 @@ function SidebarImpl({
+   // A wide phone (unfolded foldable, landscape) docks the open sidebar beside
+   // the chat instead of over it.
+   const sideBySide = useIsSideBySideSidebarViewport();
++  // The phone drawer folds the primary nav into one strip; docked and desktop keep rows.
++  const navLayout: PrimaryNavLayout = mobileLayout && !sideBySide ? "cell" : "row";
+   const closeSwipeEnabled = open && mobileLayout && dragProgress == null;
+   const openSwipeEnabled = !open && !peek && mobileLayout && dragProgress == null;
+   useSidebarSwipeToOpen({
+@@ -1460,153 +1462,96 @@ function SidebarImpl({
+ 
+             <div
+               className={cn(
+-                "flex flex-col gap-px px-2 pt-2 pb-0 max-md:pt-0",
++                "flex flex-col gap-px px-2 pt-2 max-md:pt-0",
++                navLayout === "row" ? "pb-0" : "pb-2",
+                 SIDEBAR_ROW_MOBILE_INSET,
+               )}
+               data-testid="sidebar-primary-nav"
+             >
+-              {/* "New session" routes to the home composer ("/"), which now owns
+-            session creation end-to-end (host/workspace/worktree chips +
+-            send). Rendered as a Link so cmd/middle-click opens it in a new
+-            tab; onNavClick still closes the sidebar on a plain mobile tap. */}
+-              <Button
+-                asChild
+-                className={cn(
+-                  // px-2 + gap-2 puts the icon on the sidebar's left (red) column
+-                  // and the label on the label (blue) column — matching section
+-                  // headers and project folders. border-0 drops the Button base's
+-                  // transparent 1px border so the icon lands exactly on that
+-                  // column, flush with the Inbox row and folder rows.
+-                  SIDEBAR_ROW,
+-                  "group/new-session w-full justify-start border-0 font-normal mobile-touch-target",
+-                  SIDEBAR_HOVER_HIGHLIGHT,
+-                  isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+-                )}
+-                variant="ghost"
+-                data-testid="new-chat-button"
+-              >
+-                {/* New session always creates a session the viewer owns, which
+-              lands under "My sessions" — so snap the tab back there on click
+-              (the button stays visible on both tabs). */}
+-                <Link
++              {/* Phone drawer: the core destinations share one strip of cells;
++            Canvas, Usage and extension pages stay rows below it. */}
++              <PrimaryNavStrip layout={navLayout}>
++                {/* "New session" links to the home composer ("/"), so cmd/middle-click
++            opens a new tab. The new session is the viewer's own, so a click
++            also snaps the list back to "My sessions". */}
++                <PrimaryNavLink
+                   to="/"
+-                  componentId="sidebar.new_chat"
+-                  aria-keyshortcuts={newSessionAriaShortcut()}
++                  label="New session"
++                  shortLabel="New"
++                  icon={MessageCirclePlusIcon}
++                  active={isNewChatPage}
++                  layout={navLayout}
+                   onClick={(e) => {
+                     switchTab("mine");
+                     onNavClick(e);
+                   }}
+-                >
+-                  <MessageCirclePlusIcon
+-                    className={cn(
+-                      "ui-icon",
+-                      isNewChatPage
+-                        ? "text-[var(--sidebar-active-foreground)]"
+-                        : "text-muted-foreground",
+-                    )}
++                  componentId="sidebar.new_chat"
++                  testId="new-chat-button"
++                  ariaKeyShortcuts={newSessionAriaShortcut()}
++                  className="group/new-session"
++                  trailing={navLayout === "row" && <NewSessionShortcutHint />}
++                />
++                {automationsEnabled && (
++                  <PrimaryNavLink
++                    to="/tasks"
++                    label="Automations"
++                    icon={ClockIcon}
++                    active={isTasksPage}
++                    layout={navLayout}
++                    onClick={onNavClick}
++                    componentId="sidebar.tasks"
++                    testId="scheduled-tasks-nav"
+                   />
+-                  New session
+-                  <NewSessionShortcutHint />
+-                </Link>
+-              </Button>
+-              {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
+-              {automationsEnabled && (
+-                <Button
+-                  asChild
+-                  className={cn(
+-                    // Same shared nav-row construct as "New session" / "Inbox" so
+-                    // the active-pill, hover, insets, icon column, and text weight
+-                    // all match post-refactor.
+-                    SIDEBAR_ROW,
+-                    "w-full justify-start border-0 font-normal mobile-touch-target",
+-                    SIDEBAR_HOVER_HIGHLIGHT,
+-                    isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+-                  )}
+-                  variant="ghost"
+-                  data-testid="scheduled-tasks-nav"
+-                >
+-                  <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
+-                    <ClockIcon
+-                      className={cn(
+-                        "ui-icon",
+-                        isTasksPage
+-                          ? "text-[var(--sidebar-active-foreground)]"
+-                          : "text-muted-foreground",
+-                      )}
+-                    />
+-                    Automations
+-                  </Link>
+-                </Button>
+-              )}
+-              {workflowsPageEnabled && (
+-                <Button
+-                  asChild
+-                  className={cn(
+-                    SIDEBAR_ROW,
+-                    "w-full justify-start border-0 font-normal mobile-touch-target",
+-                    SIDEBAR_HOVER_HIGHLIGHT,
+-                    isWorkflowsPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+-                  )}
+-                  variant="ghost"
+-                  data-testid="workflows-nav"
+-                >
+-                  <Link to="/workflows" onClick={onNavClick} componentId="sidebar.workflows">
+-                    <WorkflowIcon
+-                      className={cn(
+-                        "ui-icon",
+-                        isWorkflowsPage
+-                          ? "text-[var(--sidebar-active-foreground)]"
+-                          : "text-muted-foreground",
+-                      )}
+-                    />
+-                    Workflows
+-                  </Link>
+-                </Button>
+-              )}
+-              <Button
+-                asChild
+-                variant="ghost"
+-                className={cn(
+-                  SIDEBAR_ROW,
+-                  "w-full justify-start border-0 font-normal mobile-touch-target",
+-                  SIDEBAR_HOVER_HIGHLIGHT,
+-                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                 )}
+-                data-testid="inbox-button"
+-              >
+-                <Link to="/inbox" onClick={onNavClick} componentId="sidebar.inbox">
+-                  <InboxIcon
+-                    className={cn(
+-                      "ui-icon",
+-                      isInboxPage
+-                        ? "text-[var(--sidebar-active-foreground)]"
+-                        : "text-muted-foreground",
+-                    )}
++                {workflowsPageEnabled && (
++                  <PrimaryNavLink
++                    to="/workflows"
++                    label="Workflows"
++                    icon={WorkflowIcon}
++                    active={isWorkflowsPage}
++                    layout={navLayout}
++                    onClick={onNavClick}
++                    componentId="sidebar.workflows"
++                    testId="workflows-nav"
+                   />
+-                  Inbox
+-                  {(inboxCount > 0 || inboxCountIncomplete) && (
+-                    <span
+-                      title={
+-                        inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
+-                      }
+-                      aria-label={inboxBadgeLabel(
+-                        inboxCount,
+-                        inboxCountIncomplete,
+-                        inboxCountCapped,
+-                      )}
+-                      className={cn(
+-                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[0.75em] font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+-                        // The active Inbox row already paints the --sidebar-active wash;
+-                        // repainting it on the badge would double-composite to a darker fill.
+-                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+-                      )}
+-                    >
+-                      {inboxCount > 0 ? inboxCount : ""}
+-                      {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
+-                    </span>
+-                  )}
+-                </Link>
+-              </Button>
++                )}
++                <PrimaryNavLink
++                  to="/inbox"
++                  label="Inbox"
++                  icon={InboxIcon}
++                  active={isInboxPage}
++                  layout={navLayout}
++                  onClick={onNavClick}
++                  componentId="sidebar.inbox"
++                  testId="inbox-button"
++                  trailing={
++                    (inboxCount > 0 || inboxCountIncomplete) && (
++                      <span
++                        title={
++                          inboxCountIncomplete
++                            ? "Open Inbox to check older automations."
++                            : undefined
++                        }
++                        aria-label={inboxBadgeLabel(
++                          inboxCount,
++                          inboxCountIncomplete,
++                          inboxCountCapped,
++                        )}
++                        className={cn(
++                          navLayout === "cell" ? "absolute top-1 right-1" : "ml-auto",
++                          "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[0.75em] font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
++                          // The active Inbox row already paints the --sidebar-active wash;
++                          // repainting it on the badge would double-composite to a darker fill.
++                          isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
++                        )}
++                      >
++                        {inboxCount > 0 ? inboxCount : ""}
++                        {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
++                      </span>
++                    )
++                  }
++                />
++              </PrimaryNavStrip>
+               {canvasEnabled && (
+                 <PrimaryNavLink
+                   to={canvasDestination.pathname + canvasDestination.search}
+@@ -1623,29 +1568,15 @@ function SidebarImpl({
+                 onNavigate={onNavClick}
+               />
+               {usagePageEnabled && (
+-                <Button
+-                  asChild
+-                  variant="ghost"
+-                  className={cn(
+-                    SIDEBAR_ROW,
+-                    "w-full justify-start border-0 font-normal mobile-touch-target",
+-                    SIDEBAR_HOVER_HIGHLIGHT,
+-                    isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+-                  )}
+-                  data-testid="usage-nav"
+-                >
+-                  <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
+-                    <WalletIcon
+-                      className={cn(
+-                        "ui-icon",
+-                        isUsagePage
+-                          ? "text-[var(--sidebar-active-foreground)]"
+-                          : "text-muted-foreground",
+-                      )}
+-                    />
+-                    Usage
+-                  </Link>
+-                </Button>
++                <PrimaryNavLink
++                  to="/usage"
++                  label="Usage"
++                  icon={WalletIcon}
++                  active={isUsagePage}
++                  onClick={onNavClick}
++                  componentId="sidebar.usage"
++                  testId="usage-nav"
++                />
+               )}
+             </div>
+ 
