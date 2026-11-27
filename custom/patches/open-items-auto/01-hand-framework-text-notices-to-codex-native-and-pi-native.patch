@@ -24,6 +24,13 @@ image form.
   the policy-hook module, so the existing trust handshake covers it.
 - pi-native passes them on the inbox payload; the extension adds them as
   a hidden custom message from before_agent_start, once.
+- The runner's executor adapter joined the "text" of every block when it
+  flattened a message for an executor that takes plain text, so a text
+  notice became part of the user's own prompt (claude-native typed it into
+  Claude Code, the SDK harnesses sent it as user text). Executors now say
+  whether they read framework notices (reads_framework_notices): those get
+  the blocks intact, every other one gets the message without them, and the
+  text join skips notice blocks.
 
 Not proposed upstream yet.
 
@@ -31,20 +38,25 @@ Docs: none (internal channel; the open items docs describe the note that uses it
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- omnigent/harnesses/codex_native/app_server.py |  40 ++++++-
+ omnigent/harnesses/codex_native/app_server.py |  40 +++-
  omnigent/harnesses/codex_native/bridge.py     |   3 +
- omnigent/harnesses/codex_native/hook.py       |  29 +++++
+ omnigent/harnesses/codex_native/hook.py       |  29 +++
  omnigent/harnesses/pi_native/bridge.py        |   9 +-
- omnigent/inner/codex_native_executor.py       |  13 +++
- omnigent/inner/native_attachments.py          |  23 +++-
- omnigent/inner/pi_native_executor.py          |  18 ++-
- .../pi_native/omnigent_pi_native_extension.js |  26 +++++
- .../omnigent_pi_native_extension.test.js      |  39 +++++++
+ omnigent/inner/claude_native_executor.py      |   4 +
+ omnigent/inner/claude_sdk_executor.py         |   4 +
+ omnigent/inner/codex_native_executor.py       |  17 ++
+ omnigent/inner/executor.py                    |   8 +
+ omnigent/inner/native_attachments.py          |  26 ++-
+ omnigent/inner/openai_agents_sdk_executor.py  |   4 +
+ omnigent/inner/pi_native_executor.py          |  22 ++-
+ .../pi_native/omnigent_pi_native_extension.js |  26 +++
+ .../omnigent_pi_native_extension.test.js      |  39 ++++
+ .../runtime/harnesses/_executor_adapter.py    |  74 +++++--
  .../app_server/test_policy_hooks.py           |   3 +-
- tests/inner/test_framework_text_notices.py    | 108 ++++++++++++++++++
- tests/inner/test_pi_native_executor.py        |  14 ++-
- tests/inner/test_sdk_resize_notices.py        |   9 +-
- 13 files changed, 319 insertions(+), 15 deletions(-)
+ tests/inner/test_framework_text_notices.py    | 187 ++++++++++++++++++
+ tests/inner/test_pi_native_executor.py        |  14 +-
+ tests/inner/test_sdk_resize_notices.py        |  12 +-
+ 18 files changed, 488 insertions(+), 33 deletions(-)
  create mode 100644 tests/inner/test_framework_text_notices.py
 
 diff --git a/omnigent/harnesses/codex_native/app_server.py b/omnigent/harnesses/codex_native/app_server.py
@@ -221,8 +233,38 @@ index 5cb9fb240e3140721abc5f17faa0928e65ee7941..3dce6eaf40e035f1eae196c24c4ef85c
      _enqueue_payload(bridge_dir, message_id, payload)
      return message_id
  
+diff --git a/omnigent/inner/claude_native_executor.py b/omnigent/inner/claude_native_executor.py
+index df0ee38d96be629e69c34168ca5e3358a04b981a..2190fd0fe5a09ba3d9e7c9dd146b6cd144c5b02c 100644
+--- a/omnigent/inner/claude_native_executor.py
++++ b/omnigent/inner/claude_native_executor.py
+@@ -154,6 +154,10 @@ class ClaudeNativeExecutor(Executor):
+         """:returns: ``True`` because messages can be injected mid-turn."""
+         return True
+ 
++    def reads_framework_notices(self) -> bool:
++        """:returns: ``True``: notices become ``UserPromptSubmit`` hook context."""
++        return True
++
+     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
+         """
+         Inject a live steering message into the Claude terminal.
+diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
+index a3995119375edea0b46ea037d382aeb468963ad3..b585b62b430f999b022939decce4a7028db274fc 100644
+--- a/omnigent/inner/claude_sdk_executor.py
++++ b/omnigent/inner/claude_sdk_executor.py
+@@ -3448,6 +3448,10 @@ class ClaudeSDKExecutor(Executor):
+     def replays_tool_history(self) -> bool:
+         return True
+ 
++    def reads_framework_notices(self) -> bool:
++        """:returns: ``True``: notices become ``UserPromptSubmit`` hook context."""
++        return True
++
+     def supports_live_message_queue(self) -> bool:
+         # The SDK has no API to inject into an active turn; claiming this
+         # capability caused the one-turn-behind desync described in #3472.
 diff --git a/omnigent/inner/codex_native_executor.py b/omnigent/inner/codex_native_executor.py
-index f65c760a5b6fce854af66f2ec5122067f8ff836d..b14667136e5a272d3de2f46e59887d4939d2ab3f 100644
+index f65c760a5b6fce854af66f2ec5122067f8ff836d..77bcf212eb4a78d0ae3728e6c41d6ec5316cfe3a 100644
 --- a/omnigent/inner/codex_native_executor.py
 +++ b/omnigent/inner/codex_native_executor.py
 @@ -37,6 +37,7 @@ from omnigent.harnesses.codex_native.app_server import (
@@ -241,7 +283,18 @@ index f65c760a5b6fce854af66f2ec5122067f8ff836d..b14667136e5a272d3de2f46e59887d49
      materialize_attachment,
      parse_data_uri,
      unresolved_attachment_marker,
-@@ -1110,6 +1112,7 @@ class CodexNativeExecutor(Executor):
+@@ -1094,6 +1096,10 @@ class CodexNativeExecutor(Executor):
+         """:returns: ``True`` to preserve attachments and text provenance when steering."""
+         return True
+ 
++    def reads_framework_notices(self) -> bool:
++        """:returns: ``True``: notices become ``UserPromptSubmit`` hook context."""
++        return True
++
+     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
+         """
+         Steer an active native Codex turn.
+@@ -1110,6 +1116,7 @@ class CodexNativeExecutor(Executor):
          input_items = _content_to_input_items(content, self._bridge_dir)
          if not input_items:
              return False
@@ -249,7 +302,7 @@ index f65c760a5b6fce854af66f2ec5122067f8ff836d..b14667136e5a272d3de2f46e59887d49
          # Serialized against run_turn so the read-decide-RPC-write below
          # is atomic with respect to the initiating-message injection.
          async with self._inject_lock:
-@@ -1309,6 +1312,7 @@ class CodexNativeExecutor(Executor):
+@@ -1309,6 +1316,7 @@ class CodexNativeExecutor(Executor):
          if not input_items:
              yield ExecutorError(message="Codex native turn had no user input to send")
              return
@@ -257,7 +310,7 @@ index f65c760a5b6fce854af66f2ec5122067f8ff836d..b14667136e5a272d3de2f46e59887d49
          # Wait for the bridge to boot OUTSIDE the injection lock. Poll quickly
          # during the expected startup window, then back off. Once state exists,
          # the decision/RPC/write below runs under the lock — re-reading state
-@@ -1680,6 +1684,15 @@ def _latest_user_content(messages: list[Message]) -> object:
+@@ -1680,6 +1688,15 @@ def _latest_user_content(messages: list[Message]) -> object:
      return None
  
  
@@ -273,8 +326,27 @@ index f65c760a5b6fce854af66f2ec5122067f8ff836d..b14667136e5a272d3de2f46e59887d49
  def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
      """
      Normalize executor content into Codex app-server input items.
+diff --git a/omnigent/inner/executor.py b/omnigent/inner/executor.py
+index 100deca9a3f268e278069304f709e9caf26b755a..49cd15924e937f09a3085932dfdf2b714d06d8be 100644
+--- a/omnigent/inner/executor.py
++++ b/omnigent/inner/executor.py
+@@ -857,6 +857,14 @@ class Executor:
+         """Whether fresh and queued input must retain original content block boundaries."""
+         return False
+ 
++    def reads_framework_notices(self) -> bool:
++        """Whether this executor hands framework text notices to the model as context.
++
++        Executors that do get message content with those notice blocks intact;
++        every other executor gets the content without them.
++        """
++        return False
++
+     def preserves_empty_initiating_message(self) -> bool:
+         """Whether an empty final user message must survive history filtering."""
+         return False
 diff --git a/omnigent/inner/native_attachments.py b/omnigent/inner/native_attachments.py
-index b7484b66eb29cbe0f05fded1c4ff0e2aeebbdaba..937691d82307a681a7eb8d0bf40cb596db15532f 100644
+index b7484b66eb29cbe0f05fded1c4ff0e2aeebbdaba..4678215b8199c57ae92ace394d5e68ff46765c1d 100644
 --- a/omnigent/inner/native_attachments.py
 +++ b/omnigent/inner/native_attachments.py
 @@ -601,6 +601,11 @@ def framework_notice_block(source_metadata: Mapping[str, object]) -> dict[str, o
@@ -289,7 +361,7 @@ index b7484b66eb29cbe0f05fded1c4ff0e2aeebbdaba..937691d82307a681a7eb8d0bf40cb596
  def framework_notices(content: object) -> list[str]:
      """Extract transient framework notices from structured content."""
      if not isinstance(content, list):
-@@ -609,12 +614,28 @@ def framework_notices(content: object) -> list[str]:
+@@ -609,12 +614,31 @@ def framework_notices(content: object) -> list[str]:
      for block in content:
          if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE:
              continue
@@ -302,25 +374,43 @@ index b7484b66eb29cbe0f05fded1c4ff0e2aeebbdaba..937691d82307a681a7eb8d0bf40cb596
      return notices
  
  
++def is_framework_text_notice(block: object) -> bool:
++    """Whether *block* is a framework notice carrying framework-owned text."""
++    return (
++        isinstance(block, dict)
++        and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
++        and isinstance(block.get("text"), str)
++        and bool(block["text"])
++    )
++
++
 +def framework_text_notices(content: object) -> list[str]:
 +    """The framework-owned text notices in structured content, without upload notices."""
 +    if not isinstance(content, list):
 +        return []
-+    return [
-+        block["text"]
-+        for block in content
-+        if isinstance(block, dict)
-+        and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
-+        and isinstance(block.get("text"), str)
-+        and block["text"]
-+    ]
++    return [block["text"] for block in content if is_framework_text_notice(block)]
 +
 +
  def expand_framework_notices(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
      """Render structured notices as system context at a provider boundary."""
      result: list[dict[str, Any]] = []
+diff --git a/omnigent/inner/openai_agents_sdk_executor.py b/omnigent/inner/openai_agents_sdk_executor.py
+index 16c8e8a4763ae4e7c80bfad40a728a9436f8eab6..d6f104f435e671b7d90cfdf914af06295b831ba9 100644
+--- a/omnigent/inner/openai_agents_sdk_executor.py
++++ b/omnigent/inner/openai_agents_sdk_executor.py
+@@ -1421,6 +1421,10 @@ class OpenAIAgentsSDKExecutor(Executor):
+     def replays_tool_history(self) -> bool:
+         return True
+ 
++    def reads_framework_notices(self) -> bool:
++        """:returns: ``True``: notices become system messages at the provider boundary."""
++        return True
++
+     def supports_stepwise_internal_turns(self) -> bool:
+         return True
+ 
 diff --git a/omnigent/inner/pi_native_executor.py b/omnigent/inner/pi_native_executor.py
-index f3cc42241b023202a0047ed551559f0ae4250f63..3ee698355f8ce17fe8064bc007b300e9d9bfce77 100644
+index f3cc42241b023202a0047ed551559f0ae4250f63..1a83fe3ae6e85d94bc952bc0e33c3fe90177a28b 100644
 --- a/omnigent/inner/pi_native_executor.py
 +++ b/omnigent/inner/pi_native_executor.py
 @@ -24,7 +24,7 @@ from omnigent.inner.executor import (
@@ -332,7 +422,18 @@ index f3cc42241b023202a0047ed551559f0ae4250f63..3ee698355f8ce17fe8064bc007b300e9
  
  
  class PiNativeExecutor(Executor):
-@@ -74,9 +74,10 @@ class PiNativeExecutor(Executor):
+@@ -61,6 +61,10 @@ class PiNativeExecutor(Executor):
+         """:returns: ``True`` because messages can be queued for the extension."""
+         return True
+ 
++    def reads_framework_notices(self) -> bool:
++        """:returns: ``True``: the extension adds them as a hidden message at agent start."""
++        return True
++
+     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
+         """
+         Queue a live steering message for the resident Pi extension.
+@@ -74,9 +78,10 @@ class PiNativeExecutor(Executor):
          text = _content_to_text(content, self._bridge_dir)
          if not text:
              return False
@@ -344,7 +445,7 @@ index f3cc42241b023202a0047ed551559f0ae4250f63..3ee698355f8ce17fe8064bc007b300e9
          return True
  
      async def run_turn(
-@@ -108,12 +109,15 @@ class PiNativeExecutor(Executor):
+@@ -108,12 +113,15 @@ class PiNativeExecutor(Executor):
          if not text:
              yield ExecutorError(message="Pi native turn had no user text to send")
              return
@@ -361,7 +462,7 @@ index f3cc42241b023202a0047ed551559f0ae4250f63..3ee698355f8ce17fe8064bc007b300e9
          yield TurnComplete(response=None)
  
      def _refresh_auth_headers(self) -> None:
-@@ -180,6 +184,14 @@ def _request_session_id_from_env() -> str | None:
+@@ -180,6 +188,14 @@ def _request_session_id_from_env() -> str | None:
      return raw or None
  
  
@@ -482,6 +583,192 @@ index 8578dbf787e76ffa0afa258d9956e79c28929782..a330119a29e582ac3b3bc35b1ee2dc03
      await testSessionStartupDoesNotCompleteATurn();
      await testSessionStartMarksInputReady();
      await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
+diff --git a/omnigent/runtime/harnesses/_executor_adapter.py b/omnigent/runtime/harnesses/_executor_adapter.py
+index aed479b72af072d6976db7e8e05953f3b9d73214..571be17314cecd627088e58d2fdf0b6faa29f380 100644
+--- a/omnigent/runtime/harnesses/_executor_adapter.py
++++ b/omnigent/runtime/harnesses/_executor_adapter.py
+@@ -27,6 +27,7 @@ from fastapi import Response
+ from omnigent.debug_logging import phase_scope
+ from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+ from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
++from omnigent.inner import native_attachments
+ from omnigent.inner._subprocess_lifecycle import await_cleanup_task
+ from omnigent.inner.executor import (
+     CompactionComplete,
+@@ -279,6 +280,7 @@ class ExecutorAdapter(HarnessApp):
+             include_tool_history=executor.replays_tool_history(),
+             preserve_content_blocks=executor.preserves_message_content_blocks(),
+             preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
++            reads_framework_notices=_reads_framework_notices(executor),
+         )
+         # Stamp session_key on every message so the inner executor keys its client consistently,
+         # matching the key used by enqueue_session_message (steering delivery depends on this).
+@@ -874,6 +876,7 @@ class ExecutorAdapter(HarnessApp):
+             content = _extract_injection_content(
+                 injection.input,
+                 preserve_content_blocks=executor.preserves_message_content_blocks(),
++                reads_framework_notices=_reads_framework_notices(executor),
+             )
+             if not content:
+                 _logger.warning(
+@@ -1775,13 +1778,8 @@ def _extract_last_user_message(
+             if isinstance(content, str):
+                 last_user_text = content
+             elif isinstance(content, list):
+-                parts = []
+-                for block in content:
+-                    text = block.get("text")
+-                    if isinstance(text, str):
+-                        parts.append(text)
+-                if parts:
+-                    last_user_text = "\n".join(parts)
++                if text := _join_text_blocks(content):
++                    last_user_text = text
+         # Single-turn content-block shape (no role key)
+         elif role is None:
+             text = item.get("text")
+@@ -1790,12 +1788,23 @@ def _extract_last_user_message(
+     return last_user_text
+ 
+ 
++def _reads_framework_notices(executor: Executor) -> bool:
++    """Whether *executor* takes framework text notices; duck-typed executors do not."""
++    reads = getattr(executor, "reads_framework_notices", None)
++    return bool(reads()) if callable(reads) else False
++
++
+ def _extract_injection_content(
+     input_value: str | list[dict[str, Any]],
+     *,
+     preserve_content_blocks: bool,
++    reads_framework_notices: bool = False,
+ ) -> str | list[dict[str, Any]]:
+-    """Extract only the newest user input, preserving blocks for capable executors."""
++    """Extract only the newest user input, preserving blocks for capable executors.
++
++    Framework text notices stay as blocks for an executor that reads them and are
++    dropped for every other one, never joined into the user's text.
++    """
+     content: Any = input_value
+     if isinstance(input_value, list) and any(_is_role_keyed_message(item) for item in input_value):
+         newest_user = next(
+@@ -1808,8 +1817,12 @@ def _extract_injection_content(
+         )
+         # A textless newest message must never replay an older user request.
+         content = newest_user.get("content") if newest_user is not None else None
+-    if preserve_content_blocks:
+-        return _normalize_message_content(content, preserve_content_blocks=True)
++    if preserve_content_blocks or (
++        reads_framework_notices and native_attachments.framework_text_notices(content)
++    ):
++        return _normalize_message_content(
++            content, preserve_content_blocks=True, reads_framework_notices=reads_framework_notices
++        )
+     if isinstance(content, str):
+         return content
+     return _join_text_blocks(content) if isinstance(content, list) else ""
+@@ -1821,6 +1834,7 @@ def _translate_input_to_messages(
+     include_tool_history: bool = False,
+     preserve_content_blocks: bool = False,
+     preserve_empty_initiating_message: bool = False,
++    reads_framework_notices: bool = False,
+ ) -> list[Message]:
+     """Convert a CreateResponseRequest input to inner Message list.
+ 
+@@ -1836,12 +1850,15 @@ def _translate_input_to_messages(
+         include_tool_history=include_tool_history,
+         preserve_content_blocks=preserve_content_blocks,
+         preserve_empty_initiating_message=preserve_empty_initiating_message,
++        reads_framework_notices=reads_framework_notices,
+     )
+     if history_messages:
+         return history_messages
+ 
+     content = _normalize_message_content(
+-        input_value, preserve_content_blocks=preserve_content_blocks
++        input_value,
++        preserve_content_blocks=preserve_content_blocks,
++        reads_framework_notices=reads_framework_notices,
+     )
+     return [{"role": "user", "content": content}]
+ 
+@@ -1852,6 +1869,7 @@ def _extract_role_keyed_messages(
+     include_tool_history: bool,
+     preserve_content_blocks: bool,
+     preserve_empty_initiating_message: bool,
++    reads_framework_notices: bool = False,
+ ) -> list[Message]:
+     """Extract role-keyed messages from an Omnigent input list.
+ 
+@@ -1884,7 +1902,9 @@ def _extract_role_keyed_messages(
+             continue
+         role = item["role"]
+         content = _normalize_message_content(
+-            item.get("content"), preserve_content_blocks=preserve_content_blocks
++            item.get("content"),
++            preserve_content_blocks=preserve_content_blocks,
++            reads_framework_notices=reads_framework_notices,
+         )
+         is_initiating_user = role == "user" and item is input_value[-1]
+         # Opted-in executors need the empty item's identity and position.
+@@ -1950,22 +1970,34 @@ def _normalize_message_content(
+     content: Any,
+     *,
+     preserve_content_blocks: bool = False,
++    reads_framework_notices: bool = False,
+ ) -> str | list[dict[str, Any]]:
+-    """Keep blocks for opted-in executors and attachments; otherwise join plain text."""
++    """Keep blocks for opted-in executors and attachments; otherwise join plain text.
++
++    Framework text notices are kept as blocks only for an executor that reads them.
++    """
+     if content is None:
+         return ""
+     if isinstance(content, str):
+         return content
+     if not isinstance(content, list):
+         return ""
++    if not reads_framework_notices:
++        content = [
++            block for block in content if not native_attachments.is_framework_text_notice(block)
++        ]
+     if preserve_content_blocks:
+         return content
+ 
+-    has_multimodal = any(
+-        isinstance(block, dict) and block.get("type") in _MULTIMODAL_BLOCK_TYPES
++    keeps_blocks = any(
++        isinstance(block, dict)
++        and (
++            block.get("type") in _MULTIMODAL_BLOCK_TYPES
++            or native_attachments.is_framework_text_notice(block)
++        )
+         for block in content
+     )
+-    if has_multimodal:
++    if keeps_blocks:
+         return content
+     return _join_text_blocks(content)
+ 
+@@ -1976,10 +2008,16 @@ def _is_role_keyed_message(item: Any) -> bool:
+ 
+ 
+ def _join_text_blocks(blocks: list[Any]) -> str:
+-    """Join the ``text`` of dict content blocks with newlines, skipping non-text blocks."""
++    """Join the ``text`` of dict content blocks with newlines, skipping non-text blocks.
++
++    Framework notices are model context, never the user's text.
++    """
+     parts: list[str] = []
+     for block in blocks:
+-        if not isinstance(block, dict):
++        if (
++            not isinstance(block, dict)
++            or block.get("type") == native_attachments.FRAMEWORK_NOTICE_BLOCK_TYPE
++        ):
+             continue
+         text_value = block.get("text")
+         if isinstance(text_value, str):
 diff --git a/tests/harnesses/codex_native/app_server/test_policy_hooks.py b/tests/harnesses/codex_native/app_server/test_policy_hooks.py
 index 0e6a15f607f9afa2d69822f247a5beefc1144235..5c5a93d0acefb8873e44eba0ea3084338b74134d 100644
 --- a/tests/harnesses/codex_native/app_server/test_policy_hooks.py
@@ -498,10 +785,10 @@ index 0e6a15f607f9afa2d69822f247a5beefc1144235..5c5a93d0acefb8873e44eba0ea308433
  
 diff --git a/tests/inner/test_framework_text_notices.py b/tests/inner/test_framework_text_notices.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..66260500b7dc34e777d23a269b3126476feac5b4
+index 0000000000000000000000000000000000000000..142d5a83955c575856e2fc6603ba6916c6d6922b
 --- /dev/null
 +++ b/tests/inner/test_framework_text_notices.py
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,187 @@
 +"""A framework text notice reaches the model on every harness family, never as user text.
 +
 +The server may add framework-owned text to a message as a notice block (the
@@ -610,6 +897,85 @@ index 0000000000000000000000000000000000000000..66260500b7dc34e777d23a269b312647
 +    # The extension adds it as hidden context when the agent starts
 +    # (omnigent_pi_native_extension.test.js).
 +    assert queued["framework_context"] == _NOTE
++
++
++async def _adapter_turn(executor: Any, content: list[dict[str, Any]]) -> None:
++    """Run one turn through the runner's executor adapter, as a forwarded message does."""
++    import asyncio
++
++    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
++    from omnigent.runtime.harnesses._scaffold import TurnContext
++    from omnigent.server.schemas import CreateResponseRequest
++
++    adapter = ExecutorAdapter(lambda: executor, session_key="session")
++    request = CreateResponseRequest(
++        model="test-agent", input=[{"type": "message", "role": "user", "content": content}]
++    )
++    await adapter.run_turn(request, TurnContext("r1", asyncio.Queue(), asyncio.Event()))
++
++
++@pytest.mark.asyncio
++async def test_claude_native_keeps_the_note_out_of_the_typed_prompt(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """The adapter used to join every block's ``text``, so the note was typed as the prompt."""
++    sent: list[str] = []
++
++    def inject(bridge_dir: Path, *, content: str, **_: Any) -> None:
++        sent.append(content)
++
++    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
++    monkeypatch.setattr(
++        "omnigent.runtime.harnesses._executor_adapter.is_tracing_enabled", lambda: False
++    )
++    await _adapter_turn(ClaudeNativeExecutor(tmp_path), _content())
++    assert sent == ["Next step"]
++    assert (tmp_path / "pending_framework_context.txt").read_text() == _NOTE
++
++
++@pytest.mark.asyncio
++async def test_pi_native_keeps_the_note_out_of_the_queued_text(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    monkeypatch.setattr(
++        "omnigent.runtime.harnesses._executor_adapter.is_tracing_enabled", lambda: False
++    )
++    await _adapter_turn(pne.PiNativeExecutor(bridge_dir=tmp_path), _content())
++    [queued] = [json.loads(path.read_text()) for path in (tmp_path / "inbox").glob("*.json")]
++    assert queued["content"] == "Next step"
++    assert queued["framework_context"] == _NOTE
++
++
++@pytest.mark.asyncio
++async def test_a_harness_that_reads_no_notices_gets_the_user_text_alone(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from omnigent.inner.executor import Executor, TurnComplete
++
++    seen: list[object] = []
++
++    class PlainExecutor(Executor):
++        async def run_turn(self, messages, tools, system_prompt, config=None):  # type: ignore[override]
++            seen.extend(message["content"] for message in messages)
++            yield TurnComplete(response=None)
++
++    monkeypatch.setattr(
++        "omnigent.runtime.harnesses._executor_adapter.is_tracing_enabled", lambda: False
++    )
++    await _adapter_turn(PlainExecutor(), _content())
++    assert seen == ["Next step"]
++
++
++def test_a_steering_message_keeps_its_note_apart() -> None:
++    from omnigent.runtime.harnesses._executor_adapter import _extract_injection_content
++
++    message = [{"type": "message", "role": "user", "content": _content()}]
++    kept = _extract_injection_content(
++        message, preserve_content_blocks=False, reads_framework_notices=True
++    )
++    assert kept == _content()
++    plain = _extract_injection_content(message, preserve_content_blocks=False)
++    assert plain == "Next step"
 diff --git a/tests/inner/test_pi_native_executor.py b/tests/inner/test_pi_native_executor.py
 index c947b5de23386e54a1d619c2c29065e717e0950f..eb988fcf39f1cad95fc6d2339032fcc7401501fd 100644
 --- a/tests/inner/test_pi_native_executor.py
@@ -671,7 +1037,7 @@ index c947b5de23386e54a1d619c2c29065e717e0950f..eb988fcf39f1cad95fc6d2339032fcc7
      monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: called.append(a))
      ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
 diff --git a/tests/inner/test_sdk_resize_notices.py b/tests/inner/test_sdk_resize_notices.py
-index 154f3295c3bc64f6a56874c781fcfd3a66863c29..e77470241d4edec893824db9ec6f42835d880621 100644
+index 154f3295c3bc64f6a56874c781fcfd3a66863c29..5ca716849f453239ced4c495ed554710045315f0 100644
 --- a/tests/inner/test_sdk_resize_notices.py
 +++ b/tests/inner/test_sdk_resize_notices.py
 @@ -9,7 +9,10 @@ import httpx
@@ -686,21 +1052,30 @@ index 154f3295c3bc64f6a56874c781fcfd3a66863c29..e77470241d4edec893824db9ec6f4283
  from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
  from omnigent.runner.app_support import _resolve_forwarded_message_content
  from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-@@ -111,6 +114,9 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
+@@ -111,6 +114,10 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
                  content = await _resolve_forwarded_message_content(
                      authored, session_id="session", server_client=client
                  )
-+                if index == 1:
-+                    # A server-added text notice rides the same channel.
++                noted = index == len(widths) - 1
++                if noted:
++                    # A server-added text notice rides the same channel, even without an image.
 +                    content = [*content, framework_text_notice_block("[Open items] note")]
                  history.append({"type": "message", "role": "user", "content": content})
                  request = CreateResponseRequest(model="test-agent", input=copy.deepcopy(history))
                  queue = asyncio.Queue()
-@@ -137,6 +143,7 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
+@@ -131,12 +138,15 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
+                     users = [item for item in sdk_input if item.get("role") == "user"]
+                     assert len(users) == 1
+                     assert "downscaled" not in json.dumps(users)
++                    assert "[Open items]" not in json.dumps(users)
+                 else:
+                     context = json.dumps(hooks_seen[-1], ensure_ascii=False)
+                     assert "downscaled" not in json.dumps(prompts_seen[-1])
++                    assert "[Open items]" not in json.dumps(prompts_seen[-1])
                      assert FRAMEWORK_NOTICE_BLOCK_TYPE not in json.dumps(prompts_seen[-1])
                      assert len(clients) == 1
                      assert executor._pending_framework_context == {}
-+                assert ("[Open items] note" in context) == (index == 1)
++                assert ("[Open items] note" in context) == noted
                  if width:
                      assert f"{width}×4000" in context.replace("\\u00d7", "×")
                      assert f"{14000 - width}×4000" not in context.replace("\\u00d7", "×")

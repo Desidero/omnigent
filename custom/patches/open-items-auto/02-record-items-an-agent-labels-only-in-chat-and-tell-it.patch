@@ -30,8 +30,14 @@ framework notice, e.g. '[Open items] Q3 "Region?" was labelled in chat
 without being recorded, so it was added for you. Next time record items
 with sys_open_items_raise; set a topic or close them with
 sys_open_items_update if needed. Open now: 4.', at most three per session.
-The instruction does not mention any of this, so agents keep using the
-tool. A new side-store revision (open_items0002) keeps the per-session
+Only harnesses that hand framework notices to the model as context get it
+(Claude SDK, OpenAI Agents, claude-native, codex-native, pi-native); for
+the others it waits unsent. The note is never part of the user's message:
+the transcript shows it as its own collapsed system row, stored as an
+info-level error item (code framework_note), which is display-only like
+the other notices that kind of item carries and is not replayed to the
+agent. The instruction does not mention any of this, so agents keep using
+the tool. A new side-store revision (open_items0002) keeps the per-session
 read position and the untold changes.
 
 Not proposed upstream yet.
@@ -39,35 +45,39 @@ Not proposed upstream yet.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/open-items.md                            |  41 ++
+ docs/open-items.md                            |  47 ++
  feature-map/open-items.md                     |   2 +
- omnigent/entities/item_labels.py              | 342 +++++++++++++++
+ omnigent/entities/item_labels.py              | 342 +++++++++++++
  omnigent/entities/open_items.py               |   2 +
  omnigent/server/app.py                        |  10 +
  omnigent/server/open_items.py                 |  87 ++--
- omnigent/server/open_items_auto.py            | 407 ++++++++++++++++++
+ omnigent/server/open_items_auto.py            | 448 ++++++++++++++++++
  omnigent/server/routes/_sessions/helpers.py   |   2 +
- .../server/routes/_sessions/orchestration.py  |  12 +
+ .../server/routes/_sessions/orchestration.py  |  14 +
  .../open_items0002_chat_notes.py              |  61 +++
  omnigent/stores/open_items_store.py           | 215 ++++++++-
- tests/entities/test_item_labels.py            |  52 +++
- tests/server/test_open_items_auto.py          | 294 +++++++++++++
- web/src/lib/__fixtures__/itemLabelCases.json  | 306 +++++++++++++
+ tests/entities/test_item_labels.py            |  52 ++
+ tests/server/test_open_items_auto.py          | 311 ++++++++++++
+ web/src/components/blocks/BlockRenderer.tsx   |   7 +-
+ .../blocks/FrameworkNoteRow.test.tsx          |  64 +++
+ web/src/lib/__fixtures__/itemLabelCases.json  | 306 ++++++++++++
  web/src/lib/itemLabelCases.test.ts            |  36 ++
- 15 files changed, 1833 insertions(+), 36 deletions(-)
+ web/src/lib/systemMessage.ts                  |  18 +
+ 18 files changed, 1987 insertions(+), 37 deletions(-)
  create mode 100644 omnigent/entities/item_labels.py
  create mode 100644 omnigent/server/open_items_auto.py
  create mode 100644 omnigent/stores/open_items_migrations/open_items0002_chat_notes.py
  create mode 100644 tests/entities/test_item_labels.py
  create mode 100644 tests/server/test_open_items_auto.py
+ create mode 100644 web/src/components/blocks/FrameworkNoteRow.test.tsx
  create mode 100644 web/src/lib/__fixtures__/itemLabelCases.json
  create mode 100644 web/src/lib/itemLabelCases.test.ts
 
 diff --git a/docs/open-items.md b/docs/open-items.md
-index be8ef7323d7070209e1c15aacb0d6b0323406285..3f56c36de0f83376bc2faa90a827ae4ab25235ba 100644
+index be8ef7323d7070209e1c15aacb0d6b0323406285..1c5ca5ebc820cfa627145a14219056a14fa497f6 100644
 --- a/docs/open-items.md
 +++ b/docs/open-items.md
-@@ -58,6 +58,47 @@ strike the label in chat, list instead of relying on memory, leave an item the
+@@ -58,6 +58,53 @@ strike the label in chat, list instead of relying on memory, leave an item the
  user closed closed (one whose comment heading ends `(closed by me)` included)
  unless the user asks again, and label in chat only if the tools are missing.
  
@@ -95,8 +105,8 @@ index be8ef7323d7070209e1c15aacb0d6b0323406285..3f56c36de0f83376bc2faa90a827ae4a
 +  with the sentence that struck it as the resolution and `closed_by: "auto"`.
 +  Nothing is reopened from chat.
 +- **The note:** when a read changed something, the agent's next message
-+  carries one framework note, given to the model as context for that turn and
-+  never shown as your text:
++  carries one framework note, given to the model as context for that turn,
++  never as part of your message:
 +
 +  ```text
 +  [Open items] Q3 "Region?" and R1 "No snapshot" were labelled in chat without being recorded, so they were added for you. Next time record items with sys_open_items_raise; set a topic or close them with sys_open_items_update if needed. Closed from chat: Q1. Open now: 4.
@@ -104,11 +114,17 @@ index be8ef7323d7070209e1c15aacb0d6b0323406285..3f56c36de0f83376bc2faa90a827ae4a
 +
 +  A read that changes nothing leaves no note. A session's agent gets at most
 +  three notes; after that, recording goes on without them.
-+- **Harnesses:** SDK harnesses get the note as context through the same
-+  framework-notice channel as upload notices (Claude SDK as prompt-hook context,
-+  the others as a system message), claude-native and codex-native through
-+  their `UserPromptSubmit` hook, and pi-native as a hidden message when the
-+  agent starts. Other native harnesses get the items recorded but no note.
++- **In the transcript:** the note shows as its own muted row next to the
++  message it came with, **System: Open items note to the agent**, collapsed
++  like other system markers; select it to read the note. Your message shows
++  only what you typed. The row is stored with the session (an info-level
++  `error` item with code `framework_note`), so it is there after a reload, and
++  like every such item it is never replayed to the agent.
++- **Harnesses:** the note goes to the harnesses that hand framework notices to
++  the model as context: Claude SDK and claude-native (`UserPromptSubmit` hook
++  context), codex-native (its `UserPromptSubmit` hook), OpenAI Agents (a system
++  message) and pi-native (a hidden message when the agent starts). Other
++  harnesses get the items recorded but no note, and their note waits unsent.
 +- **Turn off:** with the tools, `tool_groups.open_items: false`; nothing is
 +  read for an agent without them.
 +
@@ -116,14 +132,14 @@ index be8ef7323d7070209e1c15aacb0d6b0323406285..3f56c36de0f83376bc2faa90a827ae4a
  
  - **SDK harnesses** get them with the turn's tools; **claude-native**,
 diff --git a/feature-map/open-items.md b/feature-map/open-items.md
-index 2e5e10b9e470677aa50e496de84dfb8604a745eb..3830125fb36c1065af994b0e927aa7d1a4d836df 100644
+index 2e5e10b9e470677aa50e496de84dfb8604a745eb..73c8e02f2fa7998a6a74d783b9136b6631b8a7ec 100644
 --- a/feature-map/open-items.md
 +++ b/feature-map/open-items.md
 @@ -7,6 +7,7 @@ A session's agent records the questions, risks, findings and follow-ups it raise
  - `items-raise`: `sys_open_items_raise` allocates labels per session and kind; a retried call gets the same labels; a pinned URL pinned again returns the same item; `label` adopts a chat label if it is free.
  - `items-update`: `sys_open_items_update` closes with a resolution, reopens, and edits title, detail, topic and links, each label with its own result.
  - `items-list`: `sys_open_items_list` and `GET /v1/sessions/{id}/open-items` list in label order with status, kind, topic and text filters, counts and topics.
-+- `items-from-chat`: after a turn, labels the agent wrote only in chat are recorded (`raised_by: auto`) and struck ones closed (`closed_by: auto`); its next message carries one `[Open items]` framework note, at most three per session.
++- `items-from-chat`: after a turn, labels the agent wrote only in chat are recorded (`raised_by: auto`) and struck ones closed (`closed_by: auto`); its next message carries one `[Open items]` framework note as model context (never in the user's message), shown in the transcript as its own collapsed system row; at most three per session.
  - `items-answers`: a person's replies, recorded with `POST …/open-items/answers`, mark an open item answered.
  - `items-event`: every write publishes `session.open_items.changed` on the session's stream.
  - `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
@@ -131,7 +147,7 @@ index 2e5e10b9e470677aa50e496de84dfb8604a745eb..3830125fb36c1065af994b0e927aa7d1
  Preconditions: a local server and runner from this checkout; any harness.
  
  - Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
-+- Chat-only labels and the note: `tests/server/test_open_items_auto.py` (recording, idempotency, caps, takeover, strikes, the note's text and limit, a session without the group); delivery per harness: `tests/inner/test_framework_text_notices.py`, `tests/inner/test_sdk_resize_notices.py`, `omnigent/resources/pi_native/omnigent_pi_native_extension.test.js`; the label rules shared with the web: `tests/entities/test_item_labels.py` and `web/src/lib/itemLabelCases.test.ts`.
++- Chat-only labels and the note: `tests/server/test_open_items_auto.py` (recording, idempotency, caps, takeover, strikes, the note's text and limit, a session without the group); delivery per harness, through the runner's executor adapter: `tests/inner/test_framework_text_notices.py`, `tests/inner/test_sdk_resize_notices.py`, the transcript row: `web/src/components/blocks/FrameworkNoteRow.test.tsx`, `omnigent/resources/pi_native/omnigent_pi_native_extension.test.js`; the label rules shared with the web: `tests/entities/test_item_labels.py` and `web/src/lib/itemLabelCases.test.ts`.
  - Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
  - Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
  - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`.
@@ -663,10 +679,10 @@ index c338b4099ef4b1f6a4078cf0d905654fd9490113..82916911b2a10b39669e129736786a73
      async def list_open_items(
 diff --git a/omnigent/server/open_items_auto.py b/omnigent/server/open_items_auto.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3a4360640f4f5c6d7cfd03f63dfeb90d6835a0a5
+index 0000000000000000000000000000000000000000..781825b6068706de9893ec0d764068cd55a083e7
 --- /dev/null
 +++ b/omnigent/server/open_items_auto.py
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,448 @@
 +"""Open items an agent labels only in chat: record them, and tell the agent once.
 +
 +An agent with the ``open_items`` tools is asked to record every item it
@@ -698,7 +714,7 @@ index 0000000000000000000000000000000000000000..3a4360640f4f5c6d7cfd03f63dfeb90d
 +from typing import Any
 +
 +from omnigent.db.db_models import current_workspace_id
-+from omnigent.entities import ConversationItem, MessageData
++from omnigent.entities import ConversationItem, ErrorData, MessageData, NewConversationItem
 +from omnigent.entities.item_labels import (
 +    defines_label,
 +    extract_item_block,
@@ -738,6 +754,13 @@ index 0000000000000000000000000000000000000000..3a4360640f4f5c6d7cfd03f63dfeb90d
 +# The note names this many items, then counts the rest.
 +_NOTE_NAMES = 6
 +_NOTE_TITLE_CHARS = 60
++# Harnesses that give the model a framework text notice as context; the others get no note.
++NOTE_HARNESSES = frozenset(
++    {"claude-native", "codex-native", "pi-native", "claude-sdk", "openai-agents"}
++)
++# The transcript row showing a note: an info-level ``error`` item, which is display-only.
++NOTE_ROW_CODE = "framework_note"
++NOTE_ROW_TITLE = "Open items note to the agent"
 +# A native harness mirrors its reply a moment after the turn ends.
 +SETTLE_SECONDS = 2.0
 +_PAGE = 100
@@ -1035,6 +1058,30 @@ index 0000000000000000000000000000000000000000..3a4360640f4f5c6d7cfd03f63dfeb90d
 +        note = await asyncio.to_thread(store.take_chat_note, session_id)
 +        return chat_note_text(note) if note is not None else None
 +
++    async def show_note(self, session_id: str, text: str) -> None:
++        """Add the note to the transcript as its own collapsed row, never to the user's message."""
++        from omnigent.db.utils import generate_task_id
++        from omnigent.server.routes._sessions.helpers import _publish_external_conversation_item
++
++        row = NewConversationItem(
++            type="error",
++            response_id=generate_task_id(),
++            data=ErrorData(
++                source="execution",
++                code=NOTE_ROW_CODE,
++                title=NOTE_ROW_TITLE,
++                message=text,
++                level="info",
++            ),
++        )
++        try:
++            persisted = await asyncio.to_thread(self._conversations.append, session_id, [row])
++        except Exception:
++            _logger.warning("Recording the open items note row failed", exc_info=True)
++            return
++        if persisted:
++            _publish_external_conversation_item(session_id, persisted[0])
++
 +    async def aclose(self) -> None:
 +        """Cancel reads in flight; later turn ends are still accepted."""
 +        tasks = list(self._running.values())
@@ -1059,21 +1106,31 @@ index 0000000000000000000000000000000000000000..3a4360640f4f5c6d7cfd03f63dfeb90d
 +        _installed.turn_ended(session_id)
 +
 +
-+async def with_pending_note(session_id: str, content: object) -> object:
++async def with_pending_note(session_id: str, content: object, *, harness: str | None) -> object:
 +    """Message content with the open items note appended, when one is waiting.
 +
-+    The note is a framework notice block, which harnesses give the model as
-+    context for this turn and never show as the user's text. Taking it counts
-+    it as told, so a message that then fails to reach the runner drops it.
++    The note is a framework notice block, which the harnesses in
++    :data:`NOTE_HARNESSES` give the model as context for this turn; it is never
++    the user's text. The transcript shows it as its own row instead. Taking it
++    counts it as told, so a message that then fails to reach the runner drops it.
 +    """
-+    if _installed is None or not isinstance(content, list):
++    from omnigent.harness_aliases import canonicalize_harness
++
++    if (
++        _installed is None
++        or not isinstance(content, list)
++        or canonicalize_harness(harness) not in NOTE_HARNESSES
++    ):
 +        return content
 +    try:
 +        text = await _installed.take_note(session_id)
 +    except Exception:
 +        _logger.warning("Reading the open items note failed", exc_info=True)
 +        return content
-+    return content if text is None else [*content, framework_text_notice_block(text)]
++    if text is None:
++        return content
++    await _installed.show_note(session_id, text)
++    return [*content, framework_text_notice_block(text)]
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
 index da785f0b72f3d7c73319f44af2b8594f3272f7d4..da58b0eff78e1bb99164d4f856446e29cad378d9 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
@@ -1095,10 +1152,10 @@ index da785f0b72f3d7c73319f44af2b8594f3272f7d4..da58b0eff78e1bb99164d4f856446e29
      # deduplicated, off-loop) so replicas that don't hold this session's
      # runner tunnel serve the same sidebar status.
 diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
-index e09da68b747418f13a635cff9ff903616ceee2eb..8ab9274e61c0bb9c4cbe412b00da7ea8c655c9b5 100644
+index e09da68b747418f13a635cff9ff903616ceee2eb..d1571976bb52631876b7a5f3f2066614f21cbf9a 100644
 --- a/omnigent/server/routes/_sessions/orchestration.py
 +++ b/omnigent/server/routes/_sessions/orchestration.py
-@@ -7746,6 +7746,11 @@ async def _forward_native_terminal_message(
+@@ -7746,6 +7746,13 @@ async def _forward_native_terminal_message(
                  exc_info=True,
                  extra={"session_id": session_id},
              )
@@ -1106,11 +1163,13 @@ index e09da68b747418f13a635cff9ff903616ceee2eb..8ab9274e61c0bb9c4cbe412b00da7ea8
 +        from omnigent.server import open_items_auto
 +
 +        # What the server recorded from the agent's chat labels rides along as context.
-+        event["content"] = await open_items_auto.with_pending_note(session_id, event["content"])
++        event["content"] = await open_items_auto.with_pending_note(
++            session_id, event["content"], harness=harness
++        )
      forward_options: dict[str, Any] = {}
      if native_shell_authorized:
          from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
-@@ -8412,6 +8417,13 @@ async def _forward_event_to_runner(
+@@ -8412,6 +8419,13 @@ async def _forward_event_to_runner(
                      exc_info=True,
                      extra={"session_id": session_id},
                  )
@@ -1119,7 +1178,7 @@ index e09da68b747418f13a635cff9ff903616ceee2eb..8ab9274e61c0bb9c4cbe412b00da7ea8
 +
 +        # What the server recorded from the agent's chat labels rides along as context.
 +        forwarded_data["content"] = await open_items_auto.with_pending_note(
-+            session_id, forwarded_data["content"]
++            session_id, forwarded_data["content"], harness=_resolve_harness(conv)
 +        )
  
      from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
@@ -1547,10 +1606,10 @@ index 0000000000000000000000000000000000000000..492d73933a10391daa8cd9812cae1a9d
 +    assert defines_label(markdown, "R1")
 diff --git a/tests/server/test_open_items_auto.py b/tests/server/test_open_items_auto.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c4b1725820be58152ec7f3f34d51b764bb0f2a64
+index 0000000000000000000000000000000000000000..22876167718e67fbe03f218b22cd6cbe1130a77f
 --- /dev/null
 +++ b/tests/server/test_open_items_auto.py
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,311 @@
 +"""Open items recorded from labels an agent writes only in chat, and the note that tells it."""
 +
 +from __future__ import annotations
@@ -1562,6 +1621,7 @@ index 0000000000000000000000000000000000000000..c4b1725820be58152ec7f3f34d51b764
 +import pytest
 +
 +from omnigent.entities import MessageData, NewConversationItem
++from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES
 +from omnigent.entities.open_items import normalize_new_item
 +from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE, framework_notices
 +from omnigent.server import open_items_auto
@@ -1794,18 +1854,34 @@ index 0000000000000000000000000000000000000000..c4b1725820be58152ec7f3f34d51b764
 +    session = _session(conversations)
 +    content = [{"type": "input_text", "text": "Next"}]
 +    monkeypatch.setattr(open_items_auto, "_installed", recorder)
-+    assert await open_items_auto.with_pending_note(session, content) == content
++
++    async def send(harness: str = "claude-native") -> object:
++        return await open_items_auto.with_pending_note(session, content, harness=harness)
++
++    assert await send() == content
 +    _say(conversations, session, "assistant", "[T1] **Rotate keys.**")
 +    await recorder.record(session)
-+    sent = await open_items_auto.with_pending_note(session, content)
++    # A harness that gives the model no notices leaves the note waiting.
++    assert await send("goose-native") == content
++    sent = await send()
 +    assert sent[:1] == content  # type: ignore[index]
 +    assert sent[1]["type"] == FRAMEWORK_NOTICE_BLOCK_TYPE  # type: ignore[index]
-+    assert framework_notices(sent) == [
++    note = (
 +        '[Open items] T1 "Rotate keys." was labelled in chat without being recorded, so it '
 +        "was added for you. Next time record items with sys_open_items_raise; set a topic "
 +        "or close them with sys_open_items_update if needed. Open now: 1."
-+    ]
-+    assert await open_items_auto.with_pending_note(session, content) == content
++    )
++    assert framework_notices(sent) == [note]
++    assert await send() == content
++
++    # The transcript shows it as its own display-only row, apart from the user's message.
++    [row] = [item for item in conversations.list_items(session).data if item.type == "error"]
++    assert (row.data.code, row.data.level, row.data.message) == (
++        open_items_auto.NOTE_ROW_CODE,
++        "info",
++        note,
++    )
++    assert "error" in NON_CONTENT_ITEM_TYPES
 +
 +
 +def test_only_a_completed_turn_reads_the_chat(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1845,6 +1921,108 @@ index 0000000000000000000000000000000000000000..c4b1725820be58152ec7f3f34d51b764
 +    for text in (ITEM_LABEL_INSTRUCTION, OPEN_ITEMS_INSTRUCTION):
 +        assert "automatic" not in text.lower()
 +        assert "for you" not in text
+diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
+index 3bf89bc43d5ecf9c39713dee70eb58cce9d648d9..9d0b1cde8b91e2683939dae8cf282b1d337bd02f 100644
+--- a/web/src/components/blocks/BlockRenderer.tsx
++++ b/web/src/components/blocks/BlockRenderer.tsx
+@@ -42,6 +42,8 @@ import { readTaskActivity, showsTaskActivity } from "@/lib/taskActivity";
+ import { ActivityNotice } from "./TaskActivityMessage";
+ import { TerminalCommandCard } from "./TerminalCommandCard";
+ import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
++import { SystemMessageView } from "./SystemMessage";
++import { frameworkNoteMessage } from "@/lib/systemMessage";
+ import { ToolCard, ToolGroupSummary } from "./ToolCard";
+ 
+ // Re-exported for the existing import sites; it lives in ./ChatMarkdown so
+@@ -1057,7 +1059,9 @@ function renderItem(
+           stderr={item.stderr}
+         />
+       );
+-    case "error":
++    case "error": {
++      const note = frameworkNoteMessage(item);
++      if (note) return <SystemMessageView key={key} message={note} />;
+       return (
+         <ErrorBanner
+           key={key}
+@@ -1082,6 +1086,7 @@ function renderItem(
+           }
+         />
+       );
++    }
+     case "policy_denied":
+       return <PolicyDeniedBanner key={key} reason={item.reason} phase={item.phase} />;
+     case "retry":
+diff --git a/web/src/components/blocks/FrameworkNoteRow.test.tsx b/web/src/components/blocks/FrameworkNoteRow.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..24882c0312f3468479bcc83adaa56e9f7e0425e0
+--- /dev/null
++++ b/web/src/components/blocks/FrameworkNoteRow.test.tsx
+@@ -0,0 +1,64 @@
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it } from "vitest";
++import type { ConversationItem } from "@/lib/conversationItems";
++import { itemsToBlocks } from "@/lib/itemsToBlocks";
++import type { RenderItem } from "@/lib/renderItems";
++import { FRAMEWORK_NOTE_CODE, frameworkNoteMessage } from "@/lib/systemMessage";
++import { BlockRenderer } from "./BlockRenderer";
++
++afterEach(cleanup);
++
++const NOTE =
++  '[Open items] T1 "Rotate keys." was labelled in chat without being recorded, so it was added for you.';
++
++const noteRow: RenderItem = {
++  kind: "error",
++  itemId: "err_note",
++  source: "execution",
++  code: FRAMEWORK_NOTE_CODE,
++  level: "info",
++  title: "Open items note to the agent",
++  message: NOTE,
++};
++
++describe("framework note rows", () => {
++  it("render as a collapsed system row that expands to the note", () => {
++    render(<BlockRenderer items={[noteRow]} sessionStatus="idle" />);
++    expect(screen.queryByTestId("error-pill")).toBeNull();
++    const toggle = screen.getByRole("button", { name: /Open items note to the agent/ });
++    expect(toggle).toHaveAttribute("aria-expanded", "false");
++    expect(screen.queryByText(NOTE)).toBeNull();
++    fireEvent.click(toggle);
++    expect(screen.getByText(NOTE)).toBeDefined();
++  });
++
++  it("keep their title and level from the stored item after a reload", () => {
++    const stored = {
++      id: "err_note",
++      type: "error",
++      response_id: "task_1",
++      status: "completed",
++      created_at: 1,
++      source: "execution",
++      code: FRAMEWORK_NOTE_CODE,
++      level: "info",
++      title: "Open items note to the agent",
++      message: NOTE,
++    } as unknown as ConversationItem;
++    const [block] = itemsToBlocks([stored]);
++    expect(block.type).toBe("error");
++    if (block.type !== "error") return;
++    expect(frameworkNoteMessage(block)).toEqual({
++      kind: "generic",
++      label: "Open items note to the agent",
++      body: NOTE,
++    });
++  });
++
++  it("leave other errors to the error banner", () => {
++    expect(frameworkNoteMessage({ code: FRAMEWORK_NOTE_CODE, message: NOTE })).toBeNull();
++    expect(
++      frameworkNoteMessage({ code: "workspace_recreated", level: "info", message: NOTE }),
++    ).toBeNull();
++  });
++});
 diff --git a/web/src/lib/__fixtures__/itemLabelCases.json b/web/src/lib/__fixtures__/itemLabelCases.json
 new file mode 100644
 index 0000000000000000000000000000000000000000..90f1059a2bcf5f35f8cda98e56d48fd95a9fdaba
@@ -2199,3 +2377,32 @@ index 0000000000000000000000000000000000000000..74fe5a6016f2c8ac73d76e577f4a90fd
 +    ).toEqual(links);
 +  });
 +});
+diff --git a/web/src/lib/systemMessage.ts b/web/src/lib/systemMessage.ts
+index a3698b368b608424bfd8fc04ebd6f17af0464cea..9c5efc1f2af23d6b42ea6403fbd38a448d83b266 100644
+--- a/web/src/lib/systemMessage.ts
++++ b/web/src/lib/systemMessage.ts
+@@ -91,6 +91,24 @@ const TASK_KIND_LABEL: Record<string, string> = {
+   client_tool: "Client tool",
+ };
+ 
++/** Code of the info `error` item that shows a framework note the agent was given with a message. */
++export const FRAMEWORK_NOTE_CODE = "framework_note";
++
++/**
++ * A framework note's transcript row, collapsed like other system markers, or
++ * `null` for any other error item. The note reached the model as context, so
++ * it is never part of the user's own message.
++ */
++export function frameworkNoteMessage(error: {
++  code: string;
++  level?: "error" | "info";
++  title?: string;
++  message: string;
++}): ParsedSystemMessage | null {
++  if (error.code !== FRAMEWORK_NOTE_CODE || error.level !== "info") return null;
++  return { kind: "generic", label: error.title || "Note to the agent", body: error.message };
++}
++
+ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
+   const newlineIdx = text.indexOf("\n");
+   const firstLine = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
