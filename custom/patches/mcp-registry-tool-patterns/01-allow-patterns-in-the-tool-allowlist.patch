@@ -1,0 +1,497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 05:02:36 +0000
+Subject: [PATCH] feat(mcp-registry): allow * patterns in the tool allowlist
+
+A registry service lists the upstream tools it allows by exact name, so
+the registry file has to be regenerated and the server restarted whenever
+the service adds a tool. For services with many tools (a search endpoint
+per index, generated tool sets) that list is long and goes stale.
+
+An entry in `tools` may now hold `*`, standing for any run of characters:
+`search_*`, `*_read`, `get_*_by_id`, and `"*"` alone for every tool. The
+match is literal, case-sensitive and anchored at both ends; no regular
+expression is built from the file. Exact names behave as before.
+
+Patterns are not expanded when tools are listed. Every place that checked
+membership in the list (tool discovery, the gateway listing and each call
+on the gateway and legacy session routes) asks the service instead, so
+the allowlist is enforced on the server for every call and a tool that
+appears upstream later is admitted or refused by its name. `"*"` must be
+the only entry and is logged at startup; `**`, `?` and `[...]` in a
+pattern fail validation. The registry has no deny list and none is
+added: user allowlists, an agent's own tool list and policies keep
+narrowing on top, and a policy deny still wins.
+
+A server without this change reads a pattern as an exact name that
+matches nothing, so patterns are replaced with names before a rollback;
+the registry README says so.
+
+Not upstream yet: not proposed, and there is no contribution branch for
+it. Upstream's design describes the exact allowlist as the
+administrator's review step (designs/MCP_REGISTRY_GATEWAY.md), and no
+open issue or pull request asks for patterns.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ designs/MCP_REGISTRY_GATEWAY.md               |   6 +-
+ examples/mcp-registry/README.md               |  47 ++++++-
+ omnigent/server/mcp_policy_adapter.py         |   2 +-
+ omnigent/server/mcp_registry.py               |  46 ++++++-
+ omnigent/server/registry_gateway.py           |   4 +-
+ tests/server/integration/test_mcp_registry.py |  61 +++++++++
+ tests/server/test_mcp_registry.py             | 121 ++++++++++++++++++
+ web/src/components/McpRegistry.test.tsx       |   9 ++
+ web/src/components/McpRegistry.tsx            |   7 +-
+ 9 files changed, 294 insertions(+), 9 deletions(-)
+
+diff --git a/designs/MCP_REGISTRY_GATEWAY.md b/designs/MCP_REGISTRY_GATEWAY.md
+index 7b1c801f5d21afa9716eeddb8a3db2580648b370..169544e789fc0df4be4e838fce4a297b9eab4e71 100644
+--- a/designs/MCP_REGISTRY_GATEWAY.md
++++ b/designs/MCP_REGISTRY_GATEWAY.md
+@@ -69,8 +69,10 @@ flowchart LR
+ ```
+ 
+ - **Administrator:** configures approved destinations, auth and nonempty tool
+-  allowlists in `OMNIGENT_MCP_REGISTRY`. Optional user allowlists limit visibility
+-  and use. Config changes require a server restart.
++  allowlists in `OMNIGENT_MCP_REGISTRY`. An allowlist entry is an exact tool name
++  or a `*` pattern, checked on every listing and call rather than expanded once;
++  `"*"` alone allows every upstream tool and is logged at startup. Optional user
++  allowlists limit visibility and use. Config changes require a server restart.
+ - **User:** connects an account through **Settings → MCP** or the launch picker, then
+   selects services per session. Selection and account connection are independent.
+ - **Runner:** receives service references and tool schemas. A registry entry
+diff --git a/examples/mcp-registry/README.md b/examples/mcp-registry/README.md
+index bd9b03bf2f395b5b4f3684d792cfd8ad82e82b98..0c3c5acfdeba669d58bfb292fc7a6c6af6491a49 100644
+--- a/examples/mcp-registry/README.md
++++ b/examples/mcp-registry/README.md
+@@ -289,7 +289,7 @@ admin database/UI. Settings shows users only the entries they can access.
+ | `public_url` | External Omnigent base URL used for OAuth callbacks; HTTPS except localhost. |
+ | `services[].id` | Stable service key, also used in agent bundles and `service__tool` names. |
+ | `url` | Administrator-approved Streamable HTTP MCP destination. |
+-| `tools` | Required, nonempty list of allowed upstream tool names. |
++| `tools` | Required, nonempty list of allowed upstream tool names or `*` patterns; see [Tool allowlist patterns](#tool-allowlist-patterns). |
+ | `allowed_users` | Optional list of authenticated user IDs; omitted permits all users. |
+ | `auth` | `none`, personal `bearer`, configured `oauth`, or existing `github`/`databricks`. |
+ | `oauth` | Authorization/token URLs, client ID, scopes, optional `resource` and `client_secret_env`. |
+@@ -377,6 +377,51 @@ sequenceDiagram
+   G-->>H: Policy-checked result
+ ```
+ 
++### Tool allowlist patterns
++
++An entry in `tools` is an exact upstream tool name or a pattern, in which `*`
++stands for any run of characters, including none:
++
++```yaml
++tools: [whoami, read_*, "*_search"] # an exact name, a prefix, a suffix
++```
++
++```yaml
++tools: ["*"] # every tool the upstream offers
++```
++
++Quote an entry that starts with `*`; YAML reads a bare leading `*` as an alias.
++
++- **Matching.** An entry is compared with the whole tool name, case-sensitively,
++  as literal text. `*` is the only wildcard: `?`, `[...]` and regular-expression
++  syntax mean nothing, and no regular expression is built from the file. An
++  entry with `**`, or with both `*` and one of `?`, `[`, `]`, fails startup like
++  any other invalid field. Exact names work as before.
++- **Checked per call, not expanded.** The server does not turn a pattern into a
++  list of names. It checks the name against the entries when it lists a
++  service's tools and again on every call, before the credential is resolved.
++  A tool the upstream adds later is therefore offered and callable as soon as
++  its name matches, with no restart and no review by the administrator. Use the
++  narrowest pattern that does the job, and keep exact names for a service that
++  mixes read and write tools under one prefix.
++- **`"*"` is an explicit choice.** It allows every tool the upstream offers,
++  now and later, with the user's credential. There is no default (`tools`
++  stays required and nonempty), `"*"` must be the only entry, and the server
++  logs a warning naming the service at startup.
++- **No deny list.** The registry has allowlists only, so a pattern cannot
++  exclude a name. To leave out a tool that a pattern would admit, list the
++  names you want or use narrower patterns. Everything that narrows access
++  still applies on top and can only narrow: `allowed_users`, an agent's own
++  `tools` list for the service (exact names), and tool-call policies. A
++  policy that denies a call wins over any pattern.
++- **Rolling back.** A server from before patterns reads `read_*` as an exact
++  tool name, which matches nothing: the file still loads and the service's
++  tools disappear from sessions without an error. Replace patterns with names
++  before rolling back.
++
++`GET /v1/mcp-registry/services` returns the entries as written. **Settings →
++MCP** shows them the same way, and `["*"]` as "every tool the service offers".
++
+ ## Embedding and downstream compatibility
+ 
+ The registry and gateway are enabled only when `OMNIGENT_MCP_REGISTRY` is configured.
+diff --git a/omnigent/server/mcp_policy_adapter.py b/omnigent/server/mcp_policy_adapter.py
+index 033670a483f33c98b72602a0da8f8d68c1ac5eb7..bb1e478379a0cd6dc89ef97c9403ccb4b04651c7 100644
+--- a/omnigent/server/mcp_policy_adapter.py
++++ b/omnigent/server/mcp_policy_adapter.py
+@@ -92,7 +92,7 @@ class McpPolicyAdapter:
+         return [
+             t.model_dump(by_alias=True, exclude_none=True)
+             for t in tools
+-            if t.name in context.service.tools
++            if context.service.allows_tool(t.name)
+             and (context.config.tools is None or t.name in context.config.tools)
+         ]
+ 
+diff --git a/omnigent/server/mcp_registry.py b/omnigent/server/mcp_registry.py
+index f3c17575cda09ad8c9790cb9e6626dc7078872b8..69c7993c0dea6a7e17a166cbc01d5d574def811b 100644
+--- a/omnigent/server/mcp_registry.py
++++ b/omnigent/server/mcp_registry.py
+@@ -73,6 +73,30 @@ def _upstream_error(exc: Exception) -> McpUpstreamError:
+     )
+ 
+ 
++_TOOL_WILDCARD = "*"
++
++
++def _tool_pattern_matches(pattern: str, tool: str) -> bool:
++    """Whether *tool* is *pattern*, reading each ``*`` as any run of characters.
++
++    Literal, anchored at both ends: no regular expression is built from the file.
++    """
++    first, *middle = pattern.split(_TOOL_WILDCARD)
++    if not middle:
++        return tool == pattern
++    last = middle.pop()
++    end = len(tool) - len(last)
++    position = len(first)
++    if position > end or not tool.startswith(first) or not tool.endswith(last):
++        return False
++    for part in middle:
++        found = tool.find(part, position, end)
++        if found < 0:
++            return False
++        position = found + len(part)
++    return True
++
++
+ class OAuthConfig(BaseModel):
+     """Explicit OAuth configuration for an approved MCP resource."""
+ 
+@@ -121,11 +145,26 @@ class McpService(BaseModel):
+                 raise ValueError(
+                     "MCP/OAuth URLs require HTTPS (allow_http is for local development)"
+                 )
++        for entry in self.tools:
++            if _TOOL_WILDCARD not in entry:
++                continue
++            if entry == _TOOL_WILDCARD and len(self.tools) > 1:
++                raise ValueError("tools: '*' allows every tool and must be the only entry")
++            if _TOOL_WILDCARD * 2 in entry or any(c in entry for c in "?[]"):
++                raise ValueError("tools patterns take single '*' wildcards only")
+         return self
+ 
+     def permits(self, user_id: str) -> bool:
+         return self.allowed_users is None or user_id in self.allowed_users
+ 
++    @property
++    def allows_every_tool(self) -> bool:
++        return self.tools == [_TOOL_WILDCARD]
++
++    def allows_tool(self, tool: str) -> bool:
++        """Whether the administrator's allowlist admits the upstream tool named *tool*."""
++        return any(_tool_pattern_matches(pattern, tool) for pattern in self.tools)
++
+ 
+ class McpRegistryConfig(BaseModel):
+     model_config = ConfigDict(extra="forbid")
+@@ -189,6 +228,9 @@ class McpRegistry:
+             raise ValueError(
+                 "Set OMNIGENT_MCP_OAUTH_STATE_SECRET to at least 32 random characters"
+             )
++        for s in config.services:
++            if s.allows_every_tool:
++                _logger.warning("MCP registry service %s allows every upstream tool", s.id)
+ 
+     def service(self, service_id: str, user_id: str) -> McpService:
+         service = self.services.get(service_id)
+@@ -327,7 +369,7 @@ class McpRegistry:
+         arguments: dict[str, Any] | None = None,
+     ) -> Any:
+         service = self.service(service_id, user_id)
+-        if tool is not None and tool not in service.tools:
++        if tool is not None and not service.allows_tool(tool):
+             raise ConnectionError("Tool is not allowed by the MCP registry")
+         token = await self.token(service, user_id, app_state)
+         headers = {"Authorization": f"Bearer {token}"} if token else {}
+@@ -351,7 +393,7 @@ class McpRegistry:
+                     cursor = None
+                     for _ in range(100):
+                         result = await session.list_tools(cursor=cursor)
+-                        tools.extend(t for t in result.tools if t.name in service.tools)
++                        tools.extend(t for t in result.tools if service.allows_tool(t.name))
+                         cursor = result.nextCursor
+                         if not cursor:
+                             return tools
+diff --git a/omnigent/server/registry_gateway.py b/omnigent/server/registry_gateway.py
+index 8b7ebd6300bef36d1af7f29f13e062f5624ffbf7..ead3d92c1b88e9e18bfb63ff3ba910473df4cf1f 100644
+--- a/omnigent/server/registry_gateway.py
++++ b/omnigent/server/registry_gateway.py
+@@ -43,7 +43,7 @@ async def registry_tools(
+                 service, user
+             )
+             for tool in definitions:
+-                if tool.name in service.tools and (
++                if service.allows_tool(tool.name) and (
+                     config.tools is None or tool.name in config.tools
+                 ):
+                     tools.append(
+@@ -76,7 +76,7 @@ async def execute_registry_tool(
+             raise ConnectionError("Tool is not enabled for this session")
+         user = registry_user({"run_as": credential_user} if credential_user else None)
+         service = registry.service(config.name, user)
+-        if tool not in service.tools:
++        if not service.allows_tool(tool):
+             raise ConnectionError("Tool is not allowed by the MCP registry")
+         result = await gateway_backend(registry, request.app.state).call_tool(
+             service, user, tool, arguments
+diff --git a/tests/server/integration/test_mcp_registry.py b/tests/server/integration/test_mcp_registry.py
+index 3dd23ce203cbdd2e7c16ecff0441cfa85f9d9afb..5e1f89153e82e749819e030d36c35976fc8818ce 100644
+--- a/tests/server/integration/test_mcp_registry.py
++++ b/tests/server/integration/test_mcp_registry.py
+@@ -132,6 +132,67 @@ async def test_registry_tools_are_attached_discovered_and_executed_on_server(
+     execute.assert_not_awaited()
+ 
+ 
++async def test_allowlist_patterns_filter_discovery_and_gate_each_call(client, app, monkeypatch):
++    registry = McpRegistry(
++        McpRegistryConfig(
++            services=[
++                McpService(
++                    id="tracker",
++                    title="Tracker",
++                    url="https://example.test/mcp",
++                    auth="none",
++                    tools=["read_*"],
++                )
++            ]
++        ),
++        None,
++    )
++    app.state.mcp_registry = registry
++    upstream = [
++        Tool(name=name, inputSchema={"type": "object"})
++        for name in ("read_ticket", "read_comment", "delete_ticket")
++    ]
++    execute = AsyncMock(
++        side_effect=[
++            upstream,
++            CallToolResult(content=[TextContent(type="text", text="Comment 1")]),
++        ]
++    )
++    monkeypatch.setattr(registry, "execute", execute)
++    session = await create_test_session(client, name="registry-agent")
++    session_id = session["id"]
++    attached = await client.post(
++        f"/v1/sessions/{session_id}/agent/mcp-servers",
++        json={"name": "tracker", "transport": "registry"},
++    )
++    assert attached.status_code == 200, attached.text
++    listed = await client.post(
++        "/v1/mcp/tracker",
++        headers={"X-Omnigent-Session-Id": session_id},
++        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
++    )
++    assert [t["name"] for t in listed.json()["result"]["tools"]] == ["read_ticket", "read_comment"]
++
++    async def call(rpc_id, tool):
++        response = await client.post(
++            f"/v1/sessions/{session_id}/mcp",
++            json={
++                "jsonrpc": "2.0",
++                "id": rpc_id,
++                "method": "tools/call",
++                "params": {"name": f"tracker__{tool}", "arguments": {}},
++            },
++        )
++        return response.json()
++
++    allowed = await call(2, "read_comment")
++    assert allowed["result"]["content"][0]["text"] == "Comment 1", allowed
++    # No pattern admits delete_ticket, so it is refused before any upstream call.
++    refused = await call(3, "delete_ticket")
++    assert "not allowed by the MCP registry" in json.dumps(refused), refused
++    assert execute.await_count == 2
++
++
+ @pytest.fixture
+ def launch_registry(app):
+     app.state.mcp_registry = McpRegistry(
+diff --git a/tests/server/test_mcp_registry.py b/tests/server/test_mcp_registry.py
+index dda9b6ec219a4796a35a19e92df9af4fb153ea3d..bcf5a29a73d0cdacde4a655daf992e0345412026 100644
+--- a/tests/server/test_mcp_registry.py
++++ b/tests/server/test_mcp_registry.py
+@@ -116,6 +116,127 @@ async def test_tool_and_service_rules_are_checked_before_credential_resolution(
+     resolve.assert_not_awaited()
+ 
+ 
++@pytest.mark.parametrize(
++    ("pattern", "tool", "allowed"),
++    [
++        ("read_ticket", "read_ticket", True),
++        ("read_ticket", "read_tickets", False),
++        ("read_ticket", "xread_ticket", False),
++        ("search_*", "search_issues", True),
++        ("search_*", "search_", True),
++        ("search_*", "research_issues", False),
++        ("search_*", "SEARCH_issues", False),
++        ("*_ticket", "read_ticket", True),
++        ("*_ticket", "read_ticket_history", False),
++        ("get_*_by_id", "get_issue_by_id", True),
++        ("get_*_by_id", "get__by_id", True),
++        ("get_*_by_id", "get_by_id", False),
++        ("get_*_by_id", "get_issue_by_id_and_delete", False),
++        ("a*b*c", "a-b-b-c", True),
++        ("a*b*c", "a-c-b", False),
++        ("ab*ba", "aba", False),
++        # Regular-expression syntax in an entry is literal text.
++        ("read.*", "read_ticket", False),
++        ("read.*", "read.ticket", True),
++        ("(read|delete)_*", "delete_ticket", False),
++        ("*", "delete_ticket", True),
++        ("*", "", True),
++    ],
++)
++def test_allowlist_patterns_are_literal_and_anchored(pattern, tool, allowed):
++    assert service(tools=[pattern]).allows_tool(tool) is allowed
++
++
++def test_any_allowlist_entry_may_admit_a_tool():
++    entry = service(tools=["read_ticket", "search_*"])
++    assert [entry.allows_tool(t) for t in ("read_ticket", "search_all", "delete_ticket")] == [
++        True,
++        True,
++        False,
++    ]
++    assert not entry.allows_every_tool
++    assert service(tools=["*"]).allows_every_tool
++
++
++@pytest.mark.parametrize(
++    "tools",
++    [["*", "read_ticket"], ["read_ticket", "*"], ["search_**"], ["get_?*"], ["get_[a-z]*"]],
++)
++def test_ambiguous_allowlist_patterns_fail_validation(tools):
++    with pytest.raises(ValidationError, match="tools"):
++        service(tools=tools)
++
++
++@pytest.mark.asyncio
++async def test_patterns_are_checked_on_every_call_and_filter_discovery(registry, monkeypatch):
++    registry.services["tracker"] = service(auth="none", tools=["read_*"])
++    resolve = AsyncMock()
++    monkeypatch.setattr(registry, "token", resolve)
++    with pytest.raises(ConnectionError, match="not allowed"):
++        await registry.execute("tracker", "alice", SimpleNamespace(), tool="delete_ticket")
++    resolve.assert_not_awaited()
++
++    called = []
++
++    def upstream(request):
++        if request.method == "GET":
++            return httpx.Response(405)
++        if request.method == "DELETE":
++            return httpx.Response(200)
++        message = json.loads(request.content)
++        if "id" not in message:
++            return httpx.Response(202)
++        if message["method"] == "tools/call":
++            called.append(message["params"]["name"])
++            result = {"content": [{"type": "text", "text": "ok"}]}
++        elif message["method"] == "initialize":
++            result = {
++                "protocolVersion": "2025-11-25",
++                "capabilities": {"tools": {}},
++                "serverInfo": {"name": "pattern-test", "version": "1"},
++            }
++        else:
++            names = ["read_ticket", "read_comment", "delete_ticket"]
++            result = {"tools": [{"name": n, "inputSchema": {"type": "object"}} for n in names]}
++        return httpx.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": result})
++
++    client_type = httpx.AsyncClient
++    monkeypatch.setattr(
++        httpx,
++        "AsyncClient",
++        lambda **kwargs: client_type(transport=httpx.MockTransport(upstream), **kwargs),
++    )
++    resolve.return_value = None
++    tools = await registry.execute("tracker", "alice", SimpleNamespace())
++    assert [tool.name for tool in tools] == ["read_ticket", "read_comment"]
++    # A tool that never appeared in a listing is still admitted or refused by name.
++    await registry.execute("tracker", "alice", SimpleNamespace(), tool="read_history")
++    with pytest.raises(ConnectionError, match="not allowed"):
++        await registry.execute("tracker", "alice", SimpleNamespace(), tool="delete_ticket")
++    assert called == ["read_history"]
++
++
++def test_a_registry_file_with_patterns_loads_and_allowing_everything_is_logged(
++    db_uri, tmp_path, monkeypatch, caplog
++):
++    from omnigent.server import mcp_registry
++
++    entries = [
++        service(auth="none", tools=["search_*", "read_ticket"]).model_dump(),
++        service(id="open", auth="none", tools=["*"]).model_dump(),
++    ]
++    catalog = tmp_path / "mcp-registry.yaml"
++    catalog.write_text(json.dumps({"services": entries}))
++    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
++    monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
++    with caplog.at_level("WARNING", logger=mcp_registry.__name__):
++        registry = mcp_registry.build_mcp_registry_from_env(db_uri)
++    assert registry.services["tracker"].tools == ["search_*", "read_ticket"]
++    assert [r.getMessage() for r in caplog.records] == [
++        "MCP registry service open allows every upstream tool"
++    ]
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize(
+     "refresh_response", [{}, {"refresh_token": None}, {"refresh_token": "rotated"}]
+diff --git a/web/src/components/McpRegistry.test.tsx b/web/src/components/McpRegistry.test.tsx
+index 856cfc174760dcc8589eea8b397fe263d4f19b79..389f94ffc6b2bebfa1985c67e52f0fa70be3d6bb 100644
+--- a/web/src/components/McpRegistry.test.tsx
++++ b/web/src/components/McpRegistry.test.tsx
+@@ -33,6 +33,15 @@ describe("MCP account connections", () => {
+     expect(document.querySelector('[data-settings-row-action="saveToken"]')).not.toBeNull();
+   });
+ 
++  it.each([
++    [["read_ticket", "search_*"], "Available tools: read_ticket, search_*"],
++    [["*"], "Available tools: every tool the service offers"],
++  ])("describes the allowlist %j", async (tools, text) => {
++    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, tools }] });
++    render(<McpRegistryConnections />);
++    expect(await screen.findByText(text)).toBeInTheDocument();
++  });
++
+   it.each(["github", "databricks"])(
+     "links shared %s accounts to their provider controls",
+     async (auth) => {
+diff --git a/web/src/components/McpRegistry.tsx b/web/src/components/McpRegistry.tsx
+index 2c4617f58c3ed5ff108207236a294bb6265e9ca8..faf66e65388dceda29eb0ed9a9fcab87c06323ce 100644
+--- a/web/src/components/McpRegistry.tsx
++++ b/web/src/components/McpRegistry.tsx
+@@ -94,7 +94,12 @@ function ServiceConnection({
+           {service.connected ? "Connected" : "Not connected"}
+         </span>
+       </div>
+-      <p className="text-xs text-muted-foreground">Available tools: {service.tools.join(", ")}</p>
++      <p className="text-xs text-muted-foreground">
++        Available tools:{" "}
++        {service.tools.length === 1 && service.tools[0] === "*"
++          ? "every tool the service offers"
++          : service.tools.join(", ")}
++      </p>
+       <div className="flex flex-wrap gap-2">
+         {/* One button per row action, so each names its action as the Settings catalog does. */}
+         {service.auth === "bearer" &&

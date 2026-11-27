@@ -1,0 +1,754 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 05:29:23 +0000
+Subject: [PATCH] feat(sandbox): gate an owner-identity sandbox on the user's
+ connection
+
+A sandbox provider that launches each sandbox as the session owner (the
+Databricks provider) needs that user's account connection. The server
+already refuses a launch without one, with a 409 that says to connect,
+but the New session host menu offers the option to everyone, picks it
+by default, and the refusal only arrives after the user presses Start.
+
+`GET /v1/info` now names the connection such a provider launches as, in
+`sandbox_provider_owner_connections` (e.g. {"databricks":
+"databricks"}), read from the launcher's `owner_credential_provider`.
+The route is unauthenticated, so it carries that deployment fact only.
+The web asks the caller's own `/v1/connections/<name>/status` and, in
+the New session host menu:
+
+- disables the provider's row while the user is not connected, with a
+  menu row under it that opens Settings -> Sandbox Integrations, the
+  way the menu already keeps an unavailable sandbox visible but
+  disabled with its reason;
+- shows a plain "unavailable" line when the server has no such
+  connection set up, where connecting is not possible;
+- blocks Start with the same reason while that sandbox is the pick.
+
+An unknown or failed status blocks nothing. The launch path is
+unchanged: the server still refuses a launch without a connection, for
+every client, including the fork, switch-host, workflow, project and
+automation pickers, which do not show the gate. A connection to a
+different workspace than the server's sandboxes is likewise still
+refused only at launch.
+
+Tested with the provider's fake launchers and mocked status responses;
+not run against a workspace or in a browser.
+
+Not upstream yet: not proposed, and there is no contribution branch for
+it. No open upstream issue or pull request covers it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ deploy/databricks/README.md                   |   4 +
+ feature-map/composer.md                       |  12 ++
+ omnigent/server/app.py                        |   7 ++
+ omnigent/server/managed_hosts.py              |  21 ++++
+ openapi.json                                  |   8 ++
+ tests/server/test_managed_hosts.py            |  72 +++++++++++
+ tests/server/test_managed_hosts_databricks.py |   5 +
+ .../hooks/useSandboxConnectionBlocks.test.tsx | 116 ++++++++++++++++++
+ web/src/hooks/useSandboxConnectionBlocks.ts   |  70 +++++++++++
+ web/src/lib/capabilities.test.ts              |  11 ++
+ web/src/lib/capabilities.ts                   |  14 ++-
+ web/src/shell/NewChatDialog.test.tsx          |  63 ++++++++++
+ web/src/shell/NewChatDialog.tsx               |  25 ++++
+ .../shell/SandboxConnectionMenuNotices.tsx    |  40 ++++++
+ 14 files changed, 466 insertions(+), 2 deletions(-)
+ create mode 100644 web/src/hooks/useSandboxConnectionBlocks.test.tsx
+ create mode 100644 web/src/hooks/useSandboxConnectionBlocks.ts
+ create mode 100644 web/src/shell/SandboxConnectionMenuNotices.tsx
+
+diff --git a/deploy/databricks/README.md b/deploy/databricks/README.md
+index 458620611979898ddb6caf365e5314909a4d4355..74dbe87cca9b23e29915e25aeee83af7caacf743 100644
+--- a/deploy/databricks/README.md
++++ b/deploy/databricks/README.md
+@@ -324,6 +324,10 @@ token they connected under **Settings → Connections → Databricks** (a Databr
+ account connection). The token inside the Sandbox and its proxy bearer are that
+ user's, and the server's own identity is never used: a user who has not connected
+ is refused with a "Connect Databricks first" message and no Sandbox is created.
++The New session host menu shows the option disabled, with a row that opens the
++connect page, until the user has connected; `GET /v1/info` tells the web which
++connection the provider needs in `sandbox_provider_owner_connections`. That is a
++hint only: the launch is still refused on the server, for every way of starting one.
+ Code running in a Sandbox, including the agent, can read that token and act in
+ the workspace as its owner.
+ 
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index 8300037883f2f2f47c267a9499447230000d4dda..3fea5c842a8a4da9904cd2ca6c8a7114bf7bd1ac 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -324,6 +324,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+   dismissed or the missing setup is completed.
+ - `sandbox-profiles`: participating providers add a [profile picker](sandbox-profiles.md)
+   to New session; Start waits for an authorized, current selection.
++- `sandbox-connection-gate`: a sandbox provider that launches as the signed-in
++  user (Databricks Sandbox) is disabled in the New session host menu until that
++  user has connected the account. A row under it, **Connect Databricks to use
++  Databricks Sandbox**, opens Settings → Sandbox Integrations. While that sandbox
++  is the current pick, Start is blocked with the same reason. States: connected
++  (normal row), not connected, server has no such connection set up (a plain
++  line, nothing to click), and status unknown or failed (row stays enabled; the
++  server refuses the launch). Code and tests:
++  `web/src/hooks/useSandboxConnectionBlocks.ts`,
++  `web/src/shell/SandboxConnectionMenuNotices.tsx`, and the "launches as its
++  owner" cases in `web/src/shell/NewChatDialog.test.tsx`. Fork, Switch host,
++  workflow, project and automation pickers do not show the gate.
+ - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
+   line indents it as a list item; the newline gesture continues the list
+   (numbers increment) and ends it after an empty item.
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index 0f35a6461773956926028d49806405cc07e21a20..b2f793f8d0da929e361843bb48d4186fb72d0d37 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -303,6 +303,10 @@ class ServerInfoResponse(BaseModel):
+     # ``{"agent_sandbox": "Keep your laptop signed in."}``. The automation form
+     # shows the run target's notice. Providers without one are absent.
+     sandbox_provider_automation_notices: dict[str, str] = {}
++    # The per-user connection a provider launches sandboxes as, e.g.
++    # ``{"databricks": "databricks"}``. The web disables that provider's picker
++    # row until the caller has the connection. Providers needing none are absent.
++    sandbox_provider_owner_connections: dict[str, str] = {}
+     enabled_connections: list[str]
+     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
+     public_sharing_enabled: bool
+@@ -4087,12 +4091,14 @@ def create_app(
+         sandbox_providers: list[str] = []
+         sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+         sandbox_provider_automation_notices: dict[str, str] = {}
++        sandbox_provider_owner_connections: dict[str, str] = {}
+         if sandbox_config is not None and sandbox_config.managed_launch_supported:
+             managed_sandboxes_enabled = True
+             sandbox_provider = sandbox_config.default.provider
+             sandbox_providers = list(sandbox_config.launchable_providers())
+             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+             sandbox_provider_automation_notices = sandbox_config.provider_automation_notices()
++            sandbox_provider_owner_connections = sandbox_config.provider_owner_connections()
+         # enabled_connections lists the connection providers this deploy has
+         # wired (config + store present), in a stable order. The web UI shows
+         # the Sandbox Integrations nav when the list is non-empty and renders
+@@ -4181,6 +4187,7 @@ def create_app(
+                 "sandbox_providers": sandbox_providers,
+                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                 "sandbox_provider_automation_notices": sandbox_provider_automation_notices,
++                "sandbox_provider_owner_connections": sandbox_provider_owner_connections,
+                 "enabled_connections": enabled_connections,
+                 "sharing_mode": sharing_mode.value,
+                 "public_sharing_enabled": public_sharing_enabled,
+diff --git a/omnigent/server/managed_hosts.py b/omnigent/server/managed_hosts.py
+index 7f6df768a17a2a60fd82810c9adb15b0445c508b..d936f95c7fd68a92697351d17579b10ab7a847fc 100644
+--- a/omnigent/server/managed_hosts.py
++++ b/omnigent/server/managed_hosts.py
+@@ -1091,6 +1091,27 @@ class ManagedSandboxDeployment:
+                     notices[config.provider] = notice
+         return notices
+ 
++    def provider_owner_connections(self) -> dict[str, str]:
++        """
++        The per-user connection each launchable provider launches as, for ``/v1/info``.
++
++        A provider whose launcher acts as the session owner can only launch for
++        a user who has connected that account, so the web checks the caller's
++        connection status before offering it. Deployment facts only: ``/v1/info``
++        is unauthenticated, and the launch itself still refuses without one.
++
++        :returns: Connection provider keyed by sandbox provider, e.g.
++            ``{"databricks": "databricks"}``; a provider that needs none is absent.
++        """
++        connections: dict[str, str] = {}
++        for config in self.configs:
++            if config.managed_launch_supported and config.provider is not None:
++                # getattr: embedding deployments may inject duck-typed launchers.
++                needed = getattr(config.launcher_factory(), "owner_credential_provider", None)
++                if needed:
++                    connections[config.provider] = needed
++        return connections
++
+ 
+ @dataclass
+ class ManagedHostLaunch:
+diff --git a/openapi.json b/openapi.json
+index 88fde6420dbc48e2550a2dc071938dc786c7f4ff..4deb4460891d9ae1ac87cde581691cb0c6e431eb 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -8215,6 +8215,14 @@
+             "title": "Sandbox Provider Capabilities",
+             "type": "object"
+           },
++          "sandbox_provider_owner_connections": {
++            "additionalProperties": {
++              "type": "string"
++            },
++            "default": {},
++            "title": "Sandbox Provider Owner Connections",
++            "type": "object"
++          },
+           "sandbox_providers": {
+             "items": {
+               "type": "string"
+diff --git a/tests/server/test_managed_hosts.py b/tests/server/test_managed_hosts.py
+index 98530292f3f88e973ec06f7454acf083b8b6cf70..e1510f6c99a7c05d03d416a603cc802055458dc3 100644
+--- a/tests/server/test_managed_hosts.py
++++ b/tests/server/test_managed_hosts.py
+@@ -2460,6 +2460,46 @@ def test_provider_automation_notices_list_only_launchable_providers_that_set_one
+     }
+ 
+ 
++class _OwnerIdentityLauncher(FakeSandboxLauncher):
++    """A provider that launches each sandbox as the session owner."""
++
++    owner_credential_provider = "databricks"
++
++
++def test_provider_owner_connections_name_the_connection_a_provider_launches_as() -> None:
++    """A provider whose launcher acts as its owner reports which connection that
++    is; one that needs none, or can't launch, is absent."""
++
++    def unlaunchable_factory() -> _OwnerIdentityLauncher:
++        raise AssertionError("a provider that can't launch must not be instantiated")
++
++    deployment = ManagedSandboxDeployment(
++        configs=(
++            *(
++                ManagedSandboxConfig(
++                    server_url="https://s",
++                    provider=provider,
++                    token_ttl_s=3600,
++                    launcher_factory=factory,
++                )
++                for provider, factory in (
++                    ("owned", _OwnerIdentityLauncher),
++                    ("shared", FakeSandboxLauncher),
++                )
++            ),
++            ManagedSandboxConfig(
++                server_url="https://s",
++                provider="unlaunchable",
++                token_ttl_s=3600,
++                launcher_factory=unlaunchable_factory,
++                managed_launch_supported=False,
++            ),
++        )
++    )
++
++    assert deployment.provider_owner_connections() == {"owned": "databricks"}
++
++
+ def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
+     """A provider that manages sandbox profiles is reported as no destination for
+     a move, which the move route refuses, whether profile discovery is on or not."""
+@@ -2717,6 +2757,38 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
+     assert body["sandbox_provider"] is None
+ 
+ 
++async def test_info_reports_the_connection_a_provider_launches_as(
++    db_uri: str,
++    tmp_path: Path,
++) -> None:
++    """``GET /v1/info`` names the connection an owner-identity provider needs, in
++    its own map, and nothing per-user: the route is unauthenticated."""
++    config = ManagedSandboxDeployment(
++        configs=tuple(
++            ManagedSandboxConfig(
++                server_url="https://s.example.com",
++                provider=provider,
++                launcher_factory=factory,
++                token_ttl_s=3600,
++            )
++            for provider, factory in (
++                ("owned", _OwnerIdentityLauncher),
++                ("shared", FakeSandboxLauncher),
++            )
++        )
++    )
++    app = _capability_probe_app(db_uri, tmp_path, config)
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++        resp = await client.get("/v1/info")
++    assert resp.status_code == 200, resp.text
++    body = resp.json()
++    assert body["sandbox_provider_owner_connections"] == {"owned": "databricks"}
++    assert body["sandbox_providers"] == ["owned", "shared"]
++    TypeAdapter(dict[str, dict[str, bool]]).validate_python(
++        body["sandbox_provider_capabilities"], strict=True
++    )
++
++
+ async def test_info_reports_a_providers_automation_notice_apart_from_its_flags(
+     db_uri: str,
+     tmp_path: Path,
+diff --git a/tests/server/test_managed_hosts_databricks.py b/tests/server/test_managed_hosts_databricks.py
+index 278ca60c905de3524b449c77883e713e16de6413..e1b5ae50e95bf96bbf05ce726d354e0f735bd53d 100644
+--- a/tests/server/test_managed_hosts_databricks.py
++++ b/tests/server/test_managed_hosts_databricks.py
+@@ -151,6 +151,11 @@ async def test_launch_for_an_unconnected_owner_is_a_409_connect_prompt(db_uri: s
+     assert "Connect Databricks" in str(info.value.detail)
+ 
+ 
++def test_the_databricks_provider_reports_the_connection_it_launches_as() -> None:
++    """The picker gate reads this; the 409 above still guards the launch itself."""
++    assert _owner_deployment().provider_owner_connections() == {"databricks": "databricks"}
++
++
+ _DORMANT_HOST_ID = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
+ 
+ 
+diff --git a/web/src/hooks/useSandboxConnectionBlocks.test.tsx b/web/src/hooks/useSandboxConnectionBlocks.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..008e597cf3978a43200a7e04b6d38d03ea42f83a
+--- /dev/null
++++ b/web/src/hooks/useSandboxConnectionBlocks.test.tsx
+@@ -0,0 +1,116 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { renderHook, waitFor } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
++import { authenticatedFetch } from "@/lib/identity";
++import {
++  sandboxConnectionBlockMessage,
++  useSandboxConnectionBlocks,
++} from "./useSandboxConnectionBlocks";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++
++const fetchMock = vi.mocked(authenticatedFetch);
++
++function info(overrides: Partial<ServerInfo>): ServerInfo {
++  return {
++    ...FALLBACK_SERVER_INFO,
++    sandbox_provider_owner_connections: { databricks: "databricks" },
++    enabled_connections: ["databricks"],
++    ...overrides,
++  };
++}
++
++function respond(status: number, body: unknown) {
++  fetchMock.mockResolvedValue({
++    ok: status < 400,
++    status,
++    json: async () => body,
++  } as unknown as Response);
++}
++
++function renderBlocks(serverInfo: ServerInfo | "loading") {
++  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  const wrapper = ({ children }: { children: ReactNode }) => (
++    <QueryClientProvider client={client}>{children}</QueryClientProvider>
++  );
++  const hook = renderHook(() => useSandboxConnectionBlocks(serverInfo, "alice"), { wrapper });
++  return { ...hook, client };
++}
++
++beforeEach(() => fetchMock.mockReset());
++
++describe("useSandboxConnectionBlocks", () => {
++  it("blocks a provider whose owner has not connected, with a way to connect", async () => {
++    respond(200, { enabled: true, connected: false });
++    const { result } = renderBlocks(info({}));
++    await waitFor(() =>
++      expect([...result.current]).toEqual([
++        ["databricks", { connection: "databricks", canConnect: true }],
++      ]),
++    );
++    expect(fetchMock).toHaveBeenCalledWith("/v1/connections/databricks/status");
++  });
++
++  it("blocks nothing once the owner is connected", async () => {
++    respond(200, { enabled: true, connected: true });
++    const { result } = renderBlocks(info({}));
++    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
++    await waitFor(() => expect(result.current.size).toBe(0));
++  });
++
++  it.each([
++    ["the status request fails", 500, {}],
++    ["the status has no connected flag", 200, { enabled: true }],
++  ])("blocks nothing when %s, leaving the refusal to the server", async (_case, status, body) => {
++    respond(status, body);
++    const { result, client } = renderBlocks(info({}));
++    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
++    await waitFor(() => expect(client.isFetching()).toBe(0));
++    expect(result.current.size).toBe(0);
++  });
++
++  it("blocks a provider without asking when the server has no such connection", () => {
++    const { result } = renderBlocks(info({ enabled_connections: ["github"] }));
++    expect([...result.current]).toEqual([
++      ["databricks", { connection: "databricks", canConnect: false }],
++    ]);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["no provider launches as its owner", info({ sandbox_provider_owner_connections: {} })],
++    ["server info is still loading", "loading" as const],
++  ])("asks nothing and blocks nothing when %s", (_case, serverInfo) => {
++    const { result } = renderBlocks(serverInfo);
++    expect(result.current.size).toBe(0);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it("keeps the same map while the answer is unchanged", async () => {
++    respond(200, { enabled: true, connected: false });
++    const { result, rerender } = renderBlocks(info({}));
++    await waitFor(() => expect(result.current.size).toBe(1));
++    const first = result.current;
++    rerender();
++    expect(result.current).toBe(first);
++  });
++});
++
++describe("sandboxConnectionBlockMessage", () => {
++  it("names the account to connect or says the server has none", () => {
++    expect(
++      sandboxConnectionBlockMessage("Databricks Sandbox", {
++        connection: "databricks",
++        canConnect: true,
++      }),
++    ).toBe("Connect Databricks to use Databricks Sandbox");
++    expect(
++      sandboxConnectionBlockMessage("Databricks Sandbox", {
++        connection: "databricks",
++        canConnect: false,
++      }),
++    ).toBe("Databricks Sandbox is unavailable: this server has no Databricks connection set up");
++  });
++});
+diff --git a/web/src/hooks/useSandboxConnectionBlocks.ts b/web/src/hooks/useSandboxConnectionBlocks.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..da3831132bb17d6f60ac086eeb094b0cd78bee03
+--- /dev/null
++++ b/web/src/hooks/useSandboxConnectionBlocks.ts
+@@ -0,0 +1,70 @@
++import { useQueries } from "@tanstack/react-query";
++import { useMemo } from "react";
++import type { ServerInfo } from "@/lib/capabilities";
++import { getOmnigentServerIdentity } from "@/lib/host";
++import { authenticatedFetch } from "@/lib/identity";
++
++/** Why a sandbox provider cannot launch for the signed-in user. */
++export interface SandboxConnectionBlock {
++  /** The connection the provider launches as, e.g. ``"databricks"``. */
++  connection: string;
++  /** False when the server has no such connection set up, so the user cannot fix it. */
++  canConnect: boolean;
++}
++
++async function fetchConnected(connection: string): Promise<boolean | null> {
++  const response = await authenticatedFetch(
++    `/v1/connections/${encodeURIComponent(connection)}/status`,
++  );
++  if (!response.ok) throw new Error(`Connection status failed: ${response.status}`);
++  const body: unknown = await response.json();
++  const connected = (body as { connected?: unknown } | null)?.connected;
++  return typeof connected === "boolean" ? connected : null;
++}
++
++/**
++ * The sandbox providers the signed-in user cannot launch yet, keyed by provider.
++ *
++ * A provider that launches as its owner (``sandbox_provider_owner_connections``
++ * in ``/v1/info``) is blocked when the server has no such connection, or when
++ * the user's status says they have not connected. An unknown status (loading,
++ * failed) blocks nothing: the server refuses the launch either way.
++ */
++export function useSandboxConnectionBlocks(
++  info: ServerInfo | "loading",
++  user: string | null,
++): ReadonlyMap<string, SandboxConnectionBlock> {
++  const required = useMemo(
++    () => (info === "loading" ? [] : Object.entries(info.sandbox_provider_owner_connections ?? {})),
++    [info],
++  );
++  const offered = info === "loading" ? [] : info.enabled_connections;
++  const statuses = useQueries({
++    queries: required.map(([, connection]) => ({
++      queryKey: ["connection-status", user, connection, getOmnigentServerIdentity()] as const,
++      queryFn: () => fetchConnected(connection),
++      enabled: offered.includes(connection),
++    })),
++  });
++  const blockedKey = JSON.stringify(
++    required.flatMap(([provider, connection], index) => {
++      if (!offered.includes(connection)) return [[provider, { connection, canConnect: false }]];
++      return statuses[index]?.data === false ? [[provider, { connection, canConnect: true }]] : [];
++    }),
++  );
++  return useMemo(
++    () => new Map<string, SandboxConnectionBlock>(JSON.parse(blockedKey)),
++    [blockedKey],
++  );
++}
++
++/** What to tell the user about a blocked provider, e.g. for "Databricks Sandbox". */
++export function sandboxConnectionBlockMessage(
++  sandboxLabel: string,
++  block: SandboxConnectionBlock,
++): string {
++  const account = block.connection.charAt(0).toUpperCase() + block.connection.slice(1);
++  return block.canConnect
++    ? `Connect ${account} to use ${sandboxLabel}`
++    : `${sandboxLabel} is unavailable: this server has no ${account} connection set up`;
++}
+diff --git a/web/src/lib/capabilities.test.ts b/web/src/lib/capabilities.test.ts
+index 92d3039f692cf3914c680a08c81ab62e9c79d6a0..6f41fda3f608b108e3b378f31972fedbe9f692cf 100644
+--- a/web/src/lib/capabilities.test.ts
++++ b/web/src/lib/capabilities.test.ts
+@@ -154,6 +154,17 @@ describe("resolveServerInfo sandbox_providers", () => {
+     });
+   });
+ 
++  it("keeps the connection each provider launches as, dropping malformed entries", async () => {
++    const result = await probe({
++      sandbox_provider_owner_connections: { databricks: "databricks", modal: null, e2b: "" },
++    });
++    expect(result.sandbox_provider_owner_connections).toEqual({ databricks: "databricks" });
++  });
++
++  it("reads a server without the owner-connection map as needing none", async () => {
++    expect((await probe({})).sandbox_provider_owner_connections).toEqual({});
++  });
++
+   it.each([undefined, null, "invalid", ["note"]])(
+     "reads a missing or malformed notice map as no notices (%j)",
+     async (value) => {
+diff --git a/web/src/lib/capabilities.ts b/web/src/lib/capabilities.ts
+index 25547d3c7545c04f004c8d718f1d39973854c315..3126954c8ce180ea8d5e18f3aa4a986159454a52 100644
+--- a/web/src/lib/capabilities.ts
++++ b/web/src/lib/capabilities.ts
+@@ -174,6 +174,12 @@ export interface ServerInfo {
+    * shows the run target's notice; a provider absent from the map has none.
+    */
+   sandbox_provider_automation_notices?: Record<string, string>;
++  /**
++   * The per-user connection a provider launches sandboxes as, e.g.
++   * ``{ databricks: "databricks" }``. Its picker row stays disabled until the
++   * signed-in user has that connection; a provider absent from the map needs none.
++   */
++  sandbox_provider_owner_connections?: Record<string, string>;
+   /**
+    * Connection providers this deploy has wired (config + store present),
+    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
+@@ -550,6 +556,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
+   sandbox_providers: [],
+   sandbox_provider_capabilities: {},
+   sandbox_provider_automation_notices: {},
++  sandbox_provider_owner_connections: {},
+   enabled_connections: [],
+   // Sharing fails OPEN (opposite of the other caps): a failed probe must
+   // not silently disable sharing, so the sentinel is the permissive "on".
+@@ -681,7 +688,7 @@ function parseSandboxProviderCapabilities(
+   );
+ }
+ 
+-function parseProviderAutomationNotices(value: unknown): Record<string, string> {
++function parseProviderTextMap(value: unknown): Record<string, string> {
+   if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+   return Object.fromEntries(
+     Object.entries(value).filter(
+@@ -733,9 +740,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
+           sandbox_provider_capabilities: parseSandboxProviderCapabilities(
+             data.sandbox_provider_capabilities,
+           ),
+-          sandbox_provider_automation_notices: parseProviderAutomationNotices(
++          sandbox_provider_automation_notices: parseProviderTextMap(
+             data.sandbox_provider_automation_notices,
+           ),
++          sandbox_provider_owner_connections: parseProviderTextMap(
++            data.sandbox_provider_owner_connections,
++          ),
+           enabled_connections: Array.isArray(data.enabled_connections)
+             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
+             : [],
+diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
+index ba6428ea75f084c9cc386ba083480e97ef1113c6..f66d0cf421bfa90bb1991fc56b5dd40e73be5385 100644
+--- a/web/src/shell/NewChatDialog.test.tsx
++++ b/web/src/shell/NewChatDialog.test.tsx
+@@ -8141,6 +8141,69 @@ describe("NewChatLandingScreen", () => {
+     );
+   });
+ 
++  function mockDatabricksConnection(connected: boolean) {
++    authenticatedFetchMock.mockImplementation(((input: RequestInfo | URL) => {
++      const url = typeof input === "string" ? input : input.toString();
++      const body = url === "/v1/connections/databricks/status" ? { enabled: true, connected } : {};
++      return Promise.resolve({ ok: true, json: async () => body } as unknown as Response);
++    }) as unknown as typeof authenticatedFetch);
++  }
++
++  const ownerSandboxInfo: Partial<ServerInfo> = {
++    managed_sandboxes_enabled: true,
++    sandbox_provider: "databricks",
++    sandbox_provider_owner_connections: { databricks: "databricks" },
++    enabled_connections: ["databricks"],
++  };
++
++  it("disables a sandbox that launches as its owner until the user connects", async () => {
++    mockDatabricksConnection(false);
++    renderLanding(ownerSandboxInfo);
++    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
++    await waitFor(() =>
++      expect(screen.getByTestId("new-chat-landing-sandbox-option")).toHaveAttribute(
++        "data-disabled",
++      ),
++    );
++    // The sandbox is still the default pick, so Start says what is missing.
++    const submit = screen.getByTestId("new-chat-landing-submit");
++    expect(submit).toBeDisabled();
++    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
++    expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
++      "Connect Databricks to use Databricks Sandbox",
++    );
++    const connect = screen.getByTestId("new-chat-landing-sandbox-connect-databricks");
++    expect(connect).toHaveTextContent("Connect Databricks to use Databricks Sandbox");
++    fireEvent.click(connect);
++    await waitFor(() =>
++      expect(screen.getByTestId("landing-location").textContent).toBe("/settings/integrations"),
++    );
++  });
++
++  it("offers a sandbox that launches as its owner once the user is connected", async () => {
++    mockDatabricksConnection(true);
++    renderLanding(ownerSandboxInfo);
++    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
++    await waitFor(() =>
++      expect(authenticatedFetchMock).toHaveBeenCalledWith("/v1/connections/databricks/status"),
++    );
++    expect(screen.getByTestId("new-chat-landing-sandbox-option")).not.toHaveAttribute(
++      "data-disabled",
++    );
++    expect(screen.queryByTestId("new-chat-landing-sandbox-connect-databricks")).toBeNull();
++  });
++
++  it("says a sandbox is unavailable when the server has no connection for its owner", () => {
++    renderLanding({ ...ownerSandboxInfo, enabled_connections: [] });
++    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
++    expect(screen.getByTestId("new-chat-landing-sandbox-option")).toHaveAttribute("data-disabled");
++    expect(screen.getByTestId("new-chat-landing-sandbox-unavailable-databricks")).toHaveTextContent(
++      "Databricks Sandbox is unavailable: this server has no Databricks connection set up",
++    );
++    // Nothing to ask the server: the status route does not exist there.
++    expect(authenticatedFetchMock).not.toHaveBeenCalledWith("/v1/connections/databricks/status");
++  });
++
+   it("defaults to New Sandbox when no hosts are connected and sandboxes are enabled", async () => {
+     // The screenshot regression: zero hosts used to leave the chip stuck
+     // on "No hosts" even though the sandbox option was one click away.
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 8f747f61b7142bda0f6f3d8981e34d536b41ea34..06c33ec266bf1e951e00871d81fc701e90601777 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -164,6 +164,7 @@ export {
+   isValidSandboxRepoUrl,
+   splitSandboxWorkspace,
+ } from "@/lib/sandboxRepositories";
++import { SandboxConnectionMenuNotices } from "./SandboxConnectionMenuNotices";
+ import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import { HarnessFixDialog } from "@/pages/settings/HarnessFixDialog";
+@@ -345,6 +346,10 @@ import {
+   noReachableModelsMessage,
+   useNewSandboxModelCatalog,
+ } from "@/hooks/useNewSandboxModelCatalog";
++import {
++  sandboxConnectionBlockMessage,
++  useSandboxConnectionBlocks,
++} from "@/hooks/useSandboxConnectionBlocks";
+ import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
+ import { useSkills } from "@/hooks/useSkills";
+ import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+@@ -2976,6 +2981,10 @@ function NewChatLandingContent({
+       sandboxProfile,
+       rememberedSandboxProfileId,
+     );
++  // A provider that launches as its owner stays unavailable until the user connects.
++  const sandboxConnectionBlocks = useSandboxConnectionBlocks(info, cacheUser);
++  const sandboxConnectionBlock =
++    (sandboxSelected && sandboxConnectionBlocks.get(effectiveSandboxProvider ?? "")) || null;
+   const sandboxMultiRepo =
+     info !== "loading" &&
+     effectiveSandboxProvider !== null &&
+@@ -5817,6 +5826,15 @@ function NewChatLandingContent({
+     if (pickerLoading || workspaceStartLoading || worktreeRequestPending) {
+       return { field: "other", message: "Loading session configuration…" };
+     }
++    if (sandboxConnectionBlock !== null) {
++      return {
++        field: "other",
++        message: sandboxConnectionBlockMessage(
++          sandboxOptionLabel(effectiveSandboxProvider),
++          sandboxConnectionBlock,
++        ),
++      };
++    }
+     if (
+       pickerSelectionError !== null ||
+       sandboxCatalogError !== null ||
+@@ -7930,6 +7948,7 @@ function NewChatLandingContent({
+                                 <DropdownMenuItem
+                                   key={provider ?? "default"}
+                                   onSelect={() => selectSandbox(provider)}
++                                  disabled={sandboxConnectionBlocks.has(provider ?? "")}
+                                   // First row keeps the original testid; later
+                                   // rows get a scoped one.
+                                   data-testid={
+@@ -7985,6 +8004,12 @@ function NewChatLandingContent({
+                                 </Tooltip>
+                               </DropdownMenuItem>
+                             ))}
++                          {managedSandboxesEnabled && (
++                            <SandboxConnectionMenuNotices
++                              blocks={sandboxConnectionBlocks}
++                              onConnect={() => openAppPage("/settings/integrations")}
++                            />
++                          )}
+                           {cloudHosts.map(renderHostMenuItem)}
+                           {showArcaOption && (
+                             <DropdownMenuItem
+diff --git a/web/src/shell/SandboxConnectionMenuNotices.tsx b/web/src/shell/SandboxConnectionMenuNotices.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..52dc03ecb58ad9423c4df425248421e59ed5eb97
+--- /dev/null
++++ b/web/src/shell/SandboxConnectionMenuNotices.tsx
+@@ -0,0 +1,40 @@
++import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
++import {
++  sandboxConnectionBlockMessage,
++  type SandboxConnectionBlock,
++} from "@/hooks/useSandboxConnectionBlocks";
++import { sandboxOptionLabel } from "@/lib/capabilities";
++
++/**
++ * Under the host menu's sandbox rows: why a disabled provider is disabled.
++ * When the user can fix it, the line is a menu item that opens the connect page.
++ */
++export function SandboxConnectionMenuNotices({
++  blocks,
++  onConnect,
++}: {
++  blocks: ReadonlyMap<string, SandboxConnectionBlock>;
++  onConnect: () => void;
++}) {
++  return [...blocks].map(([provider, block]) => {
++    const message = sandboxConnectionBlockMessage(sandboxOptionLabel(provider), block);
++    return block.canConnect ? (
++      <DropdownMenuItem
++        key={provider}
++        onSelect={onConnect}
++        className="mobile-touch-target text-xs text-muted-foreground"
++        data-testid={`new-chat-landing-sandbox-connect-${provider}`}
++      >
++        {message}
++      </DropdownMenuItem>
++    ) : (
++      <div
++        key={provider}
++        className="px-2 py-1 text-xs leading-[18px] text-muted-foreground"
++        data-testid={`new-chat-landing-sandbox-unavailable-${provider}`}
++      >
++        {message}
++      </div>
++    );
++  });
++}
