@@ -1,0 +1,3097 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 07:29:54 +0000
+Subject: [PATCH] feat(open-items): store a session's open items and serve them
+ over the API
+
+Agents label the questions, risks, findings and follow-ups they raise in
+chat ([Q7] **Title** detail, ~~[Q7]~~ to close), and the web reads their
+state back from the transcript. That state then depends on how much
+history a browser has loaded, agents pick numbers from memory and reuse
+them, and nothing outside the chat text can list or close an item.
+
+This stores open items as rows of their session. The open_items side
+store (docs/extending/side_schemas.md) keeps open_items_entries, keyed by
+session, kind and number so the label is part of the key, and
+open_items_heads with the next number per session and kind plus a
+session row that counts the session's items. A raise locks the session
+row and then the kind's row, so two raises at once never share a label;
+each item carries an idempotency key, so a retried raise returns the
+labels its first attempt allocated. Content (title, detail, topic, up to
+eight links, a link item's URL, raised_by) and outcome (resolution,
+closed_by, the latest five answers) are storage envelopes a deployment
+may encrypt, so filtering beyond status and kind happens in the server
+over the session's rows, which the 500-item cap bounds. Deleting a
+session deletes its rows and heads through the side store's cleanup;
+forks start empty.
+
+Routes under /v1/sessions/{id}/open-items: GET lists with filters and
+counts (read access); POST raises, only from the session's bound runner
+and only for an agent whose spec keeps the new open_items tool group;
+PATCH closes, reopens, retopics and relinks, from that runner or a
+person with edit access; POST .../answers records a person's replies.
+Every write publishes session.open_items.changed, and /v1/info reports
+open_items. The agent tools and instruction follow in the next patches.
+
+Not proposed upstream yet: upstream adds tables through its own
+migration chain, so a proposal moves these two tables there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/open-items.md                            |  56 ++
+ omnigent/entities/open_items.py               | 453 +++++++++++++
+ omnigent/server/API.md                        |  88 +++
+ omnigent/server/app.py                        |  16 +
+ omnigent/server/open_items.py                 | 373 +++++++++++
+ omnigent/server/schemas.py                    |  20 +
+ omnigent/spec/types.py                        |   5 +
+ .../open_items0001_create_tables.py           | 108 ++++
+ omnigent/stores/open_items_store.py           | 611 ++++++++++++++++++
+ openapi.json                                  | 503 ++++++++++++++
+ tests/server/routes/test_open_items_routes.py | 305 +++++++++
+ tests/stores/test_open_items_store.py         | 323 +++++++++
+ 12 files changed, 2861 insertions(+)
+ create mode 100644 docs/open-items.md
+ create mode 100644 omnigent/entities/open_items.py
+ create mode 100644 omnigent/server/open_items.py
+ create mode 100644 omnigent/stores/open_items_migrations/open_items0001_create_tables.py
+ create mode 100644 omnigent/stores/open_items_store.py
+ create mode 100644 tests/server/routes/test_open_items_routes.py
+ create mode 100644 tests/stores/test_open_items_store.py
+
+diff --git a/docs/open-items.md b/docs/open-items.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f87880c28500b8aed1669e4ed41783adf9e06f56
+--- /dev/null
++++ b/docs/open-items.md
+@@ -0,0 +1,56 @@
++# Open items
++
++A session's **open items** are the questions, risks, findings and follow-ups its
++agent raises for you, and the links it pins, kept as records of the session
++rather than only as text in the chat. Each item has a label such as `Q7`, which
++Omnigent allocates, so a label is never reused in its session and an item's
++state does not depend on how much of the transcript is loaded. It is on by
++default; an agent opts out with `tool_groups.open_items: false`.
++
++Agents still write each item once in the chat, as
++[item labels](chat-item-labels.md) describe (`[Q7] **Title** detail`, and
++`~~[Q7]~~` when it ends), so the chat reads as before and its label chips work
++as before. What changes is where the state lives: the agent records items with
++its tools, and the store decides whether an item is open.
++
++## What an item holds
++
++| Field | Notes |
++| --- | --- |
++| `label` | The kind's letter and a number: `Q` question, `R` risk, `F` finding, `T` follow-up, `L` link. Numbers count up per session and kind, 1 to 999. |
++| `status` | `open`, `answered` (you replied and the agent has not closed it yet) or `closed`. |
++| `title`, `detail` | A few words (at most 160 characters), then the full item (at most 6,000). |
++| `topic` | Optional short slug naming the piece of work, such as `cache-rollout`, so items of one coordinator session group. |
++| `links` | Up to 8 http(s) links supporting the item. A link item (`L`) is a pinned URL; pinning one URL twice returns the same item, and one pinned without a title is named by a short form of its URL (`example.com/reports/…`). |
++| `raised_by` | The sub-agent an item speaks for, when the agent raising it relays it. |
++| `resolution`, `closed_by` | How a closed item ended, and whether the agent or a person closed it. |
++| `answers` | Your latest five replies. |
++
++A session holds at most 500 items. Items are deleted with their session. A fork
++or a side chat starts with none, and session export and import leave them out;
++the forked transcript's labels still render as chat labels.
++
++## HTTP API
++
++| Route (under `/v1`) | Caller | Purpose |
++| --- | --- | --- |
++| `GET /sessions/{id}/open-items` | read access | One page in label order, with counts by status and kind over all items and the topics in use. Filters: `status` (repeatable; `all` for every status), `kind` (repeatable), `topic`, `raised_by`, `has_links`, `q` (text search), `limit` (1 to 200), `after` (a label). |
++| `POST /sessions/{id}/open-items` | the session's runner | Raise items for an agent with the `open_items` group. |
++| `PATCH /sessions/{id}/open-items` | the session's runner, or a person with edit access | Close, reopen, retitle, retopic or relink items. |
++| `POST /sessions/{id}/open-items/answers` | edit access | Record replies; an open item becomes answered. |
++
++Each write publishes `session.open_items.changed` on the session's stream with
++the labels written and the open count. `GET /v1/info` reports `open_items: true`
++when the server stores them. The request and response shapes are in
++[`omnigent/server/API.md`](../omnigent/server/API.md#open-items).
++
++## Compatibility
++
++Nothing is backfilled: items a session labelled in chat before stay chat
++labels until an agent adopts them with `label`. A server or host without this
++feature keeps working with text labels, and the web chips read the chat text
++as before. The items live in their own tables, apart from the main migration
++chain (see [side stores](extending/side_schemas.md)): a build without the
++feature starts against a database that holds them and leaves them alone.
++Search runs over the session's items in the server, not in SQL, because a
++deployment may encrypt their content.
+diff --git a/omnigent/entities/open_items.py b/omnigent/entities/open_items.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..14f3584749523c67615bb8a3c9fbf440a3b69abb
+--- /dev/null
++++ b/omnigent/entities/open_items.py
+@@ -0,0 +1,453 @@
++"""Open items: the questions, risks, findings, follow-ups and links a session raises.
++
++An item belongs to the session that raised it and is named by a label, the
++kind's letter and a number, e.g. ``Q7``. The store allocates numbers, so a
++label never changes and is never reused within its session. An item is
++``open`` until it is closed with a resolution, or ``answered`` once the user
++has replied and the agent has not closed it yet.
++
++The normalizers here check every field a write carries and return what to
++store; the store and the routes run them, so every write path applies them. Links and
++topics are canonicalized as the Inbox's are (:mod:`omnigent.server.inbox_dedupe`).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import re
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++# Kind name -> (stored code, label letter). Code 0 names a session's own head row.
++KINDS: dict[str, tuple[int, str]] = {
++    "question": (1, "Q"),
++    "risk": (2, "R"),
++    "finding": (3, "F"),
++    "follow_up": (4, "T"),
++    "link": (5, "L"),
++}
++KIND_BY_CODE: dict[int, str] = {code: name for name, (code, _) in KINDS.items()}
++KIND_BY_LETTER: dict[str, str] = {letter: name for name, (_, letter) in KINDS.items()}
++SESSION_HEAD_KIND = 0
++
++STATUSES: dict[str, int] = {"open": 1, "answered": 2, "closed": 3}
++STATUS_BY_CODE: dict[int, str] = {code: name for name, code in STATUSES.items()}
++# What a list shows unless asked otherwise.
++DEFAULT_LIST_STATUSES: tuple[str, ...] = ("open", "answered")
++
++TITLE_MAX_CHARS = 160
++DETAIL_MAX_CHARS = 6000
++TOPIC_MAX_CHARS = 48
++RESOLUTION_MAX_CHARS = 2000
++ANSWER_MAX_CHARS = 2000
++RAISED_BY_MAX_CHARS = 64
++LINK_LABEL_MAX_CHARS = 120
++URL_MAX_CHARS = 2048
++LINKS_PER_ITEM = 8
++ANSWERS_KEPT = 5
++# The chat parses labels of one to three digits.
++NUMBER_MAX = 999
++ITEMS_PER_SESSION = 500
++RAISE_BATCH_MAX = 10
++UPDATE_BATCH_MAX = 20
++LIST_PAGE_MAX = 200
++# Names the write that raised an item, e.g. "tool:<call id>:<index>".
++IDEMPOTENCY_KEY_MAX_CHARS = 128
++BATCH_KEY_MAX_CHARS = 120
++
++_LABEL = re.compile(r"([QRFTL])([1-9][0-9]{0,2})")
++_TOPIC = re.compile(r"[a-z0-9][a-z0-9-]*")
++
++
++class OpenItemError(ValueError):
++    """A write or read the store refuses; ``code`` says why.
++
++    :param code: ``invalid_input``, ``too_large``, ``session_full``,
++        ``label_taken`` or ``not_found``.
++    :param message: What is wrong, for the agent or person who sent it.
++    """
++
++    def __init__(self, code: str, message: str) -> None:
++        super().__init__(f"{code}: {message}")
++        self.code = code
++        self.message = message
++
++
++def _invalid(message: str) -> OpenItemError:
++    return OpenItemError("invalid_input", message)
++
++
++@dataclass(frozen=True)
++class OpenItem:
++    """One stored item.
++
++    :ivar content: ``title``, ``detail``, and optionally ``topic``, ``links``
++        (``[{"url", "label"?}]``), ``url`` (a link item's target) and
++        ``raised_by``.
++    :ivar outcome: ``resolution``, ``closed_by``, ``closed_ref`` and
++        ``answers`` (``[{"text", "at", "by"}]``, the latest five); empty until
++        the item is answered or closed.
++    """
++
++    conversation_id: str
++    kind: str
++    number: int
++    status: str
++    created_at: int
++    updated_at: int
++    closed_at: int | None
++    content: dict[str, Any]
++    outcome: dict[str, Any] = field(default_factory=dict)
++
++    @property
++    def label(self) -> str:
++        """The item's label, e.g. ``"Q7"``."""
++        return f"{KINDS[self.kind][1]}{self.number}"
++
++    @property
++    def sort_key(self) -> tuple[int, int]:
++        """Label order: by kind, then number."""
++        return KINDS[self.kind][0], self.number
++
++
++@dataclass(frozen=True)
++class NewOpenItem:
++    """A checked item to raise; see :func:`normalize_new_item`."""
++
++    kind: str
++    content: dict[str, Any]
++    number: int | None = None
++    dedupe_key: str | None = None
++
++
++@dataclass(frozen=True)
++class OpenItemChange:
++    """A checked change to one item; see :func:`normalize_change`.
++
++    :ivar status: ``"open"`` or ``"closed"``; ``None`` leaves it.
++    :ivar fields: Content fields to set; a ``None`` topic clears it.
++    """
++
++    kind: str
++    number: int
++    status: str | None = None
++    resolution: str | None = None
++    fields: dict[str, Any] = field(default_factory=dict)
++    add_links: tuple[dict[str, str], ...] = ()
++    remove_links: tuple[str, ...] = ()
++
++
++def parse_label(label: object) -> tuple[str, int]:
++    """Return the kind and number a label names, e.g. ``("question", 7)`` for ``"Q7"``.
++
++    :raises OpenItemError: If it is not a label this store allocates.
++    """
++    match = _LABEL.fullmatch(label.strip().upper()) if isinstance(label, str) else None
++    if match is None:
++        raise _invalid(f"{label!r} is not an item label such as Q7, R2, F1, T3 or L4")
++    return KIND_BY_LETTER[match.group(1)], int(match.group(2))
++
++
++def format_label(kind: str, number: int) -> str:
++    """Return the label of *kind* and *number*, e.g. ``"Q7"``."""
++    return f"{KINDS[kind][1]}{number}"
++
++
++def _text(value: object, name: str, limit: int, *, required: bool) -> str:
++    if value is None:
++        value = ""
++    if not isinstance(value, str):
++        raise _invalid(f"{name} must be text")
++    text = value.strip()
++    if required and not text:
++        raise _invalid(f"{name} is required")
++    if len(text) > limit:
++        raise OpenItemError("too_large", f"{name} is {len(text)} characters, over {limit}")
++    return text
++
++
++def normalize_topic_slug(value: object) -> str | None:
++    """Return a topic as a slug, e.g. ``"cache-rollout"``; ``None`` or empty clears it."""
++    if value is None:
++        return None
++    if not isinstance(value, str):
++        raise _invalid("topic must be text")
++    from omnigent.server.inbox_dedupe import normalize_topic
++
++    topic = normalize_topic(value)
++    if not topic:
++        return None
++    if len(topic) > TOPIC_MAX_CHARS or _TOPIC.fullmatch(topic) is None:
++        raise _invalid(
++            f"topic must be a short slug of letters, digits and hyphens, at most "
++            f"{TOPIC_MAX_CHARS} characters, e.g. 'cache-rollout'"
++        )
++    return topic
++
++
++def _canonical_url(value: object) -> str:
++    from omnigent.server.inbox_dedupe import InvalidLinkError, canonical_link
++
++    url = _text(value, "url", URL_MAX_CHARS, required=True)
++    try:
++        canonical = canonical_link({"type": "url", "ref": url})
++    except InvalidLinkError as exc:
++        raise _invalid(str(exc)) from exc
++    assert canonical is not None
++    return canonical
++
++
++def normalize_link(value: object) -> dict[str, str]:
++    """Check one attached link, ``{"url", "label"?}`` or a bare URL."""
++    if isinstance(value, str):
++        value = {"url": value}
++    if not isinstance(value, Mapping) or set(value) - {"url", "label"}:
++        raise _invalid("a link is a URL, or an object with url and an optional label")
++    url = _text(value.get("url"), "url", URL_MAX_CHARS, required=True)
++    _canonical_url(url)
++    link = {"url": url}
++    label = _text(value.get("label"), "link label", LINK_LABEL_MAX_CHARS, required=False)
++    if label:
++        link["label"] = label
++    return link
++
++
++def _links(value: object, name: str) -> list[dict[str, str]]:
++    if value is None:
++        return []
++    if not isinstance(value, list):
++        raise _invalid(f"{name} must be a list")
++    if len(value) > LINKS_PER_ITEM:
++        raise _invalid(f"an item holds at most {LINKS_PER_ITEM} links")
++    return [normalize_link(link) for link in value]
++
++
++def short_link_name(url: str) -> str:
++    """A short readable name for a link nothing names, e.g. ``"example.com/reports/q3"``.
++
++    The host and the start of the path, never the whole address; the web's
++    ``shortLinkName`` (``web/src/lib/sessionLinks.ts``) gives the same.
++    """
++    from urllib.parse import urlsplit
++
++    parts = urlsplit(url)
++    host = (parts.hostname or "").removeprefix("www.")
++    segments = [segment for segment in parts.path.split("/") if segment]
++    shown = [segment if len(segment) <= 16 else f"{segment[:12]}…" for segment in segments[:2]]
++    if len(segments) > 2:
++        shown.append("…")
++    return "/".join([host, *shown])[:TITLE_MAX_CHARS]
++
++
++def link_dedupe_key(url: str) -> str:
++    """The key that makes pinning one URL twice return one item."""
++    return hashlib.sha256(_canonical_url(url).encode("utf-8")).hexdigest()
++
++
++def normalize_new_item(value: object) -> NewOpenItem:
++    """Check an item to raise, as the ``sys_open_items_raise`` tool sends it.
++
++    :raises OpenItemError: If a field is missing, unknown or too large.
++    """
++    if not isinstance(value, Mapping):
++        raise _invalid("each item must be an object")
++    allowed = {"kind", "title", "detail", "topic", "links", "url", "raised_by", "label"}
++    if unknown := sorted(set(value) - allowed):
++        raise _invalid(f"unknown item fields: {', '.join(unknown)}")
++    kind = value.get("kind")
++    if kind not in KINDS:
++        raise _invalid(f"kind must be one of {', '.join(KINDS)}")
++    content: dict[str, Any] = {}
++    dedupe_key = None
++    if kind == "link":
++        url = _text(value.get("url"), "url", URL_MAX_CHARS, required=True)
++        dedupe_key = link_dedupe_key(url)
++        content["url"] = url
++        title = _text(value.get("title"), "title", TITLE_MAX_CHARS, required=False)
++        content["title"] = title or short_link_name(url)
++    else:
++        if value.get("url") is not None:
++            raise _invalid("only a link item has a url; attach links with links")
++        content["title"] = _text(value.get("title"), "title", TITLE_MAX_CHARS, required=True)
++    content["detail"] = _text(value.get("detail"), "detail", DETAIL_MAX_CHARS, required=False)
++    if (topic := normalize_topic_slug(value.get("topic"))) is not None:
++        content["topic"] = topic
++    if links := _links(value.get("links"), "links"):
++        content["links"] = links
++    raised_by = _text(value.get("raised_by"), "raised_by", RAISED_BY_MAX_CHARS, required=False)
++    if raised_by:
++        content["raised_by"] = raised_by
++    number = None
++    if value.get("label") is not None:
++        label_kind, number = parse_label(value.get("label"))
++        if label_kind != kind:
++            raise _invalid(f"label {value.get('label')!r} is not a {kind} label")
++    return NewOpenItem(kind=kind, content=content, number=number, dedupe_key=dedupe_key)
++
++
++def normalize_change(value: object) -> OpenItemChange:
++    """Check one change, as ``sys_open_items_update`` or a person sends it.
++
++    :raises OpenItemError: If the label or a field is invalid.
++    """
++    if not isinstance(value, Mapping):
++        raise _invalid("each update must be an object")
++    allowed = {"label", "status", "resolution", "title", "detail", "topic"}
++    allowed |= {"add_links", "remove_links"}
++    if unknown := sorted(set(value) - allowed):
++        raise _invalid(f"unknown update fields: {', '.join(unknown)}")
++    kind, number = parse_label(value.get("label"))
++    status = value.get("status")
++    if status is not None and status not in ("open", "closed"):
++        raise _invalid("status must be open or closed")
++    resolution = None
++    if "resolution" in value:
++        resolution = _text(value["resolution"], "resolution", RESOLUTION_MAX_CHARS, required=True)
++    if status == "closed" and resolution is None:
++        raise _invalid("closing an item needs a one-line resolution")
++    fields: dict[str, Any] = {}
++    if "title" in value:
++        fields["title"] = _text(value["title"], "title", TITLE_MAX_CHARS, required=True)
++    if "detail" in value:
++        fields["detail"] = _text(value["detail"], "detail", DETAIL_MAX_CHARS, required=False)
++    if "topic" in value:
++        fields["topic"] = normalize_topic_slug(value["topic"])
++    removed = value.get("remove_links") or []
++    if not isinstance(removed, list) or not all(isinstance(url, str) for url in removed):
++        raise _invalid("remove_links must be a list of URLs")
++    change = OpenItemChange(
++        kind=kind,
++        number=number,
++        status=status,
++        resolution=resolution,
++        fields=fields,
++        add_links=tuple(_links(value.get("add_links"), "add_links")),
++        remove_links=tuple(_canonical_url(url) for url in removed),
++    )
++    if change == OpenItemChange(kind=kind, number=number):
++        raise _invalid(f"update for {format_label(kind, number)} changes nothing")
++    return change
++
++
++def apply_link_changes(
++    links: Sequence[Mapping[str, str]], change: OpenItemChange
++) -> list[dict[str, str]]:
++    """Return an item's links after *change*, at most :data:`LINKS_PER_ITEM`."""
++    kept = [dict(link) for link in links if _canonical_url(link["url"]) not in change.remove_links]
++    seen = {_canonical_url(link["url"]) for link in kept}
++    for link in change.add_links:
++        if (canonical := _canonical_url(link["url"])) not in seen:
++            kept.append(dict(link))
++            seen.add(canonical)
++    if len(kept) > LINKS_PER_ITEM:
++        raise _invalid(f"an item holds at most {LINKS_PER_ITEM} links")
++    return kept
++
++
++# ── Reading ───────────────────────────────────────────
++
++
++@dataclass(frozen=True)
++class OpenItemFilter:
++    """Which items a list returns; every field narrows it.
++
++    :ivar statuses: Status names; empty means every status.
++    :ivar kinds: Kind names; empty means every kind.
++    :ivar query: Case-insensitive text matched against the item's words.
++    :ivar after: A label; the page starts after it in label order.
++    """
++
++    statuses: tuple[str, ...] = DEFAULT_LIST_STATUSES
++    kinds: tuple[str, ...] = ()
++    topic: str | None = None
++    raised_by: str | None = None
++    has_links: bool | None = None
++    query: str | None = None
++    after: str | None = None
++    limit: int = 100
++
++
++@dataclass(frozen=True)
++class OpenItemPage:
++    """One page of a session's items, with counts over all of them."""
++
++    items: list[OpenItem]
++    has_more: bool
++    status_counts: dict[str, int]
++    kind_counts: dict[str, int]
++    topics: list[str]
++
++
++def _searchable(item: OpenItem) -> str:
++    content, outcome = item.content, item.outcome
++    parts = [item.label, content.get("title"), content.get("detail"), content.get("topic")]
++    parts += [content.get("url"), content.get("raised_by"), outcome.get("resolution")]
++    parts += [link.get("url") for link in content.get("links") or []]
++    parts += [link.get("label") for link in content.get("links") or []]
++    parts += [answer.get("text") for answer in outcome.get("answers") or []]
++    return "\n".join(str(part) for part in parts if part).casefold()
++
++
++def _matches(item: OpenItem, wanted: OpenItemFilter) -> bool:
++    content = item.content
++    return (
++        (not wanted.statuses or item.status in wanted.statuses)
++        and (not wanted.kinds or item.kind in wanted.kinds)
++        and (wanted.topic is None or content.get("topic") == wanted.topic)
++        and (wanted.raised_by is None or content.get("raised_by") == wanted.raised_by)
++        and (wanted.has_links is None or bool(content.get("links")) == wanted.has_links)
++        and (not wanted.query or wanted.query.casefold() in _searchable(item))
++    )
++
++
++def page_items(items: Sequence[OpenItem], wanted: OpenItemFilter) -> OpenItemPage:
++    """Filter and page a session's items in label order, counting all of them.
++
++    The store reads a session's items whole (the session cap bounds them):
++    their content may be encrypted, so the database cannot search it.
++
++    :raises OpenItemError: If ``after`` is not a label.
++    """
++    ordered = sorted(items, key=lambda item: item.sort_key)
++    if wanted.after is not None:
++        kind, number = parse_label(wanted.after)
++        start = (KINDS[kind][0], number)
++        ordered = [item for item in ordered if item.sort_key > start]
++    matching = [item for item in ordered if _matches(item, wanted)]
++    status_counts = dict.fromkeys(STATUSES, 0)
++    kind_counts = dict.fromkeys(KINDS, 0)
++    for item in items:
++        status_counts[item.status] += 1
++        kind_counts[item.kind] += 1
++    topics = sorted({topic for item in items if (topic := item.content.get("topic"))})
++    return OpenItemPage(
++        items=matching[: wanted.limit],
++        has_more=len(matching) > wanted.limit,
++        status_counts=status_counts,
++        kind_counts=kind_counts,
++        topics=topics,
++    )
++
++
++def item_to_json(item: OpenItem) -> dict[str, Any]:
++    """The full item as the routes return it."""
++    content, outcome = item.content, item.outcome
++    return {
++        "label": item.label,
++        "kind": item.kind,
++        "number": item.number,
++        "status": item.status,
++        "title": content.get("title", ""),
++        "detail": content.get("detail", ""),
++        "topic": content.get("topic"),
++        "links": content.get("links") or [],
++        "url": content.get("url"),
++        "raised_by": content.get("raised_by"),
++        "created_at": item.created_at,
++        "updated_at": item.updated_at,
++        "closed_at": item.closed_at,
++        "resolution": outcome.get("resolution"),
++        "closed_by": outcome.get("closed_by"),
++        "answers": outcome.get("answers") or [],
++    }
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index c0b34baa3ea5b99f1c3277ecd155fe232c347e17..3deb200700b96eb839d1a28d9c6d08e7daa552d4 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -1542,6 +1542,93 @@ when the remote confirms the branch is absent. Detached HEADs, an unavailable
+ workspace, or a failed remote check produce `null` values so clients can retain
+ the original selection. Non-managed sessions return an empty repository list.
+ 
++### Open items
++
++The questions, risks, findings, follow-ups and pinned links a session's agent
++raises, each named by a label the server allocates (`Q7`). Not the transcript,
++which is `GET /v1/sessions/{id}/items`. `GET /v1/info` reports
++`open_items: true` when the server stores them. Usage:
++[`docs/open-items.md`](../../docs/open-items.md).
++
++```
++GET /v1/sessions/{session_id}/open-items?status=open&kind=question&q=cache&limit=100&after=Q3
++
++200 OK — {"data": [{"label": "Q7", "kind": "question", "number": 7,
++  "status": "open", "title": "Cache rows?", "detail": "...", "topic": "cache",
++  "links": [{"url": "https://...", "label": "PR"}], "url": null,
++  "raised_by": null, "created_at": 1764100000, "updated_at": 1764100000,
++  "closed_at": null, "resolution": null, "closed_by": null,
++  "answers": [{"text": "Link them", "at": 1764100100, "by": "bob@example.com"}]}],
++  "has_more": false, "next_after": null,
++  "counts": {"status": {"open": 3, "answered": 1, "closed": 2},
++             "kind": {"question": 4, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}},
++  "topics": ["cache"]}
++```
++
++Read access. Items come in label order (by kind, then number). `status` and
++`kind` repeat; `status` defaults to `open` and `answered`, and `all` means
++every status. `topic`, `raised_by`, `has_links` and `q` (case-insensitive text
++in the label, title, detail, topic, links, resolution and answers) narrow the
++page; `limit` is 1 to 200 (default 100) and `after` takes a label, the previous
++page's `next_after`. `counts` and `topics` cover all of the session's items.
++
++```
++POST /v1/sessions/{session_id}/open-items
++X-Omnigent-Orchestration-Source: <session_id>
++
++{"items": [{"kind": "question", "title": "Cache rows?", "detail": "...",
++  "topic": "cache", "links": ["https://..."], "label": "Q7"}],
++ "idempotency_key": "tool:toolu_01"}
++
++200 OK — {"items": [{"item": {...}, "duplicate": false} | {"error": {"code", "message"}}],
++  "open_count": 4, "topics": ["cache"]}
++400 — invalid_input or too_large: nothing was written
++403 — not the session's own runner (source header and, on a shared server,
++  its bound runner's tunnel token), or its agent has `tool_groups.open_items: false`
++404 — no such session, or the server does not store open items
++```
++
++Only the session's runner raises items, for its agent. One to ten items; item
++`i` is written under `<idempotency_key>:<i>`, so a retry returns the items the
++first attempt wrote. `kind` is `question`, `risk`, `finding`, `follow_up` or
++`link` (which needs `url`; pinning a URL the session already pinned returns that
++item with `duplicate: true`). `label` adopts a label written in chat if it is
++free. An item that cannot be taken carries its own error: `session_full` (500
++items, or 999 of the kind) or `label_taken`.
++
++```
++PATCH /v1/sessions/{session_id}/open-items
++
++{"updates": [{"label": "Q7", "status": "closed", "resolution": "Linked them"},
++             {"label": "R2", "topic": "release", "add_links": ["https://..."],
++              "remove_links": ["https://..."]}],
++ "ref": "tool:toolu_02"}
++
++200 OK — {"items": [{"label": "Q7", "item": {...}} | {"label": "R2", "error": {"code": "not_found", ...}}]}
++```
++
++From the session's runner (with the source header, as above) or from a person
++with edit access. One to twenty updates; each sets any of `status` (`open` or
++`closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty
++clears it), `add_links` and `remove_links`. A close records `closed_by`
++(`agent` or `user`) and `ref`; a reopen clears the resolution and keeps the
++answers. A label the session lacks gets `not_found`, a change that would not
++fit gets `too_large`; the others still apply.
++
++```
++POST /v1/sessions/{session_id}/open-items/answers
++
++{"answers": [{"label": "Q7", "text": "Link them"}]}
++
++200 OK — {"items": [{"label": "Q7", "item": {...}}]}
++```
++
++Edit access. Records each reply (the latest five are kept); an open item
++becomes `answered`.
++
++Each write publishes `session.open_items.changed` on the session's stream.
++Deleting a session deletes its items; a fork starts with none.
++
+ ### Stream Session
+ 
+ ```
+@@ -1614,6 +1701,7 @@ stream and surface queue/interrupt semantics.
+ | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
+ | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
+ | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |
++| `session.open_items.changed` | `SessionOpenItemsChangedEvent` | `{type, conversation_id, labels: string[], open_count: int}` — items were raised or changed; read `GET …/open-items` again. |
+ 
+ > **Note on `session.input.consumed`:** This event name and payload
+ > may change in a future revision; clients should isolate the
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index 0f35a6461773956926028d49806405cc07e21a20..0bb9ceb23ff2ec889f69490509d908cfd6c65a0e 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -85,6 +85,7 @@ from omnigent.runtime.agent_cache import AgentCache
+ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+ from omnigent.server import (
+     managed_host_keepalive,
++    open_items,
+     session_journal,
+     session_live_state,
+     session_pull_requests,
+@@ -419,6 +420,9 @@ class ServerInfoResponse(BaseModel):
+     # GET/POST /v1/sessions/{id}/journal and session.journal.appended; absent on
+     # older servers, which clients treat as unsupported.
+     session_journal: bool = False
++    # GET/POST/PATCH /v1/sessions/{id}/open-items and session.open_items.changed;
++    # absent on older servers, which clients treat as unsupported.
++    open_items: bool = False
+     # /v1/workflows, the caller's saved workflows; absent on older servers, which
+     # clients treat as unsupported.
+     workflows: bool = False
+@@ -4222,6 +4226,7 @@ def create_app(
+                 is not None,
+                 "session_journal": frontend_features[Feature.WORKFLOWS.value]
+                 and session_journal.open_store(conversation_store) is not None,
++                "open_items": open_items.open_store(conversation_store) is not None,
+                 "workflows": workflows_available,
+                 "workflow_sharing": workflows_available
+                 and stores_workflow_grants(permission_store),
+@@ -4516,6 +4521,17 @@ def create_app(
+         prefix="/v1",
+         tags=["session_journal"],
+     )
++    app.include_router(
++        open_items.create_open_items_router(
++            conversation_store,
++            agent_store=agent_store,
++            agent_cache=agent_cache,
++            auth_provider=auth_provider,
++            permission_store=permission_store,
++        ),
++        prefix="/v1",
++        tags=["open_items"],
++    )
+     app.include_router(
+         workflows.create_workflows_router(
+             conversation_store,
+diff --git a/omnigent/server/open_items.py b/omnigent/server/open_items.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c338b4099ef4b1f6a4078cf0d905654fd9490113
+--- /dev/null
++++ b/omnigent/server/open_items.py
+@@ -0,0 +1,373 @@
++"""Open items API: the questions, risks, findings, follow-ups and links a session raises.
++
++A session's agent raises and updates items through its ``sys_open_items_*``
++tools, which its runner sends here; people read them and may close, reopen,
++retopic or answer them. Items live in the ``open_items`` side store
++(:mod:`omnigent.stores.open_items_store`). Every write publishes
++``session.open_items.changed`` on the session's stream.
++
++Routes, under ``/v1``:
++
++* ``GET /sessions/{session_id}/open-items`` lists items with filters and
++  counts (read access).
++* ``POST /sessions/{session_id}/open-items`` raises items. Only the session's
++  runner writes, for an agent with the ``open_items`` tool group: the source
++  header names the session, and a shared server verifies its bound runner's
++  tunnel token (edit access).
++* ``PATCH /sessions/{session_id}/open-items`` changes items: from the session's
++  runner as above, or from a person with edit access.
++* ``POST /sessions/{session_id}/open-items/answers`` records a person's replies
++  (edit access); an open item becomes answered.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import threading
++from collections.abc import Iterator, Sequence
++from contextlib import contextmanager
++from typing import Any, Literal
++
++from fastapi import APIRouter, Query, Request
++from pydantic import BaseModel, Field
++
++from omnigent.entities import Conversation
++from omnigent.entities.open_items import (
++    ANSWER_MAX_CHARS,
++    BATCH_KEY_MAX_CHARS,
++    IDEMPOTENCY_KEY_MAX_CHARS,
++    LIST_PAGE_MAX,
++    RAISE_BATCH_MAX,
++    UPDATE_BATCH_MAX,
++    OpenItemError,
++    OpenItemFilter,
++    item_to_json,
++    normalize_change,
++    normalize_new_item,
++    normalize_topic_slug,
++    page_items,
++)
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.runner.identity import (
++    ORCHESTRATION_SOURCE_HEADER,
++    RUNNER_TUNNEL_TOKEN_HEADER,
++    token_bound_runner_id,
++)
++from omnigent.runtime import session_stream
++from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
++from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
++from omnigent.server.routes._errors import session_not_found
++from omnigent.stores import AgentStore, ConversationStore
++from omnigent.stores.open_items_store import (
++    ChangedItem,
++    OpenItemsSessionNotFoundError,
++    OpenItemsStore,
++    open_items_store_for,
++)
++from omnigent.stores.permission_store import PermissionStore
++from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
++
++_logger = logging.getLogger(__name__)
++
++OPEN_ITEMS_CHANGED_EVENT = "session.open_items.changed"
++_unavailable_logged = threading.Event()
++
++
++def open_store(conversation_store: object) -> OpenItemsStore | None:
++    """Return the open items store beside the session metadata, or ``None`` without SQL.
++
++    :param conversation_store: The server's conversation store; items live in
++        the database at its ``storage_location``.
++    """
++    location = getattr(conversation_store, "storage_location", None)
++    if not isinstance(location, str) or not location:
++        return None
++    try:
++        return open_items_store_for(location)
++    except Exception:
++        if not _unavailable_logged.is_set():
++            _unavailable_logged.set()
++            _logger.warning("Open items storage is unavailable", exc_info=True)
++        return None
++
++
++class OpenItemsRaiseRequest(BaseModel):
++    """Items the session's agent raises; see ``sys_open_items_raise``."""
++
++    items: list[dict[str, Any]] = Field(min_length=1, max_length=RAISE_BATCH_MAX)
++    # Names the call, e.g. "tool:<call id>"; item i is written as "<key>:<i>".
++    idempotency_key: str = Field(min_length=1, max_length=BATCH_KEY_MAX_CHARS)
++
++
++class OpenItemsUpdateRequest(BaseModel):
++    """Changes to items; see ``sys_open_items_update``."""
++
++    updates: list[dict[str, Any]] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
++    # What made an agent's change, e.g. "tool:<call id>"; recorded on a close.
++    ref: str | None = Field(default=None, max_length=IDEMPOTENCY_KEY_MAX_CHARS)
++
++
++class OpenItemAnswer(BaseModel):
++    """A person's reply to one item."""
++
++    label: str = Field(min_length=2, max_length=4)
++    text: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
++
++
++class OpenItemsAnswerRequest(BaseModel):
++    """Replies to record, one per item."""
++
++    answers: list[OpenItemAnswer] = Field(min_length=1, max_length=UPDATE_BATCH_MAX)
++
++
++def _require_store(conversation_store: ConversationStore) -> OpenItemsStore:
++    store = open_store(conversation_store)
++    if store is None:
++        raise OmnigentError(
++            "Open items are not available on this server", code=ErrorCode.NOT_FOUND
++        )
++    return store
++
++
++@contextmanager
++def _item_errors() -> Iterator[None]:
++    try:
++        yield
++    except OpenItemsSessionNotFoundError as exc:
++        raise session_not_found() from exc
++    except OpenItemError as exc:
++        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
++
++
++def _same_session(left: str, right: str) -> bool:
++    try:
++        return uuid_to_bytes(left.strip()) == uuid_to_bytes(right)
++    except InvalidUuidError:
++        return False
++
++
++def _error_json(error: OpenItemError) -> dict[str, str]:
++    return {"code": error.code, "message": error.message}
++
++
++def _changed_json(results: Sequence[ChangedItem]) -> list[dict[str, Any]]:
++    return [
++        {"label": result.label, "item": item_to_json(result.item)}
++        if result.item is not None
++        else {"label": result.label, "error": _error_json(result.error)}  # type: ignore[arg-type]
++        for result in results
++    ]
++
++
++def create_open_items_router(
++    conversation_store: ConversationStore,
++    *,
++    agent_store: AgentStore,
++    agent_cache: Any,
++    auth_provider: AuthProvider | None = None,
++    permission_store: PermissionStore | None = None,
++) -> APIRouter:
++    """Build the open items router, mounted under ``/v1``.
++
++    :param conversation_store: The server's conversation store. Items are
++        stored in its database; without a SQL backend every route answers 404.
++    :param agent_store: Loads the session's agent, whose spec must keep the
++        ``open_items`` tool group for its runner to write.
++    :param agent_cache: Loads that agent's spec.
++    :param auth_provider: Identifies the caller; ``None`` in single-user mode.
++    :param permission_store: Session grants; ``None`` disables enforcement.
++    """
++    from omnigent.runtime.workflow import _find_spec_by_name
++
++    router = APIRouter()
++
++    async def _session(request: Request, session_id: str, level: int) -> Conversation:
++        user_id = get_user_id(request, auth_provider)
++        access = await require_access_and_level(
++            user_id, session_id, level, permission_store, conversation_store
++        )
++        conversation = access.conversation or await asyncio.to_thread(
++            conversation_store.get_conversation, session_id
++        )
++        if conversation is None:
++            raise session_not_found()
++        return conversation
++
++    def _agent_keeps_open_items(session: Conversation) -> bool:
++        """Whether the session's agent (or its named sub-agent) has the tool group."""
++        agent = agent_store.get(session.agent_id) if session.agent_id else None
++        if agent is None:
++            return False
++        spec = agent_cache.load(
++            agent.id, agent.bundle_location, expand_env=agent.operator_authored
++        ).spec
++        if session.sub_agent_name:
++            spec = _find_spec_by_name(spec, session.sub_agent_name)
++        return spec is not None and spec.tool_groups.open_items
++
++    async def _agent_session(request: Request, session_id: str) -> Conversation:
++        """The session, when the call comes from its own runner for an agent with the group."""
++        session = await _session(request, session_id, LEVEL_EDIT)
++        source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
++        if source is None or not _same_session(source, session.id):
++            raise OmnigentError(
++                "Only the session's own agent writes its open items", code=ErrorCode.FORBIDDEN
++            )
++        user_id = get_user_id(request, auth_provider)
++        if permission_store is not None and user_id not in (None, RESERVED_USER_LOCAL):
++            token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
++            if (
++                not token
++                or not session.runner_id
++                or token_bound_runner_id(token) != session.runner_id
++            ):
++                raise OmnigentError(
++                    "Only the session's bound runner writes its open items",
++                    code=ErrorCode.FORBIDDEN,
++                )
++        if not await asyncio.to_thread(_agent_keeps_open_items, session):
++            raise OmnigentError(
++                "Open items need an agent with the open_items tool group",
++                code=ErrorCode.FORBIDDEN,
++            )
++        return session
++
++    def _owner(session: Conversation, user_id: str | None) -> str:
++        if permission_store is None:
++            return RESERVED_USER_LOCAL
++        root = session.root_conversation_id or session.id
++        owner = conversation_store.get_session_owner(root, owner_only=True)
++        return owner or user_id or RESERVED_USER_LOCAL
++
++    async def _publish(store: OpenItemsStore, session_id: str, labels: list[str]) -> None:
++        if not labels:
++            return
++        open_count = await asyncio.to_thread(store.open_count, session_id)
++        session_stream.publish(
++            session_id,
++            {
++                "type": OPEN_ITEMS_CHANGED_EVENT,
++                "conversation_id": session_id,
++                "labels": labels,
++                "open_count": open_count,
++            },
++        )
++
++    @router.get("/sessions/{session_id}/open-items")
++    async def list_open_items(
++        request: Request,
++        session_id: str,
++        status: list[Literal["open", "answered", "closed", "all"]] = Query(  # noqa: B008
++            default=["open", "answered"]
++        ),
++        kind: list[Literal["question", "risk", "finding", "follow_up", "link"]] = Query(  # noqa: B008
++            default=[]
++        ),
++        topic: str | None = None,
++        raised_by: str | None = None,
++        has_links: bool | None = None,
++        q: str | None = Query(default=None, max_length=200),
++        limit: int = Query(100, ge=1, le=LIST_PAGE_MAX),
++        after: str | None = Query(default=None, max_length=4),
++    ) -> dict[str, Any]:
++        """One page of the session's items in label order, with counts over all of them."""
++        session = await _session(request, session_id, LEVEL_READ)
++        store = _require_store(conversation_store)
++        with _item_errors():
++            wanted = OpenItemFilter(
++                statuses=() if "all" in status else tuple(status),
++                kinds=tuple(kind),
++                topic=normalize_topic_slug(topic),
++                raised_by=raised_by,
++                has_links=has_links,
++                query=q.strip() if q and q.strip() else None,
++                after=after,
++                limit=limit,
++            )
++            items = await asyncio.to_thread(store.list_items, session.id)
++            page = page_items(items, wanted)
++        data = [item_to_json(item) for item in page.items]
++        return {
++            "data": data,
++            "has_more": page.has_more,
++            "next_after": data[-1]["label"] if page.has_more else None,
++            "counts": {"status": page.status_counts, "kind": page.kind_counts},
++            "topics": page.topics,
++        }
++
++    @router.post("/sessions/{session_id}/open-items")
++    async def raise_open_items(
++        request: Request, session_id: str, body: OpenItemsRaiseRequest
++    ) -> dict[str, Any]:
++        """Raise items for the session's agent; only its runner calls this."""
++        session = await _agent_session(request, session_id)
++        store = _require_store(conversation_store)
++        user_id = get_user_id(request, auth_provider)
++        with _item_errors():
++            items = [normalize_new_item(item) for item in body.items]
++            owner = await asyncio.to_thread(_owner, session, user_id)
++            results = await asyncio.to_thread(
++                lambda: store.raise_items(
++                    session.id,
++                    items,
++                    idempotency_key=body.idempotency_key,
++                    root_conversation_id=session.root_conversation_id or session.id,
++                    user_id=owner,
++                )
++            )
++        rows: list[dict[str, Any]] = []
++        for result in results:
++            if result.item is None:
++                rows.append({"error": _error_json(result.error)})  # type: ignore[arg-type]
++            else:
++                rows.append({"item": item_to_json(result.item), "duplicate": result.duplicate})
++        everything = await asyncio.to_thread(store.list_items, session.id)
++        await _publish(store, session.id, [row["item"]["label"] for row in rows if "item" in row])
++        return {
++            "items": rows,
++            "open_count": sum(item.status != "closed" for item in everything),
++            "topics": sorted({t for item in everything if (t := item.content.get("topic"))}),
++        }
++
++    @router.patch("/sessions/{session_id}/open-items")
++    async def update_open_items(
++        request: Request, session_id: str, body: OpenItemsUpdateRequest
++    ) -> dict[str, Any]:
++        """Change items, from the session's runner or a person with edit access."""
++        if request.headers.get(ORCHESTRATION_SOURCE_HEADER) is not None:
++            session = await _agent_session(request, session_id)
++            closed_by = "agent"
++        else:
++            session = await _session(request, session_id, LEVEL_EDIT)
++            closed_by = "user"
++        store = _require_store(conversation_store)
++        with _item_errors():
++            changes = [normalize_change(update) for update in body.updates]
++            results = await asyncio.to_thread(
++                lambda: store.change_items(
++                    session.id, changes, closed_by=closed_by, closed_ref=body.ref
++                )
++            )
++        await _publish(store, session.id, [r.label for r in results if r.item is not None])
++        return {"items": _changed_json(results)}
++
++    @router.post("/sessions/{session_id}/open-items/answers")
++    async def answer_open_items(
++        request: Request, session_id: str, body: OpenItemsAnswerRequest
++    ) -> dict[str, Any]:
++        """Record a person's replies; needs edit access."""
++        session = await _session(request, session_id, LEVEL_EDIT)
++        store = _require_store(conversation_store)
++        user_id = get_user_id(request, auth_provider)
++        with _item_errors():
++            answers = [(answer.label, answer.text.strip()) for answer in body.answers]
++            if not all(text for _, text in answers):
++                raise OpenItemError("invalid_input", "an answer needs text")
++            results = await asyncio.to_thread(
++                lambda: store.record_answers(session.id, answers, user_id=user_id)
++            )
++        await _publish(store, session.id, [r.label for r in results if r.item is not None])
++        return {"items": _changed_json(results)}
++
++    return router
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index a97af6f035d210cd7d05d26985e51929e1257237..8ae06ff0a858985920940084103a8e0680c45e59 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -6069,6 +6069,25 @@ class SessionJournalAppendedEvent(_SSEEventBase):
+     entry: SessionJournalEntry
+ 
+ 
++class SessionOpenItemsChangedEvent(_SSEEventBase):
++    """
++    Items in the session's open items list were raised or changed.
++
++    Transient: the list is the source of truth; a client that sees it, or
++    reconnects, reads ``GET /v1/sessions/{id}/open-items`` again.
++
++    :param type: Always ``"session.open_items.changed"``.
++    :param conversation_id: The session whose items changed.
++    :param labels: The labels written, e.g. ``["Q7", "R2"]``.
++    :param open_count: The session's open and answered items after the write.
++    """
++
++    type: Literal["session.open_items.changed"]
++    conversation_id: str
++    labels: list[str]
++    open_count: int
++
++
+ class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
+     """
+     The session's changed-files list may have changed — refetch it.
+@@ -6214,6 +6233,7 @@ ServerStreamEvent = Annotated[
+     | SessionResourceDeletedEvent
+     | SessionChildSessionUpdatedEvent
+     | SessionJournalAppendedEvent
++    | SessionOpenItemsChangedEvent
+     | SessionChangedFilesInvalidatedEvent
+     | SessionTerminalActivityEvent
+     # ── Transient (SSE-only) — incremental token deltas ────────
+diff --git a/omnigent/spec/types.py b/omnigent/spec/types.py
+index 7e00da39ecbd3b4107e620bef1340e71855f0a95..436ab235086704e65e975672c3ff4839db3ef8e6 100644
+--- a/omnigent/spec/types.py
++++ b/omnigent/spec/types.py
+@@ -904,6 +904,10 @@ class ToolGroupsConfig:
+     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+     :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
+         statuses and notes.
++    :param open_items: ``sys_open_items_raise``, ``sys_open_items_update`` and
++        ``sys_open_items_list``: the session's stored questions, risks,
++        findings, follow-ups and links. The runner also drops them unless the
++        server stores open items.
+     :param projects: ``sys_project_list``, ``sys_project_update`` and
+         ``sys_session_update``.
+     :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
+@@ -921,6 +925,7 @@ class ToolGroupsConfig:
+     policies: bool = True
+     agent_discovery: bool = True
+     journal: bool = True
++    open_items: bool = True
+     projects: bool = True
+     user_inbox: bool = True
+     memory: bool = True
+diff --git a/omnigent/stores/open_items_migrations/open_items0001_create_tables.py b/omnigent/stores/open_items_migrations/open_items0001_create_tables.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1e933f110fe94e7fdf6f34149be3a9db478c295
+--- /dev/null
++++ b/omnigent/stores/open_items_migrations/open_items0001_create_tables.py
+@@ -0,0 +1,108 @@
++"""create the open items tables
++
++Revision ID: open_items0001
++Revises:
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++from alembic import op
++from sqlalchemy.dialects.mysql import VARBINARY
++
++from omnigent.db.db_models import Uuid16
++from omnigent.db.side_schemas import migration_schema
++
++revision: str = "open_items0001"
++down_revision: str | None = None
++branch_labels: str | None = None
++depends_on: str | None = None
++
++# A BLOB on PostgreSQL and SQLite, a VARBINARY of the cap on MySQL; the
++# application checks the cap on every write.
++_ENVELOPE = sa.LargeBinary().with_variant(VARBINARY(16_383), "mysql")
++_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
++# SQLite enforces neither declared lengths nor types; these bound what it stores.
++_SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
++    ("length(CAST(user_id AS BLOB)) <= 512", "ck_open_items_entries_user_id_bytes"),
++    (
++        "length(CAST(idempotency_key AS BLOB)) <= 512",
++        "ck_open_items_entries_idempotency_key_bytes",
++    ),
++    (
++        "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 256",
++        "ck_open_items_entries_dedupe_key_bytes",
++    ),
++    ("length(CAST(content AS BLOB)) <= 16383", "ck_open_items_entries_content_bytes"),
++    (
++        "outcome IS NULL OR length(CAST(outcome AS BLOB)) <= 16383",
++        "ck_open_items_entries_outcome_bytes",
++    ),
++    ("typeof(number) = 'integer'", "ck_open_items_entries_number_integer"),
++    ("typeof(created_at) = 'integer'", "ck_open_items_entries_created_at_integer"),
++)
++
++
++def _sqlite_checks() -> list[sa.CheckConstraint]:
++    if op.get_bind().dialect.name not in _SQLITE_FAMILY:
++        return []
++    return [sa.CheckConstraint(expr, name=name) for expr, name in _SQLITE_CHECKS]
++
++
++def upgrade() -> None:
++    schema = migration_schema()
++    op.create_table(
++        "open_items_entries",
++        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
++        sa.Column("conversation_id", Uuid16(), nullable=False),
++        sa.Column("kind", sa.SmallInteger(), nullable=False),
++        sa.Column("number", sa.Integer(), nullable=False),
++        sa.Column("root_conversation_id", Uuid16(), nullable=False),
++        sa.Column("user_id", sa.String(128), nullable=False),
++        sa.Column("status", sa.SmallInteger(), nullable=False),
++        sa.Column("idempotency_key", sa.String(128), nullable=False),
++        sa.Column("dedupe_key", sa.String(64), nullable=True),
++        sa.Column("created_at", sa.BigInteger(), nullable=False),
++        sa.Column("updated_at", sa.BigInteger(), nullable=False),
++        sa.Column("closed_at", sa.BigInteger(), nullable=True),
++        sa.Column("content", _ENVELOPE, nullable=False),
++        sa.Column("outcome", _ENVELOPE, nullable=True),
++        sa.CheckConstraint("status IN (1, 2, 3)", name="ck_open_items_entries_status"),
++        sa.CheckConstraint("kind IN (1, 2, 3, 4, 5)", name="ck_open_items_entries_kind"),
++        sa.PrimaryKeyConstraint(
++            "workspace_id", "conversation_id", "kind", "number", name="pk_open_items_entries"
++        ),
++        *_sqlite_checks(),
++        schema=schema,
++    )
++    op.create_index(
++        "ix_open_items_entries_status",
++        "open_items_entries",
++        ["workspace_id", "conversation_id", "status", "kind", "number"],
++        schema=schema,
++    )
++    op.create_index(
++        "ix_open_items_entries_idem",
++        "open_items_entries",
++        ["workspace_id", "conversation_id", "idempotency_key", "kind", "number"],
++        schema=schema,
++    )
++    op.create_table(
++        "open_items_heads",
++        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
++        sa.Column("conversation_id", Uuid16(), nullable=False),
++        sa.Column("kind", sa.SmallInteger(), nullable=False),
++        sa.Column("next_number", sa.Integer(), nullable=False),
++        sa.PrimaryKeyConstraint(
++            "workspace_id", "conversation_id", "kind", name="pk_open_items_heads"
++        ),
++        schema=schema,
++    )
++
++
++def downgrade() -> None:
++    schema = migration_schema()
++    op.drop_table("open_items_heads", schema=schema)
++    op.drop_index("ix_open_items_entries_idem", "open_items_entries", schema=schema)
++    op.drop_index("ix_open_items_entries_status", "open_items_entries", schema=schema)
++    op.drop_table("open_items_entries", schema=schema)
+diff --git a/omnigent/stores/open_items_store.py b/omnigent/stores/open_items_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..376651467cceeba94da1f299d71c39d1623aa9e5
+--- /dev/null
++++ b/omnigent/stores/open_items_store.py
+@@ -0,0 +1,611 @@
++"""Persistent store of each session's open items, kept in the ``open_items`` side store.
++
++Items are rows of ``open_items_entries``, keyed by session, kind and number,
++so an item's label is part of its key. ``open_items_heads`` holds one row per
++session and kind with the next number to allocate, plus a session row (kind
++0) counting the session's items. A raise locks the session row, then the
++kind's row, so two raises in one session never get the same label while
++other sessions don't wait. A raise carries an idempotency key per item, so a
++retried raise returns the labels its first attempt allocated.
++
++The tables live apart from the main migration chain
++(``docs/extending/side_schemas.md``); deleting a session deletes its rows,
++and a fork starts with none.
++"""
++
++from __future__ import annotations
++
++import threading
++from collections.abc import Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++from sqlalchemy import (
++    BigInteger,
++    CheckConstraint,
++    Index,
++    Integer,
++    SmallInteger,
++    String,
++    delete,
++    func,
++    select,
++    tuple_,
++    update,
++)
++from sqlalchemy.dialects.mysql import insert as mysql_insert
++from sqlalchemy.dialects.postgresql import insert as pg_insert
++from sqlalchemy.dialects.sqlite import insert as sqlite_insert
++from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
++
++from omnigent.db.db_models import (
++    MAX_STORED_VALUE_BYTES,
++    SqlConversationMetadata,
++    Uuid16,
++    current_workspace_id,
++)
++from omnigent.db.envelope import EnvelopedJSON, seal
++from omnigent.db.side_schemas import SideStore, register_side_store, side_metadata
++from omnigent.db.utils import now_epoch, run_write_transaction
++from omnigent.entities.open_items import (
++    ANSWERS_KEPT,
++    IDEMPOTENCY_KEY_MAX_CHARS,
++    ITEMS_PER_SESSION,
++    KIND_BY_CODE,
++    KINDS,
++    NUMBER_MAX,
++    SESSION_HEAD_KIND,
++    STATUS_BY_CODE,
++    STATUSES,
++    NewOpenItem,
++    OpenItem,
++    OpenItemChange,
++    OpenItemError,
++    apply_link_changes,
++    format_label,
++    parse_label,
++)
++
++# Session deletion removes at most this many rows per transaction.
++DELETE_BATCH = 200
++_QUERY_NAME_PREFIX = "omnigent.open_items"
++
++
++class OpenItemsBase(DeclarativeBase):
++    metadata = side_metadata("open_items")
++
++
++class SqlOpenItem(OpenItemsBase):
++    """One item; its label is the kind's letter and ``number``."""
++
++    __tablename__ = "open_items_entries"
++
++    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
++    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
++    # KINDS code: question, risk, finding, follow-up or link.
++    kind: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
++    number: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
++    # The session's root, for lists across a session tree.
++    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
++    # The root session's owner when the item was raised.
++    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
++    # STATUSES code: open, answered or closed.
++    status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
++    # Names the write that raised it, e.g. "tool:<call id>:0".
++    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
++    # A link item's canonical URL hash, so pinning it twice returns one item.
++    dedupe_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
++    # Unix epoch seconds.
++    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
++    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
++    closed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
++    # What the agent raised, which a deployment may encrypt:
++    # {"title", "detail", "topic", "links", "url", "raised_by"}.
++    content: Mapped[dict[str, Any]] = mapped_column(
++        EnvelopedJSON(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
++    )
++    # How it went, written apart from the content:
++    # {"resolution", "closed_by", "closed_ref", "answers"}.
++    outcome: Mapped[dict[str, Any] | None] = mapped_column(
++        EnvelopedJSON(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=True
++    )
++
++    __table_args__ = (
++        CheckConstraint("status IN (1, 2, 3)", name="ck_open_items_entries_status"),
++        CheckConstraint("kind IN (1, 2, 3, 4, 5)", name="ck_open_items_entries_kind"),
++        # The open count and status filters.
++        Index(
++            "ix_open_items_entries_status",
++            "workspace_id",
++            "conversation_id",
++            "status",
++            "kind",
++            "number",
++        ),
++        # Finds what a retried raise wrote.
++        Index(
++            "ix_open_items_entries_idem",
++            "workspace_id",
++            "conversation_id",
++            "idempotency_key",
++            "kind",
++            "number",
++        ),
++    )
++
++
++class SqlOpenItemHead(OpenItemsBase):
++    """The next number per session and kind; kind 0 counts the session's items."""
++
++    __tablename__ = "open_items_heads"
++
++    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
++    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
++    kind: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
++    next_number: Mapped[int] = mapped_column(Integer, nullable=False)
++
++
++def delete_open_items_batch(session: Session, conversation_ids: Sequence[str]) -> bool:
++    """Delete deleted sessions' heads and up to :data:`DELETE_BATCH` of their items.
++
++    The side-store cleanup callback. Heads go first, so a raise that starts
++    afterwards finds its session gone; items are read in key order and
++    deleted by key.
++
++    :returns: Whether items may remain, so the cleanup runs again.
++    """
++    workspace_id = current_workspace_id()
++    session.execute(
++        delete(SqlOpenItemHead).where(
++            SqlOpenItemHead.workspace_id == workspace_id,
++            SqlOpenItemHead.conversation_id.in_(conversation_ids),
++        )
++    )
++    keys: list[Any] = []
++    for conversation_id in sorted(set(conversation_ids)):
++        if len(keys) == DELETE_BATCH:
++            break
++        keys.extend(
++            session.execute(
++                select(SqlOpenItem.conversation_id, SqlOpenItem.kind, SqlOpenItem.number)
++                .where(
++                    SqlOpenItem.workspace_id == workspace_id,
++                    SqlOpenItem.conversation_id == conversation_id,
++                )
++                .order_by(SqlOpenItem.kind, SqlOpenItem.number)
++                .limit(DELETE_BATCH - len(keys))
++            ).all()
++        )
++    if keys:
++        session.execute(
++            delete(SqlOpenItem)
++            .where(
++                SqlOpenItem.workspace_id == workspace_id,
++                tuple_(SqlOpenItem.conversation_id, SqlOpenItem.kind, SqlOpenItem.number).in_(
++                    [tuple(key) for key in keys]
++                ),
++            )
++            .execution_options(synchronize_session=False)
++        )
++    return len(keys) == DELETE_BATCH
++
++
++OPEN_ITEMS_SIDE_STORE = register_side_store(
++    SideStore(
++        "open_items",
++        OpenItemsBase.metadata,
++        Path(__file__).parent / "open_items_migrations",
++        delete_open_items_batch,
++    )
++)
++
++
++@dataclass(frozen=True)
++class RaisedItem:
++    """What one raised item came to: its item, or the error that stopped it."""
++
++    item: OpenItem | None = None
++    duplicate: bool = False
++    error: OpenItemError | None = None
++
++
++@dataclass(frozen=True)
++class ChangedItem:
++    """What one change came to: the item after it, or the error that stopped it."""
++
++    label: str
++    item: OpenItem | None = None
++    error: OpenItemError | None = None
++
++
++class OpenItemsSessionNotFoundError(Exception):
++    """The session doesn't exist, or was deleted while the write ran."""
++
++
++def _to_item(row: SqlOpenItem) -> OpenItem:
++    return OpenItem(
++        conversation_id=row.conversation_id,
++        kind=KIND_BY_CODE[row.kind],
++        number=row.number,
++        status=STATUS_BY_CODE[row.status],
++        created_at=row.created_at,
++        updated_at=row.updated_at,
++        closed_at=row.closed_at,
++        content=dict(row.content),
++        outcome=dict(row.outcome or {}),
++    )
++
++
++def _check_size(content: dict[str, Any], label: str) -> None:
++    if len(seal(content)) > MAX_STORED_VALUE_BYTES:
++        raise OpenItemError(
++            "too_large", f"{label} is over {MAX_STORED_VALUE_BYTES} bytes stored; shorten it"
++        )
++
++
++class OpenItemsStore:
++    """SQLAlchemy-backed store of each session's open items."""
++
++    def __init__(self, storage_location: str) -> None:
++        """Open the store, creating or upgrading its tables on first use.
++
++        :param storage_location: SQLAlchemy URI of the database holding the
++            session metadata, e.g. ``"sqlite:///omnigent.db"``.
++        :raises RuntimeError: If the side store cannot be migrated.
++        """
++        self.storage_location = storage_location
++        self._reads = OPEN_ITEMS_SIDE_STORE.session_maker(
++            storage_location, query_name_prefix=_QUERY_NAME_PREFIX
++        )
++        self._writes = OPEN_ITEMS_SIDE_STORE.session_maker(
++            storage_location, query_name_prefix=_QUERY_NAME_PREFIX, immediate=True
++        )
++        self._dialect = self._writes.engine.dialect.name
++
++    # ── Locks and checks ──────────────────────────────
++
++    def _lock_head(self, session: Session, conversation_id: str, kind: int) -> int:
++        """Lock a heads row, creating it on first use; returns its ``next_number``."""
++        values = {
++            "workspace_id": current_workspace_id(),
++            "conversation_id": conversation_id,
++            "kind": kind,
++            "next_number": 0 if kind == SESSION_HEAD_KIND else 1,
++        }
++        if self._dialect == "mysql":
++            statement: Any = (
++                mysql_insert(SqlOpenItemHead)
++                .values(**values)
++                .on_duplicate_key_update(next_number=SqlOpenItemHead.next_number)
++            )
++        elif self._dialect == "sqlite":
++            statement = sqlite_insert(SqlOpenItemHead).values(**values).on_conflict_do_nothing()
++        else:
++            statement = pg_insert(SqlOpenItemHead).values(**values).on_conflict_do_nothing()
++        session.execute(statement)
++        # SQLite has no FOR UPDATE; its immediate transaction already holds the write lock.
++        return session.execute(
++            select(SqlOpenItemHead.next_number)
++            .where(
++                SqlOpenItemHead.workspace_id == current_workspace_id(),
++                SqlOpenItemHead.conversation_id == conversation_id,
++                SqlOpenItemHead.kind == kind,
++            )
++            .with_for_update()
++        ).scalar_one()
++
++    @staticmethod
++    def _set_head(session: Session, conversation_id: str, kind: int, next_number: int) -> None:
++        session.execute(
++            update(SqlOpenItemHead)
++            .where(
++                SqlOpenItemHead.workspace_id == current_workspace_id(),
++                SqlOpenItemHead.conversation_id == conversation_id,
++                SqlOpenItemHead.kind == kind,
++            )
++            .values(next_number=next_number)
++        )
++
++    @staticmethod
++    def _require_session(session: Session, conversation_id: str) -> None:
++        exists = session.execute(
++            select(SqlConversationMetadata.id).where(
++                SqlConversationMetadata.workspace_id == current_workspace_id(),
++                SqlConversationMetadata.id == conversation_id,
++            )
++        ).first()
++        if exists is None:
++            raise OpenItemsSessionNotFoundError(f"session {conversation_id!r} not found")
++
++    @staticmethod
++    def _row(
++        session: Session, conversation_id: str, kind: int, number: int, *, lock: bool = False
++    ) -> SqlOpenItem | None:
++        statement = select(SqlOpenItem).where(
++            SqlOpenItem.workspace_id == current_workspace_id(),
++            SqlOpenItem.conversation_id == conversation_id,
++            SqlOpenItem.kind == kind,
++            SqlOpenItem.number == number,
++        )
++        return session.execute(statement.with_for_update() if lock else statement).scalar()
++
++    # ── Writes ────────────────────────────────────────
++
++    def raise_items(
++        self,
++        conversation_id: str,
++        items: Sequence[NewOpenItem],
++        *,
++        idempotency_key: str,
++        root_conversation_id: str,
++        user_id: str,
++    ) -> list[RaisedItem]:
++        """Raise items in a session, allocating their labels.
++
++        Item ``i`` is written under ``<idempotency_key>:<i>``; a retry with the
++        same key returns the items the first attempt wrote. A link whose URL
++        the session already pinned returns that item as a duplicate. An item
++        with its own number adopts that label if it is free.
++
++        :param items: Checked items, see
++            :func:`~omnigent.entities.open_items.normalize_new_item`.
++        :param user_id: The root session's owner.
++        :returns: One result per item, in order; an item the session can't
++            take carries ``session_full`` or ``label_taken``.
++        :raises OpenItemsSessionNotFoundError: If the session doesn't exist.
++        """
++        keys = [f"{idempotency_key}:{index}" for index in range(len(items))]
++        if any(len(key) > IDEMPOTENCY_KEY_MAX_CHARS for key in keys):
++            raise OpenItemError("invalid_input", "idempotency_key is too long")
++        for item in items:
++            _check_size(item.content, f"the {item.kind} {item.content.get('title')!r}")
++
++        def write(session: Session) -> list[RaisedItem]:
++            count = self._lock_head(session, conversation_id, SESSION_HEAD_KIND)
++            self._require_session(session, conversation_id)
++            results = []
++            for item, key in zip(items, keys, strict=True):
++                result = self._raise_one(
++                    session, conversation_id, item, key, count, root_conversation_id, user_id
++                )
++                if result.item is not None and not result.duplicate:
++                    count += 1
++                results.append(result)
++            self._set_head(session, conversation_id, SESSION_HEAD_KIND, count)
++            return results
++
++        return run_write_transaction(self._writes, "raise_open_items", write)
++
++    def _raise_one(
++        self,
++        session: Session,
++        conversation_id: str,
++        item: NewOpenItem,
++        key: str,
++        count: int,
++        root_conversation_id: str,
++        user_id: str,
++    ) -> RaisedItem:
++        workspace_id = current_workspace_id()
++        earlier = session.execute(
++            select(SqlOpenItem).where(
++                SqlOpenItem.workspace_id == workspace_id,
++                SqlOpenItem.conversation_id == conversation_id,
++                SqlOpenItem.idempotency_key == key,
++            )
++        ).scalar()
++        if earlier is not None:
++            return RaisedItem(item=_to_item(earlier))
++        kind = KINDS[item.kind][0]
++        if item.dedupe_key is not None:
++            # A session's links are bounded by the per-kind cap.
++            pinned = session.execute(
++                select(SqlOpenItem).where(
++                    SqlOpenItem.workspace_id == workspace_id,
++                    SqlOpenItem.conversation_id == conversation_id,
++                    SqlOpenItem.kind == kind,
++                    SqlOpenItem.dedupe_key == item.dedupe_key,
++                )
++            ).scalar()
++            if pinned is not None:
++                return RaisedItem(item=_to_item(pinned), duplicate=True)
++        if count >= ITEMS_PER_SESSION:
++            return RaisedItem(
++                error=OpenItemError(
++                    "session_full",
++                    f"this session holds {ITEMS_PER_SESSION} items; close and reuse topics, "
++                    "or label further items in chat",
++                )
++            )
++        next_number = self._lock_head(session, conversation_id, kind)
++        number = next_number if item.number is None else item.number
++        if number > NUMBER_MAX:
++            return RaisedItem(
++                error=OpenItemError(
++                    "session_full", f"this session has used every {item.kind} label"
++                )
++            )
++        if item.number is not None and self._row(session, conversation_id, kind, number):
++            return RaisedItem(
++                error=OpenItemError(
++                    "label_taken",
++                    f"{format_label(item.kind, number)} is already an item in this session; "
++                    "raise without a label to get a new one",
++                )
++            )
++        now = now_epoch()
++        row = SqlOpenItem(
++            workspace_id=workspace_id,
++            conversation_id=conversation_id,
++            kind=kind,
++            number=number,
++            root_conversation_id=root_conversation_id,
++            user_id=user_id,
++            status=STATUSES["open"],
++            idempotency_key=key,
++            dedupe_key=item.dedupe_key,
++            created_at=now,
++            updated_at=now,
++            closed_at=None,
++            content=item.content,
++            outcome=None,
++        )
++        session.add(row)
++        session.flush()
++        self._set_head(session, conversation_id, kind, max(next_number, number + 1))
++        return RaisedItem(item=_to_item(row))
++
++    def change_items(
++        self,
++        conversation_id: str,
++        changes: Sequence[OpenItemChange],
++        *,
++        closed_by: str,
++        closed_ref: str | None = None,
++    ) -> list[ChangedItem]:
++        """Change items: status, resolution, title, detail, topic and links.
++
++        Closing records the resolution and who closed it; reopening clears
++        them and keeps the answers.
++
++        :param closed_by: ``"agent"`` or ``"user"``, recorded on a close.
++        :param closed_ref: What closed it, e.g. ``"tool:<call id>"``.
++        :returns: One result per change, in order; a label the session lacks
++            carries ``not_found``.
++        """
++
++        def write(session: Session) -> list[ChangedItem]:
++            return [
++                self._change_one(session, conversation_id, change, closed_by, closed_ref)
++                for change in changes
++            ]
++
++        return run_write_transaction(self._writes, "change_open_items", write)
++
++    def _change_one(
++        self,
++        session: Session,
++        conversation_id: str,
++        change: OpenItemChange,
++        closed_by: str,
++        closed_ref: str | None,
++    ) -> ChangedItem:
++        label = format_label(change.kind, change.number)
++        row = self._row(session, conversation_id, KINDS[change.kind][0], change.number, lock=True)
++        if row is None:
++            return ChangedItem(label, error=OpenItemError("not_found", f"no item {label}"))
++        content = dict(row.content)
++        outcome = dict(row.outcome or {})
++        try:
++            for name, value in change.fields.items():
++                if value is None:
++                    content.pop(name, None)
++                else:
++                    content[name] = value
++            if change.add_links or change.remove_links:
++                links = apply_link_changes(content.get("links") or [], change)
++                content["links"] = links
++                if not links:
++                    content.pop("links")
++            _check_size(content, label)
++        except OpenItemError as exc:
++            return ChangedItem(label, error=exc)
++        now = now_epoch()
++        if change.resolution is not None:
++            outcome["resolution"] = change.resolution
++        if change.status == "closed":
++            if row.status != STATUSES["closed"]:
++                row.closed_at = now
++            row.status = STATUSES["closed"]
++            outcome["closed_by"] = closed_by
++            if closed_ref is not None:
++                outcome["closed_ref"] = closed_ref
++        elif change.status == "open":
++            row.status = STATUSES["open"]
++            row.closed_at = None
++            for name in ("resolution", "closed_by", "closed_ref"):
++                outcome.pop(name, None)
++        row.content = content
++        row.outcome = outcome or None
++        row.updated_at = now
++        return ChangedItem(label, item=_to_item(row))
++
++    def record_answers(
++        self, conversation_id: str, answers: Sequence[tuple[str, str]], *, user_id: str | None
++    ) -> list[ChangedItem]:
++        """Record the user's replies; an open item becomes answered.
++
++        :param answers: ``(label, text)`` pairs, checked by the caller.
++        :param user_id: Who replied, or ``None`` in single-user mode.
++        """
++
++        def write(session: Session) -> list[ChangedItem]:
++            results = []
++            for label, text in answers:
++                kind, number = parse_label(label)
++                label = format_label(kind, number)
++                row = self._row(session, conversation_id, KINDS[kind][0], number, lock=True)
++                if row is None:
++                    results.append(
++                        ChangedItem(label, error=OpenItemError("not_found", f"no item {label}"))
++                    )
++                    continue
++                now = now_epoch()
++                outcome = dict(row.outcome or {})
++                answer = {"text": text, "at": now, "by": user_id}
++                outcome["answers"] = [*(outcome.get("answers") or []), answer][-ANSWERS_KEPT:]
++                row.outcome = outcome
++                if row.status == STATUSES["open"]:
++                    row.status = STATUSES["answered"]
++                row.updated_at = now
++                results.append(ChangedItem(label, item=_to_item(row)))
++            return results
++
++        return run_write_transaction(self._writes, "record_open_item_answers", write)
++
++    # ── Reads ─────────────────────────────────────────
++
++    def list_items(self, conversation_id: str) -> list[OpenItem]:
++        """Every item of the session in label order; the session cap bounds them."""
++        with self._reads("list_open_items") as session:
++            rows = session.execute(
++                select(SqlOpenItem)
++                .where(
++                    SqlOpenItem.workspace_id == current_workspace_id(),
++                    SqlOpenItem.conversation_id == conversation_id,
++                )
++                .order_by(SqlOpenItem.kind, SqlOpenItem.number)
++                .limit(ITEMS_PER_SESSION + 1)
++            ).scalars()
++            return [_to_item(row) for row in rows]
++
++    def open_count(self, conversation_id: str) -> int:
++        """How many of the session's items are open or answered."""
++        with self._reads("count_open_items") as session:
++            return session.execute(
++                select(func.count())
++                .select_from(SqlOpenItem)
++                .where(
++                    SqlOpenItem.workspace_id == current_workspace_id(),
++                    SqlOpenItem.conversation_id == conversation_id,
++                    SqlOpenItem.status.in_([STATUSES["open"], STATUSES["answered"]]),
++                )
++            ).scalar_one()
++
++
++# custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
++_stores: dict[str, OpenItemsStore] = {}
++_stores_lock = threading.Lock()
++
++
++def open_items_store_for(storage_location: str) -> OpenItemsStore:
++    """Return the process's store for a database, opening it once.
++
++    :raises RuntimeError: If the side store cannot be migrated.
++    """
++    with _stores_lock:
++        store = _stores.get(storage_location)
++        if store is None:
++            store = _stores[storage_location] = OpenItemsStore(storage_location)
++        return store
+diff --git a/openapi.json b/openapi.json
+index 006b2f2d8ccb6b9a0688895ce619500cdfb05fe0..cf39deaa38a64436c6ee4e7fa982d09cb0093373 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -5932,6 +5932,107 @@
+         "title": "OpenFileResponse",
+         "type": "object"
+       },
++      "OpenItemAnswer": {
++        "description": "A person's reply to one item.",
++        "properties": {
++          "label": {
++            "maxLength": 4,
++            "minLength": 2,
++            "title": "Label",
++            "type": "string"
++          },
++          "text": {
++            "maxLength": 2000,
++            "minLength": 1,
++            "title": "Text",
++            "type": "string"
++          }
++        },
++        "required": [
++          "label",
++          "text"
++        ],
++        "title": "OpenItemAnswer",
++        "type": "object"
++      },
++      "OpenItemsAnswerRequest": {
++        "description": "Replies to record, one per item.",
++        "properties": {
++          "answers": {
++            "items": {
++              "$ref": "#/components/schemas/OpenItemAnswer"
++            },
++            "maxItems": 20,
++            "minItems": 1,
++            "title": "Answers",
++            "type": "array"
++          }
++        },
++        "required": [
++          "answers"
++        ],
++        "title": "OpenItemsAnswerRequest",
++        "type": "object"
++      },
++      "OpenItemsRaiseRequest": {
++        "description": "Items the session's agent raises; see `sys_open_items_raise`.",
++        "properties": {
++          "idempotency_key": {
++            "maxLength": 120,
++            "minLength": 1,
++            "title": "Idempotency Key",
++            "type": "string"
++          },
++          "items": {
++            "items": {
++              "additionalProperties": true,
++              "type": "object"
++            },
++            "maxItems": 10,
++            "minItems": 1,
++            "title": "Items",
++            "type": "array"
++          }
++        },
++        "required": [
++          "items",
++          "idempotency_key"
++        ],
++        "title": "OpenItemsRaiseRequest",
++        "type": "object"
++      },
++      "OpenItemsUpdateRequest": {
++        "description": "Changes to items; see `sys_open_items_update`.",
++        "properties": {
++          "ref": {
++            "anyOf": [
++              {
++                "maxLength": 128,
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Ref"
++          },
++          "updates": {
++            "items": {
++              "additionalProperties": true,
++              "type": "object"
++            },
++            "maxItems": 20,
++            "minItems": 1,
++            "title": "Updates",
++            "type": "array"
++          }
++        },
++        "required": [
++          "updates"
++        ],
++        "title": "OpenItemsUpdateRequest",
++        "type": "object"
++      },
+       "OutputFileDoneEvent": {
+         "description": "A streamed file output completed materializing.\n\nEmitted by `_emit_file_annotation_events` in\n`omnigent/runtime/workflow.py` once per file annotation in\nthe assistant's output. `filename` and `content_type` are\nonly populated when the originating annotation carried them.",
+         "properties": {
+@@ -8158,6 +8259,11 @@
+             "title": "Needs Setup",
+             "type": "boolean"
+           },
++          "open_items": {
++            "default": false,
++            "title": "Open Items",
++            "type": "boolean"
++          },
+           "picker": {
+             "$ref": "#/components/schemas/PickerInfo",
+             "default": {
+@@ -8551,6 +8657,7 @@
+             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
+             "session.model": "#/components/schemas/SessionModelEvent",
+             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
++            "session.open_items.changed": "#/components/schemas/SessionOpenItemsChangedEvent",
+             "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
+             "session.presence": "#/components/schemas/SessionPresenceEvent",
+             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
+@@ -8648,6 +8755,9 @@
+           {
+             "$ref": "#/components/schemas/SessionJournalAppendedEvent"
+           },
++          {
++            "$ref": "#/components/schemas/SessionOpenItemsChangedEvent"
++          },
+           {
+             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
+           },
+@@ -11982,6 +12092,57 @@
+         "title": "SessionNativeToolItem",
+         "type": "object"
+       },
++      "SessionOpenItemsChangedEvent": {
++        "description": "Items in the session's open items list were raised or changed.\n\nTransient: the list is the source of truth; a client that sees it, or\nreconnects, reads `GET /v1/sessions/{id}/open-items` again.",
++        "properties": {
++          "conversation_id": {
++            "description": "The session whose items changed.",
++            "title": "Conversation Id",
++            "type": "string"
++          },
++          "labels": {
++            "description": "The labels written, e.g. `[\"Q7\", \"R2\"]`.",
++            "items": {
++              "type": "string"
++            },
++            "title": "Labels",
++            "type": "array"
++          },
++          "open_count": {
++            "description": "The session's open and answered items after the write.",
++            "format": "int64",
++            "title": "Open Count",
++            "type": "integer"
++          },
++          "sequence_number": {
++            "anyOf": [
++              {
++                "format": "int64",
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Sequence Number"
++          },
++          "type": {
++            "const": "session.open_items.changed",
++            "description": "Always `\"session.open_items.changed\"`.",
++            "title": "Type",
++            "type": "string"
++          }
++        },
++        "required": [
++          "type",
++          "conversation_id",
++          "labels",
++          "open_count"
++        ],
++        "title": "SessionOpenItemsChangedEvent",
++        "type": "object"
++      },
+       "SessionPageBoundary": {
+         "description": "Last visible primary-page row, before family context is appended.",
+         "properties": {
+@@ -24949,6 +25110,348 @@
+         ]
+       }
+     },
++    "/v1/sessions/{session_id}/open-items": {
++      "get": {
++        "description": "One page of the session's items in label order, with counts over all of them.",
++        "operationId": "list_open_items_v1_sessions__session_id__open_items_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "session_id",
++            "required": true,
++            "schema": {
++              "title": "Session Id",
++              "type": "string"
++            }
++          },
++          {
++            "in": "query",
++            "name": "status",
++            "required": false,
++            "schema": {
++              "default": [
++                "open",
++                "answered"
++              ],
++              "items": {
++                "enum": [
++                  "open",
++                  "answered",
++                  "closed",
++                  "all"
++                ],
++                "type": "string"
++              },
++              "title": "Status",
++              "type": "array"
++            }
++          },
++          {
++            "in": "query",
++            "name": "kind",
++            "required": false,
++            "schema": {
++              "default": [],
++              "items": {
++                "enum": [
++                  "question",
++                  "risk",
++                  "finding",
++                  "follow_up",
++                  "link"
++                ],
++                "type": "string"
++              },
++              "title": "Kind",
++              "type": "array"
++            }
++          },
++          {
++            "in": "query",
++            "name": "topic",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Topic"
++            }
++          },
++          {
++            "in": "query",
++            "name": "raised_by",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Raised By"
++            }
++          },
++          {
++            "in": "query",
++            "name": "has_links",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "boolean"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Has Links"
++            }
++          },
++          {
++            "in": "query",
++            "name": "q",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "maxLength": 200,
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Q"
++            }
++          },
++          {
++            "in": "query",
++            "name": "limit",
++            "required": false,
++            "schema": {
++              "default": 100,
++              "maximum": 200,
++              "minimum": 1,
++              "title": "Limit",
++              "type": "integer"
++            }
++          },
++          {
++            "in": "query",
++            "name": "after",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "maxLength": 4,
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "After"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": true,
++                  "title": "Response List Open Items V1 Sessions  Session Id  Open Items Get",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "List Open Items",
++        "tags": [
++          "open_items"
++        ]
++      },
++      "patch": {
++        "description": "Change items, from the session's runner or a person with edit access.",
++        "operationId": "update_open_items_v1_sessions__session_id__open_items_patch",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "session_id",
++            "required": true,
++            "schema": {
++              "title": "Session Id",
++              "type": "string"
++            }
++          }
++        ],
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/OpenItemsUpdateRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": true,
++                  "title": "Response Update Open Items V1 Sessions  Session Id  Open Items Patch",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Update Open Items",
++        "tags": [
++          "open_items"
++        ]
++      },
++      "post": {
++        "description": "Raise items for the session's agent; only its runner calls this.",
++        "operationId": "raise_open_items_v1_sessions__session_id__open_items_post",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "session_id",
++            "required": true,
++            "schema": {
++              "title": "Session Id",
++              "type": "string"
++            }
++          }
++        ],
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/OpenItemsRaiseRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": true,
++                  "title": "Response Raise Open Items V1 Sessions  Session Id  Open Items Post",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Raise Open Items",
++        "tags": [
++          "open_items"
++        ]
++      }
++    },
++    "/v1/sessions/{session_id}/open-items/answers": {
++      "post": {
++        "description": "Record a person's replies; needs edit access.",
++        "operationId": "answer_open_items_v1_sessions__session_id__open_items_answers_post",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "session_id",
++            "required": true,
++            "schema": {
++              "title": "Session Id",
++              "type": "string"
++            }
++          }
++        ],
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/OpenItemsAnswerRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": true,
++                  "title": "Response Answer Open Items V1 Sessions  Session Id  Open Items Answers Post",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Answer Open Items",
++        "tags": [
++          "open_items"
++        ]
++      }
++    },
+     "/v1/sessions/{session_id}/owner": {
+       "get": {
+         "description": "Return the owner of a session.\n\nRequires read-level access.\n\n**Returns:** `{\"owner\": \"<user_id>\"}` or `{\"owner\": null}`.",
+diff --git a/tests/server/routes/test_open_items_routes.py b/tests/server/routes/test_open_items_routes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e791dc2e8a0af66a827f1ed41502237aa3417c15
+--- /dev/null
++++ b/tests/server/routes/test_open_items_routes.py
+@@ -0,0 +1,305 @@
++"""Tests for the ``/v1/sessions/{id}/open-items`` routes and their live event."""
++
++from __future__ import annotations
++
++import uuid
++from collections.abc import AsyncIterator
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++import httpx
++import pytest
++import pytest_asyncio
++from fastapi import FastAPI
++
++from omnigent.runner.identity import (
++    ORCHESTRATION_SOURCE_HEADER,
++    RUNNER_TUNNEL_TOKEN_HEADER,
++    token_bound_runner_id,
++)
++from omnigent.server import open_items as open_items_api
++from omnigent.server.app import create_app
++from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
++from omnigent.spec.types import ToolGroupsConfig
++from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++from omnigent.stores.artifact_store.local import LocalArtifactStore
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
++from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
++
++pytestmark = pytest.mark.asyncio
++
++_ITEMS_AGENT = "1" * 32
++_NO_ITEMS_AGENT = "2" * 32
++_BUNDLE_HASH = "c" * 64
++_TOKEN = "runner-binding-token"
++ALICE, BOB, CAROL, DAVE = (f"{name}@example.com" for name in ("alice", "bob", "carol", "dave"))
++
++
++class _AgentCacheStub:
++    """Specs whose ``open_items`` group is on only for the items agent; its sub-agent's is off."""
++
++    def load(self, agent_id: str, bundle_location: str, **_: Any) -> SimpleNamespace:
++        keeps = agent_id == _ITEMS_AGENT
++        child = SimpleNamespace(
++            name="child", tool_groups=ToolGroupsConfig(open_items=False), sub_agents=[]
++        )
++        return SimpleNamespace(
++            spec=SimpleNamespace(
++                tool_groups=ToolGroupsConfig(open_items=keeps), sub_agents=[child]
++            )
++        )
++
++
++@pytest.fixture()
++def stores(db_uri: str) -> SimpleNamespace:
++    agents = SqlAlchemyAgentStore(db_uri)
++    for agent_id in (_ITEMS_AGENT, _NO_ITEMS_AGENT):
++        agents.create(agent_id, f"agent-{agent_id[0]}", f"{agent_id}/{_BUNDLE_HASH}")
++    permissions = SqlAlchemyPermissionStore(db_uri)
++    for user in (ALICE, BOB, CAROL, DAVE):
++        permissions.ensure_user(user, is_admin=False)
++    return SimpleNamespace(
++        agents=agents,
++        conversations=SqlAlchemyConversationStore(db_uri),
++        permissions=permissions,
++    )
++
++
++def _app(stores: SimpleNamespace, tmp_path: Path) -> FastAPI:
++    return create_app(
++        agent_store=stores.agents,
++        file_store=SqlAlchemyFileStore(stores.conversations.storage_location),
++        conversation_store=stores.conversations,
++        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
++        agent_cache=_AgentCacheStub(),  # type: ignore[arg-type]
++        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
++        permission_store=stores.permissions,
++    )
++
++
++@pytest_asyncio.fixture()
++async def client(stores: SimpleNamespace, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
++    transport = httpx.ASGITransport(app=_app(stores, tmp_path))
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
++        yield c
++
++
++@pytest.fixture()
++def events(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any]]]:
++    published: list[tuple[str, dict[str, Any]]] = []
++    monkeypatch.setattr(
++        open_items_api.session_stream,
++        "publish",
++        lambda session_id, event: published.append((session_id, event)) or 1,
++    )
++    return published
++
++
++def _session(
++    stores: SimpleNamespace, agent_id: str = _ITEMS_AGENT, sub_agent_name: str | None = None
++) -> str:
++    session_id = stores.conversations.create_conversation(
++        conversation_id=uuid.uuid4().hex,
++        agent_id=agent_id,
++        runner_id=token_bound_runner_id(_TOKEN),
++        sub_agent_name=sub_agent_name,
++    ).id
++    stores.permissions.grant(ALICE, session_id, LEVEL_OWNER)
++    return session_id
++
++
++def _user(email: str) -> dict[str, str]:
++    return {"X-Forwarded-Email": email}
++
++
++def _runner(session_id: str, user: str = ALICE, token: str = _TOKEN) -> dict[str, str]:
++    return {
++        **_user(user),
++        ORCHESTRATION_SOURCE_HEADER: session_id,
++        RUNNER_TUNNEL_TOKEN_HEADER: token,
++    }
++
++
++def _raise_body(*items: dict[str, Any], key: str = "tool:call_1") -> dict[str, Any]:
++    return {"items": list(items), "idempotency_key": key}
++
++
++_QUESTION = {"kind": "question", "title": "Cache rows?", "detail": "Copy or link?"}
++
++
++async def test_the_runner_raises_people_read_and_every_write_is_announced(
++    client: httpx.AsyncClient, stores: SimpleNamespace, events: list[Any]
++) -> None:
++    session_id = _session(stores)
++    url = f"/v1/sessions/{session_id}/open-items"
++    raised = await client.post(
++        url,
++        json=_raise_body(_QUESTION, {"kind": "risk", "title": "Flaky", "topic": "CI"}),
++        headers=_runner(session_id),
++    )
++    assert raised.status_code == 200, raised.text
++    body = raised.json()
++    assert [row["item"]["label"] for row in body["items"]] == ["Q1", "R1"]
++    assert (body["open_count"], body["topics"]) == (2, ["ci"])
++    assert events[-1] == (
++        session_id,
++        {
++            "type": "session.open_items.changed",
++            "conversation_id": session_id,
++            "labels": ["Q1", "R1"],
++            "open_count": 2,
++        },
++    )
++    # A retry of the same call gets the same labels and writes nothing new.
++    retried = await client.post(
++        url,
++        json=_raise_body(_QUESTION, {"kind": "risk", "title": "Flaky", "topic": "CI"}),
++        headers=_runner(session_id),
++    )
++    assert [row["item"]["label"] for row in retried.json()["items"]] == ["Q1", "R1"]
++
++    closed = await client.patch(
++        url,
++        json={
++            "updates": [{"label": "Q1", "status": "closed", "resolution": "Copied"}],
++            "ref": "tool:call_2",
++        },
++        headers=_runner(session_id),
++    )
++    assert closed.status_code == 200, closed.text
++    assert closed.json()["items"][0]["item"]["closed_by"] == "agent"
++    assert events[-1][1]["labels"] == ["Q1"] and events[-1][1]["open_count"] == 1
++
++    listed = await client.get(url, headers=_user(ALICE))
++    assert listed.status_code == 200, listed.text
++    page = listed.json()
++    assert [item["label"] for item in page["data"]] == ["R1"]
++    assert page["counts"]["status"] == {"open": 1, "answered": 0, "closed": 1}
++    everything = await client.get(url, params={"status": "all", "limit": 1}, headers=_user(ALICE))
++    assert (everything.json()["next_after"], everything.json()["has_more"]) == ("Q1", True)
++    rest = await client.get(
++        url,
++        params=[("status", "open"), ("status", "closed"), ("after", "Q1")],
++        headers=_user(ALICE),
++    )
++    assert [item["label"] for item in rest.json()["data"]] == ["R1"]
++
++
++async def test_viewers_read_editors_close_and_answer_and_others_are_refused(
++    client: httpx.AsyncClient, stores: SimpleNamespace, events: list[Any]
++) -> None:
++    session_id = _session(stores)
++    stores.permissions.grant(BOB, session_id, LEVEL_READ)
++    stores.permissions.grant(CAROL, session_id, LEVEL_EDIT)
++    url = f"/v1/sessions/{session_id}/open-items"
++    await client.post(url, json=_raise_body(_QUESTION, _QUESTION), headers=_runner(session_id))
++    close = {"updates": [{"label": "Q1", "status": "closed", "resolution": "Not needed"}]}
++    answer = {"answers": [{"label": "Q2", "text": "Link them"}]}
++
++    assert (await client.get(url, headers=_user(BOB))).status_code == 200
++    assert (await client.patch(url, json=close, headers=_user(BOB))).status_code == 403
++    assert (
++        await client.post(f"{url}/answers", json=answer, headers=_user(BOB))
++    ).status_code == 403
++    for refused in (
++        await client.get(url, headers=_user(DAVE)),
++        await client.patch(url, json=close, headers=_user(DAVE)),
++    ):
++        assert refused.status_code in (403, 404)
++
++    by_carol = await client.patch(url, json=close, headers=_user(CAROL))
++    assert by_carol.status_code == 200, by_carol.text
++    assert by_carol.json()["items"][0]["item"]["closed_by"] == "user"
++    answered = await client.post(f"{url}/answers", json=answer, headers=_user(CAROL))
++    assert answered.status_code == 200, answered.text
++    item = answered.json()["items"][0]["item"]
++    assert (item["status"], item["answers"][0]["text"], item["answers"][0]["by"]) == (
++        "answered",
++        "Link them",
++        CAROL,
++    )
++    assert [event[1]["labels"] for event in events[-2:]] == [["Q1"], ["Q2"]]
++
++
++async def test_only_the_sessions_own_runner_raises(
++    client: httpx.AsyncClient, stores: SimpleNamespace
++) -> None:
++    session_id, other = _session(stores), _session(stores)
++    stores.permissions.grant(CAROL, session_id, LEVEL_EDIT)
++    url = f"/v1/sessions/{session_id}/open-items"
++    for headers in (
++        _user(ALICE),
++        _runner(other),
++        _runner(session_id, token="another-runner"),
++        _runner(session_id, token=" "),
++        # An edit collaborator is not the session's runner.
++        {**_user(CAROL), ORCHESTRATION_SOURCE_HEADER: session_id},
++        _runner(session_id, user=BOB),
++    ):
++        refused = await client.post(url, json=_raise_body(_QUESTION), headers=headers)
++        assert refused.status_code in (403, 404), (headers, refused.text)
++    assert (await client.get(url, headers=_user(ALICE))).json()["data"] == []
++
++
++async def test_an_agent_without_the_tool_group_cannot_write(
++    client: httpx.AsyncClient, stores: SimpleNamespace
++) -> None:
++    for session_id in (
++        _session(stores, _NO_ITEMS_AGENT),
++        _session(stores, sub_agent_name="child"),
++    ):
++        url = f"/v1/sessions/{session_id}/open-items"
++        refused = await client.post(url, json=_raise_body(_QUESTION), headers=_runner(session_id))
++        assert refused.status_code == 403
++        assert "open_items tool group" in refused.text
++        closing = {"updates": [{"label": "Q1", "status": "closed", "resolution": "x"}]}
++        assert (
++            await client.patch(url, json=closing, headers=_runner(session_id))
++        ).status_code == 403
++
++
++async def test_invalid_input_and_per_item_errors(
++    client: httpx.AsyncClient, stores: SimpleNamespace, events: list[Any]
++) -> None:
++    session_id = _session(stores)
++    url = f"/v1/sessions/{session_id}/open-items"
++    headers = _runner(session_id)
++    for items in (
++        [{"kind": "question"}],
++        [{"kind": "idea", "title": "x"}],
++        [{"kind": "link", "url": "ftp://example.com"}],
++        [{**_QUESTION, "colour": "red"}],
++    ):
++        bad = await client.post(url, json=_raise_body(*items), headers=headers)
++        assert bad.status_code == 400 and "invalid_input" in bad.text, bad.text
++    assert events == []
++    await client.post(url, json=_raise_body(_QUESTION), headers=headers)
++    taken = await client.post(
++        url, json=_raise_body({**_QUESTION, "label": "Q1"}, key="tool:2"), headers=headers
++    )
++    assert taken.json()["items"][0]["error"]["code"] == "label_taken"
++    missing = await client.patch(
++        url, json={"updates": [{"label": "T4", "topic": "x"}]}, headers=headers
++    )
++    assert missing.json()["items"] == [
++        {"label": "T4", "error": {"code": "not_found", "message": "no item T4"}}
++    ]
++    assert (await client.get(url, params={"after": "X9"}, headers=_user(ALICE))).status_code == 400
++
++
++async def test_a_server_without_storage_hides_the_feature(
++    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    session_id = _session(stores)
++    assert (await client.get("/v1/info", headers=_user(ALICE))).json()["open_items"] is True
++    monkeypatch.setattr(open_items_api, "open_items_store_for", _unavailable)
++    assert (await client.get("/v1/info", headers=_user(ALICE))).json()["open_items"] is False
++    missing = await client.get(f"/v1/sessions/{session_id}/open-items", headers=_user(ALICE))
++    assert missing.status_code == 404
++    assert "not available" in missing.text
++
++
++def _unavailable(storage_location: str) -> Any:
++    raise RuntimeError(f"no open items store at {storage_location}")
+diff --git a/tests/stores/test_open_items_store.py b/tests/stores/test_open_items_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc7507384747667d1ab1b76789f560f3a28c1557
+--- /dev/null
++++ b/tests/stores/test_open_items_store.py
+@@ -0,0 +1,323 @@
++"""Tests for :class:`OpenItemsStore`, the ``open_items`` side store, against a real database."""
++
++from __future__ import annotations
++
++import asyncio
++import random
++import string
++import threading
++import uuid
++from collections.abc import Sequence
++
++import pytest
++
++from omnigent.entities.open_items import (
++    OpenItemError,
++    OpenItemFilter,
++    normalize_change,
++    normalize_new_item,
++    page_items,
++)
++from omnigent.stores import open_items_store
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.open_items_store import (
++    OpenItemsSessionNotFoundError,
++    OpenItemsStore,
++    RaisedItem,
++)
++
++
++@pytest.fixture()
++def conversations(db_uri: str) -> SqlAlchemyConversationStore:
++    return SqlAlchemyConversationStore(db_uri)
++
++
++@pytest.fixture()
++def store(db_uri: str) -> OpenItemsStore:
++    return OpenItemsStore(db_uri)
++
++
++def _session(conversations: SqlAlchemyConversationStore, parent: str | None = None) -> str:
++    # Side rows outlive the per-test cleanup of main tables, so ids are fresh each test.
++    return conversations.create_conversation(
++        conversation_id=uuid.uuid4().hex, parent_conversation_id=parent
++    ).id
++
++
++def _raise(
++    store: OpenItemsStore, session: str, *items: dict[str, object], key: str = "tool:call"
++) -> list[RaisedItem]:
++    return store.raise_items(
++        session,
++        [normalize_new_item(item) for item in items],
++        idempotency_key=key,
++        root_conversation_id=session,
++        user_id="alice@example.com",
++    )
++
++
++def _labels(results: Sequence[RaisedItem]) -> list[str | None]:
++    return [result.item.label if result.item else result.error.code for result in results]  # type: ignore[union-attr]
++
++
++def _question(title: str = "Cache rows?", **fields: object) -> dict[str, object]:
++    return {"kind": "question", "title": title, "detail": "Full detail", **fields}
++
++
++def test_raises_number_each_kind_and_keep_the_label_in_the_key(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session, other = _session(conversations), _session(conversations)
++    first = _raise(
++        store,
++        session,
++        _question(),
++        {"kind": "risk", "title": "Flaky e2e"},
++        _question("Rename?", topic="Cache Rollout"),
++    )
++    assert _labels(first) == ["Q1", "R1", "Q2"]
++    assert first[2].item.content["topic"] == "cache-rollout"  # type: ignore[union-attr]
++    assert _labels(_raise(store, session, {"kind": "finding", "title": "x"}, key="k2")) == ["F1"]
++    # Another session counts on its own.
++    assert _labels(_raise(store, other, _question())) == ["Q1"]
++    assert [item.label for item in store.list_items(session)] == ["Q1", "Q2", "R1", "F1"]
++    assert store.open_count(session) == 4
++
++
++def test_two_raises_at_once_never_share_a_label(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    barrier = threading.Barrier(6)
++    labels: list[str | None] = []
++    errors: list[BaseException] = []
++
++    def worker(index: int) -> None:
++        try:
++            barrier.wait()
++            labels.extend(
++                _labels(_raise(store, session, _question(), _question(), key=f"tool:{index}"))
++            )
++        except BaseException as exc:  # surfaced below
++            errors.append(exc)
++
++    threads = [threading.Thread(target=worker, args=(index,)) for index in range(6)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join(timeout=60)
++    assert not errors
++    assert sorted(labels, key=lambda label: int(label[1:])) == [f"Q{n}" for n in range(1, 13)]  # type: ignore[index]
++
++
++def test_a_retried_raise_returns_its_first_labels(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    first = _raise(store, session, _question(), {"kind": "risk", "title": "r"}, key="tool:a")
++    again = _raise(store, session, _question(), {"kind": "risk", "title": "r"}, key="tool:a")
++    assert _labels(again) == _labels(first) == ["Q1", "R1"]
++    assert not any(result.duplicate for result in again)
++    assert len(store.list_items(session)) == 2
++
++
++def test_pinning_a_link_twice_returns_one_item(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    pinned = _raise(store, session, {"kind": "link", "url": "https://github.com/a/b/pull/7"})
++    again = _raise(
++        store,
++        session,
++        {"kind": "link", "url": "https://www.github.com/a/b/pull/7/files", "title": "PR"},
++        key="tool:b",
++    )
++    assert _labels(pinned) == _labels(again) == ["L1"]
++    assert again[0].duplicate
++    # A link pinned without a title is named by a short form of its URL.
++    assert pinned[0].item.content["title"] == "github.com/a/b/…"  # type: ignore[union-attr]
++
++
++def test_a_label_from_chat_is_adopted_once_and_counting_moves_past_it(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    assert _labels(_raise(store, session, _question(label="Q7"))) == ["Q7"]
++    assert _labels(_raise(store, session, _question(), key="tool:2")) == ["Q8"]
++    taken = _raise(store, session, _question(label="q7"), _question(label="Q3"), key="tool:3")
++    assert _labels(taken) == ["label_taken", "Q3"]
++    assert _labels(_raise(store, session, _question(), key="tool:4")) == ["Q9"]
++    with pytest.raises(OpenItemError, match="not a question label"):
++        normalize_new_item(_question(label="R2"))
++
++
++def test_a_full_session_and_a_used_up_kind_refuse_further_items(
++    store: OpenItemsStore,
++    conversations: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(open_items_store, "ITEMS_PER_SESSION", 3)
++    session = _session(conversations)
++    results = _raise(store, session, _question(), _question(), _question(), _question())
++    assert _labels(results) == ["Q1", "Q2", "Q3", "session_full"]
++    monkeypatch.setattr(open_items_store, "ITEMS_PER_SESSION", 500)
++    monkeypatch.setattr(open_items_store, "NUMBER_MAX", 4)
++    assert _labels(_raise(store, session, _question(), _question(), key="k")) == [
++        "Q4",
++        "session_full",
++    ]
++    assert _labels(_raise(store, session, {"kind": "risk", "title": "r"}, key="r")) == ["R1"]
++
++
++def test_raising_in_a_missing_session_writes_nothing(store: OpenItemsStore) -> None:
++    missing = uuid.uuid4().hex
++    with pytest.raises(OpenItemsSessionNotFoundError):
++        _raise(store, missing, _question())
++    assert store.list_items(missing) == []
++
++
++def test_close_needs_a_resolution_and_reopen_clears_it(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    _raise(store, session, _question(), _question("Second"))
++    with pytest.raises(OpenItemError, match="resolution"):
++        normalize_change({"label": "Q1", "status": "closed"})
++    (closed, missing) = store.change_items(
++        session,
++        [
++            normalize_change({"label": "Q1", "status": "closed", "resolution": "Kept as is"}),
++            normalize_change({"label": "Q9", "topic": "x"}),
++        ],
++        closed_by="agent",
++        closed_ref="tool:c1",
++    )
++    assert closed.item is not None and closed.item.status == "closed"
++    assert closed.item.closed_at is not None
++    assert closed.item.outcome == {
++        "resolution": "Kept as is",
++        "closed_by": "agent",
++        "closed_ref": "tool:c1",
++    }
++    assert missing.error is not None and missing.error.code == "not_found"
++    assert store.open_count(session) == 1
++    (reopened,) = store.change_items(
++        session, [normalize_change({"label": "Q1", "status": "open"})], closed_by="user"
++    )
++    assert reopened.item is not None
++    assert (reopened.item.status, reopened.item.closed_at, reopened.item.outcome) == (
++        "open",
++        None,
++        {},
++    )
++
++
++def test_edits_change_content_topic_and_links(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    _raise(store, session, _question(topic="cache", links=["https://example.com/a"]))
++    (changed,) = store.change_items(
++        session,
++        [
++            normalize_change(
++                {
++                    "label": "Q1",
++                    "title": "Cache everything?",
++                    "topic": "",
++                    "add_links": [{"url": "https://example.com/b", "label": "B"}],
++                    "remove_links": ["https://EXAMPLE.com/a/"],
++                }
++            )
++        ],
++        closed_by="agent",
++    )
++    assert changed.item is not None
++    assert changed.item.content == {
++        "title": "Cache everything?",
++        "detail": "Full detail",
++        "links": [{"url": "https://example.com/b", "label": "B"}],
++    }
++    # Each field is within its limit, but together they don't compress below the cap.
++    noise = random.Random(0)
++    detail = "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(6000))
++    links = [
++        "https://example.com/" + "".join(noise.choices(string.ascii_letters, k=1900))
++        for _ in range(7)
++    ]
++    (too_big,) = store.change_items(
++        session,
++        [normalize_change({"label": "Q1", "detail": detail, "add_links": links})],
++        closed_by="agent",
++    )
++    assert too_big.error is not None and too_big.error.code == "too_large"
++    assert store.list_items(session)[0].content["title"] == "Cache everything?"
++
++
++def test_answers_mark_open_items_answered_and_keep_the_latest_five(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    _raise(store, session, _question())
++    for index in range(7):
++        (answered,) = store.record_answers(session, [("Q1", f"answer {index}")], user_id="bob")
++    assert answered.item is not None and answered.item.status == "answered"
++    assert [answer["text"] for answer in answered.item.outcome["answers"]] == [
++        f"answer {index}" for index in range(2, 7)
++    ]
++    (missing,) = store.record_answers(session, [("R4", "?")], user_id=None)
++    assert missing.error is not None and missing.error.code == "not_found"
++
++
++def test_deleting_a_session_removes_its_items_in_batches(
++    store: OpenItemsStore,
++    conversations: SqlAlchemyConversationStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(open_items_store, "DELETE_BATCH", 2)
++    parent = _session(conversations)
++    child = _session(conversations, parent=parent)
++    kept = _session(conversations)
++    for session in (parent, child, kept):
++        _raise(store, session, _question(), _question(), {"kind": "risk", "title": "r"})
++    asyncio.run(conversations.delete_conversation(parent))
++    assert store.list_items(parent) == store.list_items(child) == []
++    assert len(store.list_items(kept)) == 3
++
++
++def test_lists_filter_page_and_count_in_label_order(
++    store: OpenItemsStore, conversations: SqlAlchemyConversationStore
++) -> None:
++    session = _session(conversations)
++    _raise(
++        store,
++        session,
++        _question("Cache rows?", topic="cache"),
++        {"kind": "risk", "title": "Flaky e2e", "raised_by": "tester"},
++        _question("Rename table?", links=["https://example.com/t"]),
++        {"kind": "follow_up", "title": "Bump image", "topic": "release"},
++    )
++    store.change_items(
++        session,
++        [normalize_change({"label": "Q2", "status": "closed", "resolution": "Renamed it"})],
++        closed_by="agent",
++    )
++    items = store.list_items(session)
++
++    def labels(**wanted: object) -> list[str]:
++        return [item.label for item in page_items(items, OpenItemFilter(**wanted)).items]  # type: ignore[arg-type]
++
++    assert labels() == ["Q1", "R1", "T1"]
++    assert labels(statuses=()) == ["Q1", "Q2", "R1", "T1"]
++    assert labels(statuses=("closed",)) == ["Q2"]
++    assert labels(kinds=("question",), statuses=()) == ["Q1", "Q2"]
++    assert labels(topic="release") == ["T1"]
++    assert labels(raised_by="tester") == ["R1"]
++    assert labels(statuses=(), has_links=True) == ["Q2"]
++    assert labels(statuses=(), query="RENAMED") == ["Q2"]
++    page = page_items(items, OpenItemFilter(statuses=(), limit=2))
++    assert ([item.label for item in page.items], page.has_more) == (["Q1", "Q2"], True)
++    assert labels(statuses=(), after="Q2", limit=2) == ["R1", "T1"]
++    assert page.status_counts == {"open": 3, "answered": 0, "closed": 1}
++    assert page.kind_counts == {"question": 2, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}
++    assert page.topics == ["cache", "release"]

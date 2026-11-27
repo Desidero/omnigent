@@ -1,0 +1,1188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Thu, 26 Nov 2026 07:30:59 +0000
+Subject: [PATCH] feat(open-items): give agents tools to raise, update and list
+ open items
+
+With open items stored per session, agents need a way to write them: a
+label they make up in chat can collide with one used before, and closing
+an item means remembering to strike it in a later message.
+
+Three tools in a new open_items tool group, on by default and off with
+tool_groups.open_items: false: sys_open_items_raise (one to ten items;
+returns each label, the topics in use and the open count; label adopts a
+label already written in chat), sys_open_items_update (close with a
+resolution, reopen, edit title, detail, topic and links; one result per
+label) and sys_open_items_list (compact rows in label order, open and
+answered by default). The runner proxies them to the session's
+/v1/sessions/{id}/open-items routes with the session as the
+orchestration source, so they reach only the calling session; a raise
+uses the tool call ID as its idempotency key, so a harness retry gets
+the same labels. The group rides the native relay set, so claude-native,
+codex-native, pi-native, antigravity-native and hermes sessions get the
+tools as SDK harnesses do.
+
+Like the Inbox tools, the runner keeps the group only when the bundle
+download says the server stores open items (X-Omnigent-Open-Items: 1);
+an older server sends no header and its sessions keep text labels. The
+web_fetch researcher turns the group off with the other framework
+groups.
+
+Not proposed upstream yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ docs/AGENT_YAML_SPEC.md                       |   5 +
+ docs/open-items.md                            |  41 +++
+ feature-map/README.md                         |   3 +
+ feature-map/open-items.md                     |  35 +++
+ omnigent/open_items_availability.py           |  20 ++
+ omnigent/runner/_entry.py                     |   3 +
+ omnigent/runner/open_items_tools.py           | 259 ++++++++++++++++++
+ omnigent/runner/tool_dispatch.py              |  15 +
+ .../server/routes/sessions/routes_agent.py    |   6 +
+ omnigent/tools/builtins/open_items.py         | 217 +++++++++++++++
+ omnigent/tools/builtins/web_fetch.py          |   5 +-
+ omnigent/tools/manager.py                     |  16 ++
+ tests/runner/test_open_items_tool_dispatch.py |  88 ++++++
+ tests/runner/test_runner_entry.py             |  38 +++
+ tests/runner/test_tool_groups_surface.py      |   5 +-
+ tests/server/routes/test_open_items_routes.py | 107 +++++++-
+ tests/tools/builtins/test_web_fetch.py        |   1 +
+ tests/tools/test_manager.py                   |   5 +
+ 18 files changed, 864 insertions(+), 5 deletions(-)
+ create mode 100644 feature-map/open-items.md
+ create mode 100644 omnigent/open_items_availability.py
+ create mode 100644 omnigent/runner/open_items_tools.py
+ create mode 100644 omnigent/tools/builtins/open_items.py
+ create mode 100644 tests/runner/test_open_items_tool_dispatch.py
+
+diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
+index 755f4648b90a1315553c72174cc664918f600ba7..3edb6188b02e1a3723751c3dc2387c119cd176ac 100644
+--- a/docs/AGENT_YAML_SPEC.md
++++ b/docs/AGENT_YAML_SPEC.md
+@@ -1358,6 +1358,7 @@ tool_groups:
+   policies: false         # sys_add_policy / sys_policy_registry
+   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+   journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
++  open_items: false       # sys_open_items_raise / _update / _list
+   projects: false         # sys_project_* / sys_session_update
+   user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
+   memory: false           # memory_search / _get / _list / _write / _delete
+@@ -1373,6 +1374,10 @@ requires the server's `workflows` feature flag, which defaults off; enable it
+ with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
+ posts to and reads the session owner's Inbox, requires the server's `user_inbox`
+ feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
++The `open_items` group keeps the session's questions, risks, findings,
++follow-ups and pinned links with labels the server allocates (see
++[Open items](open-items.md)); the runner drops it when the server does not
++store open items.
+ Disabling `browser` also
+ drops the embedded-browser guidance from the composed system prompt, and
+ disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
+diff --git a/docs/open-items.md b/docs/open-items.md
+index f87880c28500b8aed1669e4ed41783adf9e06f56..fee612b2eea945e0b345eaefd88c826c35294591 100644
+--- a/docs/open-items.md
++++ b/docs/open-items.md
+@@ -30,6 +30,47 @@ A session holds at most 500 items. Items are deleted with their session. A fork
+ or a side chat starts with none, and session export and import leave them out;
+ the forked transcript's labels still render as chat labels.
+ 
++## Agent tools
++
++The `open_items` tool group gives every agent three tools, which reach only the
++calling session's items:
++
++| Tool | Arguments | Result |
++| --- | --- | --- |
++| `sys_open_items_raise` | `items` (1 to 10): `kind` (`question`, `risk`, `finding`, `follow_up`, `link`), `title`, `detail`, and optionally `topic`, `links`, `url` (a link item's URL), `raised_by`, `label` (a label already written in chat, to adopt it) | Per item its `label`, `status` and `title`, `duplicate: true` for a link already pinned, or an `error`; then `open_count` and the `topics` in use. |
++| `sys_open_items_update` | `updates` (1 to 20): `label` and any of `status` (`open` or `closed`), `resolution` (required to close), `title`, `detail`, `topic` (empty clears it), `add_links`, `remove_links` | Per label its new state, or its own error. |
++| `sys_open_items_list` | Optionally `status` (`open`, `answered`, `closed` or `all`; default open and answered), `kind`, `topic`, `query`, `limit` (1 to 100, default 50), `after` (a label) | Compact rows in label order: a 300-character detail preview, the latest answer, how closed items ended; `truncated` and `next_after` when more remain, counts by status and the topics. |
++
++Errors start with a code: `invalid_input`, `too_large`, `session_full`,
++`label_taken`, `not_found`, or `unavailable` when the server does not store open
++items (the agent then labels items in chat only).
++
++A raise retried by the harness with the same tool call ID returns the labels
++its first attempt allocated. Two raises at once in one session never get the
++same label. Adopting a label from chat takes it only if no item has it, and
++moves counting past it.
++
++### Which sessions get the tools
++
++- **SDK harnesses** get them with the turn's tools; **claude-native**,
++  **codex-native**, **pi-native**, **antigravity-native** and **hermes** get
++  them through the Omnigent tool relay, like the Inbox tools. Native harnesses
++  without the relay never see them and keep text labels, as the instruction's
++  last sentence tells them.
++- The runner keeps the group only when the server says, on the agent bundle
++  download, that it stores open items (`X-Omnigent-Open-Items: 1`). A server
++  without this feature sends no such header, so its sessions keep the
++  text-only instruction and no tools.
++- An agent spec turns the group off with:
++
++  ```yaml
++  tool_groups:
++    open_items: false
++  ```
++
++  A host whose Omnigent predates the group rejects an agent spec that names
++  it, so set the key only once every host has it.
++
+ ## HTTP API
+ 
+ | Route (under `/v1`) | Caller | Purpose |
+diff --git a/feature-map/README.md b/feature-map/README.md
+index 506e8eb6a7f6ea68b07cb10f47c64aa6411924d6..801184c7f128cd906ca12a4b60165868703b1e24 100644
+--- a/feature-map/README.md
++++ b/feature-map/README.md
+@@ -138,6 +138,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
+ - [Session orchestration](./session-orchestration.md) covers owner-controlled
+   messaging, sibling worker creation, polling results and sharing restrictions.
+ 
++- [Open items](./open-items.md) covers the agent tools that raise, close and list
++  a session's labelled items, their routes and live event, and sessions without them.
++
+ - [Workspace content search](./workspace-content-search.md) covers runner-backed
+   text search, result navigation and its release flag.
+ 
+diff --git a/feature-map/open-items.md b/feature-map/open-items.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..c123168e0ffca740a9090beb92d20b02cd1326e0
+--- /dev/null
++++ b/feature-map/open-items.md
+@@ -0,0 +1,35 @@
++# Open items
++
++A session's agent records the questions, risks, findings and follow-ups it raises, and the links it pins, as stored open items with labels the server allocates (`Q7`), and still writes each one once in the chat. Agents close, reopen and list items through their tools; people read them over the API and may close, reopen, retopic or answer them. There is no panel for them yet: the chat's label chips and Open items bar still read the chat text.
++
++## Sub-features
++
++- `items-raise`: `sys_open_items_raise` allocates labels per session and kind; a retried call gets the same labels; a pinned URL pinned again returns the same item; `label` adopts a chat label if it is free.
++- `items-update`: `sys_open_items_update` closes with a resolution, reopens, and edits title, detail, topic and links, each label with its own result.
++- `items-list`: `sys_open_items_list` and `GET /v1/sessions/{id}/open-items` list in label order with status, kind, topic and text filters, counts and topics.
++- `items-answers`: a person's replies, recorded with `POST …/open-items/answers`, mark an open item answered.
++- `items-event`: every write publishes `session.open_items.changed` on the session's stream.
++- `items-unavailable`: on a server or host without open items, or an agent with `tool_groups.open_items: false`, there are no tools and the agent labels items in chat only.
++- `items-delete`: deleting a session deletes its items; a fork starts with none.
++
++## How to get to it (user POV)
++
++- Chat: ask an agent with the default tool groups something that leaves it open questions; it calls `sys_open_items_raise`, which shows as a tool row, and writes the items with the returned labels.
++- Chat: answer or settle an item; the agent closes it with `sys_open_items_update` and strikes its label.
++- API: `GET /v1/sessions/{id}/open-items` with read access; `PATCH` and `POST …/answers` with edit access.
++- Agent spec: `tool_groups.open_items: false` turns the tools off for that agent.
++
++## Driving it with the repro environment
++
++Preconditions: a local server and runner from this checkout; any harness.
++
++- Store (labels under concurrency, retries, adoption, caps, close and reopen, answers, list filters, session delete): `tests/stores/test_open_items_store.py`. Set `OMNIGENT_TEST_DB_URI` to run it on PostgreSQL or CockroachDB.
++- Routes, permissions, the live event, `/v1/info` and the bundle header, and the runner's tool handlers through the real routes: `tests/server/routes/test_open_items_routes.py::test_the_agents_tools_raise_update_and_list_through_the_runner`.
++- Registration, the native relay and an older server: `tests/runner/test_open_items_tool_dispatch.py`, `tests/runner/test_tool_groups_surface.py`, `tests/runner/test_runner_entry.py::test_runner_keeps_open_items_tools_only_when_the_server_stores_them`.
++- Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row, a struck `~~[Q1]~~`, and the item `closed` with `closed_by: agent` in the API.
++
++## Gotchas
++
++- The web UI does not read the store yet: chips and the Open items bar still follow the chat text, so an item closed only through the API still shows open in the bar.
++- Hosts without the series do not know the `open_items` key in `tool_groups:`, and an agent spec naming it fails to load there.
++- Labels are unique per session, not across a session tree: a child session counts from Q1.
+diff --git a/omnigent/open_items_availability.py b/omnigent/open_items_availability.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79bf6286f7240a78a066dc344e2e925ab2e582a3
+--- /dev/null
++++ b/omnigent/open_items_availability.py
+@@ -0,0 +1,20 @@
++"""Hide the open items tools from runners whose server cannot store them."""
++
++from __future__ import annotations
++
++from dataclasses import replace
++
++from omnigent.spec.types import AgentSpec
++
++# Sent on the runner's bundle download. A missing header means "no open items":
++# servers that predate it have no /v1/sessions/{id}/open-items routes.
++OPEN_ITEMS_HEADER = "X-Omnigent-Open-Items"
++
++
++def without_open_items_tools(spec: AgentSpec) -> AgentSpec:
++    """Return *spec* and its sub-agents with the open items tool group off."""
++    return replace(
++        spec,
++        tool_groups=replace(spec.tool_groups, open_items=False),
++        sub_agents=[without_open_items_tools(child) for child in spec.sub_agents],
++    )
+diff --git a/omnigent/runner/_entry.py b/omnigent/runner/_entry.py
+index c2d11881928f0294044a6eca1a26d5ed2b60dc6f..636b9b5cd42eb092628f3b761773e6ee83bb63f3 100644
+--- a/omnigent/runner/_entry.py
++++ b/omnigent/runner/_entry.py
+@@ -1632,6 +1632,7 @@ def _load_agent_spec_bundle(
+         without_memory_search,
+         without_memory_tools,
+     )
++    from omnigent.open_items_availability import OPEN_ITEMS_HEADER, without_open_items_tools
+     from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER
+     from omnigent.runner.native import ResolvedSpec
+     from omnigent.spec import load
+@@ -1667,6 +1668,8 @@ def _load_agent_spec_bundle(
+         # tools need the server to turn them on.
+         if resp.headers.get(USER_INBOX_HEADER) != "1":
+             spec = without_user_inbox_tools(spec)
++        if resp.headers.get(OPEN_ITEMS_HEADER) != "1":
++            spec = without_open_items_tools(spec)
+         if resp.headers.get(MEMORY_HEADER) != "1":
+             spec = without_memory_tools(spec)
+         elif resp.headers.get(MEMORY_SEARCH_HEADER) != "1":
+diff --git a/omnigent/runner/open_items_tools.py b/omnigent/runner/open_items_tools.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea03a0f0cf7ce0137ae4cd6fba6be7d826a06a7d
+--- /dev/null
++++ b/omnigent/runner/open_items_tools.py
+@@ -0,0 +1,259 @@
++"""Runner-side handlers for the ``sys_open_items_*`` tools.
++
++The runner has no open items store, so these tools call the server's
++``/v1/sessions/{id}/open-items`` routes for the calling session only. A raise
++carries an idempotency key from the tool call, so its retries get the labels
++the first attempt allocated. Results come back compact, for the model to scan.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import json
++import random
++import re
++from typing import Any
++
++import httpx
++
++from omnigent.entities.open_items import BATCH_KEY_MAX_CHARS
++from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
++from omnigent.runner.journal_tools import _idempotency_key, _is_unrouted, _server_message
++from omnigent.tools.builtins.open_items import OPEN_ITEMS_LIST_MAX, OPEN_ITEMS_TOOL_NAMES
++
++__all__ = ["OPEN_ITEMS_TOOL_NAMES", "execute_open_items_tool"]
++
++_UNAVAILABLE = (
++    "unavailable: this Omnigent server does not store open items; label items in chat instead"
++)
++_WRITE_ATTEMPTS = 3
++_RETRYABLE_STATUSES = frozenset({502, 503, 504})
++_DETAIL_PREVIEW_CHARS = 300
++
++
++def _url(session_id: str) -> str:
++    """The session's open items route; the ID must stay one URL segment."""
++    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
++        raise ValueError("conversation_id must be a session ID")
++    return f"/v1/sessions/{session_id}/open-items"
++
++
++def _error(message: str) -> str:
++    return json.dumps({"error": message}, ensure_ascii=False)
++
++
++def _batch_key(call_id: str | None) -> str:
++    key = _idempotency_key(call_id)
++    if len(key) > BATCH_KEY_MAX_CHARS:
++        key = f"tool:sha256:{hashlib.sha256(key.encode()).hexdigest()}"
++    return key
++
++
++async def _sleep(seconds: float) -> None:
++    """Wait before a retry; tests replace this, never ``asyncio.sleep`` itself."""
++    await asyncio.sleep(seconds)
++
++
++async def _send(
++    server_client: httpx.AsyncClient,
++    method: str,
++    url: str,
++    conversation_id: str,
++    *,
++    body: dict[str, Any] | None = None,
++    params: dict[str, Any] | None = None,
++) -> httpx.Response | str:
++    """Send one request as the session's agent, retrying gateway failures."""
++    for attempt in range(_WRITE_ATTEMPTS):
++        last = attempt + 1 == _WRITE_ATTEMPTS
++        try:
++            response = await server_client.request(
++                method,
++                url,
++                json=body,
++                params=params,
++                headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
++                timeout=30.0,
++            )
++        except httpx.TransportError as exc:
++            if last:
++                return f"could not reach the server: {exc}"
++        else:
++            if response.status_code not in _RETRYABLE_STATUSES or last:
++                return response
++        await _sleep(0.5 * (attempt + 1) + random.uniform(0.0, 0.25))
++    raise AssertionError("unreachable")
++
++
++def _failure(response: httpx.Response | str) -> str | None:
++    """The tool's error for a failed request, or ``None`` when it succeeded."""
++    if isinstance(response, str):
++        return _error(response)
++    if _is_unrouted(response):
++        return _error(_UNAVAILABLE)
++    if response.status_code < 400:
++        return None
++    message = _server_message(response)
++    if response.status_code == 404 and message.startswith("Open items are not available"):
++        return _error(_UNAVAILABLE)
++    return _error(message)
++
++
++def _error_text(error: dict[str, Any]) -> str:
++    return f"{error.get('code')}: {error.get('message')}"
++
++
++def _state(item: dict[str, Any]) -> dict[str, Any]:
++    state = {"label": item["label"], "status": item["status"], "title": item["title"]}
++    if item.get("topic"):
++        state["topic"] = item["topic"]
++    if item["status"] == "closed":
++        state["resolution"] = item.get("resolution")
++    return state
++
++
++def _row(item: dict[str, Any]) -> dict[str, Any]:
++    row = {**_state(item), "kind": item["kind"]}
++    detail = item.get("detail") or ""
++    if detail:
++        row["detail"] = detail[:_DETAIL_PREVIEW_CHARS]
++        if len(detail) > _DETAIL_PREVIEW_CHARS:
++            row["detail_truncated"] = True
++    for name in ("url", "raised_by"):
++        if item.get(name):
++            row[name] = item[name]
++    if item.get("links"):
++        row["links"] = [link["url"] for link in item["links"]]
++    if item.get("answers"):
++        row["latest_answer"] = item["answers"][-1]["text"]
++    if item.get("closed_by"):
++        row["closed_by"] = item["closed_by"]
++    return row
++
++
++async def _raise(
++    args: dict[str, Any],
++    server_client: httpx.AsyncClient,
++    conversation_id: str,
++    call_id: str | None,
++) -> str:
++    items = args.get("items")
++    if not isinstance(items, list) or not items:
++        return _error("invalid_input: items must be a non-empty list")
++    body = {"items": items, "idempotency_key": _batch_key(call_id)}
++    response = await _send(
++        server_client, "POST", _url(conversation_id), conversation_id, body=body
++    )
++    if (failure := _failure(response)) is not None:
++        return failure
++    assert isinstance(response, httpx.Response)
++    payload = response.json()
++    results = []
++    for result in payload["items"]:
++        if "error" in result:
++            results.append({"error": _error_text(result["error"])})
++            continue
++        state = _state(result["item"])
++        if result.get("duplicate"):
++            state["duplicate"] = True
++        results.append(state)
++    return json.dumps(
++        {"items": results, "open_count": payload["open_count"], "topics": payload["topics"]},
++        ensure_ascii=False,
++    )
++
++
++async def _update(
++    args: dict[str, Any],
++    server_client: httpx.AsyncClient,
++    conversation_id: str,
++    call_id: str | None,
++) -> str:
++    updates = args.get("updates")
++    if not isinstance(updates, list) or not updates:
++        return _error("invalid_input: updates must be a non-empty list")
++    body = {"updates": updates, "ref": f"tool:{call_id}"[:128] if call_id else None}
++    response = await _send(
++        server_client, "PATCH", _url(conversation_id), conversation_id, body=body
++    )
++    if (failure := _failure(response)) is not None:
++        return failure
++    assert isinstance(response, httpx.Response)
++    results = [
++        {"label": result["label"], "error": _error_text(result["error"])}
++        if "error" in result
++        else _state(result["item"])
++        for result in response.json()["items"]
++    ]
++    return json.dumps({"items": results}, ensure_ascii=False)
++
++
++async def _list(
++    args: dict[str, Any], server_client: httpx.AsyncClient, conversation_id: str
++) -> str:
++    params: dict[str, Any] = {}
++    for name, param in (("status", "status"), ("kind", "kind"), ("topic", "topic")):
++        if args.get(name) is not None:
++            params[param] = args[name]
++    if args.get("query"):
++        params["q"] = args["query"]
++    if args.get("after"):
++        params["after"] = args["after"]
++    limit = args.get("limit", 50)
++    if not isinstance(limit, int) or not 1 <= limit <= OPEN_ITEMS_LIST_MAX:
++        return _error(f"invalid_input: limit must be 1 to {OPEN_ITEMS_LIST_MAX}")
++    params["limit"] = limit
++    response = await _send(
++        server_client, "GET", _url(conversation_id), conversation_id, params=params
++    )
++    if (failure := _failure(response)) is not None:
++        return failure
++    assert isinstance(response, httpx.Response)
++    page = response.json()
++    return json.dumps(
++        {
++            "items": [_row(item) for item in page["data"]],
++            "truncated": page["has_more"],
++            "next_after": page["next_after"],
++            "counts": page["counts"]["status"],
++            "topics": page["topics"],
++        },
++        ensure_ascii=False,
++    )
++
++
++async def execute_open_items_tool(
++    tool_name: str,
++    arguments: str,
++    *,
++    server_client: httpx.AsyncClient | None,
++    conversation_id: str | None,
++    call_id: str | None = None,
++) -> str:
++    """Run one ``sys_open_items_*`` call for the calling session.
++
++    :param tool_name: One of :data:`OPEN_ITEMS_TOOL_NAMES`.
++    :param arguments: The call's JSON arguments.
++    :param server_client: HTTP client pointed at the Omnigent server.
++    :param conversation_id: The calling session; the tools reach its items only.
++    :param call_id: The harness's tool call ID, which names a raise for its
++        retries; ``None`` when the call came without one, e.g. over MCP.
++    :returns: The tool output, a JSON object; ``{"error": …}`` on failure.
++    """
++    if server_client is None or not conversation_id:
++        return _error(f"{tool_name} requires server access")
++    try:
++        args = json.loads(arguments) if arguments.strip() else {}
++    except json.JSONDecodeError:
++        return _error(f"{tool_name}: malformed JSON arguments")
++    if not isinstance(args, dict):
++        return _error(f"{tool_name}: arguments must be an object")
++    try:
++        if tool_name == "sys_open_items_raise":
++            return await _raise(args, server_client, conversation_id, call_id)
++        if tool_name == "sys_open_items_update":
++            return await _update(args, server_client, conversation_id, call_id)
++        return await _list(args, server_client, conversation_id)
++    except (httpx.HTTPError, ValueError, KeyError) as exc:
++        return _error(f"{tool_name} failed: {exc}")
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index ad0b2dcfa898c4499d636e1299857d07f715997e..018c20d416bf2e25809a011c50d1531f953ed219 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -76,6 +76,7 @@ from omnigent.runner.journal_tools import (
+     execute_journal_tool,
+     server_workflows_enabled,
+ )
++from omnigent.runner.open_items_tools import OPEN_ITEMS_TOOL_NAMES, execute_open_items_tool
+ from omnigent.runner.session_requests import remember_session_host
+ from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
+ from omnigent.spec.types import MEMORY_TOOL_NAMES
+@@ -485,6 +486,10 @@ _SCHEDULED_TASK_TOOLS = frozenset(
+     }
+ )
+ 
++# Priority 5l.1: Open items — the runner proxies the server's
++# /v1/sessions/{id}/open-items routes for the calling session.
++_OPEN_ITEMS_TOOLS = OPEN_ITEMS_TOOL_NAMES
++
+ # Priority 5l.2: The session journal — the runner proxies the server's
+ # /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
+ _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
+@@ -560,6 +565,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
+     | _AGENT_TOOLS
+     | _POLICY_TOOLS
+     | _SCHEDULED_TASK_TOOLS
++    | _OPEN_ITEMS_TOOLS
+     | _JOURNAL_TOOLS
+     | _USER_INBOX_TOOLS
+     | _MEMORY_TOOLS
+@@ -1082,6 +1088,7 @@ _ALL_LOCAL_TOOLS = (
+     | _AGENT_TOOLS
+     | _POLICY_TOOLS
+     | _SCHEDULED_TASK_TOOLS
++    | _OPEN_ITEMS_TOOLS
+     | _JOURNAL_TOOLS
+     | _USER_INBOX_TOOLS
+     | _MEMORY_TOOLS
+@@ -8663,6 +8670,14 @@ async def execute_tool(
+                 server_client=server_client,
+                 conversation_id=conversation_id,
+             )
++        elif tool_name in _OPEN_ITEMS_TOOLS:
++            output = await execute_open_items_tool(
++                tool_name,
++                arguments,
++                server_client=server_client,
++                conversation_id=conversation_id,
++                call_id=call_id,
++            )
+         elif tool_name in _JOURNAL_TOOLS:
+             output = await execute_journal_tool(
+                 tool_name,
+diff --git a/omnigent/server/routes/sessions/routes_agent.py b/omnigent/server/routes/sessions/routes_agent.py
+index b2979339ba89b45db131e5538eb0221506c6ebdc..83685b4065d051a9f0946a6e34a0ed58a1be9451 100644
+--- a/omnigent/server/routes/sessions/routes_agent.py
++++ b/omnigent/server/routes/sessions/routes_agent.py
+@@ -22,6 +22,7 @@ from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+ from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
+ from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
+ from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
++from omnigent.open_items_availability import OPEN_ITEMS_HEADER
+ from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER, POLICY_MODULES_HEADER
+ from omnigent.runner.routing import RunnerRouter
+ from omnigent.runtime.agent_cache import AgentCache
+@@ -45,6 +46,7 @@ from omnigent.server.auth import (
+ from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
+ from omnigent.server.feature_flags import Feature, FeatureFlags
+ from omnigent.server.host_registry import HostRegistry
++from omnigent.server.open_items import open_store as open_items_store
+ from omnigent.server.permissions import check_session_access
+ from omnigent.server.routes._auth_helpers import (
+     can_mutate_session_agent as _can_mutate_session_agent,
+@@ -324,6 +326,10 @@ def register_agent_routes(
+         selection_headers[MEMORY_SEARCH_HEADER] = (
+             "1" if memory_search_available is not None and memory_search_available() else "0"
+         )
++        # The runner keeps the open items tools only when this server stores them.
++        selection_headers[OPEN_ITEMS_HEADER] = (
++            "1" if open_items_store(conversation_store) is not None else "0"
++        )
+         return Response(
+             content=bundle_bytes,
+             media_type="application/gzip",
+diff --git a/omnigent/tools/builtins/open_items.py b/omnigent/tools/builtins/open_items.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..04a763687972f5a1c350d02b69aaf922126ec430
+--- /dev/null
++++ b/omnigent/tools/builtins/open_items.py
+@@ -0,0 +1,217 @@
++"""Built-in tools that keep the session's open items: questions, risks, findings, follow-ups.
++
++Registered unless the agent spec sets ``tool_groups.open_items: false``, and
++kept by the runner only when the server stores open items. The runner sends
++them to the server's ``/v1/sessions/{id}/open-items`` routes, which allocate
++labels such as ``Q7``.
++
++``sys_open_items_raise``
++    Raise items and get their labels.
++
++``sys_open_items_update``
++    Close, reopen, retitle, retopic or relink items.
++
++``sys_open_items_list``
++    List the session's items, open and answered by default.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from omnigent.entities.open_items import (
++    KINDS,
++    LINKS_PER_ITEM,
++    RAISE_BATCH_MAX,
++    UPDATE_BATCH_MAX,
++)
++from omnigent.tools.base import Tool
++
++# The most rows one list call returns.
++OPEN_ITEMS_LIST_MAX = 100
++
++_LINKS_SCHEMA: dict[str, Any] = {
++    "type": "array",
++    "maxItems": LINKS_PER_ITEM,
++    "description": "http(s) links that support the item.",
++    "items": {
++        "type": "object",
++        "properties": {"url": {"type": "string"}, "label": {"type": "string"}},
++        "required": ["url"],
++        "additionalProperties": False,
++    },
++}
++
++
++def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict:
++    return {
++        "type": "function",
++        "function": {
++            "name": name,
++            "description": description,
++            "parameters": {
++                "type": "object",
++                "properties": properties,
++                "required": required,
++                "additionalProperties": False,
++            },
++        },
++    }
++
++
++class SysOpenItemsRaiseTool(Tool):
++    """Raise items. Dispatched to ``POST /v1/sessions/{id}/open-items``."""
++
++    @classmethod
++    def name(cls) -> str:
++        """:returns: ``"sys_open_items_raise"``."""
++        return "sys_open_items_raise"
++
++    @classmethod
++    def description(cls) -> str:
++        """:returns: Human-readable description of the tool."""
++        return (
++            "Record items that need the user's decision or attention later in this session's "
++            "open items list, which the user sees beside the chat: a question, risk, finding "
++            "or follow-up, or a link worth keeping. Returns each item's label (e.g. Q7); write "
++            "that label in chat when you present the item. Pass label to adopt a label you "
++            "already wrote in chat without the tool. Reuse a topic for items about the same "
++            "piece of work."
++        )
++
++    def get_schema(self) -> dict[str, Any]:
++        """:returns: The OpenAI-format tool schema."""
++        item = {
++            "type": "object",
++            "properties": {
++                "kind": {"type": "string", "enum": list(KINDS)},
++                "title": {"type": "string", "description": "A few words, under 160 characters."},
++                "detail": {"type": "string", "description": "The full item, Markdown."},
++                "topic": {
++                    "type": "string",
++                    "description": "Short slug for the piece of work, e.g. 'cache-rollout'.",
++                },
++                "links": _LINKS_SCHEMA,
++                "url": {"type": "string", "description": "A link item's URL (kind link only)."},
++                "raised_by": {
++                    "type": "string",
++                    "description": "The sub-agent this item speaks for, if not you.",
++                },
++                "label": {"type": "string", "description": "A label already used in chat."},
++            },
++            "required": ["kind"],
++            "additionalProperties": False,
++        }
++        return _schema(
++            self.name(),
++            self.description(),
++            {
++                "items": {
++                    "type": "array",
++                    "minItems": 1,
++                    "maxItems": RAISE_BATCH_MAX,
++                    "items": item,
++                }
++            },
++            ["items"],
++        )
++
++
++class SysOpenItemsUpdateTool(Tool):
++    """Change items. Dispatched to ``PATCH /v1/sessions/{id}/open-items``."""
++
++    @classmethod
++    def name(cls) -> str:
++        """:returns: ``"sys_open_items_update"``."""
++        return "sys_open_items_update"
++
++    @classmethod
++    def description(cls) -> str:
++        """:returns: Human-readable description of the tool."""
++        return (
++            "Change this session's open items by label. Close an item with status closed and a "
++            "one-line resolution as soon as it is resolved, decided, rejected, done or no "
++            "longer relevant; reopen it with status open. Also edits title, detail, topic and "
++            "links. Each label gets its new state or its own error."
++        )
++
++    def get_schema(self) -> dict[str, Any]:
++        """:returns: The OpenAI-format tool schema."""
++        change = {
++            "type": "object",
++            "properties": {
++                "label": {"type": "string", "description": "e.g. Q7"},
++                "status": {"type": "string", "enum": ["open", "closed"]},
++                "resolution": {
++                    "type": "string",
++                    "description": "How it ended, one line; required to close.",
++                },
++                "title": {"type": "string"},
++                "detail": {"type": "string"},
++                "topic": {"type": "string", "description": "Empty to clear."},
++                "add_links": _LINKS_SCHEMA,
++                "remove_links": {"type": "array", "items": {"type": "string"}},
++            },
++            "required": ["label"],
++            "additionalProperties": False,
++        }
++        return _schema(
++            self.name(),
++            self.description(),
++            {
++                "updates": {
++                    "type": "array",
++                    "minItems": 1,
++                    "maxItems": UPDATE_BATCH_MAX,
++                    "items": change,
++                }
++            },
++            ["updates"],
++        )
++
++
++class SysOpenItemsListTool(Tool):
++    """List items. Dispatched to ``GET /v1/sessions/{id}/open-items``."""
++
++    @classmethod
++    def name(cls) -> str:
++        """:returns: ``"sys_open_items_list"``."""
++        return "sys_open_items_list"
++
++    @classmethod
++    def description(cls) -> str:
++        """:returns: Human-readable description of the tool."""
++        return (
++            "List this session's open items in label order: open and answered ones unless "
++            "status says otherwise, with a detail preview, the user's latest answer and how "
++            "closed items ended. Use it instead of relying on memory before referring to, "
++            "closing or raising items."
++        )
++
++    def get_schema(self) -> dict[str, Any]:
++        """:returns: The OpenAI-format tool schema."""
++        return _schema(
++            self.name(),
++            self.description(),
++            {
++                "status": {
++                    "type": "string",
++                    "enum": ["open", "answered", "closed", "all"],
++                    "description": "Default: open and answered.",
++                },
++                "kind": {"type": "string", "enum": list(KINDS)},
++                "topic": {"type": "string"},
++                "query": {"type": "string", "description": "Text to look for."},
++                "limit": {"type": "integer", "minimum": 1, "maximum": OPEN_ITEMS_LIST_MAX},
++                "after": {"type": "string", "description": "Continue after this label."},
++            },
++            [],
++        )
++
++
++OPEN_ITEMS_TOOLS: tuple[type[Tool], ...] = (
++    SysOpenItemsRaiseTool,
++    SysOpenItemsUpdateTool,
++    SysOpenItemsListTool,
++)
++OPEN_ITEMS_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in OPEN_ITEMS_TOOLS)
+diff --git a/omnigent/tools/builtins/web_fetch.py b/omnigent/tools/builtins/web_fetch.py
+index f51c46a59068a39cf53cba38f265b00631b5bed0..0c5e89bf4643fdb5bedd023de5bafd151afbf679 100644
+--- a/omnigent/tools/builtins/web_fetch.py
++++ b/omnigent/tools/builtins/web_fetch.py
+@@ -244,8 +244,8 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
+         interaction=InteractionConfig(conversational=False),
+         tools=ToolsConfig(),
+         # A headless one-shot fetcher: no browser pane, review comments,
+-        # scheduling, policy editing, agent lookup, journal, project filing, user
+-        # memory or file sharing to drive.
++        # scheduling, policy editing, agent lookup, journal, open items, project
++        # filing, user memory or file sharing to drive.
+         tool_groups=ToolGroupsConfig(
+             browser=False,
+             scheduled_tasks=False,
+@@ -253,6 +253,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
+             policies=False,
+             agent_discovery=False,
+             journal=False,
++            open_items=False,
+             projects=False,
+             user_inbox=False,
+             memory=False,
+diff --git a/omnigent/tools/manager.py b/omnigent/tools/manager.py
+index a6a9191fccbf031da95ec4477d9d9706fa8cffa2..f747674ad1ea22cbf05aec2b985f0da5a74a5ead 100644
+--- a/omnigent/tools/manager.py
++++ b/omnigent/tools/manager.py
+@@ -204,6 +204,7 @@ class ToolManager:
+         self._register_policy_tools()
+         self._register_scheduled_task_tools()
+         self._register_journal_tools()
++        self._register_open_items_tools()
+         self._register_user_inbox_tools()
+         self._register_memory_tools()
+         self._register_browser_tools()
+@@ -261,6 +262,21 @@ class ToolManager:
+         for tool_class in JOURNAL_TOOLS:
+             self._tools[tool_class.name()] = tool_class()
+ 
++    def _register_open_items_tools(self) -> None:
++        """
++        Auto-register the ``sys_open_items_*`` tools.
++
++        Registered without spec opt-in; ``tool_groups.open_items: false`` drops
++        them. The runner dispatches them via the server's
++        ``/v1/sessions/{id}/open-items`` routes.
++        """
++        if not self._spec.tool_groups.open_items:
++            return
++        from omnigent.tools.builtins.open_items import OPEN_ITEMS_TOOLS
++
++        for tool_class in OPEN_ITEMS_TOOLS:
++            self._tools[tool_class.name()] = tool_class()
++
+     def _register_user_inbox_tools(self) -> None:
+         """Register the owner-Inbox tools for agents that opt in."""
+         if not self._spec.tool_groups.user_inbox:
+diff --git a/tests/runner/test_open_items_tool_dispatch.py b/tests/runner/test_open_items_tool_dispatch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c24dbe470206b972e93ef67c2003509c7176b0a
+--- /dev/null
++++ b/tests/runner/test_open_items_tool_dispatch.py
+@@ -0,0 +1,88 @@
++"""Tests for the ``sys_open_items_*`` tools: registration, relay and runner dispatch."""
++
++from __future__ import annotations
++
++import json
++
++import httpx
++import pytest
++
++from omnigent.runner.open_items_tools import execute_open_items_tool
++from omnigent.runner.tool_dispatch import (
++    _ALL_LOCAL_TOOLS,
++    _NATIVE_RELAY_BUILTIN_TOOLS,
++    _OPEN_ITEMS_TOOLS,
++    build_native_relay_tool_schemas,
++    should_dispatch_locally,
++)
++from omnigent.spec.parser import parse_tool_groups
++from omnigent.spec.types import AgentSpec, ToolGroupsConfig
++
++_TOOLS = {"sys_open_items_raise", "sys_open_items_update", "sys_open_items_list"}
++
++
++def _relay_names(spec: AgentSpec | None) -> set[str]:
++    return {schema["name"] for schema in build_native_relay_tool_schemas(spec)}
++
++
++def test_the_group_is_on_by_default_and_reaches_native_relays() -> None:
++    assert _OPEN_ITEMS_TOOLS == _TOOLS
++    assert _TOOLS <= _ALL_LOCAL_TOOLS and _TOOLS <= _NATIVE_RELAY_BUILTIN_TOOLS
++    assert all(should_dispatch_locally(name) for name in _TOOLS)
++    assert parse_tool_groups(None, spawn=False).open_items is True
++    assert parse_tool_groups({"open_items": False}, spawn=False).open_items is False
++    assert _relay_names(AgentSpec(spec_version=1, skills_filter="none")) >= _TOOLS
++    opted_out = AgentSpec(
++        spec_version=1, skills_filter="none", tool_groups=ToolGroupsConfig(open_items=False)
++    )
++    assert not _TOOLS & _relay_names(opted_out)
++    # Without a spec the relay can't evaluate the gate, so it leaves them out.
++    assert not _TOOLS & _relay_names(None)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("status", "body"),
++    [(404, {"detail": "Not Found"}), (405, {"detail": "Method Not Allowed"})],
++)
++async def test_a_server_without_open_items_says_to_label_in_chat(
++    status: int, body: dict[str, str]
++) -> None:
++    requests: list[httpx.Request] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        requests.append(request)
++        return httpx.Response(status, json=body)
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://server.test"
++    ) as client:
++        output = await execute_open_items_tool(
++            "sys_open_items_raise",
++            json.dumps({"items": [{"kind": "question", "title": "x"}]}),
++            server_client=client,
++            conversation_id="a" * 32,
++            call_id="toolu_9",
++        )
++    assert json.loads(output)["error"].startswith("unavailable:")
++    assert "label items in chat instead" in json.loads(output)["error"]
++    (request,) = requests
++    assert request.url.path == f"/v1/sessions/{'a' * 32}/open-items"
++    assert json.loads(request.content)["idempotency_key"] == "tool:toolu_9"
++
++
++@pytest.mark.asyncio
++async def test_calls_without_a_session_or_with_bad_arguments_fail_fast() -> None:
++    async with httpx.AsyncClient(base_url="http://server.test") as client:
++        no_session = await execute_open_items_tool(
++            "sys_open_items_list", "{}", server_client=client, conversation_id=None
++        )
++        bad = await execute_open_items_tool(
++            "sys_open_items_update", "[1]", server_client=client, conversation_id="a" * 32
++        )
++        empty = await execute_open_items_tool(
++            "sys_open_items_update", "{}", server_client=client, conversation_id="a" * 32
++        )
++    assert json.loads(no_session) == {"error": "sys_open_items_list requires server access"}
++    assert json.loads(bad) == {"error": "sys_open_items_update: arguments must be an object"}
++    assert json.loads(empty)["error"].startswith("invalid_input")
+diff --git a/tests/runner/test_runner_entry.py b/tests/runner/test_runner_entry.py
+index c59aa4257f455872abaf5c7ca5b1694c20843b38..2518851b82978e769aa1d790ec741f27dcd5b234 100644
+--- a/tests/runner/test_runner_entry.py
++++ b/tests/runner/test_runner_entry.py
+@@ -4452,6 +4452,44 @@ async def test_runner_keeps_user_inbox_tools_only_when_the_server_turns_them_on(
+     assert [advertised(result.spec) for result in results] == [False, True, False]
+ 
+ 
++@pytest.mark.asyncio
++async def test_runner_keeps_open_items_tools_only_when_the_server_stores_them(tmp_path):
++    from omnigent.open_items_availability import OPEN_ITEMS_HEADER
++    from omnigent.tools.manager import ToolManager
++    from tests.server.helpers import build_agent_bundle
++
++    bundle = build_agent_bundle("items-agent")
++    # No header is a server without the open items routes: the agent keeps text labels.
++    gate_headers = [{OPEN_ITEMS_HEADER: "0"}, {OPEN_ITEMS_HEADER: "1"}, {}]
++
++    def handler(request):
++        return httpx.Response(
++            200,
++            content=bundle,
++            headers={
++                "X-Agent-Version": "1",
++                "X-Agent-Session-Scoped": "true",
++                **gate_headers.pop(0),
++            },
++        )
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://server.test"
++    ) as client:
++        results = [
++            await _resolve_agent_spec_from_server(
++                client, _AgentSpecCache(tmp_path), "ag_items", session_id="session"
++            )
++            for _ in range(3)
++        ]
++
++    def advertised(spec):
++        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
++        return "sys_open_items_raise" in names
++
++    assert [advertised(result.spec) for result in results] == [False, True, False]
++
++
+ @pytest.mark.asyncio
+ async def test_runner_offers_memory_tools_only_when_the_server_says_memory_is_available(tmp_path):
+     from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
+diff --git a/tests/runner/test_tool_groups_surface.py b/tests/runner/test_tool_groups_surface.py
+index 06f7aa4f96066fdca43368c837471159b07e1224..41954174b5da58ea7f771c8185eca7b5c0a48637 100644
+--- a/tests/runner/test_tool_groups_surface.py
++++ b/tests/runner/test_tool_groups_surface.py
+@@ -20,6 +20,7 @@ _ALL_OFF = ToolGroupsConfig(
+     comments=False,
+     policies=False,
+     agent_discovery=False,
++    open_items=False,
+     memory=False,
+     files=False,
+ )
+@@ -38,9 +39,9 @@ def _registered(spec: AgentSpec) -> set[str]:
+ 
+ 
+ def _gated() -> frozenset[str]:
+-    """Tools the seven groups control, derived from registration itself."""
++    """Tools the eight groups control, derived from registration itself."""
+     gated = frozenset(_registered(_spec(_ALL_ON)) - _registered(_spec(_ALL_OFF)))
+-    assert len(gated) == 35, sorted(gated)
++    assert len(gated) == 38, sorted(gated)
+     return gated
+ 
+ 
+diff --git a/tests/server/routes/test_open_items_routes.py b/tests/server/routes/test_open_items_routes.py
+index e791dc2e8a0af66a827f1ed41502237aa3417c15..8f9c148b9ba5f294d634b51240a911b06b4050b2 100644
+--- a/tests/server/routes/test_open_items_routes.py
++++ b/tests/server/routes/test_open_items_routes.py
+@@ -290,11 +290,24 @@ async def test_invalid_input_and_per_item_errors(
+ 
+ 
+ async def test_a_server_without_storage_hides_the_feature(
+-    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
++    client: httpx.AsyncClient,
++    stores: SimpleNamespace,
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
++    from omnigent.open_items_availability import OPEN_ITEMS_HEADER
++    from tests.server.helpers import build_agent_bundle
++
+     session_id = _session(stores)
++    LocalArtifactStore(str(tmp_path / "artifacts")).put(
++        f"{_ITEMS_AGENT}/{_BUNDLE_HASH}", build_agent_bundle("items-agent")
++    )
++    bundle_url = f"/v1/sessions/{session_id}/agent/contents"
++    # The runner keeps the tools only when the bundle download says the server stores items.
++    assert (await client.get(bundle_url, headers=_user(ALICE))).headers[OPEN_ITEMS_HEADER] == "1"
+     assert (await client.get("/v1/info", headers=_user(ALICE))).json()["open_items"] is True
+     monkeypatch.setattr(open_items_api, "open_items_store_for", _unavailable)
++    assert (await client.get(bundle_url, headers=_user(ALICE))).headers[OPEN_ITEMS_HEADER] == "0"
+     assert (await client.get("/v1/info", headers=_user(ALICE))).json()["open_items"] is False
+     missing = await client.get(f"/v1/sessions/{session_id}/open-items", headers=_user(ALICE))
+     assert missing.status_code == 404
+@@ -303,3 +316,95 @@ async def test_a_server_without_storage_hides_the_feature(
+ 
+ def _unavailable(storage_location: str) -> Any:
+     raise RuntimeError(f"no open items store at {storage_location}")
++
++
++async def test_the_agents_tools_raise_update_and_list_through_the_runner(
++    client: httpx.AsyncClient, stores: SimpleNamespace
++) -> None:
++    """The runner's handlers drive the real routes and return compact results."""
++    import json
++
++    from omnigent.runner.open_items_tools import execute_open_items_tool
++
++    session_id = _session(stores)
++    client.headers.update(_runner(session_id))
++
++    async def run(tool: str, args: dict[str, Any], call_id: str | None = None) -> Any:
++        output = await execute_open_items_tool(
++            tool,
++            json.dumps(args),
++            server_client=client,
++            conversation_id=session_id,
++            call_id=call_id,
++        )
++        return json.loads(output)
++
++    raise_args = {
++        "items": [
++            {**_QUESTION, "topic": "cache"},
++            {"kind": "link", "url": "https://github.com/acme/app/pull/7", "title": "The PR"},
++        ]
++    }
++    raised = await run("sys_open_items_raise", raise_args, call_id="toolu_1")
++    assert raised == {
++        "items": [
++            {"label": "Q1", "status": "open", "title": "Cache rows?", "topic": "cache"},
++            {"label": "L1", "status": "open", "title": "The PR"},
++        ],
++        "open_count": 2,
++        "topics": ["cache"],
++    }
++    # The harness retrying the same call gets the same labels.
++    assert await run("sys_open_items_raise", raise_args, call_id="toolu_1") == raised
++    pinned_again = await run(
++        "sys_open_items_raise",
++        {"items": [{"kind": "link", "url": "https://github.com/acme/app/pull/7/files"}]},
++    )
++    assert pinned_again["items"][0] == {
++        "label": "L1",
++        "status": "open",
++        "title": "The PR",
++        "duplicate": True,
++    }
++
++    updated = await run(
++        "sys_open_items_update",
++        {
++            "updates": [
++                {"label": "Q1", "status": "closed", "resolution": "Copied as is"},
++                {"label": "R9", "status": "open"},
++            ]
++        },
++        call_id="toolu_2",
++    )
++    assert updated == {
++        "items": [
++            {
++                "label": "Q1",
++                "status": "closed",
++                "title": "Cache rows?",
++                "topic": "cache",
++                "resolution": "Copied as is",
++            },
++            {"label": "R9", "error": "not_found: no item R9"},
++        ]
++    }
++    listed = await run("sys_open_items_list", {"status": "all", "query": "copy"})
++    assert listed["items"] == [
++        {
++            "label": "Q1",
++            "status": "closed",
++            "title": "Cache rows?",
++            "topic": "cache",
++            "resolution": "Copied as is",
++            "kind": "question",
++            "detail": "Copy or link?",
++            "closed_by": "agent",
++        }
++    ]
++    assert (listed["truncated"], listed["counts"]) == (
++        False,
++        {"open": 1, "answered": 0, "closed": 1},
++    )
++    refused = await run("sys_open_items_raise", {"items": [{"kind": "question"}]})
++    assert refused == {"error": "invalid_input: title is required"}
+diff --git a/tests/tools/builtins/test_web_fetch.py b/tests/tools/builtins/test_web_fetch.py
+index b4937e8b7cc6a0a4432387ca08cf16c1072eb6da..7f22d17de85d2c6116473002d59ce6fbfb47a8c8 100644
+--- a/tests/tools/builtins/test_web_fetch.py
++++ b/tests/tools/builtins/test_web_fetch.py
+@@ -360,6 +360,7 @@ def test_researcher_drops_every_framework_tool_group() -> None:
+     }
+     assert not names & {"list_comments", "update_comment", "sys_add_policy", "sys_policy_registry"}
+     assert not names & {"sys_user_inbox_post", "sys_user_inbox_list"}
++    assert not {n for n in names if n.startswith("sys_open_items_")}
+     assert not names & {
+         "sys_project_list",
+         "sys_session_update",
+diff --git a/tests/tools/test_manager.py b/tests/tools/test_manager.py
+index b1366004b76b667aabe047b879e744db08b7ddf4..34ff1223173f02e79c3a3520ae351a6bb90ff676 100644
+--- a/tests/tools/test_manager.py
++++ b/tests/tools/test_manager.py
+@@ -106,6 +106,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
+         "sys_workflow_save",
+         "sys_workflow_load",
+         "sys_workflow_list",
++        # The session's open items tools register on every agent; the runner
++        # drops them unless the server stores open items. Runner-dispatched.
++        "sys_open_items_raise",
++        "sys_open_items_update",
++        "sys_open_items_list",
+         # The owner-Inbox tools register on every agent too; the runner drops
+         # them unless the server offers the Inbox. Schema-only; runner-dispatched.
+         "sys_user_inbox_post",
