@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import random
+import shutil
 import string
 import threading
 import uuid
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
@@ -380,3 +383,56 @@ def test_lists_filter_page_and_count_in_label_order(
     assert page.kind_counts == {"question": 2, "risk": 1, "finding": 0, "follow_up": 1, "link": 0}
     assert page.topics == ["cache", "release"]
 
+
+def test_the_retired_chat_notes_table_is_dropped_and_a_downgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    """A database that ran open_items0002 loses its chat notes table and keeps its items."""
+    from alembic import command
+    from sqlalchemy import inspect, text
+
+    from omnigent.db import side_schemas
+    from omnigent.db.utils import get_or_create_engine
+
+    revisions = Path(open_items_store.__file__).parent / "open_items_migrations"
+    up_to_notes = tmp_path / "revisions"
+    up_to_notes.mkdir()
+    for name in ("open_items0001_create_tables.py", "open_items0002_chat_notes.py"):
+        shutil.copy(revisions / name, up_to_notes)
+    store = open_items_store.OPEN_ITEMS_SIDE_STORE
+    engine = get_or_create_engine(f"sqlite:///{tmp_path / 'copy.db'}")
+
+    def tables() -> set[str]:
+        return set(inspect(engine).get_table_names())
+
+    def revision() -> str | None:
+        with engine.connect() as connection:
+            return side_schemas._current_revision(connection, store)
+
+    side_schemas.ensure_side_store(dataclasses.replace(store, migrations=up_to_notes), engine)
+    assert revision() == "open_items0002" and "open_items_chat_notes" in tables()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO open_items_heads (workspace_id, conversation_id, kind, next_number) "
+                "VALUES (0, :conversation, 1, 4)"
+            ),
+            {"conversation": uuid.uuid4().bytes},
+        )
+
+    side_schemas._migrated.pop(engine, None)
+    side_schemas.ensure_side_store(store, engine)
+    assert revision() == "open_items0003"
+    assert "open_items_chat_notes" not in tables()
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT next_number FROM open_items_heads")).all() == [(4,)]
+
+    config = side_schemas._alembic_config(store)
+    with engine.connect() as connection:
+        config.attributes.update(connection=connection, side_store=store)
+        command.downgrade(config, "open_items0002")
+        connection.commit()
+    assert revision() == "open_items0002" and "open_items_chat_notes" in tables()
+    side_schemas._migrated.pop(engine, None)
+    side_schemas.ensure_side_store(store, engine)
+    assert revision() == "open_items0003" and "open_items_chat_notes" not in tables()
