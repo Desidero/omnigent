@@ -6,6 +6,10 @@ set -eu
 dir=$(cd "$(dirname "$0")" && pwd)
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 wheel=$(ls "$dir"/omnigent-[0-9]*.whl)
-uv tool install --force --python 3.12 --find-links "$dir" -c "$dir/constraints.txt" "$wheel"
+# The antigravity harness runs on the host and imports its SDK there, so take
+# that extra when this release's constraints pin it (older releases' do not).
+extras=""
+if grep -q '^google-antigravity==' "$dir/constraints.txt"; then extras="[antigravity]"; fi
+uv tool install --force --python 3.12 --find-links "$dir" -c "$dir/constraints.txt" "$wheel$extras"
 tools=${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}
 OMNIGENT_NO_UPDATE_CHECK=1 "$tools/omnigent/bin/omnigent" --version

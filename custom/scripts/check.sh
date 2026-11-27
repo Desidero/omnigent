@@ -1,26 +1,49 @@
 #!/usr/bin/env bash
-# Apply the series onto BASE and check the result.
+# Build the series on BASE and check the result.
 #
-#   custom/scripts/check.sh [--repo <clone>] [--tree <dir>] [--custom <ref>]
+#   custom/scripts/check.sh [--repo <clone>] [--tree <dir>] [--custom <ref>] [--set <name>] [--pairs]
 #
-# Besides applying cleanly, every patch must carry usage docs (touch a path in
-# DOC_PATHS) or a "Docs: none (<reason>)" trailer, every "# series:" needs a
-# "## <series>" section in docs/custom/README.md of the applied tree, and the
-# last series must be custom-docs-index, the commit that holds that index.
-# Each series must be one block that comes after every series it "# needs:".
+# Without a build (serieslib.py lint): every series is a directory
+# custom/patches/<series>/ with NN-<slug>.patch files and a NOTE.md of at most
+# 60 lines: its title, a "Needs:" line, a "Covers:" line that matches the
+# lines its patches change, its index text (with "Turn on" and "Upstream",
+# issues and pull requests as full links) and something under "Must hold",
+# "Key code" and "Tests"; every patch carries usage docs (touches a path in
+# DOC_PATHS) or a "Docs: none (<reason>)" trailer; needs name series that
+# exist and do not form a circle; a glue directory (custom/glue/<a>+<b>/) is
+# named after two series that do not need each other and says what it joins
+# or patches, and why; every set file (custom/sets/<name>.txt) names series
+# that exist.
+# With the engine (serieslib.py verify): every series applies exactly on its
+# own foundation, BASE plus the series it needs, so each builds alone, and
+# the files, symbols and tests its note names exist in that build; every
+# glue pair builds, its patches apply exactly on the two series combined and
+# each path it joins really needs the join; and the whole build has the same
+# tree whether series that do not need each other are combined by name or by
+# name reversed.
+# On the built tree: no conflict markers, and changed Python and JSON parse.
+# The index, docs/custom/README.md, is the build's last commit, written from
+# the notes of the series built, so it needs no check of its own.
 #
 # --repo     Omnigent clone that has (or can fetch) the BASE commit
 #            (default: $OMNIGENT_REPO, else the clone this script is in).
-# --tree     Check a tree build-custom.sh already built in <dir>
-#            instead of applying the series again.
-# --custom   Also require the applied tree to equal <ref>'s tree, e.g. the
-#            working branch you exported from.
+# --tree     Check a tree build-custom.sh already built in <dir>: its HEAD
+#            must be the commit the series build to.
+# --custom   Also require the built tree to equal <ref>'s tree, e.g. the
+#            build of an earlier commit when a change must not alter it.
+# --set      Check the build of that set (build-custom.sh --set): the whole
+#            series still passes the rules above, but only the set is built
+#            (or expected in --tree).
+# --pairs    Also build every two series that touch a common file and do not
+#            need each other: any two must combine, cleanly or through glue.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 repo="${OMNIGENT_REPO:-}"
 custom_ref=""
 tree_dir=""
+set_name=""
+verify_args=()
 
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 
@@ -29,6 +52,8 @@ while [[ $# -gt 0 ]]; do
     --repo) repo="$2"; shift 2 ;;
     --tree) tree_dir="$2"; shift 2 ;;
     --custom) custom_ref="$2"; shift 2 ;;
+    --set) set_name="$2"; shift 2 ;;
+    --pairs) verify_args+=(--pairs); shift ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
@@ -37,86 +62,59 @@ if [[ -z "$repo" && -z "$tree_dir" ]]; then
   repo="$(git -C "$here" rev-parse --show-toplevel)"
 fi
 
-# Paths that count as usage docs: upstream's user and agent docs, feature-map
-# recipes, design docs (the telemetry variable table) and the server API reference.
-DOC_PATHS_RE='^(docs/|feature-map/|designs/|omnigent/server/API\.md$)'
-INDEX_SERIES=custom-docs-index
-INDEX_PATH=docs/custom/README.md
-
 base="$(tr -d '[:space:]' < "$here/BASE")"
-mapfile -t patches < <(grep -v -e '^#' -e '^[[:space:]]*$' "$here/series")
 
 fail() { echo "$1"; exit 1; }
 
-# Docs rule, per patch file: it touches a doc path or says why it needs none.
-patch_message() {
-  # The commit message: after the mail headers, up to the diffstat separator.
-  awk 'body && /^---$/ {exit} body {print} !body && /^$/ {body=1}' "$1"
-}
-problems=()
-for patch in "${patches[@]}"; do
-  file="$here/patches/$patch"
-  [[ -f "$file" ]] || { problems+=("$patch is listed in custom/series but missing"); continue; }
-  # grep -q on a pipe can SIGPIPE the writer, which pipefail reports; use strings.
-  touched="$(grep -E '^diff --git a/' "$file" | sed -E 's|^diff --git a/(.*) b/.*$|\1|')"
-  if grep -qE "$DOC_PATHS_RE" <<< "$touched"; then
-    continue
-  fi
-  if grep -q '^Docs: none (' <<< "$(patch_message "$file" | git interpret-trailers --parse)"; then
-    continue
-  fi
-  problems+=("$patch has no usage docs and no 'Docs: none (<reason>)' trailer")
-done
-shopt -s nullglob
-for file in "$here"/patches/*.patch; do
-  name="$(basename "$file")"
-  grep -qxF -- "$name" <<< "$(printf '%s\n' "${patches[@]}")" || problems+=("$name is not listed in custom/series")
-done
-mapfile -t series_names < <(sed -nE 's/^#[[:space:]]*series:[[:space:]]*([^[:space:]]+).*$/\1/p' \
-  "$here/series" | awk '!seen[$0]++')
-last_series="$(sed -nE 's/^#[[:space:]]*series:[[:space:]]*([^[:space:]]+).*$/\1/p' \
-  "$here/series" | tail -n 1)"
-if [[ "$last_series" != "$INDEX_SERIES" ]]; then
-  problems+=("the last series is ${last_series:-missing}, not $INDEX_SERIES")
+lib=(python3 -I "$here/scripts/serieslib.py")
+
+# The rules that need no build: layout, notes, the docs rule, needs, sets.
+mapfile -t problems < <("${lib[@]}" lint || true)
+if [[ ${#problems[@]} -gt 0 ]]; then
+  printf '%s\n' "${problems[@]}" >&2
+  fail "series check failed: ${problems[0]}"
 fi
-# Each series is one block, after every series it needs, so any set of
-# series (series-files.sh --only) applies in custom/series order.
-mapfile -t -O "${#problems[@]}" problems < <(awk '
-  /^#[[:space:]]*series:/ {
-    current = $0
-    sub(/^#[[:space:]]*series:[[:space:]]*/, "", current)
-    sub(/[[:space:]].*$/, "", current)
-    if (current in seen) print "series " current " is split into several blocks; keep its patches together"
-    seen[current] = 1
-    next
-  }
-  /^#[[:space:]]*needs:/ {
-    need = $0
-    sub(/^#[[:space:]]*needs:[[:space:]]*/, "", need)
-    sub(/[[:space:]].*$/, "", need)
-    if (!(need in seen)) print "series " current " needs " need ", which does not come before it"
-  }
-' "$here/series")
+mapfile -t patches < <("$here/scripts/series-files.sh" --all)
+
+set_args=()
+if [[ -n "$set_name" ]]; then
+  # From here on, only what the set builds: its series and what they need.
+  set_args=(--set "$set_name")
+  "$here/scripts/series-files.sh" "${set_args[@]}" --names >/dev/null 2>&1 \
+    || { "$here/scripts/series-files.sh" "${set_args[@]}" --names >/dev/null || true; exit 2; }
+  mapfile -t patches < <("$here/scripts/series-files.sh" "${set_args[@]}" 2>/dev/null)
+fi
+
+if [[ -n "$tree_dir" ]]; then
+  work="$(cd "$tree_dir" && pwd)"
+  engine_repo="${repo:-$work}"
+else
+  repo="$(cd "$repo" && pwd)"
+  engine_repo="$repo"
+fi
+
+# Each series exactly on its own foundation, each glue pair, the whole build in both tie orders.
+mapfile -t problems < <("${lib[@]}" verify --repo "$engine_repo" "${verify_args[@]}" 2>&1 || true)
 if [[ ${#problems[@]} -gt 0 ]]; then
   printf '%s\n' "${problems[@]}" >&2
   fail "series check failed: ${problems[0]}"
 fi
 
 if [[ -n "$tree_dir" ]]; then
-  work="$(cd "$tree_dir" && pwd)"
-  count="$(git -C "$work" rev-list --count "$base..HEAD")"
-  [[ "$count" == "${#patches[@]}" ]] \
-    || fail "$work has $count commits on BASE, the series has ${#patches[@]}; rebuild it"
+  expected="$("${lib[@]}" build --repo "$engine_repo" "${set_args[@]}" 2>/dev/null)" \
+    || fail "the series${set_name:+ in set $set_name} does not build on ${base:0:12}"
+  actual="$(git -C "$work" rev-parse HEAD)"
+  [[ "$actual" == "$expected" ]] \
+    || fail "$work is at ${actual:0:12}, the series${set_name:+ in set $set_name} builds ${expected:0:12}; rebuild it"
 else
-  repo="$(cd "$repo" && pwd)"
   work="$(mktemp -d)/check"
   cleanup() {
     git -C "$repo" worktree remove --force "$work" >/dev/null 2>&1 || true
     rm -rf "$(dirname "$work")"
   }
   trap cleanup EXIT
-  "$here/scripts/build-custom.sh" --repo "$repo" --worktree "$work" >/dev/null \
-    || fail "the series does not apply on ${base:0:12}"
+  "$here/scripts/build-custom.sh" --repo "$repo" "${set_args[@]}" --worktree "$work" >/dev/null 2>&1 \
+    || fail "the series${set_name:+ in set $set_name} does not build on ${base:0:12}"
 fi
 
 # Quick sanity: no conflict markers, and changed Python and JSON files parse.
@@ -137,30 +135,15 @@ if [[ ${#problems[@]} -gt 0 ]]; then
   fail "sanity check failed: ${problems[0]}"
 fi
 
-# Every series has a section in the index at the series tip.
-indexed=()
-if [[ -f "$work/$INDEX_PATH" ]]; then
-  mapfile -t indexed < <(sed -nE 's/^##[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' "$work/$INDEX_PATH")
-fi
-for name in "${series_names[@]}"; do
-  if ! grep -qxF -- "$name" <<< "$(printf '%s\n' "${indexed[@]}")"; then
-    problems+=("series $name has no '## $name' section in $INDEX_PATH")
-  fi
-done
-if [[ ${#problems[@]} -gt 0 ]]; then
-  printf '%s\n' "${problems[@]}" >&2
-  fail "index check failed: ${problems[0]}"
-fi
-
 tip="$(git -C "$work" rev-parse HEAD)"
 if [[ -n "$custom_ref" ]]; then
   ref_repo="${repo:-$work}"
   custom_tree="$(git -C "$ref_repo" rev-parse "$custom_ref^{tree}")"
   if [[ "$(git -C "$work" rev-parse 'HEAD^{tree}')" != "$custom_tree" ]]; then
     git -C "$ref_repo" diff --stat "$custom_ref" "$tip" >&2 || true
-    fail "${#patches[@]} patches apply, but the tree differs from $custom_ref; re-run export.sh"
+    fail "${#patches[@]} patches apply, but the tree differs from $custom_ref"
   fi
-  echo "${#patches[@]} patches apply on ${base:0:12} as ${tip:0:12} and match $custom_ref"
+  echo "${#patches[@]} patches${set_name:+ of set $set_name} apply on ${base:0:12} as ${tip:0:12} and match $custom_ref"
 else
-  echo "${#patches[@]} patches apply on ${base:0:12} as ${tip:0:12}"
+  echo "${#patches[@]} patches${set_name:+ of set $set_name} apply on ${base:0:12} as ${tip:0:12}"
 fi

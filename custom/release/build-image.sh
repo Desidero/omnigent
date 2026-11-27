@@ -40,6 +40,7 @@ args=(--platform linux/amd64 -f "$out/image/server.Dockerfile" -t "$IMAGE"
   --label "io.github.desidero.omnigent.patches-commit=$PATCHES_COMMIT"
   --label "io.github.desidero.omnigent.release-tag=$TAG"
   --metadata-file "$metadata")
+[[ -z "${BUILD_SET:-}" ]] || args+=(--label "io.github.desidero.omnigent.build-set=$BUILD_SET")
 if [[ "$push" == 1 ]]; then
   args+=(--push)
 else

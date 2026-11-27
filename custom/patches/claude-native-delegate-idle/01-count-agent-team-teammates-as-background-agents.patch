@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mhavant <matthew.hoelting@avant.com>
+Date: Thu, 22 Oct 2026 01:10:46 -0500
+Subject: [PATCH] fix(claude-native): count agent-team teammates as background
+ agents
+
+Claude Code lists an in-process teammate in a Stop hook's background_tasks
+with type "teammate". It was counted as a background shell, so the shell
+indicator over-counted, and a lead whose teammates were still running never
+got the background-agent hold, so it stayed Working after its turn.
+
+Not upstream yet: extends upstream's background-agent hold (#12561) to
+teammates; drop this copy once it merges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: mhavant <matthew.hoelting@avant.com>
+Docs: none (fix: teammates count as background agents for the idle fix; no setting)
+---
+ omnigent/harnesses/claude_native/bridge.py    |  5 +++-
+ .../test_claude_native_bridge.py              | 24 +++++++++++++++++++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index c167dedf112df697d6212eeec2c159d7a00dad12..9184c6ac63d724127e5a3d16299f59e06833df6d 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -4518,7 +4518,10 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
+ _BACKGROUND_TASK_FORWARD_LIMIT = 100
+ _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
+ _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
+-_BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset({"agent", "local_agent", "subagent"})
++# ``teammate`` is an in-process agent-team teammate; it keeps the lead busy too.
++_BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset(
++    {"agent", "local_agent", "subagent", "teammate"}
++)
+ _TURN_END_SCAN_BYTES = 256 * 1024
+ 
+ 
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index d273c2da87c0583463560df1974817030b197eb6..f633f84ef4ab9054d3a120a9430d5475c5d020f8 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -758,6 +758,8 @@ def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
+     [
+         ([{"id": "a1", "type": "subagent", "status": "running"}], True),
+         ([{"id": "a1", "type": "local_agent"}], True),
++        # An agent-team teammate keeps the lead waiting like a sub-agent.
++        ([{"id": "t1", "type": "teammate", "status": "running"}], True),
+         ([{"id": "a1", "type": "agent", "status": "completed"}], False),
+         ([{"id": "b1", "type": "local_bash", "status": "running"}], False),
+         (None, False),
+@@ -12686,6 +12688,28 @@ def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
+     ]
+ 
+ 
++def test_hook_record_stop_keeps_running_teammates_out_of_the_shell_tally() -> None:
++    """Agent-team teammates are background agents, not background shells."""
++    record = _hook_record_from_jsonl_record(
++        _make_jsonl_record(
++            {
++                "hook_event_name": "Stop",
++                "background_tasks": [
++                    {
++                        "id": "teammate-task",
++                        "type": "teammate",
++                        "status": "running",
++                        "description": "Investigate the failing check",
++                    },
++                ],
++            }
++        )
++    )
++
++    assert record.background_task_count == 0
++    assert record.background_tasks is None
++
++
+ def test_hook_record_stop_all_background_tasks_terminal_counts_zero() -> None:
+     """Every shell finished → count is 0, dropping the indicator."""
+     record = _hook_record_from_jsonl_record(

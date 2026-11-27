@@ -1,5 +1,5 @@
 <!-- Draft PR body for the skip-gzip-binary-files series; title: fix(server): handle streamed downloads with gzip middleware -->
-> Status: carried copy of upstream PR #10585; no new PR needed. Drop this series once #10585 merges.
+> Status: dropped at the 2026-11-24 refresh; kept here as a record. Upstream merged the `skip_gzip` fix described under **Fix** as #12362, so the series is no longer carried. The **Download proxy hardening** below exists only in upstream PR #10585, which is still open, and went with the series; carry #10585 again as its own series if that hardening is wanted before it merges.
 
 ## Related issue
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the upstream tracker page from custom/series, custom/tracker.yaml and live GitHub state.
+"""Generate the upstream tracker page from custom/patches/, custom/tracker.yaml and live GitHub state.
 
 Usage: custom/scripts/tracker.py OUTPUT.html [--repo owner/name]
 Needs `gh` authenticated. Reads only; never writes to GitHub.
@@ -17,24 +17,19 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import serieslib  # noqa: E402
 REPO = "omnigent-ai/omnigent"
 BOTS = {"github-actions", "omni-resolve-agent", "app/omni-resolve-agent", "omnigent-ci", "github-code-quality"}
 TODAY = dt.date.today()
 
 
-def parse_series(path: Path) -> dict[str, dict]:
-    series: dict[str, dict] = {}
-    current = None
-    for line in path.read_text().splitlines():
-        if line.startswith("# series: "):
-            # A legacy "<name> (continued)" block joins its series.
-            current = line.split(": ", 1)[1].split()[0]
-            series.setdefault(current, {"needs": [], "patches": []})
-        elif line.startswith("# needs: ") and current:
-            series[current]["needs"].append(line.split(": ", 1)[1].strip())
-        elif line.endswith(".patch") and current:
-            series[current]["patches"].append(line.strip())
-    return series
+def parse_series(custom: Path) -> dict[str, dict]:
+    catalog = serieslib.Catalog(custom)
+    return {
+        name: {"needs": catalog.series[name].needs, "patches": [patch.name for patch in catalog.series[name].patches]}
+        for name in catalog.order
+    }
 
 
 def fetch_github(numbers: set[int]) -> dict[int, dict]:
@@ -162,7 +157,7 @@ def lifecycle(entry: dict, gh: dict, watch: bool) -> tuple[str, str]:
 def main() -> None:
     out_path = Path(sys.argv[1])
     data = yaml.safe_load((ROOT / "tracker.yaml").read_text())
-    series = parse_series(ROOT / "series")
+    series = parse_series(ROOT)
     base = (ROOT / "BASE").read_text().strip()[:9]
     entries: dict[str, dict] = {}
     for name, e in data["series"].items():
@@ -371,7 +366,7 @@ td.num{{font-family:var(--mono);white-space:nowrap;font-variant-numeric:tabular-
 </style>
 <div class="wrap">
 <h1>Omnigent Upstream Tracker</h1>
-<p class="lede">Every change we want in Omnigent: the ones we patch, the ones we are contributing, and the ones we only watch. State and next step come from live GitHub; relationships come from <code>custom/series</code> and <code>custom/tracker.yaml</code> on the fork's <code>patches</code> branch.</p>
+<p class="lede">Every change we want in Omnigent: the ones we patch, the ones we are contributing, and the ones we only watch. State and next step come from live GitHub; relationships come from each series' <code>NOTE.md</code> and <code>custom/tracker.yaml</code> on the fork's <code>patches</code> branch.</p>
 <div class="meta"><span>Generated {today}</span><span>Series base: upstream <code>{base}</code></span><span>Activity column: days since the last human comment or review / since any update</span></div>
 <div class="counts">{counts}</div>
 <nav class="sections" aria-label="Sections"><a href="#graph">Graph</a><a href="#drop-list">Drop list</a><a href="#my-move">My move</a><a href="#their-move">Their move</a><a href="#watching">Watching</a><a href="#everything">Everything</a><a href="#refresh">Refresh</a></nav>
@@ -392,7 +387,7 @@ td.num{{font-family:var(--mono);white-space:nowrap;font-variant-numeric:tabular-
 <div class="tablewrap"><table><thead><tr><th>Change</th><th>What and relationships</th><th>State</th><th>Upstream</th><th>Human / any activity</th><th>Next step</th></tr></thead><tbody>{everything}</tbody></table></div>
 
 <h2 id="refresh">Refresh</h2>
-<div class="howto">Edit <code>custom/tracker.yaml</code> (a pull request into <code>patches</code>) when a link changes (new issue, PR opened, something merged), then run <code>custom/scripts/tracker.py out.html</code> and republish this page to the same URL. The series and needs edges are read from <code>custom/series</code>, so a new series only needs a <code>tracker.yaml</code> entry with its <code>want</code> line.</div>
+<div class="howto">Edit <code>custom/tracker.yaml</code> (a pull request into <code>patches</code>) when a link changes (new issue, PR opened, something merged), then run <code>custom/scripts/tracker.py out.html</code> and republish this page to the same URL. The series and needs edges are read from <code>custom/patches/</code>, so a new series only needs a <code>tracker.yaml</code> entry with its <code>want</code> line.</div>
 </div>
 """
 

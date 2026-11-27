@@ -1,0 +1,1205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 24 Nov 2026 18:12:39 +0000
+Subject: [PATCH] feat(deploy): take a Databricks deployment's own settings
+ from an overlay
+
+A real Databricks Apps deployment needs values the tracked bundle cannot
+hold: the workspace host, extras such as `kms`, app env vars, an OAuth
+client secret from a secret scope, and config files beside app.py. Each
+meant editing databricks.yml (twice, once per target's env list),
+deploy.py or src/ by hand and deploying with --allow-dirty
+(https://github.com/Desidero/omnigent/issues/21).
+
+`deploy.py --overlay <file>` reads them from one untracked YAML file with
+five optional keys: host, extras, env, secret_env and files.
+
+- extras are added to the generated src/pyproject.toml.
+- host, env and secret_env become a generated bundle fragment,
+  overlay.generated.yml, which databricks.yml now includes by glob. It
+  defines `<target>-overlay`, a copy of the target chosen by --target and
+  --no-otel with the host replaced, the target's env list followed by
+  the overlay's, and one app `secret` resource (READ) per secret-backed
+  variable. Applying it after target selection is what removes the
+  duplicated edit. The copy keeps the base target's root_path, so the
+  deployment state is shared. Without bundle keys, or without an
+  overlay, the base target deploys exactly as before.
+- files are copied into src/ for the deploy and removed when deploy.py
+  exits.
+
+The file is checked before the build: unknown keys fail, a variable the
+target already sets (OMNIGENT_FEATURES stays with --features) or a
+secret-looking name under plain `env` is refused, and a file may not
+replace anything in src/ or use a gitignored name, which the bundle sync
+would skip. Only names are logged, never values. The overlay path
+pattern (deploy/databricks/*.local.yml) and the generated fragment are
+gitignored.
+
+Not run against a workspace or the Databricks CLI. The tests cover
+parsing, the generated target (built from the real databricks.yml), file
+handling and the wiring through main(). Two things the design leans on
+were read in the CLI's source instead: an `include` glob that matches
+nothing is not an error (process_root_includes.go), and an app's
+`resources` are merged by name (merge_apps.go). Binding the new target
+to state created through the base target is untested.
+
+Not upstream yet: not proposed, and there is no contribution branch for
+it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ .gitignore                                    |   7 +
+ deploy/databricks/README.md                   |  83 ++-
+ deploy/databricks/databricks.yml              |  10 +-
+ deploy/databricks/deploy.py                   | 367 ++++++++++++-
+ docs/databricks.md                            |  10 +-
+ .../deploy/test_databricks_deploy_overlay.py  | 497 ++++++++++++++++++
+ 6 files changed, 969 insertions(+), 5 deletions(-)
+ create mode 100644 tests/deploy/test_databricks_deploy_overlay.py
+
+diff --git a/.gitignore b/.gitignore
+index 4a6100b7d78c329f80e94137630df0a0b56cee1b..9820a893055fb1b6983a12284bef3fd812612aac 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -101,6 +101,13 @@ web/storybook-static/
+ # reason — `bundle deploy` must be able to sync it to the app source folder.
+ # DAB local state directory (created by `databricks bundle deploy`).
+ deploy/databricks/.databricks/
++# A deployment's own settings for `deploy.py --overlay` (workspace host, env
++# vars, the files it adds), and the bundle fragment deploy.py generates from
++# them. `bundle deploy` skips gitignored files, which is wanted here: neither
++# belongs in the uploaded bundle. The copies deploy.py puts into src/ for a
++# deploy are not ignored, for the same reason as the wheels above.
++deploy/databricks/*.local.yml
++deploy/databricks/*.generated.yml
+ web/package-lock.json
+ # Generated demo recordings belong in PR evidence or artifacts, not Git.
+ recordings/
+diff --git a/deploy/databricks/README.md b/deploy/databricks/README.md
+index 458620611979898ddb6caf365e5314909a4d4355..4feda0ebe0f4a6b1da1dd33c0e9534650ff33998 100644
+--- a/deploy/databricks/README.md
++++ b/deploy/databricks/README.md
+@@ -46,7 +46,8 @@ Runs unchanged from a laptop. Re-runnable; every step is idempotent.
+ Set your workspace URL in `databricks.yml` under
+ `targets.prod.workspace.host` (it ships as a `https://example.databricks.com`
+ placeholder; DAB reads `workspace.host` before resolving variables, so it
+-must be a literal).
++must be a literal). To leave the tracked file alone, set `host` in a
++[deployment overlay](#deployment-overlay) instead.
+ 
+ ## One-time bootstrap
+ 
+@@ -312,6 +313,84 @@ uv run python deploy/databricks/deploy.py --no-otel ...
+ > deploy warns when `--no-otel` is paired with a target that lacks those
+ > overrides, since OTel then stays on.
+ 
++## Deployment overlay
++
++A deployment has a handful of values that are its own and cannot be committed:
++the workspace host, extra `omnigent` extras, env vars for the app, secrets, and
++config files that must sit beside `app.py`. Keep them in one untracked YAML file
++and pass it with `--overlay`, instead of editing `databricks.yml`, `deploy.py`
++or `src/`:
++
++```bash
++uv run python deploy/databricks/deploy.py \
++    --overlay deploy/databricks/deploy.local.yml ...
++```
++
++```yaml
++# deploy/databricks/deploy.local.yml
++host: https://<workspace-host>
++extras: [kms]
++env:
++  OMNIGENT_CONFIG: server-config.yml
++  OMNIGENT_SHARING_MODE: read_only
++  OMNIGENT_PUBLIC_SHARING: "off"
++secret_env:
++  OMNIGENT_DATABRICKS_CLIENT_SECRET:
++    scope: <secret-scope>
++    key: <secret-key>
++files:
++  server-config.yml: server-config.local.yml
++```
++
++| Key | What it does |
++|---|---|
++| `host` | The workspace URL the deploy targets, in place of the placeholder in `databricks.yml`. |
++| `extras` | Extras of `omnigent` installed in the app besides `databricks` and `tracing`, e.g. `kms` for the AWS KMS credential store. Each must be an extra the package declares. |
++| `env` | App env vars, name to value, added after the ones the target already sets. Values are strings: quote `on`/`off`, `yes`/`no` and numbers. |
++| `secret_env` | App env vars whose value comes from a secret scope: `scope` and `key`, plus an optional `resource` (the app resource's name; default: the variable name in lower case). Each adds an app `secret` resource with `READ` permission and an env entry that reads it. |
++| `files` | Files copied into the app source: the name in `src/`, then the source path, relative to the overlay file. |
++
++All five keys are optional, and any other key is an error.
++
++**How it is applied.** The overlay is read and checked before the build starts.
++
++- `extras` go into the generated `src/pyproject.toml`.
++- For `host`, `env` and `secret_env`, `deploy.py` writes
++  `overlay.generated.yml` beside `databricks.yml`, which includes it. It defines
++  a target named `<target>-overlay`: a copy of the selected target (`prod`, or
++  `prod-no-otel` with `--no-otel`) with your host, the target's env list
++  followed by yours, and your secret resources. The deploy then binds, deploys
++  and runs that target. It keeps the base target's `root_path`, so it works on
++  the same deployment state. The file is rewritten on every overlay deploy and
++  removed by a deploy without one; an overlay with only `extras` or `files`
++  deploys the selected target as it is.
++- `files` are copied into `src/` after the dependency files are generated, are
++  uploaded with the rest of the app source, and are removed again when
++  `deploy.py` exits.
++
++**Rules.**
++
++- `env` and `secret_env` cannot name a variable the target already sets
++  (`AP_LAKEBASE_ENDPOINT`, `AP_ARTIFACT_VOLUME_PATH`, `OMNIGENT_FEATURES`, and
++  `OTEL_TRACES_SAMPLER` on `prod`); the feature list stays with `--features`.
++  A name cannot be in both.
++- A variable whose name ends in `_SECRET`, `_TOKEN`, `_PASSWORD` or `_API_KEY`
++  is refused under `env`, because a plain value is readable in the bundle and
++  in the app's settings; put it under `secret_env`.
++- A file's name in `src/` is a plain file name. It cannot be one `deploy.py`
++  writes itself (`pyproject.toml`, `uv.lock`, the wheels, the web UI archive),
++  cannot already exist in `src/`, and cannot match a `.gitignore` pattern,
++  because `bundle deploy` does not upload gitignored files. A source over the
++  10 MB per-file cap is refused.
++- Values are never printed: the deploy log names the variables only.
++  `overlay.generated.yml` holds the plain `env` values, so it is gitignored and
++  not uploaded.
++
++`.gitignore` covers `deploy/databricks/*.local.yml`, so an overlay kept there,
++and config files named like `server-config.local.yml` beside it, do not show
++up as uncommitted changes. An `env` value is written into the bundle as it
++is, so the Databricks CLI reads `${...}` inside it as a bundle substitution.
++
+ ## Server-managed Databricks Sandboxes
+ 
+ The `databricks` sandbox provider runs managed sessions (`host_type: "managed"`, or
+@@ -395,6 +474,8 @@ reconnects. Otherwise, or to remove it sooner, a workspace admin deletes it by i
+ | `src/app.py` | The app process. SQLAlchemy `do_connect` token hook + Alembic-on-boot + uvicorn. |
+ | `src/app.yaml` | App startup config — command + env-var wiring. |
+ | `src/pyproject.toml` / `src/uv.lock` | Regenerated per deploy; not committed (they pin the per-deploy wheel version). |
++| `*.local.yml` | Yours: a [deployment overlay](#deployment-overlay) and the files it names. Gitignored. |
++| `overlay.generated.yml` | Written by `deploy.py --overlay` from the overlay. Gitignored. |
+ 
+ ## See also
+ 
+diff --git a/deploy/databricks/databricks.yml b/deploy/databricks/databricks.yml
+index 64b06c472389add4c3b205902ddb8761c6b46777..382c2cd58c3202fc64b6bcebf59076293500d526 100644
+--- a/deploy/databricks/databricks.yml
++++ b/deploy/databricks/databricks.yml
+@@ -7,6 +7,13 @@
+ bundle:
+   name: omnigent
+ 
++# `deploy.py --overlay` writes overlay.generated.yml next to this file: a copy
++# of the selected target plus one deployment's own workspace host, env vars
++# and secret resources (README.md, "Deployment overlay"). The pattern is a
++# glob so the bundle still loads when no such file exists.
++include:
++  - "*.generated.yml"
++
+ variables:
+   app_name:
+     description: "Databricks App name (e.g. omnigent)."
+@@ -95,7 +102,8 @@ resources:
+ # Reusable workspace block so a target and its no-OTel variant share one
+ # host/root_path definition (host must be literal — DAB reads it before
+ # resolving vars — so it can't be a ${var.}). To deploy to a different
+-# workspace, edit this one anchor.
++# workspace, edit this one anchor, or leave it and set `host` in a
++# `deploy.py --overlay` file.
+ .prod_workspace: &prod_workspace
+   host: https://example.databricks.com   # ← your workspace URL
+   # Isolate state per app so one bundle can deploy multiple apps.
+diff --git a/deploy/databricks/deploy.py b/deploy/databricks/deploy.py
+index 54d597419a3f941b04621b1186d8f7c062db488e..0102142b5c63b454564d8d7ae9e948c59c457ab5 100644
+--- a/deploy/databricks/deploy.py
++++ b/deploy/databricks/deploy.py
+@@ -25,6 +25,8 @@ including first-time infrastructure setup.
+ from __future__ import annotations
+ 
+ import argparse
++import atexit
++import copy
+ import os
+ import re
+ import shutil
+@@ -32,7 +34,7 @@ import subprocess
+ import sys
+ import time
+ from collections.abc import Iterable
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+@@ -79,6 +81,24 @@ _BUNDLE_RESOURCE_KEY = "omnigent"
+ 
+ _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
+ 
++# Extras every app install gets; an overlay's `extras` are added to these.
++_APP_EXTRAS = ("databricks", "tracing")
++
++# The bundle fragment deploy.py writes for --overlay. databricks.yml includes
++# it by glob, so the name must keep matching `*.generated.yml` there.
++_OVERLAY_BUNDLE_NAME = "overlay.generated.yml"
++_OVERLAY_TARGET_SUFFIX = "-overlay"
++_OVERLAY_KEYS = ("host", "extras", "env", "secret_env", "files")
++_OVERLAY_SECRET_KEYS = ("scope", "key", "resource")
++# Names deploy.py writes into src/ itself, which an overlay file may not claim.
++_OVERLAY_RESERVED_FILES = ("pyproject.toml", "uv.lock", "requirements.txt", _WEB_UI_ARCHIVE_NAME)
++_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
++_EXTRA_NAME_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?")
++_RESOURCE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
++_HOST_RE = re.compile(r"https://[A-Za-z0-9.-]+(:\d+)?")
++# A plain `env` value ends up readable in the bundle and the app's settings.
++_SECRET_ENV_NAME_RE = re.compile(r".*_(SECRET|TOKEN|PASSWORD|API_KEY)", re.IGNORECASE)
++
+ 
+ def _log(msg: str) -> None:
+     print(f"[deploy] {msg}", flush=True)
+@@ -560,6 +580,7 @@ def build_uv_pyproject(
+     oversize_wheels: list[Path],
+     deploy_version: str,
+     extension_wheels: list[Path] = (),
++    extras: Iterable[str] = (),
+ ) -> str:
+     """Compose the app-level ``pyproject.toml`` for Databricks Apps.
+ 
+@@ -572,11 +593,14 @@ def build_uv_pyproject(
+     :param extension_wheels: Omnigent extension wheels (``omnigent.extensions``
+         entry points) installed alongside the server, e.g.
+         ``src/omnigent_hello_extension-0.1.0-py3-none-any.whl``.
++    :param extras: Extras of ``omnigent`` to install besides the standard
++        ones, e.g. ``["kms"]`` from a deployment overlay.
+     :returns: Complete TOML text for ``src/pyproject.toml``.
+     """
+     source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels, extension_wheels)
++    all_extras = ",".join(dict.fromkeys([*_APP_EXTRAS, *extras]))
+     dependencies = [
+-        f'"omnigent[databricks,tracing]=={deploy_version}"',
++        f'"omnigent[{all_extras}]=={deploy_version}"',
+         f'"omnigent-client=={deploy_version}"',
+         f'"omnigent-ui-sdk=={deploy_version}"',
+     ]
+@@ -638,6 +662,7 @@ def write_uv_dependency_files(
+     oversize_wheels: list[Path],
+     deploy_version: str,
+     extension_wheels: list[Path] = (),
++    extras: Iterable[str] = (),
+ ) -> None:
+     """Write the uv dependency files Databricks Apps should install.
+ 
+@@ -649,6 +674,7 @@ def write_uv_dependency_files(
+     :param deploy_version: Version stamped into the wheels, e.g.
+         ``"0.1.0.post123"``.
+     :param extension_wheels: Extension wheels already copied into ``src``.
++    :param extras: Extra ``omnigent`` extras to install, e.g. ``["kms"]``.
+     """
+     requirements = src / "requirements.txt"
+     if requirements.exists():
+@@ -661,12 +687,326 @@ def write_uv_dependency_files(
+         oversize_wheels,
+         deploy_version,
+         extension_wheels,
++        extras,
+     )
+     (src / "pyproject.toml").write_text(pyproject)
+     _log("src/pyproject.toml:\n" + pyproject)
+     run_uv_lock(src)
+ 
+ 
++@dataclass(frozen=True)
++class _SecretEnv:
++    """One secret-backed env var: an app ``secret`` resource and its env entry."""
++
++    scope: str
++    key: str
++    resource: str
++
++
++@dataclass(frozen=True)
++class _Overlay:
++    """A deployment's own settings, read from the ``--overlay`` file.
++
++    :param host: Workspace URL for the target, e.g. ``"https://<workspace-host>"``.
++    :param extras: Extra ``omnigent`` extras for the app install, e.g. ``("kms",)``.
++    :param env: Plain env vars for the app, name to value.
++    :param secret_env: Env vars whose value comes from a secret scope.
++    :param files: Files copied into the app source, name in ``src/`` to source path.
++    """
++
++    host: str | None = None
++    extras: tuple[str, ...] = ()
++    env: dict[str, str] = field(default_factory=dict)
++    secret_env: dict[str, _SecretEnv] = field(default_factory=dict)
++    files: dict[str, Path] = field(default_factory=dict)
++
++    @property
++    def changes_bundle(self) -> bool:
++        """Whether the overlay needs its own bundle target (host or app env)."""
++        return bool(self.host or self.env or self.secret_env)
++
++
++def _known_extras() -> set[str]:
++    """Names of the extras the ``omnigent`` package declares."""
++    import tomllib
++
++    project = tomllib.loads((_repo_root() / "pyproject.toml").read_text())["project"]
++    return set(project.get("optional-dependencies", {}))
++
++
++def _is_gitignored(path: Path) -> bool:
++    """Whether git ignores ``path``; ``bundle deploy`` does not upload such files."""
++    try:
++        result = subprocess.run(
++            ["git", "check-ignore", "-q", "--", str(path)],
++            cwd=_repo_root(),
++            capture_output=True,
++        )
++    except OSError:
++        return False
++    return result.returncode == 0
++
++
++def _overlay_section(data: dict[str, Any], key: str, kind: type) -> Any:
++    value = data.get(key)
++    if value is None:
++        return kind()
++    if not isinstance(value, kind):
++        expected = "a mapping" if kind is dict else "a list"
++        raise ValueError(f"'{key}' must be {expected}")
++    return value
++
++
++def _overlay_string(value: Any, what: str) -> str:
++    """A non-empty string, or an error that names ``what`` and never the value."""
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{what} must be a non-empty string (quote numbers, on/off and yes/no)")
++    return value
++
++
++def _parse_overlay(data: Any, base_dir: Path) -> _Overlay:
++    """Validate overlay content; any key or shape it does not know is an error.
++
++    :param data: Parsed YAML of the overlay file.
++    :param base_dir: Directory relative ``files`` sources resolve against.
++    :raises ValueError: With a message that never contains an env value.
++    """
++    if not isinstance(data, dict):
++        raise ValueError("the file must be a mapping")
++    unknown = sorted(str(key) for key in data if key not in _OVERLAY_KEYS)
++    if unknown:
++        raise ValueError(f"unknown key(s) {unknown}; allowed: {list(_OVERLAY_KEYS)}")
++
++    host = data.get("host")
++    if host is not None:
++        host = _overlay_string(host, "'host'").rstrip("/")
++        if not _HOST_RE.fullmatch(host):
++            raise ValueError("'host' must be a workspace URL like https://<workspace-host>")
++
++    extras: list[str] = []
++    known_extras = _known_extras()
++    for extra in _overlay_section(data, "extras", list):
++        if not isinstance(extra, str) or not _EXTRA_NAME_RE.fullmatch(extra):
++            raise ValueError(f"extras: {extra!r} is not an extra name")
++        if extra not in known_extras:
++            raise ValueError(f"extras: omnigent has no extra named {extra!r}")
++        if extra in extras:
++            raise ValueError(f"extras: {extra!r} is listed twice")
++        extras.append(extra)
++
++    env: dict[str, str] = {}
++    for name, value in _overlay_section(data, "env", dict).items():
++        if not isinstance(name, str) or not _ENV_NAME_RE.fullmatch(name):
++            raise ValueError(f"env: {name!r} is not an environment variable name")
++        if _SECRET_ENV_NAME_RE.fullmatch(name):
++            raise ValueError(
++                f"env: {name} looks like a secret, and a plain value would be readable "
++                "in the bundle and the app's settings; put it under secret_env"
++            )
++        env[name] = _overlay_string(value, f"env: the value of {name}")
++
++    secret_env: dict[str, _SecretEnv] = {}
++    for name, spec in _overlay_section(data, "secret_env", dict).items():
++        if not isinstance(name, str) or not _ENV_NAME_RE.fullmatch(name):
++            raise ValueError(f"secret_env: {name!r} is not an environment variable name")
++        if name in env:
++            raise ValueError(f"{name} is in both env and secret_env")
++        if not isinstance(spec, dict):
++            raise ValueError(f"secret_env: {name} must be a mapping with scope and key")
++        unknown = sorted(str(key) for key in spec if key not in _OVERLAY_SECRET_KEYS)
++        if unknown:
++            raise ValueError(
++                f"secret_env: {name} has unknown key(s) {unknown}; "
++                f"allowed: {list(_OVERLAY_SECRET_KEYS)}"
++            )
++        resource = _overlay_string(
++            spec.get("resource", name.lower()), f"secret_env: {name}.resource"
++        )
++        if not _RESOURCE_NAME_RE.fullmatch(resource):
++            raise ValueError(f"secret_env: {name}.resource may hold letters, digits, - and _")
++        if resource in {secret.resource for secret in secret_env.values()}:
++            raise ValueError(f"secret_env: resource name {resource!r} is used twice")
++        secret_env[name] = _SecretEnv(
++            scope=_overlay_string(spec.get("scope"), f"secret_env: {name}.scope"),
++            key=_overlay_string(spec.get("key"), f"secret_env: {name}.key"),
++            resource=resource,
++        )
++
++    files: dict[str, Path] = {}
++    for dest, source in _overlay_section(data, "files", dict).items():
++        if not isinstance(dest, str) or not dest or Path(dest).name != dest or dest[0] == ".":
++            raise ValueError(f"files: {dest!r} must be a plain file name for src/")
++        if dest in _OVERLAY_RESERVED_FILES or dest.endswith(".whl") or dest == _WEB_UI_DIR_NAME:
++            raise ValueError(f"files: src/{dest} is written by deploy.py itself")
++        source_path = Path(_overlay_string(source, f"files: the source of {dest}")).expanduser()
++        if not source_path.is_absolute():
++            source_path = base_dir / source_path
++        if not source_path.is_file():
++            raise ValueError(f"files: the source of {dest} is not a file: {source_path}")
++        if source_path.stat().st_size > _WORKSPACE_FILE_LIMIT_BYTES:
++            raise ValueError(f"files: the source of {dest} is over the 10 MB per-file cap")
++        if _is_gitignored(_src_dir() / dest):
++            raise ValueError(
++                f"files: src/{dest} matches a .gitignore pattern, so `bundle deploy` "
++                "would not upload it; choose another name"
++            )
++        files[dest] = source_path.resolve()
++
++    return _Overlay(host=host, extras=tuple(extras), env=env, secret_env=secret_env, files=files)
++
++
++def load_overlay(path: Path) -> _Overlay:
++    """Read and validate the ``--overlay`` file.
++
++    :param path: Overlay YAML, e.g. ``deploy/databricks/deploy.local.yml``.
++    :raises SystemExit: If the file is unreadable or holds anything unexpected.
++    """
++    try:
++        import yaml
++    except ImportError:
++        raise SystemExit("--overlay needs PyYAML; run deploy.py from the repo's venv") from None
++    try:
++        data = yaml.safe_load(path.read_text())
++        return _parse_overlay({} if data is None else data, path.resolve().parent)
++    except OSError as exc:
++        raise SystemExit(f"--overlay {path}: {exc.strerror or exc}") from None
++    except yaml.YAMLError as exc:
++        # The parser's message can quote the offending line; keep it to the position.
++        mark = getattr(exc, "problem_mark", None)
++        where = f" at line {mark.line + 1}" if mark else ""
++        raise SystemExit(f"--overlay {path}: not valid YAML{where}") from None
++    except ValueError as exc:
++        raise SystemExit(f"--overlay {path}: {exc}") from None
++
++
++def build_overlay_bundle(
++    overlay: _Overlay, bundle: dict[str, Any], target: str
++) -> tuple[str, dict[str, Any]]:
++    """Derive a bundle target that is ``target`` plus the overlay.
++
++    The new target is a copy of ``target`` with the overlay's host, the
++    target's app env followed by the overlay's entries, and one app ``secret``
++    resource per secret-backed entry. It shares the base target's
++    ``root_path``, and so its deployment state.
++
++    :param overlay: The validated overlay.
++    :param bundle: Parsed ``databricks.yml``.
++    :param target: The target to extend, e.g. ``"prod-no-otel"``.
++    :returns: The new target's name and the bundle fragment that defines it.
++    :raises SystemExit: If the overlay collides with what the bundle already sets.
++    """
++    targets = bundle.get("targets") or {}
++    if target not in targets:
++        raise SystemExit(f"--overlay: target {target!r} is not defined in databricks.yml")
++    name = f"{target}{_OVERLAY_TARGET_SUFFIX}"
++    if name in targets:
++        raise SystemExit(f"--overlay: databricks.yml already defines a target named {name!r}")
++    block = copy.deepcopy(targets[target]) or {}
++
++    variables = block.setdefault("variables", {})
++    base_env = variables.get("app_env")
++    if base_env is None:
++        base_env = copy.deepcopy(bundle["variables"]["app_env"]["default"])
++    taken = {entry["name"] for entry in base_env}
++    clashes = sorted(taken & (overlay.env.keys() | overlay.secret_env.keys()))
++    if clashes:
++        raise SystemExit(
++            f"--overlay: {', '.join(clashes)} is already set by the bundle for target "
++            f"{target!r} (OMNIGENT_FEATURES comes from --features)"
++        )
++    variables["app_env"] = [
++        *base_env,
++        *({"name": env_name, "value": value} for env_name, value in overlay.env.items()),
++        *(
++            {"name": env_name, "value_from": secret.resource}
++            for env_name, secret in overlay.secret_env.items()
++        ),
++    ]
++
++    if overlay.host:
++        block.setdefault("workspace", {})["host"] = overlay.host
++
++    if overlay.secret_env:
++        app = bundle["resources"]["apps"][_BUNDLE_RESOURCE_KEY]
++        target_app = (
++            block.setdefault("resources", {})
++            .setdefault("apps", {})
++            .setdefault(_BUNDLE_RESOURCE_KEY, {})
++        )
++        target_resources = target_app.setdefault("resources", [])
++        existing = {entry["name"] for entry in [*(app.get("resources") or []), *target_resources]}
++        for secret in overlay.secret_env.values():
++            if secret.resource in existing:
++                raise SystemExit(
++                    f"--overlay: the app already has a resource named {secret.resource!r}"
++                )
++            target_resources.append(
++                {
++                    "name": secret.resource,
++                    "secret": {"scope": secret.scope, "key": secret.key, "permission": "READ"},
++                }
++            )
++    return name, {"targets": {name: block}}
++
++
++def write_overlay_bundle(overlay: _Overlay | None, target: str) -> str:
++    """Write (or clear) the overlay's bundle fragment and return the target to deploy.
++
++    A fragment left by an earlier deploy is removed first, so a deploy without
++    an overlay, or with one that only adds extras or files, uses ``target`` as is.
++    """
++    fragment_path = _deploy_dir() / _OVERLAY_BUNDLE_NAME
++    fragment_path.unlink(missing_ok=True)
++    if overlay is None or not overlay.changes_bundle:
++        return target
++
++    import yaml
++
++    class _PlainDumper(yaml.SafeDumper):
++        # The copied target shares nodes with the bundle's anchors; spell them out.
++        def ignore_aliases(self, _data: Any) -> bool:
++            return True
++
++    bundle = yaml.safe_load((_deploy_dir() / "databricks.yml").read_text())
++    name, fragment = build_overlay_bundle(overlay, bundle, target)
++    fragment_path.write_text(
++        "# Generated by deploy.py --overlay on every deploy. Do not edit or commit.\n"
++        + yaml.dump(fragment, Dumper=_PlainDumper, sort_keys=False)
++    )
++    # Names only: env values stay out of the deploy log.
++    _log(
++        f"overlay: target {name!r} = {target!r}"
++        + (" + host" if overlay.host else "")
++        + (f" + env {sorted(overlay.env)}" if overlay.env else "")
++        + (f" + secret env {sorted(overlay.secret_env)}" if overlay.secret_env else "")
++    )
++    return name
++
++
++def copy_overlay_files(overlay: _Overlay, src: Path, copied: list[Path]) -> None:
++    """Copy the overlay's files into the app source, recording each in ``copied``.
++
++    :param copied: Receives every file written, so the caller can remove them
++        even when a later copy fails.
++    :raises SystemExit: If a file of that name is already in ``src``.
++    """
++    for dest, source in overlay.files.items():
++        destination = src / dest
++        if destination.exists():
++            raise SystemExit(
++                f"--overlay: src/{dest} already exists; remove it or choose another name"
++            )
++        shutil.copy2(source, destination)
++        copied.append(destination)
++        _log(f"overlay: copy {dest} → {destination.relative_to(_repo_root())}")
++
++
++def remove_overlay_files(copied: list[Path]) -> None:
++    """Remove the files :func:`copy_overlay_files` put into the app source."""
++    for path in copied:
++        path.unlink(missing_ok=True)
++
++
+ def _smoke_check(wc: WorkspaceClient, app_url: str) -> None:
+     """Poll /health on the running app and fail if it never returns 200.
+ 
+@@ -885,6 +1225,18 @@ def _parse_args() -> argparse.Namespace:
+             "The server discovers it through its omnigent.extensions entry point."
+         ),
+     )
++    parser.add_argument(
++        "--overlay",
++        default=None,
++        type=Path,
++        metavar="FILE",
++        help=(
++            "Untracked YAML with this deployment's own settings: workspace host, "
++            "extra omnigent extras, app env vars, secret-backed env vars and files "
++            "for the app source, e.g. deploy/databricks/deploy.local.yml. See "
++            "'Deployment overlay' in README.md."
++        ),
++    )
+     parser.add_argument(
+         "--app-url",
+         default=None,
+@@ -1143,6 +1495,9 @@ def _ensure_app_sp_uc_traversal(
+ def main() -> int:
+     args = _parse_args()
+     _clear_env_vars()
++    # Read the overlay before the build so a mistake in it fails in seconds.
++    overlay = load_overlay(args.overlay) if args.overlay else None
++    args.target = write_overlay_bundle(overlay, args.target)
+     _assert_clean_tree(skip=args.allow_dirty)
+ 
+     base_version = _read_base_version()
+@@ -1220,8 +1575,16 @@ def main() -> int:
+         classified.oversize,
+         deploy_version,
+         [src / wheel.name for wheel in extension_wheels],
++        overlay.extras if overlay else (),
+     )
+ 
++    # 2a) Add the overlay's files for the duration of the deploy only, so the
++    # app source never keeps a copy that a later deploy no longer asks for.
++    if overlay and overlay.files:
++        overlay_files: list[Path] = []
++        atexit.register(remove_overlay_files, overlay_files)
++        copy_overlay_files(overlay, src, overlay_files)
++
+     # 3) Guard every uploaded source file before touching the workspace.
+     _assert_app_files_under_limit()
+ 
+diff --git a/docs/databricks.md b/docs/databricks.md
+index d234a1a3beb85d48a13a787ec544202db04c68b4..6037204182930dacca4c028375a82bb509133ebc 100644
+--- a/docs/databricks.md
++++ b/docs/databricks.md
+@@ -197,7 +197,8 @@ git clone https://github.com/omnigent-ai/omnigent
+ cd omnigent
+ uv sync --extra databricks
+ 
+-# Set targets.prod.workspace.host in deploy/databricks/databricks.yml, then run
++# Set targets.prod.workspace.host in deploy/databricks/databricks.yml (or `host`
++# in a `--overlay` file, which leaves the tracked bundle untouched), then run
+ # the deploy orchestrator — it builds the wheels and runs `databricks bundle
+ # deploy` + `bundle run` for you:
+ #   uv run python deploy/databricks/deploy.py --app-name omnigent --profile <profile> ...
+@@ -210,6 +211,13 @@ creation, service principal permissions) lives in
+ that as canonical for the deploy details. The rest of this page covers
+ the integration knobs you set on top of that deploy.
+ 
++Values that belong to one deployment (the workspace host, extra `omnigent`
++extras such as `kms`, app env vars, secret-backed env vars and config files
++for the app source) go in one untracked file passed with
++`deploy.py --overlay <file>`, so no tracked file has to be edited. The format
++is in the README's
++[Deployment overlay](../deploy/databricks/README.md#deployment-overlay) section.
++
+ ### What you get on Databricks vs DIY
+ 
+ Self-hosting the omnigent server (e.g., on a VM or in a container)
+diff --git a/tests/deploy/test_databricks_deploy_overlay.py b/tests/deploy/test_databricks_deploy_overlay.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0ca1ae74fab8def174bef0abfdff00f50438e73
+--- /dev/null
++++ b/tests/deploy/test_databricks_deploy_overlay.py
+@@ -0,0 +1,497 @@
++"""``deploy.py --overlay``: one untracked file holds a deployment's own settings.
++
++A Databricks Apps deployment needs values the tracked bundle cannot hold: the
++workspace host, extra ``omnigent`` extras, app env vars, secret-backed env vars
++and config files for the app source. The overlay supplies them, so these tests
++pin down the three things that must hold without a live workspace:
++
++1. the file is validated strictly, and no message or log line carries a value;
++2. the generated bundle target is the selected target plus the overlay, built
++   from the real ``databricks.yml`` so a change there cannot silently drop the
++   base env or resources;
++3. files copied into the app source are removed again.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++import importlib.util
++import subprocess
++import sys
++from pathlib import Path
++from types import ModuleType, SimpleNamespace
++from typing import Any
++
++import pytest
++import yaml
++
++_ROOT = Path(__file__).resolve().parents[2]
++_DEPLOY_DIR = _ROOT / "deploy" / "databricks"
++_DEPLOY_PY = _DEPLOY_DIR / "deploy.py"
++_BUNDLE_YML = _DEPLOY_DIR / "databricks.yml"
++
++_REQUIRED_ARGS = [
++    "--app-name",
++    "omnigent",
++    "--lakebase-branch",
++    "projects/omnigent/branches/production",
++    "--lakebase-database",
++    "projects/omnigent/branches/production/databases/databricks-postgres",
++    "--volume-name",
++    "main.omnigent.artifacts",
++]
++
++# A value that must never reach an error message or the deploy log.
++_PRIVATE_VALUE = "value-that-must-not-be-printed"
++
++
++@pytest.fixture(scope="module")
++def deploy_mod() -> ModuleType:
++    """Load ``deploy.py`` by path — ``deploy/`` is not an installed package."""
++    spec = importlib.util.spec_from_file_location("_databricks_deploy_overlay", _DEPLOY_PY)
++    assert spec and spec.loader
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++@pytest.fixture(scope="module")
++def bundle() -> dict[str, Any]:
++    return yaml.safe_load(_BUNDLE_YML.read_text())
++
++
++@pytest.fixture
++def config_file(tmp_path: Path) -> Path:
++    path = tmp_path / "server-config.local.yml"
++    path.write_text("routing:\n  provider: none\n")
++    return path
++
++
++def _full_overlay(config_file: Path) -> dict[str, Any]:
++    return {
++        "host": "https://workspace.example.com/",
++        "extras": ["kms"],
++        "env": {"OMNIGENT_CONFIG": "server-config.yml", "OMNIGENT_SHARING_MODE": "read_only"},
++        "secret_env": {
++            "OMNIGENT_DATABRICKS_CLIENT_SECRET": {
++                "scope": "omnigent",
++                "key": "oauth-client-secret",
++                "resource": "oauth_secret",
++            }
++        },
++        "files": {"server-config.yml": config_file.name},
++    }
++
++
++def test_a_full_overlay_parses(deploy_mod: ModuleType, config_file: Path) -> None:
++    overlay = deploy_mod._parse_overlay(_full_overlay(config_file), config_file.parent)
++
++    assert overlay.host == "https://workspace.example.com"
++    assert overlay.extras == ("kms",)
++    assert overlay.env == {
++        "OMNIGENT_CONFIG": "server-config.yml",
++        "OMNIGENT_SHARING_MODE": "read_only",
++    }
++    secret = overlay.secret_env["OMNIGENT_DATABRICKS_CLIENT_SECRET"]
++    assert (secret.scope, secret.key, secret.resource) == (
++        "omnigent",
++        "oauth-client-secret",
++        "oauth_secret",
++    )
++    # Sources resolve against the overlay file's directory.
++    assert overlay.files == {"server-config.yml": config_file.resolve()}
++    assert overlay.changes_bundle
++
++
++def test_a_secret_resource_defaults_to_the_lowercased_variable_name(
++    deploy_mod: ModuleType, tmp_path: Path
++) -> None:
++    overlay = deploy_mod._parse_overlay(
++        {"secret_env": {"CLIENT_SECRET": {"scope": "omnigent", "key": "client"}}}, tmp_path
++    )
++    assert overlay.secret_env["CLIENT_SECRET"].resource == "client_secret"
++
++
++def test_an_empty_overlay_changes_nothing(deploy_mod: ModuleType, tmp_path: Path) -> None:
++    overlay = deploy_mod._parse_overlay({}, tmp_path)
++    assert overlay == deploy_mod._Overlay()
++    assert not overlay.changes_bundle
++
++
++@pytest.mark.parametrize(
++    ("data", "message"),
++    [
++        pytest.param(["host"], "must be a mapping", id="not-a-mapping"),
++        pytest.param({"hosts": "x"}, "unknown key(s) ['hosts']", id="unknown-top-level-key"),
++        pytest.param({"env": ["A=b"]}, "'env' must be a mapping", id="env-not-a-mapping"),
++        pytest.param({"extras": "kms"}, "'extras' must be a list", id="extras-not-a-list"),
++        pytest.param({"host": "http://workspace.example.com"}, "'host' must be", id="http-host"),
++        pytest.param(
++            {"host": "https://workspace.example.com/path"}, "'host' must be", id="host-with-path"
++        ),
++        pytest.param({"extras": ["no-such-extra"]}, "no extra named", id="unknown-extra"),
++        pytest.param({"extras": ["kms", "kms"]}, "listed twice", id="repeated-extra"),
++        pytest.param({"extras": ["kms]evil"]}, "not an extra name", id="malformed-extra"),
++        pytest.param({"env": {"1BAD": "x"}}, "not an environment variable", id="bad-env-name"),
++        pytest.param({"env": {"FLAG": False}}, "non-empty string", id="unquoted-boolean"),
++        pytest.param({"env": {"FLAG": ""}}, "non-empty string", id="empty-value"),
++        pytest.param(
++            {"env": {"OMNIGENT_DATABRICKS_CLIENT_SECRET": _PRIVATE_VALUE}},
++            "put it under secret_env",
++            id="secret-as-plain-env",
++        ),
++        pytest.param(
++            {"env": {"A": "x"}, "secret_env": {"A": {"scope": "s", "key": "k"}}},
++            "both env and secret_env",
++            id="name-in-both",
++        ),
++        pytest.param(
++            {"secret_env": {"A": "scope/key"}}, "must be a mapping", id="secret-not-a-mapping"
++        ),
++        pytest.param(
++            {"secret_env": {"A": {"scope": "s", "key": "k", "value": _PRIVATE_VALUE}}},
++            "unknown key(s) ['value']",
++            id="unknown-secret-key",
++        ),
++        pytest.param({"secret_env": {"A": {"scope": "s"}}}, "A.key", id="secret-without-key"),
++        pytest.param(
++            {
++                "secret_env": {
++                    "A": {"scope": "s", "key": "k", "resource": "shared"},
++                    "B": {"scope": "s", "key": "k2", "resource": "shared"},
++                }
++            },
++            "used twice",
++            id="repeated-resource-name",
++        ),
++        pytest.param({"files": {"sub/config.yml": "x"}}, "plain file name", id="nested-dest"),
++        pytest.param({"files": {"../config.yml": "x"}}, "plain file name", id="escaping-dest"),
++        pytest.param({"files": {".env": "x"}}, "plain file name", id="hidden-dest"),
++        pytest.param({"files": {"uv.lock": "x"}}, "written by deploy.py", id="generated-dest"),
++        pytest.param({"files": {"extra.whl": "x"}}, "written by deploy.py", id="wheel-dest"),
++        pytest.param({"files": {"config.yml": "missing.yml"}}, "is not a file", id="no-source"),
++    ],
++)
++def test_anything_unexpected_in_the_overlay_fails(
++    deploy_mod: ModuleType, tmp_path: Path, data: Any, message: str
++) -> None:
++    with pytest.raises(ValueError) as excinfo:
++        deploy_mod._parse_overlay(data, tmp_path)
++    assert message in str(excinfo.value)
++    assert _PRIVATE_VALUE not in str(excinfo.value)
++
++
++def test_a_gitignored_destination_is_refused(
++    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch, config_file: Path
++) -> None:
++    """``bundle deploy`` skips gitignored files, so the copy would never upload."""
++    monkeypatch.setattr(deploy_mod, "_is_gitignored", lambda path: path.name == "ignored.yml")
++
++    with pytest.raises(ValueError, match="would not upload it"):
++        deploy_mod._parse_overlay({"files": {"ignored.yml": str(config_file)}}, config_file.parent)
++    deploy_mod._parse_overlay({"files": {"kept.yml": str(config_file)}}, config_file.parent)
++
++
++def test_the_repo_ignores_overlay_files_but_not_their_copies(deploy_mod: ModuleType) -> None:
++    assert deploy_mod._is_gitignored(_DEPLOY_DIR / "deploy.local.yml")
++    assert deploy_mod._is_gitignored(_DEPLOY_DIR / deploy_mod._OVERLAY_BUNDLE_NAME)
++    assert not deploy_mod._is_gitignored(_DEPLOY_DIR / "src" / "server-config.yml")
++
++
++def test_load_overlay_names_the_file_and_never_quotes_it(
++    deploy_mod: ModuleType, tmp_path: Path
++) -> None:
++    path = tmp_path / "deploy.local.yml"
++
++    with pytest.raises(SystemExit, match=r"deploy\.local\.yml"):
++        deploy_mod.load_overlay(path)
++
++    path.write_text(f"env:\n  A: [{_PRIVATE_VALUE}\n")
++    with pytest.raises(SystemExit) as excinfo:
++        deploy_mod.load_overlay(path)
++    assert "not valid YAML" in str(excinfo.value)
++    assert _PRIVATE_VALUE not in str(excinfo.value)
++
++    path.write_text("extras: [kms]\nunknown: 1\n")
++    with pytest.raises(SystemExit, match=r"deploy\.local\.yml: unknown key"):
++        deploy_mod.load_overlay(path)
++
++    path.write_text("extras: [kms]\n")
++    assert deploy_mod.load_overlay(path).extras == ("kms",)
++
++
++@pytest.mark.parametrize("target", ["prod", "prod-no-otel"])
++def test_the_overlay_target_is_the_base_target_plus_the_overlay(
++    deploy_mod: ModuleType, bundle: dict[str, Any], config_file: Path, target: str
++) -> None:
++    overlay = deploy_mod._parse_overlay(_full_overlay(config_file), config_file.parent)
++    before = yaml.safe_dump(bundle)
++
++    name, fragment = deploy_mod.build_overlay_bundle(overlay, bundle, target)
++
++    assert name == f"{target}-overlay"
++    assert list(fragment) == ["targets"]
++    block = fragment["targets"][name]
++    base = bundle["targets"][target]
++    base_env = (base.get("variables") or {}).get("app_env") or bundle["variables"]["app_env"][
++        "default"
++    ]
++    # The whole base env first, then the overlay's entries in file order.
++    assert block["variables"]["app_env"] == [
++        *base_env,
++        {"name": "OMNIGENT_CONFIG", "value": "server-config.yml"},
++        {"name": "OMNIGENT_SHARING_MODE", "value": "read_only"},
++        {"name": "OMNIGENT_DATABRICKS_CLIENT_SECRET", "value_from": "oauth_secret"},
++    ]
++    # Everything else the base target sets is carried over unchanged.
++    for variable, value in (base.get("variables") or {}).items():
++        if variable != "app_env":
++            assert block["variables"][variable] == value
++    assert block["mode"] == base["mode"]
++    assert block["workspace"] == {**base["workspace"], "host": "https://workspace.example.com"}
++    target_app = block["resources"]["apps"]["omnigent"]
++    base_app = ((base.get("resources") or {}).get("apps") or {}).get("omnigent") or {}
++    assert target_app.get("telemetry_export_destinations") == base_app.get(
++        "telemetry_export_destinations"
++    )
++    assert target_app["resources"] == [
++        {
++            "name": "oauth_secret",
++            "secret": {"scope": "omnigent", "key": "oauth-client-secret", "permission": "READ"},
++        }
++    ]
++    # The parsed bundle is only read.
++    assert yaml.safe_dump(bundle) == before
++
++
++@pytest.mark.parametrize(
++    ("data", "target", "message"),
++    [
++        pytest.param(
++            {"env": {"OMNIGENT_FEATURES": "canvas"}}, "prod", "--features", id="features-by-env"
++        ),
++        pytest.param(
++            {"secret_env": {"AP_LAKEBASE_ENDPOINT": {"scope": "s", "key": "k"}}},
++            "prod",
++            "already set by the bundle",
++            id="bundle-env-as-secret",
++        ),
++        pytest.param(
++            {"secret_env": {"A": {"scope": "s", "key": "k", "resource": "postgres"}}},
++            "prod",
++            "already has a resource named 'postgres'",
++            id="resource-name-taken",
++        ),
++        pytest.param({"env": {"A": "x"}}, "staging", "not defined", id="unknown-target"),
++    ],
++)
++def test_an_overlay_cannot_replace_what_the_bundle_sets(
++    deploy_mod: ModuleType,
++    bundle: dict[str, Any],
++    tmp_path: Path,
++    data: dict[str, Any],
++    target: str,
++    message: str,
++) -> None:
++    overlay = deploy_mod._parse_overlay(data, tmp_path)
++    with pytest.raises(SystemExit) as excinfo:
++        deploy_mod.build_overlay_bundle(overlay, bundle, target)
++    assert message in str(excinfo.value)
++
++
++def test_the_sampler_can_be_set_only_where_the_target_leaves_it_unset(
++    deploy_mod: ModuleType, bundle: dict[str, Any], tmp_path: Path
++) -> None:
++    overlay = deploy_mod._parse_overlay({"env": {"OTEL_TRACES_SAMPLER": "always_off"}}, tmp_path)
++
++    with pytest.raises(SystemExit, match="OTEL_TRACES_SAMPLER"):
++        deploy_mod.build_overlay_bundle(overlay, bundle, "prod")
++    deploy_mod.build_overlay_bundle(overlay, bundle, "prod-no-otel")
++
++
++def test_the_bundle_includes_the_generated_fragment_by_glob(
++    deploy_mod: ModuleType, bundle: dict[str, Any]
++) -> None:
++    """A glob may match nothing; a plain name would fail every deploy without an overlay."""
++    patterns = bundle["include"]
++    assert any(fnmatch.fnmatch(deploy_mod._OVERLAY_BUNDLE_NAME, pattern) for pattern in patterns)
++    assert all(any(char in pattern for char in "*?[") for pattern in patterns)
++
++
++def test_the_fragment_is_written_logged_by_name_and_cleared(
++    deploy_mod: ModuleType,
++    monkeypatch: pytest.MonkeyPatch,
++    capsys: pytest.CaptureFixture[str],
++    tmp_path: Path,
++) -> None:
++    (tmp_path / "databricks.yml").write_text(_BUNDLE_YML.read_text())
++    monkeypatch.setattr(deploy_mod, "_deploy_dir", lambda: tmp_path)
++    fragment_path = tmp_path / deploy_mod._OVERLAY_BUNDLE_NAME
++    overlay = deploy_mod._parse_overlay(
++        {
++            "host": "https://workspace.example.com",
++            "env": {"OMNIGENT_CONFIG": _PRIVATE_VALUE},
++            "secret_env": {"CLIENT_SECRET": {"scope": "omnigent", "key": "client"}},
++        },
++        tmp_path,
++    )
++
++    assert deploy_mod.write_overlay_bundle(overlay, "prod-no-otel") == "prod-no-otel-overlay"
++
++    text = fragment_path.read_text()
++    # Self-contained YAML: no anchors or aliases left over from the copied target.
++    assert "&" not in text and "*" not in text
++    written = yaml.safe_load(text)["targets"]["prod-no-otel-overlay"]
++    assert written["workspace"]["host"] == "https://workspace.example.com"
++    assert written["variables"]["app_command"] == ["python", "app.py"]
++    assert {"name": "OMNIGENT_CONFIG", "value": _PRIVATE_VALUE} in written["variables"]["app_env"]
++    log = capsys.readouterr().out
++    assert "OMNIGENT_CONFIG" in log and "CLIENT_SECRET" in log
++    assert _PRIVATE_VALUE not in log
++
++    # An overlay with nothing for the bundle, and no overlay at all, deploy the
++    # base target and leave no stale fragment behind.
++    extras_only = deploy_mod._parse_overlay({"extras": ["kms"]}, tmp_path)
++    assert deploy_mod.write_overlay_bundle(extras_only, "prod") == "prod"
++    assert not fragment_path.exists()
++    fragment_path.write_text("stale: true\n")
++    assert deploy_mod.write_overlay_bundle(None, "prod") == "prod"
++    assert not fragment_path.exists()
++
++
++def test_overlay_extras_join_the_standard_ones(deploy_mod: ModuleType, tmp_path: Path) -> None:
++    wheels = [
++        tmp_path / "omnigent-1.0-py3-none-any.whl",
++        tmp_path / "omnigent_client-1.0-py3-none-any.whl",
++        tmp_path / "omnigent_ui_sdk-1.0-py3-none-any.whl",
++    ]
++    for wheel in wheels:
++        wheel.write_bytes(b"")
++
++    standard = deploy_mod.build_uv_pyproject(wheels[0], wheels, [], "1.0")
++    with_overlay = deploy_mod.build_uv_pyproject(
++        wheels[0], wheels, [], "1.0", extras=("kms", "tracing")
++    )
++
++    assert '"omnigent[databricks,tracing]==1.0"' in standard
++    assert '"omnigent[databricks,tracing,kms]==1.0"' in with_overlay
++
++
++def test_overlay_files_are_copied_and_removed_again(
++    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_file: Path
++) -> None:
++    monkeypatch.setattr(deploy_mod, "_repo_root", lambda: tmp_path)
++    src = tmp_path / "src"
++    src.mkdir()
++    (src / "app.py").write_text("tracked")
++    overlay = deploy_mod._Overlay(files={"server-config.yml": config_file, "app.py": config_file})
++    copied: list[Path] = []
++
++    # The second file would overwrite a file the app source already has.
++    with pytest.raises(SystemExit, match=r"src/app\.py already exists"):
++        deploy_mod.copy_overlay_files(overlay, src, copied)
++
++    assert copied == [src / "server-config.yml"]
++    assert (src / "server-config.yml").read_text() == config_file.read_text()
++    deploy_mod.remove_overlay_files(copied)
++    assert not (src / "server-config.yml").exists()
++    assert (src / "app.py").read_text() == "tracked"
++
++
++def test_the_overlay_option_takes_a_path(
++    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(sys, "argv", ["deploy.py", *_REQUIRED_ARGS])
++    assert deploy_mod._parse_args().overlay is None
++
++    monkeypatch.setattr(sys, "argv", ["deploy.py", *_REQUIRED_ARGS, "--overlay", "x.local.yml"])
++    assert deploy_mod._parse_args().overlay == Path("x.local.yml")
++
++
++def test_a_deploy_carries_the_whole_overlay(
++    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_file: Path
++) -> None:
++    """``main`` with the workspace, the build and the CLI replaced by fakes."""
++    repo = tmp_path / "repo"
++    deploy_dir = repo / "deploy" / "databricks"
++    src = deploy_dir / "src"
++    src.mkdir(parents=True)
++    (deploy_dir / "databricks.yml").write_text(_BUNDLE_YML.read_text())
++    (repo / "dist").mkdir()
++    for prefix in ("omnigent", "omnigent_client", "omnigent_ui_sdk"):
++        (repo / "dist" / f"{prefix}-1.0-py3-none-any.whl").write_bytes(b"wheel")
++    overlay_path = tmp_path / "deploy.local.yml"
++    overlay_path.write_text(
++        yaml.safe_dump(
++            {
++                "host": "https://workspace.example.com",
++                "extras": ["kms"],
++                "env": {"OMNIGENT_CONFIG": "server-config.yml"},
++                "files": {"server-config.yml": str(config_file)},
++            }
++        )
++    )
++
++    app = SimpleNamespace(url="https://app.example.com", service_principal_client_id="sp")
++    fake_sdk = ModuleType("databricks.sdk")
++    fake_sdk.WorkspaceClient = lambda **_kwargs: SimpleNamespace(  # type: ignore[attr-defined]
++        apps=SimpleNamespace(get=lambda name: app)
++    )
++    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
++    for name, replacement in {
++        "_repo_root": lambda: repo,
++        "_deploy_dir": lambda: deploy_dir,
++        "_src_dir": lambda: src,
++        "_is_gitignored": lambda path: False,
++        "_known_extras": lambda: {"kms"},
++        "_clear_env_vars": lambda: None,
++        "_read_base_version": lambda: "1.0",
++        "run_uv_lock": lambda src: None,
++        "_ensure_bound": lambda args: None,
++        "_ensure_compute_size": lambda *args: None,
++        "_ensure_app_sp_uc_traversal": lambda *args: None,
++    }.items():
++        monkeypatch.setattr(deploy_mod, name, replacement)
++    at_exit: list[tuple[Any, ...]] = []
++    monkeypatch.setattr(deploy_mod.atexit, "register", lambda *call: at_exit.append(call))
++    bundle_runs: list[tuple[list[str], set[str]]] = []
++
++    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess:
++        bundle_runs.append((cmd, {path.name for path in src.iterdir()}))
++        return subprocess.CompletedProcess(cmd, 0)
++
++    monkeypatch.setattr(deploy_mod.subprocess, "run", fake_run)
++    monkeypatch.setattr(
++        sys,
++        "argv",
++        [
++            "deploy.py",
++            *_REQUIRED_ARGS,
++            "--no-otel",
++            "--skip-build",
++            "--version",
++            "1.0",
++            "--allow-dirty",
++            "--no-smoke-check",
++            "--overlay",
++            str(overlay_path),
++        ],
++    )
++
++    assert deploy_mod.main() == 0
++
++    # Both bundle commands ran against the overlay's target, with its file in place.
++    assert [cmd[2] for cmd, _ in bundle_runs] == ["deploy", "run"]
++    for cmd, source_files in bundle_runs:
++        assert cmd[cmd.index("--target") + 1] == "prod-no-otel-overlay"
++        assert "server-config.yml" in source_files
++    assert '"omnigent[databricks,tracing,kms]==1.0"' in (src / "pyproject.toml").read_text()
++    fragment = yaml.safe_load((deploy_dir / deploy_mod._OVERLAY_BUNDLE_NAME).read_text())
++    assert fragment["targets"]["prod-no-otel-overlay"]["workspace"]["host"] == (
++        "https://workspace.example.com"
++    )
++    # The copy is removed when the deploy exits.
++    ((cleanup, copied),) = at_exit
++    cleanup(copied)
++    assert not (src / "server-config.yml").exists()

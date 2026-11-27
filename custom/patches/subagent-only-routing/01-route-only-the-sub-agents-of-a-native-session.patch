@@ -1,0 +1,1456 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 24 Nov 2026 18:31:14 +0000
+Subject: [PATCH] feat(routing): route only the sub-agents of a native session
+
+A common setup is a strong coordinator on a model the user chose, with
+cheaper models picked per task for the sub-agents it starts. On a native
+Claude Code or Codex session that was not possible: the gate that routes
+the CLI's own sub-agents (Claude Code's Agent/Task, Codex's spawn_agent)
+is installed at launch, and only for a session launched on Smart
+Routing, which also routes the coordinator's model.
+
+A create that asks for `subagent_routing_override: "on"` on a native
+Claude Code or Codex session now stamps the label
+`omnigent.routing.subagent_routing`. Every launch of such a session
+installs the spawn-routing endpoint and hook (on Codex also the
+routed-spawn tool approvals and the extended model catalog), and nothing
+that touches the session's own model: no first-message hook, no alias or
+launch-model pins. The label, not the switch, is what launches read,
+because the switch can change mid-session and the gate cannot be added
+afterwards. The switch is still read per spawn, so it turns routing of
+later spawns off and on.
+
+The new-session composer offers "Route sub-agents" under Smart Routing
+when a Claude Code or Codex model is picked, and the session's model
+menu has the same row. A native session created without it, whose switch
+is turned on later through the API, routes its Omnigent child sessions
+only, as before; the row then says so. The family rule is unchanged:
+spawns stay in the session's model family, and sys_agent_list is
+confined accordingly.
+
+A create with a bound inference profile now refuses the switch, as
+PATCH already did: nothing on the routing paths consults the profile's
+model list, and the launch gate would otherwise route such a session's
+spawns.
+
+Not upstream yet: tracked by issue https://github.com/omnigent-ai/omnigent/issues/14897;
+not proposed as a pull request yet. Drop this copy once it merges.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ feature-map/composer.md                       |  20 +++
+ omnigent/runner/native/orchestration.py       |  38 ++++--
+ omnigent/runner/subagent_routing.py           |  46 +++++--
+ omnigent/runner/tool_dispatch.py              |   7 +-
+ omnigent/server/API.md                        |  29 +++++
+ .../server/routes/_sessions/orchestration.py  |  10 ++
+ omnigent/server/routes/sandbox_inference.py   |   6 +-
+ tests/runner/test_agent_list_spawn_family.py  |  17 +++
+ ...pp_sessions_native_terminals_autocreate.py |  46 +++++++
+ .../runner/test_codex_native_launch_config.py |  39 ++++++
+ tests/runner/test_subagent_router_launch.py   |  76 +++++++++++-
+ .../test_native_smart_routing_create.py       |  51 ++++++++
+ tests/server/test_sandbox_inference_routes.py |  32 +++++
+ .../components/CostRoutingControl.test.tsx    |  58 +++++++++
+ web/src/components/CostRoutingControl.tsx     |  36 +++++-
+ .../composer/SessionHarnessPicker.tsx         |   9 ++
+ .../composer/SubagentRoutingItem.test.tsx     | 114 ++++++++++++++++++
+ .../composer/SubagentRoutingItem.tsx          |  74 ++++++++++++
+ web/src/lib/agentLabels.ts                    |   3 +
+ web/src/shell/NewChatDialog.test.tsx          |  64 ++++++++++
+ web/src/shell/NewChatDialog.tsx               |  23 ++++
+ web/src/store/chatStore.test.ts               |  16 +++
+ web/src/store/chatStore.ts                    |  14 ++-
+ 23 files changed, 801 insertions(+), 27 deletions(-)
+ create mode 100644 web/src/components/composer/SubagentRoutingItem.test.tsx
+ create mode 100644 web/src/components/composer/SubagentRoutingItem.tsx
+
+diff --git a/feature-map/composer.md b/feature-map/composer.md
+index 8300037883f2f2f47c267a9499447230000d4dda..561a11fd99236825db0bbd93d6b46421da615268 100644
+--- a/feature-map/composer.md
++++ b/feature-map/composer.md
+@@ -103,6 +103,26 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
+   (`restrict_to_agent_names`, see `native-harnesses.md`) does not offer, which
+   New Chat reports as unavailable until the user picks an offered agent while
+   project settings keeps storing it.
++- `route-sub-agents`: on a server with Smart Routing, a Claude Code or Codex
++  session can keep the model picked for it and let Smart Routing choose the
++  model of each sub-agent it starts. In the new-session composer the model menu
++  shows **Route sub-agents** under Smart Routing while Smart Routing itself is
++  unchecked; checking it creates the session with
++  `subagent_routing_override: "on"` and nothing else of Smart Routing, so the
++  session's own model, effort and first message are not routed. In the session
++  the same row in the model menu turns routing of later spawns off and on.
++  Spawns stay in the session's own model family, and a Claude Code spawn takes a
++  routed model only when the session has an alias for it, otherwise it keeps
++  the model it asked for. A session created without the option has no row,
++  because the gate that routes the CLI's own sub-agents is installed at launch.
++  If its switch is turned on later through the API, the row appears and says
++  **Child sessions only**: Omnigent child sessions are routed, the CLI's own
++  sub-agents are not. Hosts need a build with this option for the gate; an older
++  host routes child sessions only. The row is not offered on a sandbox with a
++  bound inference profile, where the API refuses the switch
++  (`web/src/components/composer/SubagentRoutingItem.test.tsx`,
++  `web/src/components/CostRoutingControl.test.tsx`,
++  `tests/runner/test_subagent_router_launch.py`).
+ - `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
+   in both composers (Ctrl on every platform). The relevant menu briefly opens
+   with the selected choice highlighted, preserving draft and input focus. In an
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 708f89d80db0153e200a61213770d3a85898b12f..fd600236186670fb862bd5c60f4c181c7407478b 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -804,6 +804,10 @@ class _CodexNativeLaunchConfig:
+         still has work to do. False on a session something already routed —
+         a web create that pinned the model before the pane launched — so the
+         ``UserPromptSubmit`` hook is never registered and no prompt is held.
++    :param subagent_routing: ``True`` when the session was created with
++        sub-agent routing on while keeping the model the user picked. It gets
++        the spawn-routing endpoint and the extended catalog a routed spawn may
++        need, and no turn routing.
+     :param reasoning_effort: Persisted per-session effort, e.g. ``"ultra"``,
+         pinned into the private ``config.toml`` at launch so the thread (and
+         the TUI footer) start at it instead of the shared config's default.
+@@ -828,6 +832,7 @@ class _CodexNativeLaunchConfig:
+     auto_harness: bool = False
+     routing_enabled: bool = False
+     turn_routing: bool = False
++    subagent_routing: bool = False
+     reasoning_effort: str | None = None
+     bridge_id: str | None = None
+     #: The session is a child whose replies its parent receives, so one-time user
+@@ -915,6 +920,7 @@ def _start_subagent_router_for_native_session(
+     server_client: httpx.AsyncClient | None,
+     routing_enabled: bool,
+     auto_harness: bool,
++    subagent_routing: bool = False,
+ ) -> _NativeRouterLaunch:
+     """Start the subagent-routing endpoint for a native session.
+ 
+@@ -922,9 +928,10 @@ def _start_subagent_router_for_native_session(
+     launch, so the endpoint has to be live (and advertised in the bridge
+     dir the hooks read) before the CLI starts.
+ 
+-    Installed for Smart Routing sessions only, on both families: a plain
+-    session launches like a plain one, with no loopback server, no bearer
+-    token on disk and no spawn hook on its argv. On the codex family the
++    Installed for Smart Routing sessions and for sessions created with
++    sub-agent routing on, on both families: a plain session launches like a
++    plain one, with no loopback server, no bearer token on disk and no spawn
++    hook on its argv. On the codex family the
+     advertisement additionally turns on a generated ``hooks.json`` and the
+     routed-spawn tool pre-approvals — which is why a pinned Smart Routing
+     codex session needs it too: without them its spawn tools are neither
+@@ -943,6 +950,8 @@ def _start_subagent_router_for_native_session(
+     :param auto_harness: Whether Smart Routing also owns this session's
+         harness, so its spawns may cross families. Not required for the
+         endpoint; it decides what the router may offer.
++    :param subagent_routing: Whether the session was created with sub-agent
++        routing on. Enough for the endpoint without ``routing_enabled``.
+     :returns: The advertisement directory to point hooks at (``None`` when
+         the endpoint could not start) paired with the router handle.
+     """
+@@ -959,6 +968,7 @@ def _start_subagent_router_for_native_session(
+         routing_class=SessionRoutingClass(
+             routing_enabled=routing_enabled,
+             auto_harness=auto_harness,
++            subagent_routing=subagent_routing,
+         ),
+     )
+     return _NativeRouterLaunch(bridge_dir if router is not None else None, router)
+@@ -1651,6 +1661,7 @@ async def _codex_native_launch_config(
+         auto_harness=routing_class.auto_harness,
+         routing_enabled=routing_class.routing_enabled,
+         turn_routing=routing_class.turn_routing,
++        subagent_routing=routing_class.subagent_routing,
+         reasoning_effort=reasoning_effort,
+         bridge_id=bridge_id,
+         has_parent=bool(snapshot.get("parent_session_id")),
+@@ -6147,6 +6158,7 @@ async def _auto_create_codex_terminal(
+         server_client=server_client,
+         routing_enabled=launch_config.routing_enabled,
+         auto_harness=launch_config.auto_harness,
++        subagent_routing=launch_config.subagent_routing,
+     )
+     if _codex_router_dir is not None:
+         from omnigent.runner.subagent_routing import router_env
+@@ -6156,7 +6168,10 @@ async def _auto_create_codex_terminal(
+     # (GLM), which its own client-side validation then refuses — so a Smart
+     # Routing session (pinned or auto) gets the extended catalog. A plain
+     # session keeps codex's bundled catalog and never pays the probe.
+-    app_server.env.update(codex_extended_catalog_env(launch_config.routing_enabled))
++    # A sub-agent-only session's routed spawn can land on such an arm too.
++    app_server.env.update(
++        codex_extended_catalog_env(launch_config.routing_enabled or launch_config.subagent_routing)
++    )
+     app_server.env.update(resource_registry.client_surface_env(session_id))
+     # First-message model routing. Advertised in the same bridge dir the
+     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
+@@ -9355,6 +9370,9 @@ class _ClaudeSessionLaunchMetadata:
+     #: The session is a child (sub-agent, worker or side chat) whose replies its
+     #: parent receives, so one-time user offers are left to top-level sessions.
+     has_parent: bool = False
++    #: Created with sub-agent routing on while keeping the model the user
++    #: picked: the launch adds the spawn gate and none of the model pins.
++    subagent_routing: bool = False
+ 
+ 
+ def _claude_launch_metadata_from_envelope(
+@@ -9378,6 +9396,7 @@ def _claude_launch_metadata_from_envelope(
+         routing_enabled=routing_class.routing_enabled,
+         auto_harness=routing_class.auto_harness,
+         turn_routing=routing_class.turn_routing,
++        subagent_routing=routing_class.subagent_routing,
+         reasoning_effort=snapshot.reasoning_effort,
+         model_override=snapshot.model_override,
+         terminal_launch_args=snapshot.terminal_launch_args,
+@@ -9437,6 +9456,7 @@ async def _load_legacy_claude_launch_metadata(
+         routing_enabled=routing_class.routing_enabled,
+         auto_harness=routing_class.auto_harness,
+         turn_routing=routing_class.turn_routing,
++        subagent_routing=routing_class.subagent_routing,
+         reasoning_effort=effort if isinstance(effort, str) and effort else None,
+         model_override=(
+             model_override if isinstance(model_override, str) and model_override else None
+@@ -10271,10 +10291,11 @@ async def _auto_create_claude_terminal(
+     # ``api_key_helper`` (ucode) registers Claude's gateway token command.
+     # Gate natively spawned subagents (the Task/Agent tool): start the loopback
+     # endpoint in the bridge dir the PreToolUse hook already discovers. Smart
+-    # Routing sessions only — a plain session would otherwise carry a loopback
+-    # server, a bearer token on disk and a hook subprocess on every spawn for a
+-    # verdict the server never routes. Claude routes spawns whether or not the
+-    # harness is auto-picked, so ``auto_harness`` is not required here.
++    # Routing and sub-agent-routing sessions only — a plain session would
++    # otherwise carry a loopback server, a bearer token on disk and a hook
++    # subprocess on every spawn for a verdict the server never routes. Claude
++    # routes spawns whether or not the harness is auto-picked, so
++    # ``auto_harness`` is not required here.
+     subagent_router_dir, _subagent_router = _start_subagent_router_for_native_session(
+         session_id,
+         bridge_dir=bridge_dir,
+@@ -10282,6 +10303,7 @@ async def _auto_create_claude_terminal(
+         server_client=server_client,
+         routing_enabled=launch_metadata.routing_enabled,
+         auto_harness=launch_metadata.auto_harness,
++        subagent_routing=launch_metadata.subagent_routing,
+     )
+     # First-message model routing. Advertised in the same bridge dir the
+     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its
+diff --git a/omnigent/runner/subagent_routing.py b/omnigent/runner/subagent_routing.py
+index 5296bdc4d54bdd5a2cbbfa28628a6cc9256026ec..bb62a5cf63032e630317f57b72ff6cad3e09f686 100644
+--- a/omnigent/runner/subagent_routing.py
++++ b/omnigent/runner/subagent_routing.py
+@@ -115,6 +115,11 @@ CREATE_ROUTE_PROMPT_LABEL_KEY = "omnigent.routing.create_prompt"
+ #: may still move this session's subagents across harness families.
+ AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
+ 
++#: Conversation label marking a native session created with sub-agent routing
++#: on. The spawn gate is installed at launch only, so every launch reads this
++#: durable record instead of the switch, which can change mid-session.
++SUBAGENT_ROUTING_LABEL_KEY = "omnigent.routing.subagent_routing"
++
+ _SCOPE = "native_subagent"
+ _PROMPT_CAP = 4000
+ #: Task label scored for a codex spawn that carries no prompt and no
+@@ -143,6 +148,9 @@ _CODEX_HOOK_HARNESSES = frozenset({"codex", "codex-native"})
+ # codex app-server spawns through session-create, which already routes off the
+ # stamped switch, so the in-harness gate would only add a round trip.
+ _PINNED_CODEX_HOOK_HARNESSES = frozenset({"codex-native"})
++# Harnesses that take the spawn gate without Smart Routing owning their own
++# model: the native terminals, whose in-harness spawns reach no other gate.
++SUBAGENT_ONLY_HOOK_HARNESSES = frozenset({"claude-native", "codex-native"})
+ 
+ # Cross-harness counterpart used to offer the router a second family, and
+ # to name the redirect target when it picks from that family.
+@@ -214,7 +222,7 @@ class SessionRoutingClass:
+     """Which Smart Routing additions one session is entitled to.
+ 
+     Three classes, and the codex paths treat them differently (the product
+-    ruling): a **plain** session (both flags false) must be
++    ruling): a **plain** session (every flag false) must be
+     byte-for-byte a plain codex session — no catalog replacement, no
+     spawn-routing hooks, no extra tool pre-approvals. A **pinned**
+     Smart Routing session (``routing_enabled`` only) adds the extended
+@@ -225,6 +233,11 @@ class SessionRoutingClass:
+     those spawns cross into the counterpart harness family; a pinned one
+     routes within its own.
+ 
++    A fourth, **sub-agent-only** session (``subagent_routing`` alone) keeps
++    the model the user picked and takes only what its routed spawns need: the
++    spawn gate, and on codex the pre-approvals and the extended catalog.
++    Nothing that routes or re-pins its own model.
++
+     :param routing_enabled: The session launched with Smart Routing as its
+         model.
+     :param auto_harness: The session also let Smart Routing pick the
+@@ -236,11 +249,25 @@ class SessionRoutingClass:
+         answer is "already routed", paid for with a round trip per prompt.
+         Independent of ``routing_enabled``: a routed session keeps the
+         extended catalog and its spawn routing.
++    :param subagent_routing: The session was created with sub-agent routing
++        on (:data:`SUBAGENT_ROUTING_LABEL_KEY`), whatever its own model is.
+     """
+ 
+     routing_enabled: bool = False
+     auto_harness: bool = False
+     turn_routing: bool = False
++    subagent_routing: bool = False
++
++    def routes_spawns(self, harness: str | None) -> bool:
++        """Report whether a launch on *harness* installs the spawn gate.
++
++        :param harness: Harness being launched, e.g. ``"claude-native"``.
++        :returns: ``True`` for a Smart Routing session on any harness, and
++            for a sub-agent-only session on a native terminal.
++        """
++        if self.routing_enabled:
++            return True
++        return self.subagent_routing and harness in SUBAGENT_ONLY_HOOK_HARNESSES
+ 
+ 
+ #: The class a session with no recorded routing state is treated as. Read by
+@@ -263,8 +290,9 @@ def routing_class_from_snapshot(
+     :param harness_override: ``harness_override``; the ``"auto"`` sentinel
+         marks auto-harness until first-message routing replaces it.
+     :param labels: Conversation labels, which carry the durable
+-        :data:`AUTO_HARNESS_LABEL_KEY` record and the
+-        :data:`ROUTING_DECISION_LABEL_KEY` a completed route stamps.
++        :data:`AUTO_HARNESS_LABEL_KEY` record, the
++        :data:`ROUTING_DECISION_LABEL_KEY` a completed route stamps and the
++        :data:`SUBAGENT_ROUTING_LABEL_KEY` a sub-agent-only create stamps.
+     :returns: The session's class.
+     """
+     auto = harness_override == "auto" or (
+@@ -283,6 +311,9 @@ def routing_class_from_snapshot(
+         routing_enabled=routes,
+         auto_harness=auto,
+         turn_routing=routes and not already_routed,
++        subagent_routing=bool(
++            labels is not None and labels.get(SUBAGENT_ROUTING_LABEL_KEY) == "1"
++        ),
+     )
+ 
+ 
+@@ -1431,9 +1462,10 @@ def ensure_session_router_quietly(
+         pinned Smart Routing session could not spawn at all. The codex
+         *SDK* arm still needs :attr:`~SessionRoutingClass.auto_harness`:
+         its spawns go through the session-create path, which routes off the
+-        stamped switch without any in-harness gate. Stamped at create, so
+-        flipping the gear's subagent-routing toggle on for a plain session
+-        stays inert until it is recreated.
++        stamped switch without any in-harness gate. A **sub-agent-only**
++        session on a native terminal gets one too, and nothing else of
++        Smart Routing's. Stamped at create, so flipping the subagent-routing
++        switch on for a plain session later routes its child sessions only.
+     :returns: The running router handle, or ``None`` when it could not
+         start.
+     """
+@@ -1442,7 +1474,7 @@ def ensure_session_router_quietly(
+         return None
+     if harness not in _CLAUDE_HOOK_HARNESSES and harness not in _CODEX_HOOK_HARNESSES:
+         return None
+-    if not routing_class.routing_enabled:
++    if not routing_class.routes_spawns(harness):
+         return None
+     if (
+         harness in _CODEX_HOOK_HARNESSES
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index ad0b2dcfa898c4499d636e1299857d07f715997e..808073594445ba4c51604cab2e2f8557177d1e49 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -7054,8 +7054,9 @@ async def _spawn_family(
+ ) -> str | None:
+     """Return the model family a session's spawns are confined to.
+ 
+-    Only a session running Smart Routing on a PINNED harness confines
+-    them: its spawns are routed inside its own family, so an agent from
++    Only a session routing its spawns on a PINNED harness confines them
++    (Smart Routing, or sub-agent routing on a model the user picked):
++    its spawns are routed inside its own family, so an agent from
+     another family has no candidate model it could be routed onto and
+     must never be offered as spawnable in the first place. An
+     auto-harness session hands the family choice to the router, and a
+@@ -7089,7 +7090,7 @@ async def _spawn_family(
+     if conversation_id is None:
+         return None
+     local = session_routing_class(conversation_id)
+-    if not local.routing_enabled or local.auto_harness:
++    if not (local.routing_enabled or local.subagent_routing) or local.auto_harness:
+         return None
+     if conversation_id in _spawn_family_cache:
+         return _spawn_family_cache[conversation_id]
+diff --git a/omnigent/server/API.md b/omnigent/server/API.md
+index 5df0ade67008ab56a514fb6e48b4a3ba21dcad5c..4652d37c979ef7ee11cee31019adb3768ccd40b5 100644
+--- a/omnigent/server/API.md
++++ b/omnigent/server/API.md
+@@ -487,6 +487,13 @@ Fields:
+     `PATCH /v1/sessions/{id}` (the web "Cost Optimized" toggle) and
+     read by the cost-control advisor pipeline at turn start.
+ 
++  subagent_routing_override (string or null)
++    Whether Smart Routing picks the model of each sub-agent this
++    session starts: `"on"` routes them, `"off"` and `null` leave them
++    to the harness. Independent of the session's own model. A session
++    created on Smart Routing is stamped `"on"`. Set at create or via
++    `PATCH /v1/sessions/{id}`.
++
+   git_branch (string or null)
+     Git branch checked out in the session's worktree, e.g.
+     `"feature/login"`. Set only when the session was created with a
+@@ -703,6 +710,17 @@ already uploaded or registered an agent. The response is the full
+     base_branch?: string | null}`. `branch_name` is validated against
+     git ref-format rules. See `designs/SESSION_GIT_WORKTREE.md`.
+ 
++  subagent_routing_override (string or null)
++    `"on"` routes the sub-agents this session starts while the session
++    keeps the `model_override` (or default model) it was created with;
++    it needs no `cost_control_mode_override`. On a native Claude Code or
++    Codex session the create also stamps the label
++    `omnigent.routing.subagent_routing: "1"`, and every launch of the
++    session then installs the gate that routes the CLI's own sub-agents
++    (Claude Code's `Agent`/`Task`, Codex's `spawn_agent`). Spawns stay in
++    the session's model family. Fails with 400 `invalid_input` on a
++    session with a bound inference profile.
++
+   terminal_launch_args (array of strings or null)
+     Optional pass-through CLI args for a native terminal wrapper
+     (claude / codex), e.g. `["--permission-mode", "bypassPermissions"]`
+@@ -942,6 +960,17 @@ Request body:
+     a clear alias — is the clear signal). Any other value fails with
+     400 `invalid_input`.
+ 
++  subagent_routing_override (string or null, optional)
++    `"on"` or `"off"`; explicit `null` clears it, which reads as off.
++    Read per spawn, so a change applies to the next sub-agent. Omnigent
++    child sessions follow it on any session. The CLI's own sub-agents
++    on a native Claude Code or Codex session follow it only when the
++    session's launch installed the routing gate: it was created with
++    `subagent_routing_override: "on"` or on Smart Routing. Turning it
++    on later for a session created without it routes child sessions
++    only. `"on"` fails with 400 `invalid_input` on a session with a
++    bound inference profile.
++
+   external_session_id (string, optional)
+     Runtime-native session id this conversation wraps (e.g. Claude
+     Code's session uuid). Idempotent on same-value writes; the server
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 664e1c98e1722ed78a607bf6f79fb86386c3b2f5..d180e5d91fdda19ffb4713e429074ef67058e987 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -109,6 +109,8 @@ from omnigent.runner.routing import RunnerRouter, routing_host_id
+ from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+ from omnigent.runner.subagent_routing import (
+     ROUTING_DECISION_LABEL_KEY,
++    SUBAGENT_ONLY_HOOK_HARNESSES,
++    SUBAGENT_ROUTING_LABEL_KEY,
+     auto_harness_session,
+     harness_family,
+     subagent_routing_enabled,
+@@ -13741,6 +13743,14 @@ async def _create_session_from_existing_agent(
+         from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+ 
+         initial_labels[AUTO_HARNESS_LABEL_KEY] = "1"
++    # A native create that asks for sub-agent routing itself is marked, so its
++    # launches install the spawn gate whether or not its own model is routed.
++    if (
++        body.subagent_routing_override == "on"
++        and (native_agent.harness if native_agent is not None else selected_harness)
++        in SUBAGENT_ONLY_HOOK_HARNESSES
++    ):
++        initial_labels[SUBAGENT_ROUTING_LABEL_KEY] = "1"
+     # A managed create's chosen sandbox host id is born with the row: the caller
+     # routes the session by it until the host binds, and a sidebar list read
+     # racing the create must never return the row without it.
+diff --git a/omnigent/server/routes/sandbox_inference.py b/omnigent/server/routes/sandbox_inference.py
+index 52e8042ff42779033623fb261e9e03e1b8dee304..b724211f367c4c711873900afb8de35561565e28 100644
+--- a/omnigent/server/routes/sandbox_inference.py
++++ b/omnigent/server/routes/sandbox_inference.py
+@@ -136,7 +136,11 @@ async def prepare_create_inference(
+             "The agent's Databricks profile conflicts with the configured harness provider",
+             code=ErrorCode.INVALID_INPUT,
+         )
+-    if getattr(body, "cost_control_mode_override", None) == "on" or harness_override == "auto":
++    if (
++        getattr(body, "cost_control_mode_override", None) == "on"
++        or getattr(body, "subagent_routing_override", None) == "on"
++        or harness_override == "auto"
++    ):
+         raise OmnigentError(
+             "Automatic provider routing is unavailable for a bound inference profile",
+             code=ErrorCode.INVALID_INPUT,
+diff --git a/tests/runner/test_agent_list_spawn_family.py b/tests/runner/test_agent_list_spawn_family.py
+index e5e676ab16202ee4324e2f20017fc75922a37168..b93c3470ab0315ef6f9f4f430416de9d8f0752d3 100644
+--- a/tests/runner/test_agent_list_spawn_family.py
++++ b/tests/runner/test_agent_list_spawn_family.py
+@@ -108,6 +108,23 @@ async def test_pinned_routed_session_sees_only_its_own_family() -> None:
+     assert _names(listing) == ["codex", "mystery"]
+ 
+ 
++@pytest.mark.asyncio
++async def test_subagent_only_session_sees_only_its_own_family() -> None:
++    """The family rule follows the switch, not who picked the session's model."""
++    remember_session_routing_class("conv_parent", SessionRoutingClass(subagent_routing=True))
++    seen: list[str] = []
++    listing = await _agent_list(
++        {
++            "id": "conv_parent",
++            "harness": "codex-native",
++            "subagent_routing_override": "on",
++            "labels": {"omnigent.routing.subagent_routing": "1"},
++        },
++        seen,
++    )
++    assert _names(listing) == ["codex", "mystery"]
++
++
+ @pytest.mark.asyncio
+ async def test_auto_harness_session_sees_every_family() -> None:
+     remember_session_routing_class("conv_parent", _AUTO)
+diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+index 9c9ea07dfc0b1055a3efd3e183b96e10b7511bf3..0ef9a92c407b2eda45688baf5115efc3f6757021 100644
+--- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
++++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+@@ -6853,6 +6853,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
+     session_id: str,
+     routed: bool,
+     auto_harness: bool = False,
++    subagent_routing: bool = False,
+     custom_slot: str = "workspace-picker-row",
+ ) -> Any:
+     """Drive the claude-native launch and return the captured terminal spec.
+@@ -6862,6 +6863,8 @@ async def _run_auto_create_claude_terminal_for_routing_class(
+     :param auto_harness: Stamp the auto-harness label and sentinel WITHOUT the
+         cost-control field, which is the shape a sub-agent child of a routed
+         parent is created with.
++    :param subagent_routing: Stamp the sub-agent routing label, as the create
++        path does for a session that routes only the sub-agents it starts.
+     """
+     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+ 
+@@ -6931,6 +6934,11 @@ async def _run_auto_create_claude_terminal_for_routing_class(
+ 
+         snapshot["labels"][AUTO_HARNESS_LABEL_KEY] = "1"
+         snapshot["harness_override"] = "auto"
++    if subagent_routing:
++        from omnigent.runner.subagent_routing import SUBAGENT_ROUTING_LABEL_KEY
++
++        snapshot["labels"][SUBAGENT_ROUTING_LABEL_KEY] = "1"
++        snapshot["subagent_routing_override"] = "on"
+     fake_client = httpx.AsyncClient(
+         base_url="http://test-server",
+         transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
+@@ -7035,6 +7043,44 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+     assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
+ 
+ 
++async def test_a_subagent_only_claude_native_launch_gates_spawns_and_keeps_its_model(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Sub-agent routing on a model the user picked: the spawn gate and nothing else."""
++    for launch_dir in ("plain", "subagent-only"):
++        (tmp_path / launch_dir).mkdir()
++    plain = await _run_auto_create_claude_terminal_for_routing_class(
++        tmp_path=tmp_path / "plain",
++        monkeypatch=monkeypatch,
++        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f605",
++        routed=False,
++    )
++    spec = await _run_auto_create_claude_terminal_for_routing_class(
++        tmp_path=tmp_path / "subagent-only",
++        monkeypatch=monkeypatch,
++        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f606",
++        routed=False,
++        subagent_routing=True,
++    )
++
++    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
++    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
++    # The session's own model is not routed: no first-message hook, and the
++    # model flags and alias pins are exactly a plain launch's.
++    assert all("route-turn" not in command for command in _claude_hook_commands(spec))
++    assert spec.args[spec.args.index("--model") + 1] == plain.args[plain.args.index("--model") + 1]
++    model_env = {key: value for key, value in spec.env.items() if key.startswith("ANTHROPIC_")}
++    assert model_env == {
++        key: value for key, value in plain.env.items() if key.startswith("ANTHROPIC_")
++    }
++    # In-family spawns only, so neither the routed-spawn note nor pre-approvals.
++    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
++
++    spawn_note = smart_routing_spawn_note("claude-native")
++    assert all(spawn_note not in arg for arg in spec.args)
++    assert "--allowedTools" not in spec.args
++
++
+ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+diff --git a/tests/runner/test_codex_native_launch_config.py b/tests/runner/test_codex_native_launch_config.py
+index 5747bbe409fc606540075f395f25704cd0506933..efcda9ea40734df81154d68cbde0bd86400d7713 100644
+--- a/tests/runner/test_codex_native_launch_config.py
++++ b/tests/runner/test_codex_native_launch_config.py
+@@ -314,6 +314,45 @@ async def test_happy_path_parses_full_config(
+     )
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
++@pytest.mark.parametrize(
++    ("labels", "subagent_routing"),
++    [
++        ({"omnigent.routing.subagent_routing": "1"}, True),
++        # Switched on after a plain create: the launch stays a plain one.
++        ({}, False),
++    ],
++    ids=["created-on", "switched-on-later"],
++)
++async def test_subagent_only_routing_is_read_from_the_create_label(
++    monkeypatch: pytest.MonkeyPatch,
++    use_envelope: bool,
++    labels: dict[str, str],
++    subagent_routing: bool,
++) -> None:
++    """The session keeps its own model: only the spawn gate is switched on."""
++    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
++    snapshot = {
++        "workspace": "/tmp/repo",
++        "model_override": "gpt-5.4-mini",
++        "subagent_routing_override": "on",
++        "labels": labels,
++    }
++    cfg = await _codex_native_launch_config(
++        session_id="conv_1",
++        server_client=_Client(_Resp(200, snapshot)),
++        session_init=(
++            parse_runner_session_init_envelope(_init_payload(snapshot)) if use_envelope else None
++        ),
++    )
++    assert cfg.subagent_routing is subagent_routing
++    assert cfg.model_override == "gpt-5.4-mini"
++    assert cfg.routing_enabled is False
++    assert cfg.turn_routing is False
++    assert cfg.auto_harness is False
++
++
+ @pytest.mark.asyncio
+ async def test_complete_envelope_avoids_timed_out_metadata_read(
+     retry_sleeps: list[float],
+diff --git a/tests/runner/test_subagent_router_launch.py b/tests/runner/test_subagent_router_launch.py
+index 0d46e7199662935b2dc7a57d7cdeeb6ae98a2b2c..70db53616ad267bb0e9591f2afe11361fbb9e0f9 100644
+--- a/tests/runner/test_subagent_router_launch.py
++++ b/tests/runner/test_subagent_router_launch.py
+@@ -15,13 +15,21 @@ from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+ from omnigent.runner import subagent_routing
+ from omnigent.runner.app import _build_spawn_env_from_spec, _ensure_session_subagent_router
+ from omnigent.runner.native.orchestration import _start_subagent_router_for_native_session
+-from omnigent.runner.subagent_routing import SessionRoutingClass
++from omnigent.runner.subagent_routing import (
++    AUTO_HARNESS_LABEL_KEY,
++    ROUTING_DECISION_LABEL_KEY,
++    SUBAGENT_ROUTING_LABEL_KEY,
++    SessionRoutingClass,
++    routing_class_from_snapshot,
++)
+ from omnigent.spec.types import AgentSpec, ExecutorSpec
+ 
+ # The three session classes the codex launch paths distinguish.
+ _PLAIN = SessionRoutingClass()
+ _PINNED = SessionRoutingClass(routing_enabled=True)
+ _AUTO = SessionRoutingClass(routing_enabled=True, auto_harness=True)
++# Created with sub-agent routing on while keeping the model the user picked.
++_SUBAGENT_ONLY = SessionRoutingClass(subagent_routing=True)
+ 
+ 
+ class _DeadClient:
+@@ -83,6 +91,62 @@ async def test_a_plain_native_launch_gets_no_router(tmp_path: Path, harness: str
+     assert read_router_endpoint(tmp_path) is None
+ 
+ 
++@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
++async def test_a_subagent_only_native_launch_installs_the_router(
++    tmp_path: Path, harness: str
++) -> None:
++    """A session that routes only its sub-agents gets the spawn gate too."""
++    advertised, router = _start_subagent_router_for_native_session(
++        "conv_native_launch",
++        bridge_dir=tmp_path,
++        harness=harness,
++        server_client=_DeadClient(),  # type: ignore[arg-type]
++        routing_enabled=False,
++        auto_harness=False,
++        subagent_routing=True,
++    )
++    assert advertised == tmp_path
++    assert router is not None
++    assert read_router_endpoint(tmp_path) is not None
++
++
++@pytest.mark.parametrize(
++    ("labels", "cost_control_mode", "expected"),
++    [
++        ({}, None, _PLAIN),
++        # The coordinator's own model is not routed: no turn routing.
++        ({SUBAGENT_ROUTING_LABEL_KEY: "1"}, None, _SUBAGENT_ONLY),
++        ({SUBAGENT_ROUTING_LABEL_KEY: "0"}, None, _PLAIN),
++        (
++            {SUBAGENT_ROUTING_LABEL_KEY: "1"},
++            "on",
++            SessionRoutingClass(routing_enabled=True, turn_routing=True, subagent_routing=True),
++        ),
++        (
++            {AUTO_HARNESS_LABEL_KEY: "1", ROUTING_DECISION_LABEL_KEY: "dec_1"},
++            None,
++            _AUTO,
++        ),
++    ],
++)
++def test_the_routing_class_reads_the_subagent_routing_label(
++    labels: dict[str, str], cost_control_mode: str | None, expected: SessionRoutingClass
++) -> None:
++    assert (
++        routing_class_from_snapshot(
++            cost_control_mode=cost_control_mode, harness_override=None, labels=labels
++        )
++        == expected
++    )
++
++
++@pytest.mark.parametrize("harness", ["claude-sdk", "codex", "pi-native"])
++def test_subagent_only_routing_is_for_the_claude_and_codex_terminals(harness: str) -> None:
++    """Elsewhere the label alone changes nothing: those spawns have other gates."""
++    assert not _SUBAGENT_ONLY.routes_spawns(harness)
++    assert _PINNED.routes_spawns(harness)
++
++
+ async def test_a_pinned_codex_sdk_session_gets_no_router(tmp_path: Path) -> None:
+     """The SDK codex arm keeps the auto-harness requirement.
+ 
+@@ -177,6 +241,16 @@ async def test_a_routed_claude_sdk_launch_installs_the_router(
+     assert env["OMNIGENT_SUBAGENT_ROUTER_SESSION_ID"] == "conv_sdk_launch"
+ 
+ 
++async def test_a_subagent_only_claude_sdk_launch_gets_no_router() -> None:
++    await _ensure_session_subagent_router(
++        "conv_sdk_launch",
++        "claude-sdk",
++        server_client=_DeadClient(),  # type: ignore[arg-type]
++        routing_class=_SUBAGENT_ONLY,
++    )
++    assert subagent_routing.session_router_env("conv_sdk_launch", "claude-sdk") == {}
++
++
+ async def test_a_plain_claude_sdk_launch_gets_no_router() -> None:
+     """No router means no env, so the executor registers no ``Task`` hook."""
+     await _ensure_session_subagent_router(
+diff --git a/tests/server/routes/test_native_smart_routing_create.py b/tests/server/routes/test_native_smart_routing_create.py
+index 350262e856bf9ad46f59ec41fd557922fb14da89..34ce9e1c066158380abddfc3d5d53a43a99e8507 100644
+--- a/tests/server/routes/test_native_smart_routing_create.py
++++ b/tests/server/routes/test_native_smart_routing_create.py
+@@ -948,6 +948,57 @@ async def test_create_stamps_subagent_routing_for_routed_sessions(
+     assert snapshot.json()["subagent_routing_override"] == expected
+ 
+ 
++@pytest.mark.parametrize(
++    ("agent", "body", "marked"),
++    [
++        # Asked for on a model the caller picked: every launch installs the spawn gate.
++        (_WRAPPER, {"subagent_routing_override": "on"}, True),
++        (_CODEX_WRAPPER, {"subagent_routing_override": "on"}, True),
++        # Not asked for: a plain native create stays plain.
++        (_WRAPPER, {}, False),
++        (_WRAPPER, {"subagent_routing_override": "off"}, False),
++        # An SDK agent's spawns go through session create, which reads the switch.
++        (_BUNDLE, {"subagent_routing_override": "on"}, False),
++    ],
++)
++async def test_create_marks_a_native_session_that_asks_for_subagent_routing(
++    client: httpx.AsyncClient,
++    db_uri: str,
++    agent: str,
++    body: dict[str, Any],  # type: ignore[explicit-any]
++    marked: bool,
++) -> None:
++    from omnigent.runner.subagent_routing import (
++        SUBAGENT_ROUTING_LABEL_KEY,
++        routing_class_from_snapshot,
++    )
++
++    wrappers = await _native_wrappers(client, db_uri)
++    bundle = await create_test_agent(client, name=f"mark-{len(body)}-{marked}")
++    agent_ids = {
++        _WRAPPER: wrappers["claude-native"],
++        _CODEX_WRAPPER: wrappers["codex-native"],
++        _BUNDLE: str(bundle["id"]),
++    }
++
++    created = await client.post("/v1/sessions", json={**body, "agent_id": agent_ids[agent]})
++    assert created.status_code == 201, created.text
++
++    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
++    assert conv is not None
++    assert (conv.labels.get(SUBAGENT_ROUTING_LABEL_KEY) == "1") is marked
++    # The session's own model is never routed by this switch.
++    routing_class = routing_class_from_snapshot(
++        cost_control_mode=conv.cost_control_mode_override,
++        harness_override=conv.harness_override,
++        labels=conv.labels,
++    )
++    assert routing_class.subagent_routing is marked
++    assert routing_class.routing_enabled is False
++    assert routing_class.turn_routing is False
++    assert conv.cost_control_mode_override is None
++
++
+ async def test_unrouted_create_writes_no_subagent_routing_key(
+     client: httpx.AsyncClient,
+     db_uri: str,
+diff --git a/tests/server/test_sandbox_inference_routes.py b/tests/server/test_sandbox_inference_routes.py
+index fc6855b982396ae00ed67ddb3a33e7d4a4d0ef9e..cbdb5732cebd0afa7e1121c2708f5a73d6ef8bf5 100644
+--- a/tests/server/test_sandbox_inference_routes.py
++++ b/tests/server/test_sandbox_inference_routes.py
+@@ -709,6 +709,38 @@ async def test_stale_revision_rejects_before_rows_artifacts_or_provisioning(env:
+     env.launch.assert_not_called()
+ 
+ 
++@pytest.mark.parametrize("switch", ["cost_control_mode_override", "subagent_routing_override"])
++async def test_routing_switches_are_refused_on_a_bound_profile(env: _Env, switch: str):
++    """Neither the session's own routing nor its sub-agents' can leave the bound provider."""
++    agent = await create_test_agent(
++        env.client,
++        executor={"type": "omnigent", "config": {"harness": "codex"}},
++        include_llm=False,
++    )
++    body = {
++        "agent_id": agent["id"],
++        "host_type": "managed",
++        "sandbox_provider": "agent_sandbox",
++        "inference_configuration_revision": "revision-1",
++    }
++    before = env.persisted()
++    refused = await env.client.post("/v1/sessions", json={**body, switch: "on"})
++    assert refused.status_code == 400, refused.text
++    assert "unavailable for a bound inference profile" in refused.text
++    assert env.persisted() == before
++    env.launch.assert_not_awaited()
++
++    created = await env.client.post("/v1/sessions", json=body)
++    assert created.status_code == 201, created.text
++    patched = await env.client.patch(f"/v1/sessions/{created.json()['id']}", json={switch: "on"})
++    assert patched.status_code == 400, patched.text
++    assert "unavailable for a bound inference profile" in patched.text
++    saved = env.store.get_conversation(created.json()["id"])
++    assert saved is not None
++    assert saved.cost_control_mode_override is None
++    assert saved.subagent_routing_override is None
++
++
+ async def test_unlisted_patch_rejects_before_any_metadata_change(env: _Env):
+     created = await _json_create(env, model_override="gateway/main", title="Original")
+     assert created.status_code == 201, created.text
+diff --git a/web/src/components/CostRoutingControl.test.tsx b/web/src/components/CostRoutingControl.test.tsx
+index 8dfde4b6efbc42ede4475473fc7b3ac750e75d64..a0cf555e516206cc904f571ee867e0d2c187b8a0 100644
+--- a/web/src/components/CostRoutingControl.test.tsx
++++ b/web/src/components/CostRoutingControl.test.tsx
+@@ -5,6 +5,8 @@ import {
+   isCostRoutingSession,
+   isSubagentRoutingSession,
+   shortModelName,
++  SUBAGENT_ROUTING_LABEL_KEY,
++  subagentRoutingReach,
+ } from "./CostRoutingControl";
+ 
+ afterEach(cleanup);
+@@ -67,6 +69,28 @@ describe("isSubagentRoutingSession", () => {
+     }
+   });
+ 
++  it("matches a native session created with sub-agent routing on its own model", () => {
++    // The create stamps the label and every launch installs the spawn gate,
++    // while the session's own routing stays off.
++    for (const harness of ["claude-native", "codex-native"]) {
++      expect(
++        isSubagentRoutingSession({
++          ...top,
++          harness,
++          labels: { [SUBAGENT_ROUTING_LABEL_KEY]: "1" },
++        }),
++      ).toBe(true);
++    }
++    // A native wrapper with no spawn hook has nothing to install.
++    expect(
++      isSubagentRoutingSession({
++        ...top,
++        harness: "cursor-native",
++        labels: { [SUBAGENT_ROUTING_LABEL_KEY]: "1" },
++      }),
++    ).toBe(false);
++  });
++
+   it("matches non-native sessions whatever their harness (spawns go through create)", () => {
+     // An SDK/bundle agent spawns children through the session-create path, which
+     // routes off this switch regardless of the harness the parent runs.
+@@ -110,6 +134,40 @@ describe("isSubagentRoutingSession", () => {
+   });
+ });
+ 
++describe("subagentRoutingReach", () => {
++  const top = { agentName: "claude-native-ui", parentSessionId: null };
++
++  it("covers every sub-agent where the launch installed the spawn gate", () => {
++    const session = {
++      ...top,
++      harness: "claude-native",
++      labels: { [SUBAGENT_ROUTING_LABEL_KEY]: "1" },
++    };
++    // The control stays while the switch is off, so it can be turned back on.
++    for (const override of ["on", "off", null] as const) {
++      expect(subagentRoutingReach(session, override)).toBe("spawns");
++    }
++    expect(subagentRoutingReach({ ...top, harness: "pi" }, null)).toBe("spawns");
++  });
++
++  it("covers child sessions only on a plain native session switched on afterwards", () => {
++    for (const harness of ["claude-native", "codex-native"]) {
++      expect(subagentRoutingReach({ ...top, harness }, "on")).toBe("child-sessions");
++      // Off or unset there is nothing to say and nothing to turn off.
++      expect(subagentRoutingReach({ ...top, harness }, "off")).toBeNull();
++      expect(subagentRoutingReach({ ...top, harness }, null)).toBeNull();
++    }
++  });
++
++  it("offers no control where nothing routes", () => {
++    expect(subagentRoutingReach({ ...top, harness: "cursor-native" }, "on")).toBeNull();
++    expect(
++      subagentRoutingReach({ ...top, parentSessionId: "conv_parent987", harness: "pi" }, "on"),
++    ).toBeNull();
++    expect(subagentRoutingReach(null, "on")).toBeNull();
++  });
++});
++
+ describe("shortModelName", () => {
+   it("collapses Claude ids to their family token", () => {
+     expect(shortModelName("databricks-claude-haiku-4-5")).toBe("haiku");
+diff --git a/web/src/components/CostRoutingControl.tsx b/web/src/components/CostRoutingControl.tsx
+index d5fc2c5837eea27f7a959f28a86f452a7ba6fd41..8a8ea76248786b78a0f05484f03740e7d6ccd57c 100644
+--- a/web/src/components/CostRoutingControl.tsx
++++ b/web/src/components/CostRoutingControl.tsx
+@@ -29,6 +29,9 @@ const SUBAGENT_ROUTING_HARNESSES: ReadonlySet<string> = new Set(["claude-native"
+ /** Session label recording that Smart Routing owns this session's harness. */
+ export const AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness";
+ 
++/** Session label recording a create that asked for sub-agent routing on a model the user picked. */
++export const SUBAGENT_ROUTING_LABEL_KEY = "omnigent.routing.subagent_routing";
++
+ /** Whether Smart Routing owns this session's harness (so its spawns may cross families). */
+ function isAutoHarnessSession(
+   session: Pick<Session, "harness" | "labels"> | null | undefined,
+@@ -52,6 +55,8 @@ function isAutoHarnessSession(
+  *   Routing, pinned harness included: the launch starts the spawn-routing
+  *   endpoint either way, and on codex that advertisement is what turns on the
+  *   generated ``hooks.json`` gate and the routed-spawn tool pre-approvals;
++ * - a Claude- or Codex-family session created with sub-agent routing on has
++ *   it too, on the model the user picked ({@link SUBAGENT_ROUTING_LABEL_KEY});
+  * - a plain native session of either family never has it.
+  *
+  * That last case would present "Smart Routing" as choosable while nothing
+@@ -80,10 +85,39 @@ export function isSubagentRoutingSession(
+   if (isAutoHarnessSession(session)) return true;
+   return (
+     SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "") &&
+-    session?.costControlModeOverride === "on"
++    (session?.costControlModeOverride === "on" ||
++      session?.labels?.[SUBAGENT_ROUTING_LABEL_KEY] === "1")
+   );
+ }
+ 
++/** What the sub-agent routing switch reaches on a session. */
++export type SubagentRoutingReach = "spawns" | "child-sessions";
++
++/**
++ * What a session's sub-agent routing control governs, or `null` for no control.
++ *
++ * `"spawns"` is every sub-agent ({@link isSubagentRoutingSession}).
++ * `"child-sessions"` is a native Claude or Codex session launched without the
++ * spawn gate whose switch was turned on afterwards: only the Omnigent child
++ * sessions it creates are routed, so the control says so and can turn it off.
++ *
++ * Callers must also check ``ServerInfo.smart_routing_enabled``.
++ */
++export function subagentRoutingReach(
++  session: Parameters<typeof isSubagentRoutingSession>[0],
++  subagentRoutingOverride: "on" | "off" | null | undefined,
++): SubagentRoutingReach | null {
++  if (isSubagentRoutingSession(session)) return "spawns";
++  if (
++    isCostRoutingSession(session) &&
++    SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "") &&
++    subagentRoutingOverride === "on"
++  ) {
++    return "child-sessions";
++  }
++  return null;
++}
++
+ // The tier-defining token of Claude model ids ("databricks-claude-haiku-4-5" → "haiku").
+ const MODEL_FAMILY_HINTS = ["haiku", "sonnet", "opus"] as const;
+ 
+diff --git a/web/src/components/composer/SessionHarnessPicker.tsx b/web/src/components/composer/SessionHarnessPicker.tsx
+index 39b73f276bb7a29b9b37771c9cd6c966148b5cbe..8208a7893eb4c5e718a9800077f9b8d240213619 100644
+--- a/web/src/components/composer/SessionHarnessPicker.tsx
++++ b/web/src/components/composer/SessionHarnessPicker.tsx
+@@ -27,6 +27,7 @@ import {
+ } from "@/components/composer/composerSectionSettings";
+ import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
+ import { buildFusionSections } from "@/components/composer/fusionSections";
++import { SubagentRoutingItem } from "@/components/composer/SubagentRoutingItem";
+ import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
+ import {
+   compactModelTriggerLabel,
+@@ -506,6 +507,14 @@ export function SessionHarnessPicker({
+           <DropdownMenuSeparator />
+         </>
+       )}
++      <SubagentRoutingItem
++        sessionId={sessionId}
++        conversationId={conversationId}
++        disabled={busy || pendingModelChange !== null}
++        onChange={(mode) =>
++          void apply(() => useChatStore.getState().setSubagentRouting(mode, ...target))
++        }
++      />
+       <ComposerConfigSections
+         models={modelSection}
+         efforts={effortSection}
+diff --git a/web/src/components/composer/SubagentRoutingItem.test.tsx b/web/src/components/composer/SubagentRoutingItem.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..481fd07877ef63fd3a4dac4d2720e0f35949fb5a
+--- /dev/null
++++ b/web/src/components/composer/SubagentRoutingItem.test.tsx
+@@ -0,0 +1,114 @@
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, expect, it, vi } from "vitest";
++import { SUBAGENT_ROUTING_LABEL_KEY } from "@/components/CostRoutingControl";
++import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
++import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
++import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
++import type { Session } from "@/lib/types";
++import { useChatStore } from "@/store/chatStore";
++import { SubagentRoutingItem } from "./SubagentRoutingItem";
++
++const sessionRead = vi.hoisted(() => ({ session: null as unknown, reads: 0 }));
++vi.mock("@/hooks/useSession", () => ({
++  useSession: () => {
++    sessionRead.reads += 1;
++    return { session: sessionRead.session, isLoading: false, error: null };
++  },
++}));
++
++const initialState = useChatStore.getState();
++
++afterEach(() => {
++  cleanup();
++  useChatStore.setState(initialState, true);
++  sessionRead.session = null;
++  sessionRead.reads = 0;
++});
++
++const ROUTING_SERVER = { ...FALLBACK_SERVER_INFO, smart_routing_enabled: true };
++
++function nativeSession(labels: Record<string, string> = {}): Partial<Session> {
++  return { agentName: "claude-native-ui", parentSessionId: null, harness: "claude-native", labels };
++}
++
++function renderItem({
++  session,
++  override = null,
++  info = ROUTING_SERVER,
++  onChange = () => {},
++}: {
++  session: Partial<Session> | null;
++  override?: "on" | "off" | null;
++  info?: typeof FALLBACK_SERVER_INFO;
++  onChange?: (mode: "on" | "off") => void;
++}) {
++  sessionRead.session = session;
++  useChatStore.setState({ conversationId: "conv_1", subagentRoutingOverride: override });
++  return render(
++    <CapabilitiesProvider info={info}>
++      <DropdownMenu open>
++        <DropdownMenuContent>
++          <SubagentRoutingItem
++            sessionId={undefined}
++            conversationId="conv_1"
++            disabled={false}
++            onChange={onChange}
++          />
++        </DropdownMenuContent>
++      </DropdownMenu>
++    </CapabilitiesProvider>,
++  );
++}
++
++const item = () => screen.queryByTestId("composer-agent-subagent-routing");
++
++it("toggles sub-agent routing on a native session created with it", () => {
++  const onChange = vi.fn();
++  renderItem({
++    session: nativeSession({ [SUBAGENT_ROUTING_LABEL_KEY]: "1" }),
++    override: "on",
++    onChange,
++  });
++
++  expect(item()?.getAttribute("aria-checked")).toBe("true");
++  expect(item()?.getAttribute("data-subagent-routing-reach")).toBe("spawns");
++  expect(item()?.textContent).toBe("Route sub-agents");
++  fireEvent.click(item()!);
++  expect(onChange).toHaveBeenCalledWith("off");
++});
++
++it("keeps the control after the switch is turned off, so it can come back on", () => {
++  const onChange = vi.fn();
++  renderItem({
++    session: nativeSession({ [SUBAGENT_ROUTING_LABEL_KEY]: "1" }),
++    override: "off",
++    onChange,
++  });
++
++  expect(item()?.getAttribute("aria-checked")).toBe("false");
++  fireEvent.click(item()!);
++  expect(onChange).toHaveBeenCalledWith("on");
++});
++
++it("says so when only child sessions are routed", () => {
++  // A plain native launch has no spawn gate; the switch was turned on later.
++  renderItem({ session: nativeSession(), override: "on" });
++
++  expect(item()?.getAttribute("data-subagent-routing-reach")).toBe("child-sessions");
++  expect(item()?.textContent).toContain("Child sessions only");
++});
++
++it("offers nothing on a plain native session", () => {
++  renderItem({ session: nativeSession(), override: null });
++  expect(item()).toBeNull();
++});
++
++it("reads no session on a server that cannot route", () => {
++  renderItem({
++    session: nativeSession({ [SUBAGENT_ROUTING_LABEL_KEY]: "1" }),
++    override: "on",
++    info: FALLBACK_SERVER_INFO,
++  });
++  expect(item()).toBeNull();
++  expect(sessionRead.reads).toBe(0);
++});
+diff --git a/web/src/components/composer/SubagentRoutingItem.tsx b/web/src/components/composer/SubagentRoutingItem.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f9c3a7e7fcad1e5b831499c3ffde7f929c46bcd
+--- /dev/null
++++ b/web/src/components/composer/SubagentRoutingItem.tsx
+@@ -0,0 +1,74 @@
++import { NetworkIcon } from "lucide-react";
++import { subagentRoutingReach } from "@/components/CostRoutingControl";
++import { useSessionField } from "@/components/composer/sessionPickerInputs";
++import { DropdownMenuCheckboxItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
++import { useSession } from "@/hooks/useSession";
++import { SUBAGENT_ROUTING_LABEL } from "@/lib/agentLabels";
++import { useServerInfo } from "@/lib/CapabilitiesContext";
++
++interface SubagentRoutingItemProps {
++  /** Read and change this session instead of the active conversation. */
++  sessionId: string | undefined;
++  /** The conversation the picker is showing, or `null` before one exists. */
++  conversationId: string | null;
++  disabled: boolean;
++  /** Persist the switch; the picker runs it under its busy guard. */
++  onChange: (mode: "on" | "off") => void;
++}
++
++/**
++ * The session picker's "Route sub-agents" row: Smart Routing picks the model
++ * of each sub-agent the session starts while the session keeps its own.
++ * Renders nothing on a server that cannot route or a session with no control.
++ */
++export function SubagentRoutingItem(props: SubagentRoutingItemProps) {
++  const serverInfo = useServerInfo();
++  if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return null;
++  if (props.conversationId === null) return null;
++  return <RoutableSubagentRoutingItem {...props} conversationId={props.conversationId} />;
++}
++
++function RoutableSubagentRoutingItem({
++  sessionId,
++  conversationId,
++  disabled,
++  onChange,
++}: SubagentRoutingItemProps & { conversationId: string }) {
++  const { session } = useSession(conversationId);
++  const override = useSessionField(sessionId, (state) => state.subagentRoutingOverride);
++  // The store holds the live switch; the snapshot's can trail a toggle.
++  const costControlModeOverride = useSessionField(
++    sessionId,
++    (state) => state.costControlModeOverride,
++  );
++  const reach =
++    session === null
++      ? null
++      : subagentRoutingReach({ ...session, costControlModeOverride }, override);
++  if (reach === null) return null;
++  return (
++    <>
++      <DropdownMenuCheckboxItem
++        checked={override === "on"}
++        disabled={disabled}
++        onCheckedChange={(checked) => onChange(checked ? "on" : "off")}
++        onSelect={(event) => event.preventDefault()}
++        className="items-start"
++        data-testid="composer-agent-subagent-routing"
++        data-subagent-routing-reach={reach}
++      >
++        <NetworkIcon className="mt-0.5 size-4" aria-hidden="true" />
++        <span className="flex min-w-0 flex-col">
++          <span>{SUBAGENT_ROUTING_LABEL}</span>
++          {reach === "child-sessions" && (
++            <span className="text-xs whitespace-normal text-muted-foreground">
++              Child sessions only. This session started without sub-agent routing, so its built-in
++              sub-agents keep their own model.
++            </span>
++          )}
++        </span>
++      </DropdownMenuCheckboxItem>
++      <DropdownMenuSeparator />
++    </>
++  );
++}
+diff --git a/web/src/lib/agentLabels.ts b/web/src/lib/agentLabels.ts
+index 01af66911393a3c0bd58569d0e662d4716e59269..2b5229642909c1597ae928dbf111d7086b5c8607 100644
+--- a/web/src/lib/agentLabels.ts
++++ b/web/src/lib/agentLabels.ts
+@@ -152,6 +152,9 @@ export const AUTO_NATIVE_HARNESS_ID = "auto-native";
+  */
+ export const SMART_ROUTING_LABEL = "Smart Routing";
+ 
++/** User-facing name for routing only the sub-agents a session starts. */
++export const SUBAGENT_ROUTING_LABEL = "Route sub-agents";
++
+ /**
+  * Whether a harness id is one of the fully-auto sentinels, i.e. the router owns
+  * the harness pick. Use the individual ids where the two flavors differ.
+diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
+index ba6428ea75f084c9cc386ba083480e97ef1113c6..ed85ff6a23392bdcb7c350638e9cecbcc88a7fa7 100644
+--- a/web/src/shell/NewChatDialog.test.tsx
++++ b/web/src/shell/NewChatDialog.test.tsx
+@@ -11397,6 +11397,70 @@ describe("NewChatLandingScreen smart routing", () => {
+     expect(body.reasoning_effort).toBeUndefined();
+   });
+ 
++  // "Route sub-agents" keeps the model picked here for the session itself and
++  // lets the router pick only the models of the sub-agents it starts.
++  it.each([
++    ["Claude Code", "a1", "Opus 4.8", true],
++    // The Codex default row is its own pick and pins nothing.
++    ["Codex", "a2", "GPT-5.5", false],
++  ] as const)(
++    "sends subagent_routing_override 'on' beside a picked %s model",
++    async (_label, agentId, model, pinsModel) => {
++      authenticatedFetchMock.mockResolvedValue({
++        ok: true,
++        json: async () => ({ id: "conv_subagent_routed" }),
++      } as unknown as Response);
++      renderLanding({ smart_routing_enabled: true });
++      await waitFor(() =>
++        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
++      );
++      openAgentModels(agentId);
++      pickPrimaryOption("model", model);
++      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Route sub-agents" }));
++      expect(screen.getByRole("menuitemcheckbox", { name: "Route sub-agents" })).toHaveAttribute(
++        "aria-checked",
++        "true",
++      );
++      closePrimaryPicker();
++
++      const { body } = await submitAndReadBody("refactor the auth module");
++      expect(body.agent_id).toBe(agentId);
++      expect(body.subagent_routing_override).toBe("on");
++      // The session's own model is the user's pick, never the router's.
++      expect(body.model_override !== undefined).toBe(pinsModel);
++      expect(body.cost_control_mode_override).toBeUndefined();
++      expect(body.smart_routing_message).toBeUndefined();
++      expect(body.harness_override).not.toBe("auto");
++    },
++  );
++
++  it("offers Route sub-agents only beside a model the user picks", async () => {
++    authenticatedFetchMock.mockResolvedValue({
++      ok: true,
++      json: async () => ({ id: "conv_routed" }),
++    } as unknown as Response);
++    renderLanding({ smart_routing_enabled: true });
++    await waitFor(() =>
++      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
++    );
++    openAgentModels("a1");
++    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Route sub-agents" }));
++    // Smart Routing routes the session and its sub-agents, so the row goes.
++    pickPrimaryOption("model", "Smart Routing");
++    expect(screen.queryByRole("menuitemcheckbox", { name: "Route sub-agents" })).toBeNull();
++    closePrimaryPicker();
++
++    const { body } = await submitAndReadBody();
++    expect(body.cost_control_mode_override).toBe("on");
++    expect(body.subagent_routing_override).toBeUndefined();
++  });
++
++  it("offers no Route sub-agents on a server that cannot route", () => {
++    renderLanding({ smart_routing_enabled: false });
++    openAgentModels("a1");
++    expect(screen.queryByRole("menuitemcheckbox", { name: "Route sub-agents" })).toBeNull();
++  });
++
+   // The prompt rides along on a PINNED native create too, so the server routes
+   // the model before the pane launches. Routing after the fact means holding
+   // the first prompt inside the harness and replaying it, which the user sees
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 8f747f61b7142bda0f6f3d8981e34d536b41ea34..a50877ecb5201ffb42d3d405ff25eefe729d6397 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -98,6 +98,7 @@ import {
+   FolderGit2Icon,
+   FolderIcon,
+   FolderOpenIcon,
++  NetworkIcon,
+   PlusIcon,
+   ShuffleIcon,
+   WandSparklesIcon,
+@@ -283,6 +284,7 @@ import {
+   AUTO_NATIVE_HARNESS_ID,
+   isAutoHarness,
+   SMART_ROUTING_LABEL,
++  SUBAGENT_ROUTING_LABEL,
+   useBrainHarnessLabels,
+ } from "@/lib/agentLabels";
+ import {
+@@ -3116,6 +3118,9 @@ function NewChatLandingContent({
+     _setCostControlMode(mode);
+     if (mode === "on") _setPickedModel("");
+   }, []);
++  // "Route sub-agents": Smart Routing picks the model of each sub-agent the
++  // session starts, while the session keeps the model picked here.
++  const [routeSubagents, setRouteSubagents] = useState(false);
+   // Controls the working-directory popover so picking a directory closes it.
+   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
+   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
+@@ -4537,6 +4542,8 @@ function NewChatLandingContent({
+       !creating &&
+       (!pickerLoading || pickerInteractiveWhileLoading),
+   );
++  // Offered beside a picked model: with Smart Routing on, sub-agents route anyway.
++  const subagentRoutingOffered = smartRoutingEligible && !routingOn;
+   const selectedConfigContent =
+     selectedAgent && isEntryConfigurable(selectedAgent) ? (
+       <>
+@@ -4555,6 +4562,17 @@ function NewChatLandingContent({
+               <WandSparklesIcon className="size-4" aria-hidden="true" />
+               {SMART_ROUTING_LABEL}
+             </DropdownMenuCheckboxItem>
++            {subagentRoutingOffered && (
++              <DropdownMenuCheckboxItem
++                checked={routeSubagents}
++                onCheckedChange={setRouteSubagents}
++                onSelect={(event) => event.preventDefault()}
++                data-testid="new-chat-landing-agent-subagent-routing"
++              >
++                <NetworkIcon className="size-4" aria-hidden="true" />
++                {SUBAGENT_ROUTING_LABEL}
++              </DropdownMenuCheckboxItem>
++            )}
+             <DropdownMenuSeparator />
+           </>
+         )}
+@@ -6359,6 +6377,9 @@ function NewChatLandingContent({
+       // sending both would silently disable routing for the whole session. Never
+       // pin a model or an effort alongside routing, whatever the UI state says.
+       const routingOwnsModel = costControlOverride === "on";
++      // Sub-agent routing on a session whose own model is the one picked here.
++      const subagentRoutingOverride =
++        subagentRoutingOffered && routeSubagents && !routingOwnsModel ? "on" : undefined;
+       // A pinned native pane routes its MODEL at create too: the terminal
+       // launches with the session row and its turns start in the TUI, so
+       // routing after the fact means blocking the first prompt and replaying
+@@ -6604,6 +6625,7 @@ function NewChatLandingContent({
+                   ? null
+                   : (selectedNativeHarness ?? pickedHarness ?? null),
+                 costControlModeOverride: costControlOverride ?? null,
++                ...(subagentRoutingOverride ? { subagentRoutingOverride } : {}),
+                 boundAgentId: effectiveAgentId,
+                 // Name (not just id) so the in-session temp composer can evaluate
+                 // routing eligibility (isCostRoutingSession needs a bound agent).
+@@ -6714,6 +6736,7 @@ function NewChatLandingContent({
+           model_override: normalizedModelOverride ?? undefined,
+           reasoning_effort: normalizedReasoningEffort ?? undefined,
+           cost_control_mode_override: costControlOverride,
++          subagent_routing_override: subagentRoutingOverride,
+           // Top-level Smart Routing sends the same "auto" sentinel the bundle
+           // path does; the server tells them apart by the bound agent being a
+           // native wrapper, and routes at create time (the terminal launches
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index ea969c23057bd847f30084027d085431806d2ddd..6fde739f92654534c341f2b48d928c51275a47fd 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -21414,6 +21414,22 @@ describe("chatStore — setSubagentRouting", () => {
+     expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+   });
+ 
++  it("targets a given session and leaves the active one alone", async () => {
++    seedSession("conv_sr_cell", []);
++    seedSession("conv_sr_active", []);
++    await useChatStore.getState().switchTo("conv_sr_cell");
++    await useChatStore.getState().switchTo("conv_sr_active");
++
++    await useChatStore.getState().setSubagentRouting("on", "conv_sr_cell");
++
++    expect(patchBodies("conv_sr_cell")).toEqual([{ subagent_routing_override: "on" }]);
++    expect(patchBodies("conv_sr_active")).toEqual([]);
++    expect(conversationRegistry.peek("conv_sr_cell")!.getState().subagentRoutingOverride).toBe(
++      "on",
++    );
++    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
++  });
++
+   it("hydrates from the session snapshot on bind and resets on switch-away", async () => {
+     seedSession("conv_sr4", []);
+     seedSession("conv_sr5", []);
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 9577fffef657d0939285f8d6888907662dce0a3c..5525a56a367deb189d7f0871cc8aa2855e34a5b5 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -1510,9 +1510,10 @@ export interface ChatActions {
+    * Set the active session's sub-agent routing switch — optimistic local
+    * write, then PATCH; the server's canonical value (or a rollback on
+    * failure) settles the state. Two-state: ``"off"`` is the way back to
+-   * unrouted sub-agents. No-ops when there is no active conversation.
++   * unrouted sub-agents. Targets *sessionId* when given; otherwise no-ops
++   * when there is no active conversation.
+    */
+-  setSubagentRouting: (mode: "on" | "off") => Promise<void>;
++  setSubagentRouting: (mode: "on" | "off", sessionId?: string) => Promise<void>;
+   /**
+    * Re-read the active session's routing switches (cost control + sub-agent
+    * routing) from the server and apply them.
+@@ -4362,10 +4363,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+     }
+   },
+ 
+-  setSubagentRouting: async (mode) => {
+-    const { conversationId } = get();
+-    if (!conversationId) return;
+-    const previous = get().subagentRoutingOverride;
++  setSubagentRouting: async (mode, sessionId) => {
++    const target = sessionId === undefined ? get() : setterForState(sessionId);
++    const conversationId = sessionId ?? target?.conversationId;
++    if (!target || !conversationId) return;
++    const previous = target.subagentRoutingOverride;
+     // Optimistic write so the select responds instantly; the PATCH response
+     // (or the rollback below) is the settled truth. Unlike the session's own
+     // routing switch this never touches `model_override` — it governs the

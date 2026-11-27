@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Publish a build: push an immutable tag, push the server image, create the
 # GitHub release on the fork, then point the fork's custom branch at it.
+# A build set's release (BUILD_SET in build.env, tag custom/<date>.<n>-<set>)
+# stops before the last step: custom follows the whole series only, and such
+# a release is never marked as the latest.
 #
 #   custom/release/publish.sh <out-dir> <built-commit>
 #
@@ -35,6 +38,7 @@ fork="${FORK_REPO:-Desidero/omnigent}"
 resume=""
 # shellcheck disable=SC1091
 [[ ! -f "$out/plan.env" ]] || . "$out/plan.env"
+build_set="${BUILD_SET:-}"
 
 summary() { echo "$*"; [[ -z "${GITHUB_STEP_SUMMARY:-}" ]] || echo "$*" >> "$GITHUB_STEP_SUMMARY"; }
 run() {
@@ -49,6 +53,12 @@ die() { echo "::error::$*" >&2; exit 1; }
 [[ "$built" == "$CUSTOM_COMMIT" ]] \
   || die "rebuilt custom $built differs from the install set's $CUSTOM_COMMIT"
 [[ "$TAG" == custom/* ]] || die "$TAG is not a release tag; was the plan step skipped?"
+# A set's tag and the whole series' tag can never stand in for each other.
+if [[ -n "$build_set" ]]; then
+  [[ "$TAG" == *"-$build_set" ]] || die "$TAG is not a tag of set $build_set; plan it with plan.py --set $build_set"
+else
+  [[ "$TAG" =~ ^custom/[0-9-]+\.[0-9]+$ ]] || die "$TAG is a build set's tag, but build.env names no set"
+fi
 mode=""
 [[ "$dry_run" != true ]] || mode=", dry run"
 summary "### Publish $TAG ($VERSION)${resume:+, resuming}$mode"
@@ -88,7 +98,8 @@ Built from $fork@$PATCHES_COMMIT (the patches branch) onto ${UPSTREAM_REPO:-omni
 Build-Id: $BUILD_ID
 OSS-Commit: $OSS_COMMIT
 Patches-Commit: $PATCHES_COMMIT
-Image: $IMAGE"
+Image: $IMAGE${build_set:+
+Set: $build_set}"
   git -C "$repo" tag -a "$TAG" "$CUSTOM_COMMIT" -m "$message"
   summary "- tag $TAG on ${CUSTOM_COMMIT:0:12}"
   run git "${auth[@]}" -C "$repo" push --quiet "$push_url" "refs/tags/$TAG"
@@ -112,7 +123,13 @@ fi
 
 # 3. The GitHub release with the install set.
 args=(release create "$TAG" -R "$fork" --verify-tag --title "$TAG ($VERSION)" --notes-file "$out/notes.md")
-if [[ "$prerelease" == true ]]; then args+=(--prerelease); else args+=(--latest); fi
+if [[ "$prerelease" == true ]]; then
+  args+=(--prerelease)
+elif [[ -n "$build_set" ]]; then
+  args+=(--latest=false)
+else
+  args+=(--latest)
+fi
 mapfile -t assets < <(find "$out/release" -maxdepth 1 -type f ! -name '.*' | sort)
 if [[ "$dry_run" != true ]] && gh release view "$TAG" -R "$fork" >/dev/null 2>&1; then
   summary "- release $TAG already exists; not changing it"
@@ -128,6 +145,10 @@ fi
 
 # 4. The fork's custom branch, last, so it only ever points at a released build.
 #    Written only by this script; it moves sideways on every refresh.
+if [[ -n "$build_set" ]]; then
+  summary "- custom is not moved: set $build_set is a part of the series; its tag holds the build"
+  exit 0
+fi
 old_custom="$(git ls-remote "$fork_url" refs/heads/custom | cut -f1)"
 if [[ "$old_custom" == "$CUSTOM_COMMIT" ]]; then
   summary "- custom is already ${CUSTOM_COMMIT:0:12}"

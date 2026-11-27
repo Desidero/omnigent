@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Pick the tests to run for a change to the series: the ones near what it touches.
 
-  custom/scripts/select-tests.py --tree <built tree> --out <dir> [--since <ref> | --all]
+  custom/scripts/select-tests.py --tree <built tree> --out <dir> [--since <ref> | --all] [--set <name>]
 
 --since REF   the patches that differ from REF (a patch-id change, an added or a
-              removed patch) on the patches branch; a moved custom/BASE (an
-              upstream refresh) selects the whole series
+              removed patch; a moved or renumbered file is not a change) on the
+              patches branch; a moved custom/BASE (an upstream refresh) selects
+              the whole series
 --all         every patch in the series
+--set NAME    only the patches of that build set (custom/sets/NAME.txt, with
+              the series it needs); a change to the set file selects them all
 
 Writes <dir>/pytest.txt (test files), <dir>/vitest-run.txt (web test files)
 and <dir>/vitest-related.txt (web sources for `vitest related`), one path per
@@ -25,6 +28,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # custom/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import serieslib  # noqa: E402
 TOP = ROOT.parent  # the Omnigent checkout of the patches branch
 SKIP_TEST_DIRS = ("e2e", "e2e_ui", "e2e_live", "browser_ui", "benchmarks", "loadtest", "harness_bench")
 PYTEST_LIMIT = 250
@@ -37,10 +42,7 @@ def git(*args: str) -> str:
 
 
 def touched_files(patch_text: str) -> set[str]:
-    files = set()
-    for match in re.finditer(r"^diff --git a/(\S+) b/(\S+)$", patch_text, re.M):
-        files.update(match.groups())
-    return files
+    return set(serieslib.touched_files(patch_text))
 
 
 def patch_id(text: str) -> str:
@@ -48,36 +50,69 @@ def patch_id(text: str) -> str:
     return result.stdout.split(" ", 1)[0]
 
 
-def series_patches() -> list[str]:
-    lines = (ROOT / "series").read_text().splitlines()
-    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+def set_series(name: str | None) -> set[str] | None:
+    """The series a build set holds, with the ones they need; None means every series."""
+    if not name:
+        return None
+    catalog = serieslib.Catalog(ROOT)
+    try:
+        return set(catalog.select(catalog.set_members(name), needs=True)[0])
+    except serieslib.SeriesError as error:
+        sys.exit(f"error: {error}")
 
 
-def changed_patch_texts(since: str | None) -> tuple[list[str], str]:
+def in_set(patch: str, only: set[str] | None) -> bool:
+    """Whether a patch file belongs to the series: custom/patches/<series>/NN-<slug>.patch, or a
+    glue patch, custom/glue/<first>+<second>/NN-<slug>.patch, of two of them."""
+    series = Path(patch).parent.name
+    if series == "patches":  # the flat layout an older commit has: <series>--<slug>.patch
+        series = Path(patch).name.split("--", 1)[0]
+    return only is None or all(name in only for name in series.split("+"))
+
+
+def series_patches(only: set[str] | None = None) -> list[Path]:
+    """The patches of the series, and of the glue between them."""
+    catalog = serieslib.Catalog(ROOT)
+    names = [name for name in catalog.order if only is None or name in only]
+    return catalog.files(names) + [patch for glue in catalog.active_glue(names) for patch in glue.patches]
+
+
+def changed_patch_texts(since: str | None, set_name: str | None = None) -> tuple[list[str], str]:
     """Texts of the patches to cover, and why."""
-    current = series_patches()
+    only = set_series(set_name)
+    current = series_patches(only)
+    scope = f" of set {set_name}" if set_name else ""
     if since is None:
-        return [(ROOT / "patches" / name).read_text() for name in current], "all patches"
+        return [path.read_text() for path in current], f"all patches{scope}"
     # git runs in custom/, where a bare pathspec would mean custom/custom/...; anchor at the top.
-    names = git(
-        "diff", "--name-only", f"{since}...HEAD", "--", ":/custom/BASE", ":/custom/series", ":/custom/patches/"
-    ).split()
+    paths = [":/custom/BASE", ":/custom/patches/", ":/custom/glue/"]
+    set_path = f"custom/sets/{set_name}.txt"
+    if set_name:
+        paths.append(f":/{set_path}")
+    names = git("diff", "--name-only", "--no-renames", f"{since}...HEAD", "--", *paths).split()
     if "custom/BASE" in names:
-        return [(ROOT / "patches" / name).read_text() for name in current], "BASE moved: all patches"
-    texts = []
+        return [path.read_text() for path in current], f"BASE moved: all patches{scope}"
+    if set_name and set_path in names:
+        return [path.read_text() for path in current], f"set {set_name} changed: all its patches"
+    old: dict[str, str] = {}
+    new: dict[str, str] = {}
     for path in names:
-        if not path.endswith(".patch"):
+        if not path.endswith(".patch") or not in_set(path, only):
             continue
         new_file = TOP / path
         try:
             old_text = git("show", f"{since}:{path}")
         except subprocess.CalledProcessError:
             old_text = ""
-        new_text = new_file.read_text() if new_file.is_file() else ""
-        if old_text and new_text and patch_id(old_text) == patch_id(new_text):
-            continue  # only blob ids or line numbers moved
-        texts += [text for text in (old_text, new_text) if text]
-    return texts, f"{len(texts)} patch versions changed since {since}"
+        if old_text:
+            old[patch_id(old_text)] = old_text
+        if new_file.is_file():
+            new[patch_id(new_file.read_text())] = new_file.read_text()
+    # A patch id on both sides is a moved or renumbered file, or one where only
+    # blob ids or line numbers changed.
+    texts = [text for key, text in old.items() if key not in new]
+    texts += [text for key, text in new.items() if key not in old]
+    return texts, f"{len(texts)} patch versions{scope} changed since {since}"
 
 
 def python_tests(tree: Path, files: set[str]) -> list[str]:
@@ -131,11 +166,12 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--since")
     group.add_argument("--all", action="store_true")
+    parser.add_argument("--set", dest="set_name")
     args = parser.parse_args()
     tree, out = Path(args.tree), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    texts, why = changed_patch_texts(None if args.all else args.since)
+    texts, why = changed_patch_texts(None if args.all else args.since, args.set_name)
     files: set[str] = set()
     for text in texts:
         files |= touched_files(text)

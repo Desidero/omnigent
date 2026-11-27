@@ -1,0 +1,297 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Tue, 24 Nov 2026 18:21:19 +0000
+Subject: [PATCH] docs(deploy): document what a Databricks App needs after the
+ first deploy
+
+deploy/databricks/README.md gets an app running, but what a working
+deployment needs next was undocumented or only discoverable from code
+(https://github.com/Desidero/omnigent/issues/17). Add a "Configuring the
+app" section, written against the code at this base:
+
+- how the server config reaches an app, how to tell that it loaded, and
+  which config keys the Apps entry point honours (admins and
+  allowed_domains are not passed through);
+- smart routing: why it is off on an app, the `routing:` block that
+  turns it on, who calls the router and what is sent;
+- the MCP registry, the per-user Databricks connection and its
+  credential store, sharing defaults, that sessions need a host, the
+  OTel schema, and deploy practicalities;
+- every `sandbox.databricks` key, and `sandbox.host_config`.
+
+Settings are shown through the deployment overlay and the KMS service
+credential option, which is why this series needs both of those series.
+Statements that come from one deployment's experience and cannot be
+checked in this repository (managed MCP URL shapes, the read-only
+catalog failure, the --compute-size resize) are marked as not verified;
+the others the issue marked unverified are left out.
+
+Not upstream yet: not proposed, and there is no contribution branch for
+it. Most of it would apply upstream without the overlay examples.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: Desidero <desidero@gmail.com>
+---
+ deploy/databricks/README.md | 202 +++++++++++++++++++++++++++++++++++-
+ docs/databricks.md          |   7 ++
+ 2 files changed, 207 insertions(+), 2 deletions(-)
+
+diff --git a/deploy/databricks/README.md b/deploy/databricks/README.md
+index eda792e494e41494e1fea5e3afc3a27d657a9f44..0ed2dea5a7042ac6795276dd12944c75019c80d7 100644
+--- a/deploy/databricks/README.md
++++ b/deploy/databricks/README.md
+@@ -261,7 +261,14 @@ Environment variables read by `src/app.py`:
+ | `AP_ARTIFACT_VOLUME_PATH` | app resource `valueFrom: artifact_volume` | UC Volume path for artifacts |
+ | `DATABRICKS_APP_PORT` | Databricks runtime | App port (default 8000) |
+ | `AP_POOL_RECYCLE_SECONDS` | Optional | Connection pool recycle interval (default 300) |
+-| `OMNIGENT_CONFIG` | Optional | Path to a server config YAML. Its `sandbox:` section enables managed sandbox hosts (`host_type: "managed"`), parsed exactly as `omnigent server` parses it; a malformed section fails startup. Branding and title keys are read from the same file. |
++| `OMNIGENT_CONFIG` | Optional | Path to a server config YAML. Its `sandbox:` section enables managed sandbox hosts (`host_type: "managed"`), parsed exactly as `omnigent server` parses it; a malformed section fails startup. Branding and title keys are read from the same file. The keys this entry point honours are listed under [Server config](#server-config). |
++| `OMNIGENT_MCP_REGISTRY` | Optional | Path to the MCP service catalog ([MCP registry](#mcp-registry)). |
++| `OMNIGENT_FEATURES` | `--features` | Release-feature overrides. |
++| `OMNIGENT_SHARING_MODE`, `OMNIGENT_PUBLIC_SHARING` | Optional | Sharing defaults ([Sharing](#sharing)). |
++| `OMNIGENT_DATABRICKS_CLIENT_ID`, `OMNIGENT_DATABRICKS_CLIENT_SECRET`, `OMNIGENT_DATABRICKS_REDIRECT_URI` | Optional | The per-user Databricks account connection ([Server-managed Databricks Sandboxes](#server-managed-databricks-sandboxes)). |
++| `OMNIGENT_CREDENTIAL_KMS_KEY_ID`, `OMNIGENT_CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL`, `AWS_DEFAULT_REGION` | Optional | The credential store's KMS key, and the Unity Catalog service credential the app reaches it with. |
++
++Optional variables are set with a [deployment overlay](#deployment-overlay).
+ 
+ ## Multi-app safety — one bundle, many apps
+ 
+@@ -391,6 +398,176 @@ and config files named like `server-config.local.yml` beside it, do not show
+ up as uncommitted changes. An `env` value is written into the bundle as it
+ is, so the Databricks CLI reads `${...}` inside it as a bundle substitution.
+ 
++## Configuring the app
++
++A deployed app is configured through its env vars and the files beside
++`app.py`. A [deployment overlay](#deployment-overlay) supplies both, so nothing
++here needs an edit to a tracked file. An overlay for an app with managed
++sandboxes, the per-user Databricks connection and an MCP registry:
++
++```yaml
++# deploy/databricks/deploy.local.yml
++host: https://<workspace-host>
++extras: [kms]
++env:
++  OMNIGENT_CONFIG: server-config.yml
++  OMNIGENT_MCP_REGISTRY: mcp-registry.yml
++  OMNIGENT_DATABRICKS_CLIENT_ID: <oauth-client-id>
++  OMNIGENT_DATABRICKS_REDIRECT_URI: https://<app-url>/v1/connections/databricks/callback
++  OMNIGENT_CREDENTIAL_KMS_KEY_ID: <kms-key-arn>
++  OMNIGENT_CREDENTIAL_KMS_UC_SERVICE_CREDENTIAL: <service-credential-name>
++  AWS_DEFAULT_REGION: <aws-region>
++  OMNIGENT_SHARING_MODE: read_only
++  OMNIGENT_PUBLIC_SHARING: "off"
++secret_env:
++  OMNIGENT_DATABRICKS_CLIENT_SECRET:
++    scope: <secret-scope>
++    key: <secret-key>
++files:
++  server-config.yml: server-config.local.yml
++  mcp-registry.yml: mcp-registry.local.yml
++```
++
++### Server config
++
++`OMNIGENT_CONFIG` names a server config YAML; ship the file with the overlay's
++`files` and set the variable to its name. A relative path resolves against the
++directory the app is started in, the one `python app.py` runs from.
++
++A missing, unreadable or malformed file does not stop the app: it logs
++`server config <path> unreadable/invalid: … — falling back to env` and runs
++with defaults. After a deploy, look for `loaded server config from <path>` in
++the app's logs.
++
++The Apps entry point honours these keys:
++
++| Key | Use |
++|---|---|
++| `sandbox` | Managed sandbox hosts ([below](#server-managed-databricks-sandboxes)). A malformed section fails startup. |
++| `llm` | The server-side model, used by policies and by the built-in routing judge. |
++| `routing` | [Smart routing](#smart-routing). |
++| `policies`, `policy_modules` | Default policies and the modules that provide policy code. |
++| `execution_timeout` | Maximum wall-clock seconds for an agent loop (default 7200). |
++| `native_hook_allow_cache_seconds` | Seconds a native policy hook's allow decision is cached; unset keeps every hook a server round trip. |
++| `branding`, `default_agent_name`, `restrict_to_agent_names`, `session_title_instructions` | The web UI's branding, the New Chat picker and session titles. |
++| `automation_trigger_poll_minutes`, `scheduled_task_scheduler`, `recovery_prompt`, `filesystem_attachment_allowed_extensions`, `debug_router_modules` | Passed to the server as for `omnigent server`. |
++
++Not honoured here, although the Docker entry point reads them from the same
++file: `admins` and `allowed_domains` (the Apps entry point does not pass them
++to the server), and `database_uri`, `artifact_location`, `artifact_store_uri`,
++`host` and `port` (an app takes those from its Lakebase and volume resources
++and from `DATABRICKS_APP_PORT`).
++
++### Smart routing
++
++Smart routing is off on an app until the server config says how to route.
++Without a `routing:` block, the server builds the workspace router only when
++it finds a `kind: databricks` provider with a CLI `profile`, which an app does
++not have; and it builds the built-in judge only from an `llm:` block. With
++neither, `GET /v1/info` reports `smart_routing_enabled: false`.
++
++To route through the workspace's Unity Gateway:
++
++```yaml
++routing:
++  provider: external
++  base_url: https://<workspace-host>/ai-gateway/routing/v1
++  router_name: task_v1
++```
++
++- **Who calls the router.** With no `api_key` or `profile` in the block, the
++  server authenticates with the ambient Databricks SDK credentials, which on an
++  app are the app's service principal, not the user. It attaches them only
++  when the router's host is the ambient workspace host, so a `base_url`
++  elsewhere gets no workspace token.
++- **What is sent.** Each routing request carries up to the first 4,000
++  characters of the prompt and the candidate models.
++- **The router's own model.** The router makes its own model call;
++  `routing.selection_model` pins the model it uses, and `routing.menus`
++  replaces the candidate menu the router requires.
++- **The built-in judge.** An `llm:` block adds a second router, which serves
++  harnesses whose inference does not run through the workspace gateway.
++  `GET /v1/info` reports which of the two can answer in
++  `smart_routing_sources` (`external` and `oss`).
++- **The Smart Routing choice on the New Chat page** needs the external router,
++  both native wrapper agents (Claude and Codex) registered, both CLIs ready on
++  the selected host, and both running through the workspace gateway.
++- **Off.** `routing: {provider: none}` builds neither router.
++
++Not verified here: that an app's service principal is allowed to call the
++routing API in a given workspace, and a routed turn end to end.
++
++### MCP registry
++
++`OMNIGENT_MCP_REGISTRY` names the YAML catalog of MCP services the server
++offers; there is no other way to supply it. Ship it with the overlay's `files`.
++The format is in
++[`examples/mcp-registry/README.md`](../../examples/mcp-registry/README.md#administrator-configuration).
++An invalid catalog fails startup.
++
++- `auth: databricks` calls the service with the user's own Databricks account
++  connection, so it needs that connection configured (below).
++- `tools` is required and is an allowlist of exact tool names; there is no
++  wildcard. Generate it from each endpoint's tool list and regenerate it when
++  a service changes.
++
++Reported by one deployment and not verifiable from this repository: managed MCP
++URLs are `/api/2.0/mcp/functions/<catalog>/<schema>` for Unity Catalog
++functions and `/ai-gateway/mcp-services/<catalog>.<schema>.<name>` for Unity
++Gateway MCP services.
++
++### Sharing
++
++Two env vars set the sharing defaults, and neither is specific to Databricks:
++
++- `OMNIGENT_SHARING_MODE`: `on` (default), `read_only`,
++  `restricted_read_only` or `off`. It limits the grants people can create on
++  their sessions.
++- `OMNIGENT_PUBLIC_SHARING`: `off` stops anyone-with-the-link access; the
++  default is on.
++
++A session's agent runs as the session's owner, and with `proxy_bearer` the
++sandbox holds the owner's Databricks token. For a multi-user deployment, start
++from `read_only` and public sharing off unless letting collaborators drive each
++other's sessions is a deliberate choice.
++
++### Sessions need a host
++
++The app's entry point starts the server only; sessions run on hosts. Either
++configure managed sandboxes (below), or have each user attach a machine with
++`omnigent host https://<app-url>`.
++
++### Telemetry
++
++The `prod` target runs the app under `opentelemetry-instrument` and has the
++platform write logs, metrics and spans to `<schema>.otel_logs`,
++`<schema>.otel_metrics` and `<schema>.otel_spans`; `--otel-table-schema`
++chooses the schema (default `main.omnigent_logs`). The export API rejects
++tables in default storage, so the workspace needs a custom storage location;
++otherwise deploy with `--no-otel`. What the spans carry, and the variables that
++add content or user attribution, are in
++[`docs/databricks.md`](../../docs/databricks.md#4-mlflow-tracing-in-unity-catalog).
++
++Reported by one deployment and not verified here: a catalog bound read-only to
++the workspace also fails the export, so pick a schema the workspace can write.
++
++### Deploy notes
++
++- **uv.** The repo's `uv.toml` requires uv 0.13.4 or newer.
++- **`--allow-dirty`.** The deploy refuses to run unless the tree is clean and
++  `HEAD` is `origin/main`. Deploying a release tag or a branch therefore needs
++  `--allow-dirty`, and so does a tree that still holds the untracked wheels a
++  previous deploy left in `src/`. The overlay and its `*.local.yml` files are
++  gitignored and do not count.
++- **Wheels.** `deploy.py` builds its own wheels with the web UI kept outside
++  them. Wheels built with the web UI inside, as for other install paths, are
++  over the 10 MB per-file cap and cannot be reused with `--skip-build`.
++- **`--compute-size`.** `deploy.py` resizes an existing app before
++  `bundle deploy`, and the bundle itself does not declare a size. One
++  deployment reports that the resize is logged on every deploy and the app
++  stays at its previous size. Not verified or fixed here; check the app's size
++  in the workspace after a deploy.
++
+ ## Server-managed Databricks Sandboxes
+ 
+ The `databricks` sandbox provider runs managed sessions (`host_type: "managed"`, or
+@@ -415,8 +592,19 @@ sandbox:
+     proxy_bearer: true                 # only behind the Databricks Apps OAuth proxy
+     inactivity_timeout_s: 3600         # optional idle stop; resumed on the next turn
+     sandbox_id_prefix: omnigent        # optional
++    bootstrap_command: uv tool install omnigent==<server version>   # optional
++  # host_config: …                     # optional; the in-sandbox ~/.omnigent/config.yaml
+ ```
+ 
++These five are all the keys `sandbox.databricks` takes; any other key fails
++startup. `bootstrap_command` runs in the Sandbox before every host start (the
++first launch and every resume), which makes it the way to pin Sandboxes to the
++server's build. `inactivity_timeout_s` must be at least twice the keepalive
++interval. `sandbox.host_config` is written into the Sandbox as its host
++config before the host starts; its `providers` and `inference.harnesses`
++sections bind harnesses to a model provider
++([MANAGED_SANDBOX_MODEL_SELECTION.md](../../designs/MANAGED_SANDBOX_MODEL_SELECTION.md)).
++
+ `workspace_host` is the workspace Sandboxes run in; a user connected to any other
+ workspace is refused, so their existing Sandboxes are never lost track of. With `proxy_bearer: true`,
+ the Sandbox's `omnigent` must include proxy-bearer support, so pin it with a
+@@ -427,12 +615,22 @@ image's built-in copy is older than the server.
+ app integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
+ with the redirect URL `<server_url>/v1/connections/databricks/callback` and the
+ scopes `all-apis offline_access` (see
+-[DATABRICKS_CONNECT.md](../../designs/DATABRICKS_CONNECT.md)). Set its client id and
++[DATABRICKS_CONNECT.md](../../designs/DATABRICKS_CONNECT.md); it still shows an
++older `/v1/integrations/…` callback path, and the route in the code is the one
++above). Set its client id and
+ secret in `OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`,
+ and a credential-store key (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or
+ `OMNIGENT_CREDENTIAL_VAULT_KEY`) to encrypt the stored tokens. The Apps entry
+ point (`src/app.py`), `omnigent server`, and the Docker entry point all read these.
+ 
++The server also needs the redirect URL itself: set
++`OMNIGENT_DATABRICKS_REDIRECT_URI`, or `OMNIGENT_DOMAIN` to derive it. Without
++the client id, the secret and one of those two, the connection is off. The
++integration needs a client secret, which belongs in a secret scope: name it
++under the overlay's `secret_env` rather than `env`. There is no local-key
++credential store: without a KMS or Vault key the entry point logs that the
++connection is configured but disabled.
++
+ **Credential store on an App (AWS KMS).** A Databricks App has no AWS identity,
+ so the KMS backend cannot find credentials on its own. Create a Unity Catalog
+ service credential that wraps an IAM role allowed `kms:Encrypt` and
+diff --git a/docs/databricks.md b/docs/databricks.md
+index 6037204182930dacca4c028375a82bb509133ebc..b006106c7a4342d7e2e97f2dd0bc5e3c110d9eb3 100644
+--- a/docs/databricks.md
++++ b/docs/databricks.md
+@@ -218,6 +218,13 @@ for the app source) go in one untracked file passed with
+ is in the README's
+ [Deployment overlay](../deploy/databricks/README.md#deployment-overlay) section.
+ 
++What a running app needs beyond the first deploy is in the README's
++[Configuring the app](../deploy/databricks/README.md#configuring-the-app)
++section: how the server config and the MCP registry reach the app and which
++config keys the Apps entry point honours, turning on smart routing, the
++per-user Databricks connection and its credential store, sharing defaults,
++and why sessions need a host.
++
+ ### What you get on Databricks vs DIY
+ 
+ Self-hosting the omnigent server (e.g., on a VM or in a container)

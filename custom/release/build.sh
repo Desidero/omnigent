@@ -18,17 +18,24 @@
 #                        ghcr.io/desidero/omnigent-server)
 # --previous-manifest F  manifest.json of the previous release, for the notes
 # --note TEXT            extra line for the notes header (e.g. the pull request)
+# --set NAME             the tree is a build of that set (build-custom.sh --set
+#                        NAME); its name goes into the version, tag and image
+# --names-only           print build.env's lines (version, tag, image) and stop;
+#                        needs no --out
 #
 # Version: <upstream version>+oss<BASE:8>.p<patches commit:7>, e.g.
-# 0.20.0.dev0+oss65be0f24.p0123abc. Needs uv, node 22 and pnpm (web UI).
+# 0.20.0.dev0+oss65be0f24.p0123abc; a set's ends in .<set>, e.g.
+# 0.20.0.dev0+oss65be0f24.p0123abc.fixes. Needs uv, node 22 and pnpm (web UI).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # custom/
-tree="" out="" tag="" patches_commit="" previous="" note=""
+tree="" out="" tag="" patches_commit="" previous="" note="" set_name="" names_only=0
 fork="${FORK_REPO:-Desidero/omnigent}"
 image_name="${IMAGE_NAME:-ghcr.io/desidero/omnigent-server}"
-# Extras whose dependencies constraints.txt pins too (server: postgres).
-constraint_extras=(postgres vault)
+# Extras whose dependencies constraints.txt pins too (server: postgres; hosts:
+# antigravity, see install-host.sh). They must resolve together: antigravity
+# needs protobuf 7, so cwsandbox and modal (protobuf<7) cannot join this list.
+constraint_extras=(postgres vault antigravity)
 
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 while [[ $# -gt 0 ]]; do
@@ -41,32 +48,60 @@ while [[ $# -gt 0 ]]; do
     --image) image_name="$2"; shift 2 ;;
     --previous-manifest) previous="$2"; shift 2 ;;
     --note) note="$2"; shift 2 ;;
+    --set) set_name="$2"; shift 2 ;;
+    --names-only) names_only=1; shift ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
 done
-[[ -n "$tree" && -n "$out" ]] || usage 2
+[[ -n "$tree" && ( -n "$out" || "$names_only" == 1 ) ]] || usage 2
 tree="$(cd "$tree" && pwd)"
-mkdir -p "$out"
-out="$(cd "$out" && pwd)"
+if [[ "$names_only" != 1 ]]; then
+  mkdir -p "$out"
+  out="$(cd "$out" && pwd)"
+fi
 
 base="$(tr -d '[:space:]' < "$here/BASE")"
 custom="$(git -C "$tree" rev-parse HEAD)"
-[[ "$(git -C "$tree" rev-list --count "$base..HEAD")" -gt 0 ]] \
-  || { echo "error: $tree is not a build of the series on BASE ${base:0:12}" >&2; exit 2; }
+set_series=""
+set_args=()
+if [[ -n "$set_name" ]]; then
+  # The set's series (series-files.sh also checks the name).
+  set_series="$("$here/scripts/series-files.sh" --set "$set_name" --names 2>/dev/null)" \
+    || { "$here/scripts/series-files.sh" --set "$set_name" --names >/dev/null || true; exit 2; }
+  set_args=(--set "$set_name")
+fi
+# The tree must be at the commit the series (or the set) build to: the build
+# is reproducible, so the engine names that commit without building a tree.
+expected="$(python3 -I "$here/scripts/serieslib.py" build --repo "$tree" "${set_args[@]}" 2>/dev/null)" \
+  || { python3 -I "$here/scripts/serieslib.py" build --repo "$tree" "${set_args[@]}" >/dev/null || true; exit 2; }
+if [[ "$custom" != "$expected" ]]; then
+  echo "error: $tree is at ${custom:0:12}, not the build of ${set_name:+set $set_name of }the series on BASE ${base:0:12} (${expected:0:12}); build it with build-custom.sh${set_name:+ --set $set_name}" >&2
+  exit 2
+fi
 [[ -z "$(git -C "$tree" status --porcelain --untracked-files=no)" ]] \
   || { echo "error: $tree has local changes; build from a clean tree" >&2; exit 2; }
 dirty=""
 if [[ -z "$patches_commit" ]]; then
   patches_commit="$(git -C "$here" rev-parse HEAD)"
-  [[ -z "$(git -C "$here" status --porcelain -- BASE series patches release)" ]] || dirty=.dirty
+  [[ -z "$(git -C "$here" status --porcelain -- BASE patches glue release ${set_name:+sets})" ]] || dirty=.dirty
 fi
 
 upstream_version="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$tree/pyproject.toml")"
-build_id="oss${base:0:8}.p${patches_commit:0:7}${dirty}"
+build_id="oss${base:0:8}.p${patches_commit:0:7}${set_name:+.$set_name}${dirty}"
 version="${upstream_version}+${build_id}"
 [[ -n "$tag" ]] || tag="build/$build_id"
 image="$image_name:${tag//\//-}"
+build_env() {
+  printf '%s\n' "VERSION=$version" "BUILD_ID=$build_id" "TAG=$tag" "IMAGE=$image" \
+    "CUSTOM_COMMIT=$custom" "OSS_COMMIT=$base" "PATCHES_COMMIT=$patches_commit" "FORK_REPO=$fork"
+  # Only a set build has this line, so the whole series' build.env is as before.
+  [[ -z "$set_name" ]] || echo "BUILD_SET=$set_name"
+}
+if [[ "$names_only" == 1 ]]; then
+  build_env
+  exit 0
+fi
 echo "building $version ($tag) from custom ${custom:0:12}" >&2
 
 rel="$out/release"
@@ -101,10 +136,16 @@ done
 chmod +x "$rel"/*.sh
 
 # Series list (with patch ids) for the manifest, then the manifest itself.
-python3 -I "$here/release/notes.py" series --custom "$here" > "$out/series.json"
+series_args=(series --custom "$here")
+manifest_args=()
+if [[ -n "$set_name" ]]; then
+  series_args+=(--names "$(tr '\n' ',' <<< "$set_series")")
+  manifest_args+=(--set "$set_name")
+fi
+python3 -I "$here/release/notes.py" "${series_args[@]}" > "$out/series.json"
 python3 -I "$here/release/hostlib.py" manifest --dir "$rel" --tag "$tag" --commit "$custom" \
   --image "$image" --build-id "$build_id" --oss-commit "$base" --patches-commit "$patches_commit" \
-  --patches-repo "$fork" --fork-repo "$fork" --series-json "$out/series.json"
+  --patches-repo "$fork" --fork-repo "$fork" --series-json "$out/series.json" "${manifest_args[@]}"
 
 notes_args=(render --manifest "$rel/manifest.json" --tree "$tree" --custom "$here"
   --fork "$fork" --notes "$out/notes.md" --docs "$rel/custom-docs.md")
@@ -116,14 +157,5 @@ python3 -I "$here/release/notes.py" "${notes_args[@]}"
 cp "$here/release/server.Dockerfile" "$out/image/"
 cp "$tree/deploy/docker/entrypoint.py" "$out/image/"
 
-cat > "$out/build.env" <<EOF
-VERSION=$version
-BUILD_ID=$build_id
-TAG=$tag
-IMAGE=$image
-CUSTOM_COMMIT=$custom
-OSS_COMMIT=$base
-PATCHES_COMMIT=$patches_commit
-FORK_REPO=$fork
-EOF
+build_env > "$out/build.env"
 echo "built $out: $(cd "$rel" && ls | tr '\n' ' ')" >&2

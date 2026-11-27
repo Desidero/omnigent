@@ -1,38 +1,35 @@
-<!-- Draft PR body for the claude-native-subagent-status series; title: fix(claude-native): keep quiet sub-agents running until their turn ends -->
+<!-- Draft PR body for the claude-native-subagent-status series; title: fix(claude-native): settle a mirrored sub-agent when its parent records the result -->
+> Status: not filed. The series was shrunk at the 2026-11-24 refresh: upstream fixed the other half (a sub-agent in a long tool call no longer flips to idle) in #13811, so only the server-side settle below is left. The open upstream PR #12411 (not ours) changes the same function; check it before filing.
+
 ## Related issue
 
 Closes #TODO (issue to be opened)
 
+Related: #13811 (merged; the forwarder now keeps an open turn running for up to 600 seconds), #12411 (open).
+
 ## Summary
 
-A Claude sub-agent running a long command (a build, a test suite, a sleep) writes nothing to its transcript until the command returns. Omnigent took that silence as "idle" after five seconds, so the Agents rail showed the child idle or done while it was still working. It now checks how the child's transcript ends before calling it idle.
+A mirrored Claude sub-agent that is killed in the middle of a tool call never writes a turn end. Since #13811 the forwarder keeps such a child "running" until its 600-second mid-turn window runs out, although the parent already holds the child's result, so the Agents rail shows a finished child as Working for up to ten minutes.
 
-- **Turn-phase check.** Before reporting a quiet child idle, the forwarder classifies the end of its transcript:
-  - a pending tool call keeps it running however long the tool takes;
-  - a turn awaiting a model reply counts as idle only after ten quiet minutes (a live model call keeps writing records well within that);
-  - a final reply (a `stop_reason` other than `tool_use`/`pause_turn`), a `SubagentHandback` result, or a user interrupt ends the turn;
-  - a transcript with no readable message record keeps the old lull rule.
-- **Cheap polls.** The tail read starts at 64 KiB and grows (up to 8 MiB) until it holds a message record; the result is cached by file size and mtime, and the check is skipped once the child is already idle.
-- **Server-side settle.** A child killed mid-tool never writes a turn end, so the server now also settles a running or waiting mirrored child to idle (or failed) when the parent records that child's result. Deduplicated (retried) results are skipped, so a resumed child is not cut short.
+- **Server-side settle.** When the parent records a child's result, the server settles a child that is still running or waiting: idle for a completed result, failed for a failed one (`failure_origin="claude_subagent_result"`).
+- **Retries are skipped.** A deduplicated (retried) result may predate a resumed run of the same child, so it settles nothing and a resumed child is not cut short.
+- **Nothing else changes.** A child that already reported idle or failed is left as it is; the forwarder's own idle rules are upstream's.
 
 ## Test Plan
 
-Tests added or changed:
+Test changed:
 
-- `tests/harnesses/claude_native/forwarder/test_subagent_status.py::test_quiet_subagent_is_idle_only_once_its_turn_ends`: pending tool, final reply, streaming reply, stalled reply, awaiting model, large tool output (tail growth), handback, interrupt, no messages.
-- `tests/server/routes/test_subagent_activity.py::test_claude_completion_survives_retries_and_late_child_discovery`: a live result settles a running child once; a retry or a late-discovered child does not.
-- `tests/harnesses/claude_native/forwarder/test_subagent_status.py`, `tests/harnesses/claude_native/forwarder/test_subagent_delivery.py`, `tests/e2e/test_subagent_status_compat_e2e.py`: existing idle tests now write `stop_reason: "end_turn"` on the final reply, as Claude does.
+- `tests/server/routes/test_subagent_activity.py::test_claude_completion_survives_retries_and_late_child_discovery`: a live result settles a running child once (idle, or failed for a failed result); a retry or a late-discovered child settles nothing.
 
 ```sh
-uv run pytest tests/harnesses/claude_native/forwarder/test_subagent_status.py tests/harnesses/claude_native/forwarder/test_subagent_delivery.py tests/server/routes/test_subagent_activity.py
-uv run pytest tests/e2e/test_subagent_status_compat_e2e.py
+uv run pytest tests/server/routes/test_subagent_activity.py
 ```
 
 Manual:
 
-1. In a claude-native session, ask: "Spawn a sub-agent that runs `sleep 90 && echo done` with Bash and reports the output."
-2. Watch the Agents rail: the child stays Working for the whole 90 seconds (before this change it flipped to idle after about five seconds), then goes idle once it replies.
-3. Spawn another sub-agent running `sleep 600`, then interrupt the parent so the child is killed mid-tool. Once the parent records the child's result, the child leaves Working.
+1. In a claude-native session, ask: "Spawn a sub-agent that runs `sleep 600` with Bash."
+2. While the child is Working, interrupt the parent so the child is killed mid-tool.
+3. Once the parent records the child's result, the child leaves Working in the Agents rail (before this change it stayed Working until the forwarder's ten-minute window ended).
 
 ## Demo
 
@@ -40,8 +37,8 @@ Manual:
 - [x] Non-visual evidence provided below or in Test Plan
 - [ ] Not applicable — no behavioral change
 
-- [ ] TODO: short recording or before/after screenshots of the Agents rail during a 90-second sub-agent `sleep` (throwaway server, dummy task)
-- [ ] TODO: attach the pytest output for the commands above
+- [ ] TODO: short recording or before/after screenshots of the Agents rail after a sub-agent is killed mid-tool (throwaway server, dummy task)
+- [ ] TODO: attach the pytest output for the command above
 
 ## Type of change
 
@@ -57,14 +54,14 @@ Manual:
 
 - [x] Unit tests added / updated
 - [ ] Integration tests added / updated
-- [x] E2E tests added / updated
+- [ ] E2E tests added / updated
 - [ ] Manual verification completed
 - [ ] Existing tests cover this change
 - [ ] Not applicable
 
 ## Coverage notes
 
-The phase classifier is tested directly against transcript files covering each turn-ending and non-ending shape; the server settle path is tested through the external-item persistence route with retries and late child discovery. The E2E change only adds the `stop_reason` Claude writes.
+The settle path is tested through the external-item persistence route, with a live result, a retried result and a late-discovered child, for completed and failed results.
 
 ## Release notes
 

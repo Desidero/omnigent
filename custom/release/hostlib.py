@@ -215,6 +215,8 @@ def cmd_manifest(args: argparse.Namespace) -> None:
         },
         "built_with": built_with,
     }
+    if args.set_name:
+        manifest["set"] = args.set_name
     if args.series_json:
         manifest["series"] = json.loads(Path(args.series_json).read_text())
     (folder / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -458,6 +460,7 @@ def main() -> None:
     p.add_argument("--patches-repo", default="")
     p.add_argument("--fork-repo", default="")
     p.add_argument("--series-json", help="series -> patches list from release/notes.py")
+    p.add_argument("--set", dest="set_name", default="", help="the build set, when not the whole series")
     p.set_defaults(func=cmd_manifest)
 
     p = sub.add_parser("release-info")

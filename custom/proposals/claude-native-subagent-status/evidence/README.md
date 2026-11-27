@@ -11,5 +11,5 @@ sharing.
 
 To capture:
 
-- short recording or before/after screenshots of the Agents rail during a 90-second sub-agent `sleep` (throwaway server, dummy task)
-- attach the pytest output for the commands above
+- short recording or before/after screenshots of the Agents rail after a sub-agent is killed mid-tool (throwaway server, dummy task)
+- attach the pytest output for the command above

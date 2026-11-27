@@ -84,8 +84,8 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
   clearUnreadOverride,
@@ -102,6 +102,7 @@ import {
   type InboxSource,
   type UnreadInboxItem,
 } from "@/lib/inbox";
+import { useMutedProjects } from "@/lib/sessionMute";
 import {
   isInboxFilter,
   readInboxFilter,
@@ -129,6 +130,7 @@ import {
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import {
   DISMISS_REASONS,
+  listSuggestions,
   OPEN_SUGGESTION_STATUSES,
   PROACTIVE_AGENT_DISPLAY_NAME,
   suggestionKindLabel,
@@ -152,6 +154,7 @@ import {
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import type { Conversation } from "@/hooks/useConversations";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
@@ -212,10 +215,12 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
 // Enough trailing items to step past a tool call or two after the final reply.
 const PREVIEW_SCAN_ITEMS = 12;
 const UNREAD_ONLY = ["unread"] as const;
+// "Mark all as read" lists at most this many pages of unread suggestions per click.
+const MARK_ALL_SUGGESTION_PAGES = 20;
 const PREVIEW_MAX_CHARS = 280;
 
 /** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
-type InboxEntry =
+export type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
   | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
@@ -264,14 +269,16 @@ export function InboxPage() {
     advisorAvailable &&
     (advisorSettings?.enabled === true ||
       (advisorSettings === undefined && storedFilter === "advisor"));
-  // Suggestions load only once the settings say the agent is on, so until they
-  // arrive the page is still assembling, and a failed first read is a failure
-  // to show. A failed refetch keeps the settings it had, and the cards with them.
+  // The tab lists the agent's own items, which the settings identify; until
+  // they arrive it is still assembling, and a failed first read is a failure
+  // to show there. A failed refetch keeps the settings it had.
   const advisorSettingsPending = advisorAvailable && advisorSettingsQuery.isPending;
   const advisorSettingsFailed =
     advisorAvailable && advisorSettingsQuery.isError && advisorSettings === undefined;
   const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
   const advisorOnly = filter === "advisor";
+  const isAdvisorItem = (item: Suggestion) =>
+    advisorSettings !== undefined && item.agentId === advisorSettings.agent_id;
   // The Unread tab pages through unread suggestions only, so an older unread
   // one is reachable behind newer read ones.
   const proactiveInbox = useProactiveInbox(
@@ -286,6 +293,8 @@ export function InboxPage() {
     if (!proactiveInbox.enabled) setPinnedSuggestions({});
   }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
+  // True while "Mark all as read" is still listing or marking suggestions.
+  const [markingAll, setMarkingAll] = useState(false);
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
   // the map falls back to the default: expanded only for the newest
@@ -298,8 +307,7 @@ export function InboxPage() {
   const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
   const [submitWithModEnter] = useState(readSubmitWithModEnter);
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
 
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = conversationsQuery;
   const rows = allRows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);
@@ -337,6 +345,7 @@ export function InboxPage() {
   // Subscribed to the read-state mirror so "Mark as read" (here or in the
   // sidebar) drops the row immediately instead of on the next list poll.
   useUnseenTick();
+  useMutedProjects();
   const unreadItems = collectUnreadInboxItems(allRows, isConversationUnseen);
   const showApprovals = filter === "all" || filter === "awaiting";
   // Unread sessions, file comments, and automation results.
@@ -400,8 +409,13 @@ export function InboxPage() {
     filter === "unread"
       ? Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id))
       : [];
+  const listedSuggestions = [...proactiveInbox.items, ...pinned];
   const visibleSuggestions =
-    showSuggestions && proactiveInbox.enabled ? [...proactiveInbox.items, ...pinned] : [];
+    showSuggestions && proactiveInbox.enabled
+      ? advisorOnly
+        ? listedSuggestions.filter(isAdvisorItem)
+        : listedSuggestions
+      : [];
   const visibleCount =
     visibleApprovals.length +
     visibleComments.length +
@@ -435,6 +449,79 @@ export function InboxPage() {
     .filter(Boolean)
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
+
+  // "Mark all as read" covers what the current tab lists as unread; approvals
+  // stay, since only an answer clears them. A session whose reply is still
+  // sending stays too: its pending POST may hand the draft back.
+  const unreadSuggestions = visibleSuggestions.filter((item) => item.status === "unread");
+  const unreadSessionsToClear = visibleUnread.filter(
+    ({ row }) => replyStatuses[row.id]?.state !== "sending",
+  );
+  // Outside the advisor tab the server's unread total covers what the tab
+  // lists, so it also counts unread suggestions past the loaded pages.
+  const unloadedUnreadSuggestions =
+    showSuggestions && proactiveInbox.hasNextPage && !advisorOnly
+      ? Math.max(0, proactiveInbox.unreadCount - unreadSuggestions.length)
+      : 0;
+  const markAllReadCount =
+    visibleComments.length +
+    unreadSessionsToClear.length +
+    visibleAutomations.length +
+    unreadSuggestions.length +
+    unloadedUnreadSuggestions;
+  // Tabs stay switchable while a click is still marking, but Awaiting response
+  // lists only approvals, so it never offers the action.
+  const showMarkAllRead = filter !== "awaiting" && (markAllReadCount > 0 || markingAll);
+  const markSuggestionsRead = async () => {
+    const targets = new Set(unreadSuggestions.map((item) => item.id));
+    let listingFailed = false;
+    if (showSuggestions && proactiveInbox.hasNextPage) {
+      try {
+        let cursor: string | null = null;
+        for (let pages = 0; pages < MARK_ALL_SUGGESTION_PAGES; pages += 1) {
+          // oxlint-disable-next-line no-await-in-loop -- Each page's cursor comes from the one before.
+          const page = await listSuggestions(cursor, UNREAD_ONLY);
+          for (const item of page.data) {
+            if (!advisorOnly || isAdvisorItem(item)) targets.add(item.id);
+          }
+          cursor = page.nextCursor;
+          if (cursor === null) break;
+        }
+      } catch {
+        listingFailed = true;
+      }
+    }
+    let failures = 0;
+    const onError = () => {
+      failures += 1;
+    };
+    await Promise.all(
+      [...targets].map((id) => proactiveInbox.update(id, { status: "read" }, { onError })),
+    );
+    if (failures > 0) {
+      showToast(
+        `Couldn’t mark ${failures === 1 ? "1 suggestion" : `${failures} suggestions`} as read. Try again.`,
+      );
+    } else if (listingFailed) {
+      showToast("Couldn’t load every unread suggestion, so some are still unread. Try again.");
+    }
+  };
+  const markAllRead = () => {
+    const clearedKeys = new Set(unreadSessionsToClear.map(({ row }) => `unread:${row.id}`));
+    const clearedSessions = new Set(unreadSessionsToClear.map(({ row }) => row.id));
+    const keep = <T,>(state: Record<string, T>, cleared: Set<string>) =>
+      Object.fromEntries(Object.entries(state).filter(([key]) => !cleared.has(key)));
+    setExpandedOverrides((prev) => keep(prev, clearedKeys));
+    setReplyDrafts((prev) => keep(prev, clearedSessions));
+    setReplyStatuses((prev) => keep(prev, clearedSessions));
+    for (const { row } of unreadSessionsToClear) markConversationRead(row.id, row.updated_at);
+    markCommentsSeen(visibleComments.map(({ comment }) => comment.id));
+    for (const item of visibleAutomations) automationInbox.markRead(item.runId);
+    if (unreadSuggestions.length > 0 || (showSuggestions && proactiveInbox.hasNextPage)) {
+      setMarkingAll(true);
+      void markSuggestionsRead().finally(() => setMarkingAll(false));
+    }
+  };
 
   const groups = groupInboxEntries<InboxEntry>([
     ...visibleSuggestions.map((item) => ({
@@ -511,7 +598,7 @@ export function InboxPage() {
         snapshotQueries.some((q) => q.isLoading) ||
         commentInbox.isLoading)) ||
     (showUnread && automationInbox.isLoading) ||
-    (showSuggestions && (advisorSettingsPending || proactiveInbox.isLoading));
+    (showSuggestions && (proactiveInbox.isLoading || (advisorOnly && advisorSettingsPending)));
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount = advisorOnly
     ? 0
@@ -578,6 +665,21 @@ export function InboxPage() {
     };
   };
 
+  const chooseFilter = (value: InboxFilter) => {
+    setFilter(value);
+    writeInboxFilter(value);
+  };
+  const markUnreadRead = (entry: Extract<InboxEntry, { kind: "unread" }>) => {
+    const sessionId = entry.item.row.id;
+    // Drop the toggle so a later reply re-surfaces the row collapsed, and
+    // the reply state so it can't come back stale with the row.
+    setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
+    setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
+    setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
+    markConversationRead(sessionId, entry.item.row.updated_at);
+  };
+
+  const rowsById = new Map(allRows.map((row) => [row.id, row]));
   const renderEntry = (entry: InboxEntry) => {
     const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
     const onToggle = () => {
@@ -608,13 +710,18 @@ export function InboxPage() {
         // The user reviews and sends the prompt from the composer.
         navigate(newSessionLocation(action.prompt, []));
       };
+      const fromAdvisor = isAdvisorItem(item);
       return (
         <InboxCard
           key={entry.key}
           testId="inbox-suggestion"
           dataKind={item.kind}
           tile={<KindTile icon={LightbulbIcon} tone="gray" />}
-          kindLabel={`${PROACTIVE_AGENT_DISPLAY_NAME} · ${suggestionKindLabel(item.kind)}`}
+          kindLabel={
+            fromAdvisor
+              ? `${PROACTIVE_AGENT_DISPLAY_NAME} · ${suggestionKindLabel(item.kind)}`
+              : suggestionKindLabel(item.kind)
+          }
           title={item.title}
           preview={suggestionPreview(item.bodyMd)}
           at={entry.at}
@@ -629,6 +736,13 @@ export function InboxPage() {
           </FileViewerContext.Provider>
           <SuggestionMedia media={item.media} />
           <SuggestionLinks item={item} />
+          {/* Omni Advisor runs in hidden sessions; any other agent's session is the source. */}
+          {!fromAdvisor && (
+            <SuggestionOrigin
+              sessionId={item.sourceSessionId}
+              row={rowsById.get(item.sourceSessionId)}
+            />
+          )}
           <InboxActions>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -864,14 +978,7 @@ export function InboxPage() {
     const previewQuery = previewBySession.get(sessionId);
     const output = previewQuery?.data ?? undefined;
     const preview = output?.preview;
-    const markRead = () => {
-      // Drop the toggle so a later reply re-surfaces the row collapsed, and
-      // the reply state so it can't come back stale with the row.
-      setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
-      setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
-      setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
-      markConversationRead(sessionId, item.row.updated_at);
-    };
+    const markRead = () => markUnreadRead(entry);
     // The server refuses user messages below edit access.
     const canReply = isEditorLevel(item.row.permission_level);
     const replyDraft = replyDrafts[sessionId] ?? "";
@@ -1074,14 +1181,25 @@ export function InboxPage() {
             <span className="sr-only">{summary}</span>
           </span>
         )}
+        {showMarkAllRead && (
+          <Button
+            variant="outline"
+            size="xs"
+            className={`ml-auto ${OUTLINE_ACTION}`}
+            disabled={markingAll}
+            onClick={markAllRead}
+            componentId="inbox.mark_all_read"
+            data-testid="inbox-mark-all-read"
+          >
+            <CheckIcon className="size-3.5" /> Mark all as read
+          </Button>
+        )}
       </div>
 
       <Tabs
         value={filter}
         onValueChange={(value) => {
-          if (!isInboxFilter(value)) return;
-          setFilter(value);
-          writeInboxFilter(value);
+          if (isInboxFilter(value)) chooseFilter(value);
         }}
         componentId="inbox.filter"
         className="mb-4"
@@ -1130,7 +1248,7 @@ export function InboxPage() {
         </div>
       )}
 
-      {showSuggestions && advisorSettingsFailed && (
+      {advisorOnly && advisorSettingsFailed && (
         <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
           Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings, so its suggestions are not shown.
           <Button
@@ -1182,7 +1300,8 @@ export function InboxPage() {
       {!assembling &&
         failedSessionCount === 0 &&
         !(showUnread && automationInbox.isError) &&
-        !(showSuggestions && (advisorSettingsFailed || proactiveInbox.isError)) &&
+        !(advisorOnly && advisorSettingsFailed) &&
+        !(showSuggestions && proactiveInbox.isError) &&
         visibleCount === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
@@ -1286,9 +1405,7 @@ function InboxCard({
       data-expanded={expanded}
       className={cn(
         "overflow-hidden border border-border transition-[border-radius]",
-        expanded
-          ? "rounded-2xl bg-card shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)]"
-          : "rounded-xl bg-transparent",
+        expanded ? "rounded-2xl bg-card shadow-lg" : "rounded-xl bg-transparent",
       )}
     >
       <button
@@ -1351,6 +1468,29 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
       <SquarePenIcon aria-hidden className="size-3 shrink-0" />
       <span className="truncate">{title}</span>
       {detail && <span className="shrink-0">· {detail}</span>}
+    </p>
+  );
+}
+
+/** The session whose agent posted a suggestion, named when the sidebar has it loaded. */
+function SuggestionOrigin({ sessionId, row }: { sessionId: string; row?: Conversation }) {
+  const title = row ? conversationDisplayLabel(row) : undefined;
+  const agentLabel = row ? getConversationAgentType(row) : undefined;
+  return (
+    <p
+      className="flex items-center gap-1.5 text-sm text-muted-foreground"
+      data-testid="inbox-suggestion-origin"
+    >
+      <SquarePenIcon aria-hidden className="size-3 shrink-0" />
+      <span className="shrink-0">Posted from</span>
+      <Link
+        to={`/c/${encodeURIComponent(sessionId)}`}
+        componentId="inbox.suggestion.open_origin"
+        className="truncate underline underline-offset-2"
+      >
+        {title ?? "its session"}
+      </Link>
+      {agentLabel && agentLabel !== title && <span className="shrink-0">· {agentLabel}</span>}
     </p>
   );
 }
@@ -1432,7 +1572,8 @@ function LatestOutputPreview({ preview, fullText }: { preview: string; fullText?
       <HoverCardContent
         side="bottom"
         align="start"
-        className="max-h-[min(60vh,32rem)] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
+        collisionPadding={8}
+        className="max-h-[min(60vh,32rem,var(--radix-hover-card-content-available-height))] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
       >
         {/* No session is open here, so file paths stay plain text instead of
             resolving against whichever session the file viewer last showed. */}

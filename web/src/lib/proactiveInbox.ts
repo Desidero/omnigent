@@ -42,6 +42,8 @@ export interface Suggestion {
   /** Rich content drawn on the card, in order. */
   media: SuggestionMediaBlock[];
   sourceSessionId: string;
+  /** Agent of the posting session; Omni Advisor's items carry its agent id. */
+  agentId: string;
   status: SuggestionStatus;
   resolution: SuggestionResolution;
   createdAt: number;
@@ -56,6 +58,7 @@ interface SuggestionWire {
   actions?: SuggestionAction[];
   media?: unknown;
   source_session_id: string;
+  agent_id?: string;
   status: SuggestionStatus;
   resolution?: SuggestionResolution;
   created_at: number;
@@ -74,6 +77,11 @@ export const OPEN_SUGGESTION_STATUSES: readonly SuggestionStatus[] = ["unread", 
 
 /** What the UI calls the proactive agent; the one place to change when it is renamed. */
 export const PROACTIVE_AGENT_DISPLAY_NAME = "Omni Advisor";
+/** What Omni Advisor's switch says it does, for the viewer's own switch and the workspace's. */
+export const PROACTIVE_AGENT_SCOPE_COPY = {
+  me: `${PROACTIVE_AGENT_DISPLAY_NAME} reads your recent sessions on a schedule and posts follow-ups, related information, and reminders to your Inbox.`,
+  workspace: `Let ${PROACTIVE_AGENT_DISPLAY_NAME} post follow-ups, related information, and reminders to each user's Inbox. Users can turn it off for themselves.`,
+} as const;
 export const SUGGESTION_PAGE_SIZE = 50;
 
 /** Reasons the Dismiss menu offers, in menu order. */
@@ -105,6 +113,7 @@ export function suggestionFromWire(wire: SuggestionWire): Suggestion {
         )
       : [],
     sourceSessionId: wire.source_session_id,
+    agentId: wire.agent_id ?? "",
     status: wire.status,
     resolution: wire.resolution ?? "none",
     createdAt: wire.created_at,

@@ -23,16 +23,13 @@ vi.mock("@/lib/proactiveInbox", async (importActual) => ({
   updateSuggestion: vi.fn(),
 }));
 vi.mock("./useViewerId", () => ({ useViewerId: () => "alice" }));
-vi.mock("./useProactiveAgentSettings", () => ({
-  useProactiveAgentSettings: () => ({ settings: enabled ? { enabled: true } : undefined }),
-}));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 let client: QueryClient;
 let enabled = true;
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
-    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, inbox_items_available: enabled }}>
       <RoutingProvider value={basenamedRouting("/")}>{children}</RoutingProvider>
     </CapabilitiesProvider>
   </QueryClientProvider>
@@ -47,6 +44,7 @@ const item: Suggestion = {
   actions: [],
   media: [],
   sourceSessionId: "s",
+  agentId: "agent",
   status: "unread",
   resolution: "none",
   createdAt: 1,
@@ -201,6 +199,22 @@ it("reports a failed update and reloads the list", async () => {
   // The server still has the item open, so the refetch shows it again.
   await waitFor(() => expect(result.current.items).toEqual([item]));
   expect(listSuggestions).toHaveBeenCalledTimes(2);
+});
+
+it("hands a failed update to the caller's onError instead of the toast", async () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  vi.mocked(updateSuggestion).mockRejectedValueOnce(new Error("offline"));
+  const onError = vi.fn();
+
+  let accepted: Promise<boolean> = Promise.resolve(true);
+  act(() => {
+    accepted = result.current.update("sug", { status: "read" }, { onError });
+  });
+
+  await expect(accepted).resolves.toBe(false);
+  expect(onError).toHaveBeenCalledOnce();
+  expect(showToast).not.toHaveBeenCalled();
 });
 
 it("keeps the item when the update and the recovery fetch both fail", async () => {
