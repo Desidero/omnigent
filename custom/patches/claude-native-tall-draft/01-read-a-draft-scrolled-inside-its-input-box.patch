@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Desidero <desidero@gmail.com>
+Date: Fri, 27 Nov 2026 06:59:51 +0000
+Subject: [PATCH] fix(claude-native): read a draft scrolled inside its input
+ box
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Claude Code caps the input box's height. When a pasted message is taller
+than the box, it keeps the draft's last rows in view and labels the box's
+opening rule "↑ N more"; the "❯" row scrolls out of view with the first
+rows. A long paste reaches that height sooner in a narrow pane, where
+its lines wrap.
+
+The bridge found the box only by a glyph row under the opening rule, so
+it read this box as missing. The paste wait never saw the draft, delivery
+took the "paste dropped" recovery and waited for a "❯" row that could not
+return while the draft sat in the box, and the turn failed with
+ClaudePromptTimeout and the terminal was reaped. The end-of-draft marker
+added for scrolled drafts only matched rows under a glyph row, so it did
+not help here.
+
+Read a box whose opening rule carries that label as an unframed box of
+its visible rows, and let the draft check match a scrolled box's rows.
+The paste is then seen and submitted with the usual Enter verification,
+and a leftover draft of this shape is cleared before delivery like one
+taller than the pane. The same draft check now also verifies a pasted
+draft taller than the pane, which was submitted blind.
+
+Not upstream yet: proposed from fix/claude-native-tall-draft-ready; drop this copy once it merges.
+
+Signed-off-by: Desidero <desidero@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Docs: none (fix: a draft taller than the input box is delivered; no setting)
+---
+ omnigent/harnesses/claude_native/bridge.py    | 18 ++++-
+ .../test_claude_native_bridge.py              | 77 ++++++++++++++++++-
+ 2 files changed, 93 insertions(+), 2 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index c167dedf112df697d6212eeec2c159d7a00dad12..b61f376beb4505d307b0c953f70637ca880347c6 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -399,6 +399,9 @@ _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
+ _COMPOSER_CLEAR_MAX_ROUNDS = 3
+ # Footer rows Claude Code draws under the input box (mode hints, status line).
+ _SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
++# Label Claude Code puts on the box's opening rule when a draft taller than
++# the box has scrolled its first rows, ``❯`` row included, out of view.
++_BOX_SCROLLED_LABEL_RE = re.compile(r"\s↑ \d+ more\s")
+ # How long to wait for the pasted draft to visibly land in Claude's
+ # input box before sending the submit Enter. Claude Code coalesces
+ # rapid stdin bursts into a paste, so an Enter sent while the TUI is
+@@ -7491,7 +7494,9 @@ def _composer_box(pane: str) -> _ComposerBox | None:
+     first non-blank one under the opening rule, led by a composer glyph. The
+     rows run to the closing rule, or to the bottom of the pane when there is
+     none on screen. A draft taller than the pane is read as well
+-    (:func:`_scrolled_draft_rows`), without its first rows.
++    (:func:`_scrolled_draft_rows`), without its first rows, and so is one
++    taller than the box, whose opening rule reads ``↑ N more`` above the
++    draft's last rows.
+ 
+     :param pane: Captured pane text from :func:`_capture_pane`.
+     :returns: The box's visible rows and whether both of its rules were on
+@@ -7505,6 +7510,13 @@ def _composer_box(pane: str) -> _ComposerBox | None:
+         first = _first_non_blank(lines, rules[-2] + 1, rules[-1])
+         if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+             return _ComposerBox(lines[first : rules[-1]], framed=True)
++        rows = lines[first : rules[-1]]
++        if (
++            rows
++            and _BOX_SCROLLED_LABEL_RE.search(lines[rules[-2]])
++            and all(row.startswith("  ") for row in rows if row.strip())
++        ):
++            return _ComposerBox(rows, framed=False)
+     first = _first_non_blank(lines, rules[-1] + 1, len(lines))
+     if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+         return _ComposerBox(lines[first:], framed=False)
+@@ -7887,6 +7899,8 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
+     Claude Code keeps in the draft but does not render.
+     A shell-mode box (``!`` glyph) is read too: Claude Code turns a draft's
+     leading ``!`` into that glyph, so the needle is matched without it.
++    So is a draft scrolled past its glyph row (:func:`_composer_box`),
++    whose visible rows hold its end.
+ 
+     :param pane: Captured pane text from :func:`_capture_pane`.
+     :param needle: Marker from :func:`_submit_needle`, e.g.
+@@ -7903,6 +7917,8 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
+     elif first_row.startswith(_SHELL_MODE_GLYPH):
+         tail = "\n".join([first_row[len(_SHELL_MODE_GLYPH) :], *rows[1:]])
+         needle = needle.removeprefix(_SHELL_MODE_GLYPH)
++    elif not rows and (box := _composer_box(pane)) is not None:
++        tail = "\n".join(box.rows)
+     else:
+         glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
+         if not glyph_lines:
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index d273c2da87c0583463560df1974817030b197eb6..5987fdf7e875ca6996df7c19565e915be752a4f8 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -11314,6 +11314,52 @@ def test_a_draft_scrolled_past_its_first_line_is_seen_by_its_end() -> None:
+     assert not claude_native_bridge._draft_in_input_box(empty_box, needle, tail_needle=tail_needle)
+ 
+ 
++# Claude Code 2.1.332 in a 47-column pane after a long paste: the box keeps the
++# draft's last rows and counts the rows above them on its opening rule.
++_BOX_SCROLLED_DRAFT_PANE = "\n".join(
++    [
++        "  that the retry path is covered as well.",
++        "",
++        "✻ Cogitated for 5m 18s · done 4:28 AM",
++        "",
++        "       new task? /clear to save 132.6k tokens",
++        "─── ↑ 11 more ─────────────────────────────────",
++        "  Then ask a reviewer to weigh the general idea,",
++        "  what we have seen, and what they think makes",
++        "  the most sense.",
++        "───────────────────────────────────────────────",
++        "  ⏵⏵ auto mode on (shift+tab to cycle)",
++    ]
++)
++
++
++def test_a_draft_scrolled_inside_its_box_is_seen_by_its_end() -> None:
++    """
++    A draft taller than the input box scrolls its ``❯`` row away under an ``↑ N more`` rule.
++
++    Read as no input box, the pasted draft went unseen and delivery waited for
++    a ``❯`` row that never returned, so the turn timed out and the pane was reaped.
++    """
++    content = (
++        "Please look at the delivery change again.\n\n"
++        + "Check each caller and the retry path. " * 8
++        + "Then ask a reviewer to weigh the general idea, what we have seen, "
++        "and what they think makes the most sense."
++    )
++    needle = claude_native_bridge._submit_needle(content)
++    tail_needle = claude_native_bridge._submit_tail_needle(content)
++
++    assert claude_native_bridge._composer_box(_BOX_SCROLLED_DRAFT_PANE) == (
++        claude_native_bridge._ComposerBox(_BOX_SCROLLED_DRAFT_PANE.splitlines()[6:9], framed=False)
++    )
++    assert claude_native_bridge._draft_in_input_box(
++        _BOX_SCROLLED_DRAFT_PANE, needle, tail_needle=tail_needle
++    )
++    assert claude_native_bridge._occupying_surface(_BOX_SCROLLED_DRAFT_PANE) == (
++        claude_native_bridge._SCROLLED_DRAFT_SURFACE
++    )
++
++
+ @pytest.mark.parametrize(
+     ("content", "expected"),
+     [
+@@ -13110,6 +13156,7 @@ class _EditableComposer:
+         cursor: int,
+         visible_rows: int | None = None,
+         pane_rows: int | None = None,
++        box_rows: int | None = None,
+         unavailable_clear_captures: int = 0,
+     ) -> None:
+         """
+@@ -13123,6 +13170,9 @@ class _EditableComposer:
+         :param pane_rows: When set, the pane has this many lines and keeps the
+             bottom of the screen in view, as Claude Code 2.1.309 does: a draft
+             too tall for it scrolls the opening rule and glyph row off the top.
++        :param box_rows: When set, the box shows at most this many rows, as
++            Claude Code 2.1.332 does: a taller draft keeps its last rows and
++            labels the opening rule ``↑ N more``.
+         :param unavailable_clear_captures: Captures that fail after clearing
+             starts; readiness captures remain readable.
+         """
+@@ -13130,6 +13180,7 @@ class _EditableComposer:
+         self.cursor = cursor
+         self._visible_rows = visible_rows
+         self._pane_rows = pane_rows
++        self._box_rows = box_rows
+         self._unavailable_clear_captures = unavailable_clear_captures
+         self._clearing_started = False
+         self.submitted: list[str] = []
+@@ -13181,7 +13232,11 @@ class _EditableComposer:
+             # The rows take every line the pane has: no closing rule.
+             clipped = "\n".join(rows[: self._visible_rows])
+             return f"⏺ done\n{self._RULE}\n{clipped}\n"
+-        screen = ["⏺ done", self._RULE, *rows, self._RULE, "  ? for shortcuts"]
++        opening = self._RULE
++        if self._box_rows is not None and len(rows) > self._box_rows:
++            hidden = len(rows) - self._box_rows
++            opening, rows = f"─── ↑ {hidden} more {self._RULE}", rows[hidden:]
++        screen = ["⏺ done", opening, *rows, self._RULE, "  ? for shortcuts"]
+         if self._pane_rows is not None:
+             screen = screen[-self._pane_rows :]
+         return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
+@@ -13418,6 +13473,26 @@ def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
+     assert [text.strip() for text in composer.submitted] == [expected]
+ 
+ 
++def test_a_message_taller_than_the_input_box_is_submitted_and_verified(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """
++    A pasted message that scrolls inside the input box is submitted, not waited on.
++
++    Its ``❯`` row scrolls away under an ``↑ N more`` rule, so delivery read the
++    box as missing, waited for a prompt row that could not return, and failed
++    the turn with the message left unsent in the box.
++    """
++    bridge_dir = _picker_bridge_dir(tmp_path)
++    composer = _EditableComposer("", cursor=0, box_rows=3)
++    composer.install(monkeypatch)
++    message = "\n".join(f"step {idx} of the plan" for idx in range(1, 8))
++
++    inject_user_message(bridge_dir, content=message)
++
++    assert [text.strip() for text in composer.submitted] == [message]
++
++
+ @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+ @pytest.mark.parametrize("cursor", [0, 8, 18], ids=["start", "middle", "end"])
+ @pytest.mark.parametrize("stale_frame", [False, True], ids=["plain", "previous-frame"])
