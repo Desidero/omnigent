@@ -15,7 +15,9 @@ count is what selecting it would list. Items group by status (as before),
 topic or kind, each group folding from its heading; the grouping is kept
 in this browser, and the search, chips and folds survive the panel closing
 until the page reloads. On a phone the search stays first in the sheet and
-the chips scroll sideways in one row. Filtering runs over the loaded list,
+the chips scroll sideways in one row. Opening the panel focuses the
+panel itself, not the search field that is now its first control, so a
+phone's keyboard does not come up over the list. Filtering runs over the loaded list,
 which the store caps at 500 items, so it needs nothing from the server.
 
 Not proposed upstream yet: the panel it extends is not upstream either.
@@ -23,23 +25,24 @@ Not proposed upstream yet: the panel it extends is not upstream either.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
- docs/open-items.md                            |  22 +-
+ docs/open-items.md                            |  23 +-
  feature-map/open-items.md                     |   5 +-
  .../components/chat/OpenItemsFilterBar.tsx    | 143 +++++++++++
- .../chat/StoredOpenItemsPanel.test.tsx        |  89 +++++++
+ .../components/chat/SessionItemsButton.tsx    |  11 +
+ .../chat/StoredOpenItemsPanel.test.tsx        | 100 ++++++++
  .../components/chat/StoredOpenItemsPanel.tsx  | 158 ++++++++----
  web/src/lib/openItemFilters.test.ts           | 130 ++++++++++
  web/src/lib/openItemFilters.ts                | 229 ++++++++++++++++++
- 7 files changed, 721 insertions(+), 55 deletions(-)
+ 8 files changed, 744 insertions(+), 55 deletions(-)
  create mode 100644 web/src/components/chat/OpenItemsFilterBar.tsx
  create mode 100644 web/src/lib/openItemFilters.test.ts
  create mode 100644 web/src/lib/openItemFilters.ts
 
 diff --git a/docs/open-items.md b/docs/open-items.md
-index f3361ad3408d0cf80105c568a6eabe522c0a8a54..0a2b2c7cc8102710a497a410e071a5922c61fae1 100644
+index f3361ad3408d0cf80105c568a6eabe522c0a8a54..2818138c05fe1de34ec8551f40fb1f5cddc9c6b9 100644
 --- a/docs/open-items.md
 +++ b/docs/open-items.md
-@@ -107,10 +107,24 @@ stays current as the agent raises and closes them.
+@@ -107,10 +107,25 @@ stays current as the agent raises and closes them.
  - **Chips:** a stored item's label in the chat is its anchor: its chips
    follow the stored status (struck once the item is closed, whatever the chat
    wrote), and a plain or struck mention never changes the item.
@@ -63,13 +66,14 @@ index f3361ad3408d0cf80105c568a6eabe522c0a8a54..0a2b2c7cc8102710a497a410e071a592
 +  clears it. Each count is what selecting that chip would list. Filtering runs
 +  in the browser over the loaded list. A search shows every match, folded
 +  groups included. On a phone the search stays at the top of the sheet and
-+  the chips scroll sideways in one row. The search, chips and folds stay as
++  the chips scroll sideways in one row. Opening the panel does not put the
++  cursor in the search, so a phone's keyboard stays down until you tap it. The search, chips and folds stay as
 +  you left them when the panel closes, until the page reloads.
  - **Details:** select an item to expand it: its detail, links, its thread
    (your comments and the agent's replies, each once, in order), how it was
    closed (left out when the resolution only repeats the last reply), and
 diff --git a/feature-map/open-items.md b/feature-map/open-items.md
-index a201bd39f12db221ebf3e143c45a01c5c0140bd2..317e5432c5f002738eae9bfc49e2b80d8e953553 100644
+index a201bd39f12db221ebf3e143c45a01c5c0140bd2..f1011cb8f5c43fd5c3c276bfb4a4511af35d7eb9 100644
 --- a/feature-map/open-items.md
 +++ b/feature-map/open-items.md
 @@ -12,6 +12,7 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
@@ -87,7 +91,7 @@ index a201bd39f12db221ebf3e143c45a01c5c0140bd2..317e5432c5f002738eae9bfc49e2b80d
 -- Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge and user changes: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; the live event: `web/src/store/chatStore.openItems.test.ts`.
 -- Human check (panel): with items raised as above, open the header's bookmark button. Expect the badge to count the open items, each row its stored title, and an answered or closed one under its group. Tap ✕ on one: it moves to **Closed (N)**, the badge drops, its chips in the chat strike through, and `sys_open_items_list` shows it `closed_by: user`. On a server without the store the panel looks as before.
 +- Web merge and rows: `web/src/lib/openItems.test.ts`; panel, badge, user changes, search, chips and grouping: `web/src/components/chat/StoredOpenItemsPanel.test.tsx`; filter rules: `web/src/lib/openItemFilters.test.ts`; the live event: `web/src/store/chatStore.openItems.test.ts`.
-+- Human check (panel): with items raised as above, open the header's bookmark button. Expect the badge to count the open items, each row its stored title, and an answered or closed one under its group. Tap ✕ on one: it moves to **Closed (N)**, the badge drops, its chips in the chat strike through, and `sys_open_items_list` shows it `closed_by: user`. On a server without the store the panel looks as before. With five or more items, type a word from one item's detail: only it remains; pick **By topic**, close and reopen the panel: the grouping and search are kept. On a phone, the chip row scrolls sideways without moving the sheet.
++- Human check (panel): with items raised as above, open the header's bookmark button. Expect the badge to count the open items, each row its stored title, and an answered or closed one under its group. Tap ✕ on one: it moves to **Closed (N)**, the badge drops, its chips in the chat strike through, and `sys_open_items_list` shows it `closed_by: user`. On a server without the store the panel looks as before. With five or more items, type a word from one item's detail: only it remains; pick **By topic**, close and reopen the panel: the grouping and search are kept. On a phone, opening the sheet brings up no keyboard (the search is not focused), and the chip row scrolls sideways without moving the sheet.
  - Human check: in a new session, ask the agent to review a small change and list its open questions. Expect one `sys_open_items_raise` tool row and the items written as `[Q1] **Title** detail`. Then `curl -H 'X-Forwarded-Email: <you>' <server>/v1/sessions/<id>/open-items` lists them as `open`. Answer one in chat and ask the agent to close it: expect a `sys_open_items_update` row with a `reply`, and the item `closed` with `closed_by: agent` and the reply in its `replies` in the API. The agent does not strike labels.
  
  ## Gotchas
@@ -240,8 +244,44 @@ index 0000000000000000000000000000000000000000..24bf810f60dbebc8347ac396aa49c9a3
 +    </div>
 +  );
 +}
+diff --git a/web/src/components/chat/SessionItemsButton.tsx b/web/src/components/chat/SessionItemsButton.tsx
+index 551552c3d5000c90c5b488bc37a23707becc0069..229d0c212e39816a24c4abffb5811b88a8a98a9b 100644
+--- a/web/src/components/chat/SessionItemsButton.tsx
++++ b/web/src/components/chat/SessionItemsButton.tsx
+@@ -19,6 +19,15 @@ import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
+ 
+ const PANEL_NAME = "Open items and links";
+ 
++/**
++ * Focus the opened panel itself rather than its first control, the search
++ * field: on a phone a focused field raises the keyboard over the list.
++ */
++function focusPanel(event: Event) {
++  event.preventDefault();
++  (event.currentTarget as HTMLElement).focus();
++}
++
+ function LinkRow({ link, sessionId }: { link: SessionLink; sessionId: string | null }) {
+   return (
+     <li className="flex min-w-0 items-center">
+@@ -145,6 +154,7 @@ export function SessionItemsButton({
+           aria-describedby={undefined}
+           className="top-auto bottom-0 max-h-[80dvh] max-w-full translate-y-0 gap-2 overflow-y-auto rounded-b-none px-2 pt-4 pb-[calc(1rem+var(--omnigent-safe-bottom,0px))] sm:max-w-full"
+           style={{ top: "auto" }}
++          onOpenAutoFocus={focusPanel}
+         >
+           <DialogTitle className="px-3">{PANEL_NAME}</DialogTitle>
+           <SessionItemsPanel links={links} />
+@@ -166,6 +176,7 @@ export function SessionItemsButton({
+         aria-label={PANEL_NAME}
+         data-testid="session-items-panel"
+         className="menu-surface max-h-[var(--radix-popover-content-available-height)] w-96 max-w-[calc(100vw-1rem)] gap-1 overflow-y-auto rounded-[12px] p-1.5 ring-0"
++        onOpenAutoFocus={focusPanel}
+       >
+         <SessionItemsPanel links={links} />
+       </PopoverContent>
 diff --git a/web/src/components/chat/StoredOpenItemsPanel.test.tsx b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
-index 17af493dd4c85d66d36ed0770315a0aae4701b9e..41c0b57b8d4d63f4dcac25b6c74c60f986640009 100644
+index 17af493dd4c85d66d36ed0770315a0aae4701b9e..7c87caa8095db16a368b21c08635fdcecff308e7 100644
 --- a/web/src/components/chat/StoredOpenItemsPanel.test.tsx
 +++ b/web/src/components/chat/StoredOpenItemsPanel.test.tsx
 @@ -27,6 +27,7 @@ import {
@@ -261,7 +301,7 @@ index 17af493dd4c85d66d36ed0770315a0aae4701b9e..41c0b57b8d4d63f4dcac25b6c74c60f9
  });
  
  /** The header button inside the label scope the transcript gives it, store merged in. */
-@@ -292,3 +295,89 @@ describe("the Open items panel on a server that stores them", () => {
+@@ -292,3 +295,100 @@ describe("the Open items panel on a server that stores them", () => {
      expect(fetchMock).not.toHaveBeenCalled();
    });
  });
@@ -332,6 +372,17 @@ index 17af493dd4c85d66d36ed0770315a0aae4701b9e..41c0b57b8d4d63f4dcac25b6c74c60f9
 +    // A group folds from its heading.
 +    fireEvent.click(within(panel).getByRole("button", { name: "cache (2)" }));
 +    expect(rowLabels(panel)).toEqual(["T1", "R1", "Q3"]);
++  });
++
++  it("does not focus the search when the panel opens, on a phone or on desktop", () => {
++    for (const mobile of [true, false]) {
++      viewport.mobile = mobile;
++      renderPanel(["Nothing labelled."], MANY);
++      openPanel();
++      expect(document.activeElement).not.toBe(search());
++      expect(document.activeElement).toBe(screen.getByTestId("session-items-panel"));
++      cleanup();
++    }
 +  });
 +
 +  it("keeps the search and folds when the phone sheet closes and reopens", () => {

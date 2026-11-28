@@ -19,10 +19,13 @@ waits at most three seconds for the record; on a server without open items
 nothing is recorded, and a refused or failed call never changes the
 message. An expanded row in the panel also offers Comment.
 
-A stored item's chip previews its thread from the store (StoredItemThread:
+A stored item's chip opens a card that leads with the item as stored: its
+title, a link item's URL as a link, its detail and links. Before, the card
+led with the chat block where the label appeared, so a link item's card
+never showed the link. Its thread follows from the store (StoredItemThread:
 comments and agent replies, each once, then how it was closed, without a
 resolution that only repeats the last reply) instead of the comments and
-sentences found in the chat. A chip of a label written only in the chat says
+sentences found in the chat, and the chat block comes last, folded. A chip of a label written only in the chat says
 so and offers Record to a person who can comment, which stores it under its
 own label as the panel's import does; nothing is recorded on its own.
 
@@ -41,10 +44,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Desidero <desidero@gmail.com>
 ---
  docs/chat-item-labels.md                      |   8 +-
- docs/open-items.md                            |  27 ++
+ docs/open-items.md                            |  31 +++
  feature-map/open-items.md                     |   4 +
- .../blocks/ChatMarkdown.storedItems.test.tsx  | 143 ++++++++++
- web/src/components/blocks/ChatMarkdown.tsx    |  79 +++++-
+ .../blocks/ChatMarkdown.storedItems.test.tsx  | 179 +++++++++++++
+ web/src/components/blocks/ChatMarkdown.tsx    | 148 ++++++++++-
  .../chat/StoredOpenItemsPanel.test.tsx        |  64 +++++
  .../components/chat/StoredOpenItemsPanel.tsx  |  36 +++
  .../composer/ItemCommentTray.test.tsx         |  76 ++++++
@@ -56,7 +59,7 @@ Signed-off-by: Desidero <desidero@gmail.com>
  web/src/lib/openItemAnswers.test.ts           | 249 ++++++++++++++++++
  web/src/lib/openItemAnswers.ts                | 238 +++++++++++++++++
  web/src/pages/ChatPage.tsx                    |   7 +
- 16 files changed, 1217 insertions(+), 13 deletions(-)
+ 16 files changed, 1323 insertions(+), 16 deletions(-)
  create mode 100644 web/src/components/blocks/ChatMarkdown.storedItems.test.tsx
  create mode 100644 web/src/lib/openItemAnswers.test.ts
  create mode 100644 web/src/lib/openItemAnswers.ts
@@ -78,10 +81,10 @@ index 401c31d4a57021cb87d303e66e0f3562024b3b0b..080826ad8e6c88901eb085bc18c227ef
 +draft's ✓ in the tray) closes the item with the comment as it is sent; its
 +heading in the message then ends `(closed by me)`.
 diff --git a/docs/open-items.md b/docs/open-items.md
-index f3361ad3408d0cf80105c568a6eabe522c0a8a54..1a8caa8b5b928a989a1cfffd707084c95de20fb7 100644
+index f3361ad3408d0cf80105c568a6eabe522c0a8a54..94749c3d8a783ff32cb8018be5255c3e1f0772b6 100644
 --- a/docs/open-items.md
 +++ b/docs/open-items.md
-@@ -120,6 +120,33 @@ stays current as the agent raises and closes them.
+@@ -120,6 +120,37 @@ stays current as the agent raises and closes them.
    as closed by a person with the resolution "Closed from the Open items panel";
    expanded, you can write the resolution yourself, **Reopen** a closed item, or
    **Set topic**. The agent sees every change in `sys_open_items_list`.
@@ -94,10 +97,14 @@ index f3361ad3408d0cf80105c568a6eabe522c0a8a54..1a8caa8b5b928a989a1cfffd707084c9
 +  `sys_open_items_list`. The send waits at most a few seconds for that record,
 +  and a failed record never holds or changes the message. Labels the server
 +  does not hold are skipped.
-+- **The item card:** a stored item's chip previews where it was raised, then
-+  its thread from the store (your comments and the agent's replies, each once)
-+  and how it was closed, the resolution left out when it only repeats the last
-+  reply. Replies and closing sentences in the chat text are not read for it.
++- **The item card:** a stored item's chip opens a card that leads with the
++  item as the store holds it: when it was raised, its title, its URL for a
++  link item (as a link that opens the way the Links list does), its detail and
++  links. Then come its thread from the store (your comments and the agent's
++  replies, each once) and how it was closed, the resolution left out when it
++  only repeats the last reply, and last, folded under **In the conversation**,
++  the chat block where its label first appears in the loaded messages.
++  Replies and closing sentences in the chat text are not read for it.
 +- **Record:** a chip of a label written only in the chat (one the server does
 +  not hold, of a letter it uses) says so and offers **Record** to a person who
 +  can comment, which stores it under its own label as **Import** does. Nothing
@@ -116,7 +123,7 @@ index f3361ad3408d0cf80105c568a6eabe522c0a8a54..1a8caa8b5b928a989a1cfffd707084c9
    as the `omnigent.items_dismissed` session label, which is read for chat-only
    items and never written for stored ones.
 diff --git a/feature-map/open-items.md b/feature-map/open-items.md
-index a201bd39f12db221ebf3e143c45a01c5c0140bd2..badde399ff369d156e065c3f0de94d8381f1e267 100644
+index a201bd39f12db221ebf3e143c45a01c5c0140bd2..4e1904b899fefe0a9ad725d54d25075e8ec5b76b 100644
 --- a/feature-map/open-items.md
 +++ b/feature-map/open-items.md
 @@ -14,6 +14,9 @@ A session's agent creates the questions, risks, findings and follow-ups it raise
@@ -124,7 +131,7 @@ index a201bd39f12db221ebf3e143c45a01c5c0140bd2..badde399ff369d156e065c3f0de94d83
  - `items-import`: **Import N from chat** in the panel stores chat-only labels under their own labels (`POST …/open-items/import`, edit access), closed if the chat closed or dismissed them.
  - `items-user-change`: a person with edit access closes (one tap, or with a resolution), reopens and retopics stored items from the panel; the expanded row shows the stored thread.
 +- `items-comment-replies`: sending a "Comments on N items" message first records each stored item's comments in its thread (once per message), so it shows answered; a failed or slow record never holds or changes the message.
-+- `items-card`: a stored item's chip previews the store's thread and resolution, each once; a chat-only label's chip offers **Record**.
++- `items-card`: a stored item's chip opens a card that leads with the stored item (raised time, title, a link item's URL as a link, detail, links), then the store's thread and resolution, each once, then the chat excerpt folded; a chat-only label's chip shows its chat block and offers **Record**.
 +- `items-comment-close`: **Comment and close**, chosen per item in comment mode (header card, tray ✓, panel row), marks the item's heading `(closed by me)` and, before the message goes, closes it as the user with the comment as its resolution; only on stored items that are not closed.
  
  ## How to get to it (user POV)
@@ -139,15 +146,15 @@ index a201bd39f12db221ebf3e143c45a01c5c0140bd2..badde399ff369d156e065c3f0de94d83
  - Instruction text: `tests/runtime/test_prompt.py::test_stored_items_guidance_follows_the_open_items_tool_group`, `::test_stored_items_guidance_names_the_tools_and_never_strikes_labels`.
 diff --git a/web/src/components/blocks/ChatMarkdown.storedItems.test.tsx b/web/src/components/blocks/ChatMarkdown.storedItems.test.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..5b6a23fc2510b97ac60cc70dbfe9c270bb9d95d1
+index 0000000000000000000000000000000000000000..561d15d081ed68b90b3b3764e2f875c5b1b4a9b4
 --- /dev/null
 +++ b/web/src/components/blocks/ChatMarkdown.storedItems.test.tsx
-@@ -0,0 +1,143 @@
-+// A stored item's chip previews its thread from the store, each reply once,
+@@ -0,0 +1,179 @@
++// A stored item's chip previews the stored item and its thread, each reply once,
 +// never sentences found in the chat; a label only in the chat offers Record.
 +
 +import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 +import { MemoryRouter } from "react-router-dom";
 +import { afterEach, describe, expect, it, vi } from "vitest";
 +import { buildItemCommentMessage, scanItemLabelSource } from "@/lib/itemComments";
@@ -257,6 +264,38 @@ index 0000000000000000000000000000000000000000..5b6a23fc2510b97ac60cc70dbfe9c270
 +    expect(screen.queryByRole("button", { name: "Record" })).toBeNull();
 +  });
 +
++  it("leads a link item's card with its title and URL, the chat excerpt folded after", async () => {
++    const mention: ItemLabelSource = {
++      messageId: "resp_drafts",
++      role: "assistant",
++      text: "The upstream drafts are on [L1] for you to read.",
++    };
++    const index = mergeStoredOpenItems(buildItemLabelIndex([scanItemLabelSource(mention)]), [
++      storedItem("L1", {
++        title: "Upstream drafts",
++        url: "https://claude.ai/artifact/abc",
++        created_at: Math.floor(Date.now() / 1000) - 11 * 3600,
++      }),
++    ]);
++    renderChip("Read the drafts on [L1].", index);
++    fireEvent.click(await screen.findByRole("button", { name: /Show item L1/ }));
++
++    const summary = await screen.findByTestId("stored-item-summary");
++    expect(summary.textContent).toContain("Upstream drafts");
++    const link = within(summary).getByRole("link", { name: "https://claude.ai/artifact/abc" });
++    expect((link as HTMLAnchorElement).href).toBe("https://claude.ai/artifact/abc");
++    expect((link as HTMLAnchorElement).target).toBe("_blank");
++    // The card's age is when the item was raised in the store.
++    expect(screen.getByText(/L1/, { selector: "span.font-mono" }).parentElement?.textContent).toBe(
++      "L1 · Raised 11h ago",
++    );
++    const context = screen.getByTestId("item-chat-context") as HTMLDetailsElement;
++    expect(context.open).toBe(false);
++    expect(summary.compareDocumentPosition(context) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++    expect(context.textContent).toContain("In the conversation · Agent");
++    expect(context.textContent).toContain("for you to read");
++  });
++
 +  it("stays open when the chat struck its label but the store keeps it open", async () => {
 +    const index = mergeStoredOpenItems(chatIndex(), [storedItem("Q1"), storedItem("R1")]);
 +    renderChip("Recap: [Q1].", index);
@@ -274,6 +313,10 @@ index 0000000000000000000000000000000000000000..5b6a23fc2510b97ac60cc70dbfe9c270
 +    );
 +    renderChip("Still flaky: [R1].", index);
 +    fireEvent.click(await screen.findByRole("button", { name: /Show item R1/ }));
++    // The chat's own block is the card, as before: there is no stored record to lead with.
++    expect(await screen.findByText(/It times out/)).toBeTruthy();
++    expect(screen.queryByTestId("stored-item-summary")).toBeNull();
++    expect(screen.queryByTestId("item-chat-context")).toBeNull();
 +    fireEvent.click(await screen.findByRole("button", { name: "Record" }));
 +
 +    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
@@ -287,7 +330,7 @@ index 0000000000000000000000000000000000000000..5b6a23fc2510b97ac60cc70dbfe9c270
 +  });
 +});
 diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
-index 94387f70e6b991f7c6aa0fc12830cd80446fc490..9a0728be0ddc467c4028ce64fc6e38d340d7dbd4 100644
+index 94387f70e6b991f7c6aa0fc12830cd80446fc490..fbecf88ba9e957a49246be284cce2f09325ebb68 100644
 --- a/web/src/components/blocks/ChatMarkdown.tsx
 +++ b/web/src/components/blocks/ChatMarkdown.tsx
 @@ -15,7 +15,7 @@
@@ -299,7 +342,16 @@ index 94387f70e6b991f7c6aa0fc12830cd80446fc490..9a0728be0ddc467c4028ce64fc6e38d3
  import {
    BotIcon,
    CopyIcon,
-@@ -89,6 +89,15 @@ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+@@ -61,7 +61,7 @@ import { useThrottledValue } from "@/hooks/useThrottledValue";
+ import { withBasePath } from "@/lib/basePath";
+ import { copyText } from "@/lib/clipboard";
+ import { absoluteWorkspacePath } from "@/lib/composerContext";
+-import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
++import { followLinkWithPopupFallback, parseHttpUrl } from "@/lib/openLinkInApp";
+ import {
+   ITEM_LABEL_HREF_PREFIX,
+   ItemLabelIndexContext,
+@@ -89,6 +89,16 @@ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
  import { relativeTime } from "@/lib/relativeTime";
  import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
  import { keyedAttachments } from "@/lib/blocks";
@@ -310,18 +362,68 @@ index 94387f70e6b991f7c6aa0fc12830cd80446fc490..9a0728be0ddc467c4028ce64fc6e38d3
 +  importChatItems,
 +  refreshStoredOpenItems,
 +  storedItemOf,
++  type StoredOpenItem,
 +} from "@/lib/openItems";
 +import { useQueryClient } from "@tanstack/react-query";
  import { cn } from "@/lib/utils";
  import { parseMentionPillTitle } from "@/lib/mentionPills";
  import {
-@@ -766,12 +775,60 @@ export function ItemLabelDefinition({ item }: { item: ItemLabelEntry }) {
+@@ -766,12 +776,110 @@ export function ItemLabelDefinition({ item }: { item: ItemLabelEntry }) {
    );
  }
  
 +const threadMarkdown = (text: string) => (
 +  <FilePathAwareMessageResponse>{text}</FilePathAwareMessageResponse>
 +);
++
++function describeRaised(item: StoredOpenItem): string {
++  const age = relativeTime(item.created_at * 1000);
++  const when = age === "now" ? "just now" : `${age} ago`;
++  return `Raised ${when}${item.raised_by ? ` for ${item.raised_by}` : ""}`;
++}
++
++/** A link from the store, opened the way the Links list opens its rows. */
++function StoredItemLink({ href, children }: { href: string; children: React.ReactNode }) {
++  const sessionId = useContext(ItemLabelSessionContext);
++  return (
++    <a
++      href={href}
++      target="_blank"
++      rel="noopener noreferrer"
++      className="break-all text-link hover:underline"
++      onClick={(event) => followLinkWithPopupFallback(event, href, sessionId ?? undefined)}
++    >
++      {children}
++    </a>
++  );
++}
++
++/** A stored item as the store holds it: its title, its link, its detail and its links. */
++function StoredItemSummary({ item, messageId }: { item: StoredOpenItem; messageId: string }) {
++  const url = item.url ? parseHttpUrl(item.url) : null;
++  const title = item.title.trim();
++  const detail = item.detail.trim();
++  return (
++    <div className="flex flex-col gap-1.5" data-testid="stored-item-summary">
++      {title && !(url && /^https?:\/\//i.test(title)) && <p className="font-medium">{title}</p>}
++      {url && <StoredItemLink href={url.href}>{url.href}</StoredItemLink>}
++      {detail && detail !== title && (
++        <ItemLabelMessageContext.Provider value={messageId}>
++          <FilePathAwareMessageResponse>{detail}</FilePathAwareMessageResponse>
++        </ItemLabelMessageContext.Provider>
++      )}
++      {item.links.length > 0 && (
++        <ul className="flex flex-col gap-0.5">
++          {item.links.map((link) => (
++            <li key={link.url}>
++              <StoredItemLink href={link.url}>{link.label ?? link.url}</StoredItemLink>
++            </li>
++          ))}
++        </ul>
++      )}
++    </div>
++  );
++}
 +
  /**
 - * The block that defined an item, the comments sent on it (with the agent's
@@ -367,10 +469,11 @@ index 94387f70e6b991f7c6aa0fc12830cd80446fc490..9a0728be0ddc467c4028ce64fc6e38d3
 +}
 +
 +/**
-+ * The block that defined an item, then its thread: for a stored item the
-+ * store's replies and resolution, each once; for a label only in the chat the
-+ * comments sent on it (with the agent's reply to each) and how the chat closed
-+ * it. Then this browser's unsent drafts.
++ * A stored item leads with the store's record (title, link, detail, links),
++ * then its replies and resolution, each once, then the chat block it came up
++ * in, folded. A label only in the chat shows its defining block, the comments
++ * sent on it (with the agent's reply to each) and how the chat closed it.
++ * Then this browser's unsent drafts.
   */
  function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: () => void }) {
    const { label, source, closedBy, comments } = item;
@@ -378,21 +481,44 @@ index 94387f70e6b991f7c6aa0fc12830cd80446fc490..9a0728be0ddc467c4028ce64fc6e38d3
    // Only mounted inside a transcript, which always sits under a router.
    const [, setSearchParams] = useSearchParams();
    const sessionId = useContext(ItemLabelSessionContext);
-@@ -824,7 +881,12 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -813,7 +921,7 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+       <div className={POPOVER_META_CLASS}>
+         <span>
+           <span className="font-mono font-medium text-foreground">{label}</span>
+-          {` · ${describeSource(source)}`}
++          {` · ${stored ? describeRaised(stored) : describeSource(source)}`}
+         </span>
+         <button
+           type="button"
+@@ -823,8 +931,25 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+           Show in conversation
          </button>
        </div>
-       <ItemLabelDefinition item={item} />
+-      <ItemLabelDefinition item={item} />
 -      {comments.length > 0 && (
-+      {stored && (
++      {stored ? (
++        <StoredItemSummary item={stored} messageId={source.messageId} />
++      ) : (
++        <ItemLabelDefinition item={item} />
++      )}
++      {stored && (stored.replies.length > 0 || stored.status === "closed") && (
 +        <section aria-label="Thread" className={POPOVER_SECTION_CLASS}>
 +          <StoredItemThread item={stored} messageId={source.messageId} markdown={threadMarkdown} />
 +        </section>
++      )}
++      {stored && (
++        <details data-testid="item-chat-context" className={POPOVER_SECTION_CLASS}>
++          <summary className="cursor-pointer text-xs text-muted-foreground">
++            {`In the conversation · ${describeSource(source)}`}
++          </summary>
++          <ItemLabelDefinition item={item} />
++        </details>
 +      )}
 +      {!stored && comments.length > 0 && (
          <section aria-label="Comments" className={POPOVER_SECTION_CLASS}>
            <div className="text-xs font-medium text-muted-foreground">
              Comments ({comments.length})
-@@ -906,7 +968,14 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
+@@ -906,7 +1031,14 @@ function ItemLabelPreview({ item, onClose }: { item: ItemLabelEntry; onClose: ()
            )}
          </section>
        ))}
