@@ -1,14 +1,15 @@
 # open-items-filters
 
 Needs: open-items-panel
-Covers: e34fa20b2130d8b7
+Covers: eecff99c61e3abd1
 
 The Open items panel gets a search box and one row of chips (Open,
 Answered and Closed with counts, the kinds present, the topics in use) once
 it holds five items or more, and groups items by status, topic or kind. The
 grouping is remembered per browser; the search, chips and folds survive
 closing the panel. On a phone the search stays first in the sheet and the
-chips scroll sideways in one row.
+chips scroll sideways in one row; opening the panel does not focus the
+search, so the keyboard stays down.
 
 - **Turn on:** on by default with `open-items-panel`, on a server that stores
   open items; the chat-only panel is unchanged.
@@ -23,6 +24,7 @@ chips scroll sideways in one row.
 - The search matches every typed word, case-insensitively, in an item's label, title, detail or topic; a chip keeps one status, kind or topic, and selecting it again clears it; each chip's count is what selecting it would list.
 - Status grouping lists the latest reply's items, then Open, Answered and Closed (folded unless a search or chip is active); topic grouping puts items without a topic last; kind grouping follows label order with other letters last.
 - The grouping is stored per browser (`omnigent:open-items-grouping`); the search, chips and folds are kept per session until the page reloads, so the phone sheet reopens as it was left.
+- Opening the panel (phone sheet or desktop popover) focuses the panel itself, never the search field or another control in it.
 - Without the server capability the panel is the chat's tracker, exactly as before; there are no Settings controls.
 
 ## Key code
@@ -30,6 +32,7 @@ chips scroll sideways in one row.
 - `web/src/lib/openItemFilters.ts`: `filterOpenItemRows`, `openItemFacetCounts`, `groupOpenItemRows`, `useOpenItemGrouping`, `useOpenItemsView`
 - `web/src/components/chat/OpenItemsFilterBar.tsx`: `OpenItemsFilterBar`
 - `web/src/components/chat/StoredOpenItemsPanel.tsx`: `StoredOpenItemsPanel`, `GroupHeading`
+- `web/src/components/chat/SessionItemsButton.tsx`: `focusPanel`
 
 ## Tests
 
